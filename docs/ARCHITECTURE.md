@@ -23,6 +23,8 @@ These are the architectural choices that most constrain the rest of the design:
 - **Tokio is the sole runtime.** io_uring is an optional backend optimization behind the `FileSystem` trait, not a semantic requirement.
 - **Deterministic simulation testing** covers the full stack — DB, projections, and workflows — via injected I/O traits, virtual clock, and seeded PRNG.
 
+Note on examples: Code snippets in this document are written in TypeScript-style pseudocode for readability and to make control flow and APIs easier to follow. They are not intended as literal implementation code. The actual implementation is expected to be written in Rust, and the examples should be read as illustrating semantics, invariants, and library boundaries rather than exact syntax or concrete type signatures.
+
 ---
 
 # Part 1: Core Engine
