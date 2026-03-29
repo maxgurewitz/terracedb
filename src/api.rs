@@ -252,6 +252,8 @@ const MANIFEST_FORMAT_VERSION: u32 = 1;
 const LEVELED_BASE_LEVEL_TARGET_BYTES: u64 = 4 * 1024;
 const LEVELED_LEVEL_SIZE_MULTIPLIER: u64 = 10;
 const LEVELED_L0_COMPACTION_TRIGGER: usize = 2;
+const TIERED_LEVEL_RUN_COMPACTION_TRIGGER: usize = 3;
+const FIFO_MAX_LIVE_SSTABLES: usize = 2;
 const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
 const MVCC_KEY_SEPARATOR: u8 = 0;
 
@@ -394,6 +396,13 @@ struct PersistedRowSstableFile {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionJobKind {
+    Rewrite,
+    DeleteOnly,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct CompactionJob {
     id: String,
@@ -401,6 +410,7 @@ struct CompactionJob {
     table_name: String,
     source_level: u32,
     target_level: u32,
+    kind: CompactionJobKind,
     estimated_bytes: u64,
     input_local_ids: Vec<String>,
 }
@@ -2178,21 +2188,34 @@ impl Db {
 
         match table.config.compaction_strategy {
             CompactionStrategy::Leveled => Self::leveled_compaction_state(table, live),
-            CompactionStrategy::Tiered | CompactionStrategy::Fifo => {
-                TableCompactionState::default()
-            }
+            CompactionStrategy::Tiered => Self::tiered_compaction_state(table, live),
+            CompactionStrategy::Fifo => Self::fifo_compaction_state(table, live),
         }
+    }
+
+    fn table_live_sstables(
+        table_id: TableId,
+        live: &[ResidentRowSstable],
+    ) -> Vec<ResidentRowSstable> {
+        live.iter()
+            .filter(|sstable| sstable.meta.table_id == table_id)
+            .cloned()
+            .collect()
+    }
+
+    fn sstables_at_level(table_live: &[ResidentRowSstable], level: u32) -> Vec<ResidentRowSstable> {
+        table_live
+            .iter()
+            .filter(|sstable| sstable.meta.level == level)
+            .cloned()
+            .collect()
     }
 
     fn leveled_compaction_state(
         table: &StoredTable,
         live: &[ResidentRowSstable],
     ) -> TableCompactionState {
-        let table_live = live
-            .iter()
-            .filter(|sstable| sstable.meta.table_id == table.id)
-            .cloned()
-            .collect::<Vec<_>>();
+        let table_live = Self::table_live_sstables(table.id, live);
         if table_live.is_empty() {
             return TableCompactionState::default();
         }
@@ -2200,15 +2223,11 @@ impl Db {
         let mut compaction_debt = 0_u64;
         let mut next_job = None;
 
-        let l0 = table_live
-            .iter()
-            .filter(|sstable| sstable.meta.level == 0)
-            .cloned()
-            .collect::<Vec<_>>();
+        let l0 = Self::sstables_at_level(&table_live, 0);
         if l0.len() >= LEVELED_L0_COMPACTION_TRIGGER {
             compaction_debt = compaction_debt
                 .saturating_add(l0.iter().map(|sstable| sstable.meta.length).sum::<u64>());
-            next_job = Self::build_compaction_job(table, &table_live, 0, &l0);
+            next_job = Self::build_leveled_compaction_job(table, &table_live, 0, &l0);
         }
 
         let max_level = table_live
@@ -2217,11 +2236,7 @@ impl Db {
             .max()
             .unwrap_or_default();
         for level in 1..=max_level {
-            let level_files = table_live
-                .iter()
-                .filter(|sstable| sstable.meta.level == level)
-                .cloned()
-                .collect::<Vec<_>>();
+            let level_files = Self::sstables_at_level(&table_live, level);
             if level_files.is_empty() {
                 continue;
             }
@@ -2235,7 +2250,8 @@ impl Db {
                 compaction_debt =
                     compaction_debt.saturating_add(level_bytes.saturating_sub(target_bytes));
                 if next_job.is_none() {
-                    next_job = Self::build_compaction_job(table, &table_live, level, &level_files);
+                    next_job =
+                        Self::build_leveled_compaction_job(table, &table_live, level, &level_files);
                 }
             }
         }
@@ -2246,7 +2262,90 @@ impl Db {
         }
     }
 
-    fn build_compaction_job(
+    fn tiered_compaction_state(
+        table: &StoredTable,
+        live: &[ResidentRowSstable],
+    ) -> TableCompactionState {
+        let table_live = Self::table_live_sstables(table.id, live);
+        if table_live.is_empty() {
+            return TableCompactionState::default();
+        }
+
+        let mut compaction_debt = 0_u64;
+        let mut next_job = None;
+        let max_level = table_live
+            .iter()
+            .map(|sstable| sstable.meta.level)
+            .max()
+            .unwrap_or_default();
+
+        for level in 0..=max_level {
+            let level_files = Self::sstables_at_level(&table_live, level);
+            if level_files.len() < TIERED_LEVEL_RUN_COMPACTION_TRIGGER {
+                continue;
+            }
+
+            compaction_debt = compaction_debt.saturating_add(
+                level_files
+                    .iter()
+                    .map(|sstable| sstable.meta.length)
+                    .sum::<u64>(),
+            );
+            if next_job.is_none() {
+                next_job = Self::build_rewrite_compaction_job(
+                    table,
+                    level,
+                    level.saturating_add(1),
+                    &level_files,
+                );
+            }
+        }
+
+        TableCompactionState {
+            compaction_debt,
+            next_job,
+        }
+    }
+
+    fn fifo_compaction_state(
+        table: &StoredTable,
+        live: &[ResidentRowSstable],
+    ) -> TableCompactionState {
+        let mut table_live = Self::table_live_sstables(table.id, live);
+        if table_live.len() <= FIFO_MAX_LIVE_SSTABLES {
+            return TableCompactionState::default();
+        }
+
+        table_live.sort_by(|left, right| {
+            (
+                left.meta.max_sequence.get(),
+                left.meta.min_sequence.get(),
+                left.meta.local_id.as_str(),
+            )
+                .cmp(&(
+                    right.meta.max_sequence.get(),
+                    right.meta.min_sequence.get(),
+                    right.meta.local_id.as_str(),
+                ))
+        });
+
+        let delete_count = table_live.len().saturating_sub(FIFO_MAX_LIVE_SSTABLES);
+        let expired = table_live
+            .into_iter()
+            .take(delete_count)
+            .collect::<Vec<_>>();
+        let compaction_debt = expired
+            .iter()
+            .map(|sstable| sstable.meta.length)
+            .sum::<u64>();
+
+        TableCompactionState {
+            compaction_debt,
+            next_job: Self::build_delete_only_compaction_job(table, &expired),
+        }
+    }
+
+    fn build_leveled_compaction_job(
         table: &StoredTable,
         table_live: &[ResidentRowSstable],
         source_level: u32,
@@ -2254,14 +2353,7 @@ impl Db {
     ) -> Option<CompactionJob> {
         let target_level = source_level.saturating_add(1);
         let (min_key, max_key) = Self::sstable_key_span(source_inputs)?;
-        let mut input_local_ids = source_inputs
-            .iter()
-            .map(|sstable| sstable.meta.local_id.clone())
-            .collect::<Vec<_>>();
-        let mut estimated_bytes = source_inputs
-            .iter()
-            .map(|sstable| sstable.meta.length)
-            .sum::<u64>();
+        let mut inputs = source_inputs.to_vec();
 
         for sstable in table_live.iter().filter(|sstable| {
             sstable.meta.level == target_level
@@ -2272,26 +2364,79 @@ impl Db {
                     max_key.as_slice(),
                 )
         }) {
-            input_local_ids.push(sstable.meta.local_id.clone());
-            estimated_bytes = estimated_bytes.saturating_add(sstable.meta.length);
+            inputs.push(sstable.clone());
         }
 
+        Self::build_rewrite_compaction_job(table, source_level, target_level, &inputs)
+    }
+
+    fn build_rewrite_compaction_job(
+        table: &StoredTable,
+        source_level: u32,
+        target_level: u32,
+        inputs: &[ResidentRowSstable],
+    ) -> Option<CompactionJob> {
+        Self::build_compaction_job(
+            table,
+            source_level,
+            target_level,
+            CompactionJobKind::Rewrite,
+            inputs,
+        )
+    }
+
+    fn build_delete_only_compaction_job(
+        table: &StoredTable,
+        inputs: &[ResidentRowSstable],
+    ) -> Option<CompactionJob> {
+        let source_level = inputs
+            .iter()
+            .map(|sstable| sstable.meta.level)
+            .min()
+            .unwrap_or_default();
+        Self::build_compaction_job(
+            table,
+            source_level,
+            source_level,
+            CompactionJobKind::DeleteOnly,
+            inputs,
+        )
+    }
+
+    fn build_compaction_job(
+        table: &StoredTable,
+        source_level: u32,
+        target_level: u32,
+        kind: CompactionJobKind,
+        inputs: &[ResidentRowSstable],
+    ) -> Option<CompactionJob> {
+        if inputs.is_empty() {
+            return None;
+        }
+
+        let mut input_local_ids = inputs
+            .iter()
+            .map(|sstable| sstable.meta.local_id.clone())
+            .collect::<Vec<_>>();
         input_local_ids.sort();
         input_local_ids.dedup();
-        let id = format!(
-            "compaction:{}:L{}:{}",
-            table.config.name,
-            source_level,
-            input_local_ids.join("+")
-        );
 
         Some(CompactionJob {
-            id,
+            id: format!(
+                "compaction:{}:L{}:{}",
+                table.config.name,
+                source_level,
+                input_local_ids.join("+")
+            ),
             table_id: table.id,
             table_name: table.config.name.clone(),
             source_level,
             target_level,
-            estimated_bytes,
+            kind,
+            estimated_bytes: inputs
+                .iter()
+                .map(|sstable| sstable.meta.length)
+                .sum::<u64>(),
             input_local_ids,
         })
     }
@@ -2446,31 +2591,39 @@ impl Db {
             )));
         }
 
-        let mut merged_rows = inputs
-            .iter()
-            .flat_map(|sstable| sstable.rows.iter().cloned())
-            .collect::<Vec<_>>();
-        merged_rows.sort_by_key(|row| encode_mvcc_key(&row.key, CommitId::new(row.sequence)));
+        let outputs = match job.kind {
+            CompactionJobKind::Rewrite => {
+                let mut merged_rows = inputs
+                    .iter()
+                    .flat_map(|sstable| sstable.rows.iter().cloned())
+                    .collect::<Vec<_>>();
+                merged_rows
+                    .sort_by_key(|row| encode_mvcc_key(&row.key, CommitId::new(row.sequence)));
 
-        let outputs = self
-            .write_compaction_outputs(
-                local_root,
-                job.table_id,
-                job.target_level,
-                merged_rows,
-                table.config.bloom_filter_bits_per_key,
-            )
-            .await?;
-        if outputs.is_empty() {
-            return Err(StorageError::corruption(format!(
-                "compaction job {} produced no outputs",
-                job.id
-            )));
-        }
+                let outputs = self
+                    .write_compaction_outputs(
+                        local_root,
+                        job.table_id,
+                        job.target_level,
+                        merged_rows,
+                        table.config.bloom_filter_bits_per_key,
+                    )
+                    .await?;
+                if outputs.is_empty() {
+                    return Err(StorageError::corruption(format!(
+                        "compaction job {} produced no outputs",
+                        job.id
+                    )));
+                }
 
-        #[cfg(test)]
-        self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
-            .await;
+                #[cfg(test)]
+                self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
+                    .await;
+
+                outputs
+            }
+            CompactionJobKind::DeleteOnly => Vec::new(),
+        };
 
         let current_state = self.sstables_read().clone();
         let mut new_live = current_state
@@ -3757,10 +3910,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CommitPhase, CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
-        LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR,
-        LOCAL_SSTABLE_SHARD_DIR, ManifestId, PersistedRowSstableFile, SchemaDefinition,
-        StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
+        CommitPhase, CompactionJobKind, CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH,
+        LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
+        LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, PersistedRowSstableFile,
+        SchemaDefinition, StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
     };
     use crate::{
         CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
@@ -3819,13 +3972,20 @@ mod tests {
     }
 
     fn row_table_config(name: &str) -> TableConfig {
+        row_table_config_with_strategy(name, CompactionStrategy::Leveled)
+    }
+
+    fn row_table_config_with_strategy(
+        name: &str,
+        compaction_strategy: CompactionStrategy,
+    ) -> TableConfig {
         TableConfig {
             name: name.to_string(),
             format: TableFormat::Row,
             merge_operator: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(10),
-            compaction_strategy: CompactionStrategy::Leveled,
+            compaction_strategy,
             schema: None,
             metadata: BTreeMap::from([
                 ("priority".to_string(), json!("high")),
@@ -3979,8 +4139,10 @@ mod tests {
             .expect("sync overwritten file");
     }
 
-    async fn seed_leveled_compaction_fixture(
+    async fn seed_compaction_fixture(
         root: &str,
+        table_name: &str,
+        compaction_strategy: CompactionStrategy,
     ) -> (
         Db,
         crate::Table,
@@ -3995,7 +4157,10 @@ mod tests {
             .await
             .expect("open db");
         let table = db
-            .create_table(row_table_config("events"))
+            .create_table(row_table_config_with_strategy(
+                table_name,
+                compaction_strategy,
+            ))
             .await
             .expect("create table");
         let mut oracle = ShadowOracle::default();
@@ -4078,6 +4243,18 @@ mod tests {
         db.flush().await.expect("flush third l0");
 
         (db, table, file_system, dependencies, oracle)
+    }
+
+    async fn seed_leveled_compaction_fixture(
+        root: &str,
+    ) -> (
+        Db,
+        crate::Table,
+        Arc<crate::StubFileSystem>,
+        DbDependencies,
+        ShadowOracle,
+    ) {
+        seed_compaction_fixture(root, "events", CompactionStrategy::Leveled).await
     }
 
     #[test]
@@ -5380,6 +5557,418 @@ mod tests {
                 oracle_rows(&oracle, sequence, b"a", b"z", false, None)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_preserves_state_without_pulling_in_existing_next_tier_runs() {
+        let (db, table, _file_system, _dependencies, mut oracle) =
+            seed_compaction_fixture("/tiered-compaction", "events", CompactionStrategy::Tiered)
+                .await;
+
+        let initial_job = db
+            .pending_compaction_jobs()
+            .into_iter()
+            .next()
+            .expect("initial tiered compaction job");
+        assert_eq!(initial_job.kind, CompactionJobKind::Rewrite);
+        assert_eq!(initial_job.source_level, 0);
+        assert_eq!(initial_job.target_level, 1);
+        assert_eq!(initial_job.input_local_ids.len(), 3);
+
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run first tiered compaction")
+        );
+        assert_eq!(db.table_stats(&table).await.l0_sstable_count, 0);
+        assert_eq!(db.sstables_read().live.len(), 1);
+        assert_eq!(db.sstables_read().live[0].meta.level, 1);
+
+        let seventh = table
+            .write(b"apple".to_vec(), Value::bytes("v3"))
+            .await
+            .expect("write apple v3");
+        oracle.apply(
+            seventh,
+            PointMutation::Put {
+                key: b"apple".to_vec(),
+                value: b"v3".to_vec(),
+            },
+            true,
+        );
+        let eighth = table
+            .write(b"blueberry".to_vec(), Value::bytes("blue"))
+            .await
+            .expect("write blueberry");
+        oracle.apply(
+            eighth,
+            PointMutation::Put {
+                key: b"blueberry".to_vec(),
+                value: b"blue".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush fourth l0");
+
+        let ninth = table
+            .write(b"banana".to_vec(), Value::bytes("green"))
+            .await
+            .expect("rewrite banana");
+        oracle.apply(
+            ninth,
+            PointMutation::Put {
+                key: b"banana".to_vec(),
+                value: b"green".to_vec(),
+            },
+            true,
+        );
+        let tenth = table
+            .write(b"date".to_vec(), Value::bytes("brown"))
+            .await
+            .expect("write date");
+        oracle.apply(
+            tenth,
+            PointMutation::Put {
+                key: b"date".to_vec(),
+                value: b"brown".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush fifth l0");
+
+        let eleventh = table
+            .delete(b"carrot".to_vec())
+            .await
+            .expect("delete carrot");
+        oracle.apply(
+            eleventh,
+            PointMutation::Delete {
+                key: b"carrot".to_vec(),
+            },
+            true,
+        );
+        let twelfth = table
+            .write(b"avocado".to_vec(), Value::bytes("creamy"))
+            .await
+            .expect("write avocado");
+        oracle.apply(
+            twelfth,
+            PointMutation::Put {
+                key: b"avocado".to_vec(),
+                value: b"creamy".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush sixth l0");
+
+        let pending = db
+            .pending_compaction_jobs()
+            .into_iter()
+            .next()
+            .expect("second tiered compaction job");
+        assert_eq!(pending.kind, CompactionJobKind::Rewrite);
+        assert_eq!(pending.source_level, 0);
+        assert_eq!(pending.target_level, 1);
+
+        let selected_levels = db
+            .sstables_read()
+            .live
+            .iter()
+            .filter(|sstable| pending.input_local_ids.contains(&sstable.meta.local_id))
+            .map(|sstable| sstable.meta.level)
+            .collect::<Vec<_>>();
+        assert_eq!(selected_levels.len(), 3);
+        assert!(selected_levels.iter().all(|level| *level == 0));
+
+        let max_sequence = db.current_sequence();
+        for raw in 0..=max_sequence.get() {
+            let sequence = SequenceNumber::new(raw);
+            let rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        sequence,
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("scan before second tiered compaction"),
+            )
+            .await;
+            assert_eq!(
+                rows,
+                oracle_rows(&oracle, sequence, b"a", b"z", false, None)
+            );
+        }
+
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run second tiered compaction")
+        );
+
+        {
+            let sstables = db.sstables_read();
+            assert_eq!(sstables.live.len(), 2);
+            assert!(sstables.live.iter().all(|sstable| sstable.meta.level == 1));
+        }
+
+        let after_stats = db.table_stats(&table).await;
+        assert_eq!(after_stats.l0_sstable_count, 0);
+        assert_eq!(after_stats.compaction_debt, 0);
+        assert!(db.pending_work().await.is_empty());
+
+        for raw in 0..=max_sequence.get() {
+            let sequence = SequenceNumber::new(raw);
+            let rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        sequence,
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("scan after second tiered compaction"),
+            )
+            .await;
+            assert_eq!(
+                rows,
+                oracle_rows(&oracle, sequence, b"a", b"z", false, None)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fifo_compaction_ages_out_oldest_sstables_with_delete_only_jobs() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let db = Db::open(tiered_config("/fifo-compaction"), dependencies)
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config_with_strategy(
+                "events",
+                CompactionStrategy::Fifo,
+            ))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"archive".to_vec(), Value::bytes("oldest"))
+            .await
+            .expect("write archive");
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write apple v1");
+        db.flush().await.expect("flush first fifo sstable");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write apple v2");
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        db.flush().await.expect("flush second fifo sstable");
+
+        table
+            .delete(b"banana".to_vec())
+            .await
+            .expect("delete banana");
+        table
+            .write(b"carrot".to_vec(), Value::bytes("orange"))
+            .await
+            .expect("write carrot");
+        db.flush().await.expect("flush third fifo sstable");
+
+        let before_stats = db.table_stats(&table).await;
+        assert_eq!(before_stats.l0_sstable_count, 3);
+        assert!(before_stats.compaction_debt > 0);
+
+        let job = db
+            .pending_compaction_jobs()
+            .into_iter()
+            .next()
+            .expect("fifo compaction job");
+        assert_eq!(job.kind, CompactionJobKind::DeleteOnly);
+        assert_eq!(job.input_local_ids.len(), 1);
+
+        let deleted_input = db
+            .sstables_read()
+            .live
+            .iter()
+            .find(|sstable| sstable.meta.local_id == job.input_local_ids[0])
+            .expect("oldest fifo input")
+            .clone();
+
+        assert!(db.run_next_compaction().await.expect("run fifo compaction"));
+
+        let after_stats = db.table_stats(&table).await;
+        assert_eq!(after_stats.l0_sstable_count, 2);
+        assert_eq!(after_stats.compaction_debt, 0);
+        assert!(db.pending_work().await.is_empty());
+        assert!(
+            db.sstables_read()
+                .live
+                .iter()
+                .all(|sstable| sstable.meta.local_id != deleted_input.meta.local_id)
+        );
+
+        let on_disk = file_system
+            .list(&sstable_dir(
+                "/fifo-compaction",
+                table.id().expect("table id"),
+            ))
+            .await
+            .expect("list fifo sstables");
+        assert_eq!(on_disk.len(), 2);
+        assert!(!on_disk.contains(&deleted_input.meta.file_path));
+
+        assert_eq!(
+            table
+                .read(b"archive".to_vec())
+                .await
+                .expect("read aged-out key"),
+            None
+        );
+        assert_eq!(
+            table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read surviving key"),
+            Some(Value::bytes("v2"))
+        );
+        assert_eq!(
+            table
+                .read(b"banana".to_vec())
+                .await
+                .expect("read tombstoned key"),
+            None
+        );
+        assert_eq!(
+            table
+                .read(b"carrot".to_vec())
+                .await
+                .expect("read newest key"),
+            Some(Value::bytes("orange"))
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_strategies_are_selected_per_table_without_cross_table_interference() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/mixed-compaction-strategies"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let fifo = db
+            .create_table(row_table_config_with_strategy(
+                "fifo",
+                CompactionStrategy::Fifo,
+            ))
+            .await
+            .expect("create fifo table");
+        let leveled = db
+            .create_table(row_table_config_with_strategy(
+                "leveled",
+                CompactionStrategy::Leveled,
+            ))
+            .await
+            .expect("create leveled table");
+        let tiered = db
+            .create_table(row_table_config_with_strategy(
+                "tiered",
+                CompactionStrategy::Tiered,
+            ))
+            .await
+            .expect("create tiered table");
+
+        for round in 0..3_u8 {
+            fifo.write(
+                format!("fifo:{round}").into_bytes(),
+                Value::bytes(format!("fifo-{round}")),
+            )
+            .await
+            .expect("write fifo row");
+            leveled
+                .write(
+                    format!("leveled:{round}").into_bytes(),
+                    Value::bytes(format!("leveled-{round}")),
+                )
+                .await
+                .expect("write leveled row");
+            tiered
+                .write(
+                    format!("tiered:{round}").into_bytes(),
+                    Value::bytes(format!("tiered-{round}")),
+                )
+                .await
+                .expect("write tiered row");
+            db.flush().await.expect("flush mixed strategy round");
+        }
+
+        let jobs = db.pending_compaction_jobs();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(
+            jobs.iter()
+                .find(|job| job.table_name == "fifo")
+                .expect("fifo job")
+                .kind,
+            CompactionJobKind::DeleteOnly
+        );
+        assert_eq!(
+            jobs.iter()
+                .find(|job| job.table_name == "leveled")
+                .expect("leveled job")
+                .kind,
+            CompactionJobKind::Rewrite
+        );
+        assert_eq!(
+            jobs.iter()
+                .find(|job| job.table_name == "tiered")
+                .expect("tiered job")
+                .kind,
+            CompactionJobKind::Rewrite
+        );
+
+        let leveled_job = jobs
+            .into_iter()
+            .find(|job| job.table_name == "leveled")
+            .expect("leveled compaction job");
+        db.execute_compaction_job("/mixed-compaction-strategies", leveled_job)
+            .await
+            .expect("run leveled compaction only");
+
+        assert_eq!(db.table_stats(&leveled).await.l0_sstable_count, 0);
+        assert_eq!(db.table_stats(&tiered).await.l0_sstable_count, 3);
+        assert_eq!(db.table_stats(&fifo).await.l0_sstable_count, 3);
+        assert!(db.table_stats(&tiered).await.compaction_debt > 0);
+        assert!(db.table_stats(&fifo).await.compaction_debt > 0);
+
+        assert_eq!(
+            tiered
+                .read(b"tiered:0".to_vec())
+                .await
+                .expect("read tiered key"),
+            Some(Value::bytes("tiered-0"))
+        );
+        assert_eq!(
+            fifo.read(b"fifo:0".to_vec()).await.expect("read fifo key"),
+            Some(Value::bytes("fifo-0"))
+        );
+
+        let remaining_jobs = db.pending_compaction_jobs();
+        assert_eq!(remaining_jobs.len(), 2);
+        assert!(remaining_jobs.iter().all(|job| job.table_name != "leveled"));
+        assert!(remaining_jobs.iter().any(|job| job.table_name == "tiered"));
+        assert!(remaining_jobs.iter().any(|job| job.table_name == "fifo"));
     }
 
     #[tokio::test]
