@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::watch, task};
 
 use crate::{
@@ -568,7 +569,7 @@ impl Clock for SimulatedClock {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileSystemOperation {
     Open,
     WriteAt,
@@ -811,7 +812,7 @@ impl FileSystem for SimulatedFileSystem {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ObjectStoreOperation {
     Put,
     Get,

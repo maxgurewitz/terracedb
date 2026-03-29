@@ -6,6 +6,7 @@ pub mod error;
 pub mod ids;
 pub mod io;
 pub mod scheduler;
+pub mod simulation;
 pub mod stubs;
 
 pub use adapters::{
@@ -36,5 +37,10 @@ pub use io::{Clock, DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOpt
 pub use scheduler::{
     NoopScheduler, PendingWork, PendingWorkType, ScheduleAction, ScheduleDecision, Scheduler,
     TableStats, ThrottleDecision,
+};
+pub use simulation::{
+    CutPoint, GeneratedScenario, NetworkObjectStore, OracleError, PointMutation, RecoveryMatch,
+    ScheduledFault, SeededSimulationRunner, ShadowOracle, SimulationContext, SimulationOutcome,
+    SimulationScenarioConfig, StubDbProcess, TraceEvent, TurmoilClock, seed_mad_turmoil,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};

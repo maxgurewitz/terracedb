@@ -3,8 +3,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rand::{SeedableRng, rngs::StdRng};
-use terracedb::{Clock, DeterministicRng, Rng as TerraceRng, SimulatedClock, Timestamp};
+use terracedb::{
+    Clock, DeterministicRng, Rng as TerraceRng, SimulatedClock, Timestamp, seed_mad_turmoil,
+};
 
 const EXPECTED_MAD_TURMOIL_BYTES: [u8; 16] = [
     68, 7, 230, 209, 134, 195, 227, 157, 91, 18, 108, 194, 221, 180, 171, 1,
@@ -15,7 +16,7 @@ fn turmoil_and_mad_turmoil_produce_reproducible_effect_traces() -> turmoil::Resu
     let seed = 0x5eed_u64;
     let _clock_guard = mad_turmoil::time::SimClocksGuard::init();
 
-    mad_turmoil::rand::set_rng(StdRng::seed_from_u64(seed));
+    seed_mad_turmoil(seed);
 
     let trace = Arc::new(Mutex::new(Vec::new()));
     let trace_client = trace.clone();
