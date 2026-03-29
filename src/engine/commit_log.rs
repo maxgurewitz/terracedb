@@ -540,16 +540,6 @@ impl SegmentManager {
         read_file(self.fs.as_ref(), &segment_path(&self.dir, segment_id)).await
     }
 
-    pub fn seek_by_sequence(
-        &self,
-        table_id: TableId,
-        sequence: SequenceNumber,
-    ) -> Option<SegmentId> {
-        self.catalog
-            .seek_by_sequence(table_id, sequence)
-            .or_else(|| self.active.seek_by_sequence(table_id, sequence))
-    }
-
     pub fn oldest_segment_id(&self) -> Option<SegmentId> {
         self.catalog
             .footers()
@@ -564,6 +554,16 @@ impl SegmentManager {
             .into_iter()
             .chain(self.active.oldest_sequence_for_table(table_id))
             .min()
+    }
+
+    pub fn seek_by_sequence(
+        &self,
+        table_id: TableId,
+        sequence: SequenceNumber,
+    ) -> Option<SegmentId> {
+        self.catalog
+            .seek_by_sequence(table_id, sequence)
+            .or_else(|| self.active.seek_by_sequence(table_id, sequence))
     }
 
     pub async fn append(&mut self, record: CommitRecord) -> Result<AppendLocation, StorageError> {
@@ -775,6 +775,15 @@ impl SegmentManager {
         fs.write_at(&handle, 0, bytes).await?;
         fs.sync(&handle).await
     }
+}
+
+pub fn inspect_segment_bytes(
+    segment_id: SegmentId,
+    bytes: &[u8],
+) -> Result<SegmentDescriptor, StorageError> {
+    Ok(SegmentDescriptor::from(&segment_footer_from_bytes(
+        segment_id, bytes,
+    )?))
 }
 
 pub(crate) fn segment_footer_from_bytes(
@@ -1075,6 +1084,148 @@ impl SegmentReader {
             Some(sequence),
         )
     }
+}
+
+pub(crate) fn encode_segment_bytes(
+    segment_id: SegmentId,
+    records: &[CommitRecord],
+    records_per_block: u64,
+) -> Result<(Vec<u8>, SegmentFooter), StorageError> {
+    if records.is_empty() {
+        return Err(StorageError::unsupported(
+            "cannot encode an empty commit-log segment",
+        ));
+    }
+
+    let records_per_block = records_per_block.max(1);
+    let mut bytes = Vec::new();
+    let mut record_count = 0_u64;
+    let mut entry_count = 0_u64;
+    let mut min_sequence = None;
+    let mut max_sequence = None;
+    let mut tables: BTreeMap<TableId, TableMetaAccumulator> = BTreeMap::new();
+    let mut block_index = Vec::new();
+
+    for record in records {
+        if record_count.is_multiple_of(records_per_block) {
+            block_index.push(BlockIndexEntry {
+                sequence: record.sequence(),
+                offset: bytes.len() as u64,
+            });
+        }
+
+        let frame = record.encode_frame()?;
+        record_count = record_count.saturating_add(1);
+        entry_count = entry_count.saturating_add(record.entries.len() as u64);
+        min_sequence = Some(
+            min_sequence
+                .map(|current: SequenceNumber| current.min(record.sequence()))
+                .unwrap_or(record.sequence()),
+        );
+        max_sequence = Some(
+            max_sequence
+                .map(|current: SequenceNumber| current.max(record.sequence()))
+                .unwrap_or(record.sequence()),
+        );
+
+        for entry in &record.entries {
+            let table = tables.entry(entry.table_id).or_default();
+            table.min_sequence = Some(
+                table
+                    .min_sequence
+                    .map(|current| current.min(record.sequence()))
+                    .unwrap_or(record.sequence()),
+            );
+            table.max_sequence = Some(
+                table
+                    .max_sequence
+                    .map(|current| current.max(record.sequence()))
+                    .unwrap_or(record.sequence()),
+            );
+            table.entry_count = table.entry_count.saturating_add(1);
+        }
+
+        bytes.extend_from_slice(&frame);
+    }
+
+    let footer = SegmentFooter {
+        segment_id,
+        min_sequence: min_sequence.ok_or_else(|| {
+            StorageError::unsupported("cannot encode a segment without a minimum sequence")
+        })?,
+        max_sequence: max_sequence.ok_or_else(|| {
+            StorageError::unsupported("cannot encode a segment without a maximum sequence")
+        })?,
+        record_count,
+        entry_count,
+        data_end_offset: bytes.len() as u64,
+        tables: tables
+            .into_iter()
+            .map(|(table_id, meta)| {
+                Ok(TableSegmentMeta {
+                    table_id,
+                    min_sequence: meta.min_sequence.ok_or_else(|| {
+                        StorageError::corruption(
+                            "encoded segment table metadata is missing min_sequence",
+                        )
+                    })?,
+                    max_sequence: meta.max_sequence.ok_or_else(|| {
+                        StorageError::corruption(
+                            "encoded segment table metadata is missing max_sequence",
+                        )
+                    })?,
+                    entry_count: meta.entry_count,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?,
+        block_index,
+    };
+
+    let footer_bytes = footer.encode()?;
+    let footer_len = u32::try_from(footer_bytes.len())
+        .map_err(|_| StorageError::unsupported("segment footer exceeds 4 GiB"))?;
+    let footer_checksum = checksum32(&footer_bytes);
+
+    let mut trailer = Vec::with_capacity(FOOTER_TRAILER_LEN);
+    push_u32(&mut trailer, footer_len);
+    push_u32(&mut trailer, footer_checksum);
+    trailer.extend_from_slice(&FOOTER_MAGIC);
+
+    bytes.extend_from_slice(&footer_bytes);
+    bytes.extend_from_slice(&trailer);
+
+    Ok((bytes, footer))
+}
+
+pub(crate) fn scan_table_from_segment_bytes(
+    bytes: &[u8],
+    table_id: TableId,
+    sequence_inclusive: SequenceNumber,
+) -> Result<Vec<CommitRecord>, StorageError> {
+    let footer = parse_segment_footer(bytes)?.ok_or_else(|| {
+        StorageError::corruption("commit-log segment is missing a footer trailer")
+    })?;
+    let Some(table_meta) = footer
+        .tables
+        .iter()
+        .find(|table| table.table_id == table_id)
+    else {
+        return Ok(Vec::new());
+    };
+    if table_meta.max_sequence < sequence_inclusive {
+        return Ok(Vec::new());
+    }
+
+    Ok(parse_records_range(
+        bytes,
+        footer.seek_offset(sequence_inclusive) as usize,
+        footer.data_end_offset as usize,
+        Some(sequence_inclusive),
+    )?
+    .into_iter()
+    .filter(|record| record.sequence() >= sequence_inclusive)
+    .filter(|record| record_touches_table(record, table_id))
+    .collect())
 }
 
 #[async_trait]

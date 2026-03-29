@@ -10,15 +10,15 @@ use terracedb::{
     Clock, CommitOptions, CompactionStrategy, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
     DbConfig, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
     DbSimulationScenarioConfig, DbWorkloadOperation, FieldDefinition, FieldId, FieldType,
-    FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ObjectStore,
-    ObjectStoreFaultSpec, ObjectStoreOperation, OpenError, OperationResult, PendingWork,
-    PendingWorkType, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location, ScanOptions,
-    ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
-    SchemaDefinition, SeededSimulationRunner, SequenceNumber, ShadowOracle,
-    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, SsdConfig,
-    StorageConfig, StorageErrorKind, StorageSource, StubDbProcess, TableConfig, TableFormat,
-    TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, TraceEvent,
-    Transaction, UnifiedStorage, Value,
+    FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ManifestId,
+    ObjectKeyLayout, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation, OpenError,
+    OperationResult, PendingWork, PendingWorkType, PointMutation, RemoteCache, RemoteRecoveryHint,
+    S3Location, S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision,
+    ScheduledFault, ScheduledFaultKind, Scheduler, SchemaDefinition, SeededSimulationRunner,
+    SequenceNumber, ShadowOracle, SimulationMergeOperatorId, SimulationScenarioConfig,
+    SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubDbProcess,
+    TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
+    TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
@@ -171,6 +171,20 @@ fn simulation_tiered_config(root_path: &str, durability: TieredDurabilityMode) -
             },
             max_local_bytes: 1024 * 1024,
             durability,
+        }),
+        scheduler: None,
+    }
+}
+
+fn simulation_s3_primary_config(prefix: &str) -> DbConfig {
+    DbConfig {
+        storage: StorageConfig::S3Primary(S3PrimaryStorageConfig {
+            s3: S3Location {
+                bucket: "terracedb-sim".to_string(),
+                prefix: prefix.to_string(),
+            },
+            mem_cache_size_bytes: 1024 * 1024,
+            auto_flush_interval: None,
         }),
         scheduler: None,
     }
@@ -863,6 +877,139 @@ fn db_change_feed_simulation_surfaces_snapshot_too_old_for_lagging_tables_after_
 
             Ok(())
         }
+    })
+}
+
+#[test]
+fn s3_primary_simulation_recovers_to_last_durable_prefix() -> turmoil::Result {
+    let events_spec = SimulationTableSpec::row("events");
+    let specs = vec![events_spec.clone()];
+
+    SeededSimulationRunner::new(0xcdc3).run_with(move |context| {
+        let specs = specs.clone();
+        let events_spec = events_spec.clone();
+
+        async move {
+            let config = simulation_s3_primary_config("sim/s3-primary-prefix");
+            let db = context.open_db(config.clone()).await?;
+            let events = db.create_table(events_spec.table_config()).await?;
+            let mut oracle = DbShadowOracle::new(&specs);
+
+            let durable = events.write(b"user:1".to_vec(), bytes("durable")).await?;
+            oracle.apply_with_cursor(
+                LogCursor::new(durable, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:1".to_vec(),
+                    value: b"durable".to_vec(),
+                },
+                false,
+            )?;
+            db.flush().await?;
+            oracle.mark_durable_through(db.current_durable_sequence());
+
+            let visible = events
+                .write(b"user:2".to_vec(), bytes("visible-only"))
+                .await?;
+            oracle.apply_with_cursor(
+                LogCursor::new(visible, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:2".to_vec(),
+                    value: b"visible-only".to_vec(),
+                },
+                false,
+            )?;
+
+            assert_eq!(
+                collect_change_feed(
+                    db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                        .await?,
+                )
+                .await,
+                oracle.visible_changes_since("events", LogCursor::beginning())?
+            );
+            assert_eq!(
+                collect_change_feed(
+                    db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                        .await?,
+                )
+                .await,
+                oracle.durable_changes_since("events", LogCursor::beginning())?
+            );
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_events = reopened.table("events");
+            assert_eq!(reopened.current_sequence(), durable);
+            assert_eq!(reopened.current_durable_sequence(), durable);
+            assert_eq!(
+                reopened_events.read(b"user:1".to_vec()).await?,
+                Some(bytes("durable"))
+            );
+            assert_eq!(reopened_events.read(b"user:2".to_vec()).await?, None);
+            assert_eq!(
+                collect_change_feed(
+                    reopened
+                        .scan_since(
+                            &reopened_events,
+                            LogCursor::beginning(),
+                            ScanOptions::default(),
+                        )
+                        .await?,
+                )
+                .await,
+                oracle.durable_changes_since("events", LogCursor::beginning())?
+            );
+
+            Ok(())
+        }
+    })
+}
+
+#[test]
+fn s3_primary_simulation_failed_flush_recovers_last_durable_prefix() -> turmoil::Result {
+    SeededSimulationRunner::new(0xcdc4).run_with(|context| async move {
+        let config = simulation_s3_primary_config("sim/s3-primary-flush-failure");
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        let durable = events.write(b"user:1".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+
+        let visible_only = events.write(b"user:1".to_vec(), bytes("v2")).await?;
+        assert_eq!(db.current_sequence(), visible_only);
+        assert_eq!(db.current_durable_sequence(), durable);
+        assert_eq!(events.read(b"user:1".to_vec()).await?, Some(bytes("v2")));
+
+        let layout = ObjectKeyLayout::new(&S3Location {
+            bucket: "terracedb-sim".to_string(),
+            prefix: "sim/s3-primary-flush-failure".to_string(),
+        });
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Put,
+                target_prefix: layout.backup_manifest(ManifestId::new(2)),
+            })
+            .await?;
+
+        db.flush()
+            .await
+            .expect_err("remote manifest upload should fail");
+        assert_eq!(db.current_durable_sequence(), durable);
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_events = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), durable);
+        assert_eq!(reopened.current_durable_sequence(), durable);
+        assert_eq!(
+            reopened_events.read(b"user:1".to_vec()).await?,
+            Some(bytes("v1"))
+        );
+
+        Ok(())
     })
 }
 

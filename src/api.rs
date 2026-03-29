@@ -22,20 +22,20 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::{
     config::{
-        CompactionDecision, CompactionDecisionContext, CompactionStrategy, DbConfig,
+        CompactionDecision, CompactionDecisionContext, CompactionStrategy, DbConfig, S3Location,
         S3PrimaryStorageConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
         TieredDurabilityMode, TieredStorageConfig,
     },
     engine::commit_log::{
         CommitEntry, CommitRecord, SegmentFooter, SegmentManager, SegmentOptions,
-        segment_footer_from_bytes,
+        encode_segment_bytes, scan_table_from_segment_bytes, segment_footer_from_bytes,
     },
     error::{
         CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
         StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
-    io::{DbDependencies, OpenOptions},
+    io::{DbDependencies, ObjectStore, OpenOptions},
     remote::{ObjectKeyLayout, StorageSource, UnifiedStorage},
     scheduler::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
@@ -674,6 +674,7 @@ struct LoadedManifest {
     generation: ManifestId,
     last_flushed_sequence: SequenceNumber,
     live_sstables: Vec<ResidentRowSstable>,
+    durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1052,9 +1053,22 @@ enum CommitLogBackend {
     Memory(MemoryCommitLog),
 }
 
-#[derive(Default)]
 struct MemoryCommitLog {
+    object_store: Arc<dyn ObjectStore>,
     records: Vec<CommitRecord>,
+    durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
+    next_segment_id: u64,
+}
+
+impl MemoryCommitLog {
+    fn new(object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            object_store,
+            records: Vec::new(),
+            durable_commit_log_segments: Vec::new(),
+            next_segment_id: 1,
+        }
+    }
 }
 
 impl CommitRuntime {
@@ -1133,42 +1147,83 @@ impl CommitRuntime {
                     .scan_table_from_sequence(table_id, sequence_inclusive)
                     .await
             }
-            CommitLogBackend::Memory(log) => Ok(log
-                .records
-                .iter()
-                .filter(|record| record.sequence() >= sequence_inclusive)
-                .filter(|record| {
-                    record
-                        .entries
+            CommitLogBackend::Memory(log) => {
+                let mut records = Vec::new();
+                for segment in &log.durable_commit_log_segments {
+                    let Some(table_meta) = segment
+                        .footer
+                        .tables
                         .iter()
-                        .any(|entry| entry.table_id == table_id)
-                })
-                .cloned()
-                .collect()),
+                        .find(|table| table.table_id == table_id)
+                    else {
+                        continue;
+                    };
+                    if table_meta.max_sequence < sequence_inclusive {
+                        continue;
+                    }
+
+                    let bytes = log.object_store.get(&segment.object_key).await?;
+                    records.extend(scan_table_from_segment_bytes(
+                        &bytes,
+                        table_id,
+                        sequence_inclusive,
+                    )?);
+                }
+                records.extend(
+                    log.records
+                        .iter()
+                        .filter(|record| record.sequence() >= sequence_inclusive)
+                        .filter(|record| {
+                            record
+                                .entries
+                                .iter()
+                                .any(|entry| entry.table_id == table_id)
+                        })
+                        .cloned(),
+                );
+                Ok(records)
+            }
         }
     }
 
     fn oldest_sequence_for_table(&self, table_id: TableId) -> Option<SequenceNumber> {
         match &self.backend {
             CommitLogBackend::Local(manager) => manager.oldest_sequence_for_table(table_id),
-            CommitLogBackend::Memory(log) => log
-                .records
-                .iter()
-                .filter(|record| {
-                    record
-                        .entries
-                        .iter()
-                        .any(|entry| entry.table_id == table_id)
-                })
-                .map(CommitRecord::sequence)
-                .min(),
+            CommitLogBackend::Memory(log) => {
+                let durable_oldest = log
+                    .durable_commit_log_segments
+                    .iter()
+                    .flat_map(|segment| segment.footer.tables.iter())
+                    .filter(|table| table.table_id == table_id)
+                    .map(|table| table.min_sequence)
+                    .min();
+                let buffered_oldest = log
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        record
+                            .entries
+                            .iter()
+                            .any(|entry| entry.table_id == table_id)
+                    })
+                    .map(CommitRecord::sequence)
+                    .min();
+
+                durable_oldest.into_iter().chain(buffered_oldest).min()
+            }
         }
     }
 
     fn oldest_segment_id(&self) -> Option<SegmentId> {
         match &self.backend {
             CommitLogBackend::Local(manager) => manager.oldest_segment_id(),
-            CommitLogBackend::Memory(log) => (!log.records.is_empty()).then_some(SegmentId::new(1)),
+            CommitLogBackend::Memory(log) => log
+                .durable_commit_log_segments
+                .first()
+                .map(|segment| segment.footer.segment_id)
+                .or_else(|| {
+                    (!log.records.is_empty()).then_some(SegmentId::new(log.next_segment_id))
+                }),
         }
     }
 
@@ -1176,7 +1231,55 @@ impl CommitRuntime {
     fn enumerate_segments(&self) -> Vec<crate::engine::commit_log::SegmentDescriptor> {
         match &self.backend {
             CommitLogBackend::Local(manager) => manager.enumerate_segments(),
-            CommitLogBackend::Memory(_) => Vec::new(),
+            CommitLogBackend::Memory(log) => {
+                let mut descriptors = log
+                    .durable_commit_log_segments
+                    .iter()
+                    .map(|segment| {
+                        crate::engine::commit_log::SegmentDescriptor::from(&segment.footer)
+                    })
+                    .collect::<Vec<_>>();
+                if !log.records.is_empty() {
+                    let mut tables =
+                        BTreeMap::<TableId, (SequenceNumber, SequenceNumber, u32)>::new();
+                    for record in &log.records {
+                        for entry in &record.entries {
+                            tables
+                                .entry(entry.table_id)
+                                .and_modify(|table| {
+                                    table.0 = table.0.min(record.sequence());
+                                    table.1 = table.1.max(record.sequence());
+                                    table.2 = table.2.saturating_add(1);
+                                })
+                                .or_insert((record.sequence(), record.sequence(), 1));
+                        }
+                    }
+                    descriptors.push(crate::engine::commit_log::SegmentDescriptor {
+                        segment_id: SegmentId::new(log.next_segment_id),
+                        sealed: false,
+                        min_sequence: log.records.first().map(CommitRecord::sequence),
+                        max_sequence: log.records.last().map(CommitRecord::sequence),
+                        record_count: log.records.len() as u64,
+                        entry_count: log
+                            .records
+                            .iter()
+                            .map(|record| record.entries.len() as u64)
+                            .sum(),
+                        tables: tables
+                            .into_iter()
+                            .map(|(table_id, (min_sequence, max_sequence, entry_count))| {
+                                crate::engine::commit_log::TableSegmentMeta {
+                                    table_id,
+                                    min_sequence,
+                                    max_sequence,
+                                    entry_count,
+                                }
+                            })
+                            .collect(),
+                    });
+                }
+                descriptors
+            }
         }
     }
 }
@@ -2177,12 +2280,25 @@ impl Db {
         }
         let catalog_location = Self::catalog_location(&config.storage);
         let (tables, next_table_id) = Self::load_tables(&dependencies, &catalog_location).await?;
-        let commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
         let loaded_manifest = Self::load_local_manifest(&config.storage, &dependencies).await?;
+        let mut commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
+        if let CommitLogBackend::Memory(log) = &mut commit_runtime.backend {
+            log.durable_commit_log_segments = loaded_manifest.durable_commit_log_segments.clone();
+            log.next_segment_id = loaded_manifest
+                .durable_commit_log_segments
+                .iter()
+                .map(|segment| segment.footer.segment_id.get())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
+        }
         let recovered_commit_log = commit_runtime
             .recover_after(loaded_manifest.last_flushed_sequence)
             .await?;
-        let recovered_sequence = recovered_commit_log.max_sequence;
+        let recovered_sequence = recovered_commit_log
+            .max_sequence
+            .max(loaded_manifest.last_flushed_sequence);
         let next_sstable_id = loaded_manifest
             .live_sstables
             .iter()
@@ -2316,12 +2432,21 @@ impl Db {
                 let schema = config.schema.as_ref().ok_or_else(|| {
                     CreateTableError::InvalidConfig("columnar tables require a schema".to_string())
                 })?;
-                schema
-                    .validate()
-                    .map_err(|error| CreateTableError::InvalidConfig(error.to_string()))?;
+                schema.validate().map_err(|error| {
+                    CreateTableError::InvalidConfig(format!(
+                        "invalid columnar schema: {}",
+                        error.message()
+                    ))
+                })?;
                 if config.merge_operator.is_some() {
                     return Err(CreateTableError::InvalidConfig(
                         "columnar tables do not support merge operators in v1".to_string(),
+                    ));
+                }
+                if config.max_merge_operand_chain_length.is_some() {
+                    return Err(CreateTableError::InvalidConfig(
+                        "columnar tables do not support max_merge_operand_chain_length in v1"
+                            .to_string(),
                     ));
                 }
             }
@@ -2335,6 +2460,7 @@ impl Db {
             && left.format == right.format
             && left.max_merge_operand_chain_length == right.max_merge_operand_chain_length
             && left.bloom_filter_bits_per_key == right.bloom_filter_bits_per_key
+            && left.history_retention_sequences == right.history_retention_sequences
             && left.compaction_strategy == right.compaction_strategy
             && left.schema == right.schema
             && left.metadata == right.metadata
@@ -2401,7 +2527,9 @@ impl Db {
                     .await?,
                 ))
             }
-            StorageConfig::S3Primary(_) => CommitLogBackend::Memory(MemoryCommitLog::default()),
+            StorageConfig::S3Primary(_) => {
+                CommitLogBackend::Memory(MemoryCommitLog::new(dependencies.object_store.clone()))
+            }
         };
 
         Ok(CommitRuntime { backend })
@@ -2688,20 +2816,23 @@ impl Db {
         Self::join_fs_path(root, LOCAL_BACKUP_RESTORE_MARKER_RELATIVE_PATH)
     }
 
-    fn tiered_object_layout(config: &TieredStorageConfig) -> ObjectKeyLayout {
-        ObjectKeyLayout::new(&config.s3)
+    fn object_key_layout(location: &S3Location) -> ObjectKeyLayout {
+        ObjectKeyLayout::new(location)
     }
 
     async fn load_local_manifest(
         storage: &StorageConfig,
         dependencies: &DbDependencies,
     ) -> Result<LoadedManifest, OpenError> {
-        let Some(root) = Self::local_storage_root_for(storage) else {
-            return Ok(LoadedManifest::default());
+        let StorageConfig::Tiered(config) = storage else {
+            let StorageConfig::S3Primary(config) = storage else {
+                return Ok(LoadedManifest::default());
+            };
+            return Self::load_remote_manifest(config, dependencies).await;
         };
 
-        let current_path = Self::local_current_path(root);
-        let manifest_dir = Self::local_manifest_dir(root);
+        let current_path = Self::local_current_path(&config.ssd.path);
+        let manifest_dir = Self::local_manifest_dir(&config.ssd.path);
         let mut candidates = Vec::new();
         let mut last_error = None;
 
@@ -2711,7 +2842,7 @@ impl Db {
                     let pointer = pointer.trim();
                     if !pointer.is_empty() {
                         candidates.push(Self::join_fs_path(
-                            root,
+                            &config.ssd.path,
                             &format!("{LOCAL_MANIFEST_DIR_RELATIVE_PATH}/{pointer}"),
                         ));
                     }
@@ -2757,78 +2888,57 @@ impl Db {
         }
     }
 
-    async fn read_manifest_at_path(
-        dependencies: &DbDependencies,
-        path: &str,
-    ) -> Result<LoadedManifest, StorageError> {
-        let bytes = read_source(dependencies, &StorageSource::local_file(path)).await?;
-        let file: PersistedManifestFile = serde_json::from_slice(&bytes).map_err(|error| {
-            StorageError::corruption(format!("decode manifest {path} failed: {error}"))
-        })?;
-
-        if file.body.format_version != MANIFEST_FORMAT_VERSION {
-            return Err(StorageError::unsupported(format!(
-                "unsupported manifest version {}",
-                file.body.format_version
-            )));
-        }
-
-        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
-            StorageError::corruption(format!("encode manifest body failed: {error}"))
-        })?;
-        if checksum32(&encoded_body) != file.checksum {
-            return Err(StorageError::corruption(format!(
-                "manifest checksum mismatch for {path}"
-            )));
-        }
-
-        let mut live_sstables = Vec::with_capacity(file.body.sstables.len());
-        let mut max_sequence = SequenceNumber::new(0);
-        for sstable in &file.body.sstables {
-            max_sequence = max_sequence.max(sstable.max_sequence);
-            live_sstables.push(Self::load_resident_sstable(dependencies, sstable).await?);
-        }
-
-        if max_sequence > file.body.last_flushed_sequence {
-            return Err(StorageError::corruption(format!(
-                "manifest {path} flush watermark is behind referenced SSTables"
-            )));
-        }
-
-        Ok(LoadedManifest {
-            generation: file.body.generation,
-            last_flushed_sequence: file.body.last_flushed_sequence,
-            live_sstables,
-        })
+    fn remote_object_layout(config: &S3PrimaryStorageConfig) -> ObjectKeyLayout {
+        Self::object_key_layout(&config.s3)
     }
 
-    async fn read_remote_manifest_file_at_key(
+    fn tiered_object_layout(config: &TieredStorageConfig) -> ObjectKeyLayout {
+        Self::object_key_layout(&config.s3)
+    }
+
+    fn remote_manifest_path(config: &S3PrimaryStorageConfig, generation: ManifestId) -> String {
+        Self::remote_object_layout(config).backup_manifest(generation)
+    }
+
+    fn remote_manifest_latest_key(config: &S3PrimaryStorageConfig) -> String {
+        Self::remote_object_layout(config).backup_manifest_latest()
+    }
+
+    fn remote_commit_log_segment_key(
+        config: &S3PrimaryStorageConfig,
+        segment_id: crate::SegmentId,
+    ) -> String {
+        Self::remote_object_layout(config).backup_commit_log_segment(segment_id)
+    }
+
+    fn remote_sstable_key(
+        config: &S3PrimaryStorageConfig,
+        table_id: TableId,
+        local_id: &str,
+    ) -> String {
+        Self::remote_object_layout(config).backup_sstable(table_id, 0, local_id)
+    }
+
+    async fn load_remote_manifest(
+        config: &S3PrimaryStorageConfig,
         dependencies: &DbDependencies,
-        key: &str,
-    ) -> Result<PersistedRemoteManifestFile, StorageError> {
-        let bytes = read_source(dependencies, &StorageSource::remote_object(key)).await?;
-        let file: PersistedRemoteManifestFile =
-            serde_json::from_slice(&bytes).map_err(|error| {
-                StorageError::corruption(format!("decode remote manifest {key} failed: {error}"))
-            })?;
+    ) -> Result<LoadedManifest, OpenError> {
+        Self::load_remote_manifest_from_layout(&Self::remote_object_layout(config), dependencies)
+            .await
+    }
 
-        if file.body.format_version != REMOTE_MANIFEST_FORMAT_VERSION {
-            return Err(StorageError::unsupported(format!(
-                "unsupported remote manifest version {}",
-                file.body.format_version
-            )));
-        }
-
-        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
-            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
-        })?;
-        if checksum32(&encoded_body) != file.checksum {
-            return Err(StorageError::corruption(format!(
-                "remote manifest checksum mismatch for {key}"
-            )));
-        }
-
-        Ok(file)
+    async fn load_remote_manifest_from_layout(
+        layout: &ObjectKeyLayout,
+        dependencies: &DbDependencies,
+    ) -> Result<LoadedManifest, OpenError> {
+        let Some((key, file)) =
+            Self::load_remote_manifest_file_from_layout(layout, dependencies).await?
+        else {
+            return Ok(LoadedManifest::default());
+        };
+        Self::loaded_manifest_from_remote_file(dependencies, &key, file)
+            .await
+            .map_err(OpenError::Storage)
     }
 
     async fn load_remote_manifest_file_from_layout(
@@ -2889,6 +2999,115 @@ impl Db {
         } else {
             Ok(None)
         }
+    }
+
+    async fn read_manifest_at_path(
+        dependencies: &DbDependencies,
+        path: &str,
+    ) -> Result<LoadedManifest, StorageError> {
+        let bytes = read_source(dependencies, &StorageSource::local_file(path)).await?;
+        let file: PersistedManifestFile = serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!("decode manifest {path} failed: {error}"))
+        })?;
+
+        if file.body.format_version != MANIFEST_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported manifest version {}",
+                file.body.format_version
+            )));
+        }
+
+        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
+            StorageError::corruption(format!("encode manifest body failed: {error}"))
+        })?;
+        if checksum32(&encoded_body) != file.checksum {
+            return Err(StorageError::corruption(format!(
+                "manifest checksum mismatch for {path}"
+            )));
+        }
+
+        let mut live_sstables = Vec::with_capacity(file.body.sstables.len());
+        let mut max_sequence = SequenceNumber::new(0);
+        for sstable in &file.body.sstables {
+            max_sequence = max_sequence.max(sstable.max_sequence);
+            live_sstables.push(Self::load_resident_sstable(dependencies, sstable).await?);
+        }
+
+        if max_sequence > file.body.last_flushed_sequence {
+            return Err(StorageError::corruption(format!(
+                "manifest {path} flush watermark is behind referenced SSTables"
+            )));
+        }
+
+        Ok(LoadedManifest {
+            generation: file.body.generation,
+            last_flushed_sequence: file.body.last_flushed_sequence,
+            live_sstables,
+            durable_commit_log_segments: Vec::new(),
+        })
+    }
+
+    async fn read_remote_manifest_file_at_key(
+        dependencies: &DbDependencies,
+        key: &str,
+    ) -> Result<PersistedRemoteManifestFile, StorageError> {
+        let bytes = read_source(dependencies, &StorageSource::remote_object(key)).await?;
+        let file: PersistedRemoteManifestFile =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                StorageError::corruption(format!("decode remote manifest {key} failed: {error}"))
+            })?;
+
+        if file.body.format_version != REMOTE_MANIFEST_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported remote manifest version {}",
+                file.body.format_version
+            )));
+        }
+
+        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
+            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
+        })?;
+        if checksum32(&encoded_body) != file.checksum {
+            return Err(StorageError::corruption(format!(
+                "remote manifest checksum mismatch for {key}"
+            )));
+        }
+
+        Ok(file)
+    }
+
+    async fn loaded_manifest_from_remote_file(
+        dependencies: &DbDependencies,
+        key: &str,
+        file: PersistedRemoteManifestFile,
+    ) -> Result<LoadedManifest, StorageError> {
+        let mut live_sstables = Vec::with_capacity(file.body.sstables.len());
+        let mut max_sstable_sequence = SequenceNumber::new(0);
+        for sstable in &file.body.sstables {
+            max_sstable_sequence = max_sstable_sequence.max(sstable.max_sequence);
+            live_sstables.push(Self::load_resident_sstable(dependencies, sstable).await?);
+        }
+
+        let max_log_sequence = file
+            .body
+            .commit_log_segments
+            .iter()
+            .map(|segment| segment.footer.max_sequence)
+            .max()
+            .unwrap_or_default();
+
+        if max_sstable_sequence.max(max_log_sequence) > file.body.last_flushed_sequence {
+            return Err(StorageError::corruption(format!(
+                "remote manifest {key} flush watermark is behind durable objects"
+            )));
+        }
+
+        Ok(LoadedManifest {
+            generation: file.body.generation,
+            last_flushed_sequence: file.body.last_flushed_sequence,
+            live_sstables,
+            durable_commit_log_segments: file.body.commit_log_segments,
+        })
     }
 
     async fn maybe_restore_tiered_from_backup(
@@ -3210,15 +3429,75 @@ impl Db {
         Ok(outputs)
     }
 
-    async fn write_row_sstable(
+    async fn flush_immutable_remote(
         &self,
-        path: &str,
+        config: &S3PrimaryStorageConfig,
+        immutable: &ImmutableMemtable,
+    ) -> Result<Vec<ResidentRowSstable>, FlushError> {
+        let mut outputs = Vec::new();
+        let tables = self.tables_read().clone();
+
+        for (&table_id, table_memtable) in &immutable.memtable.tables {
+            if table_memtable.is_empty() {
+                continue;
+            }
+
+            let stored = tables
+                .values()
+                .find(|table| table.id == table_id)
+                .cloned()
+                .ok_or_else(|| {
+                    FlushError::Storage(StorageError::corruption(format!(
+                        "flush references unknown table id {}",
+                        table_id.get()
+                    )))
+                })?;
+
+            if stored.config.format != TableFormat::Row {
+                return Err(FlushError::Unimplemented(
+                    "columnar flush path is implemented in T25",
+                ));
+            }
+
+            let rows = table_memtable
+                .entries
+                .values()
+                .map(|entry| SstableRow {
+                    key: entry.user_key.clone(),
+                    sequence: entry.sequence,
+                    kind: entry.kind,
+                    value: entry.value.clone(),
+                })
+                .collect::<Vec<_>>();
+            let local_id = format!(
+                "SST-{:06}",
+                self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
+            );
+            let object_key = Self::remote_sstable_key(config, table_id, &local_id);
+            outputs.push(
+                self.write_row_sstable_remote(
+                    &object_key,
+                    table_id,
+                    0,
+                    local_id,
+                    rows,
+                    stored.config.bloom_filter_bits_per_key,
+                )
+                .await
+                .map_err(FlushError::Storage)?,
+            );
+        }
+
+        Ok(outputs)
+    }
+
+    fn encode_row_sstable(
         table_id: TableId,
         level: u32,
         local_id: String,
         rows: Vec<SstableRow>,
         bloom_filter_bits_per_key: Option<u32>,
-    ) -> Result<ResidentRowSstable, StorageError> {
+    ) -> Result<(ResidentRowSstable, Vec<u8>), StorageError> {
         let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
         let user_key_bloom_filter = UserKeyBloomFilter::build(&rows, bloom_filter_bits_per_key);
         let rows_bytes = serde_json::to_vec(&rows).map_err(|error| {
@@ -3248,6 +3527,32 @@ impl Db {
             StorageError::corruption(format!("encode SSTable file failed: {error}"))
         })?;
 
+        meta.length = bytes.len() as u64;
+        meta.checksum = checksum;
+        meta.data_checksum = data_checksum;
+
+        Ok((
+            ResidentRowSstable {
+                meta,
+                rows,
+                user_key_bloom_filter,
+            },
+            bytes,
+        ))
+    }
+
+    async fn write_row_sstable(
+        &self,
+        path: &str,
+        table_id: TableId,
+        level: u32,
+        local_id: String,
+        rows: Vec<SstableRow>,
+        bloom_filter_bits_per_key: Option<u32>,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let (mut resident, bytes) =
+            Self::encode_row_sstable(table_id, level, local_id, rows, bloom_filter_bits_per_key)?;
+
         let handle = self
             .inner
             .dependencies
@@ -3270,16 +3575,72 @@ impl Db {
             .await?;
         self.inner.dependencies.file_system.sync(&handle).await?;
 
-        meta.file_path = path.to_string();
-        meta.length = bytes.len() as u64;
-        meta.checksum = checksum;
-        meta.data_checksum = data_checksum;
+        resident.meta.file_path = path.to_string();
+        Ok(resident)
+    }
 
-        Ok(ResidentRowSstable {
-            meta,
-            rows,
-            user_key_bloom_filter,
+    async fn write_row_sstable_remote(
+        &self,
+        object_key: &str,
+        table_id: TableId,
+        level: u32,
+        local_id: String,
+        rows: Vec<SstableRow>,
+        bloom_filter_bits_per_key: Option<u32>,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let (mut resident, bytes) =
+            Self::encode_row_sstable(table_id, level, local_id, rows, bloom_filter_bits_per_key)?;
+        self.inner
+            .dependencies
+            .object_store
+            .put(object_key, &bytes)
+            .await?;
+        resident.meta.remote_key = Some(object_key.to_string());
+        Ok(resident)
+    }
+
+    fn encode_manifest_payload_from_sstables(
+        generation: ManifestId,
+        last_flushed_sequence: SequenceNumber,
+        sstables: &[PersistedManifestSstable],
+    ) -> Result<Vec<u8>, StorageError> {
+        let body = PersistedManifestBody {
+            format_version: MANIFEST_FORMAT_VERSION,
+            generation,
+            last_flushed_sequence,
+            sstables: sstables.to_vec(),
+        };
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
+            StorageError::corruption(format!("encode manifest body failed: {error}"))
+        })?;
+        let checksum = checksum32(&encoded_body);
+        serde_json::to_vec_pretty(&PersistedManifestFile { body, checksum }).map_err(|error| {
+            StorageError::corruption(format!("encode manifest file failed: {error}"))
         })
+    }
+
+    fn encode_remote_manifest_payload(
+        generation: ManifestId,
+        last_flushed_sequence: SequenceNumber,
+        sstables: &[PersistedManifestSstable],
+        durable_commit_log_segments: &[DurableRemoteCommitLogSegment],
+    ) -> Result<Vec<u8>, StorageError> {
+        let body = PersistedRemoteManifestBody {
+            format_version: REMOTE_MANIFEST_FORMAT_VERSION,
+            generation,
+            last_flushed_sequence,
+            sstables: sstables.to_vec(),
+            commit_log_segments: durable_commit_log_segments.to_vec(),
+        };
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
+            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
+        })?;
+        let checksum = checksum32(&encoded_body);
+        serde_json::to_vec_pretty(&PersistedRemoteManifestFile { body, checksum }).map_err(
+            |error| {
+                StorageError::corruption(format!("encode remote manifest file failed: {error}"))
+            },
+        )
     }
 
     async fn install_manifest(
@@ -3288,6 +3649,12 @@ impl Db {
         last_flushed_sequence: SequenceNumber,
         live: &[ResidentRowSstable],
     ) -> Result<(), StorageError> {
+        let root = self.local_storage_root().ok_or_else(|| {
+            StorageError::unsupported("local manifest is only used in tiered mode")
+        })?;
+        let manifest_dir = Self::local_manifest_dir(root);
+        let manifest_path = Self::local_manifest_path(root, generation);
+        let manifest_temp_path = format!("{manifest_path}{LOCAL_MANIFEST_TEMP_SUFFIX}");
         let payload = Self::encode_manifest_payload_from_sstables(
             generation,
             last_flushed_sequence,
@@ -3296,12 +3663,6 @@ impl Db {
                 .map(|sstable| sstable.meta.clone())
                 .collect::<Vec<_>>(),
         )?;
-        let root = self.local_storage_root().ok_or_else(|| {
-            StorageError::unsupported("local manifest is only used in tiered mode")
-        })?;
-        let manifest_dir = Self::local_manifest_dir(root);
-        let manifest_path = Self::local_manifest_path(root, generation);
-        let manifest_temp_path = format!("{manifest_path}{LOCAL_MANIFEST_TEMP_SUFFIX}");
 
         let manifest_handle = self
             .inner
@@ -3377,48 +3738,37 @@ impl Db {
         Ok(())
     }
 
-    fn encode_manifest_payload_from_sstables(
+    async fn install_remote_manifest(
+        &self,
+        config: &S3PrimaryStorageConfig,
         generation: ManifestId,
         last_flushed_sequence: SequenceNumber,
-        sstables: &[PersistedManifestSstable],
-    ) -> Result<Vec<u8>, StorageError> {
-        let body = PersistedManifestBody {
-            format_version: MANIFEST_FORMAT_VERSION,
-            generation,
-            last_flushed_sequence,
-            sstables: sstables.to_vec(),
-        };
-        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
-            StorageError::corruption(format!("encode manifest body failed: {error}"))
-        })?;
-        let checksum = checksum32(&encoded_body);
-        serde_json::to_vec_pretty(&PersistedManifestFile { body, checksum }).map_err(|error| {
-            StorageError::corruption(format!("encode manifest file failed: {error}"))
-        })
-    }
-
-    fn encode_remote_manifest_payload(
-        generation: ManifestId,
-        last_flushed_sequence: SequenceNumber,
-        sstables: &[PersistedManifestSstable],
+        live: &[ResidentRowSstable],
         durable_commit_log_segments: &[DurableRemoteCommitLogSegment],
-    ) -> Result<Vec<u8>, StorageError> {
-        let body = PersistedRemoteManifestBody {
-            format_version: REMOTE_MANIFEST_FORMAT_VERSION,
+    ) -> Result<(), StorageError> {
+        let manifest_key = Self::remote_manifest_path(config, generation);
+        let latest_key = Self::remote_manifest_latest_key(config);
+        let payload = Self::encode_remote_manifest_payload(
             generation,
             last_flushed_sequence,
-            sstables: sstables.to_vec(),
-            commit_log_segments: durable_commit_log_segments.to_vec(),
-        };
-        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
-            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
-        })?;
-        let checksum = checksum32(&encoded_body);
-        serde_json::to_vec_pretty(&PersistedRemoteManifestFile { body, checksum }).map_err(
-            |error| {
-                StorageError::corruption(format!("encode remote manifest file failed: {error}"))
-            },
-        )
+            &live
+                .iter()
+                .map(|sstable| sstable.meta.clone())
+                .collect::<Vec<_>>(),
+            durable_commit_log_segments,
+        )?;
+
+        self.inner
+            .dependencies
+            .object_store
+            .put(&manifest_key, &payload)
+            .await?;
+        self.inner
+            .dependencies
+            .object_store
+            .put(&latest_key, format!("{manifest_key}\n").as_bytes())
+            .await?;
+        Ok(())
     }
 
     fn tiered_backup_layout(&self) -> Option<ObjectKeyLayout> {
@@ -5049,85 +5399,190 @@ impl Db {
 
     async fn flush_internal(&self, _allow_scheduler_follow_up: bool) -> Result<(), FlushError> {
         let _maintenance_guard = self.inner.maintenance_lock.lock().await;
-        let local_root = self.local_storage_root().map(str::to_string);
-        let immutables = {
-            let _commit_guard = self.inner.commit_lock.lock().await;
-            if local_root.is_some() {
-                self.memtables_write().rotate_mutable();
+        match &self.inner.config.storage {
+            StorageConfig::Tiered(_) => {
+                let local_root = self
+                    .local_storage_root()
+                    .expect("tiered storage should have local root")
+                    .to_string();
+                let immutables = {
+                    let _commit_guard = self.inner.commit_lock.lock().await;
+                    self.memtables_write().rotate_mutable();
+
+                    self.inner
+                        .commit_runtime
+                        .lock()
+                        .await
+                        .sync()
+                        .await
+                        .map_err(FlushError::Storage)?;
+                    self.mark_all_commits_durable();
+                    self.publish_watermarks();
+                    self.memtables_read().immutables.clone()
+                };
+
+                let mut flushed_count = 0_usize;
+                let mut sstable_state = self.sstables_read().clone();
+                let mut new_live = sstable_state.live.clone();
+                let mut manifest_generation = sstable_state.manifest_generation;
+
+                for immutable in &immutables {
+                    let outputs = self.flush_immutable(&local_root, immutable).await?;
+                    if outputs.is_empty() {
+                        flushed_count += 1;
+                        continue;
+                    }
+
+                    new_live.extend(outputs);
+                    Self::sort_live_sstables(&mut new_live);
+                    manifest_generation =
+                        ManifestId::new(manifest_generation.get().saturating_add(1));
+                    self.install_manifest(manifest_generation, immutable.max_sequence, &new_live)
+                        .await
+                        .map_err(FlushError::Storage)?;
+                    flushed_count += 1;
+                }
+
+                if flushed_count > 0 {
+                    let mut memtables = self.memtables_write();
+                    memtables.immutables.drain(0..flushed_count);
+
+                    sstable_state.live = new_live;
+                    sstable_state.manifest_generation = manifest_generation;
+                    sstable_state.last_flushed_sequence = sstable_state.last_flushed_sequence.max(
+                        immutables
+                            .iter()
+                            .take(flushed_count)
+                            .map(|immutable| immutable.max_sequence)
+                            .max()
+                            .unwrap_or_default(),
+                    );
+                    *self.sstables_write() = sstable_state;
+                }
+
+                let backup_result = if flushed_count > 0 {
+                    let state = self.sstables_read().clone();
+                    self.sync_tiered_backup_manifest(
+                        state.manifest_generation,
+                        state.last_flushed_sequence,
+                        &state.live,
+                    )
+                    .await
+                } else {
+                    self.sync_tiered_commit_log_tail().await
+                };
+                let _ = backup_result;
+
+                self.prune_commit_log(true)
+                    .await
+                    .map_err(FlushError::Storage)?;
             }
+            StorageConfig::S3Primary(config) => {
+                let (immutables, buffered_records, mut durable_segments, next_segment_id) = {
+                    let _commit_guard = self.inner.commit_lock.lock().await;
+                    self.memtables_write().rotate_mutable();
 
-            self.inner
-                .commit_runtime
-                .lock()
-                .await
-                .sync()
-                .await
-                .map_err(FlushError::Storage)?;
-            self.mark_all_commits_durable();
-            self.publish_watermarks();
+                    let immutables = self.memtables_read().immutables.clone();
+                    let mut commit_runtime = self.inner.commit_runtime.lock().await;
+                    commit_runtime.sync().await.map_err(FlushError::Storage)?;
+                    match &mut commit_runtime.backend {
+                        CommitLogBackend::Memory(log) => (
+                            immutables,
+                            log.records.clone(),
+                            log.durable_commit_log_segments.clone(),
+                            log.next_segment_id,
+                        ),
+                        CommitLogBackend::Local(_) => {
+                            return Err(FlushError::Storage(StorageError::unsupported(
+                                "s3-primary flush requires the memory commit-log backend",
+                            )));
+                        }
+                    }
+                };
 
-            if local_root.is_some() {
-                self.memtables_read().immutables.clone()
-            } else {
-                return Ok(());
-            }
-        };
+                if immutables.is_empty() && buffered_records.is_empty() {
+                    return Ok(());
+                }
 
-        let local_root = local_root.expect("local storage root should exist");
-        let mut flushed_count = 0_usize;
-        let mut sstable_state = self.sstables_read().clone();
-        let mut new_live = sstable_state.live.clone();
-        let mut manifest_generation = sstable_state.manifest_generation;
+                if !buffered_records.is_empty() {
+                    let (segment_bytes, footer) = encode_segment_bytes(
+                        crate::SegmentId::new(next_segment_id),
+                        &buffered_records,
+                        SegmentOptions::default().records_per_block,
+                    )
+                    .map_err(FlushError::Storage)?;
+                    let object_key = Self::remote_commit_log_segment_key(config, footer.segment_id);
+                    self.inner
+                        .dependencies
+                        .object_store
+                        .put(&object_key, &segment_bytes)
+                        .await
+                        .map_err(FlushError::Storage)?;
+                    durable_segments.push(DurableRemoteCommitLogSegment { object_key, footer });
+                    durable_segments.sort_by_key(|segment| segment.footer.segment_id.get());
+                }
 
-        for immutable in &immutables {
-            let outputs = self.flush_immutable(&local_root, immutable).await?;
-            if outputs.is_empty() {
-                flushed_count += 1;
-                continue;
-            }
+                let mut sstable_state = self.sstables_read().clone();
+                let mut new_live = sstable_state.live.clone();
+                for immutable in &immutables {
+                    new_live.extend(self.flush_immutable_remote(config, immutable).await?);
+                }
+                Self::sort_live_sstables(&mut new_live);
 
-            new_live.extend(outputs);
-            Self::sort_live_sstables(&mut new_live);
-            manifest_generation = ManifestId::new(manifest_generation.get().saturating_add(1));
-            self.install_manifest(manifest_generation, immutable.max_sequence, &new_live)
-                .await
-                .map_err(FlushError::Storage)?;
-            flushed_count += 1;
-        }
-
-        if flushed_count > 0 {
-            let mut memtables = self.memtables_write();
-            memtables.immutables.drain(0..flushed_count);
-
-            sstable_state.live = new_live;
-            sstable_state.manifest_generation = manifest_generation;
-            sstable_state.last_flushed_sequence = sstable_state.last_flushed_sequence.max(
-                immutables
-                    .iter()
-                    .take(flushed_count)
-                    .map(|immutable| immutable.max_sequence)
+                let flushed_through = buffered_records
+                    .last()
+                    .map(CommitRecord::sequence)
+                    .into_iter()
+                    .chain(immutables.iter().map(|immutable| immutable.max_sequence))
                     .max()
-                    .unwrap_or_default(),
-            );
-            *self.sstables_write() = sstable_state;
+                    .unwrap_or(sstable_state.last_flushed_sequence)
+                    .max(sstable_state.last_flushed_sequence);
+                let next_generation =
+                    ManifestId::new(sstable_state.manifest_generation.get().saturating_add(1));
+                self.install_remote_manifest(
+                    config,
+                    next_generation,
+                    flushed_through,
+                    &new_live,
+                    &durable_segments,
+                )
+                .await
+                .map_err(FlushError::Storage)?;
+
+                {
+                    let _commit_guard = self.inner.commit_lock.lock().await;
+                    let mut commit_runtime = self.inner.commit_runtime.lock().await;
+                    match &mut commit_runtime.backend {
+                        CommitLogBackend::Memory(log) => {
+                            log.records
+                                .retain(|record| record.sequence() > flushed_through);
+                            log.durable_commit_log_segments = durable_segments.clone();
+                            if !buffered_records.is_empty() {
+                                log.next_segment_id = next_segment_id.saturating_add(1);
+                            }
+                        }
+                        CommitLogBackend::Local(_) => {
+                            return Err(FlushError::Storage(StorageError::unsupported(
+                                "s3-primary flush requires the memory commit-log backend",
+                            )));
+                        }
+                    }
+
+                    if !immutables.is_empty() {
+                        let mut memtables = self.memtables_write();
+                        memtables.immutables.drain(0..immutables.len());
+                    }
+
+                    self.mark_commits_durable_through(flushed_through);
+                    self.publish_watermarks();
+                }
+
+                sstable_state.live = new_live;
+                sstable_state.manifest_generation = next_generation;
+                sstable_state.last_flushed_sequence = flushed_through;
+                *self.sstables_write() = sstable_state;
+            }
         }
-
-        let backup_result = if flushed_count > 0 {
-            let state = self.sstables_read().clone();
-            self.sync_tiered_backup_manifest(
-                state.manifest_generation,
-                state.last_flushed_sequence,
-                &state.live,
-            )
-            .await
-        } else {
-            self.sync_tiered_commit_log_tail().await
-        };
-        let _ = backup_result;
-
-        self.prune_commit_log(true)
-            .await
-            .map_err(FlushError::Storage)?;
 
         Ok(())
     }
@@ -5588,6 +6043,15 @@ impl Db {
         let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
         for state in coordinator.sequences.values_mut() {
             if !state.aborted {
+                state.durable_confirmed = true;
+            }
+        }
+    }
+
+    fn mark_commits_durable_through(&self, upper_bound: SequenceNumber) {
+        let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
+        for (&sequence, state) in coordinator.sequences.iter_mut() {
+            if !state.aborted && sequence <= upper_bound {
                 state.durable_confirmed = true;
             }
         }
@@ -6942,6 +7406,23 @@ mod tests {
         })
     }
 
+    fn tiered_config_with_max_local_bytes(path: &str, max_local_bytes: u64) -> DbConfig {
+        DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: path.to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-test".to_string(),
+                    prefix: "tiered".to_string(),
+                },
+                max_local_bytes,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: None,
+        }
+    }
+
     fn s3_primary_config(prefix: &str) -> DbConfig {
         DbConfig {
             storage: StorageConfig::S3Primary(S3PrimaryStorageConfig {
@@ -6987,37 +7468,9 @@ mod tests {
         max_local_bytes: u64,
         scheduler: Arc<dyn Scheduler>,
     ) -> DbConfig {
-        DbConfig {
-            storage: StorageConfig::Tiered(TieredStorageConfig {
-                ssd: SsdConfig {
-                    path: path.to_string(),
-                },
-                s3: S3Location {
-                    bucket: "terracedb-test".to_string(),
-                    prefix: "tiered".to_string(),
-                },
-                max_local_bytes,
-                durability: TieredDurabilityMode::GroupCommit,
-            }),
-            scheduler: Some(scheduler),
-        }
-    }
-
-    fn tiered_config_with_max_local_bytes(path: &str, max_local_bytes: u64) -> DbConfig {
-        DbConfig {
-            storage: StorageConfig::Tiered(TieredStorageConfig {
-                ssd: SsdConfig {
-                    path: path.to_string(),
-                },
-                s3: S3Location {
-                    bucket: "terracedb-test".to_string(),
-                    prefix: "tiered".to_string(),
-                },
-                max_local_bytes,
-                durability: TieredDurabilityMode::GroupCommit,
-            }),
-            scheduler: None,
-        }
+        let mut config = tiered_config_with_max_local_bytes(path, max_local_bytes);
+        config.scheduler = Some(scheduler);
+        config
     }
 
     #[derive(Default)]
@@ -7486,27 +7939,6 @@ mod tests {
         assert_eq!(error.oldest_available, oldest_available);
     }
 
-    async fn commit_log_segment_ids(db: &Db) -> Vec<SegmentId> {
-        db.inner
-            .commit_runtime
-            .lock()
-            .await
-            .enumerate_segments()
-            .into_iter()
-            .map(|segment| segment.segment_id)
-            .collect()
-    }
-
-    async fn force_seal_commit_log(db: &Db) {
-        db.inner
-            .commit_runtime
-            .lock()
-            .await
-            .maybe_seal_active()
-            .await
-            .expect("seal active commit log segment");
-    }
-
     fn oracle_rows(
         oracle: &ShadowOracle,
         sequence: SequenceNumber,
@@ -7618,6 +8050,27 @@ mod tests {
             root,
             &format!("{LOCAL_COMMIT_LOG_RELATIVE_DIR}/SEG-{segment_id:06}"),
         )
+    }
+
+    async fn commit_log_segment_ids(db: &Db) -> Vec<SegmentId> {
+        db.inner
+            .commit_runtime
+            .lock()
+            .await
+            .enumerate_segments()
+            .into_iter()
+            .map(|segment| segment.segment_id)
+            .collect()
+    }
+
+    async fn force_seal_commit_log(db: &Db) {
+        db.inner
+            .commit_runtime
+            .lock()
+            .await
+            .maybe_seal_active()
+            .await
+            .expect("seal active commit log segment");
     }
 
     async fn overwrite_file(file_system: &crate::StubFileSystem, path: &str, bytes: &[u8]) {
@@ -12424,6 +12877,306 @@ mod tests {
         assert_eq!(s3_db.current_durable_sequence(), SequenceNumber::new(0));
         s3_db.flush().await.expect("flush s3");
         assert_eq!(s3_db.current_durable_sequence(), SequenceNumber::new(1));
+    }
+
+    #[tokio::test]
+    async fn s3_primary_flush_persists_state_and_durable_change_feed_across_reopen() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store);
+        let config = s3_primary_config("s3-flush-reopen");
+
+        let db = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("open s3-primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        let first = events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first value");
+        let second = events
+            .write(b"user:2".to_vec(), bytes("v2"))
+            .await
+            .expect("write second value");
+
+        let visible_before_flush = collect_changes(
+            db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("visible change feed before flush"),
+        )
+        .await;
+        assert_eq!(db.current_sequence(), second);
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+        assert!(
+            collect_changes(
+                db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                    .await
+                    .expect("durable change feed before flush"),
+            )
+            .await
+            .is_empty()
+        );
+
+        db.flush().await.expect("flush s3-primary state");
+        assert_eq!(db.current_durable_sequence(), second);
+
+        let durable_after_flush = collect_changes(
+            db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("durable change feed after flush"),
+        )
+        .await;
+        assert_eq!(durable_after_flush, visible_before_flush);
+
+        let reopened = Db::open(config, dependencies)
+            .await
+            .expect("reopen durable db");
+        let reopened_events = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), second);
+        assert_eq!(reopened.current_durable_sequence(), second);
+        assert_eq!(
+            reopened_events
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read first durable value"),
+            Some(bytes("v1"))
+        );
+        assert_eq!(
+            reopened_events
+                .read(b"user:2".to_vec())
+                .await
+                .expect("read second durable value"),
+            Some(bytes("v2"))
+        );
+        assert_eq!(
+            collect_changes(
+                reopened
+                    .scan_since(
+                        &reopened_events,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("reopened visible change feed"),
+            )
+            .await,
+            visible_before_flush
+        );
+        assert_eq!(first, SequenceNumber::new(1));
+    }
+
+    #[tokio::test]
+    async fn s3_primary_visible_scan_is_hybrid_but_new_process_reads_only_flushed_state() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store);
+        let config = s3_primary_config("s3-hybrid-visible");
+
+        let db = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("open s3-primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        let durable = events
+            .write(b"user:1".to_vec(), bytes("durable"))
+            .await
+            .expect("write durable event");
+        db.flush().await.expect("flush durable event");
+
+        let visible_only = events
+            .write(b"user:2".to_vec(), bytes("visible-only"))
+            .await
+            .expect("write visible-only event");
+        assert_eq!(db.current_sequence(), visible_only);
+        assert_eq!(db.current_durable_sequence(), durable);
+
+        let visible = collect_changes(
+            db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("same-process visible change feed"),
+        )
+        .await;
+        let durable_only = collect_changes(
+            db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("same-process durable change feed"),
+        )
+        .await;
+        assert_eq!(visible.len(), 2);
+        assert_eq!(durable_only.len(), 1);
+        assert_eq!(durable_only[0].sequence, durable);
+        assert_eq!(visible[1].sequence, visible_only);
+
+        let peer = Db::open(config, dependencies)
+            .await
+            .expect("open second s3-primary process");
+        let peer_events = peer.table("events");
+        assert_eq!(peer.current_sequence(), durable);
+        assert_eq!(peer.current_durable_sequence(), durable);
+        assert_eq!(
+            peer_events
+                .read(b"user:1".to_vec())
+                .await
+                .expect("peer durable read"),
+            Some(bytes("durable"))
+        );
+        assert_eq!(
+            peer_events
+                .read(b"user:2".to_vec())
+                .await
+                .expect("peer should not see visible-only row"),
+            None
+        );
+        assert_eq!(
+            collect_changes(
+                peer.scan_since(&peer_events, LogCursor::beginning(), ScanOptions::default())
+                    .await
+                    .expect("peer visible scan should be durable-only"),
+            )
+            .await,
+            durable_only
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_primary_crash_recovery_drops_unflushed_visible_tail() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let config = s3_primary_config("s3-crash-tail-loss");
+
+        let db = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("open s3-primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        let durable = events
+            .write(b"user:1".to_vec(), bytes("durable"))
+            .await
+            .expect("write durable value");
+        db.flush().await.expect("flush durable value");
+
+        let volatile = events
+            .write(b"user:1".to_vec(), bytes("volatile"))
+            .await
+            .expect("write volatile tail");
+        assert_eq!(db.current_sequence(), volatile);
+        assert_eq!(db.current_durable_sequence(), durable);
+
+        file_system.crash();
+
+        let reopened = Db::open(config, dependencies)
+            .await
+            .expect("reopen after simulated crash");
+        let reopened_events = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), durable);
+        assert_eq!(reopened.current_durable_sequence(), durable);
+        assert_eq!(
+            reopened_events
+                .read(b"user:1".to_vec())
+                .await
+                .expect("recovered durable value"),
+            Some(bytes("durable"))
+        );
+        let recovered_visible = collect_changes(
+            reopened
+                .scan_since(
+                    &reopened_events,
+                    LogCursor::beginning(),
+                    ScanOptions::default(),
+                )
+                .await
+                .expect("recovered visible change feed"),
+        )
+        .await;
+        assert_eq!(recovered_visible.len(), 1);
+        assert_eq!(recovered_visible[0].sequence, durable);
+    }
+
+    #[tokio::test]
+    async fn s3_primary_failed_manifest_upload_preserves_last_durable_prefix_until_retry() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store.clone());
+        let config = s3_primary_config("s3-flush-failure");
+
+        let db = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("open s3-primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        let first = events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first value");
+        db.flush().await.expect("flush first value");
+
+        let second = events
+            .write(b"user:1".to_vec(), bytes("v2"))
+            .await
+            .expect("write second value");
+        let StorageConfig::S3Primary(s3_config) = &config.storage else {
+            panic!("test config should use s3-primary storage");
+        };
+        object_store.inject_failure(ObjectStoreFailure::timeout(
+            ObjectStoreOperation::Put,
+            Db::remote_manifest_path(s3_config, ManifestId::new(2)),
+        ));
+
+        db.flush().await.expect_err("manifest upload should fail");
+        assert_eq!(db.current_sequence(), second);
+        assert_eq!(db.current_durable_sequence(), first);
+        assert_eq!(
+            events
+                .read(b"user:1".to_vec())
+                .await
+                .expect("same-process visible read after failed flush"),
+            Some(bytes("v2"))
+        );
+
+        let peer_before_retry = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("open peer after failed flush");
+        let peer_table = peer_before_retry.table("events");
+        assert_eq!(peer_before_retry.current_sequence(), first);
+        assert_eq!(peer_before_retry.current_durable_sequence(), first);
+        assert_eq!(
+            peer_table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("peer should only see last durable value"),
+            Some(bytes("v1"))
+        );
+
+        db.flush().await.expect("retry flush should succeed");
+        assert_eq!(db.current_durable_sequence(), second);
+
+        let peer_after_retry = Db::open(config, dependencies)
+            .await
+            .expect("open peer after successful retry");
+        let peer_after_retry_table = peer_after_retry.table("events");
+        assert_eq!(peer_after_retry.current_sequence(), second);
+        assert_eq!(peer_after_retry.current_durable_sequence(), second);
+        assert_eq!(
+            peer_after_retry_table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("peer should observe retried durable value"),
+            Some(bytes("v2"))
+        );
     }
 
     #[tokio::test]
