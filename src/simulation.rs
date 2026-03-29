@@ -15,12 +15,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use turmoil::net::{TcpListener, TcpStream};
 
 use crate::{
-    Clock, CommitError, CompactionStrategy, Db, DbConfig, DbDependencies, DeterministicRng,
-    FileSystem, FileSystemFailure, FileSystemOperation, FlushError, Key, KvStream, MergeOperator,
-    MergeOperatorRef, ObjectStore, ObjectStoreOperation, OpenError, OpenOptions, ReadError, Rng,
-    S3Location, ScanOptions, SequenceNumber, SimulatedFileSystem, SsdConfig, StorageConfig,
-    StorageError, StorageErrorKind, Table, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Timestamp, Value, WriteError,
+    Clock, CommitError, CompactionFilterRef, CompactionStrategy, Db, DbConfig, DbDependencies,
+    DeterministicRng, FileSystem, FileSystemFailure, FileSystemOperation, FlushError, Key,
+    KvStream, MergeOperator, MergeOperatorRef, ObjectStore, ObjectStoreOperation, OpenError,
+    OpenOptions, ReadError, Rng, S3Location, ScanOptions, SequenceNumber, SimulatedFileSystem,
+    SsdConfig, StorageConfig, StorageError, StorageErrorKind, Table, TableConfig, TableFormat,
+    TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value, WriteError,
 };
 
 const OBJECT_STORE_HOST: &str = "object-store";
@@ -274,6 +274,9 @@ pub enum DbWorkloadOperation {
         table: String,
         key: Vec<u8>,
     },
+    AdvanceClock {
+        millis: u64,
+    },
     Flush,
     RunCompaction,
 }
@@ -410,11 +413,17 @@ pub enum SimulationMergeOperatorId {
     AppendBytes,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SimulationCompactionFilterId {
+    ExpiryPrefixTtl,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimulationTableSpec {
     pub name: String,
     pub format: TableFormat,
     pub merge_operator: Option<SimulationMergeOperatorId>,
+    pub compaction_filter: Option<SimulationCompactionFilterId>,
     pub max_merge_operand_chain_length: Option<u32>,
     pub history_retention_sequences: Option<u64>,
     pub compaction_strategy: CompactionStrategy,
@@ -426,6 +435,7 @@ impl SimulationTableSpec {
             name: name.into(),
             format: TableFormat::Row,
             merge_operator: None,
+            compaction_filter: None,
             max_merge_operand_chain_length: None,
             history_retention_sequences: None,
             compaction_strategy: CompactionStrategy::Leveled,
@@ -443,13 +453,21 @@ impl SimulationTableSpec {
         spec
     }
 
+    pub fn ttl_row(name: impl Into<String>) -> Self {
+        let mut spec = Self::row(name);
+        spec.compaction_filter = Some(SimulationCompactionFilterId::ExpiryPrefixTtl);
+        spec
+    }
+
     pub fn table_config(&self) -> TableConfig {
         TableConfig {
             name: self.name.clone(),
             format: self.format,
             merge_operator: self.merge_operator.map(resolve_simulation_merge_operator),
             max_merge_operand_chain_length: self.max_merge_operand_chain_length,
-            compaction_filter: None,
+            compaction_filter: self
+                .compaction_filter
+                .map(resolve_simulation_compaction_filter),
             bloom_filter_bits_per_key: Some(10),
             history_retention_sequences: self.history_retention_sequences,
             compaction_strategy: self.compaction_strategy,
@@ -691,6 +709,13 @@ impl DbShadowOracle {
             })
         }
     }
+
+    fn supports_full_history_validation(&self, table: &str) -> bool {
+        self.table_specs
+            .get(table)
+            .map(|spec| spec.compaction_filter.is_none())
+            .unwrap_or(false)
+    }
 }
 
 impl TableMutation {
@@ -768,6 +793,21 @@ fn resolve_simulation_merge_operator(id: SimulationMergeOperatorId) -> MergeOper
     }
 }
 
+fn resolve_simulation_compaction_filter(id: SimulationCompactionFilterId) -> CompactionFilterRef {
+    match id {
+        SimulationCompactionFilterId::ExpiryPrefixTtl => {
+            Arc::new(TtlCompactionFilter::new(expiry_from_prefixed_bytes))
+        }
+    }
+}
+
+fn expiry_from_prefixed_bytes(value: &Value) -> Option<Timestamp> {
+    let Value::Bytes(bytes) = value else {
+        return None;
+    };
+    let prefix = bytes.get(..8)?;
+    Some(Timestamp::new(u64::from_be_bytes(prefix.try_into().ok()?)))
+}
 fn collapse_merge_operands_for_oracle(
     operator: &dyn MergeOperator,
     key: &[u8],
@@ -1230,7 +1270,9 @@ fn collect_known_db_keys(scenario: &DbGeneratedScenario) -> BTreeMap<String, Vec
                     entry.push(key.clone());
                 }
             }
-            DbWorkloadOperation::Flush | DbWorkloadOperation::RunCompaction => {}
+            DbWorkloadOperation::AdvanceClock { .. }
+            | DbWorkloadOperation::Flush
+            | DbWorkloadOperation::RunCompaction => {}
         }
     }
     keys
@@ -1349,6 +1391,10 @@ async fn execute_db_workload_operation(
             let value = read_table_bytes(runtime.table(&table), key.clone()).await?;
             Ok(OperationResult::Value(value))
         }
+        DbWorkloadOperation::AdvanceClock { millis } => {
+            context.clock().sleep(Duration::from_millis(millis)).await;
+            Ok(OperationResult::Bytes(context.clock().now().get() as usize))
+        }
         DbWorkloadOperation::Flush => {
             runtime.db.flush().await.map_err(flush_error_to_storage)?;
             Ok(OperationResult::Unit)
@@ -1375,6 +1421,9 @@ async fn validate_db_runtime(
     sequences.dedup();
 
     for (table_name, keys) in known_keys {
+        if !oracle.supports_full_history_validation(table_name) {
+            continue;
+        }
         let table = runtime.table(table_name);
         for sequence in &sequences {
             for key in keys {
@@ -1414,6 +1463,9 @@ async fn validate_db_recovery(
     known_keys: &BTreeMap<String, Vec<Key>>,
 ) -> turmoil::Result<()> {
     for (table_name, keys) in known_keys {
+        if !oracle.supports_full_history_validation(table_name) {
+            continue;
+        }
         let table = runtime.table(table_name);
         let mut recovered = BTreeMap::new();
         for key in keys {

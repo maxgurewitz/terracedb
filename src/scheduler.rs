@@ -52,6 +52,8 @@ pub struct TableStats {
     pub local_bytes: u64,
     pub s3_bytes: u64,
     pub compaction_debt: u64,
+    pub compaction_filter_removed_bytes: u64,
+    pub compaction_filter_removed_keys: u64,
     pub pending_flush_bytes: u64,
     pub immutable_memtable_count: u32,
     pub history_retention_floor_sequence: Option<SequenceNumber>,

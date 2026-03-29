@@ -23,7 +23,7 @@ pub use config::{
     CompactionDecision, CompactionDecisionContext, CompactionFilter, CompactionFilterRef,
     CompactionStrategy, DbConfig, MergeOperator, MergeOperatorRef, S3Location,
     S3PrimaryStorageConfig, SsdConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
-    TieredDurabilityMode, TieredStorageConfig,
+    TieredDurabilityMode, TieredStorageConfig, TtlCompactionFilter, TtlExpiryExtractor,
 };
 pub use error::{
     CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld, StorageError,
@@ -45,8 +45,8 @@ pub use simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleError, DbRecoveryMatch, DbShadowOracle,
     DbSimulationOutcome, DbSimulationScenarioConfig, DbWorkloadOperation, GeneratedScenario,
     NetworkObjectStore, OperationResult, OracleError, PointMutation, RecoveryMatch, ScheduledFault,
-    ScheduledFaultKind, SeededSimulationRunner, ShadowOracle, SimulationContext,
-    SimulationMergeOperatorId, SimulationOutcome, SimulationScenarioConfig, SimulationTableSpec,
-    StubDbProcess, TraceEvent, TurmoilClock, seed_mad_turmoil,
+    ScheduledFaultKind, SeededSimulationRunner, ShadowOracle, SimulationCompactionFilterId,
+    SimulationContext, SimulationMergeOperatorId, SimulationOutcome, SimulationScenarioConfig,
+    SimulationTableSpec, StubDbProcess, TraceEvent, TurmoilClock, seed_mad_turmoil,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};

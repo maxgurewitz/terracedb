@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::{
-    api::{SchemaDefinition, Value},
+    api::{ChangeKind, SchemaDefinition, Value},
     error::StorageError,
     ids::{SequenceNumber, Timestamp},
     scheduler::Scheduler,
@@ -38,9 +38,11 @@ pub enum CompactionDecision {
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionDecisionContext<'a> {
+    pub level: u32,
     pub key: &'a [u8],
-    pub value: &'a Value,
+    pub value: Option<&'a Value>,
     pub sequence: SequenceNumber,
+    pub kind: ChangeKind,
     pub now: Timestamp,
 }
 
@@ -49,6 +51,38 @@ pub trait CompactionFilter: Send + Sync {
 }
 
 pub type CompactionFilterRef = Arc<dyn CompactionFilter>;
+
+pub type TtlExpiryExtractor = fn(&Value) -> Option<Timestamp>;
+
+#[derive(Clone, Copy)]
+pub struct TtlCompactionFilter {
+    expiry_from_value: TtlExpiryExtractor,
+}
+
+impl TtlCompactionFilter {
+    pub const fn new(expiry_from_value: TtlExpiryExtractor) -> Self {
+        Self { expiry_from_value }
+    }
+}
+
+impl fmt::Debug for TtlCompactionFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TtlCompactionFilter")
+    }
+}
+
+impl CompactionFilter for TtlCompactionFilter {
+    fn decide(&self, ctx: CompactionDecisionContext<'_>) -> CompactionDecision {
+        if ctx.kind == ChangeKind::Delete {
+            return CompactionDecision::Keep;
+        }
+
+        match ctx.value.and_then(|value| (self.expiry_from_value)(value)) {
+            Some(expires_at) if expires_at <= ctx.now => CompactionDecision::Remove,
+            _ => CompactionDecision::Keep,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DbConfig {

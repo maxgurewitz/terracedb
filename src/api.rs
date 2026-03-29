@@ -21,8 +21,9 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::{
     config::{
-        CompactionStrategy, DbConfig, S3PrimaryStorageConfig, StorageConfig, TableConfig,
-        TableFormat, TableMetadata, TieredDurabilityMode, TieredStorageConfig,
+        CompactionDecision, CompactionDecisionContext, CompactionStrategy, DbConfig,
+        S3PrimaryStorageConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
+        TieredDurabilityMode, TieredStorageConfig,
     },
     engine::commit_log::{CommitEntry, CommitRecord, SegmentManager, SegmentOptions},
     error::{
@@ -282,6 +283,7 @@ struct DbInner {
     next_sstable_id: AtomicU64,
     snapshot_tracker: Mutex<SnapshotTracker>,
     next_snapshot_id: AtomicU64,
+    compaction_filter_stats: Mutex<BTreeMap<TableId, CompactionFilterStats>>,
     visible_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
     durable_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
     #[cfg(test)]
@@ -425,12 +427,31 @@ struct TableCompactionState {
     next_job: Option<CompactionJob>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CompactionFilterStats {
+    removed_bytes: u64,
+    removed_keys: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SstableRow {
     key: Key,
     sequence: SequenceNumber,
     kind: ChangeKind,
     value: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct CompactionRow {
+    level: u32,
+    row: SstableRow,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FilteredCompactionRows {
+    rows: Vec<CompactionRow>,
+    removed_bytes: u64,
+    removed_keys: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1393,6 +1414,7 @@ impl Db {
                 next_sstable_id: AtomicU64::new(next_sstable_id),
                 snapshot_tracker: Mutex::new(SnapshotTracker::default()),
                 next_snapshot_id: AtomicU64::new(0),
+                compaction_filter_stats: Mutex::new(BTreeMap::new()),
                 visible_watchers: Mutex::new(BTreeMap::new()),
                 durable_watchers: Mutex::new(BTreeMap::new()),
                 #[cfg(test)]
@@ -2592,9 +2614,9 @@ impl Db {
     }
 
     fn retain_rows_within_horizon(
-        rows: Vec<SstableRow>,
+        rows: Vec<CompactionRow>,
         horizon: Option<SequenceNumber>,
-    ) -> Vec<SstableRow> {
+    ) -> Vec<CompactionRow> {
         let Some(horizon) = horizon else {
             return rows;
         };
@@ -2602,12 +2624,12 @@ impl Db {
         let mut retained = Vec::with_capacity(rows.len());
         let mut index = 0_usize;
         while index < rows.len() {
-            let key = rows[index].key.clone();
+            let key = rows[index].row.key.clone();
             let mut anchor_kept = false;
 
-            while index < rows.len() && rows[index].key == key {
+            while index < rows.len() && rows[index].row.key == key {
                 let row = rows[index].clone();
-                if row.sequence > horizon {
+                if row.row.sequence > horizon {
                     retained.push(row);
                 } else if !anchor_kept {
                     retained.push(row);
@@ -2625,11 +2647,11 @@ impl Db {
         memtables: &MemtableState,
         sstables: &SstableState,
         table_id: TableId,
-        rows: Vec<SstableRow>,
-    ) -> Result<Vec<SstableRow>, StorageError> {
+        rows: Vec<CompactionRow>,
+    ) -> Result<Vec<CompactionRow>, StorageError> {
         let mut rewritten = Vec::with_capacity(rows.len());
         for row in rows {
-            if row.kind != ChangeKind::Merge {
+            if row.row.kind != ChangeKind::Merge {
                 rewritten.push(row);
                 continue;
             }
@@ -2639,21 +2661,83 @@ impl Db {
                 memtables,
                 sstables,
                 table_id,
-                &row.key,
-                row.sequence,
+                &row.row.key,
+                row.row.sequence,
             )?;
             let value = resolved.value.ok_or_else(|| {
                 StorageError::corruption("merge resolution unexpectedly produced a tombstone")
             })?;
-            rewritten.push(SstableRow {
-                key: row.key,
-                sequence: row.sequence,
-                kind: ChangeKind::Put,
-                value: Some(value),
+            rewritten.push(CompactionRow {
+                level: row.level,
+                row: SstableRow {
+                    key: row.row.key,
+                    sequence: row.row.sequence,
+                    kind: ChangeKind::Put,
+                    value: Some(value),
+                },
             });
         }
 
         Ok(rewritten)
+    }
+
+    fn apply_compaction_filter(
+        &self,
+        table: &StoredTable,
+        rows: Vec<CompactionRow>,
+    ) -> FilteredCompactionRows {
+        let Some(filter) = table.config.compaction_filter.as_ref() else {
+            return FilteredCompactionRows {
+                rows,
+                ..FilteredCompactionRows::default()
+            };
+        };
+
+        let now = self.inner.dependencies.clock.now();
+        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
+        let mut retained = Vec::with_capacity(rows.len());
+        let mut filtered_keys = BTreeSet::new();
+        let mut removed_bytes = 0_u64;
+
+        for row in rows {
+            let snapshot_protected = oldest_active_snapshot
+                .is_some_and(|oldest_snapshot| row.row.sequence >= oldest_snapshot);
+            if snapshot_protected {
+                retained.push(row);
+                continue;
+            }
+
+            let decision = filter.decide(CompactionDecisionContext {
+                level: row.level,
+                key: &row.row.key,
+                value: row.row.value.as_ref(),
+                sequence: row.row.sequence,
+                kind: row.row.kind,
+                now,
+            });
+            if decision == CompactionDecision::Remove {
+                removed_bytes =
+                    removed_bytes.saturating_add(Self::estimated_sstable_row_bytes(&row.row));
+                filtered_keys.insert(row.row.key.clone());
+            } else {
+                retained.push(row);
+            }
+        }
+
+        let retained_keys = retained
+            .iter()
+            .map(|row| row.row.key.clone())
+            .collect::<BTreeSet<_>>();
+        let removed_keys = filtered_keys
+            .into_iter()
+            .filter(|key| !retained_keys.contains(key))
+            .count() as u64;
+
+        FilteredCompactionRows {
+            rows: retained,
+            removed_bytes,
+            removed_keys,
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2757,14 +2841,20 @@ impl Db {
             )));
         }
 
-        let outputs = match job.kind {
+        let filtered = match job.kind {
             CompactionJobKind::Rewrite => {
                 let mut merged_rows = inputs
                     .iter()
-                    .flat_map(|sstable| sstable.rows.iter().cloned())
+                    .flat_map(|sstable| {
+                        sstable.rows.iter().cloned().map(move |row| CompactionRow {
+                            level: sstable.meta.level,
+                            row,
+                        })
+                    })
                     .collect::<Vec<_>>();
-                merged_rows
-                    .sort_by_key(|row| encode_mvcc_key(&row.key, CommitId::new(row.sequence)));
+                merged_rows.sort_by_key(|row| {
+                    encode_mvcc_key(&row.row.key, CommitId::new(row.row.sequence))
+                });
                 merged_rows = Self::rewrite_compaction_rows(
                     &tables,
                     &memtables,
@@ -2776,26 +2866,33 @@ impl Db {
                     merged_rows,
                     self.history_gc_horizon(job.table_id),
                 );
+                self.apply_compaction_filter(&table, merged_rows)
+            }
+            CompactionJobKind::DeleteOnly => FilteredCompactionRows::default(),
+        };
 
+        let outputs = match job.kind {
+            CompactionJobKind::Rewrite => {
                 let outputs = self
                     .write_compaction_outputs(
                         local_root,
                         job.table_id,
                         job.target_level,
-                        merged_rows,
+                        filtered
+                            .rows
+                            .iter()
+                            .cloned()
+                            .map(|row| row.row)
+                            .collect::<Vec<_>>(),
                         table.config.bloom_filter_bits_per_key,
                     )
                     .await?;
-                if outputs.is_empty() {
-                    return Err(StorageError::corruption(format!(
-                        "compaction job {} produced no outputs",
-                        job.id
-                    )));
-                }
 
                 #[cfg(test)]
-                self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
-                    .await;
+                if !outputs.is_empty() {
+                    self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
+                        .await;
+                }
 
                 outputs
             }
@@ -2825,6 +2922,11 @@ impl Db {
             sstables.manifest_generation = next_generation;
             sstables.live = new_live;
         }
+        self.record_compaction_filter_stats(
+            job.table_id,
+            filtered.removed_bytes,
+            filtered.removed_keys,
+        );
 
         #[cfg(test)]
         self.maybe_pause_compaction_phase(CompactionPhase::ManifestSwitched)
@@ -3125,6 +3227,8 @@ impl Db {
             total_bytes,
             local_bytes,
             compaction_debt,
+            compaction_filter_removed_bytes,
+            compaction_filter_removed_keys,
             pending_flush_bytes,
             immutable_memtable_count,
             history_retention_floor_sequence,
@@ -3145,6 +3249,7 @@ impl Db {
                     .find(|stored| stored.id == table_id)
                     .map(|stored| Self::table_compaction_state(stored, &live).compaction_debt)
                     .unwrap_or_default();
+                let compaction_filter_stats = self.compaction_filter_stats(table_id);
                 let history_retention_floor_sequence =
                     self.history_retention_floor_sequence(table_id);
                 let history_gc_horizon_sequence = self.history_gc_horizon(table_id);
@@ -3159,6 +3264,8 @@ impl Db {
                     total_bytes,
                     local_bytes,
                     compaction_debt,
+                    compaction_filter_stats.removed_bytes,
+                    compaction_filter_stats.removed_keys,
                     memtables.pending_flush_bytes(table_id),
                     memtables.immutable_memtable_count(table_id),
                     history_retention_floor_sequence,
@@ -3166,13 +3273,15 @@ impl Db {
                     history_pinned_by_snapshots,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0, None, None, false));
+            .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, None, None, false));
 
         TableStats {
             l0_sstable_count,
             total_bytes,
             local_bytes,
             compaction_debt,
+            compaction_filter_removed_bytes,
+            compaction_filter_removed_keys,
             pending_flush_bytes,
             immutable_memtable_count,
             history_retention_floor_sequence,
@@ -3895,6 +4004,29 @@ impl Db {
         mutex_lock(&self.inner.snapshot_tracker).count()
     }
 
+    fn record_compaction_filter_stats(
+        &self,
+        table_id: TableId,
+        removed_bytes: u64,
+        removed_keys: u64,
+    ) {
+        if removed_bytes == 0 && removed_keys == 0 {
+            return;
+        }
+
+        let mut stats = mutex_lock(&self.inner.compaction_filter_stats);
+        let entry = stats.entry(table_id).or_default();
+        entry.removed_bytes = entry.removed_bytes.saturating_add(removed_bytes);
+        entry.removed_keys = entry.removed_keys.saturating_add(removed_keys);
+    }
+
+    fn compaction_filter_stats(&self, table_id: TableId) -> CompactionFilterStats {
+        mutex_lock(&self.inner.compaction_filter_stats)
+            .get(&table_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn history_retention_sequences(&self, table_id: TableId) -> Option<u64> {
         self.tables_read()
             .values()
@@ -4316,7 +4448,8 @@ mod tests {
         FileSystemFailure, FileSystemOperation, MergeOperator, MergeOperatorRef, PointMutation,
         ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber,
         ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng,
-        TableConfig, TableFormat, TableId, TieredDurabilityMode, TieredStorageConfig, Value,
+        TableConfig, TableFormat, TableId, TieredDurabilityMode, TieredStorageConfig, Timestamp,
+        TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -4358,10 +4491,18 @@ mod tests {
         file_system: Arc<crate::StubFileSystem>,
         object_store: Arc<StubObjectStore>,
     ) -> DbDependencies {
+        dependencies_with_clock(file_system, object_store, Arc::new(StubClock::default()))
+    }
+
+    fn dependencies_with_clock(
+        file_system: Arc<crate::StubFileSystem>,
+        object_store: Arc<StubObjectStore>,
+        clock: Arc<StubClock>,
+    ) -> DbDependencies {
         DbDependencies::new(
             file_system,
             object_store,
-            Arc::new(StubClock::default()),
+            clock,
             Arc::new(StubRng::seeded(7)),
         )
     }
@@ -4544,6 +4685,28 @@ mod tests {
         }
 
         Ok(collapsed)
+    }
+
+    fn expiry_prefixed_value(expires_at: u64, payload: &str) -> Value {
+        let mut encoded = expires_at.to_be_bytes().to_vec();
+        encoded.extend_from_slice(payload.as_bytes());
+        Value::Bytes(encoded)
+    }
+
+    fn expiry_from_prefixed_bytes(value: &Value) -> Option<Timestamp> {
+        let Value::Bytes(bytes) = value else {
+            return None;
+        };
+        let prefix = bytes.get(..8)?;
+        Some(Timestamp::new(u64::from_be_bytes(prefix.try_into().ok()?)))
+    }
+
+    fn ttl_row_table_config(name: &str) -> TableConfig {
+        let mut config = row_table_config(name);
+        config.compaction_filter = Some(Arc::new(TtlCompactionFilter::new(
+            expiry_from_prefixed_bytes,
+        )));
+        config
     }
 
     fn row_table_config(name: &str) -> TableConfig {
@@ -7220,6 +7383,327 @@ mod tests {
                 .await
                 .expect("latest read"),
             Some(Value::bytes("v3"))
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_filters_wait_for_active_snapshots_before_removing_expired_rows() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let clock = Arc::new(StubClock::new(Timestamp::new(10)));
+        let db = Db::open(
+            tiered_config("/ttl-snapshot-guard"),
+            dependencies_with_clock(file_system, object_store, clock),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(ttl_row_table_config("events"))
+            .await
+            .expect("create ttl table");
+
+        let expired = expiry_prefixed_value(5, "apple");
+        table
+            .write(b"apple".to_vec(), expired.clone())
+            .await
+            .expect("write expired value");
+        db.flush().await.expect("flush expired value");
+        let snapshot = db.snapshot().await;
+
+        table
+            .write(b"banana".to_vec(), expiry_prefixed_value(50, "banana"))
+            .await
+            .expect("write fresh value");
+        db.flush().await.expect("flush fresh value");
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run guarded compaction")
+        );
+
+        assert_eq!(
+            snapshot
+                .read(&table, b"apple".to_vec())
+                .await
+                .expect("snapshot read"),
+            Some(expired.clone())
+        );
+        assert_eq!(
+            db.table_stats(&table).await.compaction_filter_removed_keys,
+            0
+        );
+
+        snapshot.release();
+        table
+            .write(b"aardvark".to_vec(), expiry_prefixed_value(50, "aardvark"))
+            .await
+            .expect("write third value");
+        db.flush().await.expect("flush third value");
+        table
+            .write(b"apricot".to_vec(), expiry_prefixed_value(50, "apricot"))
+            .await
+            .expect("write fourth value");
+        db.flush().await.expect("flush fourth value");
+
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run compaction after snapshot release")
+        );
+        assert_eq!(
+            table.read(b"apple".to_vec()).await.expect("expired read"),
+            None
+        );
+
+        let stats = db.table_stats(&table).await;
+        assert!(stats.compaction_filter_removed_bytes > 0);
+        assert_eq!(stats.compaction_filter_removed_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn ttl_compaction_filter_advances_with_the_virtual_clock() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let clock = Arc::new(StubClock::new(Timestamp::new(10)));
+        let db = Db::open(
+            tiered_config("/ttl-virtual-clock"),
+            dependencies_with_clock(file_system, object_store, clock.clone()),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(ttl_row_table_config("events"))
+            .await
+            .expect("create ttl table");
+
+        let soon_expiring = expiry_prefixed_value(15, "apple");
+        table
+            .write(b"apple".to_vec(), soon_expiring.clone())
+            .await
+            .expect("write soon-expiring value");
+        db.flush().await.expect("flush first value");
+        table
+            .write(b"banana".to_vec(), expiry_prefixed_value(50, "banana"))
+            .await
+            .expect("write stable value");
+        db.flush().await.expect("flush second value");
+
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run first compaction")
+        );
+        assert_eq!(
+            table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read before clock advance"),
+            Some(soon_expiring)
+        );
+        assert_eq!(
+            db.table_stats(&table).await.compaction_filter_removed_keys,
+            0
+        );
+
+        clock.set(Timestamp::new(20));
+        table
+            .write(b"aardvark".to_vec(), expiry_prefixed_value(50, "aardvark"))
+            .await
+            .expect("write third value");
+        db.flush().await.expect("flush third value");
+        table
+            .write(b"apricot".to_vec(), expiry_prefixed_value(50, "apricot"))
+            .await
+            .expect("write fourth value");
+        db.flush().await.expect("flush fourth value");
+
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run second compaction")
+        );
+        assert_eq!(
+            table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read after clock advance"),
+            None
+        );
+        assert_eq!(
+            db.table_stats(&table).await.compaction_filter_removed_keys,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_compaction_filter_uses_the_injected_clock_not_system_time() {
+        let expired = expiry_prefixed_value(5, "apple");
+
+        let keep_db = Db::open(
+            tiered_config("/ttl-injected-clock-keep"),
+            dependencies_with_clock(
+                Arc::new(crate::StubFileSystem::default()),
+                Arc::new(StubObjectStore::default()),
+                Arc::new(StubClock::new(Timestamp::new(0))),
+            ),
+        )
+        .await
+        .expect("open keep db");
+        let keep_table = keep_db
+            .create_table(ttl_row_table_config("events"))
+            .await
+            .expect("create keep table");
+        keep_table
+            .write(b"apple".to_vec(), expired.clone())
+            .await
+            .expect("write keep apple");
+        keep_db.flush().await.expect("flush keep apple");
+        keep_table
+            .write(b"banana".to_vec(), expiry_prefixed_value(50, "banana"))
+            .await
+            .expect("write keep banana");
+        keep_db.flush().await.expect("flush keep banana");
+        assert!(
+            keep_db
+                .run_next_compaction()
+                .await
+                .expect("compact keep db")
+        );
+
+        let remove_db = Db::open(
+            tiered_config("/ttl-injected-clock-remove"),
+            dependencies_with_clock(
+                Arc::new(crate::StubFileSystem::default()),
+                Arc::new(StubObjectStore::default()),
+                Arc::new(StubClock::new(Timestamp::new(10))),
+            ),
+        )
+        .await
+        .expect("open remove db");
+        let remove_table = remove_db
+            .create_table(ttl_row_table_config("events"))
+            .await
+            .expect("create remove table");
+        remove_table
+            .write(b"apple".to_vec(), expired.clone())
+            .await
+            .expect("write remove apple");
+        remove_db.flush().await.expect("flush remove apple");
+        remove_table
+            .write(b"banana".to_vec(), expiry_prefixed_value(50, "banana"))
+            .await
+            .expect("write remove banana");
+        remove_db.flush().await.expect("flush remove banana");
+        assert!(
+            remove_db
+                .run_next_compaction()
+                .await
+                .expect("compact remove db")
+        );
+
+        assert_eq!(
+            keep_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read keep apple"),
+            Some(expired)
+        );
+        assert_eq!(
+            remove_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read removed apple"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_compaction_without_manifest_switch_recovers_prior_generation() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let clock = Arc::new(StubClock::new(Timestamp::new(10)));
+        let dependencies =
+            dependencies_with_clock(file_system.clone(), object_store, clock.clone());
+        let db = Db::open(
+            tiered_config("/ttl-compaction-manifest-before-switch"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(ttl_row_table_config("events"))
+            .await
+            .expect("create ttl table");
+
+        let expired = expiry_prefixed_value(5, "apple");
+        let fresh = expiry_prefixed_value(50, "banana");
+        table
+            .write(b"apple".to_vec(), expired.clone())
+            .await
+            .expect("write expired value");
+        db.flush().await.expect("flush first value");
+        table
+            .write(b"banana".to_vec(), fresh.clone())
+            .await
+            .expect("write fresh value");
+        db.flush().await.expect("flush second value");
+
+        let prior_generation = db.sstables_read().manifest_generation;
+        let next_generation = ManifestId::new(prior_generation.get().saturating_add(1));
+        let manifest_temp_path = format!(
+            "{}{}",
+            Db::local_manifest_path("/ttl-compaction-manifest-before-switch", next_generation),
+            LOCAL_MANIFEST_TEMP_SUFFIX
+        );
+        file_system.inject_failure(FileSystemFailure::for_target(
+            FileSystemOperation::Rename,
+            manifest_temp_path,
+            StorageError::io("simulated filtered manifest rename failure"),
+        ));
+
+        let error = db
+            .run_next_compaction()
+            .await
+            .expect_err("filtered compaction should fail before manifest switch");
+        assert!(
+            error
+                .message()
+                .contains("simulated filtered manifest rename failure")
+        );
+        assert_eq!(
+            table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read apple after failure"),
+            Some(expired.clone())
+        );
+
+        file_system.crash();
+        let reopened = Db::open(
+            tiered_config("/ttl-compaction-manifest-before-switch"),
+            dependencies,
+        )
+        .await
+        .expect("reopen after failed filtered compaction");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            prior_generation
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read apple after reopen"),
+            Some(expired)
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"banana".to_vec())
+                .await
+                .expect("read banana after reopen"),
+            Some(fresh)
         );
     }
 

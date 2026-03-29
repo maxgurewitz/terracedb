@@ -2,8 +2,14 @@ use terracedb::{
     CutPoint, DbGeneratedScenario, DbMutation, DbShadowOracle, DbSimulationScenarioConfig,
     DbWorkloadOperation, OperationResult, PointMutation, ScheduledFault, ScheduledFaultKind,
     SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
-    SimulationScenarioConfig, SimulationTableSpec, StubDbProcess, TraceEvent,
+    SimulationScenarioConfig, SimulationTableSpec, StubDbProcess, TraceEvent, Value,
 };
+
+fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
+    let mut encoded = expires_at_millis.to_be_bytes().to_vec();
+    encoded.extend_from_slice(payload.as_bytes());
+    Value::Bytes(encoded)
+}
 
 #[test]
 fn simulation_harness_replays_same_seed() -> turmoil::Result {
@@ -394,6 +400,110 @@ fn db_merge_simulation_recovers_after_crash_following_read_triggered_collapse() 
     assert_eq!(
         read_results,
         vec![Some(b"seed|A|B|C".to_vec()), Some(b"seed|A|B|C".to_vec()),]
+    );
+
+    Ok(())
+}
+#[test]
+fn ttl_simulation_supports_snapshot_guarded_compaction_across_restart() -> turmoil::Result {
+    let expired = ttl_value(5, "apple");
+    let banana = ttl_value(50, "banana");
+    let scenario = DbGeneratedScenario {
+        seed: 0x1515,
+        root_path: "/terracedb/sim/t15-ttl".to_string(),
+        tables: vec![SimulationTableSpec::ttl_row("events")],
+        workload: vec![
+            DbWorkloadOperation::Put {
+                table: "events".to_string(),
+                key: b"apple".to_vec(),
+                value: match &expired {
+                    Value::Bytes(bytes) => bytes.clone(),
+                    Value::Record(_) => unreachable!("ttl simulation values are byte payloads"),
+                },
+            },
+            DbWorkloadOperation::Flush,
+            DbWorkloadOperation::ReadLatest {
+                table: "events".to_string(),
+                key: b"apple".to_vec(),
+            },
+            DbWorkloadOperation::AdvanceClock { millis: 10 },
+            DbWorkloadOperation::Put {
+                table: "events".to_string(),
+                key: b"banana".to_vec(),
+                value: match &banana {
+                    Value::Bytes(bytes) => bytes.clone(),
+                    Value::Record(_) => unreachable!("ttl simulation values are byte payloads"),
+                },
+            },
+            DbWorkloadOperation::Flush,
+            DbWorkloadOperation::RunCompaction,
+            DbWorkloadOperation::ReadLatest {
+                table: "events".to_string(),
+                key: b"apple".to_vec(),
+            },
+            DbWorkloadOperation::ReadLatest {
+                table: "events".to_string(),
+                key: b"banana".to_vec(),
+            },
+        ],
+        faults: vec![ScheduledFault {
+            step: 5,
+            cut_point: CutPoint::AfterStep,
+            kind: ScheduledFaultKind::Crash,
+        }],
+    };
+
+    let outcome = SeededSimulationRunner::new(scenario.seed).run_db_scenario(scenario.clone())?;
+
+    assert_eq!(outcome.scenario, scenario);
+    assert!(
+        outcome.trace.iter().any(|event| matches!(
+            event,
+            TraceEvent::Crash {
+                cut_point: CutPoint::AfterStep
+            }
+        )),
+        "scenario should crash after the second flush"
+    );
+    assert!(
+        outcome
+            .trace
+            .iter()
+            .any(|event| matches!(event, TraceEvent::Restart)),
+        "scenario should restart before the TTL compaction step"
+    );
+    assert!(
+        outcome
+            .trace
+            .iter()
+            .any(|event| matches!(event, TraceEvent::DbRecovered { .. })),
+        "real-db simulation should record recovery state"
+    );
+
+    let read_results = outcome
+        .trace
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::DbStepResult {
+                result: OperationResult::Value(value),
+                ..
+            } => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_results,
+        vec![
+            Some(match expired {
+                Value::Bytes(bytes) => bytes,
+                Value::Record(_) => unreachable!("ttl simulation values are byte payloads"),
+            }),
+            None,
+            Some(match banana {
+                Value::Bytes(bytes) => bytes,
+                Value::Record(_) => unreachable!("ttl simulation values are byte payloads"),
+            }),
+        ]
     );
 
     Ok(())
