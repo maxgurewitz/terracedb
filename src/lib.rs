@@ -5,6 +5,7 @@ pub mod engine;
 pub mod error;
 pub mod ids;
 pub mod io;
+pub mod remote;
 pub mod scheduler;
 pub mod simulation;
 pub mod stubs;
@@ -37,6 +38,10 @@ pub use io::{
     Clock, DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOptions, Rng,
     StandardObjectPath, StandardObjectStore, StandardObjectStoreExt,
 };
+pub use remote::{
+    CacheSpan, ObjectKeyLayout, RemoteCache, RemoteOperation, RemoteRecoveryHint,
+    RemoteStorageError, StorageSource, UnifiedStorage, UnifiedStorageError,
+};
 pub use scheduler::{
     DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, NoopScheduler,
     PendingWork, PendingWorkType, RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
@@ -45,9 +50,10 @@ pub use scheduler::{
 pub use simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleError, DbRecoveryMatch, DbShadowOracle,
     DbSimulationOutcome, DbSimulationScenarioConfig, DbWorkloadOperation, GeneratedScenario,
-    NetworkObjectStore, OperationResult, OracleError, PointMutation, RecoveryMatch, ScheduledFault,
-    ScheduledFaultKind, SeededSimulationRunner, ShadowOracle, SimulationCompactionFilterId,
-    SimulationContext, SimulationMergeOperatorId, SimulationOutcome, SimulationScenarioConfig,
-    SimulationTableSpec, StubDbProcess, TraceEvent, TurmoilClock, seed_mad_turmoil,
+    NetworkObjectStore, ObjectStoreFaultSpec, OperationResult, OracleError, PointMutation,
+    RecoveryMatch, ScheduledFault, ScheduledFaultKind, SeededSimulationRunner, ShadowOracle,
+    SimulationCompactionFilterId, SimulationContext, SimulationMergeOperatorId, SimulationOutcome,
+    SimulationScenarioConfig, SimulationTableSpec, StubDbProcess, TraceEvent, TurmoilClock,
+    seed_mad_turmoil,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
