@@ -1,14 +1,8 @@
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use parking_lot::{Mutex, MutexGuard};
-use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -31,19 +25,6 @@ const IO_CHUNK_LEN: usize = 4096;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
-}
-
-fn mad_turmoil_runtime_lock() -> &'static Mutex<()> {
-    static MAD_TURMOIL_RUNTIME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    MAD_TURMOIL_RUNTIME_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-pub fn seed_mad_turmoil(seed: u64) {
-    if let Some(mut rng) = mad_turmoil::rand::try_rng() {
-        *rng = StdRng::seed_from_u64(seed);
-    } else {
-        mad_turmoil::rand::set_rng(StdRng::seed_from_u64(seed));
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -970,6 +951,11 @@ impl SeededSimulationRunner {
         }
     }
 
+    pub fn with_simulation_duration(mut self, duration: Duration) -> Self {
+        self.simulation_duration = duration;
+        self
+    }
+
     pub fn with_scenario_config(mut self, config: SimulationScenarioConfig) -> Self {
         self.scenario_config = config;
         self
@@ -1031,13 +1017,8 @@ impl SeededSimulationRunner {
         F: FnOnce(SimulationContext) -> Fut + 'static,
         Fut: Future<Output = turmoil::Result<T>> + 'static,
     {
-        let _mad_turmoil_guard = mad_turmoil_runtime_lock().lock();
-        seed_mad_turmoil(self.seed);
-        let _clock_guard = mad_turmoil::time::SimClocksGuard::init();
-
-        let mut builder = turmoil::Builder::new();
+        let mut builder = turmoil_determinism::Builder::new(self.seed);
         builder
-            .rng_seed(self.seed)
             .simulation_duration(self.simulation_duration)
             .tick_duration(Duration::from_millis(1))
             .min_message_latency(self.min_message_latency)

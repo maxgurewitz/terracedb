@@ -1625,21 +1625,21 @@ All concurrency must go through the tokio runtime that turmoil controls. `std::t
 
 ## Deterministic Simulation Testing
 
-The engine uses deterministic simulation testing (DST) in the style of FoundationDB, using turmoil and mad-turmoil. The goal is to exercise a large number of randomized scenarios — workloads, fault combinations, scheduling orders — with full reproducibility from a seed.
+The engine uses deterministic simulation testing (DST) in the style of FoundationDB, using turmoil plus explicit injected effect seams. The goal is to exercise a large number of randomized scenarios — workloads, fault combinations, scheduling orders — with full reproducibility from a seed.
 
 ### Sources of Non-Determinism Controlled
 
 | Source | Mechanism |
 |---|---|
 | **Time** | Virtual clock via `Clock` trait. Tests control exactly when time advances. |
-| **Randomness** | Seeded PRNG via `Rng` trait. mad-turmoil also overrides libc `getrandom`/`getentropy`. |
+| **Randomness** | Seeded PRNG via `Rng` trait and simulation helpers. No ambient libc entropy interception. |
 | **Filesystem** | Simulated via `FileSystem` trait + turmoil's fs shim. Crash/torn-write/disk-full injection. |
 | **S3 / network** | S3 emulator as turmoil host. Network partitions, latency, partial responses via turmoil. |
 | **Task scheduling** | Single-threaded tokio runtime. Turmoil controls task interleaving. |
 | **Background work ordering** | `Scheduler` trait. Simulation injects a scheduler driven by the seeded PRNG. |
-| **System entropy** | mad-turmoil overrides `clock_gettime`, `getrandom`, `getentropy` at libc level. |
+| **System entropy** | Avoided by design on deterministic paths: engine code must use injected `Clock`/`Rng` traits rather than ambient system APIs. |
 
-mad-turmoil's libc overrides catch non-determinism that escapes trait boundaries — third-party crates calling `SystemTime::now()` or `rand::thread_rng()` directly.
+The harness intentionally does not override libc clocks or entropy. Determinism depends on explicit trait injection, simulation-aware adapters, and avoiding third-party code that escapes those seams on deterministic paths.
 
 ### S3 Emulator as Turmoil Host
 

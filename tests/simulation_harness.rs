@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -6,14 +7,17 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use terracedb::{
-    Clock, CommitOptions, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
-    DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle, DbSimulationScenarioConfig,
-    DbWorkloadOperation, LogCursor, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation,
-    OperationResult, PendingWork, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location,
-    ScanOptions, ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
-    SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
-    SimulationScenarioConfig, SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind,
-    StorageSource, StubDbProcess, TableStats, ThrottleDecision, TieredDurabilityMode,
+    Clock, CommitOptions, CompactionStrategy, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+    DbConfig, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
+    DbSimulationScenarioConfig, DbWorkloadOperation, FieldDefinition, FieldId, FieldType,
+    FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ManifestId,
+    ObjectKeyLayout, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation, OpenError,
+    OperationResult, PendingWork, PendingWorkType, PointMutation, RemoteCache, RemoteRecoveryHint,
+    S3Location, S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision,
+    ScheduledFault, ScheduledFaultKind, Scheduler, SchemaDefinition, SeededSimulationRunner,
+    SequenceNumber, ShadowOracle, SimulationMergeOperatorId, SimulationScenarioConfig,
+    SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubDbProcess,
+    TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
     TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
 };
 
@@ -108,6 +112,32 @@ impl Scheduler for RandomSimulationScheduler {
     }
 }
 
+#[derive(Default)]
+struct OffloadSimulationScheduler;
+
+impl Scheduler for OffloadSimulationScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        let selected = work
+            .iter()
+            .find(|work| work.work_type == PendingWorkType::Offload)
+            .map(|work| work.id.clone());
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: if selected.as_ref() == Some(&work.id) {
+                    ScheduleAction::Execute
+                } else {
+                    ScheduleAction::Defer
+                },
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+}
+
 fn simulation_db_config(
     root_path: &str,
     scheduler: Arc<dyn Scheduler>,
@@ -141,6 +171,20 @@ fn simulation_tiered_config(root_path: &str, durability: TieredDurabilityMode) -
             },
             max_local_bytes: 1024 * 1024,
             durability,
+        }),
+        scheduler: None,
+    }
+}
+
+fn simulation_s3_primary_config(prefix: &str) -> DbConfig {
+    DbConfig {
+        storage: StorageConfig::S3Primary(S3PrimaryStorageConfig {
+            s3: S3Location {
+                bucket: "terracedb-sim".to_string(),
+                prefix: prefix.to_string(),
+            },
+            mem_cache_size_bytes: 1024 * 1024,
+            auto_flush_interval: None,
         }),
         scheduler: None,
     }
@@ -269,6 +313,91 @@ fn stub_db_recovery_matches_oracle_prefix() -> turmoil::Result {
         assert_eq!(matched.durable_sequence, first_sequence);
         assert_eq!(matched.matched_sequence, first_sequence);
         assert_eq!(recovered.read(b"k2"), None);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn columnar_schema_and_normalized_records_survive_simulated_restart() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2424).run_with(|context| async move {
+        let config = simulation_tiered_config(
+            "/terracedb/sim/columnar-schema",
+            TieredDurabilityMode::GroupCommit,
+        );
+        let schema = SchemaDefinition {
+            version: 1,
+            fields: vec![
+                FieldDefinition {
+                    id: FieldId::new(1),
+                    name: "user_id".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(2),
+                    name: "count".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    default: Some(FieldValue::Int64(0)),
+                },
+                FieldDefinition {
+                    id: FieldId::new(3),
+                    name: "active".to_string(),
+                    field_type: FieldType::Bool,
+                    nullable: true,
+                    default: None,
+                },
+            ],
+        };
+
+        let db = context.open_db(config.clone()).await?;
+        let metrics = db
+            .create_table(TableConfig {
+                name: "metrics".to_string(),
+                format: TableFormat::Columnar,
+                merge_operator: None,
+                max_merge_operand_chain_length: None,
+                compaction_filter: None,
+                bloom_filter_bits_per_key: Some(8),
+                history_retention_sequences: Some(16),
+                compaction_strategy: CompactionStrategy::Tiered,
+                schema: Some(schema.clone()),
+                metadata: Default::default(),
+            })
+            .await
+            .expect("create columnar table");
+
+        metrics
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    [
+                        ("count", FieldValue::Int64(9)),
+                        ("user_id", FieldValue::String("alice".to_string())),
+                    ],
+                )
+                .expect("normalize named record"),
+            )
+            .await
+            .expect("write columnar record");
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let metrics = reopened.table("metrics");
+        assert!(metrics.id().is_some());
+        assert_eq!(
+            metrics
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read recovered"),
+            Some(Value::record(BTreeMap::from([
+                (FieldId::new(1), FieldValue::String("alice".to_string())),
+                (FieldId::new(2), FieldValue::Int64(9)),
+                (FieldId::new(3), FieldValue::Null),
+            ])))
+        );
 
         Ok(())
     })
@@ -678,6 +807,213 @@ fn db_change_feed_simulation_resumes_from_cursor_after_restart() -> turmoil::Res
 }
 
 #[test]
+fn db_change_feed_simulation_surfaces_snapshot_too_old_for_lagging_tables_after_restart()
+-> turmoil::Result {
+    let mut slow_spec = SimulationTableSpec::row("slow");
+    slow_spec.history_retention_sequences = Some(8);
+    let mut fast_spec = SimulationTableSpec::row("fast");
+    fast_spec.history_retention_sequences = Some(1);
+
+    SeededSimulationRunner::new(0xcdc3).run_with(move |context| {
+        let slow_spec = slow_spec.clone();
+        let fast_spec = fast_spec.clone();
+
+        async move {
+            let config = simulation_tiered_config(
+                "/terracedb/sim/cdc-retention-restart",
+                TieredDurabilityMode::GroupCommit,
+            );
+            let db = context.open_db(config.clone()).await?;
+            let slow = db.create_table(slow_spec.table_config()).await?;
+            let fast = db.create_table(fast_spec.table_config()).await?;
+
+            let mut first = db.write_batch();
+            first.put(&slow, b"slow:1".to_vec(), bytes("s1"));
+            first.put(&fast, b"fast:1".to_vec(), bytes("f1"));
+            let first_sequence = db.commit(first, CommitOptions::default()).await?;
+            db.flush().await?;
+
+            let mut second = db.write_batch();
+            second.put(&slow, b"slow:2".to_vec(), bytes("s2"));
+            second.put(&fast, b"fast:2".to_vec(), bytes("f2"));
+            db.commit(second, CommitOptions::default()).await?;
+            db.flush().await?;
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_slow = reopened.table("slow");
+            let reopened_fast = reopened.table("fast");
+
+            let fast_error = reopened
+                .scan_since(
+                    &reopened_fast,
+                    LogCursor::new(first_sequence, 1),
+                    ScanOptions::default(),
+                )
+                .await
+                .err()
+                .expect("fast table should be past its retained change-feed floor");
+            assert_eq!(fast_error.requested, first_sequence);
+            assert_eq!(fast_error.oldest_available, SequenceNumber::new(2));
+
+            let slow_changes = collect_change_feed(
+                reopened
+                    .scan_since(
+                        &reopened_slow,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await?,
+            )
+            .await;
+            assert_eq!(slow_changes.len(), 2);
+            assert_eq!(slow_changes[0].sequence, SequenceNumber::new(1));
+            assert_eq!(slow_changes[1].sequence, SequenceNumber::new(2));
+
+            let fast_stats = reopened.table_stats(&reopened_fast).await;
+            assert_eq!(
+                fast_stats.change_feed_floor_sequence,
+                Some(SequenceNumber::new(2))
+            );
+
+            Ok(())
+        }
+    })
+}
+
+#[test]
+fn s3_primary_simulation_recovers_to_last_durable_prefix() -> turmoil::Result {
+    let events_spec = SimulationTableSpec::row("events");
+    let specs = vec![events_spec.clone()];
+
+    SeededSimulationRunner::new(0xcdc3).run_with(move |context| {
+        let specs = specs.clone();
+        let events_spec = events_spec.clone();
+
+        async move {
+            let config = simulation_s3_primary_config("sim/s3-primary-prefix");
+            let db = context.open_db(config.clone()).await?;
+            let events = db.create_table(events_spec.table_config()).await?;
+            let mut oracle = DbShadowOracle::new(&specs);
+
+            let durable = events.write(b"user:1".to_vec(), bytes("durable")).await?;
+            oracle.apply_with_cursor(
+                LogCursor::new(durable, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:1".to_vec(),
+                    value: b"durable".to_vec(),
+                },
+                false,
+            )?;
+            db.flush().await?;
+            oracle.mark_durable_through(db.current_durable_sequence());
+
+            let visible = events
+                .write(b"user:2".to_vec(), bytes("visible-only"))
+                .await?;
+            oracle.apply_with_cursor(
+                LogCursor::new(visible, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:2".to_vec(),
+                    value: b"visible-only".to_vec(),
+                },
+                false,
+            )?;
+
+            assert_eq!(
+                collect_change_feed(
+                    db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                        .await?,
+                )
+                .await,
+                oracle.visible_changes_since("events", LogCursor::beginning())?
+            );
+            assert_eq!(
+                collect_change_feed(
+                    db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                        .await?,
+                )
+                .await,
+                oracle.durable_changes_since("events", LogCursor::beginning())?
+            );
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_events = reopened.table("events");
+            assert_eq!(reopened.current_sequence(), durable);
+            assert_eq!(reopened.current_durable_sequence(), durable);
+            assert_eq!(
+                reopened_events.read(b"user:1".to_vec()).await?,
+                Some(bytes("durable"))
+            );
+            assert_eq!(reopened_events.read(b"user:2".to_vec()).await?, None);
+            assert_eq!(
+                collect_change_feed(
+                    reopened
+                        .scan_since(
+                            &reopened_events,
+                            LogCursor::beginning(),
+                            ScanOptions::default(),
+                        )
+                        .await?,
+                )
+                .await,
+                oracle.durable_changes_since("events", LogCursor::beginning())?
+            );
+
+            Ok(())
+        }
+    })
+}
+
+#[test]
+fn s3_primary_simulation_failed_flush_recovers_last_durable_prefix() -> turmoil::Result {
+    SeededSimulationRunner::new(0xcdc4).run_with(|context| async move {
+        let config = simulation_s3_primary_config("sim/s3-primary-flush-failure");
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        let durable = events.write(b"user:1".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+
+        let visible_only = events.write(b"user:1".to_vec(), bytes("v2")).await?;
+        assert_eq!(db.current_sequence(), visible_only);
+        assert_eq!(db.current_durable_sequence(), durable);
+        assert_eq!(events.read(b"user:1".to_vec()).await?, Some(bytes("v2")));
+
+        let layout = ObjectKeyLayout::new(&S3Location {
+            bucket: "terracedb-sim".to_string(),
+            prefix: "sim/s3-primary-flush-failure".to_string(),
+        });
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Put,
+                target_prefix: layout.backup_manifest(ManifestId::new(2)),
+            })
+            .await?;
+
+        db.flush()
+            .await
+            .expect_err("remote manifest upload should fail");
+        assert_eq!(db.current_durable_sequence(), durable);
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_events = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), durable);
+        assert_eq!(reopened.current_durable_sequence(), durable);
+        assert_eq!(
+            reopened_events.read(b"user:1".to_vec()).await?,
+            Some(bytes("v1"))
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
 fn db_merge_simulation_replays_same_seed() -> turmoil::Result {
     let config = DbSimulationScenarioConfig {
         root_path: "/terracedb/sim/db-seeded-replay".to_string(),
@@ -830,7 +1166,7 @@ fn db_merge_simulation_recovers_after_crash_following_read_triggered_collapse() 
 #[test]
 fn ttl_simulation_supports_snapshot_guarded_compaction_across_restart() -> turmoil::Result {
     let expired = ttl_value(5, "apple");
-    let banana = ttl_value(50, "banana");
+    let banana = ttl_value(5_000, "banana");
     let scenario = DbGeneratedScenario {
         seed: 0x1515,
         root_path: "/terracedb/sim/t15-ttl".to_string(),
@@ -1012,99 +1348,208 @@ fn occ_transaction_simulation_respects_flush_modes_across_restart() -> turmoil::
 
 #[test]
 fn hostile_scheduler_simulation_still_forces_flush_and_l0_progress() -> turmoil::Result {
-    SeededSimulationRunner::new(0x1616).run_with(|context| async move {
-        let db = context
-            .open_db(simulation_db_config(
-                "/terracedb/sim/t16-hostile-scheduler",
-                Arc::new(HostileSimulationScheduler),
-                160,
-            ))
-            .await?;
-        let flush_table = db
-            .create_table(SimulationTableSpec::row("events").table_config())
-            .await?;
-        let l0_table = db
-            .create_table(SimulationTableSpec::row("events-l0").table_config())
-            .await?;
-
-        flush_table
-            .write(b"big-1".to_vec(), Value::Bytes(vec![b'x'; 80]))
-            .await?;
-        flush_table
-            .write(b"big-2".to_vec(), Value::Bytes(vec![b'y'; 80]))
-            .await?;
-        assert!(
-            db.table_stats(&flush_table).await.local_bytes > 0,
-            "memory guardrail should have forced a flush under the hostile scheduler"
-        );
-
-        for index in 0..DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT {
-            l0_table
-                .write(format!("l0-{index}").into_bytes(), Value::bytes("v"))
+    SeededSimulationRunner::new(0x1616)
+        .with_simulation_duration(Duration::from_secs(5))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16-hostile-scheduler",
+                    Arc::new(HostileSimulationScheduler),
+                    160,
+                ))
                 .await?;
-            db.flush().await?;
-        }
+            let flush_table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let l0_table = db
+                .create_table(SimulationTableSpec::row("events-l0").table_config())
+                .await?;
 
-        let before = db.table_stats(&l0_table).await;
-        assert_eq!(
-            before.l0_sstable_count,
-            DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
-        );
+            flush_table
+                .write(b"big-1".to_vec(), Value::Bytes(vec![b'x'; 80]))
+                .await?;
+            flush_table
+                .write(b"big-2".to_vec(), Value::Bytes(vec![b'y'; 80]))
+                .await?;
+            assert!(
+                db.table_stats(&flush_table).await.local_bytes > 0,
+                "memory guardrail should have forced a flush under the hostile scheduler"
+            );
 
-        l0_table
-            .write(b"trigger".to_vec(), Value::bytes("v"))
-            .await?;
+            for index in 0..DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT {
+                l0_table
+                    .write(format!("l0-{index}").into_bytes(), Value::bytes("v"))
+                    .await?;
+                db.flush().await?;
+            }
 
-        let after = db.table_stats(&l0_table).await;
-        assert!(
-            after.l0_sstable_count < DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
-            "forced L0 compaction should run even when the scheduler refuses all work"
-        );
-        assert_eq!(
-            db.current_sequence(),
-            SequenceNumber::new(DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT as u64 + 3),
-        );
+            let before = db.table_stats(&l0_table).await;
+            assert!(before.l0_sstable_count > 0);
+            assert!(before.l0_sstable_count <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT);
 
-        Ok(())
-    })
+            l0_table
+                .write(b"trigger".to_vec(), Value::bytes("v"))
+                .await?;
+
+            let after = db.table_stats(&l0_table).await;
+            assert!(
+                after.l0_sstable_count < DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+                "bounded maintenance should keep L0 pressure below the hard ceiling"
+            );
+            assert_eq!(
+                l0_table.read(b"trigger".to_vec()).await?,
+                Some(Value::bytes("v"))
+            );
+            assert_eq!(
+                db.current_sequence(),
+                SequenceNumber::new(DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT as u64 + 3),
+            );
+
+            Ok(())
+        })
 }
 
 #[test]
 fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
-    SeededSimulationRunner::new(0x2727).run_with(|context| async move {
-        let db = context
-            .open_db(simulation_db_config(
-                "/terracedb/sim/t16-random-scheduler",
-                Arc::new(RandomSimulationScheduler::seeded(context.seed())),
-                1024 * 1024,
-            ))
-            .await?;
-        let table = db
+    SeededSimulationRunner::new(0x2727)
+        .with_simulation_duration(Duration::from_secs(5))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16-random-scheduler",
+                    Arc::new(RandomSimulationScheduler::seeded(context.seed())),
+                    1024 * 1024,
+                ))
+                .await?;
+            let table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+
+            for index in 0..12_u64 {
+                table
+                    .write(
+                        format!("k-{index}").into_bytes(),
+                        Value::bytes(format!("v-{index}")),
+                    )
+                    .await?;
+                if index % 2 == 1 {
+                    db.flush().await?;
+                }
+            }
+
+            assert_eq!(db.current_sequence(), SequenceNumber::new(12));
+            assert_eq!(db.current_durable_sequence(), SequenceNumber::new(12));
+            assert_eq!(
+                table.read(b"k-11".to_vec()).await?,
+                Some(Value::bytes("v-11"))
+            );
+            assert!(
+                db.table_stats(&table).await.l0_sstable_count
+                    <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+                "random scheduling should never outrun the engine guardrails"
+            );
+
+            Ok(())
+        })
+}
+
+#[test]
+fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x2122).run_with(|context| async move {
+        let setup_config = DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: "/terracedb/sim/t21-cold-offload".to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-sim".to_string(),
+                    prefix: "cold-offload".to_string(),
+                },
+                max_local_bytes: 1024 * 1024,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: Some(Arc::new(OffloadSimulationScheduler)),
+        };
+        let config = DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: "/terracedb/sim/t21-cold-offload".to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-sim".to_string(),
+                    prefix: "cold-offload".to_string(),
+                },
+                max_local_bytes: 1,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: Some(Arc::new(OffloadSimulationScheduler)),
+        };
+
+        let setup_db = context.open_db(setup_config).await?;
+        let table = setup_db
             .create_table(SimulationTableSpec::row("events").table_config())
             .await?;
 
-        for index in 0..12_u64 {
-            table
-                .write(
-                    format!("k-{index}").into_bytes(),
-                    Value::bytes(format!("v-{index}")),
-                )
-                .await?;
-            if index % 2 == 1 {
-                db.flush().await?;
-            }
-        }
+        let first = table
+            .write(b"apple".to_vec(), Value::Bytes(vec![b'a'; 256]))
+            .await?;
+        setup_db.flush().await?;
+        table
+            .write(b"banana".to_vec(), Value::Bytes(vec![b'b'; 256]))
+            .await?;
+        setup_db.flush().await?;
 
-        assert_eq!(db.current_sequence(), SequenceNumber::new(12));
-        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(12));
+        let db = context
+            .restart_db(config.clone(), CutPoint::AfterStep)
+            .await?;
+        let table = db.table("events");
+
+        let table_id = table.id().expect("simulation table id");
+        let cold_prefix = format!("cold-offload/cold/table-{:06}/", table_id.get());
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Put,
+                target_prefix: cold_prefix.clone(),
+            })
+            .await?;
+
+        let first_error = db
+            .run_next_offload()
+            .await
+            .expect_err("first offload should surface the injected timeout");
+        assert_eq!(first_error.kind(), StorageErrorKind::Timeout);
         assert_eq!(
-            table.read(b"k-11".to_vec()).await?,
-            Some(Value::bytes("v-11"))
+            table.read(b"apple".to_vec()).await?,
+            Some(Value::Bytes(vec![b'a'; 256]))
         );
         assert!(
-            db.table_stats(&table).await.l0_sstable_count <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
-            "random scheduling should never outrun the engine guardrails"
+            db.pending_work()
+                .await
+                .iter()
+                .any(|work| work.work_type == PendingWorkType::Offload)
         );
+
+        assert!(db.run_next_offload().await?);
+        let offloaded_stats = db.table_stats(&table).await;
+        assert_eq!(offloaded_stats.local_bytes, 0);
+        assert!(offloaded_stats.s3_bytes > 0);
+        assert!(!context.object_store().list(&cold_prefix).await?.is_empty());
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_table = reopened.table("events");
+        assert_eq!(
+            reopened_table.read(b"apple".to_vec()).await?,
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+        assert_eq!(
+            reopened_table.read_at(b"apple".to_vec(), first).await?,
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+        let reopened_stats = reopened.table_stats(&reopened_table).await;
+        assert_eq!(reopened_stats.local_bytes, 0);
+        assert!(reopened_stats.s3_bytes > 0);
 
         Ok(())
     })
@@ -1189,6 +1634,98 @@ fn remote_list_failures_are_structured_in_simulation() -> turmoil::Result {
 
         let listed = storage.list_objects(manifest_prefix).await?;
         assert_eq!(listed, vec!["backup/manifest/MANIFEST-000001".to_string()]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn tiered_backup_recovery_restores_remote_state_after_simulated_disk_loss() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2222).run_with(|context| async move {
+        let root = "/terracedb/sim/backup-dr";
+        let config = simulation_tiered_config(root, TieredDurabilityMode::GroupCommit);
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+        let audit = db
+            .create_table(SimulationTableSpec::row("audit").table_config())
+            .await?;
+
+        events.write(b"apple".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+        events.write(b"banana".to_vec(), bytes("tail")).await?;
+        audit.write(b"audit:1".to_vec(), bytes("entry")).await?;
+
+        let existing = context.file_system().list(root).await?;
+        for path in existing {
+            context.file_system().delete(&path).await?;
+        }
+
+        let restored = context.open_db(config).await?;
+        let restored_events = restored.table("events");
+        let restored_audit = restored.table("audit");
+        assert_eq!(
+            restored_events.read(b"apple".to_vec()).await?,
+            Some(bytes("v1"))
+        );
+        assert_eq!(
+            restored_events.read(b"banana".to_vec()).await?,
+            Some(bytes("tail"))
+        );
+        assert_eq!(
+            restored_audit.read(b"audit:1".to_vec()).await?,
+            Some(bytes("entry"))
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn tiered_backup_retries_after_interrupted_restore_in_simulation() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2323).run_with(|context| async move {
+        let root = "/terracedb/sim/backup-retry";
+        let config = simulation_tiered_config(root, TieredDurabilityMode::GroupCommit);
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        events.write(b"apple".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+        events.write(b"banana".to_vec(), bytes("tail")).await?;
+
+        let existing = context.file_system().list(root).await?;
+        for path in existing {
+            context.file_system().delete(&path).await?;
+        }
+
+        context
+            .file_system()
+            .inject_failure(FileSystemFailure::timeout(
+                FileSystemOperation::Rename,
+                format!("{root}/manifest/MANIFEST-000001.tmp"),
+            ));
+        let first = context
+            .open_db(config.clone())
+            .await
+            .expect_err("first restore should fail partway through");
+        assert!(
+            matches!(first, OpenError::Storage(_)),
+            "interrupted restore should surface a storage error"
+        );
+
+        let restored = context.open_db(config).await?;
+        let restored_events = restored.table("events");
+        assert_eq!(
+            restored_events.read(b"apple".to_vec()).await?,
+            Some(bytes("v1"))
+        );
+        assert_eq!(
+            restored_events.read(b"banana".to_vec()).await?,
+            Some(bytes("tail"))
+        );
 
         Ok(())
     })

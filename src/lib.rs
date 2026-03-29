@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod api;
+pub mod composition;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -9,6 +10,8 @@ pub mod remote;
 pub mod scheduler;
 pub mod simulation;
 pub mod stubs;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod transaction;
 
 pub use adapters::{
@@ -17,9 +20,14 @@ pub use adapters::{
     SimulatedObjectStore, SystemClock, SystemRng, TokioFileSystem,
 };
 pub use api::{
-    BatchOperation, ChangeEntry, ChangeKind, ChangeStream, CommitOptions, Db, FieldDefinition,
-    FieldType, FieldValue, Key, KeyPrefix, KvStream, ReadSet, ReadSetEntry, ScanOptions,
-    SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver, WriteBatch,
+    BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarRecord, CommitOptions, Db,
+    FieldDefinition, FieldType, FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet,
+    ReadSetEntry, ScanOptions, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
+    WriteBatch,
+};
+pub use composition::{
+    DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
+    OutboxBatch, OutboxEntry, OutboxMessage, ScheduledTimer, TransactionalOutbox,
 };
 pub use config::{
     CompactionDecision, CompactionDecisionContext, CompactionFilter, CompactionFilterRef,
@@ -55,7 +63,12 @@ pub use simulation::{
     PointMutation, RecoveryMatch, ScheduledFault, ScheduledFaultKind, SeededSimulationRunner,
     ShadowOracle, SimulationCompactionFilterId, SimulationContext, SimulationMergeOperatorId,
     SimulationOutcome, SimulationScenarioConfig, SimulationTableSpec, StubDbProcess, TraceEvent,
-    TurmoilClock, seed_mad_turmoil,
+    TurmoilClock,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::{
+    bytes as test_bytes, row_table_config, test_dependencies, test_dependencies_with_clock,
+    tiered_test_config, tiered_test_config_with_durability,
+};
 pub use transaction::{Transaction, TransactionCommitError, TransactionCommitOptions};
