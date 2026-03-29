@@ -8,11 +8,12 @@ use std::{
     time::Duration,
 };
 
+use futures::TryStreamExt;
 use terracedb::{
     Clock, DeterministicRng, FileSystem, FileSystemFailure, FileSystemOperation,
     LocalDirObjectStore, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, OpenOptions, Rng,
-    SimulatedClock, SimulatedFileSystem, SimulatedObjectStore, StorageErrorKind, Timestamp,
-    TokioFileSystem,
+    SimulatedClock, SimulatedFileSystem, SimulatedObjectStore, StandardObjectPath,
+    StorageErrorKind, Timestamp, TokioFileSystem,
 };
 
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -130,6 +131,70 @@ async fn exercise_object_store(store: &dyn ObjectStore) {
     assert_eq!(listed, vec!["tables/events/0001".to_string()]);
 }
 
+async fn exercise_standard_object_store(store: &(dyn terracedb::StandardObjectStore + 'static)) {
+    let first = StandardObjectPath::from("tables/events/0001");
+    let second = StandardObjectPath::from("tables/events/0002");
+    let archive = StandardObjectPath::from("archive/events/0001");
+    let prefix = StandardObjectPath::from("tables/events");
+
+    terracedb::StandardObjectStoreExt::put(store, &first, b"first-object".as_ref().into())
+        .await
+        .expect("put first object");
+    terracedb::StandardObjectStoreExt::put(store, &second, b"second-object".as_ref().into())
+        .await
+        .expect("put second object");
+
+    let full = terracedb::StandardObjectStoreExt::get(store, &first)
+        .await
+        .expect("get object")
+        .bytes()
+        .await
+        .expect("read object bytes");
+    assert_eq!(full.as_ref(), b"first-object");
+
+    let range = terracedb::StandardObjectStoreExt::get_range(store, &second, 7..13)
+        .await
+        .expect("get object range");
+    assert_eq!(range.as_ref(), b"object");
+
+    terracedb::StandardObjectStoreExt::copy(store, &first, &archive)
+        .await
+        .expect("copy object");
+
+    let mut listed = terracedb::StandardObjectStore::list(store, Some(&prefix))
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list objects");
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![
+            "tables/events/0001".to_string(),
+            "tables/events/0002".to_string()
+        ]
+    );
+
+    let copied = terracedb::StandardObjectStoreExt::get(store, &archive)
+        .await
+        .expect("get copied object")
+        .bytes()
+        .await
+        .expect("read copied bytes");
+    assert_eq!(copied.as_ref(), b"first-object");
+
+    terracedb::StandardObjectStoreExt::delete(store, &second)
+        .await
+        .expect("delete object");
+    let mut listed = terracedb::StandardObjectStore::list(store, Some(&prefix))
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list objects after delete");
+    listed.sort();
+    assert_eq!(listed, vec!["tables/events/0001".to_string()]);
+}
+
 #[tokio::test]
 async fn tokio_filesystem_supports_core_operations() {
     let root = unique_test_dir("tokio-fs");
@@ -154,6 +219,7 @@ async fn local_object_store_supports_core_operations() {
     let store = LocalDirObjectStore::new(&root);
 
     exercise_object_store(&store).await;
+    exercise_standard_object_store(&store).await;
 
     cleanup(&root);
 }
@@ -162,6 +228,7 @@ async fn local_object_store_supports_core_operations() {
 async fn simulated_object_store_supports_core_operations() {
     let store = SimulatedObjectStore::default();
     exercise_object_store(&store).await;
+    exercise_standard_object_store(&store).await;
 }
 
 #[tokio::test]

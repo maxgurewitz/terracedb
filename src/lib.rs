@@ -33,7 +33,10 @@ pub use ids::{
     CommitId, FieldId, IdEncodingError, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId,
     Timestamp,
 };
-pub use io::{Clock, DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOptions, Rng};
+pub use io::{
+    Clock, DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOptions, Rng,
+    StandardObjectPath, StandardObjectStore, StandardObjectStoreExt,
+};
 pub use scheduler::{
     NoopScheduler, PendingWork, PendingWorkType, ScheduleAction, ScheduleDecision, Scheduler,
     TableStats, ThrottleDecision,

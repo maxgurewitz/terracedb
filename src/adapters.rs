@@ -1,16 +1,37 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    fs,
+    fmt, fs,
     io::{Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    sync::{Mutex, MutexGuard},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{
+    StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
+};
+use object_store::{
+    CopyOptions as StandardCopyOptions, Error as StandardObjectStoreError,
+    GetOptions as StandardGetOptions, GetResult as StandardGetResult,
+    ListResult as StandardListResult, MultipartUpload as StandardMultipartUpload,
+    ObjectMeta as StandardObjectMeta, ObjectStore as StandardObjectStore,
+    ObjectStoreExt as StandardObjectStoreExt, PutMultipartOptions as StandardPutMultipartOptions,
+    PutOptions as StandardPutOptions, PutPayload, PutResult as StandardPutResult,
+    local::LocalFileSystem, memory::InMemory, path::Path as StandardObjectPath,
+};
+use parking_lot::{Mutex, MutexGuard};
+use rand::{Rng as _, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::watch, task};
+use uuid::Builder as UuidBuilder;
+use walkdir::WalkDir;
 
 use crate::{
     error::StorageError,
@@ -19,38 +40,17 @@ use crate::{
 };
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().expect("adapter mutex poisoned")
-}
-
-fn format_uuid(bytes: [u8; 16]) -> String {
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15]
-    )
+    mutex.lock()
 }
 
 fn uuid_from_words(a: u64, b: u64) -> String {
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&a.to_be_bytes());
     bytes[8..].copy_from_slice(&b.to_be_bytes());
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format_uuid(bytes)
+    UuidBuilder::from_random_bytes(bytes)
+        .into_uuid()
+        .hyphenated()
+        .to_string()
 }
 
 fn map_io_error(action: &str, target: &str, error: std::io::Error) -> StorageError {
@@ -79,84 +79,101 @@ where
 }
 
 fn collect_files(dir: &Path, files: &mut Vec<String>) -> Result<(), StorageError> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(map_io_error(
-                "list directory",
-                dir.to_string_lossy().as_ref(),
-                error,
-            ));
-        }
-    };
+    if !dir.exists() {
+        return Ok(());
+    }
 
-    for entry in entries {
+    for entry in WalkDir::new(dir) {
         let entry = entry.map_err(|error| {
-            map_io_error("list directory", dir.to_string_lossy().as_ref(), error)
+            let target = error.path().unwrap_or(dir);
+            match error.io_error() {
+                Some(io_error) => map_io_error(
+                    "list directory",
+                    target.to_string_lossy().as_ref(),
+                    std::io::Error::new(io_error.kind(), io_error.to_string()),
+                ),
+                None => StorageError::io(format!(
+                    "list directory failed for {}: {error}",
+                    target.to_string_lossy()
+                )),
+            }
         })?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, files)?;
-        } else if path.is_file() {
-            files.push(path.to_string_lossy().into_owned());
+        if entry.file_type().is_file() {
+            files.push(entry.path().to_string_lossy().into_owned());
         }
     }
 
     Ok(())
 }
 
-fn normalized_relative_key(root: &Path, path: &Path) -> Result<String, StorageError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        StorageError::unsupported(format!(
-            "object path {} escapes root {}",
-            path.display(),
-            root.display()
-        ))
-    })?;
-
-    let mut key = String::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(part) => {
-                if !key.is_empty() {
-                    key.push('/');
-                }
-                key.push_str(part.to_string_lossy().as_ref());
-            }
-            Component::CurDir => {}
-            _ => {
-                return Err(StorageError::unsupported(format!(
-                    "object path {} contains unsupported components",
-                    path.display()
-                )));
-            }
-        }
-    }
-
-    Ok(key)
-}
-
-fn resolve_object_key(root: &Path, key: &str) -> Result<PathBuf, StorageError> {
-    let trimmed = key.trim_matches('/');
-    if trimmed.is_empty() {
+fn standard_object_key(key: &str) -> Result<StandardObjectPath, StorageError> {
+    let path = StandardObjectPath::parse(key)
+        .map_err(|error| StorageError::unsupported(format!("invalid object key {key}: {error}")))?;
+    if path.as_ref().is_empty() {
         return Err(StorageError::unsupported("object key cannot be empty"));
     }
+    Ok(path)
+}
 
-    let mut path = root.to_path_buf();
-    for component in Path::new(trimmed).components() {
-        match component {
-            Component::Normal(part) => path.push(part),
-            Component::CurDir => {}
-            _ => {
-                return Err(StorageError::unsupported(format!(
-                    "object key {key} contains unsupported path components"
-                )));
-            }
-        }
+fn standard_object_prefix(prefix: &str) -> Result<Option<StandardObjectPath>, StorageError> {
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
     }
 
-    Ok(path)
+    StandardObjectPath::parse(prefix)
+        .map(Some)
+        .map_err(|error| {
+            StorageError::unsupported(format!("invalid object prefix {prefix}: {error}"))
+        })
+}
+
+fn map_standard_object_store_error(error: StandardObjectStoreError) -> StorageError {
+    match error {
+        StandardObjectStoreError::NotFound { source, .. } => source
+            .downcast_ref::<StorageError>()
+            .cloned()
+            .unwrap_or_else(|| StorageError::not_found(source.to_string())),
+        StandardObjectStoreError::NotSupported { source } => source
+            .downcast_ref::<StorageError>()
+            .cloned()
+            .unwrap_or_else(|| StorageError::unsupported(source.to_string())),
+        StandardObjectStoreError::Generic { source, .. }
+        | StandardObjectStoreError::AlreadyExists { source, .. }
+        | StandardObjectStoreError::Precondition { source, .. }
+        | StandardObjectStoreError::NotModified { source, .. }
+        | StandardObjectStoreError::PermissionDenied { source, .. }
+        | StandardObjectStoreError::Unauthenticated { source, .. } => source
+            .downcast_ref::<StorageError>()
+            .cloned()
+            .unwrap_or_else(|| StorageError::io(source.to_string())),
+        StandardObjectStoreError::NotImplemented { .. }
+        | StandardObjectStoreError::InvalidPath { .. }
+        | StandardObjectStoreError::UnknownConfigurationKey { .. } => {
+            StorageError::unsupported(error.to_string())
+        }
+        _ => StorageError::io(error.to_string()),
+    }
+}
+
+fn map_storage_error_to_standard(
+    implementer: &'static str,
+    target: &str,
+    error: StorageError,
+) -> StandardObjectStoreError {
+    match error.kind() {
+        crate::error::StorageErrorKind::NotFound => StandardObjectStoreError::NotFound {
+            path: target.to_string(),
+            source: Box::new(error),
+        },
+        crate::error::StorageErrorKind::Unsupported => StandardObjectStoreError::NotSupported {
+            source: Box::new(error),
+        },
+        _ => StandardObjectStoreError::Generic {
+            store: implementer,
+            source: Box::new(error),
+        },
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -337,114 +354,151 @@ impl LocalDirObjectStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    fn standard_store(&self) -> Result<LocalFileSystem, StandardObjectStoreError> {
+        fs::create_dir_all(&self.root).map_err(|error| StandardObjectStoreError::Generic {
+            store: "LocalDirObjectStore",
+            source: Box::new(error),
+        })?;
+        LocalFileSystem::new_with_prefix(&self.root).map_err(|error| {
+            StandardObjectStoreError::Generic {
+                store: "LocalDirObjectStore",
+                source: Box::new(error),
+            }
+        })
+    }
+}
+
+impl fmt::Display for LocalDirObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LocalDirObjectStore({})", self.root.display())
+    }
+}
+
+#[async_trait]
+impl StandardObjectStore for LocalDirObjectStore {
+    async fn put_opts(
+        &self,
+        location: &StandardObjectPath,
+        payload: PutPayload,
+        opts: StandardPutOptions,
+    ) -> object_store::Result<StandardPutResult> {
+        self.standard_store()?
+            .put_opts(location, payload, opts)
+            .await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &StandardObjectPath,
+        opts: StandardPutMultipartOptions,
+    ) -> object_store::Result<Box<dyn StandardMultipartUpload>> {
+        self.standard_store()?
+            .put_multipart_opts(location, opts)
+            .await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &StandardObjectPath,
+        options: StandardGetOptions,
+    ) -> object_store::Result<StandardGetResult> {
+        self.standard_store()?.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<StandardObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<StandardObjectPath>> {
+        match self.standard_store() {
+            Ok(store) => store.delete_stream(locations),
+            Err(error) => stream::once(async move { Err(error) }).boxed(),
+        }
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&StandardObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<StandardObjectMeta>> {
+        match self.standard_store() {
+            Ok(store) => store.list(prefix),
+            Err(error) => stream::once(async move { Err(error) }).boxed(),
+        }
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&StandardObjectPath>,
+    ) -> object_store::Result<StandardListResult> {
+        self.standard_store()?.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &StandardObjectPath,
+        to: &StandardObjectPath,
+        options: StandardCopyOptions,
+    ) -> object_store::Result<()> {
+        self.standard_store()?.copy_opts(from, to, options).await
+    }
 }
 
 #[async_trait]
 impl ObjectStore for LocalDirObjectStore {
     async fn put(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
-        let root = self.root.clone();
-        let key = key.to_string();
-        let data = data.to_vec();
-        run_blocking("put object", key.clone(), move || {
-            let path = resolve_object_key(&root, &key)?;
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    map_io_error(
-                        "create object parent directory",
-                        parent.to_string_lossy().as_ref(),
-                        error,
-                    )
-                })?;
-            }
-            fs::write(&path, &data)
-                .map_err(|error| map_io_error("put object", path.to_string_lossy().as_ref(), error))
-        })
-        .await
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::put(self, &key, Bytes::copy_from_slice(data).into())
+            .await
+            .map(|_| ())
+            .map_err(map_standard_object_store_error)
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        let root = self.root.clone();
-        let key = key.to_string();
-        run_blocking("get object", key.clone(), move || {
-            let path = resolve_object_key(&root, &key)?;
-            fs::read(&path)
-                .map_err(|error| map_io_error("get object", path.to_string_lossy().as_ref(), error))
-        })
-        .await
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::get(self, &key)
+            .await
+            .map_err(map_standard_object_store_error)?
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(map_standard_object_store_error)
     }
 
     async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>, StorageError> {
-        let bytes = self.get(key).await?;
-        let start = start as usize;
-        let end = (end as usize).min(bytes.len());
         if start >= end {
             return Ok(Vec::new());
         }
-        Ok(bytes[start..end].to_vec())
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::get_range(self, &key, start..end)
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(map_standard_object_store_error)
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let root = self.root.clone();
-        let key = key.to_string();
-        run_blocking("delete object", key.clone(), move || {
-            let path = resolve_object_key(&root, &key)?;
-            match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(map_io_error(
-                    "delete object",
-                    path.to_string_lossy().as_ref(),
-                    error,
-                )),
-            }
-        })
-        .await
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::delete(self, &key)
+            .await
+            .map_err(map_standard_object_store_error)
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
-        let root = self.root.clone();
-        let prefix = prefix.to_string();
-        run_blocking("list objects", prefix.clone(), move || {
-            let mut paths = Vec::new();
-            collect_files(&root, &mut paths)?;
-
-            let mut keys = Vec::new();
-            for path in paths {
-                let key = normalized_relative_key(&root, Path::new(&path))?;
-                if key.starts_with(&prefix) {
-                    keys.push(key);
-                }
-            }
-
-            keys.sort();
-            Ok(keys)
-        })
-        .await
+        let prefix = standard_object_prefix(prefix)?;
+        let mut keys = StandardObjectStore::list(self, prefix.as_ref())
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_standard_object_store_error)?;
+        keys.sort();
+        Ok(keys)
     }
 
     async fn copy(&self, from: &str, to: &str) -> Result<(), StorageError> {
-        let root = self.root.clone();
-        let from = from.to_string();
-        let to = to.to_string();
-        run_blocking("copy object", format!("{from} -> {to}"), move || {
-            let from_path = resolve_object_key(&root, &from)?;
-            let to_path = resolve_object_key(&root, &to)?;
-            if let Some(parent) = to_path.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    map_io_error(
-                        "create object parent directory",
-                        parent.to_string_lossy().as_ref(),
-                        error,
-                    )
-                })?;
-            }
-
-            fs::copy(&from_path, &to_path).map_err(|error| {
-                map_io_error("copy object", from_path.to_string_lossy().as_ref(), error)
-            })?;
-            Ok(())
-        })
-        .await
+        let from = standard_object_key(from)?;
+        let to = standard_object_key(to)?;
+        StandardObjectStoreExt::copy(self, &from, &to)
+            .await
+            .map_err(map_standard_object_store_error)
     }
 }
 
@@ -468,7 +522,7 @@ impl Clock for SystemClock {
 
 #[derive(Debug)]
 pub struct DeterministicRng {
-    state: Mutex<u64>,
+    state: Mutex<ChaCha8Rng>,
 }
 
 impl Default for DeterministicRng {
@@ -480,16 +534,12 @@ impl Default for DeterministicRng {
 impl DeterministicRng {
     pub fn seeded(seed: u64) -> Self {
         Self {
-            state: Mutex::new(seed),
+            state: Mutex::new(ChaCha8Rng::seed_from_u64(seed)),
         }
     }
 
     fn next_state(&self) -> u64 {
-        let mut state = lock(&self.state);
-        *state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        *state
+        lock(&self.state).next_u64()
     }
 }
 
@@ -975,36 +1025,31 @@ impl ObjectStoreFailure {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SimulatedObjectStore {
-    state: Mutex<SimulatedObjectStoreState>,
-}
-
-#[derive(Debug, Default)]
-struct SimulatedObjectStoreState {
-    objects: BTreeMap<String, Vec<u8>>,
-    failures: VecDeque<ObjectStoreFailure>,
+    inner: InMemory,
+    failures: Arc<Mutex<VecDeque<ObjectStoreFailure>>>,
 }
 
 impl SimulatedObjectStore {
     pub fn inject_failure(&self, failure: ObjectStoreFailure) {
-        lock(&self.state).failures.push_back(failure);
+        lock(&self.failures).push_back(failure);
     }
 
     fn maybe_fail(
-        state: &mut SimulatedObjectStoreState,
+        &self,
         operation: ObjectStoreOperation,
         target: &str,
     ) -> Result<(), StorageError> {
-        if let Some(index) = state
-            .failures
+        let mut failures = lock(&self.failures);
+        if let Some(index) = failures
             .iter()
             .position(|failure| failure.matches(operation, target))
         {
-            let failure = if state.failures[index].persistent {
-                state.failures[index].clone()
+            let failure = if failures[index].persistent {
+                failures[index].clone()
             } else {
-                state.failures.remove(index).expect("failure exists")
+                failures.remove(index).expect("failure exists")
             };
             return Err(failure.error);
         }
@@ -1013,69 +1058,178 @@ impl SimulatedObjectStore {
     }
 }
 
+impl fmt::Display for SimulatedObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SimulatedObjectStore")
+    }
+}
+
+#[async_trait]
+impl StandardObjectStore for SimulatedObjectStore {
+    async fn put_opts(
+        &self,
+        location: &StandardObjectPath,
+        payload: PutPayload,
+        opts: StandardPutOptions,
+    ) -> object_store::Result<StandardPutResult> {
+        let target = location.to_string();
+        self.maybe_fail(ObjectStoreOperation::Put, &target)
+            .map_err(|error| {
+                map_storage_error_to_standard("SimulatedObjectStore", &target, error)
+            })?;
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &StandardObjectPath,
+        opts: StandardPutMultipartOptions,
+    ) -> object_store::Result<Box<dyn StandardMultipartUpload>> {
+        let target = location.to_string();
+        self.maybe_fail(ObjectStoreOperation::Put, &target)
+            .map_err(|error| {
+                map_storage_error_to_standard("SimulatedObjectStore", &target, error)
+            })?;
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &StandardObjectPath,
+        options: StandardGetOptions,
+    ) -> object_store::Result<StandardGetResult> {
+        let target = location.to_string();
+        let operation = if options.range.is_some() {
+            ObjectStoreOperation::GetRange
+        } else {
+            ObjectStoreOperation::Get
+        };
+        self.maybe_fail(operation, &target).map_err(|error| {
+            map_storage_error_to_standard("SimulatedObjectStore", &target, error)
+        })?;
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<StandardObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<StandardObjectPath>> {
+        let store = self.clone();
+        locations
+            .then(move |location| {
+                let store = store.clone();
+                async move {
+                    let location = location?;
+                    let target = location.to_string();
+                    store
+                        .maybe_fail(ObjectStoreOperation::Delete, &target)
+                        .map_err(|error| {
+                            map_storage_error_to_standard("SimulatedObjectStore", &target, error)
+                        })?;
+                    StandardObjectStoreExt::delete(&store.inner, &location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&StandardObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<StandardObjectMeta>> {
+        let target = prefix.map(ToString::to_string).unwrap_or_default();
+        if let Err(error) = self.maybe_fail(ObjectStoreOperation::List, &target) {
+            let error = map_storage_error_to_standard("SimulatedObjectStore", &target, error);
+            return stream::once(async move { Err(error) }).boxed();
+        }
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&StandardObjectPath>,
+    ) -> object_store::Result<StandardListResult> {
+        let target = prefix.map(ToString::to_string).unwrap_or_default();
+        self.maybe_fail(ObjectStoreOperation::List, &target)
+            .map_err(|error| {
+                map_storage_error_to_standard("SimulatedObjectStore", &target, error)
+            })?;
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &StandardObjectPath,
+        to: &StandardObjectPath,
+        options: StandardCopyOptions,
+    ) -> object_store::Result<()> {
+        let target = from.to_string();
+        self.maybe_fail(ObjectStoreOperation::Copy, &target)
+            .map_err(|error| {
+                map_storage_error_to_standard("SimulatedObjectStore", &target, error)
+            })?;
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 #[async_trait]
 impl ObjectStore for SimulatedObjectStore {
     async fn put(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
-        let mut state = lock(&self.state);
-        Self::maybe_fail(&mut state, ObjectStoreOperation::Put, key)?;
-        state.objects.insert(key.to_string(), data.to_vec());
-        Ok(())
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::put(self, &key, Bytes::copy_from_slice(data).into())
+            .await
+            .map(|_| ())
+            .map_err(map_standard_object_store_error)
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        let mut state = lock(&self.state);
-        Self::maybe_fail(&mut state, ObjectStoreOperation::Get, key)?;
-        state
-            .objects
-            .get(key)
-            .cloned()
-            .ok_or_else(|| StorageError::not_found(format!("missing key: {key}")))
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::get(self, &key)
+            .await
+            .map_err(map_standard_object_store_error)?
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(map_standard_object_store_error)
     }
 
     async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>, StorageError> {
-        let mut state = lock(&self.state);
-        Self::maybe_fail(&mut state, ObjectStoreOperation::GetRange, key)?;
-        let object = state
-            .objects
-            .get(key)
-            .ok_or_else(|| StorageError::not_found(format!("missing key: {key}")))?;
-        let start = start as usize;
-        let end = (end as usize).min(object.len());
         if start >= end {
             return Ok(Vec::new());
         }
-        Ok(object[start..end].to_vec())
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::get_range(self, &key, start..end)
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(map_standard_object_store_error)
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let mut state = lock(&self.state);
-        Self::maybe_fail(&mut state, ObjectStoreOperation::Delete, key)?;
-        state.objects.remove(key);
-        Ok(())
+        let key = standard_object_key(key)?;
+        StandardObjectStoreExt::delete(self, &key)
+            .await
+            .map_err(map_standard_object_store_error)
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
-        let mut state = lock(&self.state);
-        Self::maybe_fail(&mut state, ObjectStoreOperation::List, prefix)?;
-        let mut keys = state
-            .objects
-            .keys()
-            .filter(|key| key.starts_with(prefix))
-            .cloned()
-            .collect::<Vec<_>>();
+        self.maybe_fail(ObjectStoreOperation::List, prefix)?;
+        let prefix = standard_object_prefix(prefix)?;
+        let mut keys = self
+            .inner
+            .list(prefix.as_ref())
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_standard_object_store_error)?;
         keys.sort();
         Ok(keys)
     }
 
     async fn copy(&self, from: &str, to: &str) -> Result<(), StorageError> {
-        let mut state = lock(&self.state);
-        Self::maybe_fail(&mut state, ObjectStoreOperation::Copy, from)?;
-        let value = state
-            .objects
-            .get(from)
-            .cloned()
-            .ok_or_else(|| StorageError::not_found(format!("missing key: {from}")))?;
-        state.objects.insert(to.to_string(), value);
-        Ok(())
+        let from = standard_object_key(from)?;
+        let to = standard_object_key(to)?;
+        StandardObjectStoreExt::copy(self, &from, &to)
+            .await
+            .map_err(map_standard_object_store_error)
     }
 }

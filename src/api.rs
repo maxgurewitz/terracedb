@@ -5,12 +5,14 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
+use crc32fast::hash as checksum32;
 use futures::{Stream, stream};
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 #[cfg(test)]
@@ -2922,39 +2924,27 @@ impl Db {
     }
 
     fn tables_read(&self) -> RwLockReadGuard<'_, BTreeMap<String, StoredTable>> {
-        self.inner.tables.read().expect("db table lock poisoned")
+        self.inner.tables.read()
     }
 
     fn tables_write(&self) -> RwLockWriteGuard<'_, BTreeMap<String, StoredTable>> {
-        self.inner.tables.write().expect("db table lock poisoned")
+        self.inner.tables.write()
     }
 
     fn memtables_read(&self) -> RwLockReadGuard<'_, MemtableState> {
-        self.inner
-            .memtables
-            .read()
-            .expect("db memtable lock poisoned")
+        self.inner.memtables.read()
     }
 
     fn memtables_write(&self) -> RwLockWriteGuard<'_, MemtableState> {
-        self.inner
-            .memtables
-            .write()
-            .expect("db memtable lock poisoned")
+        self.inner.memtables.write()
     }
 
     fn sstables_read(&self) -> RwLockReadGuard<'_, SstableState> {
-        self.inner
-            .sstables
-            .read()
-            .expect("db sstable lock poisoned")
+        self.inner.sstables.read()
     }
 
     fn sstables_write(&self) -> RwLockWriteGuard<'_, SstableState> {
-        self.inner
-            .sstables
-            .write()
-            .expect("db sstable lock poisoned")
+        self.inner.sstables.write()
     }
 }
 
@@ -3181,7 +3171,7 @@ impl Drop for Snapshot {
 }
 
 fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().expect("db mutex poisoned")
+    mutex.lock()
 }
 
 async fn read_all_file(
@@ -3251,18 +3241,6 @@ async fn read_optional_path(
     }
 }
 
-fn checksum32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for &byte in bytes {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320_u32 & mask);
-        }
-    }
-    !crc
-}
-
 fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     fn hash_with_seed(key: &[u8], seed: u64) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
@@ -3277,7 +3255,6 @@ fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     let second = hash_with_seed(key, 0xc2b2_ae3d_27d4_eb4f) | 1;
     (first, second)
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;

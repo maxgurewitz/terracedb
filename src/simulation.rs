@@ -1,11 +1,12 @@
 use std::{
     collections::BTreeMap,
     future::Future,
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use async_trait::async_trait;
+use parking_lot::{Mutex, MutexGuard};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -24,7 +25,7 @@ const STUB_DB_LOG_PATH: &str = "/terracedb/sim/stub-db.log";
 const IO_CHUNK_LEN: usize = 4096;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().expect("simulation mutex poisoned")
+    mutex.lock()
 }
 
 fn mad_turmoil_runtime_lock() -> &'static Mutex<()> {
@@ -363,9 +364,7 @@ impl SeededSimulationRunner {
         F: FnOnce(SimulationContext) -> Fut + 'static,
         Fut: Future<Output = turmoil::Result<T>> + 'static,
     {
-        let _mad_turmoil_guard = mad_turmoil_runtime_lock()
-            .lock()
-            .expect("mad-turmoil runtime lock poisoned");
+        let _mad_turmoil_guard = mad_turmoil_runtime_lock().lock();
         seed_mad_turmoil(self.seed);
         let _clock_guard = mad_turmoil::time::SimClocksGuard::init();
 

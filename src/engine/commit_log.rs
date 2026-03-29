@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
+use bytes::{Buf, BufMut};
+use crc32fast::hash as checksum32;
 use futures::stream;
 
 use crate::{
@@ -1087,40 +1089,28 @@ fn decode_change_kind(tag: u8) -> Result<ChangeKind, StorageError> {
     }
 }
 
-fn push_u8(bytes: &mut Vec<u8>, value: u8) {
-    bytes.push(value);
+fn push_u8<B: BufMut>(bytes: &mut B, value: u8) {
+    bytes.put_u8(value);
 }
 
-fn push_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_be_bytes());
+fn push_u16<B: BufMut>(bytes: &mut B, value: u16) {
+    bytes.put_u16(value);
 }
 
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_be_bytes());
+fn push_u32<B: BufMut>(bytes: &mut B, value: u32) {
+    bytes.put_u32(value);
 }
 
-fn push_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_be_bytes());
+fn push_u64<B: BufMut>(bytes: &mut B, value: u64) {
+    bytes.put_u64(value);
 }
 
-fn push_len(bytes: &mut Vec<u8>, value: usize) -> Result<(), StorageError> {
+fn push_len<B: BufMut>(bytes: &mut B, value: usize) -> Result<(), StorageError> {
     push_u32(
         bytes,
         u32::try_from(value).map_err(|_| StorageError::unsupported("length exceeds 4 GiB"))?,
     );
     Ok(())
-}
-
-fn checksum32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for &byte in bytes {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320_u32 & mask);
-        }
-    }
-    !crc
 }
 
 fn parse_segment_footer(bytes: &[u8]) -> Result<Option<SegmentFooter>, StorageError> {
@@ -1285,16 +1275,15 @@ async fn read_file(fs: &dyn FileSystem, path: &str) -> Result<Vec<u8>, StorageEr
 
 struct ByteCursor<'a> {
     bytes: &'a [u8],
-    offset: usize,
 }
 
 impl<'a> ByteCursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self { bytes }
     }
 
     fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.offset)
+        self.bytes.remaining()
     }
 
     fn read_exact(&mut self, len: usize) -> Result<&'a [u8], StorageError> {
@@ -1305,37 +1294,58 @@ impl<'a> ByteCursor<'a> {
             )));
         }
 
-        let start = self.offset;
-        self.offset += len;
-        Ok(&self.bytes[start..self.offset])
+        let (head, tail) = self.bytes.split_at(len);
+        self.bytes = tail;
+        Ok(head)
     }
 
     fn read_u8(&mut self) -> Result<u8, StorageError> {
-        Ok(self.read_exact(1)?[0])
+        if !self.bytes.has_remaining() {
+            return Err(StorageError::corruption(
+                "unexpected end of buffer: needed 1 bytes, have 0",
+            ));
+        }
+        Ok(self.bytes.get_u8())
     }
 
     fn read_u16(&mut self) -> Result<u16, StorageError> {
-        Ok(u16::from_be_bytes(
-            self.read_exact(2)?.try_into().expect("u16"),
-        ))
+        if self.remaining() < 2 {
+            return Err(StorageError::corruption(format!(
+                "unexpected end of buffer: needed 2 bytes, have {}",
+                self.remaining()
+            )));
+        }
+        Ok(self.bytes.get_u16())
     }
 
     fn read_u32(&mut self) -> Result<u32, StorageError> {
-        Ok(u32::from_be_bytes(
-            self.read_exact(4)?.try_into().expect("u32"),
-        ))
+        if self.remaining() < 4 {
+            return Err(StorageError::corruption(format!(
+                "unexpected end of buffer: needed 4 bytes, have {}",
+                self.remaining()
+            )));
+        }
+        Ok(self.bytes.get_u32())
     }
 
     fn read_u64(&mut self) -> Result<u64, StorageError> {
-        Ok(u64::from_be_bytes(
-            self.read_exact(8)?.try_into().expect("u64"),
-        ))
+        if self.remaining() < 8 {
+            return Err(StorageError::corruption(format!(
+                "unexpected end of buffer: needed 8 bytes, have {}",
+                self.remaining()
+            )));
+        }
+        Ok(self.bytes.get_u64())
     }
 
     fn read_i64(&mut self) -> Result<i64, StorageError> {
-        Ok(i64::from_be_bytes(
-            self.read_exact(8)?.try_into().expect("i64"),
-        ))
+        if self.remaining() < 8 {
+            return Err(StorageError::corruption(format!(
+                "unexpected end of buffer: needed 8 bytes, have {}",
+                self.remaining()
+            )));
+        }
+        Ok(self.bytes.get_i64())
     }
 
     fn read_len_prefixed_bytes(&mut self) -> Result<&'a [u8], StorageError> {

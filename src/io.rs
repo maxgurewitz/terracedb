@@ -4,6 +4,11 @@ use async_trait::async_trait;
 
 use crate::{error::StorageError, ids::Timestamp};
 
+pub use object_store::{
+    ObjectStore as StandardObjectStore, ObjectStoreExt as StandardObjectStoreExt,
+    path::Path as StandardObjectPath,
+};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpenOptions {
     pub create: bool,
