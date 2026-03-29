@@ -39,3 +39,19 @@ It supports long-lived workflow instances, durable trigger admission, timers, re
 ## Philosophy
 
 The name **terracedb** is inspired by FoundationDB’s emphasis on small, composable primitives. The aim is similar in spirit for the single-node embedded setting: keep the core narrow, make higher-level behavior explicit, and let applications assemble the pieces they actually need.
+
+## Development
+
+This repository includes a shared pre-commit script at `scripts/pre-commit.sh`.
+
+The Git hook at `.githooks/pre-commit` calls that script, which runs:
+
+- `cargo test`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+
+Enable it locally with:
+
+```bash
+git config core.hooksPath .githooks
+```
