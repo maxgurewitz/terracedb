@@ -236,7 +236,8 @@ pub struct Db {
 
 struct DbInner {
     config: DbConfig,
-    _dependencies: DbDependencies,
+    #[allow(dead_code)]
+    dependencies: DbDependencies,
     next_table_id: AtomicU32,
     current_sequence: AtomicU64,
     current_durable_sequence: AtomicU64,
@@ -268,7 +269,7 @@ impl Db {
         Ok(Self {
             inner: Arc::new(DbInner {
                 config,
-                _dependencies: dependencies,
+                dependencies,
                 next_table_id: AtomicU32::new(1),
                 current_sequence: AtomicU64::new(0),
                 current_durable_sequence: AtomicU64::new(0),
@@ -499,6 +500,11 @@ impl Db {
                 ..
             })
         )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dependencies(&self) -> &DbDependencies {
+        &self.inner.dependencies
     }
 
     fn watch_sender(

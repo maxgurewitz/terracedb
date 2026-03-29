@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod api;
 pub mod config;
 pub mod engine;
@@ -7,6 +8,11 @@ pub mod io;
 pub mod scheduler;
 pub mod stubs;
 
+pub use adapters::{
+    DeterministicRng, FileSystemFailure, FileSystemOperation, LocalDirObjectStore,
+    ObjectStoreFailure, ObjectStoreOperation, SimulatedClock, SimulatedFileSystem,
+    SimulatedObjectStore, SystemClock, SystemRng, TokioFileSystem,
+};
 pub use api::{
     BatchOperation, ChangeEntry, ChangeKind, ChangeStream, CommitOptions, Db, FieldDefinition,
     FieldType, FieldValue, Key, KeyPrefix, KvStream, ReadSet, ReadSetEntry, ScanOptions,

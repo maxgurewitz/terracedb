@@ -26,6 +26,30 @@ impl StorageError {
         }
     }
 
+    pub fn io(message: impl Into<String>) -> Self {
+        Self::new(StorageErrorKind::Io, message)
+    }
+
+    pub fn corruption(message: impl Into<String>) -> Self {
+        Self::new(StorageErrorKind::Corruption, message)
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new(StorageErrorKind::Timeout, message)
+    }
+
+    pub fn durability_boundary(message: impl Into<String>) -> Self {
+        Self::new(StorageErrorKind::DurabilityBoundary, message)
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(StorageErrorKind::Unsupported, message)
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StorageErrorKind::NotFound, message)
+    }
+
     pub fn kind(&self) -> StorageErrorKind {
         self.kind
     }
