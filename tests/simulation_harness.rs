@@ -1,14 +1,124 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use terracedb::{
-    CutPoint, DbGeneratedScenario, DbMutation, DbShadowOracle, DbSimulationScenarioConfig,
-    DbWorkloadOperation, OperationResult, PointMutation, ScheduledFault, ScheduledFaultKind,
-    SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
-    SimulationScenarioConfig, SimulationTableSpec, StubDbProcess, TraceEvent, Value,
+    CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig, DbGeneratedScenario, DbMutation,
+    DbShadowOracle, DbSimulationScenarioConfig, DbWorkloadOperation, OperationResult, PendingWork,
+    PointMutation, S3Location, ScheduleAction, ScheduleDecision, ScheduledFault,
+    ScheduledFaultKind, Scheduler, SeededSimulationRunner, SequenceNumber, ShadowOracle,
+    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, SsdConfig,
+    StorageConfig, StubDbProcess, TableStats, ThrottleDecision, TieredDurabilityMode,
+    TieredStorageConfig, TraceEvent, Value,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
     let mut encoded = expires_at_millis.to_be_bytes().to_vec();
     encoded.extend_from_slice(payload.as_bytes());
     Value::Bytes(encoded)
+}
+
+#[derive(Default)]
+struct HostileSimulationScheduler;
+
+impl Scheduler for HostileSimulationScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+}
+
+struct RandomSimulationScheduler {
+    state: AtomicU64,
+}
+
+impl RandomSimulationScheduler {
+    fn seeded(seed: u64) -> Self {
+        Self {
+            state: AtomicU64::new(seed.max(1)),
+        }
+    }
+
+    fn next_u64(&self) -> u64 {
+        let mut current = self.state.load(Ordering::SeqCst);
+        loop {
+            let mut next = current;
+            next ^= next << 7;
+            next ^= next >> 9;
+            next ^= next << 8;
+            if self
+                .state
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return next;
+            }
+            current = self.state.load(Ordering::SeqCst);
+        }
+    }
+}
+
+impl Scheduler for RandomSimulationScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        let selected = (!work.is_empty()).then(|| (self.next_u64() as usize) % work.len());
+        let force_defer = self.next_u64().is_multiple_of(3);
+
+        work.iter()
+            .enumerate()
+            .map(|(index, work)| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: if !force_defer && selected == Some(index) {
+                    ScheduleAction::Execute
+                } else {
+                    ScheduleAction::Defer
+                },
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, stats: &TableStats) -> ThrottleDecision {
+        if stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT.saturating_sub(1)
+            || self.next_u64().is_multiple_of(5)
+        {
+            return ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: None,
+                stall: false,
+            };
+        }
+
+        ThrottleDecision::default()
+    }
+}
+
+fn simulation_db_config(
+    root_path: &str,
+    scheduler: Arc<dyn Scheduler>,
+    max_local_bytes: u64,
+) -> DbConfig {
+    DbConfig {
+        storage: StorageConfig::Tiered(TieredStorageConfig {
+            ssd: SsdConfig {
+                path: root_path.to_string(),
+            },
+            s3: S3Location {
+                bucket: "terracedb-sim".to_string(),
+                prefix: "scheduler".to_string(),
+            },
+            max_local_bytes,
+            durability: TieredDurabilityMode::GroupCommit,
+        }),
+        scheduler: Some(scheduler),
+    }
 }
 
 #[test]
@@ -507,4 +617,104 @@ fn ttl_simulation_supports_snapshot_guarded_compaction_across_restart() -> turmo
     );
 
     Ok(())
+}
+
+#[test]
+fn hostile_scheduler_simulation_still_forces_flush_and_l0_progress() -> turmoil::Result {
+    SeededSimulationRunner::new(0x1616).run_with(|context| async move {
+        let db = context
+            .open_db(simulation_db_config(
+                "/terracedb/sim/t16-hostile-scheduler",
+                Arc::new(HostileSimulationScheduler),
+                160,
+            ))
+            .await?;
+        let flush_table = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+        let l0_table = db
+            .create_table(SimulationTableSpec::row("events-l0").table_config())
+            .await?;
+
+        flush_table
+            .write(b"big-1".to_vec(), Value::Bytes(vec![b'x'; 80]))
+            .await?;
+        flush_table
+            .write(b"big-2".to_vec(), Value::Bytes(vec![b'y'; 80]))
+            .await?;
+        assert!(
+            db.table_stats(&flush_table).await.local_bytes > 0,
+            "memory guardrail should have forced a flush under the hostile scheduler"
+        );
+
+        for index in 0..DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT {
+            l0_table
+                .write(format!("l0-{index}").into_bytes(), Value::bytes("v"))
+                .await?;
+            db.flush().await?;
+        }
+
+        let before = db.table_stats(&l0_table).await;
+        assert_eq!(
+            before.l0_sstable_count,
+            DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
+        );
+
+        l0_table
+            .write(b"trigger".to_vec(), Value::bytes("v"))
+            .await?;
+
+        let after = db.table_stats(&l0_table).await;
+        assert!(
+            after.l0_sstable_count < DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+            "forced L0 compaction should run even when the scheduler refuses all work"
+        );
+        assert_eq!(
+            db.current_sequence(),
+            SequenceNumber::new(DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT as u64 + 3),
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2727).run_with(|context| async move {
+        let db = context
+            .open_db(simulation_db_config(
+                "/terracedb/sim/t16-random-scheduler",
+                Arc::new(RandomSimulationScheduler::seeded(context.seed())),
+                1024 * 1024,
+            ))
+            .await?;
+        let table = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        for index in 0..12_u64 {
+            table
+                .write(
+                    format!("k-{index}").into_bytes(),
+                    Value::bytes(format!("v-{index}")),
+                )
+                .await?;
+            if index % 2 == 1 {
+                db.flush().await?;
+            }
+        }
+
+        assert_eq!(db.current_sequence(), SequenceNumber::new(12));
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(12));
+        assert_eq!(
+            table.read(b"k-11".to_vec()).await?,
+            Some(Value::bytes("v-11"))
+        );
+        assert!(
+            db.table_stats(&table).await.l0_sstable_count <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+            "random scheduling should never outrun the engine guardrails"
+        );
+
+        Ok(())
+    })
 }

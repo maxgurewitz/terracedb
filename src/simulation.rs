@@ -793,7 +793,9 @@ fn resolve_simulation_merge_operator(id: SimulationMergeOperatorId) -> MergeOper
     }
 }
 
-fn resolve_simulation_compaction_filter(id: SimulationCompactionFilterId) -> CompactionFilterRef {
+fn resolve_simulation_compaction_filter(
+    id: SimulationCompactionFilterId,
+) -> CompactionFilterRef {
     match id {
         SimulationCompactionFilterId::ExpiryPrefixTtl => {
             Arc::new(TtlCompactionFilter::new(expiry_from_prefixed_bytes))

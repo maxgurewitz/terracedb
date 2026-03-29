@@ -8,6 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use crc32fast::hash as checksum32;
@@ -32,7 +33,10 @@ use crate::{
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SequenceNumber, TableId},
     io::{DbDependencies, OpenOptions},
-    scheduler::{PendingWork, TableStats},
+    scheduler::{
+        DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
+        ScheduleAction, Scheduler, TableStats,
+    },
 };
 
 pub type Key = Vec<u8>;
@@ -258,6 +262,7 @@ const FIFO_MAX_LIVE_SSTABLES: usize = 2;
 const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
 const MVCC_KEY_SEPARATOR: u8 = 0;
 const DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH: usize = 8;
+const MAX_SCHEDULER_DEFER_CYCLES: u32 = 3;
 
 #[derive(Clone)]
 pub struct Db {
@@ -266,6 +271,7 @@ pub struct Db {
 
 struct DbInner {
     config: DbConfig,
+    scheduler: Arc<dyn Scheduler>,
     dependencies: DbDependencies,
     catalog_location: CatalogLocation,
     catalog_write_lock: AsyncMutex<()>,
@@ -286,6 +292,7 @@ struct DbInner {
     compaction_filter_stats: Mutex<BTreeMap<TableId, CompactionFilterStats>>,
     visible_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
     durable_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
+    work_deferrals: Mutex<BTreeMap<String, u32>>,
     #[cfg(test)]
     commit_phase_blocks: Mutex<Vec<CommitPhaseBlock>>,
     #[cfg(test)]
@@ -431,6 +438,18 @@ struct TableCompactionState {
 struct CompactionFilterStats {
     removed_bytes: u64,
     removed_keys: u64,
+}
+
+#[derive(Clone, Debug)]
+enum PendingWorkSpec {
+    Flush,
+    Compaction(CompactionJob),
+}
+
+#[derive(Clone, Debug)]
+struct PendingWorkCandidate {
+    pending: PendingWork,
+    spec: PendingWorkSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -942,6 +961,22 @@ impl Memtable {
             .unwrap_or_default()
     }
 
+    fn pending_flush_bytes_by_table(&self) -> BTreeMap<TableId, u64> {
+        self.tables
+            .iter()
+            .filter_map(|(&table_id, table)| {
+                (table.pending_flush_bytes > 0).then_some((table_id, table.pending_flush_bytes))
+            })
+            .collect()
+    }
+
+    fn total_pending_flush_bytes(&self) -> u64 {
+        self.tables
+            .values()
+            .map(|table| table.pending_flush_bytes)
+            .sum()
+    }
+
     fn has_entries_for_table(&self, table_id: TableId) -> bool {
         self.tables
             .get(&table_id)
@@ -1190,6 +1225,28 @@ impl MemtableState {
         mutable_bytes.saturating_add(immutable_bytes)
     }
 
+    fn immutable_flush_backlog_by_table(&self) -> BTreeMap<TableId, u64> {
+        let mut backlog = BTreeMap::new();
+        for immutable in &self.immutables {
+            for (table_id, bytes) in immutable.memtable.pending_flush_bytes_by_table() {
+                backlog
+                    .entry(table_id)
+                    .and_modify(|current: &mut u64| *current = current.saturating_add(bytes))
+                    .or_insert(bytes);
+            }
+        }
+        backlog
+    }
+
+    fn total_pending_flush_bytes(&self) -> u64 {
+        self.mutable.total_pending_flush_bytes().saturating_add(
+            self.immutables
+                .iter()
+                .map(|immutable| immutable.memtable.total_pending_flush_bytes())
+                .sum::<u64>(),
+        )
+    }
+
     fn immutable_memtable_count(&self, table_id: TableId) -> u32 {
         self.immutables
             .iter()
@@ -1371,8 +1428,16 @@ impl fmt::Debug for Db {
 }
 
 impl Db {
-    pub async fn open(config: DbConfig, dependencies: DbDependencies) -> Result<Self, OpenError> {
+    pub async fn open(
+        mut config: DbConfig,
+        dependencies: DbDependencies,
+    ) -> Result<Self, OpenError> {
         Self::validate_storage_config(&config.storage)?;
+        let scheduler = config
+            .scheduler
+            .clone()
+            .unwrap_or_else(|| Arc::new(RoundRobinScheduler::default()));
+        config.scheduler = Some(scheduler.clone());
         let catalog_location = Self::catalog_location(&config.storage);
         let (tables, next_table_id) = Self::load_tables(&dependencies, &catalog_location).await?;
         let commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
@@ -1393,6 +1458,7 @@ impl Db {
         Ok(Self {
             inner: Arc::new(DbInner {
                 config,
+                scheduler,
                 dependencies,
                 catalog_location,
                 catalog_write_lock: AsyncMutex::new(()),
@@ -1417,6 +1483,7 @@ impl Db {
                 compaction_filter_stats: Mutex::new(BTreeMap::new()),
                 visible_watchers: Mutex::new(BTreeMap::new()),
                 durable_watchers: Mutex::new(BTreeMap::new()),
+                work_deferrals: Mutex::new(BTreeMap::new()),
                 #[cfg(test)]
                 commit_phase_blocks: Mutex::new(Vec::new()),
                 #[cfg(test)]
@@ -2608,6 +2675,217 @@ impl Db {
         jobs
     }
 
+    fn pending_flush_candidates(&self) -> Vec<PendingWorkCandidate> {
+        if self.local_storage_root().is_none() {
+            return Vec::new();
+        }
+
+        let tables = self.tables_read().clone();
+        let mut candidates = self
+            .memtables_read()
+            .immutable_flush_backlog_by_table()
+            .into_iter()
+            .filter_map(|(table_id, estimated_bytes)| {
+                let stored = Self::stored_table_by_id(&tables, table_id)?;
+                Some(PendingWorkCandidate {
+                    pending: PendingWork {
+                        id: format!("flush:{}", stored.config.name),
+                        work_type: PendingWorkType::Flush,
+                        table: stored.config.name.clone(),
+                        level: None,
+                        estimated_bytes,
+                    },
+                    spec: PendingWorkSpec::Flush,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.pending
+                .table
+                .cmp(&right.pending.table)
+                .then_with(|| left.pending.id.cmp(&right.pending.id))
+        });
+        candidates
+    }
+
+    fn pending_work_candidates(&self) -> Vec<PendingWorkCandidate> {
+        let mut candidates = self.pending_flush_candidates();
+        candidates.extend(self.pending_compaction_jobs().into_iter().map(|job| {
+            PendingWorkCandidate {
+                pending: PendingWork {
+                    id: job.id.clone(),
+                    work_type: PendingWorkType::Compaction,
+                    table: job.table_name.clone(),
+                    level: Some(job.source_level),
+                    estimated_bytes: job.estimated_bytes,
+                },
+                spec: PendingWorkSpec::Compaction(job),
+            }
+        }));
+        candidates.sort_by(|left, right| {
+            pending_work_sort_key(&left.pending)
+                .cmp(&pending_work_sort_key(&right.pending))
+                .then_with(|| left.pending.id.cmp(&right.pending.id))
+        });
+        candidates
+    }
+
+    fn prune_work_deferrals(&self, candidates: &[PendingWorkCandidate]) {
+        let live_work_ids = candidates
+            .iter()
+            .map(|candidate| candidate.pending.id.as_str())
+            .collect::<BTreeSet<_>>();
+        mutex_lock(&self.inner.work_deferrals)
+            .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
+    }
+
+    fn record_deferred_work(
+        &self,
+        candidates: &[PendingWorkCandidate],
+        decisions: &BTreeMap<String, ScheduleAction>,
+    ) {
+        let mut deferrals = mutex_lock(&self.inner.work_deferrals);
+        for candidate in candidates {
+            match decisions
+                .get(&candidate.pending.id)
+                .copied()
+                .unwrap_or(ScheduleAction::Defer)
+            {
+                ScheduleAction::Execute => {
+                    deferrals.remove(&candidate.pending.id);
+                }
+                ScheduleAction::Defer => {
+                    *deferrals.entry(candidate.pending.id.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    fn reset_work_deferral(&self, work_id: &str) {
+        mutex_lock(&self.inner.work_deferrals).remove(work_id);
+    }
+
+    fn deferred_work_candidate(
+        &self,
+        candidates: &[PendingWorkCandidate],
+    ) -> Option<PendingWorkCandidate> {
+        let deferrals = mutex_lock(&self.inner.work_deferrals);
+        candidates
+            .iter()
+            .find(|candidate| {
+                deferrals
+                    .get(&candidate.pending.id)
+                    .copied()
+                    .unwrap_or_default()
+                    >= MAX_SCHEDULER_DEFER_CYCLES
+            })
+            .cloned()
+    }
+
+    fn forced_l0_compaction_candidate(
+        &self,
+        candidates: &[PendingWorkCandidate],
+    ) -> Option<PendingWorkCandidate> {
+        let live = self.sstables_read().live.clone();
+        candidates
+            .iter()
+            .find(|candidate| match &candidate.spec {
+                PendingWorkSpec::Compaction(job) if job.source_level == 0 => {
+                    SstableState {
+                        manifest_generation: ManifestId::default(),
+                        last_flushed_sequence: SequenceNumber::default(),
+                        live: live.clone(),
+                    }
+                    .table_stats(job.table_id)
+                    .0 >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
+                }
+                PendingWorkSpec::Flush | PendingWorkSpec::Compaction(_) => false,
+            })
+            .cloned()
+    }
+
+    async fn execute_pending_work(
+        &self,
+        local_root: &str,
+        candidate: PendingWorkCandidate,
+    ) -> Result<(), StorageError> {
+        self.reset_work_deferral(&candidate.pending.id);
+        match candidate.spec {
+            PendingWorkSpec::Flush => self
+                .flush_internal(false)
+                .await
+                .map_err(Self::flush_error_into_storage),
+            PendingWorkSpec::Compaction(job) => self.execute_compaction_job(local_root, job).await,
+        }
+    }
+
+    async fn run_scheduler_pass(&self, allow_forced_execution: bool) -> Result<bool, StorageError> {
+        let Some(local_root) = self.local_storage_root().map(str::to_string) else {
+            return Ok(false);
+        };
+
+        let attempts = if allow_forced_execution {
+            MAX_SCHEDULER_DEFER_CYCLES
+        } else {
+            1
+        };
+
+        for _ in 0..attempts {
+            let candidates = self.pending_work_candidates();
+            self.prune_work_deferrals(&candidates);
+            if candidates.is_empty() {
+                return Ok(false);
+            }
+
+            if let Some(candidate) = self.forced_l0_compaction_candidate(&candidates) {
+                self.execute_pending_work(&local_root, candidate).await?;
+                return Ok(true);
+            }
+
+            let pending = candidates
+                .iter()
+                .map(|candidate| candidate.pending.clone())
+                .collect::<Vec<_>>();
+            let decisions = self
+                .inner
+                .scheduler
+                .on_work_available(&pending)
+                .into_iter()
+                .map(|decision| (decision.work_id, decision.action))
+                .collect::<BTreeMap<_, _>>();
+
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| {
+                    decisions
+                        .get(&candidate.pending.id)
+                        .copied()
+                        .unwrap_or(ScheduleAction::Defer)
+                        == ScheduleAction::Execute
+                })
+                .cloned()
+            {
+                self.execute_pending_work(&local_root, candidate).await?;
+                return Ok(true);
+            }
+
+            self.record_deferred_work(&candidates, &decisions);
+            if allow_forced_execution
+                && let Some(candidate) = self.deferred_work_candidate(&candidates)
+            {
+                self.execute_pending_work(&local_root, candidate).await?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    async fn run_next_scheduled_work(&self) -> Result<bool, StorageError> {
+        self.run_scheduler_pass(true).await
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn estimated_sstable_row_bytes(row: &SstableRow) -> u64 {
         (row.key.len() + row.value.as_ref().map(value_size_bytes).unwrap_or_default() + 32) as u64
@@ -3045,6 +3323,7 @@ impl Db {
 
         let resolved_operations = self.resolve_batch_operations(batch.operations())?;
         let resolved_read_set = self.resolve_read_set_entries(opts.read_set.as_ref())?;
+        self.apply_write_backpressure(&resolved_operations).await?;
 
         let participant = {
             let _commit_guard = self.inner.commit_lock.lock().await;
@@ -3104,6 +3383,10 @@ impl Db {
     }
 
     pub async fn flush(&self) -> Result<(), FlushError> {
+        self.flush_internal(true).await
+    }
+
+    async fn flush_internal(&self, _allow_scheduler_follow_up: bool) -> Result<(), FlushError> {
         let _maintenance_guard = self.inner.maintenance_lock.lock().await;
         let local_root = self.local_storage_root().map(str::to_string);
         let immutables = {
@@ -3295,16 +3578,143 @@ impl Db {
     }
 
     pub async fn pending_work(&self) -> Vec<PendingWork> {
-        self.pending_compaction_jobs()
+        self.pending_work_candidates()
             .into_iter()
-            .map(|job| PendingWork {
-                id: job.id,
-                work_type: crate::scheduler::PendingWorkType::Compaction,
-                table: job.table_name,
-                level: Some(job.source_level),
-                estimated_bytes: job.estimated_bytes,
-            })
+            .map(|candidate| candidate.pending)
             .collect()
+    }
+
+    async fn apply_write_backpressure(
+        &self,
+        operations: &[ResolvedBatchOperation],
+    ) -> Result<(), CommitError> {
+        let batch_bytes_by_table = Self::estimated_batch_bytes_by_table(operations);
+        let total_batch_bytes = batch_bytes_by_table.values().copied().sum::<u64>();
+        if self.memtable_budget_exceeded_by(total_batch_bytes) {
+            self.flush_internal(false)
+                .await
+                .map_err(|error| CommitError::Storage(Self::flush_error_into_storage(error)))?;
+        }
+
+        let touched_tables = operations
+            .iter()
+            .map(|operation| {
+                (
+                    operation.table_id,
+                    Table {
+                        db: self.clone(),
+                        name: Arc::from(operation.table_name.clone()),
+                        id: Some(operation.table_id),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+
+        loop {
+            let mut max_delay = Duration::ZERO;
+            let mut should_run_maintenance = false;
+            let mut must_stall = false;
+
+            for table in &touched_tables {
+                let stats = self.table_stats(table).await;
+                let decision = self.inner.scheduler.should_throttle(table, &stats);
+                let table_bytes = table
+                    .id()
+                    .and_then(|table_id| batch_bytes_by_table.get(&table_id).copied())
+                    .unwrap_or(total_batch_bytes);
+
+                if let Some(rate) = decision.max_write_bytes_per_second {
+                    max_delay = max_delay.max(Self::throttle_delay(table_bytes, rate));
+                }
+                if decision.throttle {
+                    should_run_maintenance = true;
+                }
+                if decision.stall || stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
+                {
+                    should_run_maintenance = true;
+                    must_stall = true;
+                }
+            }
+
+            if should_run_maintenance {
+                let progressed = self
+                    .run_scheduler_pass(true)
+                    .await
+                    .map_err(CommitError::Storage)?;
+                if progressed {
+                    continue;
+                }
+                if must_stall {
+                    break;
+                }
+            }
+
+            if max_delay > Duration::ZERO {
+                self.inner.dependencies.clock.sleep(max_delay).await;
+            }
+            break;
+        }
+
+        Ok(())
+    }
+
+    fn memtable_budget_bytes(&self) -> Option<u64> {
+        match &self.inner.config.storage {
+            StorageConfig::Tiered(config) => Some(config.max_local_bytes),
+            StorageConfig::S3Primary(_) => None,
+        }
+    }
+
+    fn memtable_budget_exceeded_by(&self, additional_bytes: u64) -> bool {
+        self.memtable_budget_bytes().is_some_and(|budget| {
+            self.memtables_read()
+                .total_pending_flush_bytes()
+                .saturating_add(additional_bytes)
+                > budget
+        })
+    }
+
+    fn estimated_batch_bytes_by_table(
+        operations: &[ResolvedBatchOperation],
+    ) -> BTreeMap<TableId, u64> {
+        let mut bytes_by_table = BTreeMap::new();
+        for operation in operations {
+            let entry_bytes = Self::estimated_operation_size_bytes(operation);
+            bytes_by_table
+                .entry(operation.table_id)
+                .and_modify(|bytes: &mut u64| *bytes = bytes.saturating_add(entry_bytes))
+                .or_insert(entry_bytes);
+        }
+        bytes_by_table
+    }
+
+    fn estimated_operation_size_bytes(operation: &ResolvedBatchOperation) -> u64 {
+        (operation.key.len()
+            + encode_mvcc_key(&operation.key, CommitId::new(SequenceNumber::default())).len()
+            + operation
+                .value
+                .as_ref()
+                .map(value_size_bytes)
+                .unwrap_or_default()) as u64
+    }
+
+    fn throttle_delay(bytes: u64, max_write_bytes_per_second: u64) -> Duration {
+        if bytes == 0 || max_write_bytes_per_second == 0 {
+            return Duration::ZERO;
+        }
+
+        let millis = ((bytes as u128).saturating_mul(1000))
+            .div_ceil(max_write_bytes_per_second as u128) as u64;
+        Duration::from_millis(millis)
+    }
+
+    fn flush_error_into_storage(error: FlushError) -> StorageError {
+        match error {
+            FlushError::Storage(error) => error,
+            FlushError::Unimplemented(message) => StorageError::unsupported(message),
+        }
     }
 
     fn resolve_read_set_entries(
@@ -4343,6 +4753,16 @@ impl Drop for Snapshot {
     }
 }
 
+fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32>) {
+    let priority = match work.work_type {
+        PendingWorkType::Flush => 0,
+        PendingWorkType::Compaction => 1,
+        PendingWorkType::Backup => 2,
+        PendingWorkType::Offload => 3,
+    };
+    (priority, work.table.as_str(), work.level)
+}
+
 fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
 }
@@ -4431,9 +4851,10 @@ fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use futures::StreamExt;
+    use parking_lot::Mutex;
     use serde_json::json;
 
     use super::{
@@ -4448,8 +4869,9 @@ mod tests {
         FileSystemFailure, FileSystemOperation, MergeOperator, MergeOperatorRef, PointMutation,
         ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber,
         ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng,
-        TableConfig, TableFormat, TableId, TieredDurabilityMode, TieredStorageConfig, Timestamp,
-        TtlCompactionFilter, Value,
+        TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
+        TieredStorageConfig, Timestamp, TtlCompactionFilter, Value, PendingWork, PendingWorkType,
+        ScheduleAction, ScheduleDecision, Scheduler,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -4505,6 +4927,138 @@ mod tests {
             clock,
             Arc::new(StubRng::seeded(7)),
         )
+    }
+
+    fn tiered_config_with_scheduler(path: &str, scheduler: Arc<dyn Scheduler>) -> DbConfig {
+        let mut config = tiered_config(path);
+        config.scheduler = Some(scheduler);
+        config
+    }
+
+    fn tiered_config_with_limits_and_scheduler(
+        path: &str,
+        max_local_bytes: u64,
+        scheduler: Arc<dyn Scheduler>,
+    ) -> DbConfig {
+        DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: path.to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-test".to_string(),
+                    prefix: "tiered".to_string(),
+                },
+                max_local_bytes,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: Some(scheduler),
+        }
+    }
+
+    #[derive(Default)]
+    struct RefusingScheduler;
+
+    impl Scheduler for RefusingScheduler {
+        fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+            work.iter()
+                .map(|work| ScheduleDecision {
+                    work_id: work.id.clone(),
+                    action: ScheduleAction::Defer,
+                })
+                .collect()
+        }
+
+        fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+            ThrottleDecision::default()
+        }
+    }
+
+    struct PreferredTableScheduler {
+        preferred_table: String,
+    }
+
+    impl Scheduler for PreferredTableScheduler {
+        fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+            let selected = work
+                .iter()
+                .find(|item| item.table == self.preferred_table)
+                .map(|item| item.id.clone());
+            work.iter()
+                .map(|item| ScheduleDecision {
+                    work_id: item.id.clone(),
+                    action: if selected.as_ref() == Some(&item.id) {
+                        ScheduleAction::Execute
+                    } else {
+                        ScheduleAction::Defer
+                    },
+                })
+                .collect()
+        }
+
+        fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+            ThrottleDecision::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct MetadataRateLimitScheduler {
+        seen: Mutex<Vec<(String, BTreeMap<String, serde_json::Value>)>>,
+        max_write_bytes_per_second: u64,
+    }
+
+    impl MetadataRateLimitScheduler {
+        fn seen(&self) -> Vec<(String, BTreeMap<String, serde_json::Value>)> {
+            self.seen.lock().clone()
+        }
+    }
+
+    impl Scheduler for MetadataRateLimitScheduler {
+        fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+            work.iter()
+                .map(|work| ScheduleDecision {
+                    work_id: work.id.clone(),
+                    action: ScheduleAction::Defer,
+                })
+                .collect()
+        }
+
+        fn should_throttle(&self, table: &crate::Table, stats: &TableStats) -> ThrottleDecision {
+            self.seen
+                .lock()
+                .push((table.name().to_string(), stats.metadata.clone()));
+            ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: Some(self.max_write_bytes_per_second),
+                stall: false,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct DeferringThrottleScheduler;
+
+    impl Scheduler for DeferringThrottleScheduler {
+        fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+            work.iter()
+                .map(|work| ScheduleDecision {
+                    work_id: work.id.clone(),
+                    action: ScheduleAction::Defer,
+                })
+                .collect()
+        }
+
+        fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+            if _stats.l0_sstable_count >= crate::DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT {
+                return ThrottleDecision {
+                    throttle: true,
+                    max_write_bytes_per_second: None,
+                    stall: false,
+                };
+            }
+
+            ThrottleDecision::default()
+        }
     }
 
     #[derive(Debug)]
@@ -5070,6 +5624,274 @@ mod tests {
         ShadowOracle,
     ) {
         seed_compaction_fixture(root, "events", CompactionStrategy::Leveled).await
+    }
+
+    #[tokio::test]
+    async fn pending_work_reports_flush_and_compaction_backlog() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/scheduler-pending-work"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write first value");
+        db.memtables_write().rotate_mutable();
+
+        let flush_stats = db.table_stats(&table).await;
+        assert_eq!(flush_stats.immutable_memtable_count, 1);
+        assert!(flush_stats.pending_flush_bytes > 0);
+        let flush_work = db.pending_work().await;
+        assert!(flush_work.iter().any(|work| {
+            work.work_type == PendingWorkType::Flush
+                && work.table == "events"
+                && work.estimated_bytes > 0
+        }));
+
+        db.flush().await.expect("flush immutable backlog");
+        table
+            .write(b"user:2".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second value");
+        db.flush().await.expect("flush second l0");
+
+        let compaction_work = db.pending_work().await;
+        assert!(compaction_work.iter().any(|work| {
+            work.work_type == PendingWorkType::Compaction && work.table == "events"
+        }));
+    }
+
+    #[tokio::test]
+    async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let clock = Arc::new(StubClock::default());
+        let scheduler = Arc::new(MetadataRateLimitScheduler {
+            seen: Mutex::new(Vec::new()),
+            max_write_bytes_per_second: 1,
+        });
+        let db = Db::open(
+            tiered_config_with_scheduler("/scheduler-metadata", scheduler.clone()),
+            dependencies_with_clock(file_system, object_store, clock.clone()),
+        )
+        .await
+        .expect("open db");
+        let config = row_table_config("events");
+        let expected_metadata = config.metadata.clone();
+        let table = db.create_table(config).await.expect("create table");
+
+        let write_table = table.clone();
+        let write = tokio::spawn(async move {
+            write_table
+                .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 64]))
+                .await
+                .expect("rate-limited write")
+        });
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !write.is_finished(),
+            "write should still be waiting on the clock"
+        );
+
+        let seen = scheduler.seen();
+        assert!(
+            seen.iter()
+                .any(|(table_name, metadata)| table_name == "events"
+                    && metadata == &expected_metadata)
+        );
+
+        for _ in 0..180 {
+            if write.is_finished() {
+                break;
+            }
+            clock.advance(Duration::from_secs(1));
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            write.is_finished(),
+            "write should finish once the simulated clock advances far enough"
+        );
+        assert_eq!(
+            write.await.expect("join write task"),
+            SequenceNumber::new(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_choice_controls_which_compaction_runs_first() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let scheduler = Arc::new(PreferredTableScheduler {
+            preferred_table: "beta".to_string(),
+        });
+        let db = Db::open(
+            tiered_config_with_scheduler("/scheduler-priority", scheduler),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let alpha = db
+            .create_table(row_table_config("alpha"))
+            .await
+            .expect("create alpha");
+        let beta = db
+            .create_table(row_table_config("beta"))
+            .await
+            .expect("create beta");
+
+        for round in 0..2_u8 {
+            alpha
+                .write(vec![b'a', round], Value::Bytes(vec![round]))
+                .await
+                .expect("write alpha");
+            beta.write(vec![b'b', round], Value::Bytes(vec![round]))
+                .await
+                .expect("write beta");
+            db.flush().await.expect("flush round");
+        }
+
+        assert!(db.table_stats(&alpha).await.compaction_debt > 0);
+        assert!(db.table_stats(&beta).await.compaction_debt > 0);
+        assert!(
+            db.run_next_scheduled_work()
+                .await
+                .expect("run scheduled work")
+        );
+
+        assert!(db.table_stats(&alpha).await.compaction_debt > 0);
+        assert_eq!(db.table_stats(&beta).await.compaction_debt, 0);
+    }
+
+    #[tokio::test]
+    async fn forced_flush_ignores_scheduler_deferrals_when_memtable_budget_is_exhausted() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config_with_limits_and_scheduler(
+                "/forced-flush-guardrail",
+                160,
+                Arc::new(RefusingScheduler),
+            ),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 80]))
+            .await
+            .expect("write first large value");
+        assert_eq!(db.sstables_read().live.len(), 0);
+
+        table
+            .write(b"user:2".to_vec(), Value::Bytes(vec![b'y'; 80]))
+            .await
+            .expect("write second large value");
+
+        let stats = db.table_stats(&table).await;
+        assert_eq!(stats.immutable_memtable_count, 0);
+        assert!(
+            stats.local_bytes > 0,
+            "forced flush should install SSTables"
+        );
+        assert!(!db.sstables_read().live.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forced_l0_compaction_ignores_scheduler_deferrals_at_the_hard_ceiling() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config_with_scheduler("/forced-l0-compaction", Arc::new(RefusingScheduler)),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        for index in 0..crate::DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT {
+            table
+                .write(format!("key-{index}").into_bytes(), Value::bytes("v"))
+                .await
+                .expect("write l0 seed");
+            db.flush().await.expect("flush l0 seed");
+        }
+
+        assert_eq!(
+            db.table_stats(&table).await.l0_sstable_count,
+            crate::DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
+        );
+        table
+            .write(b"trigger".to_vec(), Value::bytes("v"))
+            .await
+            .expect("write through hard-ceiling guardrail");
+
+        let stats = db.table_stats(&table).await;
+        assert!(
+            stats.l0_sstable_count < crate::DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+            "forced compaction should reduce L0 pressure before accepting more writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_scheduler_work_is_forced_before_reaching_the_hard_ceiling() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config_with_scheduler(
+                "/forced-deferred-work",
+                Arc::new(DeferringThrottleScheduler),
+            ),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        for index in 0..crate::DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT {
+            table
+                .write(format!("seed-{index}").into_bytes(), Value::bytes("v"))
+                .await
+                .expect("write seed");
+            db.flush().await.expect("flush seed");
+        }
+
+        assert_eq!(
+            db.table_stats(&table).await.l0_sstable_count,
+            crate::DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT
+        );
+        table
+            .write(b"trigger".to_vec(), Value::bytes("v"))
+            .await
+            .expect("write through deferred-work guardrail");
+
+        let stats = db.table_stats(&table).await;
+        assert!(
+            stats.l0_sstable_count < crate::DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT,
+            "bounded deferral should still execute pending compaction work"
+        );
     }
 
     #[test]
