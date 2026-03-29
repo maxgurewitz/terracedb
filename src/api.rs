@@ -256,6 +256,7 @@ const TIERED_LEVEL_RUN_COMPACTION_TRIGGER: usize = 3;
 const FIFO_MAX_LIVE_SSTABLES: usize = 2;
 const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
 const MVCC_KEY_SEPARATOR: u8 = 0;
+const DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH: usize = 8;
 
 #[derive(Clone)]
 pub struct Db {
@@ -317,6 +318,7 @@ struct PersistedCatalogEntry {
 struct PersistedTableConfig {
     name: String,
     format: TableFormat,
+    max_merge_operand_chain_length: Option<u32>,
     bloom_filter_bits_per_key: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     history_retention_sequences: Option<u64>,
@@ -508,6 +510,18 @@ struct ResolvedBatchOperation {
     key: Key,
     kind: ChangeKind,
     value: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MergeCollapse {
+    sequence: SequenceNumber,
+    value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct VisibleValueResolution {
+    value: Option<Value>,
+    collapse: Option<MergeCollapse>,
 }
 
 #[derive(Clone, Debug)]
@@ -770,6 +784,7 @@ impl TableMemtable {
         self.pending_flush_bytes = self.pending_flush_bytes.saturating_add(entry.size_bytes);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_at(&self, key: &[u8], sequence: SequenceNumber) -> Option<MemtableEntry> {
         let seek = encode_mvcc_key(key, CommitId::new(sequence));
         let (_encoded_key, entry) = self.entries.range(seek..).next()?;
@@ -780,6 +795,31 @@ impl TableMemtable {
         for entry in self.entries.values() {
             if matcher.matches(&entry.user_key) {
                 keys.insert(entry.user_key.clone());
+            }
+        }
+    }
+
+    fn collect_visible_rows(
+        &self,
+        key: &[u8],
+        sequence: SequenceNumber,
+        rows: &mut Vec<SstableRow>,
+    ) {
+        let seek = encode_mvcc_key(key, CommitId::new(sequence));
+        for (_encoded_key, entry) in self.entries.range(seek..) {
+            match entry.user_key.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {
+                    if entry.sequence <= sequence {
+                        rows.push(SstableRow {
+                            key: entry.user_key.clone(),
+                            sequence: entry.sequence,
+                            kind: entry.kind,
+                            value: entry.value.clone(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -822,6 +862,7 @@ impl Memtable {
             ));
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_at(
         &self,
         table_id: TableId,
@@ -840,6 +881,37 @@ impl Memtable {
         if let Some(table) = self.tables.get(&table_id) {
             table.collect_matching_keys(matcher, keys);
         }
+    }
+
+    fn collect_visible_rows(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+        rows: &mut Vec<SstableRow>,
+    ) {
+        if let Some(table) = self.tables.get(&table_id) {
+            table.collect_visible_rows(key, sequence, rows);
+        }
+    }
+
+    fn force_collapse(
+        &mut self,
+        table_id: TableId,
+        key: Key,
+        sequence: SequenceNumber,
+        value: Value,
+    ) {
+        self.max_sequence = self.max_sequence.max(sequence);
+        self.tables
+            .entry(table_id)
+            .or_default()
+            .insert(MemtableEntry::new(
+                key,
+                sequence,
+                ChangeKind::Put,
+                Some(value),
+            ));
     }
 
     fn pending_flush_bytes(&self, table_id: TableId) -> u64 {
@@ -861,54 +933,7 @@ impl Memtable {
     }
 }
 
-impl SstableRow {
-    fn visible_value(&self) -> Option<Value> {
-        match self.kind {
-            ChangeKind::Delete => None,
-            ChangeKind::Put | ChangeKind::Merge => self.value.clone(),
-        }
-    }
-}
-
 impl ResidentRowSstable {
-    fn read_at(&self, key: &[u8], sequence: SequenceNumber) -> Option<SstableRow> {
-        if key < self.meta.min_key.as_slice()
-            || key > self.meta.max_key.as_slice()
-            || sequence < self.meta.min_sequence
-        {
-            return None;
-        }
-
-        if let Some(filter) = &self.user_key_bloom_filter
-            && !filter.may_contain(key)
-        {
-            return None;
-        }
-
-        let start = self.lower_bound(key);
-        let mut best: Option<SstableRow> = None;
-
-        for row in &self.rows[start..] {
-            match row.key.as_slice().cmp(key) {
-                std::cmp::Ordering::Less => continue,
-                std::cmp::Ordering::Greater => break,
-                std::cmp::Ordering::Equal => {
-                    if row.sequence <= sequence {
-                        let replace = match best.as_ref() {
-                            Some(current) => row.sequence > current.sequence,
-                            None => true,
-                        };
-                        if replace {
-                            best = Some(row.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        best
-    }
-
     fn collect_matching_keys(&self, matcher: &KeyMatcher<'_>, keys: &mut BTreeSet<Key>) {
         let start = match matcher {
             KeyMatcher::Range { start, .. } | KeyMatcher::Prefix(start) => self.lower_bound(start),
@@ -932,41 +957,45 @@ impl ResidentRowSstable {
         }
     }
 
+    fn collect_visible_rows(
+        &self,
+        key: &[u8],
+        sequence: SequenceNumber,
+        rows: &mut Vec<SstableRow>,
+    ) {
+        if key < self.meta.min_key.as_slice()
+            || key > self.meta.max_key.as_slice()
+            || sequence < self.meta.min_sequence
+        {
+            return;
+        }
+
+        if let Some(filter) = &self.user_key_bloom_filter
+            && !filter.may_contain(key)
+        {
+            return;
+        }
+
+        let start = self.lower_bound(key);
+        for row in &self.rows[start..] {
+            match row.key.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {
+                    if row.sequence <= sequence {
+                        rows.push(row.clone());
+                    }
+                }
+            }
+        }
+    }
+
     fn lower_bound(&self, target: &[u8]) -> usize {
         self.rows.partition_point(|row| row.key.as_slice() < target)
     }
 }
 
 impl SstableState {
-    fn read_at(
-        &self,
-        table_id: TableId,
-        key: &[u8],
-        sequence: SequenceNumber,
-    ) -> Option<SstableRow> {
-        let mut best: Option<SstableRow> = None;
-
-        for sstable in &self.live {
-            if sstable.meta.table_id != table_id {
-                continue;
-            }
-
-            let Some(candidate) = sstable.read_at(key, sequence) else {
-                continue;
-            };
-
-            let replace = match best.as_ref() {
-                Some(current) => candidate.sequence > current.sequence,
-                None => true,
-            };
-            if replace {
-                best = Some(candidate);
-            }
-        }
-
-        best
-    }
-
     fn collect_matching_keys(
         &self,
         table_id: TableId,
@@ -979,6 +1008,22 @@ impl SstableState {
             }
 
             sstable.collect_matching_keys(matcher, keys);
+        }
+    }
+
+    fn collect_visible_rows(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+        rows: &mut Vec<SstableRow>,
+    ) {
+        for sstable in &self.live {
+            if sstable.meta.table_id != table_id {
+                continue;
+            }
+
+            sstable.collect_visible_rows(key, sequence, rows);
         }
     }
 
@@ -1026,6 +1071,7 @@ impl MemtableState {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_at(
         &self,
         table_id: TableId,
@@ -1070,6 +1116,32 @@ impl MemtableState {
                 .memtable
                 .collect_matching_keys(table_id, matcher, keys);
         }
+    }
+
+    fn collect_visible_rows(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+        rows: &mut Vec<SstableRow>,
+    ) {
+        self.mutable
+            .collect_visible_rows(table_id, key, sequence, rows);
+        for immutable in &self.immutables {
+            immutable
+                .memtable
+                .collect_visible_rows(table_id, key, sequence, rows);
+        }
+    }
+
+    fn force_collapse(
+        &mut self,
+        table_id: TableId,
+        key: Key,
+        sequence: SequenceNumber,
+        value: Value,
+    ) {
+        self.mutable.force_collapse(table_id, key, sequence, value);
     }
 
     fn rotate_mutable(&mut self) -> Option<SequenceNumber> {
@@ -1238,6 +1310,7 @@ impl PersistedCatalogEntry {
             config: PersistedTableConfig {
                 name: table.config.name.clone(),
                 format: table.config.format,
+                max_merge_operand_chain_length: table.config.max_merge_operand_chain_length,
                 bloom_filter_bits_per_key: table.config.bloom_filter_bits_per_key,
                 history_retention_sequences: table.config.history_retention_sequences,
                 compaction_strategy: table.config.compaction_strategy,
@@ -1254,6 +1327,7 @@ impl PersistedCatalogEntry {
                 name: self.config.name,
                 format: self.config.format,
                 merge_operator: None,
+                max_merge_operand_chain_length: self.config.max_merge_operand_chain_length,
                 compaction_filter: None,
                 bloom_filter_bits_per_key: self.config.bloom_filter_bits_per_key,
                 history_retention_sequences: self.config.history_retention_sequences,
@@ -1385,6 +1459,11 @@ impl Db {
                 "history_retention_sequences must be greater than zero".to_string(),
             ));
         }
+        if matches!(config.max_merge_operand_chain_length, Some(0)) {
+            return Err(CreateTableError::InvalidConfig(
+                "max_merge_operand_chain_length must be greater than zero".to_string(),
+            ));
+        }
         if matches!(config.format, TableFormat::Columnar) && config.schema.is_none() {
             return Err(CreateTableError::InvalidConfig(
                 "columnar tables require a schema".to_string(),
@@ -1392,6 +1471,16 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    fn same_persisted_table_config(left: &TableConfig, right: &TableConfig) -> bool {
+        left.name == right.name
+            && left.format == right.format
+            && left.max_merge_operand_chain_length == right.max_merge_operand_chain_length
+            && left.bloom_filter_bits_per_key == right.bloom_filter_bits_per_key
+            && left.compaction_strategy == right.compaction_strategy
+            && left.schema == right.schema
+            && left.metadata == right.metadata
     }
 
     fn catalog_location(storage: &StorageConfig) -> CatalogLocation {
@@ -2531,6 +2620,42 @@ impl Db {
         retained
     }
 
+    fn rewrite_compaction_rows(
+        tables: &BTreeMap<String, StoredTable>,
+        memtables: &MemtableState,
+        sstables: &SstableState,
+        table_id: TableId,
+        rows: Vec<SstableRow>,
+    ) -> Result<Vec<SstableRow>, StorageError> {
+        let mut rewritten = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.kind != ChangeKind::Merge {
+                rewritten.push(row);
+                continue;
+            }
+
+            let resolved = Self::resolve_visible_value_with_state(
+                tables,
+                memtables,
+                sstables,
+                table_id,
+                &row.key,
+                row.sequence,
+            )?;
+            let value = resolved.value.ok_or_else(|| {
+                StorageError::corruption("merge resolution unexpectedly produced a tombstone")
+            })?;
+            rewritten.push(SstableRow {
+                key: row.key,
+                sequence: row.sequence,
+                kind: ChangeKind::Put,
+                value: Some(value),
+            });
+        }
+
+        Ok(rewritten)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     async fn write_compaction_outputs(
         &self,
@@ -2605,10 +2730,10 @@ impl Db {
         local_root: &str,
         job: CompactionJob,
     ) -> Result<(), StorageError> {
-        let table = self
-            .tables_read()
-            .values()
-            .find(|table| table.id == job.table_id)
+        let tables = self.tables_read().clone();
+        let memtables = self.memtables_read().clone();
+        let sstables = self.sstables_read().clone();
+        let table = Self::stored_table_by_id(&tables, job.table_id)
             .cloned()
             .ok_or_else(|| {
                 StorageError::corruption(format!(
@@ -2616,7 +2741,7 @@ impl Db {
                     job.table_id.get()
                 ))
             })?;
-        let live = self.sstables_read().live.clone();
+        let live = sstables.live.clone();
         let input_local_ids = job.input_local_ids.iter().cloned().collect::<BTreeSet<_>>();
         let inputs = live
             .iter()
@@ -2640,6 +2765,13 @@ impl Db {
                     .collect::<Vec<_>>();
                 merged_rows
                     .sort_by_key(|row| encode_mvcc_key(&row.key, CommitId::new(row.sequence)));
+                merged_rows = Self::rewrite_compaction_rows(
+                    &tables,
+                    &memtables,
+                    &sstables,
+                    job.table_id,
+                    merged_rows,
+                )?;
                 merged_rows = Self::retain_rows_within_horizon(
                     merged_rows,
                     self.history_gc_horizon(job.table_id),
@@ -2735,7 +2867,22 @@ impl Db {
         })?;
 
         let mut updated_tables = self.tables_read().clone();
-        if updated_tables.contains_key(&name) {
+        if let Some(existing) = updated_tables.get(&name).cloned() {
+            if Self::same_persisted_table_config(&existing.config, &config)
+                && (config.merge_operator.is_some() || config.compaction_filter.is_some())
+            {
+                let mut refreshed = existing.clone();
+                refreshed.config.merge_operator = config.merge_operator;
+                refreshed.config.compaction_filter = config.compaction_filter;
+                updated_tables.insert(name.clone(), refreshed);
+                *self.tables_write() = updated_tables;
+
+                return Ok(Table {
+                    db: self.clone(),
+                    name: Arc::from(name),
+                    id: Some(existing.id),
+                });
+            }
             return Err(CreateTableError::AlreadyExists(name));
         }
 
@@ -3474,44 +3621,64 @@ impl Db {
         operations
             .iter()
             .map(|operation| match operation {
-                BatchOperation::Put { table, key, value } => Ok(ResolvedBatchOperation {
-                    table_id: self.resolve_table_id(table).ok_or_else(|| {
+                BatchOperation::Put { table, key, value } => {
+                    let stored = self.resolve_stored_table(table).ok_or_else(|| {
                         CommitError::Storage(StorageError::not_found(format!(
                             "table does not exist: {}",
                             table.name()
                         )))
-                    })?,
-                    table_name: table.name().to_string(),
-                    key: key.clone(),
-                    kind: ChangeKind::Put,
-                    value: Some(value.clone()),
-                }),
-                BatchOperation::Merge { table, key, value } => Ok(ResolvedBatchOperation {
-                    table_id: self.resolve_table_id(table).ok_or_else(|| {
+                    })?;
+                    Ok(ResolvedBatchOperation {
+                        table_id: stored.id,
+                        table_name: table.name().to_string(),
+                        key: key.clone(),
+                        kind: ChangeKind::Put,
+                        value: Some(value.clone()),
+                    })
+                }
+                BatchOperation::Merge { table, key, value } => {
+                    let stored = self.resolve_stored_table(table).ok_or_else(|| {
                         CommitError::Storage(StorageError::not_found(format!(
                             "table does not exist: {}",
                             table.name()
                         )))
-                    })?,
-                    table_name: table.name().to_string(),
-                    key: key.clone(),
-                    kind: ChangeKind::Merge,
-                    value: Some(value.clone()),
-                }),
-                BatchOperation::Delete { table, key } => Ok(ResolvedBatchOperation {
-                    table_id: self.resolve_table_id(table).ok_or_else(|| {
+                    })?;
+                    if stored.config.merge_operator.is_none() {
+                        return Err(CommitError::Storage(StorageError::unsupported(format!(
+                            "merge operator is not configured for table {}",
+                            table.name()
+                        ))));
+                    }
+                    Ok(ResolvedBatchOperation {
+                        table_id: stored.id,
+                        table_name: table.name().to_string(),
+                        key: key.clone(),
+                        kind: ChangeKind::Merge,
+                        value: Some(value.clone()),
+                    })
+                }
+                BatchOperation::Delete { table, key } => {
+                    let stored = self.resolve_stored_table(table).ok_or_else(|| {
                         CommitError::Storage(StorageError::not_found(format!(
                             "table does not exist: {}",
                             table.name()
                         )))
-                    })?,
-                    table_name: table.name().to_string(),
-                    key: key.clone(),
-                    kind: ChangeKind::Delete,
-                    value: None,
-                }),
+                    })?;
+                    Ok(ResolvedBatchOperation {
+                        table_id: stored.id,
+                        table_name: table.name().to_string(),
+                        key: key.clone(),
+                        kind: ChangeKind::Delete,
+                        value: None,
+                    })
+                }
             })
             .collect()
+    }
+
+    fn resolve_stored_table(&self, table: &Table) -> Option<StoredTable> {
+        let table_id = self.resolve_table_id(table)?;
+        Self::stored_table_by_id(&self.tables_read(), table_id).cloned()
     }
 
     fn resolve_table_id(&self, table: &Table) -> Option<TableId> {
@@ -3520,47 +3687,162 @@ impl Db {
             .or_else(|| self.tables_read().get(table.name()).map(|stored| stored.id))
     }
 
+    fn stored_table_by_id(
+        tables: &BTreeMap<String, StoredTable>,
+        table_id: TableId,
+    ) -> Option<&StoredTable> {
+        tables.values().find(|stored| stored.id == table_id)
+    }
+
+    fn max_merge_operand_chain_length(config: &TableConfig) -> usize {
+        config
+            .max_merge_operand_chain_length
+            .map(|limit| limit.max(1) as usize)
+            .unwrap_or(DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH)
+    }
+
+    fn visible_row_priority(kind: ChangeKind) -> u8 {
+        match kind {
+            ChangeKind::Merge => 1,
+            ChangeKind::Put | ChangeKind::Delete => 0,
+        }
+    }
+
+    fn collapse_merge_operands(
+        operator: &dyn crate::config::MergeOperator,
+        key: &[u8],
+        operands: &[Value],
+    ) -> Result<Vec<Value>, StorageError> {
+        let mut collapsed = Vec::with_capacity(operands.len());
+        for operand in operands.iter().cloned() {
+            collapsed.push(operand);
+            while collapsed.len() >= 2 {
+                let right = collapsed.pop().expect("right operand should exist");
+                let left = collapsed.pop().expect("left operand should exist");
+                match operator.partial_merge(key, &left, &right)? {
+                    Some(merged) => collapsed.push(merged),
+                    None => {
+                        collapsed.push(left);
+                        collapsed.push(right);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(collapsed)
+    }
+
+    fn resolve_visible_value_with_state(
+        tables: &BTreeMap<String, StoredTable>,
+        memtables: &MemtableState,
+        sstables: &SstableState,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<VisibleValueResolution, StorageError> {
+        let table = Self::stored_table_by_id(tables, table_id).ok_or_else(|| {
+            StorageError::not_found(format!("table id {} is not registered", table_id.get()))
+        })?;
+        let mut rows = Vec::new();
+        memtables.collect_visible_rows(table_id, key, sequence, &mut rows);
+        sstables.collect_visible_rows(table_id, key, sequence, &mut rows);
+        rows.sort_by(|left, right| {
+            right.sequence.cmp(&left.sequence).then_with(|| {
+                Self::visible_row_priority(left.kind).cmp(&Self::visible_row_priority(right.kind))
+            })
+        });
+
+        let Some(head) = rows.first() else {
+            return Ok(VisibleValueResolution {
+                value: None,
+                collapse: None,
+            });
+        };
+
+        match head.kind {
+            ChangeKind::Put => Ok(VisibleValueResolution {
+                value: Some(
+                    head.value
+                        .clone()
+                        .ok_or_else(|| StorageError::corruption("put row is missing a value"))?,
+                ),
+                collapse: None,
+            }),
+            ChangeKind::Delete => Ok(VisibleValueResolution {
+                value: None,
+                collapse: None,
+            }),
+            ChangeKind::Merge => {
+                let operator = table.config.merge_operator.as_ref().ok_or_else(|| {
+                    StorageError::unsupported(format!(
+                        "merge operator is not configured for table {}",
+                        table.config.name
+                    ))
+                })?;
+                let mut operands = Vec::new();
+                let mut existing = None;
+                for row in &rows {
+                    match row.kind {
+                        ChangeKind::Merge => operands.push(row.value.clone().ok_or_else(|| {
+                            StorageError::corruption("merge row is missing an operand value")
+                        })?),
+                        ChangeKind::Put => {
+                            existing = Some(row.value.as_ref().ok_or_else(|| {
+                                StorageError::corruption("put row is missing a value")
+                            })?);
+                            break;
+                        }
+                        ChangeKind::Delete => break,
+                    }
+                }
+                operands.reverse();
+                let collapsed = Self::collapse_merge_operands(operator.as_ref(), key, &operands)?;
+                let value = operator.full_merge(key, existing, &collapsed)?;
+                let collapse = (operands.len()
+                    > Self::max_merge_operand_chain_length(&table.config))
+                .then(|| MergeCollapse {
+                    sequence: head.sequence,
+                    value: value.clone(),
+                });
+
+                Ok(VisibleValueResolution {
+                    value: Some(value),
+                    collapse,
+                })
+            }
+        }
+    }
+
+    fn force_collapse_merge_chain(&self, table_id: TableId, key: &[u8], collapse: MergeCollapse) {
+        self.memtables_write().force_collapse(
+            table_id,
+            key.to_vec(),
+            collapse.sequence,
+            collapse.value,
+        );
+    }
+
     fn read_visible_value(
         &self,
         table_id: TableId,
         key: &[u8],
         sequence: SequenceNumber,
-    ) -> Option<Value> {
-        self.read_visible_entry(table_id, key, sequence)
-            .and_then(|entry| entry.visible_value())
-    }
+    ) -> Result<Option<Value>, StorageError> {
+        let resolution = {
+            let tables = self.tables_read();
+            let memtables = self.memtables_read();
+            let sstables = self.sstables_read();
+            Self::resolve_visible_value_with_state(
+                &tables, &memtables, &sstables, table_id, key, sequence,
+            )?
+        };
 
-    fn read_visible_entry(
-        &self,
-        table_id: TableId,
-        key: &[u8],
-        sequence: SequenceNumber,
-    ) -> Option<SstableRow> {
-        let memtable_best = self.memtables_read().read_at(table_id, key, sequence);
-        let sstable_best = self.sstables_read().read_at(table_id, key, sequence);
-
-        match (memtable_best, sstable_best) {
-            (Some(memtable), Some(sstable)) => {
-                if memtable.sequence >= sstable.sequence {
-                    Some(SstableRow {
-                        key: memtable.user_key,
-                        sequence: memtable.sequence,
-                        kind: memtable.kind,
-                        value: memtable.value,
-                    })
-                } else {
-                    Some(sstable)
-                }
-            }
-            (Some(memtable), None) => Some(SstableRow {
-                key: memtable.user_key,
-                sequence: memtable.sequence,
-                kind: memtable.kind,
-                value: memtable.value,
-            }),
-            (None, Some(sstable)) => Some(sstable),
-            (None, None) => None,
+        if let Some(collapse) = resolution.collapse.clone() {
+            self.force_collapse_merge_chain(table_id, key, collapse);
         }
+
+        Ok(resolution.value)
     }
 
     fn scan_visible(
@@ -3569,10 +3851,10 @@ impl Db {
         sequence: SequenceNumber,
         matcher: KeyMatcher<'_>,
         opts: &ScanOptions,
-    ) -> Vec<(Key, Value)> {
+    ) -> Result<Vec<(Key, Value)>, StorageError> {
         let limit = opts.limit.unwrap_or(usize::MAX);
         if limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut keys = BTreeSet::new();
@@ -3588,10 +3870,7 @@ impl Db {
 
         let mut rows = Vec::new();
         for key in ordered_keys {
-            let Some(entry) = self.read_visible_entry(table_id, &key, sequence) else {
-                continue;
-            };
-            let Some(value) = entry.visible_value() else {
+            let Some(value) = self.read_visible_value(table_id, &key, sequence)? else {
                 continue;
             };
 
@@ -3601,7 +3880,7 @@ impl Db {
             }
         }
 
-        rows
+        Ok(rows)
     }
 
     fn release_snapshot_registration(&self, id: u64) {
@@ -3783,7 +4062,7 @@ impl Table {
         };
         self.db.validate_historical_read(table_id, sequence)?;
 
-        Ok(self.db.read_visible_value(table_id, &key, sequence))
+        Ok(self.db.read_visible_value(table_id, &key, sequence)?)
     }
 
     pub async fn scan_at(
@@ -3806,7 +4085,7 @@ impl Table {
                 end: &end,
             },
             &opts,
-        );
+        )?;
         Ok(Box::pin(stream::iter(rows)))
     }
 
@@ -3823,7 +4102,7 @@ impl Table {
 
         let rows = self
             .db
-            .scan_visible(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts);
+            .scan_visible(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts)?;
         Ok(Box::pin(stream::iter(rows)))
     }
 
@@ -4032,12 +4311,12 @@ mod tests {
         SchemaDefinition, StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
     };
     use crate::{
-        CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
-        FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
-        FileSystemOperation, PointMutation, ReadError, Rng, S3Location, S3PrimaryStorageConfig,
-        ScanOptions, SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StorageError,
-        StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TableId,
-        TieredDurabilityMode, TieredStorageConfig, Value,
+        ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
+        DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
+        FileSystemFailure, FileSystemOperation, MergeOperator, MergeOperatorRef, PointMutation,
+        ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber,
+        ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng,
+        TableConfig, TableFormat, TableId, TieredDurabilityMode, TieredStorageConfig, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -4087,6 +4366,85 @@ mod tests {
         )
     }
 
+    #[derive(Debug)]
+    struct AppendMergeOperator;
+
+    impl MergeOperator for AppendMergeOperator {
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            existing: Option<&Value>,
+            operands: &[Value],
+        ) -> Result<Value, StorageError> {
+            let mut merged = match existing {
+                Some(Value::Bytes(bytes)) => bytes.clone(),
+                Some(_) => {
+                    return Err(StorageError::unsupported(
+                        "append merge operator only supports byte values",
+                    ));
+                }
+                None => Vec::new(),
+            };
+
+            for operand in operands {
+                let Value::Bytes(bytes) = operand else {
+                    return Err(StorageError::unsupported(
+                        "append merge operator only supports byte operands",
+                    ));
+                };
+                if !merged.is_empty() && !bytes.is_empty() {
+                    merged.push(b'|');
+                }
+                merged.extend_from_slice(bytes);
+            }
+
+            Ok(Value::Bytes(merged))
+        }
+
+        fn partial_merge(
+            &self,
+            _key: &[u8],
+            left: &Value,
+            right: &Value,
+        ) -> Result<Option<Value>, StorageError> {
+            let Value::Bytes(left_bytes) = left else {
+                return Err(StorageError::unsupported(
+                    "append merge operator only supports byte operands",
+                ));
+            };
+            let Value::Bytes(right_bytes) = right else {
+                return Err(StorageError::unsupported(
+                    "append merge operator only supports byte operands",
+                ));
+            };
+
+            let mut merged = left_bytes.clone();
+            if !merged.is_empty() && !right_bytes.is_empty() {
+                merged.push(b'|');
+            }
+            merged.extend_from_slice(right_bytes);
+            Ok(Some(Value::Bytes(merged)))
+        }
+    }
+
+    fn append_merge_operator() -> MergeOperatorRef {
+        Arc::new(AppendMergeOperator)
+    }
+
+    fn merge_row_table_config(
+        name: &str,
+        max_merge_operand_chain_length: Option<u32>,
+    ) -> TableConfig {
+        let mut config = row_table_config(name);
+        config.merge_operator = Some(append_merge_operator());
+        config.max_merge_operand_chain_length = max_merge_operand_chain_length;
+        config
+    }
+
+    fn bytes(value: &str) -> Value {
+        Value::bytes(value.as_bytes().to_vec())
+    }
+
     fn row_table_config(name: &str) -> TableConfig {
         row_table_config_with_strategy(name, CompactionStrategy::Leveled)
     }
@@ -4099,6 +4457,7 @@ mod tests {
             name: name.to_string(),
             format: TableFormat::Row,
             merge_operator: None,
+            max_merge_operand_chain_length: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(10),
             history_retention_sequences: None,
@@ -4122,6 +4481,7 @@ mod tests {
             name: name.to_string(),
             format: TableFormat::Columnar,
             merge_operator: None,
+            max_merge_operand_chain_length: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(6),
             history_retention_sequences: Some(30),
@@ -4155,6 +4515,10 @@ mod tests {
     fn assert_catalog_entry(table: &StoredTable, expected: &TableConfig) {
         assert_eq!(table.config.name, expected.name);
         assert_eq!(table.config.format, expected.format);
+        assert_eq!(
+            table.config.max_merge_operand_chain_length,
+            expected.max_merge_operand_chain_length
+        );
         assert_eq!(
             table.config.bloom_filter_bits_per_key,
             expected.bloom_filter_bits_per_key
@@ -6896,6 +7260,331 @@ mod tests {
         assert_eq!(first.await.expect("join first"), SequenceNumber::new(1));
         assert_eq!(db.current_sequence(), SequenceNumber::new(2));
         assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+    }
+
+    #[test]
+    fn append_merge_operator_partial_merge_is_associative_and_full_merge_is_deterministic() {
+        let operator = AppendMergeOperator;
+        let existing = bytes("seed");
+        let a = bytes("A");
+        let b = bytes("B");
+        let c = bytes("C");
+
+        let merged_ab = operator
+            .partial_merge(b"doc", &a, &b)
+            .expect("partial merge A+B")
+            .expect("append merge should collapse adjacent operands");
+        let merged_bc = operator
+            .partial_merge(b"doc", &b, &c)
+            .expect("partial merge B+C")
+            .expect("append merge should collapse adjacent operands");
+
+        let direct = operator
+            .full_merge(b"doc", Some(&existing), &[a.clone(), b.clone(), c.clone()])
+            .expect("deterministic full merge");
+        let left_assoc = operator
+            .full_merge(b"doc", Some(&existing), &[merged_ab, c.clone()])
+            .expect("left-associated merge");
+        let right_assoc = operator
+            .full_merge(b"doc", Some(&existing), &[a.clone(), merged_bc])
+            .expect("right-associated merge");
+
+        assert_eq!(direct, bytes("seed|A|B|C"));
+        assert_eq!(direct, left_assoc);
+        assert_eq!(direct, right_assoc);
+        assert_eq!(
+            operator
+                .full_merge(b"doc", Some(&existing), &[a, b, c])
+                .expect("repeat deterministic full merge"),
+            direct
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_resolution_preserves_non_commutative_commit_order_across_memtables_and_sstables()
+    {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/merge-ordering"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("create merge table");
+
+        let base = table
+            .write(b"doc".to_vec(), bytes("seed"))
+            .await
+            .expect("write base value");
+        let first_merge = table
+            .merge(b"doc".to_vec(), bytes("A"))
+            .await
+            .expect("write first merge operand");
+        db.flush().await.expect("flush merge chain");
+        let second_merge = table
+            .merge(b"doc".to_vec(), bytes("B"))
+            .await
+            .expect("write second merge operand");
+
+        assert_eq!(
+            table
+                .read(b"doc".to_vec())
+                .await
+                .expect("latest merged read"),
+            Some(bytes("seed|A|B"))
+        );
+        assert_eq!(
+            table
+                .read_at(b"doc".to_vec(), base)
+                .await
+                .expect("read base sequence"),
+            Some(bytes("seed"))
+        );
+        assert_eq!(
+            table
+                .read_at(b"doc".to_vec(), first_merge)
+                .await
+                .expect("read first merged sequence"),
+            Some(bytes("seed|A"))
+        );
+        assert_eq!(
+            table
+                .read_at(b"doc".to_vec(), second_merge)
+                .await
+                .expect("read second merged sequence"),
+            Some(bytes("seed|A|B"))
+        );
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan(b"doc".to_vec(), b"doe".to_vec(), ScanOptions::default(),)
+                    .await
+                    .expect("scan merged key"),
+            )
+            .await,
+            vec![(b"doc".to_vec(), bytes("seed|A|B"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn long_merge_chains_force_a_collapsed_shadow_value_on_read() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/merge-collapse"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("create merge table");
+
+        table
+            .write(b"doc".to_vec(), bytes("seed"))
+            .await
+            .expect("write base value");
+        table
+            .merge(b"doc".to_vec(), bytes("A"))
+            .await
+            .expect("write operand A");
+        table
+            .merge(b"doc".to_vec(), bytes("B"))
+            .await
+            .expect("write operand B");
+        let latest = table
+            .merge(b"doc".to_vec(), bytes("C"))
+            .await
+            .expect("write operand C");
+        db.flush().await.expect("flush unresolved operands");
+
+        let table_id = table.id().expect("table id");
+        assert!(
+            db.memtables_read()
+                .read_at(table_id, b"doc", latest)
+                .is_none(),
+            "no collapsed shadow row should exist before the read"
+        );
+
+        assert_eq!(
+            table
+                .read(b"doc".to_vec())
+                .await
+                .expect("resolve long chain"),
+            Some(bytes("seed|A|B|C"))
+        );
+
+        let collapsed = db
+            .memtables_read()
+            .read_at(table_id, b"doc", latest)
+            .expect("forced collapse should install a shadow row");
+        assert_eq!(collapsed.kind, ChangeKind::Put);
+        assert_eq!(collapsed.value, Some(bytes("seed|A|B|C")));
+    }
+
+    #[tokio::test]
+    async fn compaction_rewrites_merge_rows_without_changing_historical_reads() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/merge-compaction"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("create merge table");
+
+        let base = table
+            .write(b"doc".to_vec(), bytes("seed"))
+            .await
+            .expect("write base value");
+        db.flush().await.expect("flush base value");
+        let first_merge = table
+            .merge(b"doc".to_vec(), bytes("A"))
+            .await
+            .expect("write operand A");
+        db.flush().await.expect("flush operand A");
+        let second_merge = table
+            .merge(b"doc".to_vec(), bytes("B"))
+            .await
+            .expect("write operand B");
+        db.flush().await.expect("flush operand B");
+
+        let before = vec![
+            table
+                .read_at(b"doc".to_vec(), base)
+                .await
+                .expect("read base before compaction"),
+            table
+                .read_at(b"doc".to_vec(), first_merge)
+                .await
+                .expect("read first merge before compaction"),
+            table
+                .read_at(b"doc".to_vec(), second_merge)
+                .await
+                .expect("read second merge before compaction"),
+        ];
+
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run merge compaction")
+        );
+
+        let after = vec![
+            table
+                .read_at(b"doc".to_vec(), base)
+                .await
+                .expect("read base after compaction"),
+            table
+                .read_at(b"doc".to_vec(), first_merge)
+                .await
+                .expect("read first merge after compaction"),
+            table
+                .read_at(b"doc".to_vec(), second_merge)
+                .await
+                .expect("read second merge after compaction"),
+        ];
+        assert_eq!(after, before);
+
+        let live = db.sstables_read().live.clone();
+        assert_eq!(live.len(), 1);
+        let doc_rows = live[0]
+            .rows
+            .iter()
+            .filter(|row| row.key == b"doc")
+            .collect::<Vec<_>>();
+        assert_eq!(doc_rows.len(), 3);
+        assert!(doc_rows.iter().all(|row| row.kind == ChangeKind::Put));
+        assert_eq!(
+            doc_rows
+                .iter()
+                .map(|row| row.value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(bytes("seed|A|B")),
+                Some(bytes("seed|A")),
+                Some(bytes("seed")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_recovers_unresolved_merge_operands_from_sstables_and_memtables() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store);
+        let db = Db::open(tiered_config("/merge-recovery"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("create merge table");
+
+        table
+            .write(b"doc".to_vec(), bytes("seed"))
+            .await
+            .expect("write base value");
+        let first_merge = table
+            .merge(b"doc".to_vec(), bytes("A"))
+            .await
+            .expect("write first operand");
+        db.flush().await.expect("flush unresolved SSTable operand");
+        let latest = table
+            .merge(b"doc".to_vec(), bytes("B"))
+            .await
+            .expect("write tail operand");
+
+        let reopened = Db::open(tiered_config("/merge-recovery"), dependencies)
+            .await
+            .expect("reopen db");
+        let reopened_table = reopened
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("reattach merge operator through public API");
+        let table_id = reopened_table.id().expect("table id after reopen");
+
+        assert!(
+            reopened
+                .sstables_read()
+                .live
+                .iter()
+                .flat_map(|sstable| sstable.rows.iter())
+                .any(|row| row.key == b"doc" && row.kind == ChangeKind::Merge),
+            "reopened SSTables should still contain unresolved merge operands"
+        );
+        assert_eq!(
+            reopened
+                .memtables_read()
+                .read_at(table_id, b"doc", latest)
+                .expect("recover memtable tail")
+                .kind,
+            ChangeKind::Merge
+        );
+
+        assert_eq!(
+            reopened_table
+                .read(b"doc".to_vec())
+                .await
+                .expect("latest merged read after reopen"),
+            Some(bytes("seed|A|B"))
+        );
+        assert_eq!(
+            reopened_table
+                .read_at(b"doc".to_vec(), first_merge)
+                .await
+                .expect("historical read after reopen"),
+            Some(bytes("seed|A"))
+        );
     }
 
     #[tokio::test]

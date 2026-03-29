@@ -2,10 +2,72 @@ use std::sync::Arc;
 
 use terracedb::{
     CommitOptions, CompactionStrategy, Db, DbConfig, DbDependencies, FieldDefinition, FieldId,
-    FieldType, FieldValue, LogCursor, NoopScheduler, S3Location, ScanOptions, SchemaDefinition,
-    SequenceNumber, SsdConfig, StorageConfig, StubClock, StubFileSystem, StubObjectStore, StubRng,
-    TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Value,
+    FieldType, FieldValue, LogCursor, MergeOperator, NoopScheduler, S3Location, ScanOptions,
+    SchemaDefinition, SequenceNumber, SsdConfig, StorageConfig, StorageError, StubClock,
+    StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
+    TieredStorageConfig, Value,
 };
+
+#[derive(Debug)]
+struct AppendMergeOperator;
+
+impl MergeOperator for AppendMergeOperator {
+    fn full_merge(
+        &self,
+        _key: &[u8],
+        existing: Option<&Value>,
+        operands: &[Value],
+    ) -> Result<Value, StorageError> {
+        let mut merged = match existing {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            Some(_) => {
+                return Err(StorageError::unsupported(
+                    "append merge operator only supports byte values",
+                ));
+            }
+            None => Vec::new(),
+        };
+
+        for operand in operands {
+            let Value::Bytes(bytes) = operand else {
+                return Err(StorageError::unsupported(
+                    "append merge operator only supports byte operands",
+                ));
+            };
+            if !merged.is_empty() && !bytes.is_empty() {
+                merged.push(b'|');
+            }
+            merged.extend_from_slice(bytes);
+        }
+
+        Ok(Value::Bytes(merged))
+    }
+
+    fn partial_merge(
+        &self,
+        _key: &[u8],
+        left: &Value,
+        right: &Value,
+    ) -> Result<Option<Value>, StorageError> {
+        let Value::Bytes(left_bytes) = left else {
+            return Err(StorageError::unsupported(
+                "append merge operator only supports byte operands",
+            ));
+        };
+        let Value::Bytes(right_bytes) = right else {
+            return Err(StorageError::unsupported(
+                "append merge operator only supports byte operands",
+            ));
+        };
+
+        let mut merged = left_bytes.clone();
+        if !merged.is_empty() && !right_bytes.is_empty() {
+            merged.push(b'|');
+        }
+        merged.extend_from_slice(right_bytes);
+        Ok(Some(Value::Bytes(merged)))
+    }
+}
 
 #[tokio::test]
 async fn public_api_surface_compiles_and_is_instantiable() {
@@ -37,7 +99,8 @@ async fn public_api_surface_compiles_and_is_instantiable() {
         .create_table(TableConfig {
             name: "events".to_string(),
             format: TableFormat::Row,
-            merge_operator: None,
+            merge_operator: Some(Arc::new(AppendMergeOperator)),
+            max_merge_operand_chain_length: Some(4),
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(10),
             history_retention_sequences: None,
@@ -53,6 +116,7 @@ async fn public_api_surface_compiles_and_is_instantiable() {
             name: "metrics".to_string(),
             format: TableFormat::Columnar,
             merge_operator: None,
+            max_merge_operand_chain_length: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(8),
             history_retention_sequences: Some(128),

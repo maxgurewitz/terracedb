@@ -13,12 +13,19 @@ use crate::{
 pub type TableMetadata = BTreeMap<String, JsonValue>;
 
 pub trait MergeOperator: Send + Sync {
-    fn merge(
+    fn full_merge(
         &self,
         key: &[u8],
         existing: Option<&Value>,
-        delta: &Value,
+        operands: &[Value],
     ) -> Result<Value, StorageError>;
+
+    fn partial_merge(
+        &self,
+        key: &[u8],
+        left: &Value,
+        right: &Value,
+    ) -> Result<Option<Value>, StorageError>;
 }
 
 pub type MergeOperatorRef = Arc<dyn MergeOperator>;
@@ -120,6 +127,7 @@ pub struct TableConfig {
     pub name: String,
     pub format: TableFormat,
     pub merge_operator: Option<MergeOperatorRef>,
+    pub max_merge_operand_chain_length: Option<u32>,
     pub compaction_filter: Option<CompactionFilterRef>,
     pub bloom_filter_bits_per_key: Option<u32>,
     pub history_retention_sequences: Option<u64>,
@@ -136,6 +144,10 @@ impl fmt::Debug for TableConfig {
             .field(
                 "merge_operator",
                 &self.merge_operator.as_ref().map(|_| "<dyn MergeOperator>"),
+            )
+            .field(
+                "max_merge_operand_chain_length",
+                &self.max_merge_operand_chain_length,
             )
             .field(
                 "compaction_filter",
