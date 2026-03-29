@@ -1,0 +1,105 @@
+use crate::ids::SequenceNumber;
+use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageErrorKind {
+    Io,
+    Corruption,
+    Timeout,
+    DurabilityBoundary,
+    Unsupported,
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("{kind:?}: {message}")]
+pub struct StorageError {
+    kind: StorageErrorKind,
+    message: String,
+}
+
+impl StorageError {
+    pub fn new(kind: StorageErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> StorageErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum OpenError {
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("operation not implemented: {0}")]
+    Unimplemented(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum CreateTableError {
+    #[error("table already exists: {0}")]
+    AlreadyExists(String),
+    #[error("invalid table configuration: {0}")]
+    InvalidConfig(String),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("operation not implemented: {0}")]
+    Unimplemented(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum CommitError {
+    #[error("conflict detected")]
+    Conflict,
+    #[error("cannot commit an empty batch")]
+    EmptyBatch,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("operation not implemented: {0}")]
+    Unimplemented(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum WriteError {
+    #[error(transparent)]
+    Commit(#[from] CommitError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ReadError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("operation not implemented: {0}")]
+    Unimplemented(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum FlushError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("operation not implemented: {0}")]
+    Unimplemented(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error(
+    "history older than retained horizon: requested {requested}, oldest available {oldest_available}"
+)]
+pub struct SnapshotTooOld {
+    pub requested: SequenceNumber,
+    pub oldest_available: SequenceNumber,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("subscription closed")]
+pub struct SubscriptionClosed;

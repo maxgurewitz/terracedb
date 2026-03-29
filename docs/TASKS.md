@@ -118,14 +118,14 @@ Implement the injected trait layer for all external effects: local storage, obje
 
 1. Implement production adapters for `FileSystem`, `ObjectStore`, `Clock`, and `Rng`.
 2. Ensure the production filesystem adapter hides blocking local I/O behind controlled Tokio integration (for example `spawn_blocking`).
-3. Implement deterministic/simulated versions of all four traits for tests.
+3. Implement deterministic/simulated versions of all four traits for tests, using turmoil-backed simulated I/O/time where appropriate and mad-turmoil to catch nondeterminism that escapes the trait boundary.
 4. Standardize error mapping so later tasks can distinguish I/O failure, corruption, timeouts, and durability boundaries cleanly.
 5. Wire dependency injection through DB open/config so no subsystem constructs ambient implementations internally.
 
 **Verification**
 
 - Unit tests for open/read/write/range-read/rename/delete/list behavior on each adapter.
-- Deterministic tests proving seeded RNG output and simulated clock behavior are reproducible.
+- Deterministic tests proving seeded RNG output and simulated clock behavior are reproducible under the turmoil/mad-turmoil test harness.
 - Simulation tests that inject disk-full, timeout, stale-list, and partial-read failures through the trait boundary and verify structured errors rather than panics.
 
 ---
@@ -140,15 +140,15 @@ Build the reusable simulation harness that every later task will plug into. This
 
 **Implementation steps**
 
-1. Build a deterministic simulation runner using a single Tokio runtime under test control.
-2. Integrate a turmoil-based or equivalent simulated object-store/network host and a simulated filesystem.
+1. Build a deterministic simulation runner using a single Tokio runtime under turmoil's control, with mad-turmoil enabled so leaked wall-clock or entropy access is surfaced during tests.
+2. Integrate a turmoil-based simulated object-store/network host and simulated filesystem adapters through the `FileSystem` and `ObjectStore` traits established in T02.
 3. Implement seeded workload and fault-schedule generation plus trace capture.
 4. Implement an initial shadow oracle for point state, sequence ordering, and recovery-prefix validation.
 5. Add helpers to crash and restart the DB at controlled cut points.
 
 **Verification**
 
-- Reproducibility test: same seed produces the same workload, fault schedule, and trace.
+- Reproducibility test: same seed under turmoil/mad-turmoil produces the same workload, fault schedule, and trace.
 - Variance test: different seeds change at least one part of workload shape or execution order.
 - Crash/restart simulation of an empty or stub DB to prove the harness itself is stable before engine logic is added.
 
