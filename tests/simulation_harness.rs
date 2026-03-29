@@ -5,12 +5,13 @@ use std::sync::{
 
 use terracedb::{
     CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig, DbGeneratedScenario, DbMutation,
-    DbShadowOracle, DbSimulationScenarioConfig, DbWorkloadOperation, OperationResult, PendingWork,
-    PointMutation, S3Location, ScheduleAction, ScheduleDecision, ScheduledFault,
+    DbShadowOracle, DbSimulationScenarioConfig, DbWorkloadOperation, ObjectStore,
+    ObjectStoreFaultSpec, ObjectStoreOperation, OperationResult, PendingWork, PointMutation,
+    RemoteCache, RemoteRecoveryHint, S3Location, ScheduleAction, ScheduleDecision, ScheduledFault,
     ScheduledFaultKind, Scheduler, SeededSimulationRunner, SequenceNumber, ShadowOracle,
     SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, SsdConfig,
-    StorageConfig, StubDbProcess, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, TraceEvent, Value,
+    StorageConfig, StorageErrorKind, StorageSource, StubDbProcess, TableStats, ThrottleDecision,
+    TieredDurabilityMode, TieredStorageConfig, TraceEvent, UnifiedStorage, Value,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
@@ -714,6 +715,90 @@ fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
             db.table_stats(&table).await.l0_sstable_count <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
             "random scheduling should never outrun the engine guardrails"
         );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn remote_cache_survives_simulated_restart_and_masks_warmed_network_faults() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2020).run_with(|context| async move {
+        let key = "backup/sst/table-000001/0000/SST-000001.sst";
+        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+        let cache_root = "/terracedb/sim/remote-cache";
+
+        context.object_store().put(key, &payload).await?;
+
+        let cache = Arc::new(RemoteCache::open(context.file_system(), cache_root).await?);
+        let storage =
+            UnifiedStorage::new(context.file_system(), context.object_store(), Some(cache));
+        let source = StorageSource::remote_object(key);
+
+        let first_range = storage.read_range(&source, 2..7).await?;
+        assert_eq!(first_range, b"cdefg");
+
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::GetRange,
+                target_prefix: key.to_string(),
+            })
+            .await?;
+        let cached_range = storage.read_range(&source, 2..7).await?;
+        assert_eq!(cached_range, b"cdefg");
+
+        let full = storage.read_all(&source).await?;
+        assert_eq!(full, payload);
+
+        context.crash_filesystem(CutPoint::AfterStep);
+        let reopened_cache = Arc::new(RemoteCache::open(context.file_system(), cache_root).await?);
+        let reopened_storage = UnifiedStorage::new(
+            context.file_system(),
+            context.object_store(),
+            Some(reopened_cache),
+        );
+
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Get,
+                target_prefix: key.to_string(),
+            })
+            .await?;
+        let reopened_full = reopened_storage.read_all(&source).await?;
+        assert_eq!(reopened_full, payload);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn remote_list_failures_are_structured_in_simulation() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2121).run_with(|context| async move {
+        let manifest_prefix = "backup/manifest/";
+        let storage = UnifiedStorage::new(context.file_system(), context.object_store(), None);
+
+        context
+            .object_store()
+            .put("backup/manifest/MANIFEST-000001", b"manifest-1")
+            .await?;
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::StaleList {
+                prefix: manifest_prefix.to_string(),
+            })
+            .await?;
+
+        let error = storage
+            .list_objects(manifest_prefix)
+            .await
+            .expect_err("stale list should surface a structured remote error");
+
+        assert_eq!(error.kind(), StorageErrorKind::DurabilityBoundary);
+        assert_eq!(error.recovery_hint(), RemoteRecoveryHint::RefreshListing);
+
+        let listed = storage.list_objects(manifest_prefix).await?;
+        assert_eq!(listed, vec!["backup/manifest/MANIFEST-000001".to_string()]);
 
         Ok(())
     })

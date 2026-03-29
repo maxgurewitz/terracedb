@@ -33,6 +33,7 @@ use crate::{
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SequenceNumber, TableId},
     io::{DbDependencies, OpenOptions},
+    remote::{StorageSource, UnifiedStorage},
     scheduler::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
         ScheduleAction, Scheduler, TableStats,
@@ -356,6 +357,8 @@ struct PersistedManifestSstable {
     level: u32,
     local_id: String,
     file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_key: Option<String>,
     length: u64,
     checksum: u32,
     data_checksum: u32,
@@ -363,6 +366,26 @@ struct PersistedManifestSstable {
     max_key: Key,
     min_sequence: SequenceNumber,
     max_sequence: SequenceNumber,
+}
+
+impl PersistedManifestSstable {
+    fn storage_source(&self) -> StorageSource {
+        if !self.file_path.is_empty() {
+            StorageSource::local_file(self.file_path.clone())
+        } else if let Some(remote_key) = &self.remote_key {
+            StorageSource::remote_object(remote_key.clone())
+        } else {
+            StorageSource::local_file(self.file_path.clone())
+        }
+    }
+
+    fn storage_descriptor(&self) -> &str {
+        if !self.file_path.is_empty() {
+            &self.file_path
+        } else {
+            self.remote_key.as_deref().unwrap_or("")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1935,7 +1958,7 @@ impl Db {
         dependencies: &DbDependencies,
         path: &str,
     ) -> Result<LoadedManifest, StorageError> {
-        let bytes = read_path(dependencies, path).await?;
+        let bytes = read_source(dependencies, &StorageSource::local_file(path)).await?;
         let file: PersistedManifestFile = serde_json::from_slice(&bytes).map_err(|error| {
             StorageError::corruption(format!("decode manifest {path} failed: {error}"))
         })?;
@@ -1980,18 +2003,20 @@ impl Db {
         dependencies: &DbDependencies,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
-        let bytes = read_path(dependencies, &meta.file_path).await?;
+        let source = meta.storage_source();
+        let location = meta.storage_descriptor();
+        let bytes = read_source(dependencies, &source).await?;
         if bytes.len() as u64 != meta.length {
             return Err(StorageError::corruption(format!(
                 "sstable {} length mismatch: manifest={}, file={}",
-                meta.file_path,
+                location,
                 meta.length,
                 bytes.len()
             )));
         }
 
         let file: PersistedRowSstableFile = serde_json::from_slice(&bytes).map_err(|error| {
-            StorageError::corruption(format!("decode SSTable {} failed: {error}", meta.file_path))
+            StorageError::corruption(format!("decode SSTable {location} failed: {error}"))
         })?;
         if file.body.format_version != ROW_SSTABLE_FORMAT_VERSION {
             return Err(StorageError::unsupported(format!(
@@ -2005,8 +2030,7 @@ impl Db {
         })?;
         if checksum32(&encoded_body) != file.checksum || file.checksum != meta.checksum {
             return Err(StorageError::corruption(format!(
-                "SSTable checksum mismatch for {}",
-                meta.file_path
+                "SSTable checksum mismatch for {location}",
             )));
         }
 
@@ -2017,8 +2041,7 @@ impl Db {
             || file.body.data_checksum != meta.data_checksum
         {
             return Err(StorageError::corruption(format!(
-                "SSTable data checksum mismatch for {}",
-                meta.file_path
+                "SSTable data checksum mismatch for {location}",
             )));
         }
 
@@ -2031,8 +2054,7 @@ impl Db {
             || file.body.max_sequence != meta.max_sequence
         {
             return Err(StorageError::corruption(format!(
-                "manifest metadata does not match SSTable {}",
-                meta.file_path
+                "manifest metadata does not match SSTable {location}",
             )));
         }
 
@@ -2048,8 +2070,7 @@ impl Db {
             || computed.max_sequence != meta.max_sequence
         {
             return Err(StorageError::corruption(format!(
-                "SSTable row summary does not match metadata for {}",
-                meta.file_path
+                "SSTable row summary does not match metadata for {location}",
             )));
         }
 
@@ -2092,6 +2113,7 @@ impl Db {
             level,
             local_id: local_id.to_string(),
             file_path: String::new(),
+            remote_key: None,
             length: 0,
             checksum: 0,
             data_checksum: 0,
@@ -4793,21 +4815,19 @@ async fn read_all_file(
     Ok(bytes)
 }
 
+#[cfg(test)]
 async fn read_path(dependencies: &DbDependencies, path: &str) -> Result<Vec<u8>, StorageError> {
-    let handle = dependencies
-        .file_system
-        .open(
-            path,
-            OpenOptions {
-                create: false,
-                read: true,
-                write: false,
-                truncate: false,
-                append: false,
-            },
-        )
-        .await?;
-    read_all_file(dependencies, &handle).await
+    read_source(dependencies, &StorageSource::local_file(path)).await
+}
+
+async fn read_source(
+    dependencies: &DbDependencies,
+    source: &StorageSource,
+) -> Result<Vec<u8>, StorageError> {
+    UnifiedStorage::from_dependencies(dependencies)
+        .read_all(source)
+        .await
+        .map_err(|error| error.into_storage_error())
 }
 
 async fn read_optional_path(
@@ -4866,12 +4886,12 @@ mod tests {
     use crate::{
         ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
         DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
-        FileSystemFailure, FileSystemOperation, MergeOperator, MergeOperatorRef, PointMutation,
-        ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber,
-        ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng,
-        TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
-        TieredStorageConfig, Timestamp, TtlCompactionFilter, Value, PendingWork, PendingWorkType,
-        ScheduleAction, ScheduleDecision, Scheduler,
+        FileSystemFailure, FileSystemOperation, MergeOperator, MergeOperatorRef, PendingWork,
+        PendingWorkType, PointMutation, ReadError, Rng, S3Location, S3PrimaryStorageConfig,
+        ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SequenceNumber, ShadowOracle,
+        SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng, TableConfig,
+        TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
+        TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
