@@ -13,7 +13,7 @@ use terracedb::{
     SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
     SimulationScenarioConfig, SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind,
     StorageSource, StubDbProcess, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, TraceEvent, UnifiedStorage, Value,
+    TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
@@ -929,6 +929,84 @@ fn ttl_simulation_supports_snapshot_guarded_compaction_across_restart() -> turmo
     );
 
     Ok(())
+}
+
+#[test]
+fn occ_transaction_simulation_respects_flush_modes_across_restart() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2828).run_with(|context| async move {
+        let config = DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: "/terracedb/sim/t28-occ-transactions".to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-sim".to_string(),
+                    prefix: "occ-transactions".to_string(),
+                },
+                max_local_bytes: 1024 * 1024,
+                durability: TieredDurabilityMode::Deferred,
+            }),
+            scheduler: None,
+        };
+
+        let db = context.open_db(config.clone()).await?;
+        let table = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        let mut volatile_tx = Transaction::begin(&db).await;
+        volatile_tx.write(&table, b"user:1".to_vec(), Value::bytes("volatile-a"));
+        volatile_tx.write(&table, b"user:2".to_vec(), Value::bytes("volatile-b"));
+        assert_eq!(
+            volatile_tx.read(&table, b"user:1".to_vec()).await?,
+            Some(Value::bytes("volatile-a"))
+        );
+        assert_eq!(volatile_tx.commit_no_flush().await?, SequenceNumber::new(1));
+        assert_eq!(db.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+
+        let reopened = context
+            .restart_db(config.clone(), CutPoint::AfterStep)
+            .await?;
+        let reopened_table = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(0));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(0));
+        assert_eq!(reopened_table.read(b"user:1".to_vec()).await?, None);
+        assert_eq!(reopened_table.read(b"user:2".to_vec()).await?, None);
+
+        let mut durable_tx = Transaction::begin(&reopened).await;
+        durable_tx.write(
+            &reopened_table,
+            b"user:1".to_vec(),
+            Value::bytes("durable-a"),
+        );
+        durable_tx.write(
+            &reopened_table,
+            b"user:2".to_vec(),
+            Value::bytes("durable-b"),
+        );
+        assert_eq!(durable_tx.commit().await?, SequenceNumber::new(1));
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(1));
+
+        let durable_reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let durable_table = durable_reopened.table("events");
+        assert_eq!(durable_reopened.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(
+            durable_reopened.current_durable_sequence(),
+            SequenceNumber::new(1)
+        );
+        assert_eq!(
+            durable_table.read(b"user:1".to_vec()).await?,
+            Some(Value::bytes("durable-a"))
+        );
+        assert_eq!(
+            durable_table.read(b"user:2".to_vec()).await?,
+            Some(Value::bytes("durable-b"))
+        );
+
+        Ok(())
+    })
 }
 
 #[test]
