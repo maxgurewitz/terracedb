@@ -136,7 +136,7 @@ Implement the injected trait layer for all external effects: local storage, obje
 
 **Description**
 
-Build the reusable simulation harness that every later task will plug into. This includes seeded workload generation, fault injection controls, controlled crash/restart, and the first version of the oracle model.
+Build the deterministic substrate that every later task will extend. This task establishes seed replay, trace capture, controlled crash/restart, and the first reusable fault-injection and oracle machinery, but it is not the place to defer subsystem-specific correctness models; later tasks are expected to add production-path cut points, workload generators, and oracle extensions as their own semantics land.
 
 **Implementation steps**
 
@@ -419,7 +419,7 @@ Turn snapshot tracking into enforced retention semantics. Implement history recl
 
 **Description**
 
-Implement merge semantics end to end: merge-operand writes, read-time merge resolution, compaction-time full/partial merge, and forced collapse when operand chains get too long.
+Implement merge semantics end to end: merge-operand writes, read-time merge resolution, compaction-time full/partial merge, and forced collapse when operand chains get too long. This task also owns the merge-specific correctness model, including ordered-merge oracle behavior, merge-focused workloads, and production-path recovery cut points for unresolved operands.
 
 **Implementation steps**
 
@@ -469,7 +469,7 @@ Implement compaction filters, including deterministic TTL evaluation driven by t
 
 **Description**
 
-Implement background-work observability, scheduler callbacks, default scheduling policy, and engine-enforced safety guardrails that prevent deadlock or unbounded backlog regardless of scheduler behavior.
+Implement background-work observability, scheduler callbacks, default scheduling policy, and engine-enforced safety guardrails that prevent deadlock or unbounded backlog regardless of scheduler behavior. This task also establishes the scheduler-specific deterministic test surface: hostile/random scheduler implementations, progress invariants, and proof that scheduler freedom cannot violate engine guardrails.
 
 **Implementation steps**
 
@@ -501,7 +501,7 @@ Implement background-work observability, scheduler callbacks, default scheduling
 
 **Description**
 
-Implement change capture on top of the unified commit log: gap-free iteration, per-table segment indexing, visible-vs-durable boundaries, and exact cursor semantics.
+Implement change capture on top of the unified commit log: gap-free iteration, per-table segment indexing, visible-vs-durable boundaries, and exact cursor semantics. This task owns the exact change-feed correctness model for cursor semantics and `(sequence, op_index)` ordering so later full-stack tests can reuse that machinery rather than invent it from scratch.
 
 **Implementation steps**
 
@@ -526,7 +526,7 @@ Implement change capture on top of the unified commit log: gap-free iteration, p
 
 **Description**
 
-Implement the coalescing notification channels paired with change capture. These are wake-up signals, not full event queues.
+Implement the coalescing notification channels paired with change capture. These are wake-up signals, not full event queues. This task establishes the deterministic wakeup semantics that later projection, workflow, and simulation workloads rely on, rather than leaving notification behavior to be inferred indirectly by integration tests.
 
 **Implementation steps**
 
@@ -551,7 +551,7 @@ Implement the coalescing notification channels paired with change capture. These
 
 **Description**
 
-Implement retention and garbage collection for the unified commit log, including the change-feed version of `SnapshotTooOld`.
+Implement retention and garbage collection for the unified commit log, including the change-feed version of `SnapshotTooOld`. This task owns CDC-retention invariants, lagging-consumer scenarios, and change-feed `SnapshotTooOld` behavior so those rules are verified at the log layer before projections and workflows exercise them transitively.
 
 **Implementation steps**
 
@@ -580,7 +580,7 @@ Implement retention and garbage collection for the unified commit log, including
 
 **Description**
 
-Implement the shared object-store substrate used by tiered cold storage, backup, s3-primary mode, and remote columnar reads.
+Implement the shared object-store substrate used by tiered cold storage, backup, s3-primary mode, and remote columnar reads. This task also establishes the reusable remote-I/O fault model and range-read test substrate that later remote-storage tasks build on, rather than deferring remote fault semantics to the capstone pass.
 
 **Implementation steps**
 
@@ -605,7 +605,7 @@ Implement the shared object-store substrate used by tiered cold storage, backup,
 
 **Description**
 
-Implement tiered mode's cold-storage path: offloading old SSTables to S3, updating manifests, reclaiming local bytes, and reading cold SSTables through the normal read path.
+Implement tiered mode's cold-storage path: offloading old SSTables to S3, updating manifests, reclaiming local bytes, and reading cold SSTables through the normal read path. This task owns offload-specific crash/fault semantics and invariants around manifest publication, local reclamation, and read equivalence across local and remote placement.
 
 **Implementation steps**
 
@@ -630,7 +630,7 @@ Implement tiered mode's cold-storage path: offloading old SSTables to S3, updati
 
 **Description**
 
-Implement continuous backup/replication to S3, disaster recovery from S3, immutable manifest generations plus convenience pointers, and mark-and-sweep garbage collection of unreferenced S3 objects.
+Implement continuous backup/replication to S3, disaster recovery from S3, immutable manifest generations plus convenience pointers, and mark-and-sweep garbage collection of unreferenced S3 objects. This task owns backup/DR-specific correctness, including upload-order rules, orphan-object harmlessness, tail-RPO behavior, and S3 GC safety, rather than leaving those semantics to the final full-stack task.
 
 **Implementation steps**
 
@@ -655,7 +655,7 @@ Implement continuous backup/replication to S3, disaster recovery from S3, immuta
 
 **Description**
 
-Implement memory + S3 mode, including buffered visible commits, explicit `flush()` durability, same-process hybrid `scanSince`, and the exact visible-vs-durable semantics described in the architecture.
+Implement memory + S3 mode, including buffered visible commits, explicit `flush()` durability, same-process hybrid `scanSince`, and the exact visible-vs-durable semantics described in the architecture. This task owns the mode-specific visible-vs-durable rules, flush/recovery invariants, and the contract between in-process visible readers and durable-only readers that later higher-level libraries depend on.
 
 **Implementation steps**
 
@@ -663,13 +663,13 @@ Implement memory + S3 mode, including buffered visible commits, explicit `flush(
 2. Implement `flush()` to ship buffered commit-log data and SSTables to S3.
 3. Implement `currentDurableSequence()` and durable scanning for s3-primary mode.
 4. Implement same-process hybrid `scanSince` that merges durable S3 segments with the in-memory visible buffer.
-5. Ensure remote readers see only durable state while same-process readers can see the visible superset.
+5. Ensure `scanDurableSince` and any separate-process S3 readers see only flushed durable state, while same-process `scanSince` readers can see the visible superset.
 
 **Verification**
 
 - Tests proving `commit()` makes writes visible but not durable until `flush()`.
 - Crash tests showing everything after the last flush disappears consistently across source tables, cursors, projections, timers, outbox, and workflow state.
-- Tests showing local `scanSince` can see visible buffered entries while `scanDurableSince` cannot.
+- Tests showing same-process `scanSince` can see visible buffered entries while `scanDurableSince` and other durable-only readers cannot.
 - Simulation tests with failed flushes, partial uploads, and recovery to the last durable prefix.
 
 ---
@@ -734,7 +734,7 @@ Implement memtable flush to the physical columnar SSTable layout: key index, seq
 
 **Description**
 
-Implement local and remote read paths for columnar SSTables, including point lookup, scans with column pruning, default-filling for newly added columns, and exact range-fetch behavior on S3.
+Implement local and remote read paths for columnar SSTables, including point lookup, scans with column pruning, default-filling for newly added columns, and exact range-fetch behavior on S3. This task owns the supported read semantics for columnar tables, including exact remote fetch behavior and explicit fail-closed handling around unsupported overwritten-key-history cases.
 
 **Implementation steps**
 
@@ -760,7 +760,7 @@ Implement local and remote read paths for columnar SSTables, including point loo
 
 **Description**
 
-Complete columnar support by integrating it with compaction, merge operators, and lazy schema evolution.
+Complete columnar support by integrating it with compaction, merge operators, and lazy schema evolution. This task also owns the columnar-specific correctness model for schema evolution, compaction, and merge behavior so columnar semantics are already well-defined before the final full-stack matrix composes them with other subsystems.
 
 **Implementation steps**
 
@@ -814,7 +814,7 @@ Implement the user-space optimistic transaction helper described in the architec
 
 **Description**
 
-Implement reusable helper libraries for durable timers and transactional outbox processing. These are building blocks for workflows and other application code.
+Implement reusable helper libraries for durable timers and transactional outbox processing. These are building blocks for workflows and other application code, and this task owns their durability and replay semantics so workflows later compose trusted primitives rather than redefining timer/outbox correctness for themselves.
 
 **Implementation steps**
 
@@ -839,7 +839,7 @@ Implement reusable helper libraries for durable timers and transactional outbox 
 
 **Description**
 
-Implement the core projection runtime for single-source durable projections: whole-sequence batching, durable cursors, durable subscriptions, cursor/output atomicity, and watermark tracking.
+Implement the core projection runtime for single-source durable projections: whole-sequence batching, durable cursors, durable subscriptions, cursor/output atomicity, and watermark tracking. This task owns the single-source projection correctness model, including deterministic replay, cursor/output atomicity, and watermark progression, rather than treating projections as only an integration concern.
 
 **Implementation steps**
 
@@ -867,7 +867,7 @@ Implement the core projection runtime for single-source durable projections: who
 
 **Description**
 
-Extend the projection runtime to support multiple source tables, frontier-pinned reads, dependency ordering, transitive waits where supported, and recomputation from SSTables or checkpoints after `SnapshotTooOld`.
+Extend the projection runtime to support multiple source tables, frontier-pinned reads, dependency ordering, transitive waits where supported, and recomputation from SSTables or checkpoints after `SnapshotTooOld`. This task owns the multi-source projection correctness model, including frontier semantics, deterministic tie-breaking, recomputation behavior, and fail-closed handling of unsupported provenance cases.
 
 **Implementation steps**
 
@@ -894,7 +894,7 @@ Extend the projection runtime to support multiple source tables, frontier-pinned
 
 **Description**
 
-Implement the workflow runtime: durable trigger admission, per-instance trigger ordering, ready-instance scheduling, inbox execution, callback admission, timer admission, outbox delivery, and crash recovery.
+Implement the workflow runtime: durable trigger admission, per-instance trigger ordering, ready-instance scheduling, inbox execution, callback admission, timer admission, outbox delivery, and crash recovery. This task owns workflow-specific durability and ordering semantics, including trigger admission, inbox execution, timer/outbox correctness, and crash cut points, so the final full-stack task can compose workflows rather than define them.
 
 **Implementation steps**
 
@@ -930,7 +930,17 @@ Implement the workflow runtime: durable trigger admission, per-instance trigger 
 
 **Description**
 
-Build the full deterministic simulation matrix that exercises the engine, projections, and workflows together under randomized workloads and injected failures. This is the main correctness bar for the architecture as a whole.
+Compose the deterministic testing machinery built in earlier tasks into the full-system correctness matrix: mixed workloads, mixed fault workloads, large-seed campaigns, and cross-layer invariants spanning engine, projections, and workflows. This task is the capstone integration bar for the architecture as a whole, not the first place subsystem-specific oracles, fault hooks, or workload generators should appear.
+
+**Interpretation note**
+
+Implement this task in the strongest sense, following the FoundationDB testing philosophy rather than a weaker “simulation-flavored tests” version:
+
+- The simulation target is the real production engine / projection / workflow code, not a parallel stub-only model.
+- Production code paths should contain the fault hooks and cut points that simulation drives; adapter-only fault injection is not sufficient.
+- Randomized runs should be composed from domain workloads plus fault workloads, with invariants checked throughout, rather than from generic raw-I/O fuzzing alone.
+- A failing seed must reproduce the workload shape, injected faults, scheduling decisions, and trace, not merely the final state.
+- The goal of T33 is to make this randomized deterministic simulation matrix the primary correctness bar for the system, not an optional supplement to unit tests.
 
 **Implementation steps**
 

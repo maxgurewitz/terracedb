@@ -2711,7 +2711,7 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn run_next_compaction(&self) -> Result<bool, StorageError> {
+    pub(crate) async fn run_next_compaction(&self) -> Result<bool, StorageError> {
         let Some(local_root) = self.local_storage_root().map(str::to_string) else {
             return Ok(false);
         };
@@ -4445,6 +4445,107 @@ mod tests {
         Value::bytes(value.as_bytes().to_vec())
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum MergePointMutation {
+        Put { key: Vec<u8>, value: Vec<u8> },
+        Merge { key: Vec<u8>, value: Vec<u8> },
+        Delete { key: Vec<u8> },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct MergePointVersion {
+        sequence: SequenceNumber,
+        mutation: MergePointMutation,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct MergeShadowOracle {
+        versions: BTreeMap<Vec<u8>, Vec<MergePointVersion>>,
+    }
+
+    impl MergeShadowOracle {
+        fn apply(&mut self, sequence: SequenceNumber, mutation: MergePointMutation) {
+            let key = match &mutation {
+                MergePointMutation::Put { key, .. }
+                | MergePointMutation::Merge { key, .. }
+                | MergePointMutation::Delete { key } => key.clone(),
+            };
+            self.versions
+                .entry(key)
+                .or_default()
+                .push(MergePointVersion { sequence, mutation });
+        }
+
+        fn value_at(&self, key: &[u8], sequence: SequenceNumber) -> Option<Value> {
+            let versions = self.versions.get(key)?;
+            let operator = AppendMergeOperator;
+            let mut operands = Vec::new();
+            let mut existing = None;
+
+            for version in versions.iter().rev() {
+                if version.sequence > sequence {
+                    continue;
+                }
+                match &version.mutation {
+                    MergePointMutation::Put { value, .. } => {
+                        existing = Some(Value::bytes(value.clone()));
+                        break;
+                    }
+                    MergePointMutation::Merge { value, .. } => {
+                        operands.push(Value::bytes(value.clone()));
+                    }
+                    MergePointMutation::Delete { .. } => break,
+                }
+            }
+
+            match (existing, operands.is_empty()) {
+                (Some(value), true) => Some(value),
+                (None, true) => None,
+                (existing, false) => {
+                    operands.reverse();
+                    let collapsed =
+                        collapse_merge_operands_for_oracle(&operator, key, &operands).ok()?;
+                    operator.full_merge(key, existing.as_ref(), &collapsed).ok()
+                }
+            }
+        }
+
+        fn point_state_at(&self, sequence: SequenceNumber) -> BTreeMap<Vec<u8>, Value> {
+            let mut state = BTreeMap::new();
+            for key in self.versions.keys() {
+                if let Some(value) = self.value_at(key, sequence) {
+                    state.insert(key.clone(), value);
+                }
+            }
+            state
+        }
+    }
+
+    fn collapse_merge_operands_for_oracle(
+        operator: &dyn MergeOperator,
+        key: &[u8],
+        operands: &[Value],
+    ) -> Result<Vec<Value>, StorageError> {
+        let mut collapsed = Vec::with_capacity(operands.len());
+        for operand in operands.iter().cloned() {
+            collapsed.push(operand);
+            while collapsed.len() >= 2 {
+                let right = collapsed.pop().expect("right operand should exist");
+                let left = collapsed.pop().expect("left operand should exist");
+                match operator.partial_merge(key, &left, &right)? {
+                    Some(merged) => collapsed.push(merged),
+                    None => {
+                        collapsed.push(left);
+                        collapsed.push(right);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(collapsed)
+    }
+
     fn row_table_config(name: &str) -> TableConfig {
         row_table_config_with_strategy(name, CompactionStrategy::Leveled)
     }
@@ -4590,6 +4691,53 @@ mod tests {
             .into_iter()
             .filter(|(key, _value)| key.starts_with(prefix))
             .map(|(key, value)| (key, Value::bytes(value)))
+            .collect::<Vec<_>>();
+
+        if reverse {
+            rows.reverse();
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+
+        rows
+    }
+
+    fn merge_oracle_rows(
+        oracle: &MergeShadowOracle,
+        sequence: SequenceNumber,
+        start: &[u8],
+        end: &[u8],
+        reverse: bool,
+        limit: Option<usize>,
+    ) -> Vec<(crate::Key, Value)> {
+        let mut rows = oracle
+            .point_state_at(sequence)
+            .into_iter()
+            .filter(|(key, _value)| key.as_slice() >= start && key.as_slice() < end)
+            .collect::<Vec<_>>();
+
+        if reverse {
+            rows.reverse();
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+
+        rows
+    }
+
+    fn merge_oracle_prefix_rows(
+        oracle: &MergeShadowOracle,
+        sequence: SequenceNumber,
+        prefix: &[u8],
+        reverse: bool,
+        limit: Option<usize>,
+    ) -> Vec<(crate::Key, Value)> {
+        let mut rows = oracle
+            .point_state_at(sequence)
+            .into_iter()
+            .filter(|(key, _value)| key.starts_with(prefix))
             .collect::<Vec<_>>();
 
         if reverse {
@@ -7262,6 +7410,136 @@ mod tests {
         assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
     }
 
+    #[tokio::test]
+    async fn randomized_merge_read_path_matches_merge_shadow_oracle_across_flushes_and_compaction()
+    {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/randomized-merge-read-oracle"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(merge_row_table_config("events", Some(3)))
+            .await
+            .expect("create merge table");
+        let rng = StubRng::seeded(0x1a2b_3c4d_5e6f_7081);
+        let keys = [
+            b"apple".to_vec(),
+            b"apricot".to_vec(),
+            b"banana".to_vec(),
+            b"blueberry".to_vec(),
+            b"cherry".to_vec(),
+        ];
+        let mut oracle = MergeShadowOracle::default();
+
+        for step in 0..64_u64 {
+            let key = keys[(rng.next_u64() as usize) % keys.len()].clone();
+            let committed = match rng.next_u64() % 6 {
+                0 => {
+                    let sequence = table
+                        .delete(key.clone())
+                        .await
+                        .expect("delete key in randomized merge oracle test");
+                    oracle.apply(sequence, MergePointMutation::Delete { key });
+                    sequence
+                }
+                1..=3 => {
+                    let value = format!("merge-{step}").into_bytes();
+                    let sequence = table
+                        .merge(key.clone(), Value::bytes(value.clone()))
+                        .await
+                        .expect("merge key in randomized merge oracle test");
+                    oracle.apply(sequence, MergePointMutation::Merge { key, value });
+                    sequence
+                }
+                _ => {
+                    let value = format!("put-{step}").into_bytes();
+                    let sequence = table
+                        .write(key.clone(), Value::bytes(value.clone()))
+                        .await
+                        .expect("put key in randomized merge oracle test");
+                    oracle.apply(sequence, MergePointMutation::Put { key, value });
+                    sequence
+                }
+            };
+
+            if rng.next_u64().is_multiple_of(3) {
+                db.flush().await.expect("flush randomized merge state");
+            }
+            if rng.next_u64().is_multiple_of(5) {
+                let _ = db
+                    .run_next_compaction()
+                    .await
+                    .expect("run merge compaction during randomized workload");
+            }
+
+            let historical = SequenceNumber::new(rng.next_u64() % (committed.get() + 1));
+            for key in &keys {
+                assert_eq!(
+                    table
+                        .read_at(key.clone(), historical)
+                        .await
+                        .expect("historical merge point read"),
+                    oracle.value_at(key, historical)
+                );
+            }
+
+            let rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        historical,
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("historical merge scan"),
+            )
+            .await;
+            assert_eq!(
+                rows,
+                merge_oracle_rows(&oracle, historical, b"a", b"z", false, None)
+            );
+
+            let reverse_limit = ((rng.next_u64() % 3) + 1) as usize;
+            let reverse_rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        historical,
+                        ScanOptions {
+                            reverse: true,
+                            limit: Some(reverse_limit),
+                            columns: None,
+                        },
+                    )
+                    .await
+                    .expect("historical reverse merge scan"),
+            )
+            .await;
+            assert_eq!(
+                reverse_rows,
+                merge_oracle_rows(&oracle, historical, b"a", b"z", true, Some(reverse_limit))
+            );
+
+            let prefix_rows = collect_rows(
+                table
+                    .scan_prefix_at(b"ap".to_vec(), historical, ScanOptions::default())
+                    .await
+                    .expect("historical merge prefix scan"),
+            )
+            .await;
+            assert_eq!(
+                prefix_rows,
+                merge_oracle_prefix_rows(&oracle, historical, b"ap", false, None)
+            );
+        }
+    }
+
     #[test]
     fn append_merge_operator_partial_merge_is_associative_and_full_merge_is_deterministic() {
         let operator = AppendMergeOperator;
@@ -7428,6 +7706,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_drops_unflushed_merge_collapse_shadow_but_preserves_unresolved_operands() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let db = Db::open(tiered_config("/merge-collapse-crash"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("create merge table");
+
+        table
+            .write(b"doc".to_vec(), bytes("seed"))
+            .await
+            .expect("write base value");
+        table
+            .merge(b"doc".to_vec(), bytes("A"))
+            .await
+            .expect("write operand A");
+        table
+            .merge(b"doc".to_vec(), bytes("B"))
+            .await
+            .expect("write operand B");
+        let latest = table
+            .merge(b"doc".to_vec(), bytes("C"))
+            .await
+            .expect("write operand C");
+        db.flush().await.expect("flush unresolved operands");
+
+        let table_id = table.id().expect("table id");
+        assert!(
+            db.memtables_read()
+                .read_at(table_id, b"doc", latest)
+                .is_none(),
+            "collapse shadow row should not exist before the read"
+        );
+        assert_eq!(
+            table
+                .read(b"doc".to_vec())
+                .await
+                .expect("resolve long chain before crash"),
+            Some(bytes("seed|A|B|C"))
+        );
+        assert_eq!(
+            db.memtables_read()
+                .read_at(table_id, b"doc", latest)
+                .expect("collapse shadow row should be installed")
+                .kind,
+            ChangeKind::Put
+        );
+
+        file_system.crash();
+
+        let reopened = Db::open(tiered_config("/merge-collapse-crash"), dependencies)
+            .await
+            .expect("reopen db after crash");
+        let reopened_table = reopened
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("reattach merge operator through public API");
+        let reopened_table_id = reopened_table.id().expect("table id after reopen");
+
+        assert!(
+            reopened
+                .memtables_read()
+                .read_at(reopened_table_id, b"doc", latest)
+                .is_none(),
+            "unflushed collapse shadow row should not survive crash recovery"
+        );
+        assert!(
+            reopened
+                .sstables_read()
+                .live
+                .iter()
+                .flat_map(|sstable| sstable.rows.iter())
+                .any(|row| row.key == b"doc" && row.kind == ChangeKind::Merge),
+            "recovery should still have unresolved merge operands available"
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"doc".to_vec())
+                .await
+                .expect("resolve long chain after crash"),
+            Some(bytes("seed|A|B|C"))
+        );
+        assert_eq!(
+            reopened
+                .memtables_read()
+                .read_at(reopened_table_id, b"doc", latest)
+                .expect("read after crash should re-install collapse shadow row")
+                .kind,
+            ChangeKind::Put
+        );
+    }
+
+    #[tokio::test]
     async fn compaction_rewrites_merge_rows_without_changing_historical_reads() {
         let file_system = Arc::new(crate::StubFileSystem::default());
         let object_store = Arc::new(StubObjectStore::default());
@@ -7521,7 +7896,7 @@ mod tests {
     async fn reopen_recovers_unresolved_merge_operands_from_sstables_and_memtables() {
         let file_system = Arc::new(crate::StubFileSystem::default());
         let object_store = Arc::new(StubObjectStore::default());
-        let dependencies = dependencies(file_system, object_store);
+        let dependencies = dependencies(file_system.clone(), object_store);
         let db = Db::open(tiered_config("/merge-recovery"), dependencies.clone())
             .await
             .expect("open db");
@@ -7543,6 +7918,8 @@ mod tests {
             .merge(b"doc".to_vec(), bytes("B"))
             .await
             .expect("write tail operand");
+
+        file_system.crash();
 
         let reopened = Db::open(tiered_config("/merge-recovery"), dependencies)
             .await

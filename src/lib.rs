@@ -42,8 +42,11 @@ pub use scheduler::{
     TableStats, ThrottleDecision,
 };
 pub use simulation::{
-    CutPoint, GeneratedScenario, NetworkObjectStore, OracleError, PointMutation, RecoveryMatch,
-    ScheduledFault, SeededSimulationRunner, ShadowOracle, SimulationContext, SimulationOutcome,
-    SimulationScenarioConfig, StubDbProcess, TraceEvent, TurmoilClock, seed_mad_turmoil,
+    CutPoint, DbGeneratedScenario, DbMutation, DbOracleError, DbRecoveryMatch, DbShadowOracle,
+    DbSimulationOutcome, DbSimulationScenarioConfig, DbWorkloadOperation, GeneratedScenario,
+    NetworkObjectStore, OperationResult, OracleError, PointMutation, RecoveryMatch, ScheduledFault,
+    ScheduledFaultKind, SeededSimulationRunner, ShadowOracle, SimulationContext,
+    SimulationMergeOperatorId, SimulationOutcome, SimulationScenarioConfig, SimulationTableSpec,
+    StubDbProcess, TraceEvent, TurmoilClock, seed_mad_turmoil,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
