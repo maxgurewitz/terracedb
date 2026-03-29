@@ -9,6 +9,7 @@ pub mod remote;
 pub mod scheduler;
 pub mod simulation;
 pub mod stubs;
+pub mod transaction;
 
 pub use adapters::{
     DeterministicRng, FileSystemFailure, FileSystemOperation, LocalDirObjectStore,
@@ -57,3 +58,4 @@ pub use simulation::{
     TurmoilClock, seed_mad_turmoil,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
+pub use transaction::{Transaction, TransactionCommitError, TransactionCommitOptions};
