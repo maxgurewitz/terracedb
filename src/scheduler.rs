@@ -64,6 +64,11 @@ pub struct TableStats {
     pub oldest_active_snapshot_sequence: Option<SequenceNumber>,
     pub active_snapshot_count: u64,
     pub history_pinned_by_snapshots: bool,
+    pub change_feed_oldest_available_sequence: Option<SequenceNumber>,
+    pub change_feed_floor_sequence: Option<SequenceNumber>,
+    pub commit_log_recovery_floor_sequence: SequenceNumber,
+    pub commit_log_gc_floor_sequence: SequenceNumber,
+    pub change_feed_pins_commit_log_gc: bool,
     pub metadata: std::collections::BTreeMap<String, JsonValue>,
 }
 
