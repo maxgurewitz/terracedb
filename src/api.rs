@@ -249,6 +249,9 @@ const LOCAL_MANIFEST_TEMP_SUFFIX: &str = ".tmp";
 const LOCAL_SSTABLE_RELATIVE_DIR: &str = "sst";
 const LOCAL_SSTABLE_SHARD_DIR: &str = "0000";
 const MANIFEST_FORMAT_VERSION: u32 = 1;
+const LEVELED_BASE_LEVEL_TARGET_BYTES: u64 = 4 * 1024;
+const LEVELED_LEVEL_SIZE_MULTIPLIER: u64 = 10;
+const LEVELED_L0_COMPACTION_TRIGGER: usize = 2;
 const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
 const MVCC_KEY_SEPARATOR: u8 = 0;
 
@@ -263,6 +266,7 @@ struct DbInner {
     catalog_location: CatalogLocation,
     catalog_write_lock: AsyncMutex<()>,
     commit_lock: AsyncMutex<()>,
+    maintenance_lock: AsyncMutex<()>,
     commit_runtime: AsyncMutex<CommitRuntime>,
     commit_coordinator: Mutex<CommitCoordinator>,
     next_table_id: AtomicU32,
@@ -279,6 +283,8 @@ struct DbInner {
     durable_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
     #[cfg(test)]
     commit_phase_blocks: Mutex<Vec<CommitPhaseBlock>>,
+    #[cfg(test)]
+    compaction_phase_blocks: Mutex<Vec<CompactionPhaseBlock>>,
 }
 
 #[derive(Clone)]
@@ -385,6 +391,24 @@ struct PersistedRowSstableBody {
 struct PersistedRowSstableFile {
     body: PersistedRowSstableBody,
     checksum: u32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct CompactionJob {
+    id: String,
+    table_id: TableId,
+    table_name: String,
+    source_level: u32,
+    target_level: u32,
+    estimated_bytes: u64,
+    input_local_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TableCompactionState {
+    compaction_debt: u64,
+    next_job: Option<CompactionJob>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -497,6 +521,14 @@ enum CommitPhase {
     AfterDurablePublish,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionPhase {
+    OutputWritten,
+    ManifestSwitched,
+    InputCleanupFinished,
+}
+
 #[cfg(test)]
 struct CommitPhaseBlock {
     phase: CommitPhase,
@@ -511,6 +543,19 @@ struct CommitPhaseBlocker {
 }
 
 #[cfg(test)]
+struct CompactionPhaseBlock {
+    phase: CompactionPhase,
+    reached_tx: Option<oneshot::Sender<()>>,
+    release_rx: Option<oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+struct CompactionPhaseBlocker {
+    reached_rx: Option<oneshot::Receiver<()>>,
+    release_tx: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
 impl CommitPhaseBlocker {
     async fn sequence(&mut self) -> SequenceNumber {
         self.sequence_rx
@@ -518,6 +563,23 @@ impl CommitPhaseBlocker {
             .expect("commit phase blocker sequence receiver should be available")
             .await
             .expect("commit phase blocker should observe a sequence")
+    }
+
+    fn release(&mut self) {
+        if let Some(release_tx) = self.release_tx.take() {
+            let _ = release_tx.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl CompactionPhaseBlocker {
+    async fn wait_until_reached(&mut self) {
+        self.reached_rx
+            .take()
+            .expect("compaction phase blocker should have a receiver")
+            .await
+            .expect("compaction phase blocker should observe the phase");
     }
 
     fn release(&mut self) {
@@ -1223,6 +1285,7 @@ impl Db {
                 catalog_location,
                 catalog_write_lock: AsyncMutex::new(()),
                 commit_lock: AsyncMutex::new(()),
+                maintenance_lock: AsyncMutex::new(()),
                 commit_runtime: AsyncMutex::new(commit_runtime),
                 commit_coordinator: Mutex::new(CommitCoordinator::default()),
                 next_table_id: AtomicU32::new(next_table_id),
@@ -1243,6 +1306,8 @@ impl Db {
                 durable_watchers: Mutex::new(BTreeMap::new()),
                 #[cfg(test)]
                 commit_phase_blocks: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                compaction_phase_blocks: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -1891,7 +1956,8 @@ impl Db {
                     rows,
                     stored.config.bloom_filter_bits_per_key,
                 )
-                .await?,
+                .await
+                .map_err(FlushError::Storage)?,
             );
         }
 
@@ -1906,13 +1972,11 @@ impl Db {
         local_id: String,
         rows: Vec<SstableRow>,
         bloom_filter_bits_per_key: Option<u32>,
-    ) -> Result<ResidentRowSstable, FlushError> {
+    ) -> Result<ResidentRowSstable, StorageError> {
         let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
         let user_key_bloom_filter = UserKeyBloomFilter::build(&rows, bloom_filter_bits_per_key);
         let rows_bytes = serde_json::to_vec(&rows).map_err(|error| {
-            FlushError::Storage(StorageError::corruption(format!(
-                "encode SSTable rows failed: {error}"
-            )))
+            StorageError::corruption(format!("encode SSTable rows failed: {error}"))
         })?;
         let data_checksum = checksum32(&rows_bytes);
 
@@ -1930,16 +1994,12 @@ impl Db {
             user_key_bloom_filter: user_key_bloom_filter.clone(),
         };
         let encoded_body = serde_json::to_vec(&body).map_err(|error| {
-            FlushError::Storage(StorageError::corruption(format!(
-                "encode SSTable body failed: {error}"
-            )))
+            StorageError::corruption(format!("encode SSTable body failed: {error}"))
         })?;
         let checksum = checksum32(&encoded_body);
         let file = PersistedRowSstableFile { body, checksum };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|error| {
-            FlushError::Storage(StorageError::corruption(format!(
-                "encode SSTable file failed: {error}"
-            )))
+            StorageError::corruption(format!("encode SSTable file failed: {error}"))
         })?;
 
         let handle = self
@@ -1981,10 +2041,10 @@ impl Db {
         generation: ManifestId,
         last_flushed_sequence: SequenceNumber,
         live: &[ResidentRowSstable],
-    ) -> Result<(), FlushError> {
-        let root = self.local_storage_root().ok_or(FlushError::Unimplemented(
-            "local manifest is only used in tiered mode",
-        ))?;
+    ) -> Result<(), StorageError> {
+        let root = self.local_storage_root().ok_or_else(|| {
+            StorageError::unsupported("local manifest is only used in tiered mode")
+        })?;
         let manifest_dir = Self::local_manifest_dir(root);
         let manifest_path = Self::local_manifest_path(root, generation);
         let manifest_temp_path = format!("{manifest_path}{LOCAL_MANIFEST_TEMP_SUFFIX}");
@@ -1995,16 +2055,12 @@ impl Db {
             sstables: live.iter().map(|sstable| sstable.meta.clone()).collect(),
         };
         let encoded_body = serde_json::to_vec(&body).map_err(|error| {
-            FlushError::Storage(StorageError::corruption(format!(
-                "encode manifest body failed: {error}"
-            )))
+            StorageError::corruption(format!("encode manifest body failed: {error}"))
         })?;
         let checksum = checksum32(&encoded_body);
         let payload = serde_json::to_vec_pretty(&PersistedManifestFile { body, checksum })
             .map_err(|error| {
-                FlushError::Storage(StorageError::corruption(format!(
-                    "encode manifest file failed: {error}"
-                )))
+                StorageError::corruption(format!("encode manifest file failed: {error}"))
             })?;
 
         let manifest_handle = self
@@ -2077,6 +2133,384 @@ impl Db {
             .rename(&current_temp_path, &current_path)
             .await?;
         self.inner.dependencies.file_system.sync_dir(root).await?;
+
+        Ok(())
+    }
+
+    fn sort_live_sstables(live: &mut [ResidentRowSstable]) {
+        live.sort_by(|left, right| {
+            (
+                left.meta.table_id.get(),
+                left.meta.level,
+                left.meta.min_key.as_slice(),
+                left.meta.max_key.as_slice(),
+                left.meta.local_id.as_str(),
+            )
+                .cmp(&(
+                    right.meta.table_id.get(),
+                    right.meta.level,
+                    right.meta.min_key.as_slice(),
+                    right.meta.max_key.as_slice(),
+                    right.meta.local_id.as_str(),
+                ))
+        });
+    }
+
+    fn leveled_level_target_bytes(level: u32) -> u64 {
+        if level == 0 {
+            return 0;
+        }
+
+        let mut target = LEVELED_BASE_LEVEL_TARGET_BYTES;
+        for _ in 1..level {
+            target = target.saturating_mul(LEVELED_LEVEL_SIZE_MULTIPLIER);
+        }
+        target
+    }
+
+    fn table_compaction_state(
+        table: &StoredTable,
+        live: &[ResidentRowSstable],
+    ) -> TableCompactionState {
+        if table.config.format != TableFormat::Row {
+            return TableCompactionState::default();
+        }
+
+        match table.config.compaction_strategy {
+            CompactionStrategy::Leveled => Self::leveled_compaction_state(table, live),
+            CompactionStrategy::Tiered | CompactionStrategy::Fifo => {
+                TableCompactionState::default()
+            }
+        }
+    }
+
+    fn leveled_compaction_state(
+        table: &StoredTable,
+        live: &[ResidentRowSstable],
+    ) -> TableCompactionState {
+        let table_live = live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if table_live.is_empty() {
+            return TableCompactionState::default();
+        }
+
+        let mut compaction_debt = 0_u64;
+        let mut next_job = None;
+
+        let l0 = table_live
+            .iter()
+            .filter(|sstable| sstable.meta.level == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        if l0.len() >= LEVELED_L0_COMPACTION_TRIGGER {
+            compaction_debt = compaction_debt
+                .saturating_add(l0.iter().map(|sstable| sstable.meta.length).sum::<u64>());
+            next_job = Self::build_compaction_job(table, &table_live, 0, &l0);
+        }
+
+        let max_level = table_live
+            .iter()
+            .map(|sstable| sstable.meta.level)
+            .max()
+            .unwrap_or_default();
+        for level in 1..=max_level {
+            let level_files = table_live
+                .iter()
+                .filter(|sstable| sstable.meta.level == level)
+                .cloned()
+                .collect::<Vec<_>>();
+            if level_files.is_empty() {
+                continue;
+            }
+
+            let level_bytes = level_files
+                .iter()
+                .map(|sstable| sstable.meta.length)
+                .sum::<u64>();
+            let target_bytes = Self::leveled_level_target_bytes(level);
+            if level_bytes > target_bytes {
+                compaction_debt =
+                    compaction_debt.saturating_add(level_bytes.saturating_sub(target_bytes));
+                if next_job.is_none() {
+                    next_job = Self::build_compaction_job(table, &table_live, level, &level_files);
+                }
+            }
+        }
+
+        TableCompactionState {
+            compaction_debt,
+            next_job,
+        }
+    }
+
+    fn build_compaction_job(
+        table: &StoredTable,
+        table_live: &[ResidentRowSstable],
+        source_level: u32,
+        source_inputs: &[ResidentRowSstable],
+    ) -> Option<CompactionJob> {
+        let target_level = source_level.saturating_add(1);
+        let (min_key, max_key) = Self::sstable_key_span(source_inputs)?;
+        let mut input_local_ids = source_inputs
+            .iter()
+            .map(|sstable| sstable.meta.local_id.clone())
+            .collect::<Vec<_>>();
+        let mut estimated_bytes = source_inputs
+            .iter()
+            .map(|sstable| sstable.meta.length)
+            .sum::<u64>();
+
+        for sstable in table_live.iter().filter(|sstable| {
+            sstable.meta.level == target_level
+                && Self::key_ranges_overlap(
+                    sstable.meta.min_key.as_slice(),
+                    sstable.meta.max_key.as_slice(),
+                    min_key.as_slice(),
+                    max_key.as_slice(),
+                )
+        }) {
+            input_local_ids.push(sstable.meta.local_id.clone());
+            estimated_bytes = estimated_bytes.saturating_add(sstable.meta.length);
+        }
+
+        input_local_ids.sort();
+        input_local_ids.dedup();
+        let id = format!(
+            "compaction:{}:L{}:{}",
+            table.config.name,
+            source_level,
+            input_local_ids.join("+")
+        );
+
+        Some(CompactionJob {
+            id,
+            table_id: table.id,
+            table_name: table.config.name.clone(),
+            source_level,
+            target_level,
+            estimated_bytes,
+            input_local_ids,
+        })
+    }
+
+    fn sstable_key_span(sstables: &[ResidentRowSstable]) -> Option<(Key, Key)> {
+        Some((
+            sstables
+                .iter()
+                .map(|sstable| sstable.meta.min_key.clone())
+                .min()?,
+            sstables
+                .iter()
+                .map(|sstable| sstable.meta.max_key.clone())
+                .max()?,
+        ))
+    }
+
+    fn key_ranges_overlap(
+        left_min: &[u8],
+        left_max: &[u8],
+        right_min: &[u8],
+        right_max: &[u8],
+    ) -> bool {
+        left_min <= right_max && right_min <= left_max
+    }
+
+    fn pending_compaction_jobs(&self) -> Vec<CompactionJob> {
+        let tables = self.tables_read().clone();
+        let live = self.sstables_read().live.clone();
+        let mut jobs = tables
+            .values()
+            .filter_map(|table| Self::table_compaction_state(table, &live).next_job)
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            (
+                left.source_level,
+                left.table_name.as_str(),
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    right.source_level,
+                    right.table_name.as_str(),
+                    right.id.as_str(),
+                ))
+        });
+        jobs
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn estimated_sstable_row_bytes(row: &SstableRow) -> u64 {
+        (row.key.len() + row.value.as_ref().map(value_size_bytes).unwrap_or_default() + 32) as u64
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn write_compaction_outputs(
+        &self,
+        local_root: &str,
+        table_id: TableId,
+        level: u32,
+        rows: Vec<SstableRow>,
+        bloom_filter_bits_per_key: Option<u32>,
+    ) -> Result<Vec<ResidentRowSstable>, StorageError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let target_bytes =
+            Self::leveled_level_target_bytes(level).max(LEVELED_BASE_LEVEL_TARGET_BYTES);
+        let mut outputs = Vec::new();
+        let mut start = 0_usize;
+
+        while start < rows.len() {
+            let mut end = start;
+            let mut estimated_bytes = 0_u64;
+            while end < rows.len() {
+                estimated_bytes =
+                    estimated_bytes.saturating_add(Self::estimated_sstable_row_bytes(&rows[end]));
+                end += 1;
+
+                let next_shares_key = end < rows.len() && rows[end - 1].key == rows[end].key;
+                if estimated_bytes >= target_bytes && !next_shares_key {
+                    break;
+                }
+            }
+
+            let local_id = format!(
+                "SST-{:06}",
+                self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
+            );
+            let path = Self::local_sstable_path(local_root, table_id, &local_id);
+            outputs.push(
+                self.write_row_sstable(
+                    &path,
+                    table_id,
+                    level,
+                    local_id,
+                    rows[start..end].to_vec(),
+                    bloom_filter_bits_per_key,
+                )
+                .await?,
+            );
+            start = end;
+        }
+
+        Ok(outputs)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn run_next_compaction(&self) -> Result<bool, StorageError> {
+        let Some(local_root) = self.local_storage_root().map(str::to_string) else {
+            return Ok(false);
+        };
+        let _maintenance_guard = self.inner.maintenance_lock.lock().await;
+        let Some(job) = self.pending_compaction_jobs().into_iter().next() else {
+            return Ok(false);
+        };
+
+        self.execute_compaction_job(&local_root, job).await?;
+        Ok(true)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn execute_compaction_job(
+        &self,
+        local_root: &str,
+        job: CompactionJob,
+    ) -> Result<(), StorageError> {
+        let table = self
+            .tables_read()
+            .values()
+            .find(|table| table.id == job.table_id)
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "compaction references unknown table id {}",
+                    job.table_id.get()
+                ))
+            })?;
+        let live = self.sstables_read().live.clone();
+        let input_local_ids = job.input_local_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let inputs = live
+            .iter()
+            .filter(|sstable| input_local_ids.contains(&sstable.meta.local_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if inputs.len() != job.input_local_ids.len() {
+            return Err(StorageError::corruption(format!(
+                "compaction job {} resolved {} of {} inputs",
+                job.id,
+                inputs.len(),
+                job.input_local_ids.len()
+            )));
+        }
+
+        let mut merged_rows = inputs
+            .iter()
+            .flat_map(|sstable| sstable.rows.iter().cloned())
+            .collect::<Vec<_>>();
+        merged_rows.sort_by_key(|row| encode_mvcc_key(&row.key, CommitId::new(row.sequence)));
+
+        let outputs = self
+            .write_compaction_outputs(
+                local_root,
+                job.table_id,
+                job.target_level,
+                merged_rows,
+                table.config.bloom_filter_bits_per_key,
+            )
+            .await?;
+        if outputs.is_empty() {
+            return Err(StorageError::corruption(format!(
+                "compaction job {} produced no outputs",
+                job.id
+            )));
+        }
+
+        #[cfg(test)]
+        self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
+            .await;
+
+        let current_state = self.sstables_read().clone();
+        let mut new_live = current_state
+            .live
+            .into_iter()
+            .filter(|sstable| !input_local_ids.contains(&sstable.meta.local_id))
+            .collect::<Vec<_>>();
+        new_live.extend(outputs);
+        Self::sort_live_sstables(&mut new_live);
+
+        let next_generation =
+            ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
+        self.install_manifest(
+            next_generation,
+            current_state.last_flushed_sequence,
+            &new_live,
+        )
+        .await?;
+
+        {
+            let mut sstables = self.sstables_write();
+            sstables.manifest_generation = next_generation;
+            sstables.live = new_live;
+        }
+
+        #[cfg(test)]
+        self.maybe_pause_compaction_phase(CompactionPhase::ManifestSwitched)
+            .await;
+
+        for input in &inputs {
+            self.inner
+                .dependencies
+                .file_system
+                .delete(&input.meta.file_path)
+                .await?;
+        }
+
+        #[cfg(test)]
+        self.maybe_pause_compaction_phase(CompactionPhase::InputCleanupFinished)
+            .await;
 
         Ok(())
     }
@@ -2223,6 +2657,7 @@ impl Db {
     }
 
     pub async fn flush(&self) -> Result<(), FlushError> {
+        let _maintenance_guard = self.inner.maintenance_lock.lock().await;
         let local_root = self.local_storage_root().map(str::to_string);
         let immutables = {
             let _commit_guard = self.inner.commit_lock.lock().await;
@@ -2261,16 +2696,11 @@ impl Db {
             }
 
             new_live.extend(outputs);
-            new_live.sort_by_key(|sstable| {
-                (
-                    sstable.meta.table_id.get(),
-                    sstable.meta.min_sequence.get(),
-                    sstable.meta.local_id.clone(),
-                )
-            });
+            Self::sort_live_sstables(&mut new_live);
             manifest_generation = ManifestId::new(manifest_generation.get().saturating_add(1));
             self.install_manifest(manifest_generation, immutable.max_sequence, &new_live)
-                .await?;
+                .await
+                .map_err(FlushError::Storage)?;
             flushed_count += 1;
         }
 
@@ -2337,8 +2767,9 @@ impl Db {
     }
 
     pub async fn table_stats(&self, table: &Table) -> TableStats {
-        let metadata = self
-            .tables_read()
+        let tables = self.tables_read().clone();
+        let live = self.sstables_read().live.clone();
+        let metadata = tables
             .get(table.name())
             .map(|table| table.config.metadata.clone())
             .unwrap_or_default();
@@ -2346,28 +2777,41 @@ impl Db {
             l0_sstable_count,
             total_bytes,
             local_bytes,
+            compaction_debt,
             pending_flush_bytes,
             immutable_memtable_count,
         ) = table
             .resolve_id()
             .map(|table_id| {
                 let memtables = self.memtables_read();
-                let sstables = self.sstables_read();
-                let (l0_sstable_count, total_bytes, local_bytes) = sstables.table_stats(table_id);
+                let (l0_sstable_count, total_bytes, local_bytes) = SstableState {
+                    manifest_generation: ManifestId::default(),
+                    last_flushed_sequence: SequenceNumber::default(),
+                    live: live.clone(),
+                }
+                .table_stats(table_id);
+                let compaction_debt = tables
+                    .values()
+                    .find(|stored| stored.id == table_id)
+                    .map(|stored| Self::table_compaction_state(stored, &live).compaction_debt)
+                    .unwrap_or_default();
+
                 (
                     l0_sstable_count,
                     total_bytes,
                     local_bytes,
+                    compaction_debt,
                     memtables.pending_flush_bytes(table_id),
                     memtables.immutable_memtable_count(table_id),
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0));
+            .unwrap_or((0, 0, 0, 0, 0, 0));
 
         TableStats {
             l0_sstable_count,
             total_bytes,
             local_bytes,
+            compaction_debt,
             pending_flush_bytes,
             immutable_memtable_count,
             metadata,
@@ -2376,7 +2820,16 @@ impl Db {
     }
 
     pub async fn pending_work(&self) -> Vec<PendingWork> {
-        Vec::new()
+        self.pending_compaction_jobs()
+            .into_iter()
+            .map(|job| PendingWork {
+                id: job.id,
+                work_type: crate::scheduler::PendingWorkType::Compaction,
+                table: job.table_name,
+                level: Some(job.source_level),
+                estimated_bytes: job.estimated_bytes,
+            })
+            .collect()
     }
 
     fn resolve_read_set_entries(
@@ -2728,6 +3181,22 @@ impl Db {
     }
 
     #[cfg(test)]
+    fn block_next_compaction_phase(&self, phase: CompactionPhase) -> CompactionPhaseBlocker {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        mutex_lock(&self.inner.compaction_phase_blocks).push(CompactionPhaseBlock {
+            phase,
+            reached_tx: Some(reached_tx),
+            release_rx: Some(release_rx),
+        });
+
+        CompactionPhaseBlocker {
+            reached_rx: Some(reached_rx),
+            release_tx: Some(release_tx),
+        }
+    }
+
+    #[cfg(test)]
     async fn maybe_pause_commit_phase(&self, phase: CommitPhase, sequence: SequenceNumber) {
         let block = {
             let mut blocks = mutex_lock(&self.inner.commit_phase_blocks);
@@ -2749,6 +3218,30 @@ impl Db {
 
     #[cfg(not(test))]
     async fn maybe_pause_commit_phase(&self, _phase: CommitPhase, _sequence: SequenceNumber) {}
+
+    #[cfg(test)]
+    async fn maybe_pause_compaction_phase(&self, phase: CompactionPhase) {
+        let block = {
+            let mut blocks = mutex_lock(&self.inner.compaction_phase_blocks);
+            blocks
+                .iter()
+                .position(|block| block.phase == phase)
+                .map(|index| blocks.remove(index))
+        };
+
+        if let Some(mut block) = block {
+            if let Some(reached_tx) = block.reached_tx.take() {
+                let _ = reached_tx.send(());
+            }
+            if let Some(release_rx) = block.release_rx.take() {
+                let _ = release_rx.await;
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    async fn maybe_pause_compaction_phase(&self, _phase: CompactionPhase) {}
 
     #[allow(dead_code)]
     pub(crate) fn dependencies(&self) -> &DbDependencies {
@@ -3264,18 +3757,18 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CommitPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
-        LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR,
-        ManifestId, PersistedRowSstableFile, SchemaDefinition, StoredTable, decode_mvcc_key,
-        encode_mvcc_key, read_path,
+        CommitPhase, CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
+        LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR,
+        LOCAL_SSTABLE_SHARD_DIR, ManifestId, PersistedRowSstableFile, SchemaDefinition,
+        StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
     };
     use crate::{
         CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
         FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
         FileSystemOperation, PointMutation, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
-        SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StubClock, StubObjectStore,
-        StubRng, TableConfig, TableFormat, TableId, TieredDurabilityMode, TieredStorageConfig,
-        Value,
+        SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock,
+        StubObjectStore, StubRng, TableConfig, TableFormat, TableId, TieredDurabilityMode,
+        TieredStorageConfig, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -3484,6 +3977,107 @@ mod tests {
             .sync(&handle)
             .await
             .expect("sync overwritten file");
+    }
+
+    async fn seed_leveled_compaction_fixture(
+        root: &str,
+    ) -> (
+        Db,
+        crate::Table,
+        Arc<crate::StubFileSystem>,
+        DbDependencies,
+        ShadowOracle,
+    ) {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let db = Db::open(tiered_config(root), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+        let mut oracle = ShadowOracle::default();
+
+        let first = table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write apple v1");
+        oracle.apply(
+            first,
+            PointMutation::Put {
+                key: b"apple".to_vec(),
+                value: b"v1".to_vec(),
+            },
+            true,
+        );
+        let second = table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        oracle.apply(
+            second,
+            PointMutation::Put {
+                key: b"banana".to_vec(),
+                value: b"yellow".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush first l0");
+
+        let third = table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write apple v2");
+        oracle.apply(
+            third,
+            PointMutation::Put {
+                key: b"apple".to_vec(),
+                value: b"v2".to_vec(),
+            },
+            true,
+        );
+        let fourth = table
+            .write(b"carrot".to_vec(), Value::bytes("orange"))
+            .await
+            .expect("write carrot");
+        oracle.apply(
+            fourth,
+            PointMutation::Put {
+                key: b"carrot".to_vec(),
+                value: b"orange".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush second l0");
+
+        let fifth = table
+            .delete(b"banana".to_vec())
+            .await
+            .expect("delete banana");
+        oracle.apply(
+            fifth,
+            PointMutation::Delete {
+                key: b"banana".to_vec(),
+            },
+            true,
+        );
+        let sixth = table
+            .write(b"apricot".to_vec(), Value::bytes("soft"))
+            .await
+            .expect("write apricot");
+        oracle.apply(
+            sixth,
+            PointMutation::Put {
+                key: b"apricot".to_vec(),
+                value: b"soft".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush third l0");
+
+        (db, table, file_system, dependencies, oracle)
     }
 
     #[test]
@@ -4712,6 +5306,324 @@ mod tests {
                 .expect("read banana"),
             Some(Value::bytes("yellow"))
         );
+    }
+
+    #[tokio::test]
+    async fn leveled_compaction_preserves_state_and_reports_backlog() {
+        let (db, table, _file_system, _dependencies, oracle) =
+            seed_leveled_compaction_fixture("/leveled-compaction").await;
+
+        let before_stats = db.table_stats(&table).await;
+        assert_eq!(before_stats.l0_sstable_count, 3);
+        assert!(before_stats.compaction_debt > 0);
+
+        let pending = db.pending_work().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].table, "events");
+        assert_eq!(pending[0].level, Some(0));
+
+        let max_sequence = db.current_sequence();
+        for raw in 0..=max_sequence.get() {
+            let sequence = SequenceNumber::new(raw);
+            let rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        sequence,
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("scan before compaction"),
+            )
+            .await;
+            assert_eq!(
+                rows,
+                oracle_rows(&oracle, sequence, b"a", b"z", false, None)
+            );
+        }
+
+        assert!(db.run_next_compaction().await.expect("run compaction"));
+
+        {
+            let sstables = db.sstables_read();
+            assert_eq!(sstables.live.len(), 1);
+            let output = sstables.live.first().expect("compaction output");
+            assert_eq!(output.meta.level, 1);
+            assert_eq!(output.meta.min_key, b"apple".to_vec());
+            assert_eq!(output.meta.max_key, b"carrot".to_vec());
+            assert_eq!(output.meta.min_sequence, SequenceNumber::new(1));
+            assert_eq!(output.meta.max_sequence, SequenceNumber::new(6));
+        }
+
+        let after_stats = db.table_stats(&table).await;
+        assert_eq!(after_stats.l0_sstable_count, 0);
+        assert_eq!(after_stats.compaction_debt, 0);
+        assert!(db.pending_work().await.is_empty());
+
+        for raw in 0..=max_sequence.get() {
+            let sequence = SequenceNumber::new(raw);
+            let rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        sequence,
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("scan after compaction"),
+            )
+            .await;
+            assert_eq!(
+                rows,
+                oracle_rows(&oracle, sequence, b"a", b"z", false, None)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_output_without_manifest_switch_recovers_prior_generation() {
+        let (db, table, file_system, dependencies, _oracle) =
+            seed_leveled_compaction_fixture("/compaction-manifest-before-switch").await;
+
+        let prior_generation = db.sstables_read().manifest_generation;
+        let next_generation = ManifestId::new(prior_generation.get().saturating_add(1));
+        let manifest_temp_path = format!(
+            "{}{}",
+            Db::local_manifest_path("/compaction-manifest-before-switch", next_generation),
+            LOCAL_MANIFEST_TEMP_SUFFIX
+        );
+        file_system.inject_failure(FileSystemFailure::for_target(
+            FileSystemOperation::Rename,
+            manifest_temp_path,
+            StorageError::io("simulated manifest rename failure"),
+        ));
+
+        let error = db
+            .run_next_compaction()
+            .await
+            .expect_err("compaction should fail before manifest switch");
+        assert!(
+            error
+                .message()
+                .contains("simulated manifest rename failure")
+        );
+
+        let on_disk = file_system
+            .list(&sstable_dir(
+                "/compaction-manifest-before-switch",
+                table.id().expect("table id"),
+            ))
+            .await
+            .expect("list on-disk sstables");
+        assert!(on_disk.len() > db.sstables_read().live.len());
+
+        file_system.crash();
+        let reopened = Db::open(
+            tiered_config("/compaction-manifest-before-switch"),
+            dependencies,
+        )
+        .await
+        .expect("reopen after failed compaction");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            prior_generation
+        );
+        assert_eq!(reopened.sstables_read().live.len(), 3);
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read apple"),
+            Some(Value::bytes("v2"))
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"banana".to_vec())
+                .await
+                .expect("read banana"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_manifest_switch_reopen_ignores_old_inputs_when_cleanup_fails() {
+        let (db, table, file_system, dependencies, _oracle) =
+            seed_leveled_compaction_fixture("/compaction-cleanup-failure").await;
+
+        let job = db
+            .pending_compaction_jobs()
+            .into_iter()
+            .next()
+            .expect("pending compaction job");
+        let first_input_path = db
+            .sstables_read()
+            .live
+            .iter()
+            .find(|sstable| sstable.meta.local_id == job.input_local_ids[0])
+            .expect("first compaction input")
+            .meta
+            .file_path
+            .clone();
+
+        file_system.inject_failure(FileSystemFailure::for_target(
+            FileSystemOperation::Delete,
+            first_input_path,
+            StorageError::io("simulated compaction delete failure"),
+        ));
+
+        let prior_generation = db.sstables_read().manifest_generation;
+        let error = db
+            .run_next_compaction()
+            .await
+            .expect_err("compaction should fail during cleanup");
+        assert!(
+            error
+                .message()
+                .contains("simulated compaction delete failure")
+        );
+        assert_eq!(
+            db.sstables_read().manifest_generation,
+            ManifestId::new(prior_generation.get().saturating_add(1))
+        );
+        assert_eq!(db.table_stats(&table).await.l0_sstable_count, 0);
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/compaction-cleanup-failure"), dependencies)
+            .await
+            .expect("reopen after cleanup failure");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(prior_generation.get().saturating_add(1))
+        );
+        assert_eq!(
+            reopened.table_stats(&reopened_table).await.l0_sstable_count,
+            0
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read apple"),
+            Some(Value::bytes("v2"))
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"banana".to_vec())
+                .await
+                .expect("read banana"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_recovers_cleanly_after_post_cleanup_crash() {
+        let (db, _table, file_system, dependencies, _oracle) =
+            seed_leveled_compaction_fixture("/compaction-post-cleanup-crash").await;
+
+        assert!(db.run_next_compaction().await.expect("run compaction"));
+        let manifest_generation = db.sstables_read().manifest_generation;
+
+        file_system.crash();
+        let reopened = Db::open(
+            tiered_config("/compaction-post-cleanup-crash"),
+            dependencies,
+        )
+        .await
+        .expect("reopen after compaction crash");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            manifest_generation
+        );
+        assert_eq!(
+            reopened.table_stats(&reopened_table).await.l0_sstable_count,
+            0
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read apple"),
+            Some(Value::bytes("v2"))
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"banana".to_vec())
+                .await
+                .expect("read banana"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_and_writes_remain_consistent_while_compaction_runs() {
+        let (db, table, _file_system, _dependencies, _oracle) =
+            seed_leveled_compaction_fixture("/compaction-concurrency").await;
+
+        let mut blocker = db.block_next_compaction_phase(CompactionPhase::OutputWritten);
+        let compact_db = db.clone();
+        let compaction = tokio::spawn(async move { compact_db.run_next_compaction().await });
+
+        blocker.wait_until_reached().await;
+
+        let snapshot = db.snapshot().await;
+        assert_eq!(
+            snapshot
+                .read(&table, b"apple".to_vec())
+                .await
+                .expect("snapshot read before concurrent write"),
+            Some(Value::bytes("v2"))
+        );
+
+        let latest = table
+            .write(b"apple".to_vec(), Value::bytes("v3"))
+            .await
+            .expect("write during compaction");
+        assert_eq!(
+            table
+                .read(b"apple".to_vec())
+                .await
+                .expect("latest read during compaction"),
+            Some(Value::bytes("v3"))
+        );
+        assert_eq!(
+            snapshot
+                .read(&table, b"apple".to_vec())
+                .await
+                .expect("snapshot read after concurrent write"),
+            Some(Value::bytes("v2"))
+        );
+
+        blocker.release();
+        assert!(
+            compaction
+                .await
+                .expect("join compaction task")
+                .expect("compaction result")
+        );
+
+        assert_eq!(
+            table
+                .read_at(b"apple".to_vec(), snapshot.sequence())
+                .await
+                .expect("historical apple"),
+            Some(Value::bytes("v2"))
+        );
+        assert_eq!(
+            table
+                .read_at(b"apple".to_vec(), latest)
+                .await
+                .expect("latest apple"),
+            Some(Value::bytes("v3"))
+        );
+        assert_eq!(db.table_stats(&table).await.l0_sstable_count, 0);
     }
 
     #[tokio::test]
