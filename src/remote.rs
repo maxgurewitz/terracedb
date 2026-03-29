@@ -161,6 +161,14 @@ impl ObjectKeyLayout {
         self.key("backup/manifest/")
     }
 
+    pub fn backup_prefix(&self) -> String {
+        self.key("backup/")
+    }
+
+    pub fn backup_catalog(&self) -> String {
+        self.key("backup/catalog/CATALOG.json")
+    }
+
     pub fn backup_manifest(&self, generation: ManifestId) -> String {
         self.key(&format!("backup/manifest/MANIFEST-{:06}", generation.get()))
     }
@@ -181,6 +189,21 @@ impl ObjectKeyLayout {
         self.key(&format!(
             "backup/sst/table-{:06}/{shard:04}/{local_id}.sst",
             table_id.get()
+        ))
+    }
+
+    pub fn backup_sstable_prefix(&self) -> String {
+        self.key("backup/sst/")
+    }
+
+    pub fn backup_gc_metadata_prefix(&self) -> String {
+        self.key("backup/gc/objects/")
+    }
+
+    pub fn backup_gc_metadata(&self, object_key: &str) -> String {
+        self.key(&format!(
+            "backup/gc/objects/{}.json",
+            hex_encode(object_key.as_bytes())
         ))
     }
 
@@ -874,6 +897,11 @@ mod tests {
             prefix: "/tenant-a/db-01/".to_string(),
         });
 
+        assert_eq!(layout.backup_prefix(), "tenant-a/db-01/backup");
+        assert_eq!(
+            layout.backup_catalog(),
+            "tenant-a/db-01/backup/catalog/CATALOG.json"
+        );
         assert_eq!(
             layout.backup_manifest(ManifestId::new(7)),
             "tenant-a/db-01/backup/manifest/MANIFEST-000007"
@@ -889,6 +917,15 @@ mod tests {
         assert_eq!(
             layout.backup_sstable(TableId::new(9), 0, "SST-000123"),
             "tenant-a/db-01/backup/sst/table-000009/0000/SST-000123.sst"
+        );
+        assert_eq!(layout.backup_sstable_prefix(), "tenant-a/db-01/backup/sst");
+        assert_eq!(
+            layout.backup_gc_metadata_prefix(),
+            "tenant-a/db-01/backup/gc/objects"
+        );
+        assert_eq!(
+            layout.backup_gc_metadata("tenant-a/db-01/backup/sst/table-000009/0000/SST-000123.sst"),
+            "tenant-a/db-01/backup/gc/objects/74656e616e742d612f64622d30312f6261636b75702f7373742f7461626c652d3030303030392f303030302f5353542d3030303132332e737374.json"
         );
         assert_eq!(
             layout.cold_sstable(

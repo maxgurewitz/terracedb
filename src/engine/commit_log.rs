@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut};
 use crc32fast::hash as checksum32;
 use futures::stream;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{ChangeKind, ChangeStream, FieldValue, ScanOptions, Table, Value},
@@ -178,13 +179,13 @@ impl CommitEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockIndexEntry {
     pub sequence: SequenceNumber,
     pub offset: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSegmentMeta {
     pub table_id: TableId,
     pub min_sequence: SequenceNumber,
@@ -192,7 +193,7 @@ pub struct TableSegmentMeta {
     pub entry_count: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentFooter {
     pub segment_id: SegmentId,
     pub min_sequence: SequenceNumber,
@@ -531,6 +532,14 @@ impl SegmentManager {
         self.active.id
     }
 
+    pub async fn read_segment_bytes(&self, segment_id: SegmentId) -> Result<Vec<u8>, StorageError> {
+        if self.active.id == segment_id {
+            return read_file(self.fs.as_ref(), &self.active.path).await;
+        }
+
+        read_file(self.fs.as_ref(), &segment_path(&self.dir, segment_id)).await
+    }
+
     pub fn seek_by_sequence(
         &self,
         table_id: TableId,
@@ -766,6 +775,24 @@ impl SegmentManager {
         fs.write_at(&handle, 0, bytes).await?;
         fs.sync(&handle).await
     }
+}
+
+pub(crate) fn segment_footer_from_bytes(
+    segment_id: SegmentId,
+    bytes: &[u8],
+) -> Result<SegmentFooter, StorageError> {
+    if let Some(footer) = parse_segment_footer(bytes)? {
+        return Ok(footer);
+    }
+
+    let recovered = ActiveSegment::recover(
+        segment_id,
+        format!("segment-{:06}", segment_id.get()),
+        FileHandle::new(format!("segment-{:06}", segment_id.get())),
+        bytes.to_vec(),
+        DEFAULT_RECORDS_PER_BLOCK,
+    )?;
+    recovered.segment.footer()
 }
 
 struct ActiveSegmentRecovery {

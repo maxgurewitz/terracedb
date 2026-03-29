@@ -26,14 +26,17 @@ use crate::{
         S3PrimaryStorageConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
         TieredDurabilityMode, TieredStorageConfig,
     },
-    engine::commit_log::{CommitEntry, CommitRecord, SegmentManager, SegmentOptions},
+    engine::commit_log::{
+        CommitEntry, CommitRecord, SegmentFooter, SegmentManager, SegmentOptions,
+        segment_footer_from_bytes,
+    },
     error::{
         CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
         StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, OpenOptions},
-    remote::{StorageSource, UnifiedStorage},
+    remote::{ObjectKeyLayout, StorageSource, UnifiedStorage},
     scheduler::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
         ScheduleAction, Scheduler, TableStats,
@@ -523,6 +526,11 @@ const LOCAL_MANIFEST_TEMP_SUFFIX: &str = ".tmp";
 const LOCAL_SSTABLE_RELATIVE_DIR: &str = "sst";
 const LOCAL_SSTABLE_SHARD_DIR: &str = "0000";
 const MANIFEST_FORMAT_VERSION: u32 = 1;
+const REMOTE_MANIFEST_FORMAT_VERSION: u32 = 1;
+const BACKUP_GC_METADATA_FORMAT_VERSION: u32 = 1;
+const BACKUP_MANIFEST_RETENTION_LIMIT: usize = 1;
+const BACKUP_GC_GRACE_PERIOD_MILLIS: u64 = 60_000;
+const LOCAL_BACKUP_RESTORE_MARKER_RELATIVE_PATH: &str = "backup/RESTORE_INCOMPLETE";
 const LEVELED_BASE_LEVEL_TARGET_BYTES: u64 = 4 * 1024;
 const LEVELED_LEVEL_SIZE_MULTIPLIER: u64 = 10;
 const LEVELED_L0_COMPACTION_TRIGGER: usize = 2;
@@ -546,6 +554,7 @@ struct DbInner {
     catalog_write_lock: AsyncMutex<()>,
     commit_lock: AsyncMutex<()>,
     maintenance_lock: AsyncMutex<()>,
+    backup_lock: AsyncMutex<()>,
     commit_runtime: AsyncMutex<CommitRuntime>,
     commit_coordinator: Mutex<CommitCoordinator>,
     next_table_id: AtomicU32,
@@ -677,6 +686,34 @@ struct PersistedManifestBody {
 struct PersistedManifestFile {
     body: PersistedManifestBody,
     checksum: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DurableRemoteCommitLogSegment {
+    object_key: String,
+    footer: SegmentFooter,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedRemoteManifestBody {
+    format_version: u32,
+    generation: ManifestId,
+    last_flushed_sequence: SequenceNumber,
+    sstables: Vec<PersistedManifestSstable>,
+    commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedRemoteManifestFile {
+    body: PersistedRemoteManifestBody,
+    checksum: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BackupObjectBirthRecord {
+    format_version: u32,
+    object_key: String,
+    first_uploaded_at_millis: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2078,6 +2115,9 @@ impl Db {
             .clone()
             .unwrap_or_else(|| Arc::new(RoundRobinScheduler::default()));
         config.scheduler = Some(scheduler.clone());
+        if let StorageConfig::Tiered(tiered) = &config.storage {
+            Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
+        }
         let catalog_location = Self::catalog_location(&config.storage);
         let (tables, next_table_id) = Self::load_tables(&dependencies, &catalog_location).await?;
         let commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
@@ -2112,6 +2152,7 @@ impl Db {
                 catalog_write_lock: AsyncMutex::new(()),
                 commit_lock: AsyncMutex::new(()),
                 maintenance_lock: AsyncMutex::new(()),
+                backup_lock: AsyncMutex::new(()),
                 commit_runtime: AsyncMutex::new(commit_runtime),
                 commit_coordinator: Mutex::new(CommitCoordinator::default()),
                 next_table_id: AtomicU32::new(next_table_id),
@@ -2564,6 +2605,34 @@ impl Db {
         local_id.strip_prefix("SST-")?.parse::<u64>().ok()
     }
 
+    fn parse_segment_id(path: &str) -> Option<SegmentId> {
+        let path_buf = PathBuf::from(path);
+        let file_name = path_buf.file_name()?.to_str()?;
+        let suffix = file_name.strip_prefix("SEG-")?;
+        if suffix.is_empty() || suffix.contains('.') {
+            return None;
+        }
+        suffix.parse::<u64>().ok().map(SegmentId::new)
+    }
+
+    fn local_commit_log_segment_path(root: &str, segment_id: SegmentId) -> String {
+        Self::join_fs_path(
+            root,
+            &format!(
+                "{LOCAL_COMMIT_LOG_RELATIVE_DIR}/SEG-{:06}",
+                segment_id.get()
+            ),
+        )
+    }
+
+    fn backup_restore_marker_path(root: &str) -> String {
+        Self::join_fs_path(root, LOCAL_BACKUP_RESTORE_MARKER_RELATIVE_PATH)
+    }
+
+    fn tiered_object_layout(config: &TieredStorageConfig) -> ObjectKeyLayout {
+        ObjectKeyLayout::new(&config.s3)
+    }
+
     async fn load_local_manifest(
         storage: &StorageConfig,
         dependencies: &DbDependencies,
@@ -2672,6 +2741,226 @@ impl Db {
             last_flushed_sequence: file.body.last_flushed_sequence,
             live_sstables,
         })
+    }
+
+    async fn read_remote_manifest_file_at_key(
+        dependencies: &DbDependencies,
+        key: &str,
+    ) -> Result<PersistedRemoteManifestFile, StorageError> {
+        let bytes = read_source(dependencies, &StorageSource::remote_object(key)).await?;
+        let file: PersistedRemoteManifestFile =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                StorageError::corruption(format!("decode remote manifest {key} failed: {error}"))
+            })?;
+
+        if file.body.format_version != REMOTE_MANIFEST_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported remote manifest version {}",
+                file.body.format_version
+            )));
+        }
+
+        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
+            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
+        })?;
+        if checksum32(&encoded_body) != file.checksum {
+            return Err(StorageError::corruption(format!(
+                "remote manifest checksum mismatch for {key}"
+            )));
+        }
+
+        Ok(file)
+    }
+
+    async fn load_remote_manifest_file_from_layout(
+        layout: &ObjectKeyLayout,
+        dependencies: &DbDependencies,
+    ) -> Result<Option<(String, PersistedRemoteManifestFile)>, OpenError> {
+        let latest_key = layout.backup_manifest_latest();
+        let manifest_prefix = layout.backup_manifest_prefix();
+        let mut candidates = Vec::new();
+        let mut last_error = None;
+
+        match dependencies.object_store.get(&latest_key).await {
+            Ok(pointer) => match String::from_utf8(pointer) {
+                Ok(pointer) => {
+                    let pointer = pointer.trim();
+                    if !pointer.is_empty() {
+                        candidates.push(pointer.to_string());
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(StorageError::corruption(format!(
+                        "decode remote latest pointer failed: {error}"
+                    )));
+                }
+            },
+            Err(error) if error.kind() == StorageErrorKind::NotFound => {}
+            Err(error) => last_error = Some(error),
+        }
+
+        let mut listed = dependencies.object_store.list(&manifest_prefix).await?;
+        listed.retain(|key| key != &latest_key && Self::parse_manifest_generation(key).is_some());
+        listed.sort_by_key(|key| {
+            std::cmp::Reverse(
+                Self::parse_manifest_generation(key)
+                    .map(ManifestId::get)
+                    .unwrap_or_default(),
+            )
+        });
+        for key in listed {
+            if !candidates.iter().any(|candidate| candidate == &key) {
+                candidates.push(key);
+            }
+        }
+
+        let mut saw_manifest = false;
+        for key in candidates {
+            saw_manifest = true;
+            match Self::read_remote_manifest_file_at_key(dependencies, &key).await {
+                Ok(file) => return Ok(Some((key, file))),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if saw_manifest {
+            Err(OpenError::Storage(last_error.unwrap_or_else(|| {
+                StorageError::corruption("no valid remote manifest generation found")
+            })))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn maybe_restore_tiered_from_backup(
+        config: &TieredStorageConfig,
+        dependencies: &DbDependencies,
+    ) -> Result<(), OpenError> {
+        let root = &config.ssd.path;
+        let marker_path = Self::backup_restore_marker_path(root);
+        let restore_incomplete = read_optional_path(dependencies, &marker_path)
+            .await?
+            .is_some();
+        let has_local_catalog = read_optional_path(
+            dependencies,
+            &Self::join_fs_path(root, LOCAL_CATALOG_RELATIVE_PATH),
+        )
+        .await?
+        .is_some();
+        let has_local_current = read_optional_path(dependencies, &Self::local_current_path(root))
+            .await?
+            .is_some();
+        let has_local_manifests = !dependencies
+            .file_system
+            .list(&Self::local_manifest_dir(root))
+            .await?
+            .is_empty();
+        let has_local_commit_log = !dependencies
+            .file_system
+            .list(&Self::local_commit_log_dir(root))
+            .await?
+            .is_empty();
+
+        if !restore_incomplete
+            && (has_local_catalog
+                || has_local_current
+                || has_local_manifests
+                || has_local_commit_log)
+        {
+            return Ok(());
+        }
+
+        let layout = Self::tiered_object_layout(config);
+        let remote_catalog =
+            read_optional_remote_object(dependencies, &layout.backup_catalog()).await?;
+        let remote_manifest =
+            Self::load_remote_manifest_file_from_layout(&layout, dependencies).await?;
+        let mut remote_commit_log_keys = dependencies
+            .object_store
+            .list(&layout.backup_commit_log_prefix())
+            .await?;
+
+        let Some(catalog_bytes) = remote_catalog else {
+            if remote_manifest.is_some() || !remote_commit_log_keys.is_empty() {
+                return Err(OpenError::Storage(StorageError::corruption(
+                    "backup recovery requires a replicated catalog",
+                )));
+            }
+            return Ok(());
+        };
+
+        write_local_file_atomic(dependencies, &marker_path, b"incomplete backup restore\n").await?;
+        write_local_file_atomic(
+            dependencies,
+            &Self::join_fs_path(root, LOCAL_CATALOG_RELATIVE_PATH),
+            &catalog_bytes,
+        )
+        .await?;
+
+        if let Some((_key, file)) = remote_manifest {
+            for sstable in &file.body.sstables {
+                let remote_key = sstable.remote_key.as_ref().ok_or_else(|| {
+                    OpenError::Storage(StorageError::corruption(format!(
+                        "remote manifest SSTable {} is missing a remote key",
+                        sstable.local_id
+                    )))
+                })?;
+                let local_path = if sstable.file_path.is_empty() {
+                    Self::local_sstable_path(root, sstable.table_id, &sstable.local_id)
+                } else {
+                    sstable.file_path.clone()
+                };
+                let bytes = read_source(
+                    dependencies,
+                    &StorageSource::remote_object(remote_key.clone()),
+                )
+                .await?;
+                write_local_file_atomic(dependencies, &local_path, &bytes).await?;
+            }
+
+            remote_commit_log_keys.extend(
+                file.body
+                    .commit_log_segments
+                    .iter()
+                    .map(|segment| segment.object_key.clone()),
+            );
+            let local_manifest_bytes = Self::encode_manifest_payload_from_sstables(
+                file.body.generation,
+                file.body.last_flushed_sequence,
+                &file.body.sstables,
+            )?;
+            write_local_file_atomic(
+                dependencies,
+                &Self::local_manifest_path(root, file.body.generation),
+                &local_manifest_bytes,
+            )
+            .await?;
+            write_local_file_atomic(
+                dependencies,
+                &Self::local_current_path(root),
+                format!("{}\n", Self::manifest_filename(file.body.generation)).as_bytes(),
+            )
+            .await?;
+        }
+
+        remote_commit_log_keys.sort();
+        remote_commit_log_keys.dedup();
+        for object_key in remote_commit_log_keys {
+            let Some(segment_id) = Self::parse_segment_id(&object_key) else {
+                continue;
+            };
+            let bytes =
+                read_source(dependencies, &StorageSource::remote_object(object_key)).await?;
+            write_local_file_atomic(
+                dependencies,
+                &Self::local_commit_log_segment_path(root, segment_id),
+                &bytes,
+            )
+            .await?;
+        }
+
+        delete_local_file_if_exists(dependencies, &marker_path).await?;
+        Ok(())
     }
 
     async fn load_resident_sstable(
@@ -2940,26 +3229,20 @@ impl Db {
         last_flushed_sequence: SequenceNumber,
         live: &[ResidentRowSstable],
     ) -> Result<(), StorageError> {
+        let payload = Self::encode_manifest_payload_from_sstables(
+            generation,
+            last_flushed_sequence,
+            &live
+                .iter()
+                .map(|sstable| sstable.meta.clone())
+                .collect::<Vec<_>>(),
+        )?;
         let root = self.local_storage_root().ok_or_else(|| {
             StorageError::unsupported("local manifest is only used in tiered mode")
         })?;
         let manifest_dir = Self::local_manifest_dir(root);
         let manifest_path = Self::local_manifest_path(root, generation);
         let manifest_temp_path = format!("{manifest_path}{LOCAL_MANIFEST_TEMP_SUFFIX}");
-        let body = PersistedManifestBody {
-            format_version: MANIFEST_FORMAT_VERSION,
-            generation,
-            last_flushed_sequence,
-            sstables: live.iter().map(|sstable| sstable.meta.clone()).collect(),
-        };
-        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
-            StorageError::corruption(format!("encode manifest body failed: {error}"))
-        })?;
-        let checksum = checksum32(&encoded_body);
-        let payload = serde_json::to_vec_pretty(&PersistedManifestFile { body, checksum })
-            .map_err(|error| {
-                StorageError::corruption(format!("encode manifest file failed: {error}"))
-            })?;
 
         let manifest_handle = self
             .inner
@@ -3031,6 +3314,343 @@ impl Db {
             .rename(&current_temp_path, &current_path)
             .await?;
         self.inner.dependencies.file_system.sync_dir(root).await?;
+
+        Ok(())
+    }
+
+    fn encode_manifest_payload_from_sstables(
+        generation: ManifestId,
+        last_flushed_sequence: SequenceNumber,
+        sstables: &[PersistedManifestSstable],
+    ) -> Result<Vec<u8>, StorageError> {
+        let body = PersistedManifestBody {
+            format_version: MANIFEST_FORMAT_VERSION,
+            generation,
+            last_flushed_sequence,
+            sstables: sstables.to_vec(),
+        };
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
+            StorageError::corruption(format!("encode manifest body failed: {error}"))
+        })?;
+        let checksum = checksum32(&encoded_body);
+        serde_json::to_vec_pretty(&PersistedManifestFile { body, checksum }).map_err(|error| {
+            StorageError::corruption(format!("encode manifest file failed: {error}"))
+        })
+    }
+
+    fn encode_remote_manifest_payload(
+        generation: ManifestId,
+        last_flushed_sequence: SequenceNumber,
+        sstables: &[PersistedManifestSstable],
+        durable_commit_log_segments: &[DurableRemoteCommitLogSegment],
+    ) -> Result<Vec<u8>, StorageError> {
+        let body = PersistedRemoteManifestBody {
+            format_version: REMOTE_MANIFEST_FORMAT_VERSION,
+            generation,
+            last_flushed_sequence,
+            sstables: sstables.to_vec(),
+            commit_log_segments: durable_commit_log_segments.to_vec(),
+        };
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
+            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
+        })?;
+        let checksum = checksum32(&encoded_body);
+        serde_json::to_vec_pretty(&PersistedRemoteManifestFile { body, checksum }).map_err(
+            |error| {
+                StorageError::corruption(format!("encode remote manifest file failed: {error}"))
+            },
+        )
+    }
+
+    fn tiered_backup_layout(&self) -> Option<ObjectKeyLayout> {
+        match &self.inner.config.storage {
+            StorageConfig::Tiered(config) => Some(Self::tiered_object_layout(config)),
+            StorageConfig::S3Primary(_) => None,
+        }
+    }
+
+    async fn write_remote_backup_object(
+        &self,
+        layout: &ObjectKeyLayout,
+        object_key: &str,
+        bytes: &[u8],
+        track_for_gc: bool,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .dependencies
+            .object_store
+            .put(object_key, bytes)
+            .await?;
+        if track_for_gc {
+            Self::note_backup_object_birth(&self.inner.dependencies, layout, object_key).await;
+        }
+        Ok(())
+    }
+
+    async fn note_backup_object_birth(
+        dependencies: &DbDependencies,
+        layout: &ObjectKeyLayout,
+        object_key: &str,
+    ) {
+        let metadata_key = layout.backup_gc_metadata(object_key);
+        if read_optional_remote_object(dependencies, &metadata_key)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+
+        let record = BackupObjectBirthRecord {
+            format_version: BACKUP_GC_METADATA_FORMAT_VERSION,
+            object_key: object_key.to_string(),
+            first_uploaded_at_millis: dependencies.clock.now().get(),
+        };
+        let Ok(payload) = serde_json::to_vec_pretty(&record) else {
+            return;
+        };
+        let _ = dependencies.object_store.put(&metadata_key, &payload).await;
+    }
+
+    async fn read_backup_object_birth(
+        dependencies: &DbDependencies,
+        layout: &ObjectKeyLayout,
+        object_key: &str,
+    ) -> Option<BackupObjectBirthRecord> {
+        let metadata_key = layout.backup_gc_metadata(object_key);
+        let bytes = read_optional_remote_object(dependencies, &metadata_key)
+            .await
+            .ok()
+            .flatten()?;
+        let record: BackupObjectBirthRecord = serde_json::from_slice(&bytes).ok()?;
+        (record.format_version == BACKUP_GC_METADATA_FORMAT_VERSION
+            && record.object_key == object_key)
+            .then_some(record)
+    }
+
+    async fn collect_tiered_commit_log_snapshots(
+        &self,
+        layout: &ObjectKeyLayout,
+    ) -> Result<Vec<(DurableRemoteCommitLogSegment, Vec<u8>)>, StorageError> {
+        let mut runtime = self.inner.commit_runtime.lock().await;
+        let CommitLogBackend::Local(manager) = &mut runtime.backend else {
+            return Ok(Vec::new());
+        };
+
+        let mut snapshots = Vec::new();
+        for descriptor in manager.enumerate_segments() {
+            if descriptor.record_count == 0 {
+                continue;
+            }
+
+            let bytes = manager.read_segment_bytes(descriptor.segment_id).await?;
+            let footer = segment_footer_from_bytes(descriptor.segment_id, &bytes)?;
+            snapshots.push((
+                DurableRemoteCommitLogSegment {
+                    object_key: layout.backup_commit_log_segment(descriptor.segment_id),
+                    footer,
+                },
+                bytes,
+            ));
+        }
+
+        Ok(snapshots)
+    }
+
+    async fn sync_tiered_backup_catalog(&self) -> Result<(), StorageError> {
+        let Some(layout) = self.tiered_backup_layout() else {
+            return Ok(());
+        };
+        let payload = Self::encode_catalog(&self.tables_read().clone())?;
+        let _backup_guard = self.inner.backup_lock.lock().await;
+        self.write_remote_backup_object(&layout, &layout.backup_catalog(), &payload, false)
+            .await
+    }
+
+    async fn sync_tiered_commit_log_tail(&self) -> Result<(), StorageError> {
+        let Some(layout) = self.tiered_backup_layout() else {
+            return Ok(());
+        };
+        let _backup_guard = self.inner.backup_lock.lock().await;
+        let snapshots = self.collect_tiered_commit_log_snapshots(&layout).await?;
+        for (segment, bytes) in snapshots {
+            self.write_remote_backup_object(&layout, &segment.object_key, &bytes, true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn sync_tiered_backup_manifest(
+        &self,
+        generation: ManifestId,
+        last_flushed_sequence: SequenceNumber,
+        live: &[ResidentRowSstable],
+    ) -> Result<(), StorageError> {
+        let Some(layout) = self.tiered_backup_layout() else {
+            return Ok(());
+        };
+
+        let catalog_payload = Self::encode_catalog(&self.tables_read().clone())?;
+        let mut manifest_sstables = Vec::with_capacity(live.len());
+        let mut local_sstable_uploads = Vec::<(String, Vec<u8>)>::new();
+
+        for sstable in live {
+            let mut meta = sstable.meta.clone();
+            if !meta.file_path.is_empty() {
+                let backup_key = layout.backup_sstable(meta.table_id, 0, &meta.local_id);
+                let bytes = read_path(&self.inner.dependencies, &meta.file_path).await?;
+                meta.file_path.clear();
+                meta.remote_key = Some(backup_key.clone());
+                local_sstable_uploads.push((backup_key, bytes));
+            }
+            manifest_sstables.push(meta);
+        }
+
+        let _backup_guard = self.inner.backup_lock.lock().await;
+        self.write_remote_backup_object(&layout, &layout.backup_catalog(), &catalog_payload, false)
+            .await?;
+
+        for (object_key, bytes) in local_sstable_uploads {
+            self.write_remote_backup_object(&layout, &object_key, &bytes, true)
+                .await?;
+        }
+
+        let segment_snapshots = self.collect_tiered_commit_log_snapshots(&layout).await?;
+        let durable_segments = segment_snapshots
+            .iter()
+            .map(|(segment, _)| segment.clone())
+            .filter(|segment| segment.footer.max_sequence <= last_flushed_sequence)
+            .collect::<Vec<_>>();
+        for (segment, bytes) in &segment_snapshots {
+            self.write_remote_backup_object(&layout, &segment.object_key, bytes, true)
+                .await?;
+        }
+
+        let payload = Self::encode_remote_manifest_payload(
+            generation,
+            last_flushed_sequence,
+            &manifest_sstables,
+            &durable_segments,
+        )?;
+        let manifest_key = layout.backup_manifest(generation);
+        self.write_remote_backup_object(&layout, &manifest_key, &payload, true)
+            .await?;
+        self.inner
+            .dependencies
+            .object_store
+            .put(
+                &layout.backup_manifest_latest(),
+                format!("{manifest_key}\n").as_bytes(),
+            )
+            .await?;
+        self.run_tiered_backup_gc_locked(&layout).await
+    }
+
+    async fn run_tiered_backup_gc_locked(
+        &self,
+        layout: &ObjectKeyLayout,
+    ) -> Result<(), StorageError> {
+        let latest_key = layout.backup_manifest_latest();
+        let mut referenced = BTreeSet::from([latest_key.clone(), layout.backup_catalog()]);
+        let mut manifest_keys = self
+            .inner
+            .dependencies
+            .object_store
+            .list(&layout.backup_manifest_prefix())
+            .await?;
+        manifest_keys
+            .retain(|key| key != &latest_key && Self::parse_manifest_generation(key).is_some());
+        manifest_keys.sort_by_key(|key| {
+            std::cmp::Reverse(
+                Self::parse_manifest_generation(key)
+                    .map(ManifestId::get)
+                    .unwrap_or_default(),
+            )
+        });
+
+        let retained_manifest_keys = manifest_keys
+            .iter()
+            .take(BACKUP_MANIFEST_RETENTION_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut min_last_flushed_sequence = None;
+        for key in &retained_manifest_keys {
+            referenced.insert(key.clone());
+            let Ok(file) =
+                Self::read_remote_manifest_file_at_key(&self.inner.dependencies, key).await
+            else {
+                continue;
+            };
+            min_last_flushed_sequence = Some(
+                min_last_flushed_sequence
+                    .map(|current: SequenceNumber| current.min(file.body.last_flushed_sequence))
+                    .unwrap_or(file.body.last_flushed_sequence),
+            );
+            for sstable in &file.body.sstables {
+                if let Some(remote_key) = &sstable.remote_key {
+                    referenced.insert(remote_key.clone());
+                }
+            }
+        }
+
+        if let Some(min_last_flushed_sequence) = min_last_flushed_sequence {
+            let commit_log_keys = self
+                .inner
+                .dependencies
+                .object_store
+                .list(&layout.backup_commit_log_prefix())
+                .await?;
+            for key in commit_log_keys {
+                let Some(segment_id) = Self::parse_segment_id(&key) else {
+                    continue;
+                };
+                let Ok(bytes) = self.inner.dependencies.object_store.get(&key).await else {
+                    continue;
+                };
+                let Ok(footer) = segment_footer_from_bytes(segment_id, &bytes) else {
+                    continue;
+                };
+                if footer.max_sequence > min_last_flushed_sequence {
+                    referenced.insert(key);
+                }
+            }
+        }
+
+        let mut candidates = Vec::new();
+        for prefix in [
+            layout.backup_manifest_prefix(),
+            layout.backup_commit_log_prefix(),
+            layout.backup_sstable_prefix(),
+        ] {
+            candidates.extend(self.inner.dependencies.object_store.list(&prefix).await?);
+        }
+        candidates.sort();
+        candidates.dedup();
+
+        let now_millis = self.inner.dependencies.clock.now().get();
+        for key in candidates {
+            if key.starts_with(&layout.backup_gc_metadata_prefix()) || referenced.contains(&key) {
+                continue;
+            }
+            let Some(record) =
+                Self::read_backup_object_birth(&self.inner.dependencies, layout, &key).await
+            else {
+                continue;
+            };
+            if now_millis.saturating_sub(record.first_uploaded_at_millis)
+                < BACKUP_GC_GRACE_PERIOD_MILLIS
+            {
+                continue;
+            }
+            self.inner.dependencies.object_store.delete(&key).await?;
+            let _ = self
+                .inner
+                .dependencies
+                .object_store
+                .delete(&layout.backup_gc_metadata(&key))
+                .await;
+        }
 
         Ok(())
     }
@@ -3898,6 +4518,14 @@ impl Db {
             sstables.manifest_generation = next_generation;
             sstables.live = new_live;
         }
+        let state = self.sstables_read().clone();
+        let _ = self
+            .sync_tiered_backup_manifest(
+                state.manifest_generation,
+                state.last_flushed_sequence,
+                &state.live,
+            )
+            .await;
         self.record_compaction_filter_stats(
             job.table_id,
             filtered.removed_bytes,
@@ -3972,11 +4600,13 @@ impl Db {
             .store(next_table_id, Ordering::SeqCst);
         *self.tables_write() = updated_tables;
 
-        Ok(Table {
+        let table = Table {
             db: self.clone(),
             name: Arc::from(name),
             id: Some(id),
-        })
+        };
+        let _ = self.sync_tiered_backup_catalog().await;
+        Ok(table)
     }
 
     pub async fn snapshot(&self) -> Snapshot {
@@ -4051,6 +4681,7 @@ impl Db {
             }
 
             self.mark_durable_confirmed(participant.sequence);
+            let _ = self.sync_tiered_commit_log_tail().await;
             self.maybe_pause_commit_phase(CommitPhase::AfterDurabilitySync, participant.sequence)
                 .await;
         }
@@ -4148,6 +4779,19 @@ impl Db {
             );
             *self.sstables_write() = sstable_state;
         }
+
+        let backup_result = if flushed_count > 0 {
+            let state = self.sstables_read().clone();
+            self.sync_tiered_backup_manifest(
+                state.manifest_generation,
+                state.last_flushed_sequence,
+                &state.live,
+            )
+            .await
+        } else {
+            self.sync_tiered_commit_log_tail().await
+        };
+        let _ = backup_result;
 
         self.prune_commit_log(true)
             .await
@@ -5749,7 +6393,6 @@ async fn read_all_file(
     Ok(bytes)
 }
 
-#[cfg(test)]
 async fn read_path(dependencies: &DbDependencies, path: &str) -> Result<Vec<u8>, StorageError> {
     read_source(dependencies, &StorageSource::local_file(path)).await
 }
@@ -5788,6 +6431,71 @@ async fn read_optional_path(
     }
 }
 
+async fn read_optional_remote_object(
+    dependencies: &DbDependencies,
+    key: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    match dependencies.object_store.get(key).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == StorageErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn write_local_file_atomic(
+    dependencies: &DbDependencies,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), StorageError> {
+    let temp_path = format!("{path}.tmp");
+    let handle = dependencies
+        .file_system
+        .open(
+            &temp_path,
+            OpenOptions {
+                create: true,
+                read: true,
+                write: true,
+                truncate: true,
+                append: false,
+            },
+        )
+        .await?;
+    dependencies.file_system.write_at(&handle, 0, bytes).await?;
+    dependencies.file_system.sync(&handle).await?;
+    dependencies.file_system.rename(&temp_path, path).await?;
+    if let Some(parent) = PathBuf::from(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        dependencies
+            .file_system
+            .sync_dir(parent.to_string_lossy().as_ref())
+            .await?;
+    }
+    Ok(())
+}
+
+async fn delete_local_file_if_exists(
+    dependencies: &DbDependencies,
+    path: &str,
+) -> Result<(), StorageError> {
+    match dependencies.file_system.delete(path).await {
+        Ok(()) => {
+            if let Some(parent) = PathBuf::from(path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                dependencies
+                    .file_system
+                    .sync_dir(parent.to_string_lossy().as_ref())
+                    .await?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == StorageErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     fn hash_with_seed(key: &[u8], seed: u64) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
@@ -5822,12 +6530,12 @@ mod tests {
         ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
         DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
         FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
-        PendingWork, PendingWorkType, PointMutation, ReadError, Rng, S3Location,
-        S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
-        SegmentId, SequenceNumber, ShadowOracle, SnapshotTooOld, SsdConfig, StorageConfig,
-        StorageError, StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TableId,
-        TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Timestamp,
-        TtlCompactionFilter, Value,
+        ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
+        PendingWorkType, PointMutation, ReadError, Rng, S3Location, S3PrimaryStorageConfig,
+        ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber,
+        ShadowOracle, SnapshotTooOld, SsdConfig, StorageConfig, StorageError, StubClock,
+        StubObjectStore, StubRng, TableConfig, TableFormat, TableId, TableStats, ThrottleDecision,
+        TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -5849,6 +6557,13 @@ mod tests {
 
     fn tiered_config(path: &str) -> DbConfig {
         tiered_config_with_durability(path, TieredDurabilityMode::GroupCommit)
+    }
+
+    fn tiered_layout() -> ObjectKeyLayout {
+        ObjectKeyLayout::new(&S3Location {
+            bucket: "terracedb-test".to_string(),
+            prefix: "tiered".to_string(),
+        })
     }
 
     fn s3_primary_config(prefix: &str) -> DbConfig {
@@ -8004,6 +8719,191 @@ mod tests {
                 .await
                 .expect("write after repeated reopen"),
             SequenceNumber::new(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn tiered_backup_restores_catalog_sstables_and_commit_log_tail_after_local_loss() {
+        let primary_file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let primary_dependencies = dependencies(primary_file_system, object_store.clone());
+
+        let db = Db::open(tiered_config("/remote-dr"), primary_dependencies)
+            .await
+            .expect("open primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+        let audit = db
+            .create_table(row_table_config("audit"))
+            .await
+            .expect("create audit table");
+
+        events
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write flushed value");
+        db.flush().await.expect("flush backup snapshot");
+        events
+            .write(b"banana".to_vec(), Value::bytes("tail"))
+            .await
+            .expect("write tail value");
+        audit
+            .write(b"audit:1".to_vec(), Value::bytes("entry"))
+            .await
+            .expect("write audit tail");
+
+        let restored_file_system = Arc::new(crate::StubFileSystem::default());
+        let restored_dependencies = dependencies(restored_file_system, object_store);
+        let restored = Db::open(tiered_config("/remote-dr"), restored_dependencies)
+            .await
+            .expect("restore from remote backup");
+
+        let restored_events = restored.table("events");
+        let restored_audit = restored.table("audit");
+        assert_eq!(
+            restored_events
+                .read(b"apple".to_vec())
+                .await
+                .expect("read restored flushed value"),
+            Some(Value::bytes("v1"))
+        );
+        assert_eq!(
+            restored_events
+                .read(b"banana".to_vec())
+                .await
+                .expect("read restored tail value"),
+            Some(Value::bytes("tail"))
+        );
+        assert_eq!(
+            restored_audit
+                .read(b"audit:1".to_vec())
+                .await
+                .expect("read restored audit tail"),
+            Some(Value::bytes("entry"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tiered_backup_falls_back_to_generation_list_when_latest_pointer_is_corrupt() {
+        let primary_file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let primary_dependencies = dependencies(primary_file_system, object_store.clone());
+
+        let db = Db::open(
+            tiered_config("/remote-latest-fallback"),
+            primary_dependencies,
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write v1");
+        db.flush().await.expect("flush first generation");
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write v2");
+        db.flush().await.expect("flush second generation");
+
+        object_store
+            .put(
+                &tiered_layout().backup_manifest_latest(),
+                &[0xff, 0xfe, 0xfd],
+            )
+            .await
+            .expect("corrupt latest pointer");
+
+        let restored = Db::open(
+            tiered_config("/remote-latest-fallback"),
+            dependencies(Arc::new(crate::StubFileSystem::default()), object_store),
+        )
+        .await
+        .expect("recover using immutable manifest generations");
+        let restored_table = restored.table("events");
+        assert_eq!(
+            restored_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read restored value"),
+            Some(Value::bytes("v2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_backup_sstables_are_harmless_before_manifest_publish() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db_dependencies = dependencies(file_system, object_store.clone());
+        let layout = tiered_layout();
+
+        let db = Db::open(tiered_config("/remote-orphan-manifest"), db_dependencies)
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write first value");
+        db.flush().await.expect("flush first generation");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second value");
+        object_store.inject_failure(ObjectStoreFailure::timeout(
+            ObjectStoreOperation::Put,
+            layout.backup_manifest(ManifestId::new(2)),
+        ));
+        db.flush()
+            .await
+            .expect("local flush should succeed despite backup manifest failure");
+
+        let latest_pointer = String::from_utf8(
+            object_store
+                .get(&layout.backup_manifest_latest())
+                .await
+                .expect("read latest manifest pointer"),
+        )
+        .expect("decode latest manifest pointer");
+        assert_eq!(
+            latest_pointer.trim(),
+            layout.backup_manifest(ManifestId::new(1))
+        );
+        assert_eq!(
+            object_store
+                .list(&layout.backup_sstable_prefix())
+                .await
+                .expect("list backup sstables")
+                .len(),
+            2,
+            "the second SSTable upload should already exist even though its manifest did not publish"
+        );
+
+        let restored = Db::open(
+            tiered_config("/remote-orphan-manifest"),
+            dependencies(Arc::new(crate::StubFileSystem::default()), object_store),
+        )
+        .await
+        .expect("recover from previous remote manifest and commit-log tail");
+        let restored_table = restored.table("events");
+        assert_eq!(
+            restored_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read recovered value"),
+            Some(Value::bytes("v2"))
         );
     }
 

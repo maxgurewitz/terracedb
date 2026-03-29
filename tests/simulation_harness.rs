@@ -10,14 +10,14 @@ use terracedb::{
     Clock, CommitOptions, CompactionStrategy, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
     DbConfig, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
     DbSimulationScenarioConfig, DbWorkloadOperation, FieldDefinition, FieldId, FieldType,
-    FieldValue, LogCursor, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation,
-    OperationResult, PendingWork, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location,
-    ScanOptions, ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
-    SchemaDefinition, SeededSimulationRunner, SequenceNumber, ShadowOracle,
-    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, SsdConfig,
-    StorageConfig, StorageErrorKind, StorageSource, StubDbProcess, TableConfig, TableFormat,
-    TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
+    FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ObjectStore,
+    ObjectStoreFaultSpec, ObjectStoreOperation, OpenError, OperationResult, PendingWork,
+    PointMutation, RemoteCache, RemoteRecoveryHint, S3Location, ScanOptions, ScheduleAction,
+    ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler, SchemaDefinition,
+    SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
+    SimulationScenarioConfig, SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind,
+    StorageSource, StubDbProcess, TableConfig, TableFormat, TableStats, ThrottleDecision,
+    TieredDurabilityMode, TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
@@ -1358,6 +1358,98 @@ fn remote_list_failures_are_structured_in_simulation() -> turmoil::Result {
 
         let listed = storage.list_objects(manifest_prefix).await?;
         assert_eq!(listed, vec!["backup/manifest/MANIFEST-000001".to_string()]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn tiered_backup_recovery_restores_remote_state_after_simulated_disk_loss() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2222).run_with(|context| async move {
+        let root = "/terracedb/sim/backup-dr";
+        let config = simulation_tiered_config(root, TieredDurabilityMode::GroupCommit);
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+        let audit = db
+            .create_table(SimulationTableSpec::row("audit").table_config())
+            .await?;
+
+        events.write(b"apple".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+        events.write(b"banana".to_vec(), bytes("tail")).await?;
+        audit.write(b"audit:1".to_vec(), bytes("entry")).await?;
+
+        let existing = context.file_system().list(root).await?;
+        for path in existing {
+            context.file_system().delete(&path).await?;
+        }
+
+        let restored = context.open_db(config).await?;
+        let restored_events = restored.table("events");
+        let restored_audit = restored.table("audit");
+        assert_eq!(
+            restored_events.read(b"apple".to_vec()).await?,
+            Some(bytes("v1"))
+        );
+        assert_eq!(
+            restored_events.read(b"banana".to_vec()).await?,
+            Some(bytes("tail"))
+        );
+        assert_eq!(
+            restored_audit.read(b"audit:1".to_vec()).await?,
+            Some(bytes("entry"))
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn tiered_backup_retries_after_interrupted_restore_in_simulation() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2323).run_with(|context| async move {
+        let root = "/terracedb/sim/backup-retry";
+        let config = simulation_tiered_config(root, TieredDurabilityMode::GroupCommit);
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        events.write(b"apple".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+        events.write(b"banana".to_vec(), bytes("tail")).await?;
+
+        let existing = context.file_system().list(root).await?;
+        for path in existing {
+            context.file_system().delete(&path).await?;
+        }
+
+        context
+            .file_system()
+            .inject_failure(FileSystemFailure::timeout(
+                FileSystemOperation::Rename,
+                format!("{root}/manifest/MANIFEST-000001.tmp"),
+            ));
+        let first = context
+            .open_db(config.clone())
+            .await
+            .expect_err("first restore should fail partway through");
+        assert!(
+            matches!(first, OpenError::Storage(_)),
+            "interrupted restore should surface a storage error"
+        );
+
+        let restored = context.open_db(config).await?;
+        let restored_events = restored.table("events");
+        assert_eq!(
+            restored_events.read(b"apple".to_vec()).await?,
+            Some(bytes("v1"))
+        );
+        assert_eq!(
+            restored_events.read(b"banana".to_vec()).await?,
+            Some(bytes("tail"))
+        );
 
         Ok(())
     })
