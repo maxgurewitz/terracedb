@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -99,13 +100,15 @@ pub struct S3PrimaryStorageConfig {
     pub auto_flush_interval: Option<Duration>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TableFormat {
     Row,
     Columnar,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CompactionStrategy {
     Leveled,
     Tiered,
