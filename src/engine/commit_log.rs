@@ -388,6 +388,20 @@ impl SegmentCatalog {
             .get(&table_id)
             .and_then(|spans| spans.first().map(|span| span.min_sequence))
     }
+
+    pub fn segment_ids_for_table_since(
+        &self,
+        table_id: TableId,
+        sequence: SequenceNumber,
+    ) -> Vec<SegmentId> {
+        self.table_index
+            .get(&table_id)
+            .into_iter()
+            .flat_map(|spans| spans.iter())
+            .filter(|span| span.max_sequence >= sequence)
+            .map(|span| span.segment_id)
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -638,6 +652,42 @@ impl SegmentManager {
         Ok(records)
     }
 
+    pub async fn scan_table_from_sequence(
+        &self,
+        table_id: TableId,
+        sequence_inclusive: SequenceNumber,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        let mut records = Vec::new();
+
+        for segment_id in self
+            .catalog
+            .segment_ids_for_table_since(table_id, sequence_inclusive)
+        {
+            records.extend(
+                self.read_from_sequence(segment_id, sequence_inclusive)
+                    .await?
+                    .into_iter()
+                    .filter(|record| record.sequence() >= sequence_inclusive)
+                    .filter(|record| record_touches_table(record, table_id)),
+            );
+        }
+
+        if self
+            .active
+            .has_entries_for_table_since(table_id, sequence_inclusive)
+        {
+            records.extend(
+                self.read_from_sequence(self.active.id, sequence_inclusive)
+                    .await?
+                    .into_iter()
+                    .filter(|record| record.sequence() >= sequence_inclusive)
+                    .filter(|record| record_touches_table(record, table_id)),
+            );
+        }
+
+        Ok(records)
+    }
+
     async fn repair_active_segment(
         fs: &dyn FileSystem,
         path: &str,
@@ -867,6 +917,13 @@ impl ActiveSegment {
             }
         })
     }
+
+    fn has_entries_for_table_since(&self, table_id: TableId, sequence: SequenceNumber) -> bool {
+        self.tables
+            .get(&table_id)
+            .and_then(|meta| meta.max_sequence)
+            .is_some_and(|max_sequence| max_sequence >= sequence)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -874,6 +931,13 @@ struct TableMetaAccumulator {
     min_sequence: Option<SequenceNumber>,
     max_sequence: Option<SequenceNumber>,
     entry_count: u32,
+}
+
+fn record_touches_table(record: &CommitRecord, table_id: TableId) -> bool {
+    record
+        .entries
+        .iter()
+        .any(|entry| entry.table_id == table_id)
 }
 
 impl From<&SegmentFooter> for SegmentDescriptor {
@@ -1613,6 +1677,72 @@ mod tests {
                 (0, TableId::new(1)),
                 (1, TableId::new(2)),
                 (2, TableId::new(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn segment_manager_scans_table_entries_across_sealed_and_active_segments() {
+        let fs = Arc::new(SimulatedFileSystem::default());
+        let dir = "/db/table-scan";
+
+        let mut manager = SegmentManager::open(
+            fs.clone(),
+            dir,
+            SegmentOptions {
+                max_segment_size_bytes: 4096,
+                records_per_block: 1,
+            },
+        )
+        .await
+        .expect("open manager");
+
+        manager
+            .append(sample_record(1))
+            .await
+            .expect("append first");
+        manager
+            .append(sample_record(2))
+            .await
+            .expect("append second");
+        manager.seal_active().await.expect("seal").expect("sealed");
+        manager
+            .append(sample_record(3))
+            .await
+            .expect("append third");
+
+        let reopened = SegmentManager::open(
+            fs.clone(),
+            dir,
+            SegmentOptions {
+                max_segment_size_bytes: 4096,
+                records_per_block: 1,
+            },
+        )
+        .await
+        .expect("reopen manager");
+
+        let records = reopened
+            .scan_table_from_sequence(TableId::new(1), SequenceNumber::new(2))
+            .await
+            .expect("scan table");
+
+        assert_eq!(
+            records
+                .iter()
+                .flat_map(|record| {
+                    record
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.table_id == TableId::new(1))
+                        .map(move |entry| (record.sequence(), entry.op_index, entry.table_id))
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (SequenceNumber::new(2), 0, TableId::new(1)),
+                (SequenceNumber::new(2), 2, TableId::new(1)),
+                (SequenceNumber::new(3), 0, TableId::new(1)),
+                (SequenceNumber::new(3), 2, TableId::new(1)),
             ]
         );
     }

@@ -3,21 +3,27 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use futures::StreamExt;
 use terracedb::{
-    CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig, DbGeneratedScenario, DbMutation,
-    DbShadowOracle, DbSimulationScenarioConfig, DbWorkloadOperation, ObjectStore,
-    ObjectStoreFaultSpec, ObjectStoreOperation, OperationResult, PendingWork, PointMutation,
-    RemoteCache, RemoteRecoveryHint, S3Location, ScheduleAction, ScheduleDecision, ScheduledFault,
-    ScheduledFaultKind, Scheduler, SeededSimulationRunner, SequenceNumber, ShadowOracle,
-    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, SsdConfig,
-    StorageConfig, StorageErrorKind, StorageSource, StubDbProcess, TableStats, ThrottleDecision,
-    TieredDurabilityMode, TieredStorageConfig, TraceEvent, UnifiedStorage, Value,
+    CommitOptions, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig, DbGeneratedScenario,
+    DbMutation, DbOracleChange, DbShadowOracle, DbSimulationScenarioConfig, DbWorkloadOperation,
+    LogCursor, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation, OperationResult,
+    PendingWork, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location, ScanOptions,
+    ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
+    SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
+    SimulationScenarioConfig, SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind,
+    StorageSource, StubDbProcess, TableStats, ThrottleDecision, TieredDurabilityMode,
+    TieredStorageConfig, TraceEvent, UnifiedStorage, Value,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
     let mut encoded = expires_at_millis.to_be_bytes().to_vec();
     encoded.extend_from_slice(payload.as_bytes());
     Value::Bytes(encoded)
+}
+
+fn bytes(payload: &str) -> Value {
+    Value::Bytes(payload.as_bytes().to_vec())
 }
 
 #[derive(Default)]
@@ -122,6 +128,41 @@ fn simulation_db_config(
     }
 }
 
+fn simulation_tiered_config(root_path: &str, durability: TieredDurabilityMode) -> DbConfig {
+    DbConfig {
+        storage: StorageConfig::Tiered(TieredStorageConfig {
+            ssd: SsdConfig {
+                path: root_path.to_string(),
+            },
+            s3: S3Location {
+                bucket: "terracedb-sim".to_string(),
+                prefix: "cdc".to_string(),
+            },
+            max_local_bytes: 1024 * 1024,
+            durability,
+        }),
+        scheduler: None,
+    }
+}
+
+async fn collect_change_feed(stream: terracedb::ChangeStream) -> Vec<DbOracleChange> {
+    stream
+        .map(|entry| DbOracleChange {
+            table: entry.table.name().to_string(),
+            key: entry.key,
+            value: entry.value.map(|value| match value {
+                Value::Bytes(bytes) => bytes,
+                Value::Record(_) => {
+                    panic!("simulation change-feed tests only support byte row values")
+                }
+            }),
+            cursor: entry.cursor,
+            sequence: entry.sequence,
+            kind: entry.kind,
+        })
+        .collect::<Vec<_>>()
+        .await
+}
 #[test]
 fn simulation_harness_replays_same_seed() -> turmoil::Result {
     let config = SimulationScenarioConfig {
@@ -363,6 +404,276 @@ fn db_shadow_oracle_matches_merge_recovery_prefix() {
         .expect("validate recovery prefix");
     assert_eq!(matched.durable_sequence, SequenceNumber::new(2));
     assert_eq!(matched.matched_sequence, SequenceNumber::new(2));
+}
+
+#[test]
+fn db_change_feed_simulation_tracks_visible_durable_and_crash_recovery() -> turmoil::Result {
+    let events_spec = SimulationTableSpec::row("events");
+    let audit_spec = SimulationTableSpec::row("audit");
+    let specs = vec![events_spec.clone(), audit_spec.clone()];
+
+    SeededSimulationRunner::new(0xcdc1).run_with(move |context| {
+        let specs = specs.clone();
+        let events_spec = events_spec.clone();
+        let audit_spec = audit_spec.clone();
+
+        async move {
+            let config = simulation_tiered_config(
+                "/terracedb/sim/cdc-deferred",
+                TieredDurabilityMode::Deferred,
+            );
+            let db = context.open_db(config.clone()).await?;
+            let events = db.create_table(events_spec.table_config()).await?;
+            let audit = db.create_table(audit_spec.table_config()).await?;
+            let mut oracle = DbShadowOracle::new(&specs);
+
+            let mut batch = db.write_batch();
+            batch.put(&events, b"user:1".to_vec(), bytes("v1"));
+            batch.put(&audit, b"audit:1".to_vec(), bytes("ignore"));
+            batch.delete(&events, b"user:2".to_vec());
+            batch.put(&events, b"user:3".to_vec(), bytes("v3"));
+            let first_sequence = db.commit(batch, CommitOptions::default()).await?;
+
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:1".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+                false,
+            )?;
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 1),
+                DbMutation::Put {
+                    table: "audit".to_string(),
+                    key: b"audit:1".to_vec(),
+                    value: b"ignore".to_vec(),
+                },
+                false,
+            )?;
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 2),
+                DbMutation::Delete {
+                    table: "events".to_string(),
+                    key: b"user:2".to_vec(),
+                },
+                false,
+            )?;
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 3),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:3".to_vec(),
+                    value: b"v3".to_vec(),
+                },
+                false,
+            )?;
+
+            let visible = collect_change_feed(
+                db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                    .await?,
+            )
+            .await;
+            assert_eq!(
+                visible,
+                oracle.visible_changes_since("events", LogCursor::beginning())?
+            );
+
+            let durable_before_flush = collect_change_feed(
+                db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                    .await?,
+            )
+            .await;
+            assert_eq!(
+                durable_before_flush,
+                oracle.durable_changes_since("events", LogCursor::beginning())?
+            );
+            assert!(durable_before_flush.is_empty());
+
+            db.flush().await?;
+            oracle.mark_durable_through(db.current_durable_sequence());
+
+            let durable_after_flush = collect_change_feed(
+                db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                    .await?,
+            )
+            .await;
+            assert_eq!(
+                durable_after_flush,
+                oracle.durable_changes_since("events", LogCursor::beginning())?
+            );
+
+            let second_sequence = events.write(b"user:4".to_vec(), bytes("volatile")).await?;
+            oracle.apply_with_cursor(
+                LogCursor::new(second_sequence, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:4".to_vec(),
+                    value: b"volatile".to_vec(),
+                },
+                false,
+            )?;
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_events = reopened.table("events");
+
+            let visible_after_restart = collect_change_feed(
+                reopened
+                    .scan_since(
+                        &reopened_events,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await?,
+            )
+            .await;
+            assert_eq!(
+                visible_after_restart,
+                oracle.durable_changes_since("events", LogCursor::beginning())?
+            );
+
+            let durable_after_restart = collect_change_feed(
+                reopened
+                    .scan_durable_since(
+                        &reopened_events,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await?,
+            )
+            .await;
+            assert_eq!(durable_after_restart, visible_after_restart);
+            assert_eq!(
+                reopened.current_sequence(),
+                reopened.current_durable_sequence()
+            );
+
+            Ok(())
+        }
+    })
+}
+
+#[test]
+fn db_change_feed_simulation_resumes_from_cursor_after_restart() -> turmoil::Result {
+    let events_spec = SimulationTableSpec::row("events");
+    let audit_spec = SimulationTableSpec::row("audit");
+    let specs = vec![events_spec.clone(), audit_spec.clone()];
+
+    SeededSimulationRunner::new(0xcdc2).run_with(move |context| {
+        let specs = specs.clone();
+        let events_spec = events_spec.clone();
+        let audit_spec = audit_spec.clone();
+
+        async move {
+            let config = simulation_tiered_config(
+                "/terracedb/sim/cdc-resume-restart",
+                TieredDurabilityMode::GroupCommit,
+            );
+            let db = context.open_db(config.clone()).await?;
+            let events = db.create_table(events_spec.table_config()).await?;
+            let audit = db.create_table(audit_spec.table_config()).await?;
+            let mut oracle = DbShadowOracle::new(&specs);
+
+            let mut batch = db.write_batch();
+            batch.put(&events, b"user:1".to_vec(), bytes("v1"));
+            batch.put(&audit, b"audit:1".to_vec(), bytes("ignore"));
+            batch.delete(&events, b"user:2".to_vec());
+            batch.put(&events, b"user:3".to_vec(), bytes("v3"));
+            let first_sequence = db.commit(batch, CommitOptions::default()).await?;
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:1".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+                true,
+            )?;
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 1),
+                DbMutation::Put {
+                    table: "audit".to_string(),
+                    key: b"audit:1".to_vec(),
+                    value: b"ignore".to_vec(),
+                },
+                true,
+            )?;
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 2),
+                DbMutation::Delete {
+                    table: "events".to_string(),
+                    key: b"user:2".to_vec(),
+                },
+                true,
+            )?;
+            oracle.apply_with_cursor(
+                LogCursor::new(first_sequence, 3),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:3".to_vec(),
+                    value: b"v3".to_vec(),
+                },
+                true,
+            )?;
+
+            let second_sequence = events.write(b"user:4".to_vec(), bytes("v4")).await?;
+            oracle.apply_with_cursor(
+                LogCursor::new(second_sequence, 0),
+                DbMutation::Put {
+                    table: "events".to_string(),
+                    key: b"user:4".to_vec(),
+                    value: b"v4".to_vec(),
+                },
+                true,
+            )?;
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_events = reopened.table("events");
+            let expected = oracle.visible_changes_since("events", LogCursor::beginning())?;
+
+            let first_page = collect_change_feed(
+                reopened
+                    .scan_since(
+                        &reopened_events,
+                        LogCursor::beginning(),
+                        ScanOptions {
+                            limit: Some(2),
+                            ..ScanOptions::default()
+                        },
+                    )
+                    .await?,
+            )
+            .await;
+            assert_eq!(first_page, expected[..2].to_vec());
+
+            let resumed = collect_change_feed(
+                reopened
+                    .scan_since(
+                        &reopened_events,
+                        first_page.last().expect("page should not be empty").cursor,
+                        ScanOptions::default(),
+                    )
+                    .await?,
+            )
+            .await;
+            assert_eq!(resumed, expected[2..].to_vec());
+
+            let durable = collect_change_feed(
+                reopened
+                    .scan_durable_since(
+                        &reopened_events,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await?,
+            )
+            .await;
+            assert_eq!(durable, expected);
+
+            Ok(())
+        }
+    })
 }
 
 #[test]
