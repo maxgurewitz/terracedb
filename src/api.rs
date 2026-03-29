@@ -23,7 +23,7 @@ use crate::{
         CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
         StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
     },
-    ids::{FieldId, LogCursor, SequenceNumber, TableId},
+    ids::{CommitId, FieldId, LogCursor, SequenceNumber, TableId},
     io::{DbDependencies, OpenOptions},
     scheduler::{PendingWork, TableStats},
 };
@@ -235,6 +235,7 @@ const CATALOG_READ_CHUNK_LEN: usize = 8 * 1024;
 const LOCAL_CATALOG_RELATIVE_PATH: &str = "catalog/CATALOG.json";
 const LOCAL_CATALOG_TEMP_SUFFIX: &str = ".tmp";
 const OBJECT_CATALOG_RELATIVE_KEY: &str = "catalog/CATALOG.json";
+const MVCC_KEY_SEPARATOR: u8 = 0;
 
 #[derive(Clone)]
 pub struct Db {
@@ -246,10 +247,15 @@ struct DbInner {
     dependencies: DbDependencies,
     catalog_location: CatalogLocation,
     catalog_write_lock: AsyncMutex<()>,
+    commit_lock: AsyncMutex<()>,
     next_table_id: AtomicU32,
+    next_sequence: AtomicU64,
     current_sequence: AtomicU64,
     current_durable_sequence: AtomicU64,
     tables: RwLock<BTreeMap<String, StoredTable>>,
+    memtables: RwLock<MemtableState>,
+    snapshot_tracker: Mutex<SnapshotTracker>,
+    next_snapshot_id: AtomicU64,
     visible_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
     durable_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
 }
@@ -286,6 +292,371 @@ struct PersistedTableConfig {
     compaction_strategy: CompactionStrategy,
     schema: Option<SchemaDefinition>,
     metadata: TableMetadata,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedBatchOperation {
+    table_id: TableId,
+    table_name: String,
+    key: Key,
+    kind: ChangeKind,
+    value: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct MemtableEntry {
+    user_key: Key,
+    sequence: SequenceNumber,
+    kind: ChangeKind,
+    value: Option<Value>,
+    size_bytes: u64,
+}
+
+impl MemtableEntry {
+    fn new(
+        user_key: Key,
+        sequence: SequenceNumber,
+        kind: ChangeKind,
+        value: Option<Value>,
+    ) -> Self {
+        let size_bytes = (user_key.len()
+            + encode_mvcc_key(&user_key, CommitId::new(sequence)).len()
+            + value.as_ref().map(value_size_bytes).unwrap_or_default())
+            as u64;
+
+        Self {
+            user_key,
+            sequence,
+            kind,
+            value,
+            size_bytes,
+        }
+    }
+
+    fn visible_value(&self) -> Option<Value> {
+        match self.kind {
+            ChangeKind::Delete => None,
+            ChangeKind::Put | ChangeKind::Merge => self.value.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TableMemtable {
+    entries: BTreeMap<Vec<u8>, MemtableEntry>,
+    pending_flush_bytes: u64,
+}
+
+impl TableMemtable {
+    fn insert(&mut self, entry: MemtableEntry) {
+        let encoded_key = encode_mvcc_key(&entry.user_key, CommitId::new(entry.sequence));
+        if let Some(replaced) = self.entries.insert(encoded_key, entry.clone()) {
+            self.pending_flush_bytes = self.pending_flush_bytes.saturating_sub(replaced.size_bytes);
+        }
+        self.pending_flush_bytes = self.pending_flush_bytes.saturating_add(entry.size_bytes);
+    }
+
+    fn read_at(&self, key: &[u8], sequence: SequenceNumber) -> Option<MemtableEntry> {
+        let seek = encode_mvcc_key(key, CommitId::new(sequence));
+        let (_encoded_key, entry) = self.entries.range(seek..).next()?;
+        (entry.user_key.as_slice() == key).then(|| entry.clone())
+    }
+
+    fn collect_matching_keys(&self, matcher: &KeyMatcher<'_>, keys: &mut BTreeSet<Key>) {
+        for entry in self.entries.values() {
+            if matcher.matches(&entry.user_key) {
+                keys.insert(entry.user_key.clone());
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Memtable {
+    tables: BTreeMap<TableId, TableMemtable>,
+    max_sequence: SequenceNumber,
+}
+
+impl Memtable {
+    fn apply(&mut self, sequence: SequenceNumber, operation: &ResolvedBatchOperation) {
+        self.max_sequence = self.max_sequence.max(sequence);
+        self.tables
+            .entry(operation.table_id)
+            .or_default()
+            .insert(MemtableEntry::new(
+                operation.key.clone(),
+                sequence,
+                operation.kind,
+                operation.value.clone(),
+            ));
+    }
+
+    fn read_at(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<MemtableEntry> {
+        self.tables.get(&table_id)?.read_at(key, sequence)
+    }
+
+    fn collect_matching_keys(
+        &self,
+        table_id: TableId,
+        matcher: &KeyMatcher<'_>,
+        keys: &mut BTreeSet<Key>,
+    ) {
+        if let Some(table) = self.tables.get(&table_id) {
+            table.collect_matching_keys(matcher, keys);
+        }
+    }
+
+    fn pending_flush_bytes(&self, table_id: TableId) -> u64 {
+        self.tables
+            .get(&table_id)
+            .map(|table| table.pending_flush_bytes)
+            .unwrap_or_default()
+    }
+
+    fn has_entries_for_table(&self, table_id: TableId) -> bool {
+        self.tables
+            .get(&table_id)
+            .map(|table| !table.is_empty())
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.tables.values().all(TableMemtable::is_empty)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ImmutableMemtable {
+    max_sequence: SequenceNumber,
+    memtable: Memtable,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MemtableState {
+    mutable: Memtable,
+    immutables: Vec<ImmutableMemtable>,
+}
+
+impl MemtableState {
+    fn apply(&mut self, sequence: SequenceNumber, operations: &[ResolvedBatchOperation]) {
+        for operation in operations {
+            self.mutable.apply(sequence, operation);
+        }
+    }
+
+    fn read_at(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<MemtableEntry> {
+        let mut best = self.mutable.read_at(table_id, key, sequence);
+
+        for immutable in self.immutables.iter().rev() {
+            if immutable.max_sequence < sequence
+                && let Some(current) = best.as_ref()
+                && current.sequence >= immutable.max_sequence
+            {
+                continue;
+            }
+
+            let Some(candidate) = immutable.memtable.read_at(table_id, key, sequence) else {
+                continue;
+            };
+
+            let replace = match best.as_ref() {
+                Some(current) => candidate.sequence > current.sequence,
+                None => true,
+            };
+            if replace {
+                best = Some(candidate);
+            }
+        }
+
+        best
+    }
+
+    fn scan(
+        &self,
+        table_id: TableId,
+        sequence: SequenceNumber,
+        matcher: KeyMatcher<'_>,
+        opts: &ScanOptions,
+    ) -> Vec<(Key, Value)> {
+        let limit = opts.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut keys = BTreeSet::new();
+        self.mutable
+            .collect_matching_keys(table_id, &matcher, &mut keys);
+        for immutable in &self.immutables {
+            immutable
+                .memtable
+                .collect_matching_keys(table_id, &matcher, &mut keys);
+        }
+
+        let mut ordered_keys = keys.into_iter().collect::<Vec<_>>();
+        if opts.reverse {
+            ordered_keys.reverse();
+        }
+
+        let mut rows = Vec::new();
+        for key in ordered_keys {
+            let Some(entry) = self.read_at(table_id, &key, sequence) else {
+                continue;
+            };
+            let Some(value) = entry.visible_value() else {
+                continue;
+            };
+
+            rows.push((key, value));
+            if rows.len() >= limit {
+                break;
+            }
+        }
+
+        rows
+    }
+
+    #[cfg(test)]
+    fn rotate_mutable(&mut self) -> Option<SequenceNumber> {
+        if self.mutable.is_empty() {
+            return None;
+        }
+
+        let rotated = std::mem::take(&mut self.mutable);
+        let max_sequence = rotated.max_sequence;
+        self.immutables.push(ImmutableMemtable {
+            max_sequence,
+            memtable: rotated,
+        });
+        Some(max_sequence)
+    }
+
+    fn pending_flush_bytes(&self, table_id: TableId) -> u64 {
+        let mutable_bytes = self.mutable.pending_flush_bytes(table_id);
+        let immutable_bytes = self
+            .immutables
+            .iter()
+            .map(|immutable| immutable.memtable.pending_flush_bytes(table_id))
+            .sum::<u64>();
+
+        mutable_bytes.saturating_add(immutable_bytes)
+    }
+
+    fn immutable_memtable_count(&self, table_id: TableId) -> u32 {
+        self.immutables
+            .iter()
+            .filter(|immutable| immutable.memtable.has_entries_for_table(table_id))
+            .count() as u32
+    }
+}
+
+#[derive(Clone, Debug)]
+enum KeyMatcher<'a> {
+    Range { start: &'a [u8], end: &'a [u8] },
+    Prefix(&'a [u8]),
+}
+
+impl KeyMatcher<'_> {
+    fn matches(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Range { start, end } => key >= *start && key < *end,
+            Self::Prefix(prefix) => key.starts_with(prefix),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SnapshotTracker {
+    registrations: BTreeMap<u64, SequenceNumber>,
+    counts_by_sequence: BTreeMap<SequenceNumber, usize>,
+}
+
+impl SnapshotTracker {
+    fn register(&mut self, id: u64, sequence: SequenceNumber) {
+        self.registrations.insert(id, sequence);
+        *self.counts_by_sequence.entry(sequence).or_default() += 1;
+    }
+
+    fn release(&mut self, id: u64) {
+        let Some(sequence) = self.registrations.remove(&id) else {
+            return;
+        };
+
+        let mut remove_key = false;
+        if let Some(count) = self.counts_by_sequence.get_mut(&sequence) {
+            *count = count.saturating_sub(1);
+            remove_key = *count == 0;
+        }
+
+        if remove_key {
+            self.counts_by_sequence.remove(&sequence);
+        }
+    }
+
+    #[cfg(test)]
+    fn oldest_active(&self) -> Option<SequenceNumber> {
+        self.counts_by_sequence.keys().next().copied()
+    }
+}
+
+fn encode_mvcc_key(user_key: &[u8], commit_id: CommitId) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(user_key.len() + 1 + CommitId::ENCODED_LEN);
+    encoded.extend_from_slice(user_key);
+    encoded.push(MVCC_KEY_SEPARATOR);
+    encoded.extend(commit_id.encode().into_iter().map(|byte| !byte));
+    encoded
+}
+
+#[cfg(test)]
+fn decode_mvcc_key(encoded: &[u8]) -> Result<(Key, CommitId), StorageError> {
+    if encoded.len() < CommitId::ENCODED_LEN + 1 {
+        return Err(StorageError::corruption("mvcc key is too short"));
+    }
+
+    let separator_index = encoded.len() - CommitId::ENCODED_LEN - 1;
+    if encoded[separator_index] != MVCC_KEY_SEPARATOR {
+        return Err(StorageError::corruption("mvcc key missing separator"));
+    }
+
+    let mut commit_bytes = [0_u8; CommitId::ENCODED_LEN];
+    for (decoded, source) in commit_bytes.iter_mut().zip(&encoded[separator_index + 1..]) {
+        *decoded = !*source;
+    }
+
+    let commit_id = CommitId::decode(&commit_bytes)
+        .map_err(|error| StorageError::corruption(format!("decode mvcc key failed: {error}")))?;
+    Ok((encoded[..separator_index].to_vec(), commit_id))
+}
+
+fn value_size_bytes(value: &Value) -> usize {
+    match value {
+        Value::Bytes(bytes) => bytes.len(),
+        Value::Record(record) => record.values().map(field_value_size_bytes).sum(),
+    }
+}
+
+fn field_value_size_bytes(value: &FieldValue) -> usize {
+    match value {
+        FieldValue::Null => 0,
+        FieldValue::Int64(_) | FieldValue::Float64(_) => 8,
+        FieldValue::String(value) => value.len(),
+        FieldValue::Bytes(value) => value.len(),
+        FieldValue::Bool(_) => 1,
+    }
 }
 
 impl PersistedCatalog {
@@ -363,10 +734,15 @@ impl Db {
                 dependencies,
                 catalog_location,
                 catalog_write_lock: AsyncMutex::new(()),
+                commit_lock: AsyncMutex::new(()),
                 next_table_id: AtomicU32::new(next_table_id),
+                next_sequence: AtomicU64::new(0),
                 current_sequence: AtomicU64::new(0),
                 current_durable_sequence: AtomicU64::new(0),
                 tables: RwLock::new(tables),
+                memtables: RwLock::new(MemtableState::default()),
+                snapshot_tracker: Mutex::new(SnapshotTracker::default()),
+                next_snapshot_id: AtomicU64::new(0),
                 visible_watchers: Mutex::new(BTreeMap::new()),
                 durable_watchers: Mutex::new(BTreeMap::new()),
             }),
@@ -686,10 +1062,17 @@ impl Db {
     }
 
     pub async fn snapshot(&self) -> Snapshot {
+        let sequence = self.current_sequence();
+        let registration_id = self.inner.next_snapshot_id.fetch_add(1, Ordering::SeqCst) + 1;
+        mutex_lock(&self.inner.snapshot_tracker).register(registration_id, sequence);
+
         Snapshot {
-            db: self.clone(),
-            sequence: self.current_sequence(),
-            released: Arc::new(AtomicBool::new(false)),
+            registration: Arc::new(SnapshotRegistration {
+                db: self.clone(),
+                id: registration_id,
+                sequence,
+                released: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -718,17 +1101,19 @@ impl Db {
             return Err(CommitError::EmptyBatch);
         }
 
+        let _commit_guard = self.inner.commit_lock.lock().await;
         let sequence =
-            SequenceNumber::new(self.inner.current_sequence.fetch_add(1, Ordering::SeqCst) + 1);
+            SequenceNumber::new(self.inner.next_sequence.fetch_add(1, Ordering::SeqCst) + 1);
+        let resolved_operations = self.resolve_batch_operations(batch.operations())?;
+        self.memtables_write().apply(sequence, &resolved_operations);
 
-        let touched_tables: BTreeSet<String> = batch
-            .operations()
+        self.inner
+            .current_sequence
+            .store(sequence.get(), Ordering::SeqCst);
+
+        let touched_tables: BTreeSet<String> = resolved_operations
             .iter()
-            .map(|op| match op {
-                BatchOperation::Put { table, .. }
-                | BatchOperation::Merge { table, .. }
-                | BatchOperation::Delete { table, .. } => table.name().to_string(),
-            })
+            .map(|operation| operation.table_name.clone())
             .collect();
 
         self.notify_watchers(&self.inner.visible_watchers, &touched_tables, sequence);
@@ -803,8 +1188,20 @@ impl Db {
             .get(table.name())
             .map(|table| table.config.metadata.clone())
             .unwrap_or_default();
+        let (pending_flush_bytes, immutable_memtable_count) = table
+            .resolve_id()
+            .map(|table_id| {
+                let memtables = self.memtables_read();
+                (
+                    memtables.pending_flush_bytes(table_id),
+                    memtables.immutable_memtable_count(table_id),
+                )
+            })
+            .unwrap_or_default();
 
         TableStats {
+            pending_flush_bytes,
+            immutable_memtable_count,
             metadata,
             ..TableStats::default()
         }
@@ -827,6 +1224,96 @@ impl Db {
     #[allow(dead_code)]
     pub(crate) fn dependencies(&self) -> &DbDependencies {
         &self.inner.dependencies
+    }
+
+    fn resolve_batch_operations(
+        &self,
+        operations: &[BatchOperation],
+    ) -> Result<Vec<ResolvedBatchOperation>, CommitError> {
+        operations
+            .iter()
+            .map(|operation| match operation {
+                BatchOperation::Put { table, key, value } => Ok(ResolvedBatchOperation {
+                    table_id: self.resolve_table_id(table).ok_or_else(|| {
+                        CommitError::Storage(StorageError::not_found(format!(
+                            "table does not exist: {}",
+                            table.name()
+                        )))
+                    })?,
+                    table_name: table.name().to_string(),
+                    key: key.clone(),
+                    kind: ChangeKind::Put,
+                    value: Some(value.clone()),
+                }),
+                BatchOperation::Merge { table, key, value } => Ok(ResolvedBatchOperation {
+                    table_id: self.resolve_table_id(table).ok_or_else(|| {
+                        CommitError::Storage(StorageError::not_found(format!(
+                            "table does not exist: {}",
+                            table.name()
+                        )))
+                    })?,
+                    table_name: table.name().to_string(),
+                    key: key.clone(),
+                    kind: ChangeKind::Merge,
+                    value: Some(value.clone()),
+                }),
+                BatchOperation::Delete { table, key } => Ok(ResolvedBatchOperation {
+                    table_id: self.resolve_table_id(table).ok_or_else(|| {
+                        CommitError::Storage(StorageError::not_found(format!(
+                            "table does not exist: {}",
+                            table.name()
+                        )))
+                    })?,
+                    table_name: table.name().to_string(),
+                    key: key.clone(),
+                    kind: ChangeKind::Delete,
+                    value: None,
+                }),
+            })
+            .collect()
+    }
+
+    fn resolve_table_id(&self, table: &Table) -> Option<TableId> {
+        table
+            .id
+            .or_else(|| self.tables_read().get(table.name()).map(|stored| stored.id))
+    }
+
+    fn read_memtable_value(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<Value> {
+        self.memtables_read()
+            .read_at(table_id, key, sequence)
+            .and_then(|entry| entry.visible_value())
+    }
+
+    fn scan_memtable(
+        &self,
+        table_id: TableId,
+        sequence: SequenceNumber,
+        matcher: KeyMatcher<'_>,
+        opts: &ScanOptions,
+    ) -> Vec<(Key, Value)> {
+        self.memtables_read()
+            .scan(table_id, sequence, matcher, opts)
+    }
+
+    fn release_snapshot_registration(&self, id: u64) {
+        mutex_lock(&self.inner.snapshot_tracker).release(id);
+    }
+
+    #[cfg(test)]
+    fn oldest_active_snapshot_sequence(&self) -> Option<SequenceNumber> {
+        mutex_lock(&self.inner.snapshot_tracker).oldest_active()
+    }
+
+    #[cfg(test)]
+    fn snapshot_gc_horizon(&self) -> SequenceNumber {
+        self.oldest_active_snapshot_sequence()
+            .unwrap_or_else(|| self.current_sequence())
     }
 
     fn watch_sender(
@@ -866,6 +1353,20 @@ impl Db {
     fn tables_write(&self) -> RwLockWriteGuard<'_, BTreeMap<String, StoredTable>> {
         self.inner.tables.write().expect("db table lock poisoned")
     }
+
+    fn memtables_read(&self) -> RwLockReadGuard<'_, MemtableState> {
+        self.inner
+            .memtables
+            .read()
+            .expect("db memtable lock poisoned")
+    }
+
+    fn memtables_write(&self) -> RwLockWriteGuard<'_, MemtableState> {
+        self.inner
+            .memtables
+            .write()
+            .expect("db memtable lock poisoned")
+    }
 }
 
 #[derive(Clone)]
@@ -884,8 +1385,8 @@ impl Table {
         self.id
     }
 
-    pub async fn read(&self, _key: Key) -> Result<Option<Value>, ReadError> {
-        Ok(None)
+    pub async fn read(&self, key: Key) -> Result<Option<Value>, ReadError> {
+        self.read_at(key, self.db.current_sequence()).await
     }
 
     pub async fn write(&self, key: Key, value: Value) -> Result<SequenceNumber, WriteError> {
@@ -917,37 +1418,76 @@ impl Table {
 
     pub async fn scan(
         &self,
-        _start: Key,
-        _end: Key,
-        _opts: ScanOptions,
+        start: Key,
+        end: Key,
+        opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        Ok(Box::pin(stream::empty()))
+        self.scan_at(start, end, self.db.current_sequence(), opts)
+            .await
     }
 
     pub async fn scan_prefix(
         &self,
-        _prefix: KeyPrefix,
-        _opts: ScanOptions,
+        prefix: KeyPrefix,
+        opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        Ok(Box::pin(stream::empty()))
+        self.scan_prefix_at(prefix, self.db.current_sequence(), opts)
+            .await
     }
 
     pub async fn read_at(
         &self,
-        _key: Key,
-        _sequence: SequenceNumber,
+        key: Key,
+        sequence: SequenceNumber,
     ) -> Result<Option<Value>, ReadError> {
-        Ok(None)
+        let Some(table_id) = self.resolve_id() else {
+            return Ok(None);
+        };
+
+        Ok(self.db.read_memtable_value(table_id, &key, sequence))
     }
 
     pub async fn scan_at(
         &self,
-        _start: Key,
-        _end: Key,
-        _sequence: SequenceNumber,
-        _opts: ScanOptions,
+        start: Key,
+        end: Key,
+        sequence: SequenceNumber,
+        opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        Ok(Box::pin(stream::empty()))
+        let Some(table_id) = self.resolve_id() else {
+            return Ok(Box::pin(stream::empty()));
+        };
+
+        let rows = self.db.scan_memtable(
+            table_id,
+            sequence,
+            KeyMatcher::Range {
+                start: &start,
+                end: &end,
+            },
+            &opts,
+        );
+        Ok(Box::pin(stream::iter(rows)))
+    }
+
+    async fn scan_prefix_at(
+        &self,
+        prefix: KeyPrefix,
+        sequence: SequenceNumber,
+        opts: ScanOptions,
+    ) -> Result<KvStream, ReadError> {
+        let Some(table_id) = self.resolve_id() else {
+            return Ok(Box::pin(stream::empty()));
+        };
+
+        let rows = self
+            .db
+            .scan_memtable(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts);
+        Ok(Box::pin(stream::iter(rows)))
+    }
+
+    fn resolve_id(&self) -> Option<TableId> {
+        self.db.resolve_table_id(self)
     }
 }
 
@@ -977,18 +1517,23 @@ impl Hash for Table {
 
 #[derive(Clone)]
 pub struct Snapshot {
+    registration: Arc<SnapshotRegistration>,
+}
+
+struct SnapshotRegistration {
     db: Db,
+    id: u64,
     sequence: SequenceNumber,
-    released: Arc<AtomicBool>,
+    released: AtomicBool,
 }
 
 impl Snapshot {
     pub fn sequence(&self) -> SequenceNumber {
-        self.sequence
+        self.registration.sequence
     }
 
     pub async fn read(&self, table: &Table, key: Key) -> Result<Option<Value>, ReadError> {
-        table.read_at(key, self.sequence).await
+        table.read_at(key, self.sequence()).await
     }
 
     pub async fn scan(
@@ -998,7 +1543,7 @@ impl Snapshot {
         end: Key,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        table.scan_at(start, end, self.sequence, opts).await
+        table.scan_at(start, end, self.sequence(), opts).await
     }
 
     pub async fn scan_prefix(
@@ -1007,28 +1552,42 @@ impl Snapshot {
         prefix: KeyPrefix,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        table.scan_prefix(prefix, opts).await
+        table.scan_prefix_at(prefix, self.sequence(), opts).await
     }
 
     pub fn release(&self) {
-        self.released.store(true, Ordering::SeqCst);
+        if self.registration.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        self.registration
+            .db
+            .release_snapshot_registration(self.registration.id);
     }
 
     pub fn is_released(&self) -> bool {
-        self.released.load(Ordering::SeqCst)
+        self.registration.released.load(Ordering::SeqCst)
     }
 
     pub fn db(&self) -> &Db {
-        &self.db
+        &self.registration.db
     }
 }
 
 impl fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Snapshot")
-            .field("sequence", &self.sequence)
+            .field("sequence", &self.sequence())
             .field("released", &self.is_released())
             .finish()
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.registration) == 1 {
+            self.release();
+        }
     }
 }
 
@@ -1066,16 +1625,19 @@ async fn read_all_file(
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
+    use futures::StreamExt;
     use serde_json::json;
 
     use super::{
         Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX, SchemaDefinition, StoredTable,
+        decode_mvcc_key, encode_mvcc_key,
     };
     use crate::{
-        CompactionStrategy, DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType,
-        FieldValue, FileSystemFailure, FileSystemOperation, S3Location, S3PrimaryStorageConfig,
-        SsdConfig, StorageConfig, StubClock, StubObjectStore, StubRng, TableConfig, TableFormat,
-        TieredDurabilityMode, TieredStorageConfig,
+        CommitId, CompactionStrategy, DbConfig, DbDependencies, FieldDefinition, FieldId,
+        FieldType, FieldValue, FileSystemFailure, FileSystemOperation, S3Location,
+        S3PrimaryStorageConfig, ScanOptions, SequenceNumber, SsdConfig, StorageConfig, StubClock,
+        StubObjectStore, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
+        TieredStorageConfig, Value,
     };
 
     fn tiered_config(path: &str) -> DbConfig {
@@ -1186,6 +1748,38 @@ mod tests {
         assert_eq!(table.config.metadata, expected.metadata);
         assert!(table.config.merge_operator.is_none());
         assert!(table.config.compaction_filter.is_none());
+    }
+
+    async fn collect_rows(stream: crate::KvStream) -> Vec<(crate::Key, Value)> {
+        stream.collect::<Vec<_>>().await
+    }
+
+    #[test]
+    fn mvcc_key_encoding_orders_newer_versions_first() {
+        let mut encoded = [
+            encode_mvcc_key(b"user:1", CommitId::new(SequenceNumber::new(3))),
+            encode_mvcc_key(b"user:1", CommitId::new(SequenceNumber::new(9))),
+            encode_mvcc_key(b"user:1", CommitId::new(SequenceNumber::new(5))),
+        ];
+        encoded.sort();
+
+        let decoded_sequences = encoded
+            .iter()
+            .map(|key| {
+                let (user_key, commit_id) = decode_mvcc_key(key).expect("decode mvcc key");
+                assert_eq!(user_key, b"user:1".to_vec());
+                commit_id.sequence()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            decoded_sequences,
+            vec![
+                SequenceNumber::new(9),
+                SequenceNumber::new(5),
+                SequenceNumber::new(3),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1307,5 +1901,204 @@ mod tests {
             .cloned()
             .expect("recovered table");
         assert_catalog_entry(&entry, &row_table_config("events"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reads_remain_stable_while_newer_writes_arrive() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/snapshot-stability"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write initial value");
+        let snapshot = db.snapshot().await;
+
+        table
+            .write(b"user:1".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write newer value");
+
+        assert_eq!(
+            snapshot
+                .read(&table, b"user:1".to_vec())
+                .await
+                .expect("snapshot read"),
+            Some(Value::bytes("v1"))
+        );
+        assert_eq!(
+            table.read(b"user:1".to_vec()).await.expect("latest read"),
+            Some(Value::bytes("v2"))
+        );
+
+        let rows = collect_rows(
+            snapshot
+                .scan(
+                    &table,
+                    b"user:".to_vec(),
+                    b"user;".to_vec(),
+                    ScanOptions::default(),
+                )
+                .await
+                .expect("snapshot scan"),
+        )
+        .await;
+        assert_eq!(rows, vec![(b"user:1".to_vec(), Value::bytes("v1"))]);
+    }
+
+    #[tokio::test]
+    async fn reads_and_scans_span_mutable_and_immutable_memtables() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/memtable-handoff"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let apple_v1 = table
+            .write(b"apple".to_vec(), Value::bytes("old"))
+            .await
+            .expect("write apple v1");
+        let apricot_v1 = table
+            .write(b"apricot".to_vec(), Value::bytes("stone"))
+            .await
+            .expect("write apricot v1");
+
+        let rotated = db.memtables_write().rotate_mutable();
+        assert_eq!(rotated, Some(apricot_v1));
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("new"))
+            .await
+            .expect("write apple v2");
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        table
+            .delete(b"apricot".to_vec())
+            .await
+            .expect("delete apricot");
+
+        assert_eq!(
+            table
+                .read_at(b"apple".to_vec(), apple_v1)
+                .await
+                .expect("historical apple read"),
+            Some(Value::bytes("old"))
+        );
+        assert_eq!(
+            table.read(b"apple".to_vec()).await.expect("latest apple"),
+            Some(Value::bytes("new"))
+        );
+        assert_eq!(
+            table
+                .read_at(b"apricot".to_vec(), apricot_v1)
+                .await
+                .expect("historical apricot read"),
+            Some(Value::bytes("stone"))
+        );
+        assert_eq!(
+            table
+                .read(b"apricot".to_vec())
+                .await
+                .expect("latest apricot"),
+            None
+        );
+
+        let prefix_rows = collect_rows(
+            table
+                .scan_prefix(b"ap".to_vec(), ScanOptions::default())
+                .await
+                .expect("prefix scan"),
+        )
+        .await;
+        assert_eq!(prefix_rows, vec![(b"apple".to_vec(), Value::bytes("new"))]);
+
+        let reverse_rows = collect_rows(
+            table
+                .scan(
+                    b"a".to_vec(),
+                    b"c".to_vec(),
+                    ScanOptions {
+                        reverse: true,
+                        limit: None,
+                        columns: None,
+                    },
+                )
+                .await
+                .expect("reverse scan"),
+        )
+        .await;
+        assert_eq!(
+            reverse_rows,
+            vec![
+                (b"banana".to_vec(), Value::bytes("yellow")),
+                (b"apple".to_vec(), Value::bytes("new")),
+            ]
+        );
+
+        let stats = db.table_stats(&table).await;
+        assert!(stats.pending_flush_bytes > 0);
+        assert_eq!(stats.immutable_memtable_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unreleased_snapshots_pin_gc_horizon_until_release() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/snapshot-horizon"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write first value");
+        let first = db.snapshot().await;
+        assert_eq!(db.snapshot_gc_horizon(), first.sequence());
+
+        table
+            .write(b"user:2".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second value");
+        let second = db.snapshot().await;
+
+        assert_eq!(db.oldest_active_snapshot_sequence(), Some(first.sequence()));
+        assert_eq!(db.snapshot_gc_horizon(), first.sequence());
+
+        first.release();
+        assert_eq!(
+            db.oldest_active_snapshot_sequence(),
+            Some(second.sequence())
+        );
+        assert_eq!(db.snapshot_gc_horizon(), second.sequence());
+
+        second.release();
+        assert_eq!(db.oldest_active_snapshot_sequence(), None);
+        assert_eq!(db.snapshot_gc_horizon(), db.current_sequence());
     }
 }
