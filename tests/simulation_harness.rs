@@ -12,12 +12,13 @@ use terracedb::{
     DbSimulationScenarioConfig, DbWorkloadOperation, FieldDefinition, FieldId, FieldType,
     FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ObjectStore,
     ObjectStoreFaultSpec, ObjectStoreOperation, OpenError, OperationResult, PendingWork,
-    PointMutation, RemoteCache, RemoteRecoveryHint, S3Location, ScanOptions, ScheduleAction,
-    ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler, SchemaDefinition,
-    SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
-    SimulationScenarioConfig, SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind,
-    StorageSource, StubDbProcess, TableConfig, TableFormat, TableStats, ThrottleDecision,
-    TieredDurabilityMode, TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
+    PendingWorkType, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location, ScanOptions,
+    ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
+    SchemaDefinition, SeededSimulationRunner, SequenceNumber, ShadowOracle,
+    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, SsdConfig,
+    StorageConfig, StorageErrorKind, StorageSource, StubDbProcess, TableConfig, TableFormat,
+    TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, TraceEvent,
+    Transaction, UnifiedStorage, Value,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
@@ -107,6 +108,32 @@ impl Scheduler for RandomSimulationScheduler {
             };
         }
 
+        ThrottleDecision::default()
+    }
+}
+
+#[derive(Default)]
+struct OffloadSimulationScheduler;
+
+impl Scheduler for OffloadSimulationScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        let selected = work
+            .iter()
+            .find(|work| work.work_type == PendingWorkType::Offload)
+            .map(|work| work.id.clone());
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: if selected.as_ref() == Some(&work.id) {
+                    ScheduleAction::Execute
+                } else {
+                    ScheduleAction::Defer
+                },
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
         ThrottleDecision::default()
     }
 }
@@ -1277,6 +1304,108 @@ fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
 
             Ok(())
         })
+}
+
+#[test]
+fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x2122).run_with(|context| async move {
+        let setup_config = DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: "/terracedb/sim/t21-cold-offload".to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-sim".to_string(),
+                    prefix: "cold-offload".to_string(),
+                },
+                max_local_bytes: 1024 * 1024,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: Some(Arc::new(OffloadSimulationScheduler)),
+        };
+        let config = DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: "/terracedb/sim/t21-cold-offload".to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-sim".to_string(),
+                    prefix: "cold-offload".to_string(),
+                },
+                max_local_bytes: 1,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: Some(Arc::new(OffloadSimulationScheduler)),
+        };
+
+        let setup_db = context.open_db(setup_config).await?;
+        let table = setup_db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        let first = table
+            .write(b"apple".to_vec(), Value::Bytes(vec![b'a'; 256]))
+            .await?;
+        setup_db.flush().await?;
+        table
+            .write(b"banana".to_vec(), Value::Bytes(vec![b'b'; 256]))
+            .await?;
+        setup_db.flush().await?;
+
+        let db = context
+            .restart_db(config.clone(), CutPoint::AfterStep)
+            .await?;
+        let table = db.table("events");
+
+        let table_id = table.id().expect("simulation table id");
+        let cold_prefix = format!("cold-offload/cold/table-{:06}/", table_id.get());
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Put,
+                target_prefix: cold_prefix.clone(),
+            })
+            .await?;
+
+        let first_error = db
+            .run_next_offload()
+            .await
+            .expect_err("first offload should surface the injected timeout");
+        assert_eq!(first_error.kind(), StorageErrorKind::Timeout);
+        assert_eq!(
+            table.read(b"apple".to_vec()).await?,
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+        assert!(
+            db.pending_work()
+                .await
+                .iter()
+                .any(|work| work.work_type == PendingWorkType::Offload)
+        );
+
+        assert!(db.run_next_offload().await?);
+        let offloaded_stats = db.table_stats(&table).await;
+        assert_eq!(offloaded_stats.local_bytes, 0);
+        assert!(offloaded_stats.s3_bytes > 0);
+        assert!(!context.object_store().list(&cold_prefix).await?.is_empty());
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_table = reopened.table("events");
+        assert_eq!(
+            reopened_table.read(b"apple".to_vec()).await?,
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+        assert_eq!(
+            reopened_table.read_at(b"apple".to_vec(), first).await?,
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+        let reopened_stats = reopened.table_stats(&reopened_table).await;
+        assert_eq!(reopened_stats.local_bytes, 0);
+        assert!(reopened_stats.s3_bytes > 0);
+
+        Ok(())
+    })
 }
 
 #[test]

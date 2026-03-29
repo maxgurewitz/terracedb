@@ -575,6 +575,8 @@ struct DbInner {
     commit_phase_blocks: Mutex<Vec<CommitPhaseBlock>>,
     #[cfg(test)]
     compaction_phase_blocks: Mutex<Vec<CompactionPhaseBlock>>,
+    #[cfg(test)]
+    offload_phase_blocks: Mutex<Vec<OffloadPhaseBlock>>,
 }
 
 #[derive(Clone)]
@@ -758,6 +760,15 @@ struct CompactionJob {
     input_local_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct OffloadJob {
+    id: String,
+    table_id: TableId,
+    table_name: String,
+    input_local_ids: Vec<String>,
+    estimated_bytes: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 struct TableCompactionState {
     compaction_debt: u64,
@@ -774,6 +785,7 @@ struct CompactionFilterStats {
 enum PendingWorkSpec {
     Flush,
     Compaction(CompactionJob),
+    Offload(OffloadJob),
 }
 
 #[derive(Clone, Debug)]
@@ -925,6 +937,14 @@ enum CompactionPhase {
     InputCleanupFinished,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OffloadPhase {
+    UploadComplete,
+    ManifestSwitched,
+    LocalCleanupFinished,
+}
+
 #[cfg(test)]
 struct CommitPhaseBlock {
     phase: CommitPhase,
@@ -946,7 +966,21 @@ struct CompactionPhaseBlock {
 }
 
 #[cfg(test)]
+struct OffloadPhaseBlock {
+    phase: OffloadPhase,
+    reached_tx: Option<oneshot::Sender<()>>,
+    release_rx: Option<oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
 struct CompactionPhaseBlocker {
+    reached_rx: Option<oneshot::Receiver<()>>,
+    release_tx: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+struct OffloadPhaseBlocker {
     reached_rx: Option<oneshot::Receiver<()>>,
     release_tx: Option<oneshot::Sender<()>>,
 }
@@ -976,6 +1010,24 @@ impl CompactionPhaseBlocker {
             .expect("compaction phase blocker should have a receiver")
             .await
             .expect("compaction phase blocker should observe the phase");
+    }
+
+    fn release(&mut self) {
+        if let Some(release_tx) = self.release_tx.take() {
+            let _ = release_tx.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl OffloadPhaseBlocker {
+    async fn wait_until_reached(&mut self) {
+        self.reached_rx
+            .take()
+            .expect("offload phase blocker should have a receiver")
+            .await
+            .expect("offload phase blocker should observe the phase");
     }
 
     fn release(&mut self) {
@@ -1739,11 +1791,16 @@ impl SstableState {
             .iter()
             .filter(|sstable| sstable.meta.level == 0)
             .count() as u32;
-        let local_bytes = matching
+        let total_bytes = matching
             .iter()
             .map(|sstable| sstable.meta.length)
             .sum::<u64>();
-        (l0_count, local_bytes, local_bytes)
+        let local_bytes = matching
+            .iter()
+            .filter(|sstable| !sstable.meta.file_path.is_empty())
+            .map(|sstable| sstable.meta.length)
+            .sum::<u64>();
+        (l0_count, total_bytes, local_bytes)
     }
 
     fn table_watermarks(&self) -> BTreeMap<TableId, SequenceNumber> {
@@ -2175,6 +2232,8 @@ impl Db {
                 commit_phase_blocks: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 compaction_phase_blocks: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                offload_phase_blocks: Mutex::new(Vec::new()),
             }),
         };
         db.prune_commit_log(true)
@@ -3622,6 +3681,7 @@ impl Db {
             layout.backup_manifest_prefix(),
             layout.backup_commit_log_prefix(),
             layout.backup_sstable_prefix(),
+            layout.cold_prefix(),
         ] {
             candidates.extend(self.inner.dependencies.object_store.list(&prefix).await?);
         }
@@ -3949,6 +4009,31 @@ impl Db {
         })
     }
 
+    fn build_offload_job(table: &StoredTable, inputs: &[ResidentRowSstable]) -> Option<OffloadJob> {
+        if inputs.is_empty() {
+            return None;
+        }
+
+        let input_local_ids = inputs
+            .iter()
+            .map(|sstable| sstable.meta.local_id.clone())
+            .collect::<Vec<_>>();
+        Some(OffloadJob {
+            id: format!(
+                "offload:{}:{}",
+                table.config.name,
+                input_local_ids.join("+")
+            ),
+            table_id: table.id,
+            table_name: table.config.name.clone(),
+            estimated_bytes: inputs
+                .iter()
+                .map(|sstable| sstable.meta.length)
+                .sum::<u64>(),
+            input_local_ids,
+        })
+    }
+
     fn sstable_key_span(sstables: &[ResidentRowSstable]) -> Option<(Key, Key)> {
         Some((
             sstables
@@ -4026,6 +4111,83 @@ impl Db {
         candidates
     }
 
+    fn pending_offload_candidates(&self) -> Vec<PendingWorkCandidate> {
+        let Some(max_local_bytes) = self.local_sstable_budget_bytes() else {
+            return Vec::new();
+        };
+
+        let tables = self.tables_read().clone();
+        let live = self.sstables_read().live.clone();
+        let mut candidates = tables
+            .values()
+            .filter_map(|table| {
+                if table.config.format != TableFormat::Row {
+                    return None;
+                }
+
+                let mut local_sstables = live
+                    .iter()
+                    .filter(|sstable| {
+                        sstable.meta.table_id == table.id && !sstable.meta.file_path.is_empty()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let local_bytes = local_sstables
+                    .iter()
+                    .map(|sstable| sstable.meta.length)
+                    .sum::<u64>();
+                if local_bytes <= max_local_bytes {
+                    return None;
+                }
+
+                local_sstables.sort_by(|left, right| {
+                    (
+                        left.meta.max_sequence.get(),
+                        left.meta.min_sequence.get(),
+                        left.meta.level,
+                        left.meta.local_id.as_str(),
+                    )
+                        .cmp(&(
+                            right.meta.max_sequence.get(),
+                            right.meta.min_sequence.get(),
+                            right.meta.level,
+                            right.meta.local_id.as_str(),
+                        ))
+                });
+
+                let mut remaining_local_bytes = local_bytes;
+                let mut selected = Vec::new();
+                for sstable in local_sstables {
+                    if remaining_local_bytes <= max_local_bytes {
+                        break;
+                    }
+                    remaining_local_bytes =
+                        remaining_local_bytes.saturating_sub(sstable.meta.length);
+                    selected.push(sstable);
+                }
+
+                let job = Self::build_offload_job(table, &selected)?;
+                Some(PendingWorkCandidate {
+                    pending: PendingWork {
+                        id: job.id.clone(),
+                        work_type: PendingWorkType::Offload,
+                        table: job.table_name.clone(),
+                        level: None,
+                        estimated_bytes: job.estimated_bytes,
+                    },
+                    spec: PendingWorkSpec::Offload(job),
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.pending
+                .table
+                .cmp(&right.pending.table)
+                .then_with(|| left.pending.id.cmp(&right.pending.id))
+        });
+        candidates
+    }
+
     fn pending_work_candidates(&self) -> Vec<PendingWorkCandidate> {
         let mut candidates = self.pending_flush_candidates();
         candidates.extend(self.pending_compaction_jobs().into_iter().map(|job| {
@@ -4040,6 +4202,7 @@ impl Db {
                 spec: PendingWorkSpec::Compaction(job),
             }
         }));
+        candidates.extend(self.pending_offload_candidates());
         candidates.sort_by(|left, right| {
             pending_work_sort_key(&left.pending)
                 .cmp(&pending_work_sort_key(&right.pending))
@@ -4117,7 +4280,9 @@ impl Db {
                     .table_stats(job.table_id)
                     .0 >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
                 }
-                PendingWorkSpec::Flush | PendingWorkSpec::Compaction(_) => false,
+                PendingWorkSpec::Flush
+                | PendingWorkSpec::Compaction(_)
+                | PendingWorkSpec::Offload(_) => false,
             })
             .cloned()
     }
@@ -4134,6 +4299,7 @@ impl Db {
                 .await
                 .map_err(Self::flush_error_into_storage),
             PendingWorkSpec::Compaction(job) => self.execute_compaction_job(local_root, job).await,
+            PendingWorkSpec::Offload(job) => self.execute_offload_job(job).await,
         }
     }
 
@@ -4391,6 +4557,27 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn run_next_offload(&self) -> Result<bool, StorageError> {
+        let Some(_) = self.local_storage_root() else {
+            return Ok(false);
+        };
+        let _maintenance_guard = self.inner.maintenance_lock.lock().await;
+        let Some(job) = self
+            .pending_offload_candidates()
+            .into_iter()
+            .find_map(|candidate| match candidate.spec {
+                PendingWorkSpec::Offload(job) => Some(job),
+                PendingWorkSpec::Flush | PendingWorkSpec::Compaction(_) => None,
+            })
+        else {
+            return Ok(false);
+        };
+
+        self.execute_offload_job(job).await?;
+        Ok(true)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn run_next_compaction(&self) -> Result<bool, StorageError> {
         let Some(local_root) = self.local_storage_root().map(str::to_string) else {
             return Ok(false);
@@ -4402,6 +4589,151 @@ impl Db {
 
         self.execute_compaction_job(&local_root, job).await?;
         Ok(true)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn execute_offload_job(&self, job: OffloadJob) -> Result<(), StorageError> {
+        let StorageConfig::Tiered(config) = &self.inner.config.storage else {
+            return Err(StorageError::unsupported(
+                "cold offload is only supported in tiered mode",
+            ));
+        };
+
+        let tables = self.tables_read().clone();
+        let table = Self::stored_table_by_id(&tables, job.table_id)
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "offload references unknown table id {}",
+                    job.table_id.get()
+                ))
+            })?;
+        if table.config.format != TableFormat::Row {
+            return Err(StorageError::unsupported(
+                "cold offload only supports row tables",
+            ));
+        }
+
+        let live = self.sstables_read().live.clone();
+        let by_local_id = live
+            .into_iter()
+            .map(|sstable| (sstable.meta.local_id.clone(), sstable))
+            .collect::<BTreeMap<_, _>>();
+        let mut inputs = Vec::with_capacity(job.input_local_ids.len());
+        for local_id in &job.input_local_ids {
+            let input = by_local_id.get(local_id).cloned().ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "offload job {} resolved no SSTable for {}",
+                    job.id, local_id
+                ))
+            })?;
+            if input.meta.table_id != job.table_id {
+                return Err(StorageError::corruption(format!(
+                    "offload job {} references SSTable {} from another table",
+                    job.id, local_id
+                )));
+            }
+            if input.meta.file_path.is_empty() {
+                return Err(StorageError::corruption(format!(
+                    "offload job {} references non-local SSTable {}",
+                    job.id, local_id
+                )));
+            }
+            inputs.push(input);
+        }
+
+        let layout = ObjectKeyLayout::new(&config.s3);
+        let storage = UnifiedStorage::from_dependencies(&self.inner.dependencies);
+        let mut updated_inputs = BTreeMap::new();
+        for input in &inputs {
+            let remote_key = layout.cold_sstable(
+                input.meta.table_id,
+                0,
+                input.meta.min_sequence,
+                input.meta.max_sequence,
+                &input.meta.local_id,
+            );
+            let bytes = read_path(&self.inner.dependencies, &input.meta.file_path).await?;
+            storage
+                .put_object(&remote_key, &bytes)
+                .await
+                .map_err(|error| error.into_storage_error())?;
+            Self::note_backup_object_birth(&self.inner.dependencies, &layout, &remote_key).await;
+
+            let mut updated = input.clone();
+            updated.meta.file_path.clear();
+            updated.meta.remote_key = Some(remote_key);
+            updated_inputs.insert(updated.meta.local_id.clone(), updated);
+        }
+
+        #[cfg(test)]
+        self.maybe_pause_offload_phase(OffloadPhase::UploadComplete)
+            .await;
+
+        let current_state = self.sstables_read().clone();
+        let mut replaced = 0_usize;
+        let mut new_live = current_state
+            .live
+            .into_iter()
+            .map(|sstable| {
+                if let Some(updated) = updated_inputs.get(&sstable.meta.local_id) {
+                    replaced += 1;
+                    updated.clone()
+                } else {
+                    sstable
+                }
+            })
+            .collect::<Vec<_>>();
+        if replaced != job.input_local_ids.len() {
+            return Err(StorageError::corruption(format!(
+                "offload job {} replaced {} of {} SSTables",
+                job.id,
+                replaced,
+                job.input_local_ids.len()
+            )));
+        }
+        Self::sort_live_sstables(&mut new_live);
+
+        let next_generation =
+            ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
+        self.install_manifest(
+            next_generation,
+            current_state.last_flushed_sequence,
+            &new_live,
+        )
+        .await?;
+
+        {
+            let mut sstables = self.sstables_write();
+            sstables.manifest_generation = next_generation;
+            sstables.live = new_live;
+        }
+        let state = self.sstables_read().clone();
+        let _ = self
+            .sync_tiered_backup_manifest(
+                state.manifest_generation,
+                state.last_flushed_sequence,
+                &state.live,
+            )
+            .await;
+
+        #[cfg(test)]
+        self.maybe_pause_offload_phase(OffloadPhase::ManifestSwitched)
+            .await;
+
+        for input in &inputs {
+            self.inner
+                .dependencies
+                .file_system
+                .delete(&input.meta.file_path)
+                .await?;
+        }
+
+        #[cfg(test)]
+        self.maybe_pause_offload_phase(OffloadPhase::LocalCleanupFinished)
+            .await;
+
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -5051,6 +5383,10 @@ impl Db {
         }
     }
 
+    fn local_sstable_budget_bytes(&self) -> Option<u64> {
+        self.memtable_budget_bytes()
+    }
+
     fn memtable_budget_exceeded_by(&self, additional_bytes: u64) -> bool {
         self.memtable_budget_bytes().is_some_and(|budget| {
             self.memtables_read()
@@ -5545,6 +5881,22 @@ impl Db {
     }
 
     #[cfg(test)]
+    fn block_next_offload_phase(&self, phase: OffloadPhase) -> OffloadPhaseBlocker {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        mutex_lock(&self.inner.offload_phase_blocks).push(OffloadPhaseBlock {
+            phase,
+            reached_tx: Some(reached_tx),
+            release_rx: Some(release_rx),
+        });
+
+        OffloadPhaseBlocker {
+            reached_rx: Some(reached_rx),
+            release_tx: Some(release_tx),
+        }
+    }
+
+    #[cfg(test)]
     async fn maybe_pause_commit_phase(&self, phase: CommitPhase, sequence: SequenceNumber) {
         let block = {
             let mut blocks = mutex_lock(&self.inner.commit_phase_blocks);
@@ -5590,6 +5942,30 @@ impl Db {
     #[cfg(not(test))]
     #[allow(dead_code)]
     async fn maybe_pause_compaction_phase(&self, _phase: CompactionPhase) {}
+
+    #[cfg(test)]
+    async fn maybe_pause_offload_phase(&self, phase: OffloadPhase) {
+        let block = {
+            let mut blocks = mutex_lock(&self.inner.offload_phase_blocks);
+            blocks
+                .iter()
+                .position(|block| block.phase == phase)
+                .map(|index| blocks.remove(index))
+        };
+
+        if let Some(mut block) = block {
+            if let Some(reached_tx) = block.reached_tx.take() {
+                let _ = reached_tx.send(());
+            }
+            if let Some(release_rx) = block.release_rx.take() {
+                let _ = release_rx.await;
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    async fn maybe_pause_offload_phase(&self, _phase: OffloadPhase) {}
 
     #[allow(dead_code)]
     pub(crate) fn dependencies(&self) -> &DbDependencies {
@@ -6522,9 +6898,9 @@ mod tests {
     use super::{
         CommitPhase, CompactionJobKind, CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH,
         LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
-        LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, PersistedRowSstableFile,
-        SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key, encode_mvcc_key,
-        read_path,
+        LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, OffloadPhase,
+        PendingWorkSpec, PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate,
+        decode_mvcc_key, encode_mvcc_key, read_path,
     };
     use crate::{
         ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
@@ -6624,6 +7000,23 @@ mod tests {
                 durability: TieredDurabilityMode::GroupCommit,
             }),
             scheduler: Some(scheduler),
+        }
+    }
+
+    fn tiered_config_with_max_local_bytes(path: &str, max_local_bytes: u64) -> DbConfig {
+        DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: SsdConfig {
+                    path: path.to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-test".to_string(),
+                    prefix: "tiered".to_string(),
+                },
+                max_local_bytes,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: None,
         }
     }
 
@@ -7369,6 +7762,66 @@ mod tests {
         seed_compaction_fixture(root, "events", CompactionStrategy::Leveled).await
     }
 
+    async fn seed_offload_fixture(
+        root: &str,
+        max_local_bytes: u64,
+    ) -> (
+        Db,
+        crate::Table,
+        Arc<crate::StubFileSystem>,
+        Arc<StubObjectStore>,
+        DbDependencies,
+        SequenceNumber,
+    ) {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store.clone());
+        let db = Db::open(
+            tiered_config_with_max_local_bytes(root, 1024 * 1024),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open offload db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create offload table");
+
+        let first = table
+            .write(b"apple".to_vec(), Value::Bytes(vec![b'a'; 256]))
+            .await
+            .expect("write first offload row");
+        db.flush().await.expect("flush first offload sstable");
+
+        let second = table
+            .write(b"banana".to_vec(), Value::Bytes(vec![b'b'; 256]))
+            .await
+            .expect("write second offload row");
+        db.flush().await.expect("flush second offload sstable");
+
+        assert!(second > first);
+
+        drop(table);
+        drop(db);
+
+        let reopened = Db::open(
+            tiered_config_with_max_local_bytes(root, max_local_bytes),
+            dependencies.clone(),
+        )
+        .await
+        .expect("reopen offload fixture with target budget");
+        let reopened_table = reopened.table("events");
+
+        (
+            reopened,
+            reopened_table,
+            file_system,
+            object_store,
+            dependencies,
+            first,
+        )
+    }
+
     #[tokio::test]
     async fn pending_work_reports_flush_and_compaction_backlog() {
         let file_system = Arc::new(crate::StubFileSystem::default());
@@ -7634,6 +8087,390 @@ mod tests {
         assert!(
             stats.l0_sstable_count < crate::DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT,
             "bounded deferral should still execute pending compaction work"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_offload_selects_oldest_local_sstables_until_table_is_back_under_budget() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store.clone());
+        let setup_db = Db::open(
+            tiered_config_with_max_local_bytes("/cold-offload-selection", 1024 * 1024),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open offload selection setup db");
+        let setup_table = setup_db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        for (key, byte) in [
+            (b"apple".to_vec(), b'a'),
+            (b"banana".to_vec(), b'b'),
+            (b"carrot".to_vec(), b'c'),
+        ] {
+            setup_table
+                .write(key, Value::Bytes(vec![byte; 512]))
+                .await
+                .expect("write offload seed");
+            setup_db.flush().await.expect("flush offload seed");
+        }
+
+        drop(setup_table);
+        drop(setup_db);
+
+        let config = tiered_config_with_max_local_bytes("/cold-offload-selection", 1200);
+        let db = Db::open(config.clone(), dependencies)
+            .await
+            .expect("reopen offload selection db");
+        let table = db.table("events");
+
+        let budget = match &config.storage {
+            StorageConfig::Tiered(config) => config.max_local_bytes,
+            StorageConfig::S3Primary(_) => unreachable!("selection test uses tiered storage"),
+        };
+        let table_id = table.id().expect("table id");
+        let live_before = db
+            .sstables_read()
+            .live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let local_before = live_before
+            .iter()
+            .map(|sstable| sstable.meta.length)
+            .sum::<u64>();
+        assert!(
+            local_before > budget,
+            "fixture should exceed the local-byte budget"
+        );
+
+        let mut expected = live_before.clone();
+        expected.sort_by(|left, right| {
+            (
+                left.meta.max_sequence.get(),
+                left.meta.min_sequence.get(),
+                left.meta.level,
+                left.meta.local_id.as_str(),
+            )
+                .cmp(&(
+                    right.meta.max_sequence.get(),
+                    right.meta.min_sequence.get(),
+                    right.meta.level,
+                    right.meta.local_id.as_str(),
+                ))
+        });
+        let mut remaining = local_before;
+        let mut expected_ids = Vec::new();
+        for sstable in &expected {
+            if remaining <= budget {
+                break;
+            }
+            remaining = remaining.saturating_sub(sstable.meta.length);
+            expected_ids.push(sstable.meta.local_id.clone());
+        }
+
+        let offload_job = db
+            .pending_offload_candidates()
+            .into_iter()
+            .find_map(|candidate| match candidate.spec {
+                PendingWorkSpec::Offload(job) => Some(job),
+                PendingWorkSpec::Flush | PendingWorkSpec::Compaction(_) => None,
+            })
+            .expect("pending offload job");
+        assert_eq!(offload_job.input_local_ids, expected_ids);
+
+        assert!(db.run_next_offload().await.expect("run offload"));
+
+        let stats = db.table_stats(&table).await;
+        assert!(stats.local_bytes <= budget);
+        assert_eq!(stats.total_bytes, stats.local_bytes + stats.s3_bytes);
+        assert!(stats.s3_bytes > 0);
+
+        let remote_only_ids = db
+            .sstables_read()
+            .live
+            .iter()
+            .filter(|sstable| {
+                sstable.meta.table_id == table_id
+                    && sstable.meta.file_path.is_empty()
+                    && sstable.meta.remote_key.is_some()
+            })
+            .map(|sstable| sstable.meta.local_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(remote_only_ids, expected_ids);
+
+        let cold_prefix = format!("tiered/cold/table-{:06}/", table_id.get());
+        let cold_keys = object_store
+            .list(&cold_prefix)
+            .await
+            .expect("list cold objects");
+        assert_eq!(cold_keys.len(), expected_ids.len());
+    }
+
+    #[tokio::test]
+    async fn reads_are_identical_before_and_after_remote_offload() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let setup_db = Db::open(
+            tiered_config_with_max_local_bytes("/cold-offload-reads", 1024 * 1024),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open offload read setup db");
+        let setup_table = setup_db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let first = setup_table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write apple v1");
+        setup_db.flush().await.expect("flush first");
+
+        setup_table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        setup_db.flush().await.expect("flush second");
+
+        setup_table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write apple v2");
+        setup_db.flush().await.expect("flush third");
+
+        drop(setup_table);
+        drop(setup_db);
+
+        let config = tiered_config_with_max_local_bytes("/cold-offload-reads", 1);
+        let db = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("reopen offload read db");
+        let table = db.table("events");
+
+        let expected_latest = table
+            .read(b"apple".to_vec())
+            .await
+            .expect("read latest before offload");
+        let expected_historical = table
+            .read_at(b"apple".to_vec(), first)
+            .await
+            .expect("historical read before offload");
+        let expected_scan = table
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+            .expect("scan before offload")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(db.run_next_offload().await.expect("run offload"));
+
+        assert_eq!(
+            table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read latest after offload"),
+            expected_latest
+        );
+        assert_eq!(
+            table
+                .read_at(b"apple".to_vec(), first)
+                .await
+                .expect("historical read after offload"),
+            expected_historical
+        );
+        let after_scan = table
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+            .expect("scan after offload")
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(after_scan, expected_scan);
+
+        file_system.crash();
+        let reopened = Db::open(config, dependencies)
+            .await
+            .expect("reopen offloaded db");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("reopen latest read"),
+            expected_latest
+        );
+        assert_eq!(
+            reopened_table
+                .read_at(b"apple".to_vec(), first)
+                .await
+                .expect("reopen historical read"),
+            expected_historical
+        );
+        let reopened_scan = reopened_table
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+            .expect("reopen scan")
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(reopened_scan, expected_scan);
+        assert_eq!(reopened.table_stats(&reopened_table).await.local_bytes, 0);
+        assert!(reopened.table_stats(&reopened_table).await.s3_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn offload_upload_without_manifest_switch_recovers_prior_local_generation() {
+        let root = "/cold-offload-upload-before-manifest";
+        let (db, table, file_system, object_store, dependencies, first_sequence) =
+            seed_offload_fixture(root, 1).await;
+        let prior_generation = db.sstables_read().manifest_generation;
+        let table_id = table.id().expect("table id");
+        let cold_prefix = format!("tiered/cold/table-{:06}/", table_id.get());
+
+        let mut blocker = db.block_next_offload_phase(OffloadPhase::UploadComplete);
+        let offload_db = db.clone();
+        let handle = tokio::spawn(async move { offload_db.run_next_offload().await });
+
+        blocker.wait_until_reached().await;
+        let uploaded = object_store
+            .list(&cold_prefix)
+            .await
+            .expect("list uploaded cold objects");
+        assert!(!uploaded.is_empty());
+
+        handle.abort();
+        let join_error = handle.await.expect_err("offload task should be cancelled");
+        assert!(join_error.is_cancelled());
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config_with_max_local_bytes(root, 1), dependencies)
+            .await
+            .expect("reopen prior generation");
+        let reopened_table = reopened.table("events");
+        let stats = reopened.table_stats(&reopened_table).await;
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            prior_generation
+        );
+        assert!(stats.local_bytes > 0);
+        assert_eq!(stats.s3_bytes, 0);
+        assert_eq!(
+            reopened_table
+                .read_at(b"apple".to_vec(), first_sequence)
+                .await
+                .expect("historical apple"),
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+    }
+
+    #[tokio::test]
+    async fn offload_manifest_switch_survives_reopen_even_if_local_cleanup_did_not_run() {
+        let root = "/cold-offload-manifest-switched";
+        let (db, table, file_system, _object_store, dependencies, first_sequence) =
+            seed_offload_fixture(root, 1).await;
+        let prior_generation = db.sstables_read().manifest_generation;
+        let table_id = table.id().expect("table id");
+
+        let mut blocker = db.block_next_offload_phase(OffloadPhase::ManifestSwitched);
+        let offload_db = db.clone();
+        let handle = tokio::spawn(async move { offload_db.run_next_offload().await });
+
+        blocker.wait_until_reached().await;
+        let still_on_disk = file_system
+            .list(&sstable_dir(root, table_id))
+            .await
+            .expect("list local sstables before cleanup");
+        assert!(!still_on_disk.is_empty());
+
+        handle.abort();
+        let join_error = handle.await.expect_err("offload task should be cancelled");
+        assert!(join_error.is_cancelled());
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config_with_max_local_bytes(root, 1), dependencies)
+            .await
+            .expect("reopen manifest-switched offload");
+        let reopened_table = reopened.table("events");
+        let stats = reopened.table_stats(&reopened_table).await;
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(prior_generation.get().saturating_add(1))
+        );
+        assert_eq!(stats.local_bytes, 0);
+        assert!(stats.s3_bytes > 0);
+        assert_eq!(
+            reopened_table
+                .read_at(b"apple".to_vec(), first_sequence)
+                .await
+                .expect("historical apple after manifest switch"),
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+        let lingering_local = file_system
+            .list(&sstable_dir(root, table_id))
+            .await
+            .expect("list lingering local sstables");
+        assert!(!lingering_local.is_empty());
+    }
+
+    #[tokio::test]
+    async fn offload_after_local_file_deletion_recovers_remote_only_state() {
+        let root = "/cold-offload-local-cleanup";
+        let (db, table, file_system, _object_store, dependencies, first_sequence) =
+            seed_offload_fixture(root, 1).await;
+        let prior_generation = db.sstables_read().manifest_generation;
+        let table_id = table.id().expect("table id");
+
+        let mut blocker = db.block_next_offload_phase(OffloadPhase::LocalCleanupFinished);
+        let offload_db = db.clone();
+        let handle = tokio::spawn(async move { offload_db.run_next_offload().await });
+
+        blocker.wait_until_reached().await;
+        let local_after_cleanup = file_system
+            .list(&sstable_dir(root, table_id))
+            .await
+            .expect("list local sstables after cleanup");
+        assert!(local_after_cleanup.is_empty());
+
+        handle.abort();
+        let join_error = handle.await.expect_err("offload task should be cancelled");
+        assert!(join_error.is_cancelled());
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config_with_max_local_bytes(root, 1), dependencies)
+            .await
+            .expect("reopen remote-only offload");
+        let reopened_table = reopened.table("events");
+        let stats = reopened.table_stats(&reopened_table).await;
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(prior_generation.get().saturating_add(1))
+        );
+        assert_eq!(stats.local_bytes, 0);
+        assert!(stats.s3_bytes > 0);
+        assert_eq!(
+            reopened_table
+                .read_at(b"apple".to_vec(), first_sequence)
+                .await
+                .expect("historical apple after local cleanup"),
+            Some(Value::Bytes(vec![b'a'; 256]))
+        );
+        assert!(
+            reopened
+                .sstables_read()
+                .live
+                .iter()
+                .filter(|sstable| sstable.meta.table_id == table_id)
+                .all(|sstable| sstable.meta.file_path.is_empty()
+                    && sstable.meta.remote_key.is_some())
         );
     }
 
@@ -8904,6 +9741,71 @@ mod tests {
                 .await
                 .expect("read recovered value"),
             Some(Value::bytes("v2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tiered_backup_gc_keeps_live_remote_objects_and_removes_old_backup_copies() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let clock = Arc::new(StubClock::default());
+        let dependencies =
+            dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone());
+        let layout = tiered_layout();
+
+        let setup = Db::open(
+            tiered_config_with_max_local_bytes("/remote-gc-offload", 1024 * 1024),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open setup db");
+        let setup_table = setup
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+        setup_table
+            .write(b"apple".to_vec(), Value::Bytes(vec![b'a'; 256]))
+            .await
+            .expect("write first offload seed");
+        setup.flush().await.expect("flush first offload seed");
+        setup_table
+            .write(b"banana".to_vec(), Value::Bytes(vec![b'b'; 256]))
+            .await
+            .expect("write second offload seed");
+        setup.flush().await.expect("flush second offload seed");
+        drop(setup_table);
+        drop(setup);
+
+        clock.advance(Duration::from_secs(120));
+
+        let offload_db = Db::open(
+            tiered_config_with_max_local_bytes("/remote-gc-offload", 1),
+            dependencies,
+        )
+        .await
+        .expect("reopen with offload budget");
+        assert!(offload_db.run_next_offload().await.expect("run offload"));
+
+        let backup_keys = object_store
+            .list(&layout.backup_sstable_prefix())
+            .await
+            .expect("list backup copies");
+        let cold_keys = object_store
+            .list(&layout.cold_prefix())
+            .await
+            .expect("list cold objects");
+        assert!(
+            backup_keys.len() < 2,
+            "GC should remove at least one unreferenced backup copy once the cold manifest is published"
+        );
+        assert!(
+            !cold_keys.is_empty(),
+            "the offloaded cold object(s) must remain live"
+        );
+        assert_eq!(
+            backup_keys.len() + cold_keys.len(),
+            2,
+            "all live SSTables should still exist across the backup and cold prefixes"
         );
     }
 

@@ -222,6 +222,10 @@ impl ObjectKeyLayout {
             max_sequence.get()
         ))
     }
+
+    pub fn cold_prefix(&self) -> String {
+        self.key("cold/")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,6 +941,7 @@ mod tests {
             ),
             "tenant-a/db-01/cold/table-000009/0000/00000000000000000044-00000000000000000088/SST-000123.sst"
         );
+        assert_eq!(layout.cold_prefix(), "tenant-a/db-01/cold");
     }
 
     #[tokio::test]
