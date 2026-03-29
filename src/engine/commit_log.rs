@@ -448,13 +448,17 @@ impl SegmentManager {
                             },
                         )
                         .await?;
-                    active = Some(ActiveSegment::recover(
+                    let recovered = ActiveSegment::recover(
                         segment_id,
-                        path,
+                        path.clone(),
                         handle,
                         bytes,
                         options.records_per_block,
-                    )?);
+                    )?;
+                    if let Some(repaired_tail) = recovered.repaired_tail.as_ref() {
+                        Self::repair_active_segment(fs.as_ref(), &path, repaired_tail).await?;
+                    }
+                    active = Some(recovered.segment);
                 }
             }
         }
@@ -605,6 +609,58 @@ impl SegmentManager {
         }
         reader.read_from_sequence(sequence)
     }
+
+    pub async fn scan_from_sequence(
+        &self,
+        sequence_exclusive: SequenceNumber,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        let mut records = Vec::new();
+        let first_needed = SequenceNumber::new(sequence_exclusive.get().saturating_add(1));
+
+        for descriptor in self.enumerate_segments() {
+            let Some(max_sequence) = descriptor.max_sequence else {
+                continue;
+            };
+            if max_sequence <= sequence_exclusive {
+                continue;
+            }
+
+            records.extend(
+                self.read_from_sequence(descriptor.segment_id, first_needed)
+                    .await?
+                    .into_iter()
+                    .filter(|record| record.sequence() > sequence_exclusive),
+            );
+        }
+
+        Ok(records)
+    }
+
+    async fn repair_active_segment(
+        fs: &dyn FileSystem,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        let handle = fs
+            .open(
+                path,
+                OpenOptions {
+                    create: false,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await?;
+        fs.write_at(&handle, 0, bytes).await?;
+        fs.sync(&handle).await
+    }
+}
+
+struct ActiveSegmentRecovery {
+    segment: ActiveSegment,
+    repaired_tail: Option<Vec<u8>>,
 }
 
 struct ActiveSegment {
@@ -660,7 +716,7 @@ impl ActiveSegment {
         handle: FileHandle,
         bytes: Vec<u8>,
         records_per_block: u64,
-    ) -> Result<Self, StorageError> {
+    ) -> Result<ActiveSegmentRecovery, StorageError> {
         let mut segment = Self {
             id,
             path,
@@ -676,14 +732,23 @@ impl ActiveSegment {
 
         let mut offset = 0;
         while offset < bytes.len() {
-            let next = parse_record_frame(&bytes, offset)?;
-            let frame_len = next.1 - offset;
-            segment.observe(offset as u64, &next.0, frame_len as u64, records_per_block);
-            offset = next.1;
+            match parse_record_frame(&bytes, offset) {
+                Ok(next) => {
+                    let frame_len = next.1 - offset;
+                    segment.observe(offset as u64, &next.0, frame_len as u64, records_per_block);
+                    offset = next.1;
+                }
+                Err(_) => break,
+            }
         }
-        segment.len = bytes.len() as u64;
+        segment.len = offset as u64;
 
-        Ok(segment)
+        let repaired_tail = (offset < bytes.len()).then(|| bytes[..offset].to_vec());
+
+        Ok(ActiveSegmentRecovery {
+            segment,
+            repaired_tail,
+        })
     }
 
     fn observe(
@@ -1543,12 +1608,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopening_a_truncated_active_segment_fails_closed() {
+    async fn reopening_a_truncated_active_segment_keeps_the_valid_prefix() {
         let fs = Arc::new(SimulatedFileSystem::default());
         let dir = "/db/truncated";
         let path = segment_path(dir, SegmentId::new(1));
 
-        let frame = sample_record(8).encode_frame().expect("encode frame");
+        let first = sample_record(8).encode_frame().expect("encode first frame");
+        let second = sample_record(9)
+            .encode_frame()
+            .expect("encode second frame");
         let handle = fs
             .open(
                 &path,
@@ -1562,15 +1630,25 @@ mod tests {
             )
             .await
             .expect("create segment");
-        fs.write_at(&handle, 0, &frame[..frame.len() - 3])
+        fs.write_at(&handle, 0, &first)
             .await
-            .expect("write truncated frame");
+            .expect("write first frame");
+        fs.write_at(&handle, first.len() as u64, &second[..second.len() - 3])
+            .await
+            .expect("write truncated second frame");
 
-        let error = match SegmentManager::open(fs.clone(), dir, SegmentOptions::default()).await {
-            Ok(_) => panic!("truncated segment should fail"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), StorageErrorKind::Corruption);
+        let reopened = SegmentManager::open(fs.clone(), dir, SegmentOptions::default())
+            .await
+            .expect("reopen manager");
+        let records = reopened
+            .read_from_sequence(reopened.active_segment_id(), SequenceNumber::new(1))
+            .await
+            .expect("read recovered prefix");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence(), SequenceNumber::new(8));
+
+        let repaired = read_segment_bytes(fs.as_ref(), &path).await;
+        assert_eq!(repaired, first);
     }
 
     #[tokio::test]

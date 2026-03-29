@@ -456,6 +456,12 @@ struct CommitRuntime {
     backend: CommitLogBackend,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RecoveredCommitLogState {
+    memtables: MemtableState,
+    max_sequence: SequenceNumber,
+}
+
 enum CommitLogBackend {
     Local(Box<SegmentManager>),
     Memory(MemoryCommitLog),
@@ -485,6 +491,27 @@ impl CommitRuntime {
             CommitLogBackend::Local(manager) => manager.sync_active().await,
             CommitLogBackend::Memory(_) => Ok(()),
         }
+    }
+
+    async fn recover_after(
+        &self,
+        after_sequence: SequenceNumber,
+    ) -> Result<RecoveredCommitLogState, StorageError> {
+        let records = match &self.backend {
+            CommitLogBackend::Local(manager) => manager.scan_from_sequence(after_sequence).await?,
+            CommitLogBackend::Memory(_) => Vec::new(),
+        };
+
+        let mut recovered = RecoveredCommitLogState {
+            max_sequence: after_sequence,
+            ..RecoveredCommitLogState::default()
+        };
+        for record in records {
+            recovered.max_sequence = recovered.max_sequence.max(record.sequence());
+            recovered.memtables.apply_recovered_record(&record);
+        }
+
+        Ok(recovered)
     }
 }
 
@@ -633,6 +660,19 @@ impl Memtable {
             ));
     }
 
+    fn apply_recovered_entry(&mut self, sequence: SequenceNumber, entry: &CommitEntry) {
+        self.max_sequence = self.max_sequence.max(sequence);
+        self.tables
+            .entry(entry.table_id)
+            .or_default()
+            .insert(MemtableEntry::new(
+                entry.key.clone(),
+                sequence,
+                entry.kind,
+                entry.value.clone(),
+            ));
+    }
+
     fn read_at(
         &self,
         table_id: TableId,
@@ -774,6 +814,12 @@ impl MemtableState {
     fn apply(&mut self, sequence: SequenceNumber, operations: &[ResolvedBatchOperation]) {
         for operation in operations {
             self.mutable.apply(sequence, operation);
+        }
+    }
+
+    fn apply_recovered_record(&mut self, record: &CommitRecord) {
+        for entry in &record.entries {
+            self.mutable.apply_recovered_entry(record.sequence(), entry);
         }
     }
 
@@ -1021,7 +1067,10 @@ impl Db {
         let (tables, next_table_id) = Self::load_tables(&dependencies, &catalog_location).await?;
         let commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
         let loaded_manifest = Self::load_local_manifest(&config.storage, &dependencies).await?;
-        let recovered_sequence = loaded_manifest.last_flushed_sequence;
+        let recovered_commit_log = commit_runtime
+            .recover_after(loaded_manifest.last_flushed_sequence)
+            .await?;
+        let recovered_sequence = recovered_commit_log.max_sequence;
         let next_sstable_id = loaded_manifest
             .live_sstables
             .iter()
@@ -1045,7 +1094,7 @@ impl Db {
                 current_sequence: AtomicU64::new(recovered_sequence.get()),
                 current_durable_sequence: AtomicU64::new(recovered_sequence.get()),
                 tables: RwLock::new(tables),
-                memtables: RwLock::new(MemtableState::default()),
+                memtables: RwLock::new(recovered_commit_log.memtables),
                 sstables: RwLock::new(SstableState {
                     manifest_generation: loaded_manifest.generation,
                     last_flushed_sequence: loaded_manifest.last_flushed_sequence,
@@ -1143,7 +1192,7 @@ impl Db {
     ) -> Result<CommitRuntime, OpenError> {
         let backend = match storage {
             StorageConfig::Tiered(config) => {
-                let dir = Self::join_fs_path(&config.ssd.path, LOCAL_COMMIT_LOG_RELATIVE_DIR);
+                let dir = Self::local_commit_log_dir(&config.ssd.path);
                 CommitLogBackend::Local(Box::new(
                     SegmentManager::open(
                         dependencies.file_system.clone(),
@@ -1374,6 +1423,10 @@ impl Db {
         Self::join_fs_path(root, LOCAL_MANIFEST_DIR_RELATIVE_PATH)
     }
 
+    fn local_commit_log_dir(root: &str) -> String {
+        Self::join_fs_path(root, LOCAL_COMMIT_LOG_RELATIVE_DIR)
+    }
+
     fn manifest_filename(generation: ManifestId) -> String {
         format!("MANIFEST-{:06}", generation.get())
     }
@@ -1423,19 +1476,24 @@ impl Db {
         let current_path = Self::local_current_path(root);
         let manifest_dir = Self::local_manifest_dir(root);
         let mut candidates = Vec::new();
+        let mut last_error = None;
 
         if let Some(pointer) = read_optional_path(dependencies, &current_path).await? {
-            let pointer = String::from_utf8(pointer).map_err(|error| {
-                OpenError::Storage(StorageError::corruption(format!(
-                    "decode CURRENT pointer failed: {error}"
-                )))
-            })?;
-            let pointer = pointer.trim();
-            if !pointer.is_empty() {
-                candidates.push(Self::join_fs_path(
-                    root,
-                    &format!("{LOCAL_MANIFEST_DIR_RELATIVE_PATH}/{pointer}"),
-                ));
+            match String::from_utf8(pointer) {
+                Ok(pointer) => {
+                    let pointer = pointer.trim();
+                    if !pointer.is_empty() {
+                        candidates.push(Self::join_fs_path(
+                            root,
+                            &format!("{LOCAL_MANIFEST_DIR_RELATIVE_PATH}/{pointer}"),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(StorageError::corruption(format!(
+                        "decode CURRENT pointer failed: {error}"
+                    )));
+                }
             }
         }
 
@@ -1455,7 +1513,6 @@ impl Db {
         }
 
         let mut saw_manifest = false;
-        let mut last_error = None;
         for path in candidates {
             saw_manifest = true;
             match Self::read_manifest_at_path(dependencies, &path).await {
@@ -3067,8 +3124,8 @@ mod tests {
 
     use super::{
         CommitPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
-        LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, SchemaDefinition,
-        StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
+        LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR,
+        ManifestId, SchemaDefinition, StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
     };
     use crate::{
         CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
@@ -3204,6 +3261,37 @@ mod tests {
                 table_id.get()
             ),
         )
+    }
+
+    fn commit_log_segment_path(root: &str, segment_id: u64) -> String {
+        Db::join_fs_path(
+            root,
+            &format!("{LOCAL_COMMIT_LOG_RELATIVE_DIR}/SEG-{segment_id:06}"),
+        )
+    }
+
+    async fn overwrite_file(file_system: &crate::StubFileSystem, path: &str, bytes: &[u8]) {
+        let handle = file_system
+            .open(
+                path,
+                crate::OpenOptions {
+                    create: true,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await
+            .expect("open file for overwrite");
+        file_system
+            .write_at(&handle, 0, bytes)
+            .await
+            .expect("overwrite file bytes");
+        file_system
+            .sync(&handle)
+            .await
+            .expect("sync overwritten file");
     }
 
     #[test]
@@ -3628,6 +3716,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_replays_commit_log_tail_newer_than_manifest() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/tail-replay"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let committed = table
+            .write(b"apple".to_vec(), Value::bytes("tail"))
+            .await
+            .expect("write tail value");
+        assert_eq!(db.current_sequence(), committed);
+        assert_eq!(db.current_durable_sequence(), committed);
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/tail-replay"), dependencies)
+            .await
+            .expect("reopen after crash");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(reopened.current_sequence(), committed);
+        assert_eq!(reopened.current_durable_sequence(), committed);
+        assert_eq!(
+            reopened.sstables_read().last_flushed_sequence,
+            SequenceNumber::new(0)
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read replayed tail"),
+            Some(Value::bytes("tail"))
+        );
+        let stats = reopened.table_stats(&reopened_table).await;
+        assert!(stats.pending_flush_bytes > 0);
+        assert_eq!(stats.immutable_memtable_count, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_recovery_drops_non_durable_tail() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(
+            tiered_config_with_durability("/deferred-tail-loss", TieredDurabilityMode::Deferred),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("volatile"))
+            .await
+            .expect("write deferred value");
+        assert_eq!(db.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+
+        file_system.crash();
+        let reopened = Db::open(
+            tiered_config_with_durability("/deferred-tail-loss", TieredDurabilityMode::Deferred),
+            dependencies,
+        )
+        .await
+        .expect("reopen deferred db");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(0));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(0));
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read after deferred crash"),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn manifest_sync_failure_preserves_prior_generation_on_reopen() {
         let file_system = Arc::new(crate::StubFileSystem::default());
         let object_store = Arc::new(StubObjectStore::default());
@@ -3665,8 +3842,8 @@ mod tests {
             .await
             .expect("reopen after failed manifest sync");
         let reopened_table = reopened.table("events");
-        assert_eq!(reopened.current_sequence(), SequenceNumber::new(1));
-        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(1));
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(2));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(2));
         assert_eq!(
             reopened.sstables_read().manifest_generation,
             ManifestId::new(1)
@@ -3676,8 +3853,10 @@ mod tests {
                 .read(b"apple".to_vec())
                 .await
                 .expect("read recovered value"),
-            Some(Value::bytes("v1"))
+            Some(Value::bytes("v2"))
         );
+        let stats = reopened.table_stats(&reopened_table).await;
+        assert!(stats.pending_flush_bytes > 0);
     }
 
     #[tokio::test]
@@ -3731,14 +3910,229 @@ mod tests {
             ManifestId::new(1)
         );
         assert_eq!(reopened.sstables_read().live.len(), 1);
-        assert_eq!(reopened.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(2));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(2));
         assert_eq!(
             reopened_table
                 .read(b"apple".to_vec())
                 .await
                 .expect("read reopened apple"),
+            Some(Value::bytes("v2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_current_pointer_falls_back_to_latest_valid_manifest() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/corrupt-current"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write apple");
+        db.flush().await.expect("first flush");
+        table
+            .write(b"banana".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write banana");
+        db.flush().await.expect("second flush");
+
+        let current_path = Db::local_current_path("/corrupt-current");
+        overwrite_file(file_system.as_ref(), &current_path, &[0xff, 0xfe, 0xfd]).await;
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/corrupt-current"), dependencies)
+            .await
+            .expect("reopen with corrupt CURRENT");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(2)
+        );
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(2));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(2));
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read apple"),
             Some(Value::bytes("v1"))
         );
+        assert_eq!(
+            reopened_table
+                .read(b"banana".to_vec())
+                .await
+                .expect("read banana"),
+            Some(Value::bytes("v2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_latest_manifest_falls_back_and_replays_commit_log_tail() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(
+            tiered_config("/corrupt-latest-manifest"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write v1");
+        db.flush().await.expect("first flush");
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write v2");
+        db.flush().await.expect("second flush");
+
+        let manifest_path = Db::local_manifest_path("/corrupt-latest-manifest", ManifestId::new(2));
+        let mut manifest_bytes = read_path(&dependencies, &manifest_path)
+            .await
+            .expect("read latest manifest");
+        let last = manifest_bytes.len() - 1;
+        manifest_bytes[last] ^= 0x55;
+        overwrite_file(file_system.as_ref(), &manifest_path, &manifest_bytes).await;
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/corrupt-latest-manifest"), dependencies)
+            .await
+            .expect("reopen with corrupt latest manifest");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(1)
+        );
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(2));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(2));
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read recovered apple"),
+            Some(Value::bytes("v2"))
+        );
+        let stats = reopened.table_stats(&reopened_table).await;
+        assert!(stats.pending_flush_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_open_recovery_is_idempotent() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/idempotent-recovery"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("tail"))
+            .await
+            .expect("write tail");
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/idempotent-recovery"), dependencies.clone())
+            .await
+            .expect("first reopen");
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(1));
+        file_system.crash();
+
+        let reopened_again = Db::open(tiered_config("/idempotent-recovery"), dependencies)
+            .await
+            .expect("second reopen");
+        let reopened_table = reopened_again.table("events");
+        assert_eq!(reopened_again.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(
+            reopened_again.current_durable_sequence(),
+            SequenceNumber::new(1)
+        );
+        assert_eq!(
+            reopened_table
+                .write(b"banana".to_vec(), Value::bytes("fresh"))
+                .await
+                .expect("write after repeated reopen"),
+            SequenceNumber::new(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_truncates_partial_active_segment_suffix() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(
+            tiered_config("/partial-active-segment"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("stable"))
+            .await
+            .expect("write stable value");
+
+        let segment_path = commit_log_segment_path("/partial-active-segment", 1);
+        let stable_bytes = read_path(&dependencies, &segment_path)
+            .await
+            .expect("read stable segment");
+        let mut corrupted = stable_bytes.clone();
+        corrupted.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        overwrite_file(file_system.as_ref(), &segment_path, &corrupted).await;
+
+        file_system.crash();
+        let reopened = Db::open(
+            tiered_config("/partial-active-segment"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("reopen with partial active segment");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(1));
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read recovered value"),
+            Some(Value::bytes("stable"))
+        );
+
+        let repaired = read_path(&dependencies, &segment_path)
+            .await
+            .expect("read repaired segment");
+        assert_eq!(repaired, stable_bytes);
     }
 
     #[tokio::test]
