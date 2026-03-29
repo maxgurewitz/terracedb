@@ -766,6 +766,80 @@ fn db_change_feed_simulation_resumes_from_cursor_after_restart() -> turmoil::Res
 }
 
 #[test]
+fn db_change_feed_simulation_surfaces_snapshot_too_old_for_lagging_tables_after_restart()
+-> turmoil::Result {
+    let mut slow_spec = SimulationTableSpec::row("slow");
+    slow_spec.history_retention_sequences = Some(8);
+    let mut fast_spec = SimulationTableSpec::row("fast");
+    fast_spec.history_retention_sequences = Some(1);
+
+    SeededSimulationRunner::new(0xcdc3).run_with(move |context| {
+        let slow_spec = slow_spec.clone();
+        let fast_spec = fast_spec.clone();
+
+        async move {
+            let config = simulation_tiered_config(
+                "/terracedb/sim/cdc-retention-restart",
+                TieredDurabilityMode::GroupCommit,
+            );
+            let db = context.open_db(config.clone()).await?;
+            let slow = db.create_table(slow_spec.table_config()).await?;
+            let fast = db.create_table(fast_spec.table_config()).await?;
+
+            let mut first = db.write_batch();
+            first.put(&slow, b"slow:1".to_vec(), bytes("s1"));
+            first.put(&fast, b"fast:1".to_vec(), bytes("f1"));
+            let first_sequence = db.commit(first, CommitOptions::default()).await?;
+            db.flush().await?;
+
+            let mut second = db.write_batch();
+            second.put(&slow, b"slow:2".to_vec(), bytes("s2"));
+            second.put(&fast, b"fast:2".to_vec(), bytes("f2"));
+            db.commit(second, CommitOptions::default()).await?;
+            db.flush().await?;
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_slow = reopened.table("slow");
+            let reopened_fast = reopened.table("fast");
+
+            let fast_error = reopened
+                .scan_since(
+                    &reopened_fast,
+                    LogCursor::new(first_sequence, 1),
+                    ScanOptions::default(),
+                )
+                .await
+                .err()
+                .expect("fast table should be past its retained change-feed floor");
+            assert_eq!(fast_error.requested, first_sequence);
+            assert_eq!(fast_error.oldest_available, SequenceNumber::new(2));
+
+            let slow_changes = collect_change_feed(
+                reopened
+                    .scan_since(
+                        &reopened_slow,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await?,
+            )
+            .await;
+            assert_eq!(slow_changes.len(), 2);
+            assert_eq!(slow_changes[0].sequence, SequenceNumber::new(1));
+            assert_eq!(slow_changes[1].sequence, SequenceNumber::new(2));
+
+            let fast_stats = reopened.table_stats(&reopened_fast).await;
+            assert_eq!(
+                fast_stats.change_feed_floor_sequence,
+                Some(SequenceNumber::new(2))
+            );
+
+            Ok(())
+        }
+    })
+}
+
+#[test]
 fn db_merge_simulation_replays_same_seed() -> turmoil::Result {
     let config = DbSimulationScenarioConfig {
         root_path: "/terracedb/sim/db-seeded-replay".to_string(),

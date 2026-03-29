@@ -31,7 +31,7 @@ use crate::{
         CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
         StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
     },
-    ids::{CommitId, FieldId, LogCursor, ManifestId, SequenceNumber, TableId},
+    ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, OpenOptions},
     remote::{StorageSource, UnifiedStorage},
     scheduler::{
@@ -989,6 +989,29 @@ impl CommitRuntime {
         }
     }
 
+    async fn maybe_seal_active(&mut self) -> Result<(), StorageError> {
+        match &mut self.backend {
+            CommitLogBackend::Local(manager) => {
+                manager.seal_active().await?;
+                Ok(())
+            }
+            CommitLogBackend::Memory(_) => Ok(()),
+        }
+    }
+
+    async fn prune_segments_before(
+        &mut self,
+        sequence_exclusive: SequenceNumber,
+    ) -> Result<(), StorageError> {
+        match &mut self.backend {
+            CommitLogBackend::Local(manager) => {
+                manager.prune_sealed_before(sequence_exclusive).await?;
+                Ok(())
+            }
+            CommitLogBackend::Memory(_) => Ok(()),
+        }
+    }
+
     async fn recover_after(
         &self,
         after_sequence: SequenceNumber,
@@ -1033,6 +1056,38 @@ impl CommitRuntime {
                 })
                 .cloned()
                 .collect()),
+        }
+    }
+
+    fn oldest_sequence_for_table(&self, table_id: TableId) -> Option<SequenceNumber> {
+        match &self.backend {
+            CommitLogBackend::Local(manager) => manager.oldest_sequence_for_table(table_id),
+            CommitLogBackend::Memory(log) => log
+                .records
+                .iter()
+                .filter(|record| {
+                    record
+                        .entries
+                        .iter()
+                        .any(|entry| entry.table_id == table_id)
+                })
+                .map(CommitRecord::sequence)
+                .min(),
+        }
+    }
+
+    fn oldest_segment_id(&self) -> Option<SegmentId> {
+        match &self.backend {
+            CommitLogBackend::Local(manager) => manager.oldest_segment_id(),
+            CommitLogBackend::Memory(log) => (!log.records.is_empty()).then_some(SegmentId::new(1)),
+        }
+    }
+
+    #[cfg(test)]
+    fn enumerate_segments(&self) -> Vec<crate::engine::commit_log::SegmentDescriptor> {
+        match &self.backend {
+            CommitLogBackend::Local(manager) => manager.enumerate_segments(),
+            CommitLogBackend::Memory(_) => Vec::new(),
         }
     }
 }
@@ -2048,7 +2103,7 @@ impl Db {
         let initial_table_watermarks =
             Self::initial_table_watermarks(&tables, &memtables, &sstables);
 
-        Ok(Self {
+        let db = Self {
             inner: Arc::new(DbInner {
                 config,
                 scheduler,
@@ -2080,7 +2135,12 @@ impl Db {
                 #[cfg(test)]
                 compaction_phase_blocks: Mutex::new(Vec::new()),
             }),
-        })
+        };
+        db.prune_commit_log(true)
+            .await
+            .map_err(OpenError::Storage)?;
+
+        Ok(db)
     }
 
     fn validate_storage_config(storage: &StorageConfig) -> Result<(), OpenError> {
@@ -4089,6 +4149,10 @@ impl Db {
             *self.sstables_write() = sstable_state;
         }
 
+        self.prune_commit_log(true)
+            .await
+            .map_err(FlushError::Storage)?;
+
         Ok(())
     }
 
@@ -4139,6 +4203,12 @@ impl Db {
     pub async fn table_stats(&self, table: &Table) -> TableStats {
         let tables = self.tables_read().clone();
         let live = self.sstables_read().live.clone();
+        let current_sequence = self.current_sequence();
+        let recovery_floor_sequence = self.sstables_read().last_flushed_sequence;
+        let cdc_gc_min_sequence = self.cdc_gc_min_sequence(current_sequence);
+        let commit_log_gc_floor_sequence = cdc_gc_min_sequence
+            .map(|cdc_min| recovery_floor_sequence.min(cdc_min))
+            .unwrap_or(recovery_floor_sequence);
         let oldest_active_snapshot_sequence = self.oldest_active_snapshot_sequence();
         let active_snapshot_count = self.active_snapshot_count();
         let metadata = tables
@@ -4197,11 +4267,37 @@ impl Db {
                 )
             })
             .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, None, None, false));
+        let (
+            change_feed_oldest_available_sequence,
+            change_feed_floor_sequence,
+            change_feed_pins_commit_log_gc,
+        ) = if let Some(table_id) = table.resolve_id() {
+            let table_watermark = self.table_change_feed_watermark(table_id);
+            let runtime = self.inner.commit_runtime.lock().await;
+            let logical_floor = self.cdc_retention_floor_sequence(table_id, current_sequence);
+            let floor = self.change_feed_floor_from_state(
+                table_id,
+                current_sequence,
+                runtime.oldest_sequence_for_table(table_id),
+                runtime.oldest_segment_id(),
+                table_watermark,
+            );
+            let pins =
+                logical_floor
+                    .zip(cdc_gc_min_sequence)
+                    .is_some_and(|(table_floor, gc_min)| {
+                        table_floor == gc_min && gc_min <= recovery_floor_sequence
+                    });
+            (runtime.oldest_sequence_for_table(table_id), floor, pins)
+        } else {
+            (None, None, false)
+        };
 
         TableStats {
             l0_sstable_count,
             total_bytes,
             local_bytes,
+            s3_bytes: total_bytes.saturating_sub(local_bytes),
             compaction_debt,
             compaction_filter_removed_bytes,
             compaction_filter_removed_keys,
@@ -4212,8 +4308,12 @@ impl Db {
             oldest_active_snapshot_sequence,
             active_snapshot_count,
             history_pinned_by_snapshots,
+            change_feed_oldest_available_sequence,
+            change_feed_floor_sequence,
+            commit_log_recovery_floor_sequence: recovery_floor_sequence,
+            commit_log_gc_floor_sequence,
+            change_feed_pins_commit_log_gc,
             metadata,
-            ..TableStats::default()
         }
     }
 
@@ -4697,25 +4797,41 @@ impl Db {
         if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
             return Ok(Box::pin(stream::empty()));
         }
+        let table_watermark = self.table_change_feed_watermark(table_id);
 
         let table_handle = Table {
             db: self.clone(),
             name: Arc::from(table.name()),
             id: Some(table_id),
         };
-        let records = self
-            .inner
-            .commit_runtime
-            .lock()
-            .await
-            .scan_table_from_sequence(table_id, cursor.sequence())
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "change capture scan failed for table {}: {error}",
-                    table.name()
-                )
-            });
+        let records = {
+            let runtime = self.inner.commit_runtime.lock().await;
+            let floor = self.change_feed_floor_from_state(
+                table_id,
+                upper_bound,
+                runtime.oldest_sequence_for_table(table_id),
+                runtime.oldest_segment_id(),
+                table_watermark,
+            );
+            if let Some(oldest_available) = floor
+                && cursor.sequence() < oldest_available
+            {
+                return Err(SnapshotTooOld {
+                    requested: cursor.sequence(),
+                    oldest_available,
+                });
+            }
+
+            runtime
+                .scan_table_from_sequence(table_id, cursor.sequence())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "change capture scan failed for table {}: {error}",
+                        table.name()
+                    )
+                })
+        };
 
         let mut changes = Vec::new();
         for record in records {
@@ -5175,6 +5291,97 @@ impl Db {
         )
     }
 
+    fn cdc_retention_floor_sequence(
+        &self,
+        table_id: TableId,
+        upper_bound: SequenceNumber,
+    ) -> Option<SequenceNumber> {
+        let retained = self.history_retention_sequences(table_id)?;
+        Some(SequenceNumber::new(
+            upper_bound.get().saturating_sub(retained.saturating_sub(1)),
+        ))
+    }
+
+    fn cdc_gc_min_sequence(&self, upper_bound: SequenceNumber) -> Option<SequenceNumber> {
+        self.tables_read()
+            .values()
+            .filter_map(|table| self.cdc_retention_floor_sequence(table.id, upper_bound))
+            .min()
+    }
+
+    fn table_change_feed_watermark(&self, table_id: TableId) -> Option<SequenceNumber> {
+        let mut watermark = None;
+
+        if let Some(sequence) = self
+            .memtables_read()
+            .table_watermarks()
+            .get(&table_id)
+            .copied()
+        {
+            watermark = Some(sequence);
+        }
+        if let Some(sequence) = self
+            .sstables_read()
+            .table_watermarks()
+            .get(&table_id)
+            .copied()
+        {
+            watermark = Some(
+                watermark
+                    .map(|current| current.max(sequence))
+                    .unwrap_or(sequence),
+            );
+        }
+
+        watermark
+    }
+
+    fn change_feed_floor_from_state(
+        &self,
+        table_id: TableId,
+        upper_bound: SequenceNumber,
+        physical_oldest: Option<SequenceNumber>,
+        oldest_segment_id: Option<SegmentId>,
+        table_watermark: Option<SequenceNumber>,
+    ) -> Option<SequenceNumber> {
+        let mut floor = self
+            .cdc_retention_floor_sequence(table_id, upper_bound)
+            .filter(|logical| physical_oldest.is_some_and(|oldest| oldest < *logical));
+
+        if oldest_segment_id.is_some_and(|segment_id| segment_id.get() > 1)
+            && let Some(physical_floor) = physical_oldest.or(table_watermark)
+        {
+            floor = Some(
+                floor
+                    .map(|current| current.max(physical_floor))
+                    .unwrap_or(physical_floor),
+            );
+        }
+
+        floor.filter(|sequence| sequence.get() > 0)
+    }
+
+    async fn prune_commit_log(&self, seal_active: bool) -> Result<(), StorageError> {
+        if self.local_storage_root().is_none() {
+            return Ok(());
+        }
+
+        let recovery_min = self.sstables_read().last_flushed_sequence;
+        let cdc_min = self.cdc_gc_min_sequence(self.current_sequence());
+        let gc_floor = cdc_min
+            .map(|cdc_min| recovery_min.min(cdc_min))
+            .unwrap_or(recovery_min);
+        if gc_floor == SequenceNumber::new(0) {
+            return Ok(());
+        }
+
+        let mut runtime = self.inner.commit_runtime.lock().await;
+        if seal_active {
+            runtime.maybe_seal_active().await?;
+        }
+        runtime.prune_segments_before(gc_floor).await
+    }
+
     fn validate_historical_read(
         &self,
         table_id: TableId,
@@ -5617,9 +5824,10 @@ mod tests {
         FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
         PendingWork, PendingWorkType, PointMutation, ReadError, Rng, S3Location,
         S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
-        SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock,
-        StubObjectStore, StubRng, TableConfig, TableFormat, TableId, TableStats, ThrottleDecision,
-        TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
+        SegmentId, SequenceNumber, ShadowOracle, SnapshotTooOld, SsdConfig, StorageConfig,
+        StorageError, StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TableId,
+        TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Timestamp,
+        TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -6159,6 +6367,36 @@ mod tests {
             .expect("expected SnapshotTooOld read error");
         assert_eq!(snapshot_too_old.requested, requested);
         assert_eq!(snapshot_too_old.oldest_available, oldest_available);
+    }
+
+    fn assert_change_feed_snapshot_too_old(
+        error: SnapshotTooOld,
+        requested: SequenceNumber,
+        oldest_available: SequenceNumber,
+    ) {
+        assert_eq!(error.requested, requested);
+        assert_eq!(error.oldest_available, oldest_available);
+    }
+
+    async fn commit_log_segment_ids(db: &Db) -> Vec<SegmentId> {
+        db.inner
+            .commit_runtime
+            .lock()
+            .await
+            .enumerate_segments()
+            .into_iter()
+            .map(|segment| segment.segment_id)
+            .collect()
+    }
+
+    async fn force_seal_commit_log(db: &Db) {
+        db.inner
+            .commit_runtime
+            .lock()
+            .await
+            .maybe_seal_active()
+            .await
+            .expect("seal active commit log segment");
     }
 
     fn oracle_rows(
@@ -10774,5 +11012,212 @@ mod tests {
         )
         .await;
         assert_eq!(resumed, expected[2..].to_vec());
+    }
+
+    #[tokio::test]
+    async fn change_feed_retention_returns_snapshot_too_old_and_reports_stats() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/cdc-retention-stats"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config_with_history_retention("events", 2))
+            .await
+            .expect("create events table");
+
+        let first = table
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first event");
+        let oldest_available = table
+            .write(b"user:2".to_vec(), bytes("v2"))
+            .await
+            .expect("write second event");
+        table
+            .write(b"user:3".to_vec(), bytes("v3"))
+            .await
+            .expect("write third event");
+
+        assert_change_feed_snapshot_too_old(
+            db.scan_since(&table, LogCursor::new(first, 0), ScanOptions::default())
+                .await
+                .err()
+                .expect("visible change feed should be too old"),
+            first,
+            oldest_available,
+        );
+        assert_change_feed_snapshot_too_old(
+            db.scan_durable_since(&table, LogCursor::new(first, 0), ScanOptions::default())
+                .await
+                .err()
+                .expect("durable change feed should be too old"),
+            first,
+            oldest_available,
+        );
+
+        let stats = db.table_stats(&table).await;
+        assert_eq!(
+            stats.change_feed_oldest_available_sequence,
+            Some(SequenceNumber::new(1))
+        );
+        assert_eq!(stats.change_feed_floor_sequence, Some(oldest_available));
+        assert_eq!(
+            stats.commit_log_recovery_floor_sequence,
+            SequenceNumber::new(0)
+        );
+        assert_eq!(stats.commit_log_gc_floor_sequence, SequenceNumber::new(0));
+        assert!(!stats.change_feed_pins_commit_log_gc);
+    }
+
+    #[tokio::test]
+    async fn physically_retained_segments_can_still_be_logically_too_old_for_other_tables() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/cdc-physical-vs-logical"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let slow = db
+            .create_table(row_table_config_with_history_retention("slow", 8))
+            .await
+            .expect("create slow table");
+        let fast = db
+            .create_table(row_table_config_with_history_retention("fast", 1))
+            .await
+            .expect("create fast table");
+
+        let mut first = db.write_batch();
+        first.put(&slow, b"slow:1".to_vec(), bytes("s1"));
+        first.put(&fast, b"fast:1".to_vec(), bytes("f1"));
+        let first_sequence = db
+            .commit(first, CommitOptions::default())
+            .await
+            .expect("commit first batch");
+        force_seal_commit_log(&db).await;
+
+        let mut second = db.write_batch();
+        second.put(&slow, b"slow:2".to_vec(), bytes("s2"));
+        second.put(&fast, b"fast:2".to_vec(), bytes("f2"));
+        db.commit(second, CommitOptions::default())
+            .await
+            .expect("commit second batch");
+        force_seal_commit_log(&db).await;
+        db.flush().await.expect("flush durable state");
+
+        assert!(
+            commit_log_segment_ids(&db)
+                .await
+                .contains(&SegmentId::new(1)),
+            "the oldest commit-log segment should stay physically retained for the slow table"
+        );
+
+        assert_change_feed_snapshot_too_old(
+            db.scan_since(
+                &fast,
+                LogCursor::new(first_sequence, 1),
+                ScanOptions::default(),
+            )
+            .await
+            .err()
+            .expect("fast table should already be past its logical retention floor"),
+            first_sequence,
+            SequenceNumber::new(2),
+        );
+
+        assert_eq!(
+            collect_changes(
+                db.scan_since(&slow, LogCursor::beginning(), ScanOptions::default())
+                    .await
+                    .expect("slow table should still scan retained history"),
+            )
+            .await,
+            vec![
+                collected_change(1, 0, ChangeKind::Put, b"slow:1", Some(bytes("s1")), "slow",),
+                collected_change(2, 0, ChangeKind::Put, b"slow:2", Some(bytes("s2")), "slow",),
+            ]
+        );
+
+        let fast_stats = db.table_stats(&fast).await;
+        assert_eq!(
+            fast_stats.change_feed_floor_sequence,
+            Some(SequenceNumber::new(2))
+        );
+        assert_eq!(
+            fast_stats.change_feed_oldest_available_sequence,
+            Some(SequenceNumber::new(1))
+        );
+        assert!(!fast_stats.change_feed_pins_commit_log_gc);
+    }
+
+    #[tokio::test]
+    async fn recovery_only_log_gc_drops_segments_once_a_flush_makes_them_unnecessary() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/cdc-recovery-only-gc"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        let first = table
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first event");
+        force_seal_commit_log(&db).await;
+
+        table
+            .write(b"user:2".to_vec(), bytes("v2"))
+            .await
+            .expect("write second event");
+        force_seal_commit_log(&db).await;
+
+        assert_eq!(
+            commit_log_segment_ids(&db).await,
+            vec![SegmentId::new(1), SegmentId::new(2), SegmentId::new(3)]
+        );
+
+        db.flush().await.expect("flush recovery state");
+        assert_eq!(
+            commit_log_segment_ids(&db).await,
+            vec![SegmentId::new(2), SegmentId::new(3)]
+        );
+
+        file_system.crash();
+
+        let reopened = Db::open(tiered_config("/cdc-recovery-only-gc"), dependencies)
+            .await
+            .expect("reopen db");
+        let reopened_table = reopened.table("events");
+
+        assert_eq!(
+            reopened_table
+                .read(b"user:2".to_vec())
+                .await
+                .expect("read latest value"),
+            Some(bytes("v2"))
+        );
+        assert_change_feed_snapshot_too_old(
+            reopened
+                .scan_since(
+                    &reopened_table,
+                    LogCursor::new(first, 0),
+                    ScanOptions::default(),
+                )
+                .await
+                .err()
+                .expect("recovery-only GC should make the oldest cursor too old"),
+            first,
+            SequenceNumber::new(2),
+        );
     }
 }

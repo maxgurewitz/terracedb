@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut};
@@ -366,6 +369,16 @@ impl SegmentCatalog {
         *self = Self::new(std::mem::take(&mut self.footers));
     }
 
+    fn remove_segments(&mut self, deleted: &BTreeSet<SegmentId>) {
+        if deleted.is_empty() {
+            return;
+        }
+
+        self.footers
+            .retain(|footer| !deleted.contains(&footer.segment_id));
+        *self = Self::new(std::mem::take(&mut self.footers));
+    }
+
     pub fn footers(&self) -> &[SegmentFooter] {
         &self.footers
     }
@@ -528,6 +541,22 @@ impl SegmentManager {
             .or_else(|| self.active.seek_by_sequence(table_id, sequence))
     }
 
+    pub fn oldest_segment_id(&self) -> Option<SegmentId> {
+        self.catalog
+            .footers()
+            .first()
+            .map(|footer| footer.segment_id)
+            .or_else(|| (self.active.record_count > 0).then_some(self.active.id))
+    }
+
+    pub fn oldest_sequence_for_table(&self, table_id: TableId) -> Option<SequenceNumber> {
+        self.catalog
+            .oldest_sequence(table_id)
+            .into_iter()
+            .chain(self.active.oldest_sequence_for_table(table_id))
+            .min()
+    }
+
     pub async fn append(&mut self, record: CommitRecord) -> Result<AppendLocation, StorageError> {
         let frame = record.encode_frame()?;
         if self.active.record_count > 0
@@ -588,6 +617,35 @@ impl SegmentManager {
         self.active = ActiveSegment::create(self.fs.as_ref(), &self.dir, next_segment_id).await?;
 
         Ok(Some(footer))
+    }
+
+    pub async fn prune_sealed_before(
+        &mut self,
+        sequence_exclusive: SequenceNumber,
+    ) -> Result<Vec<SegmentFooter>, StorageError> {
+        let deleted = self
+            .catalog
+            .footers()
+            .iter()
+            .filter(|footer| footer.max_sequence < sequence_exclusive)
+            .cloned()
+            .collect::<Vec<_>>();
+        if deleted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let deleted_ids = deleted
+            .iter()
+            .map(|footer| footer.segment_id)
+            .collect::<BTreeSet<_>>();
+        for footer in &deleted {
+            self.fs
+                .delete(&segment_path(&self.dir, footer.segment_id))
+                .await?;
+        }
+        self.catalog.remove_segments(&deleted_ids);
+
+        Ok(deleted)
     }
 
     pub async fn sync_active(&mut self) -> Result<(), StorageError> {
@@ -916,6 +974,12 @@ impl ActiveSegment {
                 None
             }
         })
+    }
+
+    fn oldest_sequence_for_table(&self, table_id: TableId) -> Option<SequenceNumber> {
+        self.tables
+            .get(&table_id)
+            .and_then(|meta| meta.min_sequence)
     }
 
     fn has_entries_for_table_since(&self, table_id: TableId, sequence: SequenceNumber) -> bool {
