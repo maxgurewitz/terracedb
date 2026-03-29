@@ -56,7 +56,7 @@ pub use simulation::{
     PointMutation, RecoveryMatch, ScheduledFault, ScheduledFaultKind, SeededSimulationRunner,
     ShadowOracle, SimulationCompactionFilterId, SimulationContext, SimulationMergeOperatorId,
     SimulationOutcome, SimulationScenarioConfig, SimulationTableSpec, StubDbProcess, TraceEvent,
-    TurmoilClock, seed_mad_turmoil,
+    TurmoilClock,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use transaction::{Transaction, TransactionCommitError, TransactionCommitOptions};

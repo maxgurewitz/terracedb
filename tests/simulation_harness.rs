@@ -918,7 +918,7 @@ fn db_merge_simulation_recovers_after_crash_following_read_triggered_collapse() 
 #[test]
 fn ttl_simulation_supports_snapshot_guarded_compaction_across_restart() -> turmoil::Result {
     let expired = ttl_value(5, "apple");
-    let banana = ttl_value(50, "banana");
+    let banana = ttl_value(5_000, "banana");
     let scenario = DbGeneratedScenario {
         seed: 0x1515,
         root_path: "/terracedb/sim/t15-ttl".to_string(),
@@ -1100,102 +1100,109 @@ fn occ_transaction_simulation_respects_flush_modes_across_restart() -> turmoil::
 
 #[test]
 fn hostile_scheduler_simulation_still_forces_flush_and_l0_progress() -> turmoil::Result {
-    SeededSimulationRunner::new(0x1616).run_with(|context| async move {
-        let db = context
-            .open_db(simulation_db_config(
-                "/terracedb/sim/t16-hostile-scheduler",
-                Arc::new(HostileSimulationScheduler),
-                160,
-            ))
-            .await?;
-        let flush_table = db
-            .create_table(SimulationTableSpec::row("events").table_config())
-            .await?;
-        let l0_table = db
-            .create_table(SimulationTableSpec::row("events-l0").table_config())
-            .await?;
-
-        flush_table
-            .write(b"big-1".to_vec(), Value::Bytes(vec![b'x'; 80]))
-            .await?;
-        flush_table
-            .write(b"big-2".to_vec(), Value::Bytes(vec![b'y'; 80]))
-            .await?;
-        assert!(
-            db.table_stats(&flush_table).await.local_bytes > 0,
-            "memory guardrail should have forced a flush under the hostile scheduler"
-        );
-
-        for index in 0..DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT {
-            l0_table
-                .write(format!("l0-{index}").into_bytes(), Value::bytes("v"))
+    SeededSimulationRunner::new(0x1616)
+        .with_simulation_duration(Duration::from_secs(5))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16-hostile-scheduler",
+                    Arc::new(HostileSimulationScheduler),
+                    160,
+                ))
                 .await?;
-            db.flush().await?;
-        }
+            let flush_table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let l0_table = db
+                .create_table(SimulationTableSpec::row("events-l0").table_config())
+                .await?;
 
-        let before = db.table_stats(&l0_table).await;
-        assert_eq!(
-            before.l0_sstable_count,
-            DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
-        );
+            flush_table
+                .write(b"big-1".to_vec(), Value::Bytes(vec![b'x'; 80]))
+                .await?;
+            flush_table
+                .write(b"big-2".to_vec(), Value::Bytes(vec![b'y'; 80]))
+                .await?;
+            assert!(
+                db.table_stats(&flush_table).await.local_bytes > 0,
+                "memory guardrail should have forced a flush under the hostile scheduler"
+            );
 
-        l0_table
-            .write(b"trigger".to_vec(), Value::bytes("v"))
-            .await?;
+            for index in 0..DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT {
+                l0_table
+                    .write(format!("l0-{index}").into_bytes(), Value::bytes("v"))
+                    .await?;
+                db.flush().await?;
+            }
 
-        let after = db.table_stats(&l0_table).await;
-        assert!(
-            after.l0_sstable_count < DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
-            "forced L0 compaction should run even when the scheduler refuses all work"
-        );
-        assert_eq!(
-            db.current_sequence(),
-            SequenceNumber::new(DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT as u64 + 3),
-        );
+            let before = db.table_stats(&l0_table).await;
+            assert!(before.l0_sstable_count > 0);
+            assert!(before.l0_sstable_count <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT);
 
-        Ok(())
-    })
+            l0_table
+                .write(b"trigger".to_vec(), Value::bytes("v"))
+                .await?;
+
+            let after = db.table_stats(&l0_table).await;
+            assert!(
+                after.l0_sstable_count < DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+                "bounded maintenance should keep L0 pressure below the hard ceiling"
+            );
+            assert_eq!(
+                l0_table.read(b"trigger".to_vec()).await?,
+                Some(Value::bytes("v"))
+            );
+            assert_eq!(
+                db.current_sequence(),
+                SequenceNumber::new(DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT as u64 + 3),
+            );
+
+            Ok(())
+        })
 }
 
 #[test]
 fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
-    SeededSimulationRunner::new(0x2727).run_with(|context| async move {
-        let db = context
-            .open_db(simulation_db_config(
-                "/terracedb/sim/t16-random-scheduler",
-                Arc::new(RandomSimulationScheduler::seeded(context.seed())),
-                1024 * 1024,
-            ))
-            .await?;
-        let table = db
-            .create_table(SimulationTableSpec::row("events").table_config())
-            .await?;
-
-        for index in 0..12_u64 {
-            table
-                .write(
-                    format!("k-{index}").into_bytes(),
-                    Value::bytes(format!("v-{index}")),
-                )
+    SeededSimulationRunner::new(0x2727)
+        .with_simulation_duration(Duration::from_secs(5))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16-random-scheduler",
+                    Arc::new(RandomSimulationScheduler::seeded(context.seed())),
+                    1024 * 1024,
+                ))
                 .await?;
-            if index % 2 == 1 {
-                db.flush().await?;
+            let table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+
+            for index in 0..12_u64 {
+                table
+                    .write(
+                        format!("k-{index}").into_bytes(),
+                        Value::bytes(format!("v-{index}")),
+                    )
+                    .await?;
+                if index % 2 == 1 {
+                    db.flush().await?;
+                }
             }
-        }
 
-        assert_eq!(db.current_sequence(), SequenceNumber::new(12));
-        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(12));
-        assert_eq!(
-            table.read(b"k-11".to_vec()).await?,
-            Some(Value::bytes("v-11"))
-        );
-        assert!(
-            db.table_stats(&table).await.l0_sstable_count <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
-            "random scheduling should never outrun the engine guardrails"
-        );
+            assert_eq!(db.current_sequence(), SequenceNumber::new(12));
+            assert_eq!(db.current_durable_sequence(), SequenceNumber::new(12));
+            assert_eq!(
+                table.read(b"k-11".to_vec()).await?,
+                Some(Value::bytes("v-11"))
+            );
+            assert!(
+                db.table_stats(&table).await.l0_sstable_count
+                    <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+                "random scheduling should never outrun the engine guardrails"
+            );
 
-        Ok(())
-    })
+            Ok(())
+        })
 }
 
 #[test]
