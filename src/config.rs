@@ -122,6 +122,7 @@ pub struct TableConfig {
     pub merge_operator: Option<MergeOperatorRef>,
     pub compaction_filter: Option<CompactionFilterRef>,
     pub bloom_filter_bits_per_key: Option<u32>,
+    pub history_retention_sequences: Option<u64>,
     pub compaction_strategy: CompactionStrategy,
     pub schema: Option<SchemaDefinition>,
     pub metadata: TableMetadata,
@@ -144,6 +145,10 @@ impl fmt::Debug for TableConfig {
                     .map(|_| "<dyn CompactionFilter>"),
             )
             .field("bloom_filter_bits_per_key", &self.bloom_filter_bits_per_key)
+            .field(
+                "history_retention_sequences",
+                &self.history_retention_sequences,
+            )
             .field("compaction_strategy", &self.compaction_strategy)
             .field("schema", &self.schema)
             .field("metadata", &self.metadata)

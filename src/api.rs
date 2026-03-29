@@ -318,6 +318,8 @@ struct PersistedTableConfig {
     name: String,
     format: TableFormat,
     bloom_filter_bits_per_key: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_retention_sequences: Option<u64>,
     compaction_strategy: CompactionStrategy,
     schema: Option<SchemaDefinition>,
     metadata: TableMetadata,
@@ -1153,9 +1155,12 @@ impl SnapshotTracker {
         }
     }
 
-    #[cfg(test)]
     fn oldest_active(&self) -> Option<SequenceNumber> {
         self.counts_by_sequence.keys().next().copied()
+    }
+
+    fn count(&self) -> u64 {
+        self.registrations.len() as u64
     }
 }
 
@@ -1234,6 +1239,7 @@ impl PersistedCatalogEntry {
                 name: table.config.name.clone(),
                 format: table.config.format,
                 bloom_filter_bits_per_key: table.config.bloom_filter_bits_per_key,
+                history_retention_sequences: table.config.history_retention_sequences,
                 compaction_strategy: table.config.compaction_strategy,
                 schema: table.config.schema.clone(),
                 metadata: table.config.metadata.clone(),
@@ -1250,6 +1256,7 @@ impl PersistedCatalogEntry {
                 merge_operator: None,
                 compaction_filter: None,
                 bloom_filter_bits_per_key: self.config.bloom_filter_bits_per_key,
+                history_retention_sequences: self.config.history_retention_sequences,
                 compaction_strategy: self.config.compaction_strategy,
                 schema: self.config.schema,
                 metadata: self.config.metadata,
@@ -1371,6 +1378,11 @@ impl Db {
         if config.name.is_empty() {
             return Err(CreateTableError::InvalidConfig(
                 "table name cannot be empty".to_string(),
+            ));
+        }
+        if config.history_retention_sequences == Some(0) {
+            return Err(CreateTableError::InvalidConfig(
+                "history_retention_sequences must be greater than zero".to_string(),
             ));
         }
         if matches!(config.format, TableFormat::Columnar) && config.schema.is_none() {
@@ -2490,6 +2502,35 @@ impl Db {
         (row.key.len() + row.value.as_ref().map(value_size_bytes).unwrap_or_default() + 32) as u64
     }
 
+    fn retain_rows_within_horizon(
+        rows: Vec<SstableRow>,
+        horizon: Option<SequenceNumber>,
+    ) -> Vec<SstableRow> {
+        let Some(horizon) = horizon else {
+            return rows;
+        };
+
+        let mut retained = Vec::with_capacity(rows.len());
+        let mut index = 0_usize;
+        while index < rows.len() {
+            let key = rows[index].key.clone();
+            let mut anchor_kept = false;
+
+            while index < rows.len() && rows[index].key == key {
+                let row = rows[index].clone();
+                if row.sequence > horizon {
+                    retained.push(row);
+                } else if !anchor_kept {
+                    retained.push(row);
+                    anchor_kept = true;
+                }
+                index += 1;
+            }
+        }
+
+        retained
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     async fn write_compaction_outputs(
         &self,
@@ -2599,6 +2640,10 @@ impl Db {
                     .collect::<Vec<_>>();
                 merged_rows
                     .sort_by_key(|row| encode_mvcc_key(&row.key, CommitId::new(row.sequence)));
+                merged_rows = Self::retain_rows_within_horizon(
+                    merged_rows,
+                    self.history_gc_horizon(job.table_id),
+                );
 
                 let outputs = self
                     .write_compaction_outputs(
@@ -2922,6 +2967,8 @@ impl Db {
     pub async fn table_stats(&self, table: &Table) -> TableStats {
         let tables = self.tables_read().clone();
         let live = self.sstables_read().live.clone();
+        let oldest_active_snapshot_sequence = self.oldest_active_snapshot_sequence();
+        let active_snapshot_count = self.active_snapshot_count();
         let metadata = tables
             .get(table.name())
             .map(|table| table.config.metadata.clone())
@@ -2933,6 +2980,9 @@ impl Db {
             compaction_debt,
             pending_flush_bytes,
             immutable_memtable_count,
+            history_retention_floor_sequence,
+            history_gc_horizon_sequence,
+            history_pinned_by_snapshots,
         ) = table
             .resolve_id()
             .map(|table_id| {
@@ -2948,6 +2998,14 @@ impl Db {
                     .find(|stored| stored.id == table_id)
                     .map(|stored| Self::table_compaction_state(stored, &live).compaction_debt)
                     .unwrap_or_default();
+                let history_retention_floor_sequence =
+                    self.history_retention_floor_sequence(table_id);
+                let history_gc_horizon_sequence = self.history_gc_horizon(table_id);
+                let history_pinned_by_snapshots = history_retention_floor_sequence
+                    .zip(oldest_active_snapshot_sequence)
+                    .is_some_and(|(retention_floor, oldest_snapshot)| {
+                        oldest_snapshot < retention_floor
+                    });
 
                 (
                     l0_sstable_count,
@@ -2956,9 +3014,12 @@ impl Db {
                     compaction_debt,
                     memtables.pending_flush_bytes(table_id),
                     memtables.immutable_memtable_count(table_id),
+                    history_retention_floor_sequence,
+                    history_gc_horizon_sequence,
+                    history_pinned_by_snapshots,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0));
+            .unwrap_or((0, 0, 0, 0, 0, 0, None, None, false));
 
         TableStats {
             l0_sstable_count,
@@ -2967,6 +3028,11 @@ impl Db {
             compaction_debt,
             pending_flush_bytes,
             immutable_memtable_count,
+            history_retention_floor_sequence,
+            history_gc_horizon_sequence,
+            oldest_active_snapshot_sequence,
+            active_snapshot_count,
+            history_pinned_by_snapshots,
             metadata,
             ..TableStats::default()
         }
@@ -3542,9 +3608,56 @@ impl Db {
         mutex_lock(&self.inner.snapshot_tracker).release(id);
     }
 
-    #[cfg(test)]
     fn oldest_active_snapshot_sequence(&self) -> Option<SequenceNumber> {
         mutex_lock(&self.inner.snapshot_tracker).oldest_active()
+    }
+
+    fn active_snapshot_count(&self) -> u64 {
+        mutex_lock(&self.inner.snapshot_tracker).count()
+    }
+
+    fn history_retention_sequences(&self, table_id: TableId) -> Option<u64> {
+        self.tables_read()
+            .values()
+            .find(|table| table.id == table_id)
+            .and_then(|table| table.config.history_retention_sequences)
+    }
+
+    fn history_retention_floor_sequence(&self, table_id: TableId) -> Option<SequenceNumber> {
+        let retained = self.history_retention_sequences(table_id)?;
+        Some(SequenceNumber::new(
+            self.current_sequence()
+                .get()
+                .saturating_sub(retained.saturating_sub(1)),
+        ))
+    }
+
+    fn history_gc_horizon(&self, table_id: TableId) -> Option<SequenceNumber> {
+        let retention_floor = self.history_retention_floor_sequence(table_id)?;
+        Some(
+            self.oldest_active_snapshot_sequence()
+                .map(|snapshot| snapshot.min(retention_floor))
+                .unwrap_or(retention_floor),
+        )
+    }
+
+    fn validate_historical_read(
+        &self,
+        table_id: TableId,
+        requested: SequenceNumber,
+    ) -> Result<(), ReadError> {
+        let Some(oldest_available) = self.history_gc_horizon(table_id) else {
+            return Ok(());
+        };
+        if requested < oldest_available {
+            return Err(SnapshotTooOld {
+                requested,
+                oldest_available,
+            }
+            .into());
+        }
+
+        Ok(())
     }
 
     #[cfg(test)]
@@ -3668,6 +3781,7 @@ impl Table {
         let Some(table_id) = self.resolve_id() else {
             return Ok(None);
         };
+        self.db.validate_historical_read(table_id, sequence)?;
 
         Ok(self.db.read_visible_value(table_id, &key, sequence))
     }
@@ -3682,6 +3796,7 @@ impl Table {
         let Some(table_id) = self.resolve_id() else {
             return Ok(Box::pin(stream::empty()));
         };
+        self.db.validate_historical_read(table_id, sequence)?;
 
         let rows = self.db.scan_visible(
             table_id,
@@ -3704,6 +3819,7 @@ impl Table {
         let Some(table_id) = self.resolve_id() else {
             return Ok(Box::pin(stream::empty()));
         };
+        self.db.validate_historical_read(table_id, sequence)?;
 
         let rows = self
             .db
@@ -3918,10 +4034,10 @@ mod tests {
     use crate::{
         CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
         FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
-        FileSystemOperation, PointMutation, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
-        SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock,
-        StubObjectStore, StubRng, TableConfig, TableFormat, TableId, TieredDurabilityMode,
-        TieredStorageConfig, Value,
+        FileSystemOperation, PointMutation, ReadError, Rng, S3Location, S3PrimaryStorageConfig,
+        ScanOptions, SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StorageError,
+        StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TableId,
+        TieredDurabilityMode, TieredStorageConfig, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -3985,6 +4101,7 @@ mod tests {
             merge_operator: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(10),
+            history_retention_sequences: None,
             compaction_strategy,
             schema: None,
             metadata: BTreeMap::from([
@@ -3994,6 +4111,12 @@ mod tests {
         }
     }
 
+    fn row_table_config_with_history_retention(name: &str, retained_sequences: u64) -> TableConfig {
+        let mut config = row_table_config(name);
+        config.history_retention_sequences = Some(retained_sequences);
+        config
+    }
+
     fn columnar_table_config(name: &str) -> TableConfig {
         TableConfig {
             name: name.to_string(),
@@ -4001,6 +4124,7 @@ mod tests {
             merge_operator: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(6),
+            history_retention_sequences: Some(30),
             compaction_strategy: CompactionStrategy::Tiered,
             schema: Some(SchemaDefinition {
                 version: 3,
@@ -4036,6 +4160,10 @@ mod tests {
             expected.bloom_filter_bits_per_key
         );
         assert_eq!(
+            table.config.history_retention_sequences,
+            expected.history_retention_sequences
+        );
+        assert_eq!(
             table.config.compaction_strategy,
             expected.compaction_strategy
         );
@@ -4047,6 +4175,18 @@ mod tests {
 
     async fn collect_rows(stream: crate::KvStream) -> Vec<(crate::Key, Value)> {
         stream.collect::<Vec<_>>().await
+    }
+
+    fn assert_snapshot_too_old(
+        error: ReadError,
+        requested: SequenceNumber,
+        oldest_available: SequenceNumber,
+    ) {
+        let snapshot_too_old = error
+            .snapshot_too_old()
+            .expect("expected SnapshotTooOld read error");
+        assert_eq!(snapshot_too_old.requested, requested);
+        assert_eq!(snapshot_too_old.oldest_available, oldest_available);
     }
 
     fn oracle_rows(
@@ -6256,6 +6396,319 @@ mod tests {
         second.release();
         assert_eq!(db.oldest_active_snapshot_sequence(), None);
         assert_eq!(db.snapshot_gc_horizon(), db.current_sequence());
+    }
+
+    #[tokio::test]
+    async fn historical_reads_past_history_retention_return_snapshot_too_old() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/history-retention"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config_with_history_retention("events", 2))
+            .await
+            .expect("create table");
+
+        let first = table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write first value");
+        let oldest_available = table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second value");
+        let latest = table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write third value");
+
+        assert_snapshot_too_old(
+            table
+                .read_at(b"apple".to_vec(), first)
+                .await
+                .expect_err("historical read should be too old"),
+            first,
+            oldest_available,
+        );
+        let historical_scan = table
+            .scan_at(b"a".to_vec(), b"z".to_vec(), first, ScanOptions::default())
+            .await;
+        let historical_scan_error = match historical_scan {
+            Ok(_) => panic!("historical scan should be too old"),
+            Err(error) => error,
+        };
+        assert_snapshot_too_old(historical_scan_error, first, oldest_available);
+
+        assert_eq!(
+            table
+                .read_at(b"apple".to_vec(), oldest_available)
+                .await
+                .expect("retained historical read"),
+            Some(Value::bytes("v2"))
+        );
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan_at(b"a".to_vec(), b"z".to_vec(), latest, ScanOptions::default(),)
+                    .await
+                    .expect("retained historical scan"),
+            )
+            .await,
+            vec![
+                (b"apple".to_vec(), Value::bytes("v2")),
+                (b"banana".to_vec(), Value::bytes("yellow")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn table_stats_report_history_horizon_and_snapshot_pinning() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/history-retention-stats"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config_with_history_retention("events", 2))
+            .await
+            .expect("create table");
+
+        let oldest_snapshot = table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write first value");
+        let snapshot = db.snapshot().await;
+        assert_eq!(snapshot.sequence(), oldest_snapshot);
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second value");
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write third value");
+
+        let pinned = db.table_stats(&table).await;
+        assert_eq!(
+            pinned.history_retention_floor_sequence,
+            Some(SequenceNumber::new(2))
+        );
+        assert_eq!(pinned.history_gc_horizon_sequence, Some(oldest_snapshot));
+        assert_eq!(
+            pinned.oldest_active_snapshot_sequence,
+            Some(oldest_snapshot)
+        );
+        assert_eq!(pinned.active_snapshot_count, 1);
+        assert!(pinned.history_pinned_by_snapshots);
+
+        snapshot.release();
+
+        let unpinned = db.table_stats(&table).await;
+        assert_eq!(
+            unpinned.history_retention_floor_sequence,
+            Some(SequenceNumber::new(2))
+        );
+        assert_eq!(
+            unpinned.history_gc_horizon_sequence,
+            Some(SequenceNumber::new(2))
+        );
+        assert_eq!(unpinned.oldest_active_snapshot_sequence, None);
+        assert_eq!(unpinned.active_snapshot_count, 0);
+        assert!(!unpinned.history_pinned_by_snapshots);
+    }
+
+    #[tokio::test]
+    async fn compaction_reclaims_versions_older_than_retained_horizon() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/history-retention-compaction"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config_with_history_retention("events", 2))
+            .await
+            .expect("create table");
+        let mut oracle = ShadowOracle::default();
+
+        let first = table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write first value");
+        oracle.apply(
+            first,
+            PointMutation::Put {
+                key: b"apple".to_vec(),
+                value: b"v1".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush first version");
+
+        let oldest_available = table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second value");
+        oracle.apply(
+            oldest_available,
+            PointMutation::Put {
+                key: b"apple".to_vec(),
+                value: b"v2".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush second version");
+
+        let latest = table
+            .write(b"apple".to_vec(), Value::bytes("v3"))
+            .await
+            .expect("write third value");
+        oracle.apply(
+            latest,
+            PointMutation::Put {
+                key: b"apple".to_vec(),
+                value: b"v3".to_vec(),
+            },
+            true,
+        );
+        db.flush().await.expect("flush third version");
+
+        for raw in oldest_available.get()..=latest.get() {
+            let sequence = SequenceNumber::new(raw);
+            assert_eq!(
+                table
+                    .read_at(b"apple".to_vec(), sequence)
+                    .await
+                    .expect("retained pre-compaction read"),
+                oracle.value_at(b"apple", sequence).map(Value::bytes)
+            );
+        }
+
+        assert!(db.run_next_compaction().await.expect("run compaction"));
+
+        let retained_sequences = {
+            let sstables = db.sstables_read();
+            assert_eq!(sstables.live.len(), 1);
+            sstables.live[0]
+                .rows
+                .iter()
+                .filter(|row| row.key == b"apple".to_vec())
+                .map(|row| row.sequence)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            retained_sequences,
+            vec![SequenceNumber::new(3), SequenceNumber::new(2)]
+        );
+
+        for raw in oldest_available.get()..=latest.get() {
+            let sequence = SequenceNumber::new(raw);
+            assert_eq!(
+                table
+                    .read_at(b"apple".to_vec(), sequence)
+                    .await
+                    .expect("retained post-compaction read"),
+                oracle.value_at(b"apple", sequence).map(Value::bytes)
+            );
+        }
+        assert_snapshot_too_old(
+            table
+                .read_at(b"apple".to_vec(), first)
+                .await
+                .expect_err("gc'd read should be too old"),
+            first,
+            oldest_available,
+        );
+    }
+
+    #[tokio::test]
+    async fn active_snapshots_protect_compaction_history_until_release() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/snapshot-pinned-history"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config_with_history_retention("events", 1))
+            .await
+            .expect("create table");
+
+        let first = table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write first value");
+        db.flush().await.expect("flush first value");
+        let snapshot = db.snapshot().await;
+        assert_eq!(snapshot.sequence(), first);
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second value");
+        db.flush().await.expect("flush second value");
+        let latest = table
+            .write(b"apple".to_vec(), Value::bytes("v3"))
+            .await
+            .expect("write third value");
+        db.flush().await.expect("flush third value");
+
+        assert!(db.run_next_compaction().await.expect("run compaction"));
+
+        let retained_sequences = {
+            let sstables = db.sstables_read();
+            assert_eq!(sstables.live.len(), 1);
+            sstables.live[0]
+                .rows
+                .iter()
+                .filter(|row| row.key == b"apple".to_vec())
+                .map(|row| row.sequence)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            retained_sequences,
+            vec![
+                SequenceNumber::new(3),
+                SequenceNumber::new(2),
+                SequenceNumber::new(1),
+            ]
+        );
+        assert_eq!(
+            snapshot
+                .read(&table, b"apple".to_vec())
+                .await
+                .expect("snapshot should stay readable while pinned"),
+            Some(Value::bytes("v1"))
+        );
+
+        snapshot.release();
+        assert_snapshot_too_old(
+            snapshot
+                .read(&table, b"apple".to_vec())
+                .await
+                .expect_err("released snapshot should become too old"),
+            first,
+            latest,
+        );
+        assert_eq!(
+            table
+                .read_at(b"apple".to_vec(), latest)
+                .await
+                .expect("latest read"),
+            Some(Value::bytes("v3"))
+        );
     }
 
     #[tokio::test]

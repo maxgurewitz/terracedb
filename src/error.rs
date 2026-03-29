@@ -104,8 +104,19 @@ pub enum WriteError {
 pub enum ReadError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    SnapshotTooOld(#[from] SnapshotTooOld),
     #[error("operation not implemented: {0}")]
     Unimplemented(&'static str),
+}
+
+impl ReadError {
+    pub fn snapshot_too_old(&self) -> Option<&SnapshotTooOld> {
+        match self {
+            Self::SnapshotTooOld(error) => Some(error),
+            Self::Storage(_) | Self::Unimplemented(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

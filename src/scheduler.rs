@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde_json::Value as JsonValue;
 
-use crate::api::Table;
+use crate::{api::Table, ids::SequenceNumber};
 
 pub trait Scheduler: Send + Sync {
     fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision>;
@@ -54,6 +54,11 @@ pub struct TableStats {
     pub compaction_debt: u64,
     pub pending_flush_bytes: u64,
     pub immutable_memtable_count: u32,
+    pub history_retention_floor_sequence: Option<SequenceNumber>,
+    pub history_gc_horizon_sequence: Option<SequenceNumber>,
+    pub oldest_active_snapshot_sequence: Option<SequenceNumber>,
+    pub active_snapshot_count: u64,
+    pub history_pinned_by_snapshots: bool,
     pub metadata: std::collections::BTreeMap<String, JsonValue>,
 }
 

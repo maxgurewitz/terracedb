@@ -40,6 +40,7 @@ async fn public_api_surface_compiles_and_is_instantiable() {
             merge_operator: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(10),
+            history_retention_sequences: None,
             compaction_strategy: CompactionStrategy::Leveled,
             schema: None,
             metadata: Default::default(),
@@ -54,6 +55,7 @@ async fn public_api_surface_compiles_and_is_instantiable() {
             merge_operator: None,
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(8),
+            history_retention_sequences: Some(128),
             compaction_strategy: CompactionStrategy::Tiered,
             schema: Some(SchemaDefinition {
                 version: 1,
