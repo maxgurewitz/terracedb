@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
@@ -222,9 +222,21 @@ pub struct ScanOptions {
 #[derive(Debug)]
 pub struct WatermarkReceiver {
     inner: watch::Receiver<SequenceNumber>,
+    subscription: WatermarkSubscription,
 }
 
 impl WatermarkReceiver {
+    fn new(
+        registry: &Arc<WatermarkRegistry>,
+        table_name: &str,
+        inner: watch::Receiver<SequenceNumber>,
+    ) -> Self {
+        Self {
+            inner,
+            subscription: WatermarkSubscription::new(registry, table_name),
+        }
+    }
+
     pub fn current(&self) -> SequenceNumber {
         *self.inner.borrow()
     }
@@ -233,12 +245,18 @@ impl WatermarkReceiver {
         self.inner.changed().await.map_err(|_| SubscriptionClosed)?;
         Ok(*self.inner.borrow_and_update())
     }
+
+    #[cfg(test)]
+    fn has_changed(&self) -> Result<bool, SubscriptionClosed> {
+        self.inner.has_changed().map_err(|_| SubscriptionClosed)
+    }
 }
 
 impl Clone for WatermarkReceiver {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            subscription: self.subscription.clone(),
         }
     }
 }
@@ -291,8 +309,8 @@ struct DbInner {
     snapshot_tracker: Mutex<SnapshotTracker>,
     next_snapshot_id: AtomicU64,
     compaction_filter_stats: Mutex<BTreeMap<TableId, CompactionFilterStats>>,
-    visible_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
-    durable_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
+    visible_watchers: Arc<WatermarkRegistry>,
+    durable_watchers: Arc<WatermarkRegistry>,
     work_deferrals: Mutex<BTreeMap<String, u32>>,
     #[cfg(test)]
     commit_phase_blocks: Mutex<Vec<CommitPhaseBlock>>,
@@ -827,6 +845,231 @@ struct WatermarkAdvance {
     durable_tables: BTreeMap<String, SequenceNumber>,
 }
 
+#[derive(Debug)]
+struct WatermarkSubscription {
+    registry: Weak<WatermarkRegistry>,
+    table_name: String,
+}
+
+impl WatermarkSubscription {
+    fn new(registry: &Arc<WatermarkRegistry>, table_name: &str) -> Self {
+        Self {
+            registry: Arc::downgrade(registry),
+            table_name: table_name.to_string(),
+        }
+    }
+}
+
+impl Clone for WatermarkSubscription {
+    fn clone(&self) -> Self {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.increment(&self.table_name);
+        }
+
+        Self {
+            registry: self.registry.clone(),
+            table_name: self.table_name.clone(),
+        }
+    }
+}
+
+impl Drop for WatermarkSubscription {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.decrement(&self.table_name);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WatermarkTableState {
+    current: SequenceNumber,
+    sender: Option<watch::Sender<SequenceNumber>>,
+    subscribers: usize,
+}
+
+impl WatermarkTableState {
+    fn new(current: SequenceNumber) -> Self {
+        Self {
+            current,
+            sender: None,
+            subscribers: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WatermarkRegistry {
+    tables: Mutex<BTreeMap<String, WatermarkTableState>>,
+    pulse: watch::Sender<u64>,
+}
+
+impl WatermarkRegistry {
+    fn new(initial: BTreeMap<String, SequenceNumber>) -> Self {
+        let (pulse, _receiver) = watch::channel(0);
+        let tables = initial
+            .into_iter()
+            .map(|(table, sequence)| (table, WatermarkTableState::new(sequence)))
+            .collect();
+        Self {
+            tables: Mutex::new(tables),
+            pulse,
+        }
+    }
+
+    fn subscribe(self: &Arc<Self>, table_name: &str) -> WatermarkReceiver {
+        let receiver = {
+            let mut tables = mutex_lock(&self.tables);
+            let state = tables
+                .entry(table_name.to_string())
+                .or_insert_with(|| WatermarkTableState::new(SequenceNumber::default()));
+            state.subscribers += 1;
+            let current = state.current;
+            let sender = state.sender.get_or_insert_with(|| {
+                let (sender, _receiver) = watch::channel(current);
+                sender
+            });
+            sender.subscribe()
+        };
+
+        WatermarkReceiver::new(self, table_name, receiver)
+    }
+
+    fn increment(&self, table_name: &str) {
+        if let Some(state) = mutex_lock(&self.tables).get_mut(table_name) {
+            state.subscribers += 1;
+        }
+    }
+
+    fn decrement(&self, table_name: &str) {
+        if let Some(state) = mutex_lock(&self.tables).get_mut(table_name) {
+            state.subscribers = state.subscribers.saturating_sub(1);
+            if state.subscribers == 0 {
+                state.sender = None;
+            }
+        }
+    }
+
+    fn notify(&self, updates: &BTreeMap<String, SequenceNumber>) {
+        if updates.is_empty() {
+            return;
+        }
+
+        let mut advanced = false;
+        let mut tables = mutex_lock(&self.tables);
+        for (table, sequence) in updates {
+            let state = tables
+                .entry(table.clone())
+                .or_insert_with(|| WatermarkTableState::new(SequenceNumber::default()));
+            if *sequence <= state.current {
+                continue;
+            }
+
+            state.current = *sequence;
+            if let Some(sender) = &state.sender {
+                sender.send_replace(*sequence);
+                advanced = true;
+            }
+        }
+        drop(tables);
+
+        if advanced {
+            let next = (*self.pulse.borrow()).wrapping_add(1);
+            self.pulse.send_replace(next);
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pulse(&self) -> watch::Receiver<u64> {
+        self.pulse.subscribe()
+    }
+
+    #[cfg(test)]
+    fn active_subscriber_count(&self, table_name: &str) -> usize {
+        mutex_lock(&self.tables)
+            .get(table_name)
+            .map(|state| state.subscribers)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WatermarkUpdate {
+    pub(crate) table: String,
+    pub(crate) sequence: SequenceNumber,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+struct NamedWatermarkReceiver {
+    table: String,
+    receiver: WatermarkReceiver,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct WatermarkSubscriptionSet {
+    pulse: watch::Receiver<u64>,
+    receivers: Vec<NamedWatermarkReceiver>,
+    observed: Vec<SequenceNumber>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WatermarkSubscriptionSet {
+    fn new(registry: &Arc<WatermarkRegistry>, receivers: Vec<(String, WatermarkReceiver)>) -> Self {
+        let mut receivers = receivers;
+        receivers.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let observed = receivers
+            .iter()
+            .map(|(_, receiver)| receiver.current())
+            .collect();
+
+        Self {
+            pulse: registry.pulse(),
+            receivers: receivers
+                .into_iter()
+                .map(|(table, receiver)| NamedWatermarkReceiver { table, receiver })
+                .collect(),
+            observed,
+        }
+    }
+
+    pub(crate) fn drain_pending(&mut self) -> Vec<WatermarkUpdate> {
+        let mut pending = Vec::new();
+        for (observed, receiver) in self.observed.iter_mut().zip(self.receivers.iter_mut()) {
+            let current = receiver.receiver.current();
+            if current <= *observed {
+                continue;
+            }
+
+            *observed = current;
+            pending.push(WatermarkUpdate {
+                table: receiver.table.clone(),
+                sequence: current,
+            });
+        }
+
+        if !pending.is_empty() {
+            let _ = *self.pulse.borrow_and_update();
+        }
+
+        pending
+    }
+
+    pub(crate) async fn changed(&mut self) -> Result<Vec<WatermarkUpdate>, SubscriptionClosed> {
+        loop {
+            let pending = self.drain_pending();
+            if !pending.is_empty() {
+                return Ok(pending);
+            }
+
+            self.pulse.changed().await.map_err(|_| SubscriptionClosed)?;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct MemtableEntry {
     user_key: Key,
@@ -1036,6 +1279,15 @@ impl Memtable {
     fn is_empty(&self) -> bool {
         self.tables.values().all(TableMemtable::is_empty)
     }
+
+    fn record_table_watermarks(&self, watermarks: &mut BTreeMap<TableId, SequenceNumber>) {
+        for (&table_id, table) in &self.tables {
+            let Some(sequence) = table.entries.values().map(|entry| entry.sequence).max() else {
+                continue;
+            };
+            update_table_watermark(watermarks, table_id, sequence);
+        }
+    }
 }
 
 impl ResidentRowSstable {
@@ -1148,6 +1400,18 @@ impl SstableState {
             .map(|sstable| sstable.meta.length)
             .sum::<u64>();
         (l0_count, local_bytes, local_bytes)
+    }
+
+    fn table_watermarks(&self) -> BTreeMap<TableId, SequenceNumber> {
+        let mut watermarks = BTreeMap::new();
+        for sstable in &self.live {
+            update_table_watermark(
+                &mut watermarks,
+                sstable.meta.table_id,
+                sstable.meta.max_sequence,
+            );
+        }
+        watermarks
     }
 }
 
@@ -1302,6 +1566,26 @@ impl MemtableState {
             .filter(|immutable| immutable.memtable.has_entries_for_table(table_id))
             .count() as u32
     }
+
+    fn table_watermarks(&self) -> BTreeMap<TableId, SequenceNumber> {
+        let mut watermarks = BTreeMap::new();
+        self.mutable.record_table_watermarks(&mut watermarks);
+        for immutable in &self.immutables {
+            immutable.memtable.record_table_watermarks(&mut watermarks);
+        }
+        watermarks
+    }
+}
+
+fn update_table_watermark(
+    watermarks: &mut BTreeMap<TableId, SequenceNumber>,
+    table_id: TableId,
+    sequence: SequenceNumber,
+) {
+    watermarks
+        .entry(table_id)
+        .and_modify(|current| *current = (*current).max(sequence))
+        .or_insert(sequence);
 }
 
 #[derive(Clone, Debug)]
@@ -1503,6 +1787,14 @@ impl Db {
             .unwrap_or(0)
             .saturating_add(1)
             .max(1);
+        let memtables = recovered_commit_log.memtables;
+        let sstables = SstableState {
+            manifest_generation: loaded_manifest.generation,
+            last_flushed_sequence: loaded_manifest.last_flushed_sequence,
+            live: loaded_manifest.live_sstables,
+        };
+        let initial_table_watermarks =
+            Self::initial_table_watermarks(&tables, &memtables, &sstables);
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -1520,18 +1812,16 @@ impl Db {
                 current_sequence: AtomicU64::new(recovered_sequence.get()),
                 current_durable_sequence: AtomicU64::new(recovered_sequence.get()),
                 tables: RwLock::new(tables),
-                memtables: RwLock::new(recovered_commit_log.memtables),
-                sstables: RwLock::new(SstableState {
-                    manifest_generation: loaded_manifest.generation,
-                    last_flushed_sequence: loaded_manifest.last_flushed_sequence,
-                    live: loaded_manifest.live_sstables,
-                }),
+                memtables: RwLock::new(memtables),
+                sstables: RwLock::new(sstables),
                 next_sstable_id: AtomicU64::new(next_sstable_id),
                 snapshot_tracker: Mutex::new(SnapshotTracker::default()),
                 next_snapshot_id: AtomicU64::new(0),
                 compaction_filter_stats: Mutex::new(BTreeMap::new()),
-                visible_watchers: Mutex::new(BTreeMap::new()),
-                durable_watchers: Mutex::new(BTreeMap::new()),
+                visible_watchers: Arc::new(WatermarkRegistry::new(
+                    initial_table_watermarks.clone(),
+                )),
+                durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
                 work_deferrals: Mutex::new(BTreeMap::new()),
                 #[cfg(test)]
                 commit_phase_blocks: Mutex::new(Vec::new()),
@@ -3513,15 +3803,7 @@ impl Db {
     }
 
     pub fn subscribe(&self, table: &Table) -> WatermarkReceiver {
-        WatermarkReceiver {
-            inner: self
-                .watch_sender(
-                    &self.inner.visible_watchers,
-                    table.name(),
-                    self.current_sequence(),
-                )
-                .subscribe(),
-        }
+        self.inner.visible_watchers.subscribe(table.name())
     }
 
     pub async fn scan_durable_since(
@@ -3535,15 +3817,23 @@ impl Db {
     }
 
     pub fn subscribe_durable(&self, table: &Table) -> WatermarkReceiver {
-        WatermarkReceiver {
-            inner: self
-                .watch_sender(
-                    &self.inner.durable_watchers,
-                    table.name(),
-                    self.current_durable_sequence(),
-                )
-                .subscribe(),
-        }
+        self.inner.durable_watchers.subscribe(table.name())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn subscribe_visible_set<'a, I>(&self, tables: I) -> WatermarkSubscriptionSet
+    where
+        I: IntoIterator<Item = &'a Table>,
+    {
+        Self::subscribe_set(&self.inner.visible_watchers, tables)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn subscribe_durable_set<'a, I>(&self, tables: I) -> WatermarkSubscriptionSet
+    where
+        I: IntoIterator<Item = &'a Table>,
+    {
+        Self::subscribe_set(&self.inner.durable_watchers, tables)
     }
 
     pub async fn table_stats(&self, table: &Table) -> TableStats {
@@ -4078,15 +4368,10 @@ impl Db {
 
     fn notify_table_sequences(
         &self,
-        watchers: &Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
+        watchers: &Arc<WatermarkRegistry>,
         updates: &BTreeMap<String, SequenceNumber>,
     ) {
-        let watchers = mutex_lock(watchers);
-        for (table, sequence) in updates {
-            if let Some(sender) = watchers.get(table) {
-                sender.send_replace(*sequence);
-            }
-        }
+        watchers.notify(updates);
     }
 
     fn durable_on_commit(&self) -> bool {
@@ -4605,20 +4890,56 @@ impl Db {
             .unwrap_or_else(|| self.current_sequence())
     }
 
-    fn watch_sender(
-        &self,
-        watchers: &Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
-        table_name: &str,
-        current: SequenceNumber,
-    ) -> watch::Sender<SequenceNumber> {
-        let mut watchers = mutex_lock(watchers);
-        watchers
-            .entry(table_name.to_string())
-            .or_insert_with(|| {
-                let (sender, _receiver) = watch::channel(current);
-                sender
+    #[cfg(test)]
+    fn visible_subscriber_count(&self, table: &Table) -> usize {
+        self.inner
+            .visible_watchers
+            .active_subscriber_count(table.name())
+    }
+
+    #[cfg(test)]
+    fn durable_subscriber_count(&self, table: &Table) -> usize {
+        self.inner
+            .durable_watchers
+            .active_subscriber_count(table.name())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn subscribe_set<'a, I>(
+        registry: &Arc<WatermarkRegistry>,
+        tables: I,
+    ) -> WatermarkSubscriptionSet
+    where
+        I: IntoIterator<Item = &'a Table>,
+    {
+        WatermarkSubscriptionSet::new(
+            registry,
+            tables
+                .into_iter()
+                .map(|table| (table.name().to_string(), registry.subscribe(table.name())))
+                .collect(),
+        )
+    }
+
+    fn initial_table_watermarks(
+        tables: &BTreeMap<String, StoredTable>,
+        memtables: &MemtableState,
+        sstables: &SstableState,
+    ) -> BTreeMap<String, SequenceNumber> {
+        let mut by_id = sstables.table_watermarks();
+        for (table_id, sequence) in memtables.table_watermarks() {
+            update_table_watermark(&mut by_id, table_id, sequence);
+        }
+
+        tables
+            .iter()
+            .filter_map(|(name, table)| {
+                by_id
+                    .get(&table.id)
+                    .copied()
+                    .map(|sequence| (name.clone(), sequence))
             })
-            .clone()
+            .collect()
     }
 
     fn tables_read(&self) -> RwLockReadGuard<'_, BTreeMap<String, StoredTable>> {
@@ -4977,7 +5298,8 @@ mod tests {
         CommitPhase, CompactionJobKind, CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH,
         LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
         LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, PersistedRowSstableFile,
-        SchemaDefinition, StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
+        SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key, encode_mvcc_key,
+        read_path,
     };
     use crate::{
         ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
@@ -9426,6 +9748,253 @@ mod tests {
                 .expect("historical read after reopen"),
             Some(bytes("seed|A"))
         );
+    }
+
+    #[tokio::test]
+    async fn subscriptions_start_from_per_table_watermarks_not_global_prefix() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/subscription-table-watermarks"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let users = db
+            .create_table(row_table_config("users"))
+            .await
+            .expect("create users table");
+        let orders = db
+            .create_table(row_table_config("orders"))
+            .await
+            .expect("create orders table");
+
+        let committed = users
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write users row");
+
+        assert_eq!(db.current_sequence(), committed);
+        assert_eq!(db.subscribe(&users).current(), committed);
+        assert_eq!(db.subscribe_durable(&users).current(), committed);
+        assert_eq!(db.subscribe(&orders).current(), SequenceNumber::new(0));
+        assert_eq!(
+            db.subscribe_durable(&orders).current(),
+            SequenceNumber::new(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn cloned_subscribers_share_notifications_and_drop_cleans_up_registry() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/subscription-drop-cleanup"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let mut first = db.subscribe(&table);
+        assert_eq!(db.visible_subscriber_count(&table), 1);
+        let mut second = first.clone();
+        assert_eq!(db.visible_subscriber_count(&table), 2);
+
+        let first_sequence = table
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("first write");
+        assert_eq!(first.changed().await.expect("first wake"), first_sequence);
+        assert_eq!(second.changed().await.expect("second wake"), first_sequence);
+
+        drop(second);
+        assert_eq!(db.visible_subscriber_count(&table), 1);
+        drop(first);
+        assert_eq!(db.visible_subscriber_count(&table), 0);
+
+        let latest = table
+            .write(b"user:2".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("second write");
+        assert_eq!(db.subscribe(&table).current(), latest);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_coalesce_multiple_commits_before_receivers_wake() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/subscription-coalescing"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let mut receiver = db.subscribe(&table);
+        let first = table
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write one");
+        let _second = table
+            .write(b"user:2".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write two");
+        let third = table
+            .write(b"user:3".to_vec(), Value::bytes("v3"))
+            .await
+            .expect("write three");
+
+        assert_eq!(first, SequenceNumber::new(1));
+        assert_eq!(receiver.current(), third);
+        assert_eq!(receiver.changed().await.expect("coalesced wake"), third);
+        assert!(
+            !receiver
+                .has_changed()
+                .expect("receiver should still be open after coalesced wake"),
+            "coalescing subscriptions should not queue one wake per commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_and_durable_subscriptions_diverge_until_flush_in_deferred_mode() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config_with_durability(
+                "/subscription-durable-divergence",
+                TieredDurabilityMode::Deferred,
+            ),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let mut visible = db.subscribe(&table);
+        let mut durable = db.subscribe_durable(&table);
+        let mut durable_set = db.subscribe_durable_set([&table]);
+        assert_eq!(db.visible_subscriber_count(&table), 1);
+        assert_eq!(db.durable_subscriber_count(&table), 2);
+
+        let committed = table
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("deferred write");
+
+        assert_eq!(visible.changed().await.expect("visible wake"), committed);
+        assert_eq!(visible.current(), committed);
+        assert_eq!(durable.current(), SequenceNumber::new(0));
+        assert!(
+            !durable
+                .has_changed()
+                .expect("durable receiver should remain open before flush"),
+            "durable subscriptions should not advance before flush"
+        );
+
+        db.flush().await.expect("flush deferred writes");
+        assert_eq!(durable.changed().await.expect("durable wake"), committed);
+        assert_eq!(
+            durable_set.changed().await.expect("durable set wake"),
+            vec![WatermarkUpdate {
+                table: "events".to_string(),
+                sequence: committed,
+            }]
+        );
+
+        drop(visible);
+        drop(durable);
+        assert_eq!(db.visible_subscriber_count(&table), 0);
+        drop(durable_set);
+        assert_eq!(db.durable_subscriber_count(&table), 0);
+    }
+
+    #[tokio::test]
+    async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_order() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/merged-subscription-set"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let users = db
+            .create_table(row_table_config("users"))
+            .await
+            .expect("create users table");
+        let orders = db
+            .create_table(row_table_config("orders"))
+            .await
+            .expect("create orders table");
+
+        let mut merged = db.subscribe_visible_set([&users, &orders]);
+        assert!(merged.drain_pending().is_empty());
+
+        let users_first = users
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write users row");
+        let orders_first = orders
+            .write(b"order:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write orders row");
+        assert_eq!(
+            merged.drain_pending(),
+            vec![
+                WatermarkUpdate {
+                    table: "orders".to_string(),
+                    sequence: orders_first,
+                },
+                WatermarkUpdate {
+                    table: "users".to_string(),
+                    sequence: users_first,
+                },
+            ]
+        );
+        assert!(merged.drain_pending().is_empty());
+
+        let orders_second = orders
+            .write(b"order:2".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second orders row");
+        let _users_second = users
+            .write(b"user:2".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write second users row");
+        let users_third = users
+            .write(b"user:3".to_vec(), Value::bytes("v3"))
+            .await
+            .expect("write third users row");
+
+        let updates = tokio::time::timeout(Duration::from_millis(50), merged.changed())
+            .await
+            .expect("merged receiver should drain pending work without blocking")
+            .expect("merged receiver should stay open");
+        assert_eq!(
+            updates,
+            vec![
+                WatermarkUpdate {
+                    table: "orders".to_string(),
+                    sequence: orders_second,
+                },
+                WatermarkUpdate {
+                    table: "users".to_string(),
+                    sequence: users_third,
+                },
+            ]
+        );
+        assert!(merged.drain_pending().is_empty());
     }
 
     #[tokio::test]

@@ -2,14 +2,15 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use futures::StreamExt;
 use terracedb::{
-    CommitOptions, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig, DbGeneratedScenario,
-    DbMutation, DbOracleChange, DbShadowOracle, DbSimulationScenarioConfig, DbWorkloadOperation,
-    LogCursor, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation, OperationResult,
-    PendingWork, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location, ScanOptions,
-    ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
+    Clock, CommitOptions, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
+    DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle, DbSimulationScenarioConfig,
+    DbWorkloadOperation, LogCursor, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation,
+    OperationResult, PendingWork, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location,
+    ScanOptions, ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
     SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
     SimulationScenarioConfig, SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind,
     StorageSource, StubDbProcess, TableStats, ThrottleDecision, TieredDurabilityMode,
@@ -1188,6 +1189,58 @@ fn remote_list_failures_are_structured_in_simulation() -> turmoil::Result {
 
         let listed = storage.list_objects(manifest_prefix).await?;
         assert_eq!(listed, vec!["backup/manifest/MANIFEST-000001".to_string()]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn visible_subscription_simulation_catches_up_after_coalesced_wakes() -> turmoil::Result {
+    SeededSimulationRunner::new(0x1818).run_with(|context| async move {
+        let db = context
+            .open_db(simulation_db_config(
+                "/terracedb/sim/t18-visible-subscription",
+                Arc::new(RandomSimulationScheduler::seeded(context.seed())),
+                1024 * 1024,
+            ))
+            .await?;
+        let table = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        let mut receiver = db.subscribe(&table);
+        let first = table.write(b"k-1".to_vec(), Value::bytes("v-1")).await?;
+        let second = table.write(b"k-2".to_vec(), Value::bytes("v-2")).await?;
+
+        let mut processed = receiver.current();
+        assert_eq!(processed, second);
+        assert!(processed >= first);
+
+        let writer_table = table.clone();
+        let clock = context.clock();
+        let writer = tokio::spawn(async move {
+            clock.sleep(Duration::from_millis(1)).await;
+            let third = writer_table
+                .write(b"k-3".to_vec(), Value::bytes("v-3"))
+                .await
+                .expect("write third row");
+            clock.sleep(Duration::from_millis(1)).await;
+            let fourth = writer_table
+                .write(b"k-4".to_vec(), Value::bytes("v-4"))
+                .await
+                .expect("write fourth row");
+            (third, fourth)
+        });
+
+        processed = processed.max(receiver.changed().await.expect("subscription wake"));
+        let (third, fourth) = writer.await.expect("join writer");
+        assert!(fourth >= third);
+        while processed < fourth {
+            processed = processed.max(receiver.changed().await.expect("catch-up wake"));
+        }
+
+        assert_eq!(processed, fourth);
+        assert_eq!(receiver.current(), fourth);
 
         Ok(())
     })
