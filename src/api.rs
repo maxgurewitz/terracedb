@@ -12,6 +12,9 @@ use std::{
 
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::{
@@ -19,6 +22,7 @@ use crate::{
         CompactionStrategy, DbConfig, S3PrimaryStorageConfig, StorageConfig, TableConfig,
         TableFormat, TableMetadata, TieredDurabilityMode, TieredStorageConfig,
     },
+    engine::commit_log::{CommitEntry, CommitRecord, SegmentManager, SegmentOptions},
     error::{
         CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
         StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
@@ -234,6 +238,7 @@ const CATALOG_FORMAT_VERSION: u32 = 1;
 const CATALOG_READ_CHUNK_LEN: usize = 8 * 1024;
 const LOCAL_CATALOG_RELATIVE_PATH: &str = "catalog/CATALOG.json";
 const LOCAL_CATALOG_TEMP_SUFFIX: &str = ".tmp";
+const LOCAL_COMMIT_LOG_RELATIVE_DIR: &str = "commitlog";
 const OBJECT_CATALOG_RELATIVE_KEY: &str = "catalog/CATALOG.json";
 const MVCC_KEY_SEPARATOR: u8 = 0;
 
@@ -248,6 +253,8 @@ struct DbInner {
     catalog_location: CatalogLocation,
     catalog_write_lock: AsyncMutex<()>,
     commit_lock: AsyncMutex<()>,
+    commit_runtime: AsyncMutex<CommitRuntime>,
+    commit_coordinator: Mutex<CommitCoordinator>,
     next_table_id: AtomicU32,
     next_sequence: AtomicU64,
     current_sequence: AtomicU64,
@@ -258,6 +265,8 @@ struct DbInner {
     next_snapshot_id: AtomicU64,
     visible_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
     durable_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
+    #[cfg(test)]
+    commit_phase_blocks: Mutex<Vec<CommitPhaseBlock>>,
 }
 
 #[derive(Clone)]
@@ -301,6 +310,155 @@ struct ResolvedBatchOperation {
     key: Key,
     kind: ChangeKind,
     value: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedReadSetEntry {
+    table_id: TableId,
+    key: Key,
+    at_sequence: SequenceNumber,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CommitConflictKey {
+    table_id: TableId,
+    key: Key,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitPhase {
+    BeforeDurabilitySync,
+    AfterDurabilitySync,
+    BeforeMemtableInsert,
+    AfterMemtableInsert,
+    AfterVisibilityPublish,
+    AfterDurablePublish,
+}
+
+#[cfg(test)]
+struct CommitPhaseBlock {
+    phase: CommitPhase,
+    sequence_tx: Option<oneshot::Sender<SequenceNumber>>,
+    release_rx: Option<oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+struct CommitPhaseBlocker {
+    sequence_rx: Option<oneshot::Receiver<SequenceNumber>>,
+    release_tx: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl CommitPhaseBlocker {
+    async fn sequence(&mut self) -> SequenceNumber {
+        self.sequence_rx
+            .take()
+            .expect("commit phase blocker sequence receiver should be available")
+            .await
+            .expect("commit phase blocker should observe a sequence")
+    }
+
+    fn release(&mut self) {
+        if let Some(release_tx) = self.release_tx.take() {
+            let _ = release_tx.send(());
+        }
+    }
+}
+
+struct CommitRuntime {
+    backend: CommitLogBackend,
+}
+
+enum CommitLogBackend {
+    Local(Box<SegmentManager>),
+    Memory(MemoryCommitLog),
+}
+
+#[derive(Default)]
+struct MemoryCommitLog {
+    records: Vec<CommitRecord>,
+}
+
+impl CommitRuntime {
+    async fn append(&mut self, record: CommitRecord) -> Result<(), StorageError> {
+        match &mut self.backend {
+            CommitLogBackend::Local(manager) => {
+                manager.append(record).await?;
+            }
+            CommitLogBackend::Memory(log) => {
+                log.records.push(record);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> Result<(), StorageError> {
+        match &mut self.backend {
+            CommitLogBackend::Local(manager) => manager.sync_active().await,
+            CommitLogBackend::Memory(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CommitCoordinator {
+    keys: BTreeMap<CommitConflictKey, BTreeSet<SequenceNumber>>,
+    sequences: BTreeMap<SequenceNumber, SequenceCommitState>,
+    current_batch: Option<Arc<GroupCommitBatch>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SequenceCommitState {
+    touched_tables: BTreeSet<String>,
+    memtable_inserted: bool,
+    durable_confirmed: bool,
+    visible_published: bool,
+    durable_published: bool,
+    aborted: bool,
+}
+
+struct GroupCommitBatch {
+    state: Mutex<GroupCommitBatchState>,
+    notify: Notify,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GroupCommitBatchState {
+    sealed: bool,
+    result: Option<Result<(), StorageError>>,
+}
+
+impl GroupCommitBatch {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GroupCommitBatchState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        !mutex_lock(&self.state).sealed
+    }
+
+    fn result(&self) -> Option<Result<(), StorageError>> {
+        mutex_lock(&self.state).result.clone()
+    }
+}
+
+struct CommitParticipant {
+    sequence: SequenceNumber,
+    operations: Vec<ResolvedBatchOperation>,
+    conflict_keys: Vec<CommitConflictKey>,
+    group_batch: Option<Arc<GroupCommitBatch>>,
+}
+
+#[derive(Default)]
+struct WatermarkAdvance {
+    visible_sequence: Option<SequenceNumber>,
+    visible_tables: BTreeMap<String, SequenceNumber>,
+    durable_sequence: Option<SequenceNumber>,
+    durable_tables: BTreeMap<String, SequenceNumber>,
 }
 
 #[derive(Clone, Debug)]
@@ -727,6 +885,7 @@ impl Db {
         Self::validate_storage_config(&config.storage)?;
         let catalog_location = Self::catalog_location(&config.storage);
         let (tables, next_table_id) = Self::load_tables(&dependencies, &catalog_location).await?;
+        let commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -735,6 +894,8 @@ impl Db {
                 catalog_location,
                 catalog_write_lock: AsyncMutex::new(()),
                 commit_lock: AsyncMutex::new(()),
+                commit_runtime: AsyncMutex::new(commit_runtime),
+                commit_coordinator: Mutex::new(CommitCoordinator::default()),
                 next_table_id: AtomicU32::new(next_table_id),
                 next_sequence: AtomicU64::new(0),
                 current_sequence: AtomicU64::new(0),
@@ -745,6 +906,8 @@ impl Db {
                 next_snapshot_id: AtomicU64::new(0),
                 visible_watchers: Mutex::new(BTreeMap::new()),
                 durable_watchers: Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                commit_phase_blocks: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -822,6 +985,28 @@ impl Db {
                 key: Self::join_object_key(&config.s3.prefix, OBJECT_CATALOG_RELATIVE_KEY),
             },
         }
+    }
+
+    async fn open_commit_runtime(
+        storage: &StorageConfig,
+        dependencies: &DbDependencies,
+    ) -> Result<CommitRuntime, OpenError> {
+        let backend = match storage {
+            StorageConfig::Tiered(config) => {
+                let dir = Self::join_fs_path(&config.ssd.path, LOCAL_COMMIT_LOG_RELATIVE_DIR);
+                CommitLogBackend::Local(Box::new(
+                    SegmentManager::open(
+                        dependencies.file_system.clone(),
+                        dir,
+                        SegmentOptions::default(),
+                    )
+                    .await?,
+                ))
+            }
+            StorageConfig::S3Primary(_) => CommitLogBackend::Memory(MemoryCommitLog::default()),
+        };
+
+        Ok(CommitRuntime { backend })
     }
 
     async fn load_tables(
@@ -1095,47 +1280,82 @@ impl Db {
     pub async fn commit(
         &self,
         batch: WriteBatch,
-        _opts: CommitOptions,
+        opts: CommitOptions,
     ) -> Result<SequenceNumber, CommitError> {
         if batch.is_empty() {
             return Err(CommitError::EmptyBatch);
         }
 
-        let _commit_guard = self.inner.commit_lock.lock().await;
-        let sequence =
-            SequenceNumber::new(self.inner.next_sequence.fetch_add(1, Ordering::SeqCst) + 1);
         let resolved_operations = self.resolve_batch_operations(batch.operations())?;
-        self.memtables_write().apply(sequence, &resolved_operations);
+        let resolved_read_set = self.resolve_read_set_entries(opts.read_set.as_ref())?;
 
-        self.inner
-            .current_sequence
-            .store(sequence.get(), Ordering::SeqCst);
+        let participant = {
+            let _commit_guard = self.inner.commit_lock.lock().await;
+            self.check_read_conflicts(&resolved_read_set)?;
 
-        let touched_tables: BTreeSet<String> = resolved_operations
-            .iter()
-            .map(|operation| operation.table_name.clone())
-            .collect();
-
-        self.notify_watchers(&self.inner.visible_watchers, &touched_tables, sequence);
-
-        if self.durable_on_commit() {
+            let sequence = SequenceNumber::new(self.inner.next_sequence.load(Ordering::SeqCst) + 1);
+            let record = Self::build_commit_record(sequence, &resolved_operations)?;
             self.inner
-                .current_durable_sequence
+                .commit_runtime
+                .lock()
+                .await
+                .append(record)
+                .await
+                .map_err(CommitError::Storage)?;
+            self.inner
+                .next_sequence
                 .store(sequence.get(), Ordering::SeqCst);
-            self.notify_watchers(&self.inner.durable_watchers, &touched_tables, sequence);
+
+            self.register_commit(sequence, resolved_operations.clone())
+        };
+
+        if let Some(batch) = participant.group_batch.clone() {
+            if let Err(error) = self.await_group_commit(batch, participant.sequence).await {
+                self.abort_commit(&participant);
+                self.publish_watermarks();
+                return Err(error);
+            }
+
+            self.mark_durable_confirmed(participant.sequence);
+            self.maybe_pause_commit_phase(CommitPhase::AfterDurabilitySync, participant.sequence)
+                .await;
         }
 
-        Ok(sequence)
+        self.maybe_pause_commit_phase(CommitPhase::BeforeMemtableInsert, participant.sequence)
+            .await;
+        self.memtables_write()
+            .apply(participant.sequence, &participant.operations);
+        self.mark_memtable_inserted(participant.sequence);
+        self.maybe_pause_commit_phase(CommitPhase::AfterMemtableInsert, participant.sequence)
+            .await;
+
+        self.publish_watermarks();
+
+        if self.current_sequence() >= participant.sequence {
+            self.maybe_pause_commit_phase(
+                CommitPhase::AfterVisibilityPublish,
+                participant.sequence,
+            )
+            .await;
+        }
+        if self.current_durable_sequence() >= participant.sequence {
+            self.maybe_pause_commit_phase(CommitPhase::AfterDurablePublish, participant.sequence)
+                .await;
+        }
+
+        Ok(participant.sequence)
     }
 
     pub async fn flush(&self) -> Result<(), FlushError> {
-        let durable = self.current_sequence();
         self.inner
-            .current_durable_sequence
-            .store(durable.get(), Ordering::SeqCst);
-
-        let tables: BTreeSet<String> = self.tables_read().keys().cloned().collect();
-        self.notify_watchers(&self.inner.durable_watchers, &tables, durable);
+            .commit_runtime
+            .lock()
+            .await
+            .sync()
+            .await
+            .map_err(FlushError::Storage)?;
+        self.mark_all_commits_durable();
+        self.publish_watermarks();
 
         Ok(())
     }
@@ -1211,6 +1431,328 @@ impl Db {
         Vec::new()
     }
 
+    fn resolve_read_set_entries(
+        &self,
+        read_set: Option<&ReadSet>,
+    ) -> Result<Vec<ResolvedReadSetEntry>, CommitError> {
+        read_set
+            .into_iter()
+            .flat_map(ReadSet::entries)
+            .map(|entry| {
+                let table_id = self.resolve_table_id(&entry.table).ok_or_else(|| {
+                    CommitError::Storage(StorageError::not_found(format!(
+                        "table does not exist: {}",
+                        entry.table.name()
+                    )))
+                })?;
+                Ok(ResolvedReadSetEntry {
+                    table_id,
+                    key: entry.key.clone(),
+                    at_sequence: entry.at_sequence,
+                })
+            })
+            .collect()
+    }
+
+    fn check_read_conflicts(&self, read_set: &[ResolvedReadSetEntry]) -> Result<(), CommitError> {
+        let coordinator = mutex_lock(&self.inner.commit_coordinator);
+        for entry in read_set {
+            let conflict_key = CommitConflictKey {
+                table_id: entry.table_id,
+                key: entry.key.clone(),
+            };
+            let changed = coordinator
+                .keys
+                .get(&conflict_key)
+                .and_then(|sequences| sequences.iter().next_back().copied())
+                .is_some_and(|sequence| sequence > entry.at_sequence);
+            if changed {
+                return Err(CommitError::Conflict);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_commit_record(
+        sequence: SequenceNumber,
+        operations: &[ResolvedBatchOperation],
+    ) -> Result<CommitRecord, CommitError> {
+        let entries = operations
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| {
+                let op_index = u16::try_from(index).map_err(|_| {
+                    CommitError::Storage(StorageError::unsupported(
+                        "write batch contains more than 65535 operations",
+                    ))
+                })?;
+                Ok(CommitEntry {
+                    op_index,
+                    table_id: operation.table_id,
+                    kind: operation.kind,
+                    key: operation.key.clone(),
+                    value: operation.value.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, CommitError>>()?;
+
+        Ok(CommitRecord {
+            id: CommitId::new(sequence),
+            entries,
+        })
+    }
+
+    fn register_commit(
+        &self,
+        sequence: SequenceNumber,
+        operations: Vec<ResolvedBatchOperation>,
+    ) -> CommitParticipant {
+        let touched_tables = operations
+            .iter()
+            .map(|operation| operation.table_name.clone())
+            .collect::<BTreeSet<_>>();
+        let conflict_keys = operations
+            .iter()
+            .map(|operation| CommitConflictKey {
+                table_id: operation.table_id,
+                key: operation.key.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let group_batch = {
+            let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
+            for key in &conflict_keys {
+                coordinator
+                    .keys
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(sequence);
+            }
+            coordinator.sequences.insert(
+                sequence,
+                SequenceCommitState {
+                    touched_tables: touched_tables.clone(),
+                    ..SequenceCommitState::default()
+                },
+            );
+
+            if self.durable_on_commit() {
+                let batch = match coordinator.current_batch.as_ref() {
+                    Some(batch) if batch.is_open() => batch.clone(),
+                    _ => {
+                        let batch = Arc::new(GroupCommitBatch::new());
+                        coordinator.current_batch = Some(batch.clone());
+                        batch
+                    }
+                };
+                Some(batch)
+            } else {
+                None
+            }
+        };
+
+        CommitParticipant {
+            sequence,
+            operations,
+            conflict_keys,
+            group_batch,
+        }
+    }
+
+    fn mark_memtable_inserted(&self, sequence: SequenceNumber) {
+        if let Some(state) = mutex_lock(&self.inner.commit_coordinator)
+            .sequences
+            .get_mut(&sequence)
+        {
+            state.memtable_inserted = true;
+        }
+    }
+
+    fn mark_durable_confirmed(&self, sequence: SequenceNumber) {
+        if let Some(state) = mutex_lock(&self.inner.commit_coordinator)
+            .sequences
+            .get_mut(&sequence)
+        {
+            state.durable_confirmed = true;
+        }
+    }
+
+    fn mark_all_commits_durable(&self) {
+        let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
+        for state in coordinator.sequences.values_mut() {
+            if !state.aborted {
+                state.durable_confirmed = true;
+            }
+        }
+    }
+
+    fn abort_commit(&self, participant: &CommitParticipant) {
+        let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
+        for key in &participant.conflict_keys {
+            let remove_key = if let Some(sequences) = coordinator.keys.get_mut(key) {
+                sequences.remove(&participant.sequence);
+                sequences.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                coordinator.keys.remove(key);
+            }
+        }
+
+        if let Some(state) = coordinator.sequences.get_mut(&participant.sequence) {
+            state.aborted = true;
+        }
+    }
+
+    async fn await_group_commit(
+        &self,
+        batch: Arc<GroupCommitBatch>,
+        sequence: SequenceNumber,
+    ) -> Result<(), CommitError> {
+        loop {
+            let notified = batch.notify.notified();
+            if let Some(result) = batch.result() {
+                return result.map_err(CommitError::Storage);
+            }
+
+            self.maybe_pause_commit_phase(CommitPhase::BeforeDurabilitySync, sequence)
+                .await;
+
+            let should_lead = {
+                let mut state = mutex_lock(&batch.state);
+                if state.result.is_some() {
+                    false
+                } else if !state.sealed {
+                    state.sealed = true;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if should_lead {
+                let result = self.inner.commit_runtime.lock().await.sync().await;
+                let notify_result = result.clone();
+                {
+                    let mut state = mutex_lock(&batch.state);
+                    state.result = Some(notify_result);
+                }
+                batch.notify.notify_waiters();
+                return result.map_err(CommitError::Storage);
+            }
+
+            notified.await;
+        }
+    }
+
+    fn publish_watermarks(&self) {
+        let advance = {
+            let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
+            let mut advance = WatermarkAdvance::default();
+            let mut visible = self.current_sequence();
+            let mut durable = self.current_durable_sequence();
+
+            loop {
+                let next = SequenceNumber::new(visible.get() + 1);
+                let Some(state) = coordinator.sequences.get_mut(&next) else {
+                    break;
+                };
+
+                if state.aborted {
+                    state.visible_published = true;
+                    visible = next;
+                    continue;
+                }
+                if !state.memtable_inserted {
+                    break;
+                }
+
+                state.visible_published = true;
+                visible = next;
+                advance.visible_sequence = Some(visible);
+                Self::record_table_notifications(
+                    &mut advance.visible_tables,
+                    &state.touched_tables,
+                    visible,
+                );
+            }
+
+            loop {
+                let next = SequenceNumber::new(durable.get() + 1);
+                if next > visible {
+                    break;
+                }
+
+                let Some(state) = coordinator.sequences.get_mut(&next) else {
+                    break;
+                };
+
+                if state.aborted {
+                    state.durable_published = true;
+                    durable = next;
+                    continue;
+                }
+                if !state.durable_confirmed {
+                    break;
+                }
+
+                state.durable_published = true;
+                durable = next;
+                advance.durable_sequence = Some(durable);
+                Self::record_table_notifications(
+                    &mut advance.durable_tables,
+                    &state.touched_tables,
+                    durable,
+                );
+            }
+
+            coordinator
+                .sequences
+                .retain(|_, state| !state.visible_published || !state.durable_published);
+
+            advance
+        };
+
+        if let Some(sequence) = advance.visible_sequence {
+            self.inner
+                .current_sequence
+                .store(sequence.get(), Ordering::SeqCst);
+        }
+        if let Some(sequence) = advance.durable_sequence {
+            self.inner
+                .current_durable_sequence
+                .store(sequence.get(), Ordering::SeqCst);
+        }
+
+        self.notify_table_sequences(&self.inner.visible_watchers, &advance.visible_tables);
+        self.notify_table_sequences(&self.inner.durable_watchers, &advance.durable_tables);
+    }
+
+    fn record_table_notifications(
+        notifications: &mut BTreeMap<String, SequenceNumber>,
+        tables: &BTreeSet<String>,
+        sequence: SequenceNumber,
+    ) {
+        for table in tables {
+            notifications.insert(table.clone(), sequence);
+        }
+    }
+
+    fn notify_table_sequences(
+        &self,
+        watchers: &Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
+        updates: &BTreeMap<String, SequenceNumber>,
+    ) {
+        let watchers = mutex_lock(watchers);
+        for (table, sequence) in updates {
+            if let Some(sender) = watchers.get(table) {
+                sender.send_replace(*sequence);
+            }
+        }
+    }
+
     fn durable_on_commit(&self) -> bool {
         matches!(
             &self.inner.config.storage,
@@ -1220,6 +1762,45 @@ impl Db {
             })
         )
     }
+
+    #[cfg(test)]
+    fn block_next_commit_phase(&self, phase: CommitPhase) -> CommitPhaseBlocker {
+        let (sequence_tx, sequence_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        mutex_lock(&self.inner.commit_phase_blocks).push(CommitPhaseBlock {
+            phase,
+            sequence_tx: Some(sequence_tx),
+            release_rx: Some(release_rx),
+        });
+
+        CommitPhaseBlocker {
+            sequence_rx: Some(sequence_rx),
+            release_tx: Some(release_tx),
+        }
+    }
+
+    #[cfg(test)]
+    async fn maybe_pause_commit_phase(&self, phase: CommitPhase, sequence: SequenceNumber) {
+        let block = {
+            let mut blocks = mutex_lock(&self.inner.commit_phase_blocks);
+            blocks
+                .iter()
+                .position(|block| block.phase == phase)
+                .map(|index| blocks.remove(index))
+        };
+
+        if let Some(mut block) = block {
+            if let Some(sequence_tx) = block.sequence_tx.take() {
+                let _ = sequence_tx.send(sequence);
+            }
+            if let Some(release_rx) = block.release_rx.take() {
+                let _ = release_rx.await;
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn maybe_pause_commit_phase(&self, _phase: CommitPhase, _sequence: SequenceNumber) {}
 
     #[allow(dead_code)]
     pub(crate) fn dependencies(&self) -> &DbDependencies {
@@ -1330,20 +1911,6 @@ impl Db {
                 sender
             })
             .clone()
-    }
-
-    fn notify_watchers(
-        &self,
-        watchers: &Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
-        touched_tables: &BTreeSet<String>,
-        sequence: SequenceNumber,
-    ) {
-        let watchers = mutex_lock(watchers);
-        for table in touched_tables {
-            if let Some(sender) = watchers.get(table) {
-                sender.send_replace(sequence);
-            }
-        }
     }
 
     fn tables_read(&self) -> RwLockReadGuard<'_, BTreeMap<String, StoredTable>> {
@@ -1623,24 +2190,25 @@ async fn read_all_file(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::{collections::BTreeMap, sync::Arc};
 
     use futures::StreamExt;
     use serde_json::json;
 
     use super::{
-        Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX, SchemaDefinition, StoredTable,
-        decode_mvcc_key, encode_mvcc_key,
+        CommitPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX, SchemaDefinition,
+        StoredTable, decode_mvcc_key, encode_mvcc_key,
     };
     use crate::{
-        CommitId, CompactionStrategy, DbConfig, DbDependencies, FieldDefinition, FieldId,
-        FieldType, FieldValue, FileSystemFailure, FileSystemOperation, S3Location,
-        S3PrimaryStorageConfig, ScanOptions, SequenceNumber, SsdConfig, StorageConfig, StubClock,
-        StubObjectStore, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
+        CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
+        FieldDefinition, FieldId, FieldType, FieldValue, FileSystemFailure, FileSystemOperation,
+        S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber, SsdConfig, StorageConfig,
+        StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
         TieredStorageConfig, Value,
     };
 
-    fn tiered_config(path: &str) -> DbConfig {
+    fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
         DbConfig {
             storage: StorageConfig::Tiered(TieredStorageConfig {
                 ssd: SsdConfig {
@@ -1651,10 +2219,14 @@ mod tests {
                     prefix: "tiered".to_string(),
                 },
                 max_local_bytes: 1024 * 1024,
-                durability: TieredDurabilityMode::GroupCommit,
+                durability,
             }),
             scheduler: None,
         }
+    }
+
+    fn tiered_config(path: &str) -> DbConfig {
+        tiered_config_with_durability(path, TieredDurabilityMode::GroupCommit)
     }
 
     fn s3_primary_config(prefix: &str) -> DbConfig {
@@ -2100,5 +2672,271 @@ mod tests {
         second.release();
         assert_eq!(db.oldest_active_snapshot_sequence(), None);
         assert_eq!(db.snapshot_gc_horizon(), db.current_sequence());
+    }
+
+    #[tokio::test]
+    async fn concurrent_commits_assign_gap_free_sequences() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/concurrent-commit-sequences"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let mut tasks = Vec::new();
+        for index in 0..32_u8 {
+            let table = table.clone();
+            tasks.push(tokio::spawn(async move {
+                table
+                    .write(vec![b'k', index], Value::Bytes(vec![index]))
+                    .await
+                    .expect("write")
+            }));
+        }
+
+        let mut sequences = Vec::new();
+        for task in tasks {
+            sequences.push(task.await.expect("join task"));
+        }
+        sequences.sort();
+
+        assert_eq!(
+            sequences,
+            (1..=32)
+                .map(SequenceNumber::new)
+                .collect::<Vec<SequenceNumber>>()
+        );
+        assert_eq!(db.current_sequence(), SequenceNumber::new(32));
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(32));
+    }
+
+    #[tokio::test]
+    async fn read_set_conflicts_when_a_key_changes_after_the_read() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/read-set-conflict"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"user:1".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write initial value");
+
+        let snapshot = db.snapshot().await;
+        assert_eq!(
+            snapshot
+                .read(&table, b"user:1".to_vec())
+                .await
+                .expect("snapshot read"),
+            Some(Value::bytes("v1"))
+        );
+
+        table
+            .write(b"user:1".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write newer value");
+
+        let mut batch = db.write_batch();
+        batch.put(&table, b"user:2".to_vec(), Value::bytes("v3"));
+        let mut read_set = db.read_set();
+        read_set.add(&table, b"user:1".to_vec(), snapshot.sequence());
+
+        let error = db
+            .commit(batch, CommitOptions::default().with_read_set(read_set))
+            .await
+            .expect_err("commit should conflict");
+        assert_eq!(error, CommitError::Conflict);
+    }
+
+    #[tokio::test]
+    async fn group_commit_batches_waiters_under_one_sync() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/group-commit-batch"),
+            dependencies(file_system.clone(), object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let before_syncs = file_system.operation_count(FileSystemOperation::Sync);
+        let mut sync_blocker = db.block_next_commit_phase(CommitPhase::BeforeDurabilitySync);
+
+        let first_table = table.clone();
+        let first = tokio::spawn(async move {
+            first_table
+                .write(b"user:1".to_vec(), Value::bytes("v1"))
+                .await
+                .expect("first write")
+        });
+
+        let first_sequence = sync_blocker.sequence().await;
+        assert_eq!(first_sequence, SequenceNumber::new(1));
+
+        let second_table = table.clone();
+        let second = tokio::spawn(async move {
+            second_table
+                .write(b"user:2".to_vec(), Value::bytes("v2"))
+                .await
+                .expect("second write")
+        });
+
+        while db.inner.next_sequence.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        sync_blocker.release();
+
+        let committed = vec![
+            first.await.expect("join first"),
+            second.await.expect("join second"),
+        ];
+        assert_eq!(
+            committed,
+            vec![SequenceNumber::new(1), SequenceNumber::new(2)]
+        );
+        assert_eq!(
+            file_system.operation_count(FileSystemOperation::Sync) - before_syncs,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_prefix_does_not_skip_an_earlier_commit() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config_with_durability("/visible-prefix-order", TieredDurabilityMode::Deferred),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let mut blocker = db.block_next_commit_phase(CommitPhase::BeforeMemtableInsert);
+        let first_table = table.clone();
+        let first = tokio::spawn(async move {
+            first_table
+                .write(b"user:1".to_vec(), Value::bytes("v1"))
+                .await
+                .expect("first write")
+        });
+
+        let first_sequence = blocker.sequence().await;
+        assert_eq!(first_sequence, SequenceNumber::new(1));
+
+        let second_sequence = table
+            .write(b"user:2".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("second write");
+        assert_eq!(second_sequence, SequenceNumber::new(2));
+        assert_eq!(db.current_sequence(), SequenceNumber::new(0));
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+
+        blocker.release();
+
+        assert_eq!(first.await.expect("join first"), SequenceNumber::new(1));
+        assert_eq!(db.current_sequence(), SequenceNumber::new(2));
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+    }
+
+    #[tokio::test]
+    async fn durability_modes_publish_expected_watermarks() {
+        let group_fs = Arc::new(crate::StubFileSystem::default());
+        let deferred_fs = Arc::new(crate::StubFileSystem::default());
+        let s3_fs = Arc::new(crate::StubFileSystem::default());
+
+        let group_db = Db::open(
+            tiered_config("/group-watermarks"),
+            dependencies(group_fs, Arc::new(StubObjectStore::default())),
+        )
+        .await
+        .expect("open group db");
+        let deferred_db = Db::open(
+            tiered_config_with_durability("/deferred-watermarks", TieredDurabilityMode::Deferred),
+            dependencies(deferred_fs, Arc::new(StubObjectStore::default())),
+        )
+        .await
+        .expect("open deferred db");
+        let s3_db = Db::open(
+            s3_primary_config("s3-watermarks"),
+            dependencies(s3_fs, Arc::new(StubObjectStore::default())),
+        )
+        .await
+        .expect("open s3 db");
+
+        let group_table = group_db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create group table");
+        let deferred_table = deferred_db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create deferred table");
+        let s3_table = s3_db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create s3 table");
+
+        assert_eq!(
+            group_table
+                .write(b"user:1".to_vec(), Value::bytes("v1"))
+                .await
+                .expect("group write"),
+            SequenceNumber::new(1)
+        );
+        assert_eq!(group_db.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(group_db.current_durable_sequence(), SequenceNumber::new(1));
+
+        assert_eq!(
+            deferred_table
+                .write(b"user:1".to_vec(), Value::bytes("v1"))
+                .await
+                .expect("deferred write"),
+            SequenceNumber::new(1)
+        );
+        assert_eq!(deferred_db.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(
+            deferred_db.current_durable_sequence(),
+            SequenceNumber::new(0)
+        );
+        deferred_db.flush().await.expect("flush deferred");
+        assert_eq!(
+            deferred_db.current_durable_sequence(),
+            SequenceNumber::new(1)
+        );
+
+        assert_eq!(
+            s3_table
+                .write(b"user:1".to_vec(), Value::bytes("v1"))
+                .await
+                .expect("s3 write"),
+            SequenceNumber::new(1)
+        );
+        assert_eq!(s3_db.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(s3_db.current_durable_sequence(), SequenceNumber::new(0));
+        s3_db.flush().await.expect("flush s3");
+        assert_eq!(s3_db.current_durable_sequence(), SequenceNumber::new(1));
     }
 }

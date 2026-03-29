@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -662,6 +662,7 @@ struct SimulatedFileSystemState {
     live: BTreeMap<String, Vec<u8>>,
     durable: BTreeMap<String, Vec<u8>>,
     failures: VecDeque<FileSystemFailure>,
+    operation_counts: HashMap<FileSystemOperation, u64>,
 }
 
 impl SimulatedFileSystem {
@@ -699,6 +700,15 @@ impl SimulatedFileSystem {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    pub fn operation_count(&self, operation: FileSystemOperation) -> u64 {
+        lock(&self.state)
+            .operation_counts
+            .get(&operation)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -706,6 +716,10 @@ impl FileSystem for SimulatedFileSystem {
     async fn open(&self, path: &str, opts: OpenOptions) -> Result<FileHandle, StorageError> {
         let mut state = lock(&self.state);
         Self::maybe_fail(&mut state, FileSystemOperation::Open, path)?;
+        *state
+            .operation_counts
+            .entry(FileSystemOperation::Open)
+            .or_default() += 1;
 
         if opts.create {
             state.live.entry(path.to_string()).or_default();
@@ -728,6 +742,10 @@ impl FileSystem for SimulatedFileSystem {
     ) -> Result<(), StorageError> {
         let mut state = lock(&self.state);
         Self::maybe_fail(&mut state, FileSystemOperation::WriteAt, handle.path())?;
+        *state
+            .operation_counts
+            .entry(FileSystemOperation::WriteAt)
+            .or_default() += 1;
 
         let buf = state
             .live
@@ -753,6 +771,10 @@ impl FileSystem for SimulatedFileSystem {
     ) -> Result<Vec<u8>, StorageError> {
         let mut state = lock(&self.state);
         Self::maybe_fail(&mut state, FileSystemOperation::ReadAt, handle.path())?;
+        *state
+            .operation_counts
+            .entry(FileSystemOperation::ReadAt)
+            .or_default() += 1;
 
         let buf = state
             .live
@@ -770,6 +792,10 @@ impl FileSystem for SimulatedFileSystem {
     async fn sync(&self, handle: &FileHandle) -> Result<(), StorageError> {
         let mut state = lock(&self.state);
         Self::maybe_fail(&mut state, FileSystemOperation::Sync, handle.path())?;
+        *state
+            .operation_counts
+            .entry(FileSystemOperation::Sync)
+            .or_default() += 1;
 
         let bytes =
             state.live.get(handle.path()).cloned().ok_or_else(|| {
@@ -782,6 +808,10 @@ impl FileSystem for SimulatedFileSystem {
     async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
         let mut state = lock(&self.state);
         Self::maybe_fail(&mut state, FileSystemOperation::Rename, from)?;
+        *state
+            .operation_counts
+            .entry(FileSystemOperation::Rename)
+            .or_default() += 1;
 
         let bytes = state
             .live
@@ -794,6 +824,10 @@ impl FileSystem for SimulatedFileSystem {
     async fn delete(&self, path: &str) -> Result<(), StorageError> {
         let mut state = lock(&self.state);
         Self::maybe_fail(&mut state, FileSystemOperation::Delete, path)?;
+        *state
+            .operation_counts
+            .entry(FileSystemOperation::Delete)
+            .or_default() += 1;
         state.live.remove(path);
         Ok(())
     }
@@ -801,6 +835,10 @@ impl FileSystem for SimulatedFileSystem {
     async fn list(&self, dir: &str) -> Result<Vec<String>, StorageError> {
         let mut state = lock(&self.state);
         Self::maybe_fail(&mut state, FileSystemOperation::List, dir)?;
+        *state
+            .operation_counts
+            .entry(FileSystemOperation::List)
+            .or_default() += 1;
         let mut files = state
             .live
             .keys()

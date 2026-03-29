@@ -570,6 +570,14 @@ impl SegmentManager {
         Ok(Some(footer))
     }
 
+    pub async fn sync_active(&mut self) -> Result<(), StorageError> {
+        if self.active.len == 0 {
+            return Ok(());
+        }
+
+        self.fs.sync(&self.active.handle).await
+    }
+
     pub async fn read_from_sequence(
         &self,
         segment_id: SegmentId,

@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     future::Future,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
@@ -25,6 +25,11 @@ const IO_CHUNK_LEN: usize = 4096;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("simulation mutex poisoned")
+}
+
+fn mad_turmoil_runtime_lock() -> &'static Mutex<()> {
+    static MAD_TURMOIL_RUNTIME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    MAD_TURMOIL_RUNTIME_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub fn seed_mad_turmoil(seed: u64) {
@@ -358,6 +363,9 @@ impl SeededSimulationRunner {
         F: FnOnce(SimulationContext) -> Fut + 'static,
         Fut: Future<Output = turmoil::Result<T>> + 'static,
     {
+        let _mad_turmoil_guard = mad_turmoil_runtime_lock()
+            .lock()
+            .expect("mad-turmoil runtime lock poisoned");
         seed_mad_turmoil(self.seed);
         let _clock_guard = mad_turmoil::time::SimClocksGuard::init();
 
