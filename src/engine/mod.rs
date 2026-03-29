@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 
 use crate::{
-    api::{BatchOperation, ChangeStream, ScanOptions, Table, Value, WriteBatch},
+    api::{BatchOperation, ChangeStream, ScanOptions, Table, WriteBatch},
     config::TableConfig,
-    error::{CommitError, CreateTableError, FlushError, OpenError, SnapshotTooOld, StorageError},
-    ids::{CommitId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
+    error::{CommitError, CreateTableError, OpenError, SnapshotTooOld, StorageError},
+    ids::{LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     scheduler::{PendingWork, ScheduleDecision, TableStats},
 };
 
@@ -77,59 +77,7 @@ pub mod memtable {
     }
 }
 
-pub mod commit_log {
-    use super::*;
-
-    #[derive(Clone, Debug)]
-    pub struct CommitRecord {
-        pub id: CommitId,
-        pub entries: Vec<CommitEntryRecord>,
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct CommitEntryRecord {
-        pub op_index: u16,
-        pub table_id: TableId,
-        pub kind: crate::api::ChangeKind,
-        pub key: Vec<u8>,
-        pub value: Option<Value>,
-    }
-
-    #[async_trait]
-    pub trait CommitLog: Send + Sync {
-        async fn append(&self, record: CommitRecord) -> Result<CommitId, CommitError>;
-        async fn flush(&self) -> Result<(), FlushError>;
-        async fn scan(
-            &self,
-            table: &Table,
-            cursor: LogCursor,
-            opts: ScanOptions,
-        ) -> Result<ChangeStream, SnapshotTooOld>;
-    }
-
-    #[derive(Debug, Default)]
-    pub struct StubCommitLog;
-
-    #[async_trait]
-    impl CommitLog for StubCommitLog {
-        async fn append(&self, record: CommitRecord) -> Result<CommitId, CommitError> {
-            Ok(record.id)
-        }
-
-        async fn flush(&self) -> Result<(), FlushError> {
-            Ok(())
-        }
-
-        async fn scan(
-            &self,
-            _table: &Table,
-            _cursor: LogCursor,
-            _opts: ScanOptions,
-        ) -> Result<ChangeStream, SnapshotTooOld> {
-            Ok(Box::pin(futures::stream::empty()))
-        }
-    }
-}
+pub mod commit_log;
 
 pub mod sstables {
     use super::*;
