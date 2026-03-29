@@ -111,7 +111,27 @@ async fn public_api_surface_compiles_and_is_instantiable() {
         .await
         .expect("create row table");
 
-    let _columnar = db
+    let metrics_schema = SchemaDefinition {
+        version: 1,
+        fields: vec![
+            FieldDefinition {
+                id: FieldId::new(1),
+                name: "user_id".to_string(),
+                field_type: FieldType::String,
+                nullable: false,
+                default: None,
+            },
+            FieldDefinition {
+                id: FieldId::new(2),
+                name: "amount".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                default: Some(FieldValue::Int64(0)),
+            },
+        ],
+    };
+
+    let columnar = db
         .create_table(TableConfig {
             name: "metrics".to_string(),
             format: TableFormat::Columnar,
@@ -121,25 +141,7 @@ async fn public_api_surface_compiles_and_is_instantiable() {
             bloom_filter_bits_per_key: Some(8),
             history_retention_sequences: Some(128),
             compaction_strategy: CompactionStrategy::Tiered,
-            schema: Some(SchemaDefinition {
-                version: 1,
-                fields: vec![
-                    FieldDefinition {
-                        id: FieldId::new(1),
-                        name: "user_id".to_string(),
-                        field_type: FieldType::String,
-                        nullable: false,
-                        default: None,
-                    },
-                    FieldDefinition {
-                        id: FieldId::new(2),
-                        name: "amount".to_string(),
-                        field_type: FieldType::Int64,
-                        nullable: false,
-                        default: Some(FieldValue::Int64(0)),
-                    },
-                ],
-            }),
+            schema: Some(metrics_schema.clone()),
             metadata: Default::default(),
         })
         .await
@@ -164,8 +166,23 @@ async fn public_api_surface_compiles_and_is_instantiable() {
         .expect("commit");
     assert_eq!(committed, SequenceNumber::new(1));
 
+    let columnar_committed = columnar
+        .write(
+            b"metric:1".to_vec(),
+            Value::named_record(
+                &metrics_schema,
+                [
+                    ("amount", FieldValue::Int64(42)),
+                    ("user_id", FieldValue::String("alice".to_string())),
+                ],
+            )
+            .expect("normalize named record"),
+        )
+        .await
+        .expect("write columnar record");
+
     let snapshot = db.snapshot().await;
-    assert_eq!(snapshot.sequence(), committed);
+    assert_eq!(snapshot.sequence(), columnar_committed);
     assert!(snapshot.read(&row_table, b"k1".to_vec()).await.is_ok());
     assert!(
         snapshot

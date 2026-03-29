@@ -17,9 +17,10 @@ pub use adapters::{
     SimulatedObjectStore, SystemClock, SystemRng, TokioFileSystem,
 };
 pub use api::{
-    BatchOperation, ChangeEntry, ChangeKind, ChangeStream, CommitOptions, Db, FieldDefinition,
-    FieldType, FieldValue, Key, KeyPrefix, KvStream, ReadSet, ReadSetEntry, ScanOptions,
-    SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver, WriteBatch,
+    BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarRecord, CommitOptions, Db,
+    FieldDefinition, FieldType, FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet,
+    ReadSetEntry, ScanOptions, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
+    WriteBatch,
 };
 pub use config::{
     CompactionDecision, CompactionDecisionContext, CompactionFilter, CompactionFilterRef,

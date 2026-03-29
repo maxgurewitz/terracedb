@@ -46,12 +46,14 @@ pub type KvStream = Pin<Box<dyn Stream<Item = (Key, Value)> + Send + 'static>>;
 pub type ChangeStream = Pin<Box<dyn Stream<Item = ChangeEntry> + Send + 'static>>;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaDefinition {
     pub version: u32,
     pub fields: Vec<FieldDefinition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldDefinition {
     pub id: FieldId,
     pub name: String,
@@ -83,6 +85,242 @@ pub enum FieldValue {
 }
 
 pub type ColumnarRecord = BTreeMap<FieldId, FieldValue>;
+pub type NamedColumnarRecord = BTreeMap<String, FieldValue>;
+
+impl SchemaDefinition {
+    pub fn validate(&self) -> Result<(), StorageError> {
+        SchemaValidation::new(self).map(|_| ())
+    }
+
+    pub fn validate_successor(&self, successor: &Self) -> Result<(), StorageError> {
+        let current = SchemaValidation::new(self)?;
+        let next = SchemaValidation::new(successor)?;
+
+        if successor.version <= self.version {
+            return Err(StorageError::unsupported(format!(
+                "schema version must increase: current={}, successor={}",
+                self.version, successor.version
+            )));
+        }
+
+        for (&field_id, current_field) in &current.fields_by_id {
+            let Some(next_field) = next.fields_by_id.get(&field_id) else {
+                continue;
+            };
+            if next_field.field_type != current_field.field_type {
+                return Err(StorageError::unsupported(format!(
+                    "field {} ({}) changes type from {} to {}",
+                    field_id.get(),
+                    current_field.name,
+                    current_field.field_type.as_str(),
+                    next_field.field_type.as_str()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn normalize_record(
+        &self,
+        record: &ColumnarRecord,
+    ) -> Result<ColumnarRecord, StorageError> {
+        SchemaValidation::new(self)?.normalize_record(record)
+    }
+
+    pub fn record_from_names<I, S>(&self, fields: I) -> Result<ColumnarRecord, StorageError>
+    where
+        I: IntoIterator<Item = (S, FieldValue)>,
+        S: Into<String>,
+    {
+        SchemaValidation::new(self)?.record_from_names(fields)
+    }
+}
+
+impl FieldType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Int64 => "int64",
+            Self::Float64 => "float64",
+            Self::String => "string",
+            Self::Bytes => "bytes",
+            Self::Bool => "bool",
+        }
+    }
+}
+
+struct SchemaValidation<'a> {
+    schema: &'a SchemaDefinition,
+    fields_by_id: BTreeMap<FieldId, &'a FieldDefinition>,
+    field_ids_by_name: BTreeMap<String, FieldId>,
+}
+
+impl<'a> SchemaValidation<'a> {
+    fn new(schema: &'a SchemaDefinition) -> Result<Self, StorageError> {
+        if schema.version == 0 {
+            return Err(StorageError::unsupported(
+                "schema version must be greater than zero",
+            ));
+        }
+        if schema.fields.is_empty() {
+            return Err(StorageError::unsupported(
+                "columnar schemas must define at least one field",
+            ));
+        }
+
+        let mut fields_by_id = BTreeMap::new();
+        let mut field_ids_by_name = BTreeMap::new();
+
+        for field in &schema.fields {
+            if field.id.get() == 0 {
+                return Err(StorageError::unsupported(format!(
+                    "field {} ({}) uses reserved field id 0",
+                    field.id.get(),
+                    field.name
+                )));
+            }
+            if field.name.trim().is_empty() {
+                return Err(StorageError::unsupported(format!(
+                    "field {} has an empty name",
+                    field.id.get()
+                )));
+            }
+            if fields_by_id.insert(field.id, field).is_some() {
+                return Err(StorageError::unsupported(format!(
+                    "schema contains duplicate field id {}",
+                    field.id.get()
+                )));
+            }
+            if field_ids_by_name
+                .insert(field.name.clone(), field.id)
+                .is_some()
+            {
+                return Err(StorageError::unsupported(format!(
+                    "schema contains duplicate field name {}",
+                    field.name
+                )));
+            }
+            if let Some(default) = &field.default {
+                validate_field_value_against_definition(field, default, "default value")?;
+            }
+        }
+
+        Ok(Self {
+            schema,
+            fields_by_id,
+            field_ids_by_name,
+        })
+    }
+
+    fn normalize_record(&self, record: &ColumnarRecord) -> Result<ColumnarRecord, StorageError> {
+        for (&field_id, value) in record {
+            let field = self.fields_by_id.get(&field_id).ok_or_else(|| {
+                StorageError::unsupported(format!(
+                    "record contains unknown field id {}",
+                    field_id.get()
+                ))
+            })?;
+            validate_field_value_against_definition(field, value, "record value")?;
+        }
+
+        let mut normalized = BTreeMap::new();
+        for field in &self.schema.fields {
+            let value = match record.get(&field.id) {
+                Some(value) => value.clone(),
+                None => self.missing_field_value(field)?,
+            };
+            normalized.insert(field.id, value);
+        }
+
+        Ok(normalized)
+    }
+
+    fn record_from_names<I, S>(&self, fields: I) -> Result<ColumnarRecord, StorageError>
+    where
+        I: IntoIterator<Item = (S, FieldValue)>,
+        S: Into<String>,
+    {
+        let mut resolved = BTreeMap::new();
+        for (name, value) in fields {
+            let name = name.into();
+            let field_id = self.field_ids_by_name.get(&name).copied().ok_or_else(|| {
+                StorageError::unsupported(format!("record contains unknown field name {}", name))
+            })?;
+            if resolved.insert(field_id, value).is_some() {
+                return Err(StorageError::unsupported(format!(
+                    "record contains duplicate field name {}",
+                    name
+                )));
+            }
+        }
+
+        self.normalize_record(&resolved)
+    }
+
+    fn missing_field_value(&self, field: &FieldDefinition) -> Result<FieldValue, StorageError> {
+        if let Some(default) = &field.default {
+            return Ok(default.clone());
+        }
+        if field.nullable {
+            return Ok(FieldValue::Null);
+        }
+
+        Err(StorageError::unsupported(format!(
+            "record is missing required field {}",
+            field.name
+        )))
+    }
+}
+
+fn validate_field_value_against_definition(
+    field: &FieldDefinition,
+    value: &FieldValue,
+    context: &str,
+) -> Result<(), StorageError> {
+    if matches!(value, FieldValue::Null) {
+        return if field.nullable {
+            Ok(())
+        } else {
+            Err(StorageError::unsupported(format!(
+                "{context} for field {} cannot be null",
+                field.name
+            )))
+        };
+    }
+
+    if field_value_matches_type(field.field_type, value) {
+        Ok(())
+    } else {
+        Err(StorageError::unsupported(format!(
+            "{context} for field {} has type {}, expected {}",
+            field.name,
+            field_value_type_name(value),
+            field.field_type.as_str()
+        )))
+    }
+}
+
+fn field_value_matches_type(field_type: FieldType, value: &FieldValue) -> bool {
+    matches!(
+        (field_type, value),
+        (FieldType::Int64, FieldValue::Int64(_))
+            | (FieldType::Float64, FieldValue::Float64(_))
+            | (FieldType::String, FieldValue::String(_))
+            | (FieldType::Bytes, FieldValue::Bytes(_))
+            | (FieldType::Bool, FieldValue::Bool(_))
+    )
+}
+
+fn field_value_type_name(value: &FieldValue) -> &'static str {
+    match value {
+        FieldValue::Null => "null",
+        FieldValue::Int64(_) => "int64",
+        FieldValue::Float64(_) => "float64",
+        FieldValue::String(_) => "string",
+        FieldValue::Bytes(_) => "bytes",
+        FieldValue::Bool(_) => "bool",
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -93,6 +331,18 @@ pub enum Value {
 impl Value {
     pub fn bytes(value: impl Into<Vec<u8>>) -> Self {
         Self::Bytes(value.into())
+    }
+
+    pub fn record(record: ColumnarRecord) -> Self {
+        Self::Record(record)
+    }
+
+    pub fn named_record<I, S>(schema: &SchemaDefinition, fields: I) -> Result<Self, StorageError>
+    where
+        I: IntoIterator<Item = (S, FieldValue)>,
+        S: Into<String>,
+    {
+        Ok(Self::Record(schema.record_from_names(fields)?))
     }
 }
 
@@ -384,6 +634,8 @@ struct PersistedManifestSstable {
     max_key: Key,
     min_sequence: SequenceNumber,
     max_sequence: SequenceNumber,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_version: Option<u32>,
 }
 
 impl PersistedManifestSstable {
@@ -1892,10 +2144,27 @@ impl Db {
                 "max_merge_operand_chain_length must be greater than zero".to_string(),
             ));
         }
-        if matches!(config.format, TableFormat::Columnar) && config.schema.is_none() {
-            return Err(CreateTableError::InvalidConfig(
-                "columnar tables require a schema".to_string(),
-            ));
+        match config.format {
+            TableFormat::Row => {
+                if config.schema.is_some() {
+                    return Err(CreateTableError::InvalidConfig(
+                        "row tables do not accept a schema".to_string(),
+                    ));
+                }
+            }
+            TableFormat::Columnar => {
+                let schema = config.schema.as_ref().ok_or_else(|| {
+                    CreateTableError::InvalidConfig("columnar tables require a schema".to_string())
+                })?;
+                schema
+                    .validate()
+                    .map_err(|error| CreateTableError::InvalidConfig(error.to_string()))?;
+                if config.merge_operator.is_some() {
+                    return Err(CreateTableError::InvalidConfig(
+                        "columnar tables do not support merge operators in v1".to_string(),
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -1909,6 +2178,36 @@ impl Db {
             && left.compaction_strategy == right.compaction_strategy
             && left.schema == right.schema
             && left.metadata == right.metadata
+    }
+
+    fn normalize_value_for_table(
+        stored: &StoredTable,
+        value: &Value,
+    ) -> Result<Value, StorageError> {
+        match stored.config.format {
+            TableFormat::Row => match value {
+                Value::Bytes(_) => Ok(value.clone()),
+                Value::Record(_) => Err(StorageError::unsupported(format!(
+                    "row table {} only accepts byte values",
+                    stored.config.name
+                ))),
+            },
+            TableFormat::Columnar => {
+                let schema = stored.config.schema.as_ref().ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "columnar table {} is missing a schema",
+                        stored.config.name
+                    ))
+                })?;
+                match value {
+                    Value::Record(record) => Ok(Value::Record(schema.normalize_record(record)?)),
+                    Value::Bytes(_) => Err(StorageError::unsupported(format!(
+                        "columnar table {} requires structured record values",
+                        stored.config.name
+                    ))),
+                }
+            }
+        }
     }
 
     fn catalog_location(storage: &StorageConfig) -> CatalogLocation {
@@ -2437,6 +2736,7 @@ impl Db {
             max_key,
             min_sequence,
             max_sequence,
+            schema_version: None,
         })
     }
 
@@ -4550,12 +4850,14 @@ impl Db {
                             table.name()
                         )))
                     })?;
+                    let value = Self::normalize_value_for_table(&stored, value)
+                        .map_err(CommitError::Storage)?;
                     Ok(ResolvedBatchOperation {
                         table_id: stored.id,
                         table_name: table.name().to_string(),
                         key: key.clone(),
                         kind: ChangeKind::Put,
-                        value: Some(value.clone()),
+                        value: Some(value),
                     })
                 }
                 BatchOperation::Merge { table, key, value } => {
@@ -4565,18 +4867,26 @@ impl Db {
                             table.name()
                         )))
                     })?;
+                    if matches!(stored.config.format, TableFormat::Columnar) {
+                        return Err(CommitError::Storage(StorageError::unsupported(format!(
+                            "columnar table {} does not support merge operands in v1",
+                            table.name()
+                        ))));
+                    }
                     if stored.config.merge_operator.is_none() {
                         return Err(CommitError::Storage(StorageError::unsupported(format!(
                             "merge operator is not configured for table {}",
                             table.name()
                         ))));
                     }
+                    let value = Self::normalize_value_for_table(&stored, value)
+                        .map_err(CommitError::Storage)?;
                     Ok(ResolvedBatchOperation {
                         table_id: stored.id,
                         table_name: table.name().to_string(),
                         key: key.clone(),
                         kind: ChangeKind::Merge,
-                        value: Some(value.clone()),
+                        value: Some(value),
                     })
                 }
                 BatchOperation::Delete { table, key } => {

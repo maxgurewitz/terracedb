@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -6,14 +7,16 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use terracedb::{
-    Clock, CommitOptions, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
-    DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle, DbSimulationScenarioConfig,
-    DbWorkloadOperation, LogCursor, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation,
+    Clock, CommitOptions, CompactionStrategy, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+    DbConfig, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
+    DbSimulationScenarioConfig, DbWorkloadOperation, FieldDefinition, FieldId, FieldType,
+    FieldValue, LogCursor, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation,
     OperationResult, PendingWork, PointMutation, RemoteCache, RemoteRecoveryHint, S3Location,
     ScanOptions, ScheduleAction, ScheduleDecision, ScheduledFault, ScheduledFaultKind, Scheduler,
-    SeededSimulationRunner, SequenceNumber, ShadowOracle, SimulationMergeOperatorId,
-    SimulationScenarioConfig, SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind,
-    StorageSource, StubDbProcess, TableStats, ThrottleDecision, TieredDurabilityMode,
+    SchemaDefinition, SeededSimulationRunner, SequenceNumber, ShadowOracle,
+    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, SsdConfig,
+    StorageConfig, StorageErrorKind, StorageSource, StubDbProcess, TableConfig, TableFormat,
+    TableStats, ThrottleDecision, TieredDurabilityMode,
     TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
 };
 
@@ -269,6 +272,91 @@ fn stub_db_recovery_matches_oracle_prefix() -> turmoil::Result {
         assert_eq!(matched.durable_sequence, first_sequence);
         assert_eq!(matched.matched_sequence, first_sequence);
         assert_eq!(recovered.read(b"k2"), None);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn columnar_schema_and_normalized_records_survive_simulated_restart() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2424).run_with(|context| async move {
+        let config = simulation_tiered_config(
+            "/terracedb/sim/columnar-schema",
+            TieredDurabilityMode::GroupCommit,
+        );
+        let schema = SchemaDefinition {
+            version: 1,
+            fields: vec![
+                FieldDefinition {
+                    id: FieldId::new(1),
+                    name: "user_id".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(2),
+                    name: "count".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    default: Some(FieldValue::Int64(0)),
+                },
+                FieldDefinition {
+                    id: FieldId::new(3),
+                    name: "active".to_string(),
+                    field_type: FieldType::Bool,
+                    nullable: true,
+                    default: None,
+                },
+            ],
+        };
+
+        let db = context.open_db(config.clone()).await?;
+        let metrics = db
+            .create_table(TableConfig {
+                name: "metrics".to_string(),
+                format: TableFormat::Columnar,
+                merge_operator: None,
+                max_merge_operand_chain_length: None,
+                compaction_filter: None,
+                bloom_filter_bits_per_key: Some(8),
+                history_retention_sequences: Some(16),
+                compaction_strategy: CompactionStrategy::Tiered,
+                schema: Some(schema.clone()),
+                metadata: Default::default(),
+            })
+            .await
+            .expect("create columnar table");
+
+        metrics
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    [
+                        ("count", FieldValue::Int64(9)),
+                        ("user_id", FieldValue::String("alice".to_string())),
+                    ],
+                )
+                .expect("normalize named record"),
+            )
+            .await
+            .expect("write columnar record");
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let metrics = reopened.table("metrics");
+        assert!(metrics.id().is_some());
+        assert_eq!(
+            metrics
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read recovered"),
+            Some(Value::record(BTreeMap::from([
+                (FieldId::new(1), FieldValue::String("alice".to_string())),
+                (FieldId::new(2), FieldValue::Int64(9)),
+                (FieldId::new(3), FieldValue::Null),
+            ])))
+        );
 
         Ok(())
     })
