@@ -15,12 +15,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use turmoil::net::{TcpListener, TcpStream};
 
 use crate::{
-    Clock, CommitError, CompactionFilterRef, CompactionStrategy, Db, DbConfig, DbDependencies,
-    DeterministicRng, FileSystem, FileSystemFailure, FileSystemOperation, FlushError, Key,
-    KvStream, MergeOperator, MergeOperatorRef, ObjectStore, ObjectStoreOperation, OpenError,
-    OpenOptions, ReadError, Rng, S3Location, ScanOptions, SequenceNumber, SimulatedFileSystem,
-    SsdConfig, StorageConfig, StorageError, StorageErrorKind, Table, TableConfig, TableFormat,
-    TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value, WriteError,
+    ChangeKind, Clock, CommitError, CompactionFilterRef, CompactionStrategy, Db, DbConfig,
+    DbDependencies, DeterministicRng, FileSystem, FileSystemFailure, FileSystemOperation,
+    FlushError, Key, KvStream, LogCursor, MergeOperator, MergeOperatorRef, ObjectStore,
+    ObjectStoreOperation, OpenError, OpenOptions, ReadError, Rng, S3Location, ScanOptions,
+    SequenceNumber, SimulatedFileSystem, SsdConfig, StorageConfig, StorageError, StorageErrorKind,
+    Table, TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp,
+    TtlCompactionFilter, Value, WriteError,
 };
 
 const OBJECT_STORE_HOST: &str = "object-store";
@@ -514,10 +515,21 @@ pub struct DbRecoveryMatch {
     pub durable_sequence: SequenceNumber,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DbOracleChange {
+    pub table: String,
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+    pub cursor: LogCursor,
+    pub sequence: SequenceNumber,
+    pub kind: ChangeKind,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DbShadowOracle {
     table_specs: BTreeMap<String, SimulationTableSpec>,
     versions: BTreeMap<String, BTreeMap<Vec<u8>, Vec<DbVersion>>>,
+    ordered_changes: Vec<DbOracleChange>,
     durable_sequence: SequenceNumber,
     max_sequence: SequenceNumber,
 }
@@ -531,6 +543,7 @@ impl DbShadowOracle {
                 .map(|spec| (spec.name.clone(), spec))
                 .collect(),
             versions: BTreeMap::new(),
+            ordered_changes: Vec::new(),
             durable_sequence: SequenceNumber::new(0),
             max_sequence: SequenceNumber::new(0),
         }
@@ -542,12 +555,33 @@ impl DbShadowOracle {
         mutation: DbMutation,
         durable: bool,
     ) -> Result<(), DbOracleError> {
-        let (table, mutation) = match mutation {
+        self.apply_with_cursor(LogCursor::new(sequence, 0), mutation, durable)
+    }
+
+    pub fn apply_with_cursor(
+        &mut self,
+        cursor: LogCursor,
+        mutation: DbMutation,
+        durable: bool,
+    ) -> Result<(), DbOracleError> {
+        let sequence = cursor.sequence();
+        if let Some(previous) = self.ordered_changes.last()
+            && previous.cursor >= cursor
+        {
+            return Err(DbOracleError::ChangeOrdering {
+                previous: previous.cursor,
+                next: cursor,
+            });
+        }
+
+        let (table, mutation) = match mutation.clone() {
             DbMutation::Put { table, key, value } => (table, TableMutation::Put { key, value }),
             DbMutation::Merge { table, key, value } => (table, TableMutation::Merge { key, value }),
             DbMutation::Delete { table, key } => (table, TableMutation::Delete { key }),
         };
+        let change_table = table.clone();
         let key = mutation.key().to_vec();
+        let change_mutation = mutation.clone();
 
         self.ensure_table_known(&table)?;
         self.versions
@@ -557,11 +591,21 @@ impl DbShadowOracle {
             .or_default()
             .push(DbVersion { sequence, mutation });
 
-        self.max_sequence = sequence;
+        self.ordered_changes.push(DbOracleChange::from_mutation(
+            cursor,
+            change_mutation,
+            &change_table,
+        ));
+
+        self.max_sequence = sequence.max(self.max_sequence);
         if durable {
-            self.durable_sequence = sequence;
+            self.durable_sequence = sequence.max(self.durable_sequence);
         }
         Ok(())
+    }
+
+    pub fn mark_durable_through(&mut self, sequence: SequenceNumber) {
+        self.durable_sequence = self.durable_sequence.max(sequence.min(self.max_sequence));
     }
 
     pub fn durable_sequence(&self) -> SequenceNumber {
@@ -716,12 +760,76 @@ impl DbShadowOracle {
             .map(|spec| spec.compaction_filter.is_none())
             .unwrap_or(false)
     }
+
+    pub fn visible_changes_since(
+        &self,
+        table: &str,
+        cursor: LogCursor,
+    ) -> Result<Vec<DbOracleChange>, DbOracleError> {
+        self.changes_since(table, cursor, self.max_sequence)
+    }
+
+    pub fn durable_changes_since(
+        &self,
+        table: &str,
+        cursor: LogCursor,
+    ) -> Result<Vec<DbOracleChange>, DbOracleError> {
+        self.changes_since(table, cursor, self.durable_sequence)
+    }
+
+    fn changes_since(
+        &self,
+        table: &str,
+        cursor: LogCursor,
+        upper_bound: SequenceNumber,
+    ) -> Result<Vec<DbOracleChange>, DbOracleError> {
+        self.ensure_table_known(table)?;
+        Ok(self
+            .ordered_changes
+            .iter()
+            .filter(|change| change.table == table)
+            .filter(|change| change.sequence <= upper_bound)
+            .filter(|change| change.cursor > cursor)
+            .cloned()
+            .collect())
+    }
 }
 
 impl TableMutation {
     fn key(&self) -> &[u8] {
         match self {
             Self::Put { key, .. } | Self::Merge { key, .. } | Self::Delete { key } => key,
+        }
+    }
+}
+
+impl DbOracleChange {
+    fn from_mutation(cursor: LogCursor, mutation: TableMutation, table: &str) -> Self {
+        match mutation {
+            TableMutation::Put { key, value } => Self {
+                table: table.to_string(),
+                key,
+                value: Some(value),
+                cursor,
+                sequence: cursor.sequence(),
+                kind: ChangeKind::Put,
+            },
+            TableMutation::Merge { key, value } => Self {
+                table: table.to_string(),
+                key,
+                value: Some(value),
+                cursor,
+                sequence: cursor.sequence(),
+                kind: ChangeKind::Merge,
+            },
+            TableMutation::Delete { key } => Self {
+                table: table.to_string(),
+                key,
+                value: None,
+                cursor,
+                sequence: cursor.sequence(),
+                kind: ChangeKind::Delete,
+            },
         }
     }
 }
@@ -2232,6 +2340,11 @@ pub enum OracleError {
 pub enum DbOracleError {
     #[error("simulation table is not registered: {table}")]
     UnknownTable { table: String },
+    #[error("change ordering violation: {previous:?} followed by {next:?}")]
+    ChangeOrdering {
+        previous: LogCursor,
+        next: LogCursor,
+    },
     #[error("point-state mismatch for table {table} at sequence {sequence}")]
     PointState {
         table: String,

@@ -739,6 +739,32 @@ impl CommitRuntime {
 
         Ok(recovered)
     }
+
+    async fn scan_table_from_sequence(
+        &self,
+        table_id: TableId,
+        sequence_inclusive: SequenceNumber,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        match &self.backend {
+            CommitLogBackend::Local(manager) => {
+                manager
+                    .scan_table_from_sequence(table_id, sequence_inclusive)
+                    .await
+            }
+            CommitLogBackend::Memory(log) => Ok(log
+                .records
+                .iter()
+                .filter(|record| record.sequence() >= sequence_inclusive)
+                .filter(|record| {
+                    record
+                        .entries
+                        .iter()
+                        .any(|entry| entry.table_id == table_id)
+                })
+                .cloned()
+                .collect()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3478,11 +3504,12 @@ impl Db {
 
     pub async fn scan_since(
         &self,
-        _table: &Table,
-        _cursor: LogCursor,
-        _opts: ScanOptions,
+        table: &Table,
+        cursor: LogCursor,
+        opts: ScanOptions,
     ) -> Result<ChangeStream, SnapshotTooOld> {
-        Ok(Box::pin(stream::empty()))
+        self.scan_change_feed(table, cursor, self.current_sequence(), opts)
+            .await
     }
 
     pub fn subscribe(&self, table: &Table) -> WatermarkReceiver {
@@ -3499,11 +3526,12 @@ impl Db {
 
     pub async fn scan_durable_since(
         &self,
-        _table: &Table,
-        _cursor: LogCursor,
-        _opts: ScanOptions,
+        table: &Table,
+        cursor: LogCursor,
+        opts: ScanOptions,
     ) -> Result<ChangeStream, SnapshotTooOld> {
-        Ok(Box::pin(stream::empty()))
+        self.scan_change_feed(table, cursor, self.current_durable_sequence(), opts)
+            .await
     }
 
     pub fn subscribe_durable(&self, table: &Table) -> WatermarkReceiver {
@@ -4069,6 +4097,74 @@ impl Db {
                 ..
             })
         )
+    }
+
+    async fn scan_change_feed(
+        &self,
+        table: &Table,
+        cursor: LogCursor,
+        upper_bound: SequenceNumber,
+        opts: ScanOptions,
+    ) -> Result<ChangeStream, SnapshotTooOld> {
+        let Some(table_id) = self.resolve_table_id(table) else {
+            return Ok(Box::pin(stream::empty()));
+        };
+        if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        let table_handle = Table {
+            db: self.clone(),
+            name: Arc::from(table.name()),
+            id: Some(table_id),
+        };
+        let records = self
+            .inner
+            .commit_runtime
+            .lock()
+            .await
+            .scan_table_from_sequence(table_id, cursor.sequence())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "change capture scan failed for table {}: {error}",
+                    table.name()
+                )
+            });
+
+        let mut changes = Vec::new();
+        for record in records {
+            let sequence = record.sequence();
+            if sequence > upper_bound {
+                break;
+            }
+
+            for entry in record.entries {
+                if entry.table_id != table_id {
+                    continue;
+                }
+
+                let entry_cursor = LogCursor::new(sequence, entry.op_index);
+                if entry_cursor <= cursor {
+                    continue;
+                }
+
+                changes.push(ChangeEntry {
+                    key: entry.key,
+                    value: entry.value,
+                    cursor: entry_cursor,
+                    sequence,
+                    kind: entry.kind,
+                    table: table_handle.clone(),
+                });
+
+                if opts.limit.is_some_and(|limit| changes.len() >= limit) {
+                    return Ok(Box::pin(stream::iter(changes)));
+                }
+            }
+        }
+
+        Ok(Box::pin(stream::iter(changes)))
     }
 
     #[cfg(test)]
@@ -4886,12 +4982,12 @@ mod tests {
     use crate::{
         ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
         DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
-        FileSystemFailure, FileSystemOperation, MergeOperator, MergeOperatorRef, PendingWork,
-        PendingWorkType, PointMutation, ReadError, Rng, S3Location, S3PrimaryStorageConfig,
-        ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SequenceNumber, ShadowOracle,
-        SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng, TableConfig,
-        TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
-        TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
+        FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
+        PendingWork, PendingWorkType, PointMutation, ReadError, Rng, S3Location,
+        S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+        SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StorageError, StubClock,
+        StubObjectStore, StubRng, TableConfig, TableFormat, TableId, TableStats, ThrottleDecision,
+        TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -5377,6 +5473,48 @@ mod tests {
 
     async fn collect_rows(stream: crate::KvStream) -> Vec<(crate::Key, Value)> {
         stream.collect::<Vec<_>>().await
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct CollectedChange {
+        sequence: SequenceNumber,
+        cursor: LogCursor,
+        kind: ChangeKind,
+        key: crate::Key,
+        value: Option<Value>,
+        table: String,
+    }
+
+    async fn collect_changes(stream: crate::ChangeStream) -> Vec<CollectedChange> {
+        stream
+            .map(|entry| CollectedChange {
+                sequence: entry.sequence,
+                cursor: entry.cursor,
+                kind: entry.kind,
+                key: entry.key,
+                value: entry.value,
+                table: entry.table.name().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    fn collected_change(
+        sequence: u64,
+        op_index: u16,
+        kind: ChangeKind,
+        key: &[u8],
+        value: Option<Value>,
+        table: &str,
+    ) -> CollectedChange {
+        CollectedChange {
+            sequence: SequenceNumber::new(sequence),
+            cursor: LogCursor::new(SequenceNumber::new(sequence), op_index),
+            kind,
+            key: key.to_vec(),
+            value,
+            table: table.to_string(),
+        }
     }
 
     fn assert_snapshot_too_old(
@@ -9367,5 +9505,395 @@ mod tests {
         assert_eq!(s3_db.current_durable_sequence(), SequenceNumber::new(0));
         s3_db.flush().await.expect("flush s3");
         assert_eq!(s3_db.current_durable_sequence(), SequenceNumber::new(1));
+    }
+
+    #[tokio::test]
+    async fn scan_since_resumes_after_cursor_within_interleaved_batch() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/cdc-resume"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+        let audit = db
+            .create_table(row_table_config("audit"))
+            .await
+            .expect("create audit table");
+
+        let mut batch = db.write_batch();
+        batch.put(&events, b"user:1".to_vec(), bytes("v1"));
+        batch.put(&audit, b"audit:1".to_vec(), bytes("ignored"));
+        batch.delete(&events, b"user:2".to_vec());
+        batch.put(&events, b"user:3".to_vec(), bytes("v3"));
+        let first_sequence = db
+            .commit(batch, CommitOptions::default())
+            .await
+            .expect("commit interleaved batch");
+        let second_sequence = events
+            .write(b"user:4".to_vec(), bytes("v4"))
+            .await
+            .expect("write trailing event");
+
+        let all = collect_changes(
+            db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan all changes"),
+        )
+        .await;
+        assert_eq!(
+            all,
+            vec![
+                collected_change(
+                    1,
+                    0,
+                    ChangeKind::Put,
+                    b"user:1",
+                    Some(bytes("v1")),
+                    "events"
+                ),
+                collected_change(1, 2, ChangeKind::Delete, b"user:2", None, "events"),
+                collected_change(
+                    1,
+                    3,
+                    ChangeKind::Put,
+                    b"user:3",
+                    Some(bytes("v3")),
+                    "events"
+                ),
+                collected_change(
+                    second_sequence.get(),
+                    0,
+                    ChangeKind::Put,
+                    b"user:4",
+                    Some(bytes("v4")),
+                    "events",
+                ),
+            ]
+        );
+
+        let resumed = collect_changes(
+            db.scan_since(
+                &events,
+                LogCursor::new(first_sequence, 0),
+                ScanOptions::default(),
+            )
+            .await
+            .expect("resume after first entry"),
+        )
+        .await;
+        assert_eq!(
+            resumed,
+            vec![
+                collected_change(1, 2, ChangeKind::Delete, b"user:2", None, "events"),
+                collected_change(
+                    1,
+                    3,
+                    ChangeKind::Put,
+                    b"user:3",
+                    Some(bytes("v3")),
+                    "events"
+                ),
+                collected_change(
+                    second_sequence.get(),
+                    0,
+                    ChangeKind::Put,
+                    b"user:4",
+                    Some(bytes("v4")),
+                    "events",
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_change_scans_can_lead_durable_scans_in_deferred_mode() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config_with_durability(
+                "/cdc-visible-vs-durable",
+                TieredDurabilityMode::Deferred,
+            ),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open deferred db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let mut batch = db.write_batch();
+        batch.put(&events, b"user:1".to_vec(), bytes("v1"));
+        batch.delete(&events, b"user:2".to_vec());
+        let committed = db
+            .commit(batch, CommitOptions::default())
+            .await
+            .expect("commit deferred batch");
+
+        assert_eq!(db.current_sequence(), committed);
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+
+        let visible = collect_changes(
+            db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan visible changes"),
+        )
+        .await;
+        assert_eq!(
+            visible,
+            vec![
+                collected_change(
+                    1,
+                    0,
+                    ChangeKind::Put,
+                    b"user:1",
+                    Some(bytes("v1")),
+                    "events"
+                ),
+                collected_change(1, 1, ChangeKind::Delete, b"user:2", None, "events"),
+            ]
+        );
+        assert!(
+            visible
+                .iter()
+                .all(|change| change.sequence <= db.current_sequence())
+        );
+
+        let durable_before_flush = collect_changes(
+            db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan durable changes before flush"),
+        )
+        .await;
+        assert!(durable_before_flush.is_empty());
+
+        db.flush().await.expect("flush deferred changes");
+
+        let durable_after_flush = collect_changes(
+            db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan durable changes after flush"),
+        )
+        .await;
+        assert_eq!(durable_after_flush, visible);
+        assert!(
+            durable_after_flush
+                .iter()
+                .all(|change| change.sequence <= db.current_durable_sequence())
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_crash_recovery_hides_non_durable_change_feed_entries() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(
+            tiered_config_with_durability("/cdc-deferred-recovery", TieredDurabilityMode::Deferred),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open deferred db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        events
+            .write(b"user:1".to_vec(), bytes("volatile"))
+            .await
+            .expect("write volatile event");
+        assert_eq!(db.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+
+        file_system.crash();
+
+        let reopened = Db::open(
+            tiered_config_with_durability("/cdc-deferred-recovery", TieredDurabilityMode::Deferred),
+            dependencies,
+        )
+        .await
+        .expect("reopen deferred db");
+        let reopened_events = reopened.table("events");
+
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(0));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(0));
+        assert!(
+            collect_changes(
+                reopened
+                    .scan_since(
+                        &reopened_events,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("scan visible changes after crash"),
+            )
+            .await
+            .is_empty()
+        );
+        assert!(
+            collect_changes(
+                reopened
+                    .scan_durable_since(
+                        &reopened_events,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("scan durable changes after crash"),
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn change_feed_order_matches_committed_write_order_exactly_after_reopen() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/cdc-ordering"), dependencies.clone())
+            .await
+            .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+        let audit = db
+            .create_table(row_table_config("audit"))
+            .await
+            .expect("create audit table");
+
+        let mut expected = Vec::new();
+
+        let mut first = db.write_batch();
+        first.put(&events, b"apple".to_vec(), bytes("v1"));
+        first.put(&audit, b"audit:1".to_vec(), bytes("ignore-1"));
+        first.delete(&events, b"banana".to_vec());
+        let first_sequence = db
+            .commit(first, CommitOptions::default())
+            .await
+            .expect("commit first batch");
+        expected.push(collected_change(
+            first_sequence.get(),
+            0,
+            ChangeKind::Put,
+            b"apple",
+            Some(bytes("v1")),
+            "events",
+        ));
+        expected.push(collected_change(
+            first_sequence.get(),
+            2,
+            ChangeKind::Delete,
+            b"banana",
+            None,
+            "events",
+        ));
+
+        db.flush().await.expect("flush after first batch");
+
+        let mut second = db.write_batch();
+        second.put(&audit, b"audit:2".to_vec(), bytes("ignore-2"));
+        second.put(&events, b"carrot".to_vec(), bytes("v3"));
+        let second_sequence = db
+            .commit(second, CommitOptions::default())
+            .await
+            .expect("commit second batch");
+        expected.push(collected_change(
+            second_sequence.get(),
+            1,
+            ChangeKind::Put,
+            b"carrot",
+            Some(bytes("v3")),
+            "events",
+        ));
+
+        let mut third = db.write_batch();
+        third.put(&events, b"apple".to_vec(), bytes("v2"));
+        third.delete(&audit, b"audit:1".to_vec());
+        third.delete(&events, b"carrot".to_vec());
+        let third_sequence = db
+            .commit(third, CommitOptions::default())
+            .await
+            .expect("commit third batch");
+        expected.push(collected_change(
+            third_sequence.get(),
+            0,
+            ChangeKind::Put,
+            b"apple",
+            Some(bytes("v2")),
+            "events",
+        ));
+        expected.push(collected_change(
+            third_sequence.get(),
+            2,
+            ChangeKind::Delete,
+            b"carrot",
+            None,
+            "events",
+        ));
+
+        file_system.crash();
+
+        let reopened = Db::open(tiered_config("/cdc-ordering"), dependencies)
+            .await
+            .expect("reopen db");
+        let reopened_events = reopened.table("events");
+
+        let actual = collect_changes(
+            reopened
+                .scan_since(
+                    &reopened_events,
+                    LogCursor::beginning(),
+                    ScanOptions::default(),
+                )
+                .await
+                .expect("scan all reopened changes"),
+        )
+        .await;
+        assert_eq!(actual, expected);
+
+        let first_page = collect_changes(
+            reopened
+                .scan_since(
+                    &reopened_events,
+                    LogCursor::beginning(),
+                    ScanOptions {
+                        limit: Some(2),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("scan first page"),
+        )
+        .await;
+        assert_eq!(first_page, expected[..2].to_vec());
+
+        let resumed = collect_changes(
+            reopened
+                .scan_since(
+                    &reopened_events,
+                    first_page
+                        .last()
+                        .expect("first page should contain entries")
+                        .cursor,
+                    ScanOptions::default(),
+                )
+                .await
+                .expect("resume after first page"),
+        )
+        .await;
+        assert_eq!(resumed, expected[2..].to_vec());
     }
 }
