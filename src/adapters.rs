@@ -263,6 +263,20 @@ impl FileSystem for TokioFileSystem {
         .await
     }
 
+    async fn sync_dir(&self, path: &str) -> Result<(), StorageError> {
+        let path = path.to_string();
+        run_blocking("sync directory", path.clone(), move || {
+            fs::create_dir_all(&path)
+                .map_err(|error| map_io_error("create directory", &path, error))?;
+            let dir = fs::File::open(&path)
+                .map_err(|error| map_io_error("open directory", &path, error))?;
+            dir.sync_all()
+                .map_err(|error| map_io_error("sync directory", &path, error))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
         let from = from.to_string();
         let to = to.to_string();
@@ -575,6 +589,7 @@ pub enum FileSystemOperation {
     WriteAt,
     ReadAt,
     Sync,
+    SyncDir,
     Rename,
     Delete,
     List,
@@ -802,6 +817,34 @@ impl FileSystem for SimulatedFileSystem {
                 StorageError::not_found(format!("missing file: {}", handle.path()))
             })?;
         state.durable.insert(handle.path().to_string(), bytes);
+        Ok(())
+    }
+
+    async fn sync_dir(&self, path: &str) -> Result<(), StorageError> {
+        let mut state = lock(&self.state);
+        Self::maybe_fail(&mut state, FileSystemOperation::SyncDir, path)?;
+
+        let prefix = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{path}/")
+        };
+
+        state
+            .durable
+            .retain(|candidate, _| !(candidate == path || candidate.starts_with(&prefix)));
+
+        let live_entries = state
+            .live
+            .iter()
+            .filter(|(candidate, _)| *candidate == path || candidate.starts_with(&prefix))
+            .map(|(candidate, bytes)| (candidate.clone(), bytes.clone()))
+            .collect::<Vec<_>>();
+
+        for (candidate, bytes) in live_entries {
+            state.durable.insert(candidate, bytes);
+        }
+
         Ok(())
     }
 

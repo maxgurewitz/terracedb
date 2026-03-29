@@ -44,6 +44,7 @@ pub trait FileSystem: Send + Sync {
         len: usize,
     ) -> Result<Vec<u8>, StorageError>;
     async fn sync(&self, handle: &FileHandle) -> Result<(), StorageError>;
+    async fn sync_dir(&self, path: &str) -> Result<(), StorageError>;
     async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError>;
     async fn delete(&self, path: &str) -> Result<(), StorageError>;
     async fn list(&self, dir: &str) -> Result<Vec<String>, StorageError>;

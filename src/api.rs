@@ -27,7 +27,7 @@ use crate::{
         CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
         StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
     },
-    ids::{CommitId, FieldId, LogCursor, SequenceNumber, TableId},
+    ids::{CommitId, FieldId, LogCursor, ManifestId, SequenceNumber, TableId},
     io::{DbDependencies, OpenOptions},
     scheduler::{PendingWork, TableStats},
 };
@@ -88,7 +88,8 @@ impl Value {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ChangeKind {
     Put,
     Delete,
@@ -240,6 +241,13 @@ const LOCAL_CATALOG_RELATIVE_PATH: &str = "catalog/CATALOG.json";
 const LOCAL_CATALOG_TEMP_SUFFIX: &str = ".tmp";
 const LOCAL_COMMIT_LOG_RELATIVE_DIR: &str = "commitlog";
 const OBJECT_CATALOG_RELATIVE_KEY: &str = "catalog/CATALOG.json";
+const LOCAL_CURRENT_RELATIVE_PATH: &str = "CURRENT";
+const LOCAL_MANIFEST_DIR_RELATIVE_PATH: &str = "manifest";
+const LOCAL_MANIFEST_TEMP_SUFFIX: &str = ".tmp";
+const LOCAL_SSTABLE_RELATIVE_DIR: &str = "sst";
+const LOCAL_SSTABLE_SHARD_DIR: &str = "0000";
+const MANIFEST_FORMAT_VERSION: u32 = 1;
+const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
 const MVCC_KEY_SEPARATOR: u8 = 0;
 
 #[derive(Clone)]
@@ -261,6 +269,8 @@ struct DbInner {
     current_durable_sequence: AtomicU64,
     tables: RwLock<BTreeMap<String, StoredTable>>,
     memtables: RwLock<MemtableState>,
+    sstables: RwLock<SstableState>,
+    next_sstable_id: AtomicU64,
     snapshot_tracker: Mutex<SnapshotTracker>,
     next_snapshot_id: AtomicU64,
     visible_watchers: Mutex<BTreeMap<String, watch::Sender<SequenceNumber>>>,
@@ -301,6 +311,83 @@ struct PersistedTableConfig {
     compaction_strategy: CompactionStrategy,
     schema: Option<SchemaDefinition>,
     metadata: TableMetadata,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SstableState {
+    manifest_generation: ManifestId,
+    last_flushed_sequence: SequenceNumber,
+    live: Vec<ResidentRowSstable>,
+}
+
+#[derive(Clone, Debug)]
+struct ResidentRowSstable {
+    meta: PersistedManifestSstable,
+    rows: Vec<SstableRow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedManifestSstable {
+    table_id: TableId,
+    level: u32,
+    local_id: String,
+    file_path: String,
+    length: u64,
+    checksum: u32,
+    data_checksum: u32,
+    min_key: Key,
+    max_key: Key,
+    min_sequence: SequenceNumber,
+    max_sequence: SequenceNumber,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LoadedManifest {
+    generation: ManifestId,
+    last_flushed_sequence: SequenceNumber,
+    live_sstables: Vec<ResidentRowSstable>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedManifestBody {
+    format_version: u32,
+    generation: ManifestId,
+    last_flushed_sequence: SequenceNumber,
+    sstables: Vec<PersistedManifestSstable>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedManifestFile {
+    body: PersistedManifestBody,
+    checksum: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedRowSstableBody {
+    format_version: u32,
+    table_id: TableId,
+    level: u32,
+    local_id: String,
+    min_key: Key,
+    max_key: Key,
+    min_sequence: SequenceNumber,
+    max_sequence: SequenceNumber,
+    rows: Vec<SstableRow>,
+    data_checksum: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedRowSstableFile {
+    body: PersistedRowSstableBody,
+    checksum: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SstableRow {
+    key: Key,
+    sequence: SequenceNumber,
+    kind: ChangeKind,
+    value: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -490,13 +577,6 @@ impl MemtableEntry {
             size_bytes,
         }
     }
-
-    fn visible_value(&self) -> Option<Value> {
-        match self.kind {
-            ChangeKind::Delete => None,
-            ChangeKind::Put | ChangeKind::Merge => self.value.clone(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -587,9 +667,94 @@ impl Memtable {
             .unwrap_or(false)
     }
 
-    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.tables.values().all(TableMemtable::is_empty)
+    }
+}
+
+impl SstableRow {
+    fn visible_value(&self) -> Option<Value> {
+        match self.kind {
+            ChangeKind::Delete => None,
+            ChangeKind::Put | ChangeKind::Merge => self.value.clone(),
+        }
+    }
+}
+
+impl SstableState {
+    fn read_at(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<SstableRow> {
+        let mut best: Option<SstableRow> = None;
+
+        for sstable in &self.live {
+            if sstable.meta.table_id != table_id
+                || key < sstable.meta.min_key.as_slice()
+                || key > sstable.meta.max_key.as_slice()
+                || sequence < sstable.meta.min_sequence
+            {
+                continue;
+            }
+
+            let candidate = sstable
+                .rows
+                .iter()
+                .filter(|row| row.key.as_slice() == key && row.sequence <= sequence)
+                .max_by_key(|row| row.sequence);
+            let Some(candidate) = candidate.cloned() else {
+                continue;
+            };
+
+            let replace = match best.as_ref() {
+                Some(current) => candidate.sequence > current.sequence,
+                None => true,
+            };
+            if replace {
+                best = Some(candidate);
+            }
+        }
+
+        best
+    }
+
+    fn collect_matching_keys(
+        &self,
+        table_id: TableId,
+        matcher: &KeyMatcher<'_>,
+        keys: &mut BTreeSet<Key>,
+    ) {
+        for sstable in &self.live {
+            if sstable.meta.table_id != table_id {
+                continue;
+            }
+
+            for row in &sstable.rows {
+                if matcher.matches(&row.key) {
+                    keys.insert(row.key.clone());
+                }
+            }
+        }
+    }
+
+    fn table_stats(&self, table_id: TableId) -> (u32, u64, u64) {
+        let matching = self
+            .live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table_id)
+            .collect::<Vec<_>>();
+
+        let l0_count = matching
+            .iter()
+            .filter(|sstable| sstable.meta.level == 0)
+            .count() as u32;
+        let local_bytes = matching
+            .iter()
+            .map(|sstable| sstable.meta.length)
+            .sum::<u64>();
+        (l0_count, local_bytes, local_bytes)
     }
 }
 
@@ -644,51 +809,20 @@ impl MemtableState {
         best
     }
 
-    fn scan(
+    fn collect_matching_keys(
         &self,
         table_id: TableId,
-        sequence: SequenceNumber,
-        matcher: KeyMatcher<'_>,
-        opts: &ScanOptions,
-    ) -> Vec<(Key, Value)> {
-        let limit = opts.limit.unwrap_or(usize::MAX);
-        if limit == 0 {
-            return Vec::new();
-        }
-
-        let mut keys = BTreeSet::new();
-        self.mutable
-            .collect_matching_keys(table_id, &matcher, &mut keys);
+        matcher: &KeyMatcher<'_>,
+        keys: &mut BTreeSet<Key>,
+    ) {
+        self.mutable.collect_matching_keys(table_id, matcher, keys);
         for immutable in &self.immutables {
             immutable
                 .memtable
-                .collect_matching_keys(table_id, &matcher, &mut keys);
+                .collect_matching_keys(table_id, matcher, keys);
         }
-
-        let mut ordered_keys = keys.into_iter().collect::<Vec<_>>();
-        if opts.reverse {
-            ordered_keys.reverse();
-        }
-
-        let mut rows = Vec::new();
-        for key in ordered_keys {
-            let Some(entry) = self.read_at(table_id, &key, sequence) else {
-                continue;
-            };
-            let Some(value) = entry.visible_value() else {
-                continue;
-            };
-
-            rows.push((key, value));
-            if rows.len() >= limit {
-                break;
-            }
-        }
-
-        rows
     }
 
-    #[cfg(test)]
     fn rotate_mutable(&mut self) -> Option<SequenceNumber> {
         if self.mutable.is_empty() {
             return None;
@@ -886,6 +1020,16 @@ impl Db {
         let catalog_location = Self::catalog_location(&config.storage);
         let (tables, next_table_id) = Self::load_tables(&dependencies, &catalog_location).await?;
         let commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
+        let loaded_manifest = Self::load_local_manifest(&config.storage, &dependencies).await?;
+        let recovered_sequence = loaded_manifest.last_flushed_sequence;
+        let next_sstable_id = loaded_manifest
+            .live_sstables
+            .iter()
+            .filter_map(|sstable| Self::parse_sstable_local_id(&sstable.meta.local_id))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -897,11 +1041,17 @@ impl Db {
                 commit_runtime: AsyncMutex::new(commit_runtime),
                 commit_coordinator: Mutex::new(CommitCoordinator::default()),
                 next_table_id: AtomicU32::new(next_table_id),
-                next_sequence: AtomicU64::new(0),
-                current_sequence: AtomicU64::new(0),
-                current_durable_sequence: AtomicU64::new(0),
+                next_sequence: AtomicU64::new(recovered_sequence.get()),
+                current_sequence: AtomicU64::new(recovered_sequence.get()),
+                current_durable_sequence: AtomicU64::new(recovered_sequence.get()),
                 tables: RwLock::new(tables),
                 memtables: RwLock::new(MemtableState::default()),
+                sstables: RwLock::new(SstableState {
+                    manifest_generation: loaded_manifest.generation,
+                    last_flushed_sequence: loaded_manifest.last_flushed_sequence,
+                    live: loaded_manifest.live_sstables,
+                }),
+                next_sstable_id: AtomicU64::new(next_sstable_id),
                 snapshot_tracker: Mutex::new(SnapshotTracker::default()),
                 next_snapshot_id: AtomicU64::new(0),
                 visible_watchers: Mutex::new(BTreeMap::new()),
@@ -1205,6 +1355,524 @@ impl Db {
         }
     }
 
+    fn local_storage_root_for(storage: &StorageConfig) -> Option<&str> {
+        match storage {
+            StorageConfig::Tiered(config) => Some(config.ssd.path.as_str()),
+            StorageConfig::S3Primary(_) => None,
+        }
+    }
+
+    fn local_storage_root(&self) -> Option<&str> {
+        Self::local_storage_root_for(&self.inner.config.storage)
+    }
+
+    fn local_current_path(root: &str) -> String {
+        Self::join_fs_path(root, LOCAL_CURRENT_RELATIVE_PATH)
+    }
+
+    fn local_manifest_dir(root: &str) -> String {
+        Self::join_fs_path(root, LOCAL_MANIFEST_DIR_RELATIVE_PATH)
+    }
+
+    fn manifest_filename(generation: ManifestId) -> String {
+        format!("MANIFEST-{:06}", generation.get())
+    }
+
+    fn local_manifest_path(root: &str, generation: ManifestId) -> String {
+        Self::join_fs_path(
+            root,
+            &format!(
+                "{LOCAL_MANIFEST_DIR_RELATIVE_PATH}/{}",
+                Self::manifest_filename(generation)
+            ),
+        )
+    }
+
+    fn local_sstable_path(root: &str, table_id: TableId, local_id: &str) -> String {
+        Self::join_fs_path(
+            root,
+            &format!(
+                "{LOCAL_SSTABLE_RELATIVE_DIR}/table-{:06}/{LOCAL_SSTABLE_SHARD_DIR}/{local_id}.sst",
+                table_id.get()
+            ),
+        )
+    }
+
+    fn parse_manifest_generation(path: &str) -> Option<ManifestId> {
+        let path_buf = PathBuf::from(path);
+        let file_name = path_buf.file_name()?.to_str()?;
+        let suffix = file_name.strip_prefix("MANIFEST-")?;
+        if suffix.is_empty() || suffix.contains('.') {
+            return None;
+        }
+        suffix.parse::<u64>().ok().map(ManifestId::new)
+    }
+
+    fn parse_sstable_local_id(local_id: &str) -> Option<u64> {
+        local_id.strip_prefix("SST-")?.parse::<u64>().ok()
+    }
+
+    async fn load_local_manifest(
+        storage: &StorageConfig,
+        dependencies: &DbDependencies,
+    ) -> Result<LoadedManifest, OpenError> {
+        let Some(root) = Self::local_storage_root_for(storage) else {
+            return Ok(LoadedManifest::default());
+        };
+
+        let current_path = Self::local_current_path(root);
+        let manifest_dir = Self::local_manifest_dir(root);
+        let mut candidates = Vec::new();
+
+        if let Some(pointer) = read_optional_path(dependencies, &current_path).await? {
+            let pointer = String::from_utf8(pointer).map_err(|error| {
+                OpenError::Storage(StorageError::corruption(format!(
+                    "decode CURRENT pointer failed: {error}"
+                )))
+            })?;
+            let pointer = pointer.trim();
+            if !pointer.is_empty() {
+                candidates.push(Self::join_fs_path(
+                    root,
+                    &format!("{LOCAL_MANIFEST_DIR_RELATIVE_PATH}/{pointer}"),
+                ));
+            }
+        }
+
+        let mut listed = dependencies.file_system.list(&manifest_dir).await?;
+        listed.retain(|path| Self::parse_manifest_generation(path).is_some());
+        listed.sort_by_key(|path| {
+            std::cmp::Reverse(
+                Self::parse_manifest_generation(path)
+                    .map(ManifestId::get)
+                    .unwrap_or_default(),
+            )
+        });
+        for path in listed {
+            if !candidates.iter().any(|candidate| candidate == &path) {
+                candidates.push(path);
+            }
+        }
+
+        let mut saw_manifest = false;
+        let mut last_error = None;
+        for path in candidates {
+            saw_manifest = true;
+            match Self::read_manifest_at_path(dependencies, &path).await {
+                Ok(manifest) => return Ok(manifest),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if saw_manifest {
+            Err(OpenError::Storage(last_error.unwrap_or_else(|| {
+                StorageError::corruption("no valid manifest generation found")
+            })))
+        } else {
+            Ok(LoadedManifest::default())
+        }
+    }
+
+    async fn read_manifest_at_path(
+        dependencies: &DbDependencies,
+        path: &str,
+    ) -> Result<LoadedManifest, StorageError> {
+        let bytes = read_path(dependencies, path).await?;
+        let file: PersistedManifestFile = serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!("decode manifest {path} failed: {error}"))
+        })?;
+
+        if file.body.format_version != MANIFEST_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported manifest version {}",
+                file.body.format_version
+            )));
+        }
+
+        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
+            StorageError::corruption(format!("encode manifest body failed: {error}"))
+        })?;
+        if checksum32(&encoded_body) != file.checksum {
+            return Err(StorageError::corruption(format!(
+                "manifest checksum mismatch for {path}"
+            )));
+        }
+
+        let mut live_sstables = Vec::with_capacity(file.body.sstables.len());
+        let mut max_sequence = SequenceNumber::new(0);
+        for sstable in &file.body.sstables {
+            max_sequence = max_sequence.max(sstable.max_sequence);
+            live_sstables.push(Self::load_resident_sstable(dependencies, sstable).await?);
+        }
+
+        if max_sequence > file.body.last_flushed_sequence {
+            return Err(StorageError::corruption(format!(
+                "manifest {path} flush watermark is behind referenced SSTables"
+            )));
+        }
+
+        Ok(LoadedManifest {
+            generation: file.body.generation,
+            last_flushed_sequence: file.body.last_flushed_sequence,
+            live_sstables,
+        })
+    }
+
+    async fn load_resident_sstable(
+        dependencies: &DbDependencies,
+        meta: &PersistedManifestSstable,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let bytes = read_path(dependencies, &meta.file_path).await?;
+        if bytes.len() as u64 != meta.length {
+            return Err(StorageError::corruption(format!(
+                "sstable {} length mismatch: manifest={}, file={}",
+                meta.file_path,
+                meta.length,
+                bytes.len()
+            )));
+        }
+
+        let file: PersistedRowSstableFile = serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!("decode SSTable {} failed: {error}", meta.file_path))
+        })?;
+        if file.body.format_version != ROW_SSTABLE_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported SSTable version {}",
+                file.body.format_version
+            )));
+        }
+
+        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
+            StorageError::corruption(format!("encode SSTable body failed: {error}"))
+        })?;
+        if checksum32(&encoded_body) != file.checksum || file.checksum != meta.checksum {
+            return Err(StorageError::corruption(format!(
+                "SSTable checksum mismatch for {}",
+                meta.file_path
+            )));
+        }
+
+        let rows_bytes = serde_json::to_vec(&file.body.rows).map_err(|error| {
+            StorageError::corruption(format!("encode SSTable rows failed: {error}"))
+        })?;
+        if checksum32(&rows_bytes) != file.body.data_checksum
+            || file.body.data_checksum != meta.data_checksum
+        {
+            return Err(StorageError::corruption(format!(
+                "SSTable data checksum mismatch for {}",
+                meta.file_path
+            )));
+        }
+
+        if file.body.table_id != meta.table_id
+            || file.body.level != meta.level
+            || file.body.local_id != meta.local_id
+            || file.body.min_key != meta.min_key
+            || file.body.max_key != meta.max_key
+            || file.body.min_sequence != meta.min_sequence
+            || file.body.max_sequence != meta.max_sequence
+        {
+            return Err(StorageError::corruption(format!(
+                "manifest metadata does not match SSTable {}",
+                meta.file_path
+            )));
+        }
+
+        let computed = Self::summarize_sstable_rows(
+            meta.table_id,
+            meta.level,
+            &meta.local_id,
+            &file.body.rows,
+        )?;
+        if computed.min_key != meta.min_key
+            || computed.max_key != meta.max_key
+            || computed.min_sequence != meta.min_sequence
+            || computed.max_sequence != meta.max_sequence
+        {
+            return Err(StorageError::corruption(format!(
+                "SSTable row summary does not match metadata for {}",
+                meta.file_path
+            )));
+        }
+
+        Ok(ResidentRowSstable {
+            meta: meta.clone(),
+            rows: file.body.rows,
+        })
+    }
+
+    fn summarize_sstable_rows(
+        table_id: TableId,
+        level: u32,
+        local_id: &str,
+        rows: &[SstableRow],
+    ) -> Result<PersistedManifestSstable, StorageError> {
+        let min_key = rows
+            .iter()
+            .map(|row| row.key.clone())
+            .min()
+            .ok_or_else(|| StorageError::unsupported("cannot build an empty SSTable"))?;
+        let max_key = rows
+            .iter()
+            .map(|row| row.key.clone())
+            .max()
+            .expect("max key");
+        let min_sequence = rows
+            .iter()
+            .map(|row| row.sequence)
+            .min()
+            .expect("min sequence");
+        let max_sequence = rows
+            .iter()
+            .map(|row| row.sequence)
+            .max()
+            .expect("max sequence");
+
+        Ok(PersistedManifestSstable {
+            table_id,
+            level,
+            local_id: local_id.to_string(),
+            file_path: String::new(),
+            length: 0,
+            checksum: 0,
+            data_checksum: 0,
+            min_key,
+            max_key,
+            min_sequence,
+            max_sequence,
+        })
+    }
+
+    async fn flush_immutable(
+        &self,
+        local_root: &str,
+        immutable: &ImmutableMemtable,
+    ) -> Result<Vec<ResidentRowSstable>, FlushError> {
+        let mut outputs = Vec::new();
+        let tables = self.tables_read().clone();
+
+        for (&table_id, table_memtable) in &immutable.memtable.tables {
+            if table_memtable.is_empty() {
+                continue;
+            }
+
+            let stored = tables
+                .values()
+                .find(|table| table.id == table_id)
+                .cloned()
+                .ok_or_else(|| {
+                    FlushError::Storage(StorageError::corruption(format!(
+                        "flush references unknown table id {}",
+                        table_id.get()
+                    )))
+                })?;
+
+            if stored.config.format != TableFormat::Row {
+                return Err(FlushError::Unimplemented(
+                    "columnar flush path is implemented in T25",
+                ));
+            }
+
+            let rows = table_memtable
+                .entries
+                .values()
+                .map(|entry| SstableRow {
+                    key: entry.user_key.clone(),
+                    sequence: entry.sequence,
+                    kind: entry.kind,
+                    value: entry.value.clone(),
+                })
+                .collect::<Vec<_>>();
+            let local_id = format!(
+                "SST-{:06}",
+                self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
+            );
+            let path = Self::local_sstable_path(local_root, table_id, &local_id);
+            outputs.push(
+                self.write_row_sstable(&path, table_id, 0, local_id, rows)
+                    .await?,
+            );
+        }
+
+        Ok(outputs)
+    }
+
+    async fn write_row_sstable(
+        &self,
+        path: &str,
+        table_id: TableId,
+        level: u32,
+        local_id: String,
+        rows: Vec<SstableRow>,
+    ) -> Result<ResidentRowSstable, FlushError> {
+        let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
+        let rows_bytes = serde_json::to_vec(&rows).map_err(|error| {
+            FlushError::Storage(StorageError::corruption(format!(
+                "encode SSTable rows failed: {error}"
+            )))
+        })?;
+        let data_checksum = checksum32(&rows_bytes);
+
+        let body = PersistedRowSstableBody {
+            format_version: ROW_SSTABLE_FORMAT_VERSION,
+            table_id,
+            level,
+            local_id: local_id.clone(),
+            min_key: meta.min_key.clone(),
+            max_key: meta.max_key.clone(),
+            min_sequence: meta.min_sequence,
+            max_sequence: meta.max_sequence,
+            rows: rows.clone(),
+            data_checksum,
+        };
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
+            FlushError::Storage(StorageError::corruption(format!(
+                "encode SSTable body failed: {error}"
+            )))
+        })?;
+        let checksum = checksum32(&encoded_body);
+        let file = PersistedRowSstableFile { body, checksum };
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|error| {
+            FlushError::Storage(StorageError::corruption(format!(
+                "encode SSTable file failed: {error}"
+            )))
+        })?;
+
+        let handle = self
+            .inner
+            .dependencies
+            .file_system
+            .open(
+                path,
+                OpenOptions {
+                    create: true,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .write_at(&handle, 0, &bytes)
+            .await?;
+        self.inner.dependencies.file_system.sync(&handle).await?;
+
+        meta.file_path = path.to_string();
+        meta.length = bytes.len() as u64;
+        meta.checksum = checksum;
+        meta.data_checksum = data_checksum;
+
+        Ok(ResidentRowSstable { meta, rows })
+    }
+
+    async fn install_manifest(
+        &self,
+        generation: ManifestId,
+        last_flushed_sequence: SequenceNumber,
+        live: &[ResidentRowSstable],
+    ) -> Result<(), FlushError> {
+        let root = self.local_storage_root().ok_or(FlushError::Unimplemented(
+            "local manifest is only used in tiered mode",
+        ))?;
+        let manifest_dir = Self::local_manifest_dir(root);
+        let manifest_path = Self::local_manifest_path(root, generation);
+        let manifest_temp_path = format!("{manifest_path}{LOCAL_MANIFEST_TEMP_SUFFIX}");
+        let body = PersistedManifestBody {
+            format_version: MANIFEST_FORMAT_VERSION,
+            generation,
+            last_flushed_sequence,
+            sstables: live.iter().map(|sstable| sstable.meta.clone()).collect(),
+        };
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
+            FlushError::Storage(StorageError::corruption(format!(
+                "encode manifest body failed: {error}"
+            )))
+        })?;
+        let checksum = checksum32(&encoded_body);
+        let payload = serde_json::to_vec_pretty(&PersistedManifestFile { body, checksum })
+            .map_err(|error| {
+                FlushError::Storage(StorageError::corruption(format!(
+                    "encode manifest file failed: {error}"
+                )))
+            })?;
+
+        let manifest_handle = self
+            .inner
+            .dependencies
+            .file_system
+            .open(
+                &manifest_temp_path,
+                OpenOptions {
+                    create: true,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .write_at(&manifest_handle, 0, &payload)
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .sync(&manifest_handle)
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .rename(&manifest_temp_path, &manifest_path)
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .sync_dir(&manifest_dir)
+            .await?;
+
+        let current_path = Self::local_current_path(root);
+        let current_temp_path = format!("{current_path}{LOCAL_CATALOG_TEMP_SUFFIX}");
+        let current_payload = format!("{}\n", Self::manifest_filename(generation)).into_bytes();
+        let current_handle = self
+            .inner
+            .dependencies
+            .file_system
+            .open(
+                &current_temp_path,
+                OpenOptions {
+                    create: true,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .write_at(&current_handle, 0, &current_payload)
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .sync(&current_handle)
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .rename(&current_temp_path, &current_path)
+            .await?;
+        self.inner.dependencies.file_system.sync_dir(root).await?;
+
+        Ok(())
+    }
+
     pub fn table(&self, name: impl Into<String>) -> Table {
         let name = name.into();
         let id = self.tables_read().get(&name).map(|table| table.id);
@@ -1347,15 +2015,73 @@ impl Db {
     }
 
     pub async fn flush(&self) -> Result<(), FlushError> {
-        self.inner
-            .commit_runtime
-            .lock()
-            .await
-            .sync()
-            .await
-            .map_err(FlushError::Storage)?;
-        self.mark_all_commits_durable();
-        self.publish_watermarks();
+        let local_root = self.local_storage_root().map(str::to_string);
+        let immutables = {
+            let _commit_guard = self.inner.commit_lock.lock().await;
+            if local_root.is_some() {
+                self.memtables_write().rotate_mutable();
+            }
+
+            self.inner
+                .commit_runtime
+                .lock()
+                .await
+                .sync()
+                .await
+                .map_err(FlushError::Storage)?;
+            self.mark_all_commits_durable();
+            self.publish_watermarks();
+
+            if local_root.is_some() {
+                self.memtables_read().immutables.clone()
+            } else {
+                return Ok(());
+            }
+        };
+
+        let local_root = local_root.expect("local storage root should exist");
+        let mut flushed_count = 0_usize;
+        let mut sstable_state = self.sstables_read().clone();
+        let mut new_live = sstable_state.live.clone();
+        let mut manifest_generation = sstable_state.manifest_generation;
+
+        for immutable in &immutables {
+            let outputs = self.flush_immutable(&local_root, immutable).await?;
+            if outputs.is_empty() {
+                flushed_count += 1;
+                continue;
+            }
+
+            new_live.extend(outputs);
+            new_live.sort_by_key(|sstable| {
+                (
+                    sstable.meta.table_id.get(),
+                    sstable.meta.min_sequence.get(),
+                    sstable.meta.local_id.clone(),
+                )
+            });
+            manifest_generation = ManifestId::new(manifest_generation.get().saturating_add(1));
+            self.install_manifest(manifest_generation, immutable.max_sequence, &new_live)
+                .await?;
+            flushed_count += 1;
+        }
+
+        if flushed_count > 0 {
+            let mut memtables = self.memtables_write();
+            memtables.immutables.drain(0..flushed_count);
+
+            sstable_state.live = new_live;
+            sstable_state.manifest_generation = manifest_generation;
+            sstable_state.last_flushed_sequence = sstable_state.last_flushed_sequence.max(
+                immutables
+                    .iter()
+                    .take(flushed_count)
+                    .map(|immutable| immutable.max_sequence)
+                    .max()
+                    .unwrap_or_default(),
+            );
+            *self.sstables_write() = sstable_state;
+        }
 
         Ok(())
     }
@@ -1408,18 +2134,32 @@ impl Db {
             .get(table.name())
             .map(|table| table.config.metadata.clone())
             .unwrap_or_default();
-        let (pending_flush_bytes, immutable_memtable_count) = table
+        let (
+            l0_sstable_count,
+            total_bytes,
+            local_bytes,
+            pending_flush_bytes,
+            immutable_memtable_count,
+        ) = table
             .resolve_id()
             .map(|table_id| {
                 let memtables = self.memtables_read();
+                let sstables = self.sstables_read();
+                let (l0_sstable_count, total_bytes, local_bytes) = sstables.table_stats(table_id);
                 (
+                    l0_sstable_count,
+                    total_bytes,
+                    local_bytes,
                     memtables.pending_flush_bytes(table_id),
                     memtables.immutable_memtable_count(table_id),
                 )
             })
-            .unwrap_or_default();
+            .unwrap_or((0, 0, 0, 0, 0));
 
         TableStats {
+            l0_sstable_count,
+            total_bytes,
+            local_bytes,
             pending_flush_bytes,
             immutable_memtable_count,
             metadata,
@@ -1860,26 +2600,88 @@ impl Db {
             .or_else(|| self.tables_read().get(table.name()).map(|stored| stored.id))
     }
 
-    fn read_memtable_value(
+    fn read_visible_value(
         &self,
         table_id: TableId,
         key: &[u8],
         sequence: SequenceNumber,
     ) -> Option<Value> {
-        self.memtables_read()
-            .read_at(table_id, key, sequence)
+        self.read_visible_entry(table_id, key, sequence)
             .and_then(|entry| entry.visible_value())
     }
 
-    fn scan_memtable(
+    fn read_visible_entry(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<SstableRow> {
+        let memtable_best = self.memtables_read().read_at(table_id, key, sequence);
+        let sstable_best = self.sstables_read().read_at(table_id, key, sequence);
+
+        match (memtable_best, sstable_best) {
+            (Some(memtable), Some(sstable)) => {
+                if memtable.sequence >= sstable.sequence {
+                    Some(SstableRow {
+                        key: memtable.user_key,
+                        sequence: memtable.sequence,
+                        kind: memtable.kind,
+                        value: memtable.value,
+                    })
+                } else {
+                    Some(sstable)
+                }
+            }
+            (Some(memtable), None) => Some(SstableRow {
+                key: memtable.user_key,
+                sequence: memtable.sequence,
+                kind: memtable.kind,
+                value: memtable.value,
+            }),
+            (None, Some(sstable)) => Some(sstable),
+            (None, None) => None,
+        }
+    }
+
+    fn scan_visible(
         &self,
         table_id: TableId,
         sequence: SequenceNumber,
         matcher: KeyMatcher<'_>,
         opts: &ScanOptions,
     ) -> Vec<(Key, Value)> {
+        let limit = opts.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut keys = BTreeSet::new();
         self.memtables_read()
-            .scan(table_id, sequence, matcher, opts)
+            .collect_matching_keys(table_id, &matcher, &mut keys);
+        self.sstables_read()
+            .collect_matching_keys(table_id, &matcher, &mut keys);
+
+        let mut ordered_keys = keys.into_iter().collect::<Vec<_>>();
+        if opts.reverse {
+            ordered_keys.reverse();
+        }
+
+        let mut rows = Vec::new();
+        for key in ordered_keys {
+            let Some(entry) = self.read_visible_entry(table_id, &key, sequence) else {
+                continue;
+            };
+            let Some(value) = entry.visible_value() else {
+                continue;
+            };
+
+            rows.push((key, value));
+            if rows.len() >= limit {
+                break;
+            }
+        }
+
+        rows
     }
 
     fn release_snapshot_registration(&self, id: u64) {
@@ -1933,6 +2735,20 @@ impl Db {
             .memtables
             .write()
             .expect("db memtable lock poisoned")
+    }
+
+    fn sstables_read(&self) -> RwLockReadGuard<'_, SstableState> {
+        self.inner
+            .sstables
+            .read()
+            .expect("db sstable lock poisoned")
+    }
+
+    fn sstables_write(&self) -> RwLockWriteGuard<'_, SstableState> {
+        self.inner
+            .sstables
+            .write()
+            .expect("db sstable lock poisoned")
     }
 }
 
@@ -2011,7 +2827,7 @@ impl Table {
             return Ok(None);
         };
 
-        Ok(self.db.read_memtable_value(table_id, &key, sequence))
+        Ok(self.db.read_visible_value(table_id, &key, sequence))
     }
 
     pub async fn scan_at(
@@ -2025,7 +2841,7 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         };
 
-        let rows = self.db.scan_memtable(
+        let rows = self.db.scan_visible(
             table_id,
             sequence,
             KeyMatcher::Range {
@@ -2049,7 +2865,7 @@ impl Table {
 
         let rows = self
             .db
-            .scan_memtable(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts);
+            .scan_visible(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts);
         Ok(Box::pin(stream::iter(rows)))
     }
 
@@ -2188,6 +3004,59 @@ async fn read_all_file(
     Ok(bytes)
 }
 
+async fn read_path(dependencies: &DbDependencies, path: &str) -> Result<Vec<u8>, StorageError> {
+    let handle = dependencies
+        .file_system
+        .open(
+            path,
+            OpenOptions {
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+                append: false,
+            },
+        )
+        .await?;
+    read_all_file(dependencies, &handle).await
+}
+
+async fn read_optional_path(
+    dependencies: &DbDependencies,
+    path: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    match dependencies
+        .file_system
+        .open(
+            path,
+            OpenOptions {
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+                append: false,
+            },
+        )
+        .await
+    {
+        Ok(handle) => Ok(Some(read_all_file(dependencies, &handle).await?)),
+        Err(error) if error.kind() == StorageErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn checksum32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff_u32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320_u32 & mask);
+        }
+    }
+    !crc
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -2197,15 +3066,16 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CommitPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX, SchemaDefinition,
-        StoredTable, decode_mvcc_key, encode_mvcc_key,
+        CommitPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
+        LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, SchemaDefinition,
+        StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
     };
     use crate::{
         CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
-        FieldDefinition, FieldId, FieldType, FieldValue, FileSystemFailure, FileSystemOperation,
-        S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber, SsdConfig, StorageConfig,
-        StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
-        TieredStorageConfig, Value,
+        FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
+        FileSystemOperation, S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber,
+        SsdConfig, StorageConfig, StubClock, StubObjectStore, StubRng, TableConfig, TableFormat,
+        TableId, TieredDurabilityMode, TieredStorageConfig, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -2324,6 +3194,16 @@ mod tests {
 
     async fn collect_rows(stream: crate::KvStream) -> Vec<(crate::Key, Value)> {
         stream.collect::<Vec<_>>().await
+    }
+
+    fn sstable_dir(root: &str, table_id: TableId) -> String {
+        Db::join_fs_path(
+            root,
+            &format!(
+                "{LOCAL_SSTABLE_RELATIVE_DIR}/table-{:06}/{LOCAL_SSTABLE_SHARD_DIR}",
+                table_id.get()
+            ),
+        )
     }
 
     #[test]
@@ -2629,6 +3509,324 @@ mod tests {
         let stats = db.table_stats(&table).await;
         assert!(stats.pending_flush_bytes > 0);
         assert_eq!(stats.immutable_memtable_count, 1);
+    }
+
+    #[tokio::test]
+    async fn flush_persists_row_sstables_manifest_and_reopenable_reads() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/flush-persist"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("old"))
+            .await
+            .expect("write apple v1");
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        let flushed = table
+            .write(b"apple".to_vec(), Value::bytes("new"))
+            .await
+            .expect("write apple v2");
+
+        db.flush().await.expect("flush to SSTable");
+
+        {
+            let sstables = db.sstables_read();
+            assert_eq!(sstables.manifest_generation, ManifestId::new(1));
+            assert_eq!(sstables.last_flushed_sequence, flushed);
+            assert_eq!(sstables.live.len(), 1);
+            let live = sstables.live.first().expect("live SSTable");
+            assert_eq!(live.meta.table_id, table.id().expect("table id"));
+            assert_eq!(live.meta.level, 0);
+            assert_eq!(live.meta.min_key, b"apple".to_vec());
+            assert_eq!(live.meta.max_key, b"banana".to_vec());
+            assert_eq!(live.meta.min_sequence, SequenceNumber::new(1));
+            assert_eq!(live.meta.max_sequence, flushed);
+            assert_eq!(live.rows.len(), 3);
+            assert!(live.meta.length > 0);
+        }
+
+        let current_path = Db::local_current_path("/flush-persist");
+        let current_bytes = read_path(&dependencies, &current_path)
+            .await
+            .expect("read CURRENT");
+        assert_eq!(
+            String::from_utf8(current_bytes)
+                .expect("decode CURRENT")
+                .trim(),
+            "MANIFEST-000001"
+        );
+
+        let loaded_manifest = Db::read_manifest_at_path(
+            &dependencies,
+            &Db::local_manifest_path("/flush-persist", ManifestId::new(1)),
+        )
+        .await
+        .expect("load manifest");
+        assert_eq!(loaded_manifest.last_flushed_sequence, flushed);
+        assert_eq!(loaded_manifest.live_sstables.len(), 1);
+        assert_eq!(
+            loaded_manifest.live_sstables[0].meta.min_key,
+            b"apple".to_vec()
+        );
+        assert_eq!(
+            loaded_manifest.live_sstables[0].meta.max_key,
+            b"banana".to_vec()
+        );
+
+        assert_eq!(
+            table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read flushed apple"),
+            Some(Value::bytes("new"))
+        );
+
+        let stats = db.table_stats(&table).await;
+        assert_eq!(stats.pending_flush_bytes, 0);
+        assert_eq!(stats.immutable_memtable_count, 0);
+        assert_eq!(stats.l0_sstable_count, 1);
+        assert!(stats.local_bytes > 0);
+
+        let reopened = Db::open(tiered_config("/flush-persist"), dependencies)
+            .await
+            .expect("reopen after flush");
+        let reopened_table = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), flushed);
+        assert_eq!(reopened.current_durable_sequence(), flushed);
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("reopened apple"),
+            Some(Value::bytes("new"))
+        );
+        let rows = collect_rows(
+            reopened_table
+                .scan(b"a".to_vec(), b"c".to_vec(), ScanOptions::default())
+                .await
+                .expect("reopened scan"),
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![
+                (b"apple".to_vec(), Value::bytes("new")),
+                (b"banana".to_vec(), Value::bytes("yellow")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_sync_failure_preserves_prior_generation_on_reopen() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(
+            tiered_config("/manifest-sync-failure"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write v1");
+        db.flush().await.expect("first flush");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write v2");
+        file_system.inject_failure(FileSystemFailure::timeout(
+            FileSystemOperation::SyncDir,
+            Db::local_manifest_dir("/manifest-sync-failure"),
+        ));
+        db.flush().await.expect_err("manifest sync failure");
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/manifest-sync-failure"), dependencies)
+            .await
+            .expect("reopen after failed manifest sync");
+        let reopened_table = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(1));
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(1)
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read recovered value"),
+            Some(Value::bytes("v1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_ignores_orphan_sstables_after_current_pointer_failure() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/orphan-sstable"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write v1");
+        db.flush().await.expect("first flush");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write v2");
+        let current_path = Db::local_current_path("/orphan-sstable");
+        let current_temp_path = format!("{current_path}{LOCAL_CATALOG_TEMP_SUFFIX}");
+        file_system.inject_failure(FileSystemFailure::timeout(
+            FileSystemOperation::Rename,
+            current_temp_path,
+        ));
+        db.flush().await.expect_err("CURRENT rename failure");
+
+        let sstable_files = file_system
+            .list(&sstable_dir(
+                "/orphan-sstable",
+                table.id().expect("table id"),
+            ))
+            .await
+            .expect("list sstable dir");
+        assert_eq!(sstable_files.len(), 2);
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/orphan-sstable"), dependencies)
+            .await
+            .expect("reopen after orphan SSTable");
+        let reopened_table = reopened.table("events");
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(1)
+        );
+        assert_eq!(reopened.sstables_read().live.len(), 1);
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(1));
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read reopened apple"),
+            Some(Value::bytes("v1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_prefers_manifest_references_over_extra_local_files() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/extra-local-files"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write apple v1");
+        db.flush().await.expect("first flush");
+
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        db.flush().await.expect("second flush");
+
+        let active_live = db.sstables_read().live.clone();
+        assert_eq!(active_live.len(), 2);
+        let stale_copy_path = Db::local_sstable_path(
+            "/extra-local-files",
+            table.id().expect("table id"),
+            "SST-999999",
+        );
+        let stale_bytes = read_path(&dependencies, &active_live[0].meta.file_path)
+            .await
+            .expect("read source sstable");
+        let stale_handle = file_system
+            .open(
+                &stale_copy_path,
+                crate::OpenOptions {
+                    create: true,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await
+            .expect("open stale copy");
+        file_system
+            .write_at(&stale_handle, 0, &stale_bytes)
+            .await
+            .expect("write stale copy");
+        file_system
+            .sync(&stale_handle)
+            .await
+            .expect("sync stale copy");
+
+        file_system.crash();
+        let reopened = Db::open(tiered_config("/extra-local-files"), dependencies)
+            .await
+            .expect("reopen with extra local file");
+        let reopened_table = reopened.table("events");
+        assert_eq!(reopened.sstables_read().live.len(), 2);
+        let on_disk = file_system
+            .list(&sstable_dir(
+                "/extra-local-files",
+                table.id().expect("table id"),
+            ))
+            .await
+            .expect("list on-disk SSTables");
+        assert_eq!(on_disk.len(), 3);
+        assert_eq!(
+            reopened_table
+                .read(b"apple".to_vec())
+                .await
+                .expect("read apple"),
+            Some(Value::bytes("v1"))
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"banana".to_vec())
+                .await
+                .expect("read banana"),
+            Some(Value::bytes("yellow"))
+        );
     }
 
     #[tokio::test]
