@@ -1,0 +1,24 @@
+# Generated output
+/target/
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Debug
+*.pdb
+
+# Temporary directory (keep the dir via .gitkeep)
+.tmp/*
+!.tmp/.gitkeep
