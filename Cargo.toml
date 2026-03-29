@@ -1,10 +1,13 @@
 [workspace]
-members = [".", "crates/turmoil-determinism"]
+members = [".", "crates/turmoil-determinism", "crates/terracedb-projections"]
 resolver = "2"
 [package]
 name = "terracedb"
 version = "0.1.0"
 edition = "2024"
+
+[features]
+test-support = []
 
 [dependencies]
 async-trait = "0.1.89"

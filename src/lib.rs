@@ -10,6 +10,8 @@ pub mod remote;
 pub mod scheduler;
 pub mod simulation;
 pub mod stubs;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod transaction;
 
 pub use adapters::{
@@ -64,4 +66,9 @@ pub use simulation::{
     TurmoilClock,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::{
+    bytes as test_bytes, row_table_config, test_dependencies, test_dependencies_with_clock,
+    tiered_test_config, tiered_test_config_with_durability,
+};
 pub use transaction::{Transaction, TransactionCommitError, TransactionCommitOptions};
