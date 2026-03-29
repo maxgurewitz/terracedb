@@ -324,6 +324,7 @@ struct SstableState {
 struct ResidentRowSstable {
     meta: PersistedManifestSstable,
     rows: Vec<SstableRow>,
+    user_key_bloom_filter: Option<UserKeyBloomFilter>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -374,6 +375,8 @@ struct PersistedRowSstableBody {
     max_sequence: SequenceNumber,
     rows: Vec<SstableRow>,
     data_checksum: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_key_bloom_filter: Option<UserKeyBloomFilter>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -388,6 +391,76 @@ struct SstableRow {
     sequence: SequenceNumber,
     kind: ChangeKind,
     value: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct UserKeyBloomFilter {
+    bits_per_key: u32,
+    hash_count: u32,
+    bytes: Vec<u8>,
+}
+
+impl UserKeyBloomFilter {
+    fn build(rows: &[SstableRow], bits_per_key: Option<u32>) -> Option<Self> {
+        let bits_per_key = bits_per_key?.max(1);
+
+        let mut unique_keys = BTreeSet::new();
+        for row in rows {
+            unique_keys.insert(row.key.as_slice());
+        }
+
+        if unique_keys.is_empty() {
+            return None;
+        }
+
+        let bit_count = unique_keys
+            .len()
+            .saturating_mul(bits_per_key as usize)
+            .max(8);
+        let byte_len = bit_count.div_ceil(8);
+        let total_bits = byte_len * 8;
+        let hash_count = ((bits_per_key.saturating_mul(69)).saturating_add(50) / 100).max(1);
+        let mut filter = Self {
+            bits_per_key,
+            hash_count,
+            bytes: vec![0; byte_len],
+        };
+
+        for key in unique_keys {
+            filter.insert(key, total_bits);
+        }
+
+        Some(filter)
+    }
+
+    fn may_contain(&self, key: &[u8]) -> bool {
+        if self.bytes.is_empty() || self.hash_count == 0 {
+            return true;
+        }
+
+        let total_bits = self.bytes.len() * 8;
+        let (h1, h2) = bloom_hash_pair(key);
+        for i in 0..self.hash_count {
+            let bit_index = h1.wrapping_add((i as u64).wrapping_mul(h2)) % total_bits as u64;
+            let byte_index = (bit_index / 8) as usize;
+            let bit_mask = 1_u8 << ((bit_index % 8) as u8);
+            if self.bytes[byte_index] & bit_mask == 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn insert(&mut self, key: &[u8], total_bits: usize) {
+        let (h1, h2) = bloom_hash_pair(key);
+        for i in 0..self.hash_count {
+            let bit_index = h1.wrapping_add((i as u64).wrapping_mul(h2)) % total_bits as u64;
+            let byte_index = (bit_index / 8) as usize;
+            let bit_mask = 1_u8 << ((bit_index % 8) as u8);
+            self.bytes[byte_index] |= bit_mask;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -721,6 +794,73 @@ impl SstableRow {
     }
 }
 
+impl ResidentRowSstable {
+    fn read_at(&self, key: &[u8], sequence: SequenceNumber) -> Option<SstableRow> {
+        if key < self.meta.min_key.as_slice()
+            || key > self.meta.max_key.as_slice()
+            || sequence < self.meta.min_sequence
+        {
+            return None;
+        }
+
+        if let Some(filter) = &self.user_key_bloom_filter
+            && !filter.may_contain(key)
+        {
+            return None;
+        }
+
+        let start = self.lower_bound(key);
+        let mut best: Option<SstableRow> = None;
+
+        for row in &self.rows[start..] {
+            match row.key.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {
+                    if row.sequence <= sequence {
+                        let replace = match best.as_ref() {
+                            Some(current) => row.sequence > current.sequence,
+                            None => true,
+                        };
+                        if replace {
+                            best = Some(row.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    fn collect_matching_keys(&self, matcher: &KeyMatcher<'_>, keys: &mut BTreeSet<Key>) {
+        let start = match matcher {
+            KeyMatcher::Range { start, .. } | KeyMatcher::Prefix(start) => self.lower_bound(start),
+        };
+        let mut last_key: Option<&[u8]> = None;
+
+        for row in &self.rows[start..] {
+            if !matcher.matches(&row.key) {
+                if matcher.is_past_end(&row.key) {
+                    break;
+                }
+                continue;
+            }
+
+            if last_key == Some(row.key.as_slice()) {
+                continue;
+            }
+
+            keys.insert(row.key.clone());
+            last_key = Some(row.key.as_slice());
+        }
+    }
+
+    fn lower_bound(&self, target: &[u8]) -> usize {
+        self.rows.partition_point(|row| row.key.as_slice() < target)
+    }
+}
+
 impl SstableState {
     fn read_at(
         &self,
@@ -731,20 +871,11 @@ impl SstableState {
         let mut best: Option<SstableRow> = None;
 
         for sstable in &self.live {
-            if sstable.meta.table_id != table_id
-                || key < sstable.meta.min_key.as_slice()
-                || key > sstable.meta.max_key.as_slice()
-                || sequence < sstable.meta.min_sequence
-            {
+            if sstable.meta.table_id != table_id {
                 continue;
             }
 
-            let candidate = sstable
-                .rows
-                .iter()
-                .filter(|row| row.key.as_slice() == key && row.sequence <= sequence)
-                .max_by_key(|row| row.sequence);
-            let Some(candidate) = candidate.cloned() else {
+            let Some(candidate) = sstable.read_at(key, sequence) else {
                 continue;
             };
 
@@ -771,11 +902,7 @@ impl SstableState {
                 continue;
             }
 
-            for row in &sstable.rows {
-                if matcher.matches(&row.key) {
-                    keys.insert(row.key.clone());
-                }
-            }
+            sstable.collect_matching_keys(matcher, keys);
         }
     }
 
@@ -913,6 +1040,13 @@ impl KeyMatcher<'_> {
         match self {
             Self::Range { start, end } => key >= *start && key < *end,
             Self::Prefix(prefix) => key.starts_with(prefix),
+        }
+    }
+
+    fn is_past_end(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Range { end, .. } => key >= *end,
+            Self::Prefix(prefix) => key > *prefix,
         }
     }
 }
@@ -1655,6 +1789,7 @@ impl Db {
         Ok(ResidentRowSstable {
             meta: meta.clone(),
             rows: file.body.rows,
+            user_key_bloom_filter: file.body.user_key_bloom_filter,
         })
     }
 
@@ -1746,8 +1881,15 @@ impl Db {
             );
             let path = Self::local_sstable_path(local_root, table_id, &local_id);
             outputs.push(
-                self.write_row_sstable(&path, table_id, 0, local_id, rows)
-                    .await?,
+                self.write_row_sstable(
+                    &path,
+                    table_id,
+                    0,
+                    local_id,
+                    rows,
+                    stored.config.bloom_filter_bits_per_key,
+                )
+                .await?,
             );
         }
 
@@ -1761,8 +1903,10 @@ impl Db {
         level: u32,
         local_id: String,
         rows: Vec<SstableRow>,
+        bloom_filter_bits_per_key: Option<u32>,
     ) -> Result<ResidentRowSstable, FlushError> {
         let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
+        let user_key_bloom_filter = UserKeyBloomFilter::build(&rows, bloom_filter_bits_per_key);
         let rows_bytes = serde_json::to_vec(&rows).map_err(|error| {
             FlushError::Storage(StorageError::corruption(format!(
                 "encode SSTable rows failed: {error}"
@@ -1781,6 +1925,7 @@ impl Db {
             max_sequence: meta.max_sequence,
             rows: rows.clone(),
             data_checksum,
+            user_key_bloom_filter: user_key_bloom_filter.clone(),
         };
         let encoded_body = serde_json::to_vec(&body).map_err(|error| {
             FlushError::Storage(StorageError::corruption(format!(
@@ -1822,7 +1967,11 @@ impl Db {
         meta.checksum = checksum;
         meta.data_checksum = data_checksum;
 
-        Ok(ResidentRowSstable { meta, rows })
+        Ok(ResidentRowSstable {
+            meta,
+            rows,
+            user_key_bloom_filter,
+        })
     }
 
     async fn install_manifest(
@@ -3114,6 +3263,21 @@ fn checksum32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
+    fn hash_with_seed(key: &[u8], seed: u64) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
+        for &byte in key {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^ (hash >> 32)
+    }
+
+    let first = hash_with_seed(key, 0x9e37_79b9_7f4a_7c15);
+    let second = hash_with_seed(key, 0xc2b2_ae3d_27d4_eb4f) | 1;
+    (first, second)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -3125,14 +3289,16 @@ mod tests {
     use super::{
         CommitPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
         LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR,
-        ManifestId, SchemaDefinition, StoredTable, decode_mvcc_key, encode_mvcc_key, read_path,
+        ManifestId, PersistedRowSstableFile, SchemaDefinition, StoredTable, decode_mvcc_key,
+        encode_mvcc_key, read_path,
     };
     use crate::{
         CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig, DbDependencies,
         FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
-        FileSystemOperation, S3Location, S3PrimaryStorageConfig, ScanOptions, SequenceNumber,
-        SsdConfig, StorageConfig, StubClock, StubObjectStore, StubRng, TableConfig, TableFormat,
-        TableId, TieredDurabilityMode, TieredStorageConfig, Value,
+        FileSystemOperation, PointMutation, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
+        SequenceNumber, ShadowOracle, SsdConfig, StorageConfig, StubClock, StubObjectStore,
+        StubRng, TableConfig, TableFormat, TableId, TieredDurabilityMode, TieredStorageConfig,
+        Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -3251,6 +3417,55 @@ mod tests {
 
     async fn collect_rows(stream: crate::KvStream) -> Vec<(crate::Key, Value)> {
         stream.collect::<Vec<_>>().await
+    }
+
+    fn oracle_rows(
+        oracle: &ShadowOracle,
+        sequence: SequenceNumber,
+        start: &[u8],
+        end: &[u8],
+        reverse: bool,
+        limit: Option<usize>,
+    ) -> Vec<(crate::Key, Value)> {
+        let mut rows = oracle
+            .point_state_at(sequence)
+            .into_iter()
+            .filter(|(key, _value)| key.as_slice() >= start && key.as_slice() < end)
+            .map(|(key, value)| (key, Value::bytes(value)))
+            .collect::<Vec<_>>();
+
+        if reverse {
+            rows.reverse();
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+
+        rows
+    }
+
+    fn oracle_prefix_rows(
+        oracle: &ShadowOracle,
+        sequence: SequenceNumber,
+        prefix: &[u8],
+        reverse: bool,
+        limit: Option<usize>,
+    ) -> Vec<(crate::Key, Value)> {
+        let mut rows = oracle
+            .point_state_at(sequence)
+            .into_iter()
+            .filter(|(key, _value)| key.starts_with(prefix))
+            .map(|(key, value)| (key, Value::bytes(value)))
+            .collect::<Vec<_>>();
+
+        if reverse {
+            rows.reverse();
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+
+        rows
     }
 
     fn sstable_dir(root: &str, table_id: TableId) -> String {
@@ -3600,6 +3815,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_reads_and_scans_span_sstables_and_newer_memtable_versions() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/historical-read-path"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let apple_v1 = table
+            .write(b"apple".to_vec(), Value::bytes("old"))
+            .await
+            .expect("write apple v1");
+        let apricot_v1 = table
+            .write(b"apricot".to_vec(), Value::bytes("stone"))
+            .await
+            .expect("write apricot v1");
+        let historical = table
+            .write(b"banana".to_vec(), Value::bytes("ripe"))
+            .await
+            .expect("write banana v1");
+
+        db.flush().await.expect("flush historical state");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("new"))
+            .await
+            .expect("write apple v2");
+        table
+            .delete(b"apricot".to_vec())
+            .await
+            .expect("delete apricot");
+        table
+            .write(b"cherry".to_vec(), Value::bytes("red"))
+            .await
+            .expect("write cherry");
+
+        assert_eq!(
+            table
+                .read_at(b"apple".to_vec(), apple_v1)
+                .await
+                .expect("historical apple"),
+            Some(Value::bytes("old"))
+        );
+        assert_eq!(
+            table.read(b"apple".to_vec()).await.expect("latest apple"),
+            Some(Value::bytes("new"))
+        );
+        assert_eq!(
+            table
+                .read_at(b"apricot".to_vec(), apricot_v1)
+                .await
+                .expect("historical apricot"),
+            Some(Value::bytes("stone"))
+        );
+        assert_eq!(
+            table
+                .read(b"apricot".to_vec())
+                .await
+                .expect("latest apricot"),
+            None
+        );
+
+        let historical_rows = collect_rows(
+            table
+                .scan_at(
+                    b"a".to_vec(),
+                    b"d".to_vec(),
+                    historical,
+                    ScanOptions::default(),
+                )
+                .await
+                .expect("historical scan"),
+        )
+        .await;
+        assert_eq!(
+            historical_rows,
+            vec![
+                (b"apple".to_vec(), Value::bytes("old")),
+                (b"apricot".to_vec(), Value::bytes("stone")),
+                (b"banana".to_vec(), Value::bytes("ripe")),
+            ]
+        );
+
+        let historical_prefix_rows = collect_rows(
+            table
+                .scan_prefix_at(b"ap".to_vec(), historical, ScanOptions::default())
+                .await
+                .expect("historical prefix scan"),
+        )
+        .await;
+        assert_eq!(
+            historical_prefix_rows,
+            vec![
+                (b"apple".to_vec(), Value::bytes("old")),
+                (b"apricot".to_vec(), Value::bytes("stone")),
+            ]
+        );
+
+        let latest_reverse_rows = collect_rows(
+            table
+                .scan_at(
+                    b"a".to_vec(),
+                    b"d".to_vec(),
+                    db.current_sequence(),
+                    ScanOptions {
+                        reverse: true,
+                        limit: Some(2),
+                        columns: None,
+                    },
+                )
+                .await
+                .expect("latest reverse scan"),
+        )
+        .await;
+        assert_eq!(
+            latest_reverse_rows,
+            vec![
+                (b"cherry".to_vec(), Value::bytes("red")),
+                (b"banana".to_vec(), Value::bytes("ripe")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn row_sstable_flush_persists_user_key_bloom_filters() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/sstable-bloom"), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("v1"))
+            .await
+            .expect("write apple v1");
+        table
+            .write(b"apple".to_vec(), Value::bytes("v2"))
+            .await
+            .expect("write apple v2");
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+
+        db.flush().await.expect("flush");
+
+        let live = db
+            .sstables_read()
+            .live
+            .first()
+            .cloned()
+            .expect("live sstable");
+        let filter = live
+            .user_key_bloom_filter
+            .as_ref()
+            .expect("resident bloom filter");
+        assert!(filter.may_contain(b"apple"));
+        assert!(filter.may_contain(b"banana"));
+        assert!(!filter.may_contain(b"carrot"));
+
+        let file_bytes = read_path(&dependencies, &live.meta.file_path)
+            .await
+            .expect("read persisted sstable");
+        let persisted: PersistedRowSstableFile =
+            serde_json::from_slice(&file_bytes).expect("decode persisted sstable");
+        let persisted_filter = persisted
+            .body
+            .user_key_bloom_filter
+            .expect("persisted bloom filter");
+        assert_eq!(persisted_filter.bits_per_key, 10);
+        assert!(persisted_filter.may_contain(b"apple"));
+        assert!(persisted_filter.may_contain(b"banana"));
+        assert!(!persisted_filter.may_contain(b"carrot"));
+    }
+
+    #[tokio::test]
     async fn flush_persists_row_sstables_manifest_and_reopenable_reads() {
         let file_system = Arc::new(crate::StubFileSystem::default());
         let object_store = Arc::new(StubObjectStore::default());
@@ -3713,6 +4116,117 @@ mod tests {
                 (b"banana".to_vec(), Value::bytes("yellow")),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn randomized_read_path_matches_shadow_oracle_across_flushes() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/randomized-read-oracle"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+        let rng = StubRng::seeded(0x0ddc_0ffe_e123_4567);
+        let keys = [
+            b"apple".to_vec(),
+            b"apricot".to_vec(),
+            b"banana".to_vec(),
+            b"blueberry".to_vec(),
+            b"cherry".to_vec(),
+        ];
+        let mut oracle = ShadowOracle::default();
+
+        for step in 0..48_u64 {
+            let key = keys[(rng.next_u64() as usize) % keys.len()].clone();
+            let committed = if rng.next_u64().is_multiple_of(4) {
+                let sequence = table
+                    .delete(key.clone())
+                    .await
+                    .expect("delete key in randomized oracle test");
+                oracle.apply(sequence, PointMutation::Delete { key }, true);
+                sequence
+            } else {
+                let value = format!("value-{step}").into_bytes();
+                let sequence = table
+                    .write(key.clone(), Value::bytes(value.clone()))
+                    .await
+                    .expect("write key in randomized oracle test");
+                oracle.apply(sequence, PointMutation::Put { key, value }, true);
+                sequence
+            };
+
+            if rng.next_u64().is_multiple_of(3) {
+                db.flush().await.expect("flush randomized state");
+            }
+
+            let historical = SequenceNumber::new(rng.next_u64() % (committed.get() + 1));
+            for key in &keys {
+                assert_eq!(
+                    table
+                        .read_at(key.clone(), historical)
+                        .await
+                        .expect("historical point read"),
+                    oracle.value_at(key, historical).map(Value::bytes)
+                );
+            }
+
+            let latest_rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        historical,
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("historical scan"),
+            )
+            .await;
+            assert_eq!(
+                latest_rows,
+                oracle_rows(&oracle, historical, b"a", b"z", false, None)
+            );
+
+            let reverse_limit = ((rng.next_u64() % 3) + 1) as usize;
+            let reverse_rows = collect_rows(
+                table
+                    .scan_at(
+                        b"a".to_vec(),
+                        b"z".to_vec(),
+                        historical,
+                        ScanOptions {
+                            reverse: true,
+                            limit: Some(reverse_limit),
+                            columns: None,
+                        },
+                    )
+                    .await
+                    .expect("reverse scan"),
+            )
+            .await;
+            assert_eq!(
+                reverse_rows,
+                oracle_rows(&oracle, historical, b"a", b"z", true, Some(reverse_limit))
+            );
+
+            let prefix_rows = collect_rows(
+                table
+                    .scan_prefix_at(b"ap".to_vec(), historical, ScanOptions::default())
+                    .await
+                    .expect("historical prefix scan"),
+            )
+            .await;
+            assert_eq!(
+                prefix_rows,
+                oracle_prefix_rows(&oracle, historical, b"ap", false, None)
+            );
+        }
     }
 
     #[tokio::test]
