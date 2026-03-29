@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod api;
+pub mod composition;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -21,6 +22,10 @@ pub use api::{
     FieldDefinition, FieldType, FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet,
     ReadSetEntry, ScanOptions, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
     WriteBatch,
+};
+pub use composition::{
+    DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
+    OutboxBatch, OutboxEntry, OutboxMessage, ScheduledTimer, TransactionalOutbox,
 };
 pub use config::{
     CompactionDecision, CompactionDecisionContext, CompactionFilter, CompactionFilterRef,
