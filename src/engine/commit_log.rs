@@ -1994,11 +1994,14 @@ mod tests {
         api::FieldValue,
         error::StorageErrorKind,
         ids::SequenceNumber,
+        telemetry::OperationContext,
     };
 
     use super::{
-        AppendLocation, BlockIndexEntry, CommitEntry, CommitRecord, SegmentFooter, SegmentManager,
-        SegmentOptions, TableSegmentMeta, checksum32, parse_segment_footer, segment_path,
+        AppendLocation, BlockIndexEntry, CommitEntry, CommitRecord, RECORD_HEADER_LEN,
+        RECORD_MAGIC, SegmentFooter, SegmentManager, SegmentOptions, TableSegmentMeta, checksum32,
+        encode_change_kind, encode_value, parse_segment_footer, push_len, push_u8, push_u16,
+        push_u32, segment_path,
     };
     use crate::api::{ChangeKind, Value};
     use crate::ids::{CommitId, FieldId, SegmentId, TableId};
@@ -2122,6 +2125,100 @@ mod tests {
         }
     }
 
+    fn sample_record_with_operation_context(sequence: u64) -> CommitRecord {
+        let mut record = sample_record(sequence);
+        record.entries[0].operation_context = Some(OperationContext {
+            traceparent: Some(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+            ),
+            tracestate: Some("vendor=value".to_string()),
+        });
+        record
+    }
+
+    fn sample_footer() -> SegmentFooter {
+        SegmentFooter {
+            segment_id: SegmentId::new(9),
+            min_sequence: SequenceNumber::new(11),
+            max_sequence: SequenceNumber::new(42),
+            record_count: 4,
+            entry_count: 9,
+            data_end_offset: 1024,
+            tables: vec![
+                TableSegmentMeta {
+                    table_id: TableId::new(1),
+                    min_sequence: SequenceNumber::new(11),
+                    max_sequence: SequenceNumber::new(40),
+                    entry_count: 5,
+                },
+                TableSegmentMeta {
+                    table_id: TableId::new(2),
+                    min_sequence: SequenceNumber::new(20),
+                    max_sequence: SequenceNumber::new(42),
+                    entry_count: 4,
+                },
+            ],
+            block_index: vec![
+                BlockIndexEntry {
+                    sequence: SequenceNumber::new(11),
+                    offset: 0,
+                },
+                BlockIndexEntry {
+                    sequence: SequenceNumber::new(20),
+                    offset: 300,
+                },
+                BlockIndexEntry {
+                    sequence: SequenceNumber::new(35),
+                    offset: 700,
+                },
+            ],
+        }
+    }
+
+    fn encode_v1_frame(record: &CommitRecord) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u8(&mut payload, 1);
+        payload.extend_from_slice(&record.id.encode());
+        push_u16(
+            &mut payload,
+            u16::try_from(record.entries.len()).expect("entry count fits in u16"),
+        );
+        for entry in &record.entries {
+            assert!(
+                entry.operation_context.is_none(),
+                "legacy commit record fixtures do not include operation context"
+            );
+            push_u16(&mut payload, entry.op_index);
+            push_u32(&mut payload, entry.table_id.get());
+            push_u8(&mut payload, encode_change_kind(entry.kind));
+            push_len(&mut payload, entry.key.len()).expect("key length fits in u32");
+            payload.extend_from_slice(&entry.key);
+
+            match &entry.value {
+                Some(value) => {
+                    let mut encoded_value = Vec::new();
+                    encode_value(&mut encoded_value, value).expect("encode legacy value");
+                    push_u32(
+                        &mut payload,
+                        u32::try_from(encoded_value.len()).expect("value length fits in u32"),
+                    );
+                    payload.extend_from_slice(&encoded_value);
+                }
+                None => push_u32(&mut payload, u32::MAX),
+            }
+        }
+
+        let mut frame = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&RECORD_MAGIC);
+        frame.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("legacy payload length fits in u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&checksum32(&payload).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
     async fn read_segment_bytes(fs: &dyn FileSystem, path: &str) -> Vec<u8> {
         let handle = fs
             .open(
@@ -2171,43 +2268,47 @@ mod tests {
     }
 
     #[test]
+    fn durable_format_fixtures_match_golden_files() {
+        let legacy_record = sample_record(5);
+        let legacy_frame = encode_v1_frame(&legacy_record);
+        let legacy_hex = crate::test_support::durable_format_hex(&legacy_frame);
+        assert_eq!(
+            CommitRecord::decode_frame(&legacy_frame).expect("decode v1 frame"),
+            legacy_record
+        );
+        crate::test_support::assert_durable_format_fixture(
+            "commit-record-v1.hex",
+            legacy_hex.as_bytes(),
+        );
+
+        let current_record = sample_record_with_operation_context(7);
+        let current_frame = current_record.encode_frame().expect("encode v2 frame");
+        let current_hex = crate::test_support::durable_format_hex(&current_frame);
+        assert_eq!(
+            CommitRecord::decode_frame(&current_frame).expect("decode v2 frame"),
+            current_record
+        );
+        crate::test_support::assert_durable_format_fixture(
+            "commit-record-v2.hex",
+            current_hex.as_bytes(),
+        );
+
+        let footer = sample_footer();
+        let footer_bytes = footer.encode().expect("encode footer");
+        let footer_hex = crate::test_support::durable_format_hex(&footer_bytes);
+        assert_eq!(
+            SegmentFooter::decode(&footer_bytes).expect("decode footer"),
+            footer
+        );
+        crate::test_support::assert_durable_format_fixture(
+            "segment-footer-v2.hex",
+            footer_hex.as_bytes(),
+        );
+    }
+
+    #[test]
     fn segment_footer_round_trips_and_seeks_by_sequence() {
-        let footer = SegmentFooter {
-            segment_id: SegmentId::new(9),
-            min_sequence: SequenceNumber::new(11),
-            max_sequence: SequenceNumber::new(42),
-            record_count: 4,
-            entry_count: 9,
-            data_end_offset: 1024,
-            tables: vec![
-                TableSegmentMeta {
-                    table_id: TableId::new(1),
-                    min_sequence: SequenceNumber::new(11),
-                    max_sequence: SequenceNumber::new(40),
-                    entry_count: 5,
-                },
-                TableSegmentMeta {
-                    table_id: TableId::new(2),
-                    min_sequence: SequenceNumber::new(20),
-                    max_sequence: SequenceNumber::new(42),
-                    entry_count: 4,
-                },
-            ],
-            block_index: vec![
-                BlockIndexEntry {
-                    sequence: SequenceNumber::new(11),
-                    offset: 0,
-                },
-                BlockIndexEntry {
-                    sequence: SequenceNumber::new(20),
-                    offset: 300,
-                },
-                BlockIndexEntry {
-                    sequence: SequenceNumber::new(35),
-                    offset: 700,
-                },
-            ],
-        };
+        let footer = sample_footer();
 
         let encoded = footer.encode().expect("encode footer");
         let decoded = SegmentFooter::decode(&encoded).expect("decode footer");

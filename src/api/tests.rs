@@ -7,11 +7,15 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use super::{
+    BACKUP_GC_METADATA_FORMAT_VERSION, BackupObjectBirthRecord, CATALOG_FORMAT_VERSION,
     COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, ColumnarCacheStatsSnapshot,
-    ColumnarReadAccessPattern, CommitPhase, CompactionJobKind, CompactionPhase, Db, KeyMatcher,
-    LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR,
-    LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId,
-    OffloadPhase, PendingWorkSpec, PersistedRowSstableFile, ResidentColumnarSstable,
+    ColumnarReadAccessPattern, CommitPhase, CompactionJobKind, CompactionPhase, Db,
+    DurableRemoteCommitLogSegment, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
+    LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
+    LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, MANIFEST_FORMAT_VERSION, ManifestId,
+    OffloadPhase, PendingWorkSpec, PersistedManifestBody, PersistedManifestFile,
+    PersistedManifestSstable, PersistedRemoteManifestBody, PersistedRemoteManifestFile,
+    PersistedRowSstableFile, REMOTE_MANIFEST_FORMAT_VERSION, ResidentColumnarSstable,
     SchemaDefinition, StorageSource, StoredTable, WatermarkUpdate, decode_mvcc_key,
     encode_mvcc_key, read_path,
 };
@@ -28,6 +32,8 @@ use crate::{
     StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng, Table,
     TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
     TieredStorageConfig, Timestamp, Transaction, TtlCompactionFilter, Value,
+    engine::commit_log::{BlockIndexEntry, SegmentFooter, TableSegmentMeta},
+    metadata_flatbuffers as metadata_fb,
 };
 
 fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -1198,6 +1204,187 @@ async fn overwrite_file(file_system: &crate::StubFileSystem, path: &str, bytes: 
         .sync(&handle)
         .await
         .expect("sync overwritten file");
+}
+
+fn durable_format_schema() -> SchemaDefinition {
+    SchemaDefinition {
+        version: 3,
+        fields: vec![
+            FieldDefinition {
+                id: FieldId::new(1),
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: false,
+                default: Some(FieldValue::String("unknown".to_string())),
+            },
+            FieldDefinition {
+                id: FieldId::new(2),
+                name: "active".to_string(),
+                field_type: FieldType::Bool,
+                nullable: false,
+                default: Some(FieldValue::Bool(true)),
+            },
+            FieldDefinition {
+                id: FieldId::new(3),
+                name: "payload".to_string(),
+                field_type: FieldType::Bytes,
+                nullable: true,
+                default: Some(FieldValue::Null),
+            },
+        ],
+    }
+}
+
+fn durable_format_tables() -> BTreeMap<String, StoredTable> {
+    let schema = durable_format_schema();
+
+    [
+        (
+            "events".to_string(),
+            StoredTable {
+                id: TableId::new(7),
+                config: TableConfig {
+                    name: "events".to_string(),
+                    format: TableFormat::Row,
+                    merge_operator: None,
+                    max_merge_operand_chain_length: Some(8),
+                    compaction_filter: None,
+                    bloom_filter_bits_per_key: Some(10),
+                    history_retention_sequences: Some(128),
+                    compaction_strategy: CompactionStrategy::Leveled,
+                    schema: None,
+                    metadata: [
+                        ("owner".to_string(), json!("local-dev")),
+                        ("stream".to_string(), json!("event-log")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            },
+        ),
+        (
+            "metrics".to_string(),
+            StoredTable {
+                id: TableId::new(9),
+                config: TableConfig {
+                    name: "metrics".to_string(),
+                    format: TableFormat::Columnar,
+                    merge_operator: None,
+                    max_merge_operand_chain_length: Some(16),
+                    compaction_filter: None,
+                    bloom_filter_bits_per_key: Some(12),
+                    history_retention_sequences: Some(512),
+                    compaction_strategy: CompactionStrategy::Tiered,
+                    schema: Some(schema),
+                    metadata: [
+                        ("owner".to_string(), json!("analytics")),
+                        ("retention".to_string(), json!("durable")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            },
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn durable_format_local_manifest_sstables() -> Vec<PersistedManifestSstable> {
+    vec![
+        PersistedManifestSstable {
+            table_id: TableId::new(7),
+            level: 0,
+            local_id: "SST-000111".to_string(),
+            file_path: Db::local_sstable_path("/durable-fixtures", TableId::new(7), "SST-000111"),
+            remote_key: None,
+            length: 512,
+            checksum: 0x1a2b3c4d,
+            data_checksum: 0x0badf00d,
+            min_key: b"alpha".to_vec(),
+            max_key: b"omega".to_vec(),
+            min_sequence: SequenceNumber::new(11),
+            max_sequence: SequenceNumber::new(19),
+            schema_version: None,
+        },
+        PersistedManifestSstable {
+            table_id: TableId::new(9),
+            level: 1,
+            local_id: "SST-000222".to_string(),
+            file_path: Db::local_sstable_path("/durable-fixtures", TableId::new(9), "SST-000222"),
+            remote_key: None,
+            length: 1024,
+            checksum: 0x55667788,
+            data_checksum: 0x99aabbcc,
+            min_key: b"metric:a".to_vec(),
+            max_key: b"metric:z".to_vec(),
+            min_sequence: SequenceNumber::new(20),
+            max_sequence: SequenceNumber::new(42),
+            schema_version: Some(3),
+        },
+    ]
+}
+
+fn durable_format_remote_manifest_sstables() -> Vec<PersistedManifestSstable> {
+    let layout = tiered_layout();
+    durable_format_local_manifest_sstables()
+        .into_iter()
+        .map(|mut sstable| {
+            sstable.remote_key =
+                Some(layout.backup_sstable(sstable.table_id, 0, &sstable.local_id));
+            sstable.file_path.clear();
+            sstable
+        })
+        .collect()
+}
+
+fn durable_format_remote_segments() -> Vec<DurableRemoteCommitLogSegment> {
+    let layout = tiered_layout();
+    vec![DurableRemoteCommitLogSegment {
+        object_key: layout.backup_commit_log_segment(SegmentId::new(3)),
+        footer: SegmentFooter {
+            segment_id: SegmentId::new(3),
+            min_sequence: SequenceNumber::new(21),
+            max_sequence: SequenceNumber::new(42),
+            record_count: 3,
+            entry_count: 6,
+            data_end_offset: 768,
+            tables: vec![
+                TableSegmentMeta {
+                    table_id: TableId::new(7),
+                    min_sequence: SequenceNumber::new(21),
+                    max_sequence: SequenceNumber::new(30),
+                    entry_count: 3,
+                },
+                TableSegmentMeta {
+                    table_id: TableId::new(9),
+                    min_sequence: SequenceNumber::new(31),
+                    max_sequence: SequenceNumber::new(42),
+                    entry_count: 3,
+                },
+            ],
+            block_index: vec![
+                BlockIndexEntry {
+                    sequence: SequenceNumber::new(21),
+                    offset: 0,
+                },
+                BlockIndexEntry {
+                    sequence: SequenceNumber::new(33),
+                    offset: 384,
+                },
+            ],
+        },
+    }]
+}
+
+fn durable_format_backup_gc_record() -> BackupObjectBirthRecord {
+    let layout = tiered_layout();
+    let object_key = layout.backup_sstable(TableId::new(9), 0, "SST-000222");
+    BackupObjectBirthRecord {
+        format_version: BACKUP_GC_METADATA_FORMAT_VERSION,
+        object_key,
+        first_uploaded_at_millis: 1_717_171_717,
+    }
 }
 
 async fn seed_compaction_fixture(
@@ -5837,11 +6024,16 @@ async fn corrupt_latest_manifest_falls_back_and_replays_commit_log_tail() {
     db.flush().await.expect("second flush");
 
     let manifest_path = Db::local_manifest_path("/corrupt-latest-manifest", ManifestId::new(2));
-    let mut manifest_bytes = read_path(&dependencies, &manifest_path)
+    let manifest_bytes = read_path(&dependencies, &manifest_path)
         .await
         .expect("read latest manifest");
-    let last = manifest_bytes.len() - 1;
-    manifest_bytes[last] ^= 0x55;
+    let mut manifest =
+        Db::decode_manifest_file_flatbuffer(&manifest_bytes).expect("decode latest manifest");
+    let body_bytes = Db::encode_manifest_body_flatbuffer(&manifest.body)
+        .expect("re-encode latest manifest body");
+    manifest.checksum ^= 0x55;
+    let manifest_bytes = Db::encode_manifest_file_flatbuffer(&manifest, &body_bytes)
+        .expect("re-encode corrupt latest manifest");
     overwrite_file(file_system.as_ref(), &manifest_path, &manifest_bytes).await;
 
     file_system.crash();
@@ -10625,5 +10817,248 @@ async fn recovery_only_log_gc_drops_segments_once_a_flush_makes_them_unnecessary
             .expect("recovery-only GC should make the oldest cursor too old"),
         first,
         SequenceNumber::new(2),
+    );
+}
+
+#[test]
+fn durable_format_fixtures_match_golden_files() {
+    let tables = durable_format_tables();
+    let catalog = Db::encode_catalog(&tables).expect("encode catalog fixture");
+    let decoded_catalog = Db::decode_catalog(&catalog).expect("decode catalog fixture");
+    assert_eq!(decoded_catalog.format_version, CATALOG_FORMAT_VERSION);
+    assert_eq!(decoded_catalog.tables.len(), 2);
+    assert_eq!(decoded_catalog.tables[0].id, TableId::new(7));
+    assert_eq!(decoded_catalog.tables[1].id, TableId::new(9));
+    assert_eq!(
+        decoded_catalog.tables[1]
+            .config
+            .schema
+            .as_ref()
+            .expect("columnar schema in catalog fixture")
+            .version,
+        3
+    );
+    crate::test_support::assert_durable_format_fixture("catalog-v1.bin", &catalog);
+
+    let local_manifest = Db::encode_manifest_payload_from_sstables(
+        ManifestId::new(12),
+        SequenceNumber::new(42),
+        &durable_format_local_manifest_sstables(),
+    )
+    .expect("encode local manifest fixture");
+    let decoded_local = Db::decode_manifest_file_flatbuffer(&local_manifest)
+        .expect("decode local manifest fixture");
+    assert_eq!(decoded_local.body.format_version, MANIFEST_FORMAT_VERSION);
+    assert_eq!(decoded_local.body.generation, ManifestId::new(12));
+    assert_eq!(decoded_local.body.sstables.len(), 2);
+    crate::test_support::assert_durable_format_fixture("local-manifest-v1.bin", &local_manifest);
+
+    let remote_manifest = Db::encode_remote_manifest_payload(
+        ManifestId::new(19),
+        SequenceNumber::new(42),
+        &durable_format_remote_manifest_sstables(),
+        &durable_format_remote_segments(),
+    )
+    .expect("encode remote manifest fixture");
+    let decoded_remote = Db::decode_remote_manifest_file_flatbuffer(&remote_manifest)
+        .expect("decode remote manifest fixture");
+    assert_eq!(
+        decoded_remote.body.format_version,
+        REMOTE_MANIFEST_FORMAT_VERSION
+    );
+    assert_eq!(decoded_remote.body.generation, ManifestId::new(19));
+    assert_eq!(decoded_remote.body.sstables.len(), 2);
+    assert_eq!(decoded_remote.body.commit_log_segments.len(), 1);
+    crate::test_support::assert_durable_format_fixture("remote-manifest-v1.bin", &remote_manifest);
+
+    let backup_gc_record = durable_format_backup_gc_record();
+    let backup_gc_payload = Db::encode_backup_object_birth_payload(&backup_gc_record)
+        .expect("encode backup GC metadata fixture");
+    let decoded_backup_gc = Db::decode_backup_object_birth_payload(&backup_gc_payload)
+        .expect("decode backup GC metadata fixture");
+    assert_eq!(
+        decoded_backup_gc.format_version,
+        BACKUP_GC_METADATA_FORMAT_VERSION
+    );
+    assert_eq!(decoded_backup_gc.object_key, backup_gc_record.object_key);
+    assert_eq!(
+        decoded_backup_gc.first_uploaded_at_millis,
+        backup_gc_record.first_uploaded_at_millis
+    );
+    crate::test_support::assert_durable_format_fixture(
+        "backup-gc-birth-v1.bin",
+        &backup_gc_payload,
+    );
+}
+
+#[tokio::test]
+async fn durable_format_decoders_fail_closed_on_corruption_and_unsupported_versions() {
+    let catalog_corrupt = Db::decode_catalog(b"not a flatbuffer")
+        .expect_err("corrupt catalog bytes should fail closed");
+    assert_eq!(catalog_corrupt.kind(), StorageErrorKind::Corruption);
+
+    let mut catalog_fbb = flatbuffers::FlatBufferBuilder::new();
+    let empty_entries = catalog_fbb.create_vector::<flatbuffers::WIPOffset<_>>(&[]);
+    let catalog_unsupported_root =
+        metadata_fb::create_catalog(&mut catalog_fbb, CATALOG_FORMAT_VERSION + 1, empty_entries);
+    catalog_fbb.finish(
+        catalog_unsupported_root,
+        Some(metadata_fb::CATALOG_IDENTIFIER),
+    );
+    let catalog_unsupported = catalog_fbb.finished_data().to_vec();
+    let catalog_unsupported = Db::decode_catalog(&catalog_unsupported)
+        .expect_err("unsupported catalog version should fail closed");
+    assert_eq!(catalog_unsupported.kind(), StorageErrorKind::Unsupported);
+
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store.clone());
+
+    let local_manifest_path = "/durable-fixtures/manifest/MANIFEST-000001";
+    let unsupported_local_manifest = PersistedManifestFile {
+        body: PersistedManifestBody {
+            format_version: MANIFEST_FORMAT_VERSION + 1,
+            generation: ManifestId::new(1),
+            last_flushed_sequence: SequenceNumber::new(0),
+            sstables: Vec::new(),
+        },
+        checksum: 0,
+    };
+    let unsupported_local_body =
+        Db::encode_manifest_body_flatbuffer(&unsupported_local_manifest.body)
+            .expect("encode unsupported local manifest body");
+    let unsupported_local_manifest = PersistedManifestFile {
+        checksum: super::checksum32(&unsupported_local_body),
+        ..unsupported_local_manifest
+    };
+    let unsupported_local_manifest =
+        Db::encode_manifest_file_flatbuffer(&unsupported_local_manifest, &unsupported_local_body)
+            .expect("encode unsupported local manifest");
+    overwrite_file(
+        file_system.as_ref(),
+        local_manifest_path,
+        &unsupported_local_manifest,
+    )
+    .await;
+    let unsupported_local_error = Db::read_manifest_at_path(&dependencies, local_manifest_path)
+        .await
+        .expect_err("unsupported local manifest version should fail closed");
+    assert_eq!(
+        unsupported_local_error.kind(),
+        StorageErrorKind::Unsupported
+    );
+
+    let valid_local_manifest =
+        Db::encode_manifest_payload_from_sstables(ManifestId::new(2), SequenceNumber::new(0), &[])
+            .expect("encode local manifest");
+    let mut corrupt_local_manifest =
+        Db::decode_manifest_file_flatbuffer(&valid_local_manifest).expect("decode local manifest");
+    let corrupt_local_body = Db::encode_manifest_body_flatbuffer(&corrupt_local_manifest.body)
+        .expect("re-encode local manifest body");
+    corrupt_local_manifest.checksum ^= 0x55;
+    let corrupt_local_manifest =
+        Db::encode_manifest_file_flatbuffer(&corrupt_local_manifest, &corrupt_local_body)
+            .expect("re-encode corrupt local manifest");
+    overwrite_file(
+        file_system.as_ref(),
+        local_manifest_path,
+        &corrupt_local_manifest,
+    )
+    .await;
+    let corrupt_local_error = Db::read_manifest_at_path(&dependencies, local_manifest_path)
+        .await
+        .expect_err("corrupt local manifest checksum should fail closed");
+    assert_eq!(corrupt_local_error.kind(), StorageErrorKind::Corruption);
+
+    let remote_manifest_key = tiered_layout().backup_manifest(ManifestId::new(1));
+    let unsupported_remote_manifest = PersistedRemoteManifestFile {
+        body: PersistedRemoteManifestBody {
+            format_version: REMOTE_MANIFEST_FORMAT_VERSION + 1,
+            generation: ManifestId::new(1),
+            last_flushed_sequence: SequenceNumber::new(0),
+            sstables: Vec::new(),
+            commit_log_segments: Vec::new(),
+        },
+        checksum: 0,
+    };
+    let unsupported_remote_body =
+        Db::encode_remote_manifest_body_flatbuffer(&unsupported_remote_manifest.body)
+            .expect("encode unsupported remote manifest body");
+    let unsupported_remote_manifest = PersistedRemoteManifestFile {
+        checksum: super::checksum32(&unsupported_remote_body),
+        ..unsupported_remote_manifest
+    };
+    let unsupported_remote_manifest = Db::encode_remote_manifest_file_flatbuffer(
+        &unsupported_remote_manifest,
+        &unsupported_remote_body,
+    )
+    .expect("encode unsupported remote manifest");
+    object_store
+        .put(&remote_manifest_key, &unsupported_remote_manifest)
+        .await
+        .expect("write unsupported remote manifest");
+    let unsupported_remote_error =
+        Db::read_remote_manifest_file_at_key(&dependencies, &remote_manifest_key)
+            .await
+            .expect_err("unsupported remote manifest version should fail closed");
+    assert_eq!(
+        unsupported_remote_error.kind(),
+        StorageErrorKind::Unsupported
+    );
+
+    let valid_remote_manifest =
+        Db::encode_remote_manifest_payload(ManifestId::new(2), SequenceNumber::new(0), &[], &[])
+            .expect("encode remote manifest");
+    let mut corrupt_remote_manifest =
+        Db::decode_remote_manifest_file_flatbuffer(&valid_remote_manifest)
+            .expect("decode remote manifest");
+    let corrupt_remote_body =
+        Db::encode_remote_manifest_body_flatbuffer(&corrupt_remote_manifest.body)
+            .expect("re-encode remote manifest body");
+    corrupt_remote_manifest.checksum ^= 0x55;
+    let corrupt_remote_manifest =
+        Db::encode_remote_manifest_file_flatbuffer(&corrupt_remote_manifest, &corrupt_remote_body)
+            .expect("re-encode corrupt remote manifest");
+    object_store
+        .put(&remote_manifest_key, &corrupt_remote_manifest)
+        .await
+        .expect("write corrupt remote manifest");
+    let corrupt_remote_error =
+        Db::read_remote_manifest_file_at_key(&dependencies, &remote_manifest_key)
+            .await
+            .expect_err("corrupt remote manifest checksum should fail closed");
+    assert_eq!(corrupt_remote_error.kind(), StorageErrorKind::Corruption);
+
+    let layout = tiered_layout();
+    let backup_object_key = layout.backup_sstable(TableId::new(9), 0, "SST-000222");
+    let backup_metadata_key = layout.backup_gc_metadata(&backup_object_key);
+
+    object_store
+        .put(&backup_metadata_key, b"{not json")
+        .await
+        .expect("write corrupt backup GC metadata");
+    assert!(
+        Db::read_backup_object_birth(&dependencies, &layout, &backup_object_key)
+            .await
+            .is_none(),
+        "corrupt backup GC metadata should fail closed by leaving the object untracked"
+    );
+
+    let unsupported_backup_gc = BackupObjectBirthRecord {
+        format_version: BACKUP_GC_METADATA_FORMAT_VERSION + 1,
+        object_key: backup_object_key.clone(),
+        first_uploaded_at_millis: 99,
+    };
+    let unsupported_backup_gc = Db::encode_backup_object_birth_payload(&unsupported_backup_gc)
+        .expect("encode unsupported backup GC metadata");
+    object_store
+        .put(&backup_metadata_key, &unsupported_backup_gc)
+        .await
+        .expect("write unsupported backup GC metadata");
+    assert!(
+        Db::read_backup_object_birth(&dependencies, &layout, &backup_object_key)
+            .await
+            .is_none(),
+        "unsupported backup GC metadata should fail closed by preventing GC from using it"
     );
 }

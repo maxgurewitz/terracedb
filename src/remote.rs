@@ -9,10 +9,13 @@ use crate::{
     error::{StorageError, StorageErrorKind},
     ids::{ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOptions},
+    metadata_flatbuffers as metadata_fb,
 };
 
 const LOCAL_READ_CHUNK_BYTES: usize = 64 * 1024;
 const CACHE_FORMAT_VERSION: u32 = 1;
+const FB_CACHE_SPAN_FULL: u8 = 1;
+const FB_CACHE_SPAN_RANGE: u8 = 2;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
@@ -293,6 +296,60 @@ struct CacheIndexEntry {
     data_path: String,
 }
 
+fn encode_cache_span_flatbuffer(span: CacheSpan) -> (u8, u64, u64) {
+    match span {
+        CacheSpan::Full => (FB_CACHE_SPAN_FULL, 0, 0),
+        CacheSpan::Range { start, end } => (FB_CACHE_SPAN_RANGE, start, end),
+    }
+}
+
+fn decode_cache_span_flatbuffer(kind: u8, start: u64, end: u64) -> Result<CacheSpan, StorageError> {
+    match kind {
+        FB_CACHE_SPAN_FULL => Ok(CacheSpan::Full),
+        FB_CACHE_SPAN_RANGE => Ok(CacheSpan::Range { start, end }),
+        _ => Err(StorageError::corruption(format!(
+            "unknown remote cache span tag {kind}"
+        ))),
+    }
+}
+
+fn encode_cache_entry_file_flatbuffer(file: &CacheEntryFile) -> Result<Vec<u8>, StorageError> {
+    let mut fbb = flatbuffers::FlatBufferBuilder::new();
+    let object_key = fbb.create_string(&file.record.object_key);
+    let (span_kind, start, end) = encode_cache_span_flatbuffer(file.record.span);
+    let root = metadata_fb::create_remote_cache_entry(
+        &mut fbb,
+        file.format_version,
+        object_key,
+        span_kind,
+        start,
+        end,
+        file.record.data_len,
+    );
+    fbb.finish(root, Some(metadata_fb::REMOTE_CACHE_IDENTIFIER));
+    Ok(fbb.finished_data().to_vec())
+}
+
+fn decode_cache_entry_file_flatbuffer(bytes: &[u8]) -> Result<CacheEntryFile, StorageError> {
+    let file = metadata_fb::root_with_identifier::<metadata_fb::RemoteCacheEntry<'_>>(
+        bytes,
+        metadata_fb::REMOTE_CACHE_IDENTIFIER,
+        "remote cache metadata",
+    )
+    .map_err(|error| {
+        StorageError::corruption(format!("decode remote cache metadata failed: {error}"))
+    })?;
+
+    Ok(CacheEntryFile {
+        format_version: file.format_version(),
+        record: CacheEntryRecord {
+            object_key: file.object_key().to_string(),
+            span: decode_cache_span_flatbuffer(file.span_kind(), file.start(), file.end())?,
+            data_len: file.data_len(),
+        },
+    })
+}
+
 pub struct RemoteCache {
     file_system: Arc<dyn FileSystem>,
     root: String,
@@ -369,7 +426,7 @@ impl RemoteCache {
             Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let file: CacheEntryFile = match serde_json::from_slice(&bytes) {
+        let file: CacheEntryFile = match decode_cache_entry_file_flatbuffer(&bytes) {
             Ok(file) => file,
             Err(_) => return Ok(None),
         };
@@ -490,9 +547,7 @@ impl RemoteCache {
                 data_len: bytes.len() as u64,
             },
         };
-        let payload = serde_json::to_vec_pretty(&metadata).map_err(|error| {
-            StorageError::corruption(format!("encode remote cache metadata failed: {error}"))
-        })?;
+        let payload = encode_cache_entry_file_flatbuffer(&metadata)?;
         write_bytes_atomic(self.file_system.as_ref(), &metadata_path, &payload).await?;
         self.file_system.sync_dir(&self.data_dir).await?;
         self.file_system.sync_dir(&self.metadata_dir).await?;
@@ -864,6 +919,22 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    fn sample_cache_entry_file() -> CacheEntryFile {
+        CacheEntryFile {
+            format_version: CACHE_FORMAT_VERSION,
+            record: CacheEntryRecord {
+                object_key:
+                    "tenant-a/db-01/cold/table-000009/0000/00000000000000000044-00000000000000000088/SST-000123.sst"
+                        .to_string(),
+                span: CacheSpan::Range {
+                    start: 128,
+                    end: 512,
+                },
+                data_len: 384,
+            },
+        }
+    }
+
     #[derive(Clone)]
     struct CountingObjectStore {
         inner: Arc<dyn ObjectStore>,
@@ -1031,6 +1102,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn durable_format_fixtures_match_golden_files() {
+        let metadata = sample_cache_entry_file();
+        let payload = encode_cache_entry_file_flatbuffer(&metadata)
+            .expect("encode remote cache metadata fixture");
+        let decoded = decode_cache_entry_file_flatbuffer(&payload)
+            .expect("decode remote cache metadata fixture");
+        assert_eq!(decoded, metadata);
+        crate::test_support::assert_durable_format_fixture("remote-cache-entry-v1.bin", &payload);
+    }
+
     #[tokio::test]
     async fn remote_cache_hits_and_misses_behave_as_expected() {
         let cache_root = unique_test_dir("cache-hit");
@@ -1118,6 +1200,102 @@ mod tests {
             0,
             "reopened cache should satisfy the read"
         );
+
+        cleanup(&cache_root);
+        cleanup(&object_root);
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_unsupported_cache_metadata_is_ignored_on_rebuild() {
+        let cache_root = unique_test_dir("cache-invalid-metadata");
+        let object_root = unique_test_dir("cache-invalid-metadata-objects");
+        let file_system = Arc::new(TokioFileSystem::new());
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(LocalDirObjectStore::new(&object_root));
+        let store = Arc::new(CountingObjectStore::new(inner_store));
+        let cache = RemoteCache::open(
+            file_system.clone(),
+            cache_root.to_string_lossy().into_owned(),
+        )
+        .await
+        .expect("open cache");
+
+        let full_key = "backup/sst/table-000001/0000/SST-000001.sst";
+        let range_key =
+            "cold/table-000001/0000/00000000000000000001-00000000000000000009/SST-000001.sst";
+        store
+            .put(full_key, b"hello invalid cache")
+            .await
+            .expect("seed full object");
+        store
+            .put(range_key, b"abcdefghijklmnopqrstuvwxyz")
+            .await
+            .expect("seed range object");
+
+        cache
+            .store(full_key, CacheSpan::Full, b"hello invalid cache")
+            .await
+            .expect("store cached full object");
+        cache
+            .store(range_key, CacheSpan::Range { start: 2, end: 6 }, b"cdef")
+            .await
+            .expect("store cached range");
+
+        let corrupt_path = cache.metadata_path(full_key, CacheSpan::Full);
+        write_bytes_atomic(file_system.as_ref(), &corrupt_path, b"not a flatbuffer")
+            .await
+            .expect("rewrite corrupt metadata");
+
+        let unsupported = CacheEntryFile {
+            format_version: CACHE_FORMAT_VERSION + 1,
+            record: CacheEntryRecord {
+                object_key: range_key.to_string(),
+                span: CacheSpan::Range { start: 2, end: 6 },
+                data_len: 4,
+            },
+        };
+        let unsupported_path =
+            cache.metadata_path(range_key, CacheSpan::Range { start: 2, end: 6 });
+        let unsupported_payload =
+            encode_cache_entry_file_flatbuffer(&unsupported).expect("encode unsupported metadata");
+        write_bytes_atomic(
+            file_system.as_ref(),
+            &unsupported_path,
+            &unsupported_payload,
+        )
+        .await
+        .expect("rewrite unsupported metadata");
+
+        let rebuilt = Arc::new(
+            RemoteCache::open(
+                file_system.clone(),
+                cache_root.to_string_lossy().into_owned(),
+            )
+            .await
+            .expect("reopen cache"),
+        );
+        assert_eq!(
+            rebuilt.entry_count(),
+            0,
+            "invalid cache metadata should be ignored during rebuild"
+        );
+
+        lock(&store.get_calls).clear();
+        lock(&store.range_calls).clear();
+        let storage = UnifiedStorage::new(file_system, store.clone(), Some(rebuilt));
+
+        let full = storage
+            .read_all(&StorageSource::remote_object(full_key))
+            .await
+            .expect("reload full object after invalid metadata");
+        let range = storage
+            .read_range(&StorageSource::remote_object(range_key), 2..6)
+            .await
+            .expect("reload range after invalid metadata");
+
+        assert_eq!(full, b"hello invalid cache");
+        assert_eq!(range, b"cdef");
+        assert_eq!(store.get_count(), 1);
+        assert_eq!(store.range_calls(), vec![(range_key.to_string(), 2, 6)]);
 
         cleanup(&cache_root);
         cleanup(&object_root);

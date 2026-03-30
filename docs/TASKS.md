@@ -970,28 +970,27 @@ Implement memory + S3 mode, including buffered visible commits, explicit `flush(
 
 ---
 
-### T23a. Durable-format compatibility contracts, golden fixtures, and CI checks
+### T23a. Durable-format compatibility contracts, golden fixtures, and local pre-commit checks
 
 **Depends on:** T04, T06, T08, T20, T22, T23
 
 **Description**
 
-Treat Terracedb's persisted bytes as long-lived contracts before changing any of the metadata/control-plane encodings. This task inventories the durable formats already in use, defines explicit compatibility expectations for each, and adds golden fixtures plus CI guardrails so accidental format drift fails during development instead of surfacing as reopen/recovery breakage later. Scope includes the catalog, commit-log frames, segment footers, local manifests, remote manifests, remote-cache metadata, and backup-GC metadata; hot SSTable layout evolution remains owned by the SSTable tasks.
+Treat Terracedb's persisted bytes as long-lived contracts before changing any of the metadata/control-plane encodings. This task inventories the durable formats already in use, defines explicit compatibility expectations for each, and adds golden fixtures plus local pre-commit guardrails so accidental format drift fails during development instead of surfacing as reopen/recovery breakage later. Scope includes the catalog, commit-log frames, segment footers, local manifests, remote manifests, remote-cache metadata, and backup-GC metadata; hot SSTable layout evolution remains owned by the SSTable tasks.
 
 **Implementation steps**
 
-1. Write down the compatibility policy for each durable format: what must remain byte-stable, what only needs backward-readable semantic compatibility, how version bumps work, and what must fail closed.
+1. Write down the durable-format policy for each owned format: what bytes are treated as reviewed artifacts for the current version, how version bumps work, and what must fail closed.
 2. Add golden fixtures for representative versions and variants of catalog files, commit-record frames, segment footers, local manifests, remote manifests, remote-cache metadata, and backup-GC metadata.
-3. Add tests proving current decoders can still read the prior fixtures, preserve checksum/version semantics, and reject corrupt or unsupported variants predictably.
-4. Add encode/regression tests for formats where canonical bytes are intentionally part of the contract, and semantic round-trip assertions where exact byte identity is not the compatibility boundary.
-5. Add a documented fixture-regeneration workflow and CI gating so intentional durable-format changes require explicit review.
+3. Add tests proving current decoders preserve checksum/version semantics and reject corrupt or unsupported variants predictably.
+4. Add encode/regression tests for formats where canonical bytes are intentionally part of the current contract, and semantic round-trip assertions where exact byte identity is not the boundary.
+5. Add a documented fixture-regeneration workflow and pre-commit gating so intentional durable-format changes require explicit review.
 
 **Verification**
 
 - Golden compatibility tests for catalog, commit-log frame, segment-footer, manifest, remote-manifest, remote-cache metadata, and backup-GC metadata fixtures.
 - Corruption and unsupported-version tests proving each format fails closed rather than silently accepting malformed bytes.
-- Upgrade-style tests proving current open/recovery/cache-rebuild paths can consume older fixtures without behavioral changes.
-- CI coverage that fails when durable-format bytes or schemas change without an explicit fixture/schema update.
+- Local pre-commit coverage that fails when durable-format bytes or schemas change without an explicit fixture/schema update.
 
 ---
 
@@ -1001,20 +1000,19 @@ Treat Terracedb's persisted bytes as long-lived contracts before changing any of
 
 **Description**
 
-Replace JSON only for structured metadata/control-plane formats where schema discipline and lower parse overhead are worth the complexity, while deliberately keeping custom binary framing for the commit log and custom/raw layouts for SSTable data blocks. This task moves the catalog, local manifest, remote manifest, remote-cache metadata, and backup-GC metadata onto FlatBuffers with explicit schema evolution rules and backward-compatible readers for legacy JSON payloads.
+Replace JSON for the structured metadata/control-plane formats where schema discipline and lower parse overhead are worth the complexity, while deliberately keeping custom binary framing for the commit log and custom/raw layouts for SSTable data blocks. This task moves the catalog, local manifest, remote manifest, remote-cache metadata, and backup-GC metadata onto FlatBuffers with explicit local schema/fixture review and fail-closed versioning. Terracedb is still greenfield here, so older JSON payloads do not need compatibility shims.
 
 **Implementation steps**
 
-1. Define FlatBuffers schemas for the catalog, local manifest, remote manifest, remote-cache metadata, and backup-GC metadata, including reserved fields and explicit evolution/versioning rules.
-2. Generate Rust bindings and add schema-evolution checks in CI so incompatible FlatBuffers schema changes fail review automatically.
-3. Implement readers that accept both legacy JSON payloads and the new FlatBuffers payloads during upgrade, and switch writers to emit canonical FlatBuffers payloads.
-4. Preserve existing outer file/object naming, checksums, and fail-closed validation behavior where possible; do not migrate commit-log frames, row SSTables, or columnar data blocks in this task.
+1. Define FlatBuffers schemas for the catalog, local manifest, remote manifest, remote-cache metadata, and backup-GC metadata, including explicit versioning rules and file identifiers for each durable artifact.
+2. Keep the checked schema reference, Rust wrapper/bindings, and reviewed fixtures in sync with local tests and pre-commit checks so incompatible schema drift fails before commit.
+3. Switch readers and writers fully to canonical FlatBuffers payloads for these metadata formats; do not carry JSON fallback readers in this greenfield phase.
+4. Preserve checksums and fail-closed validation behavior where applicable; do not migrate commit-log frames, row SSTables, or columnar data blocks in this task.
 5. Update open, recovery, cache-rebuild, and backup-GC paths plus their fixtures/tests so the new schemas are exercised end to end.
 
 **Verification**
 
-- Upgrade tests proving Terracedb can read legacy JSON catalog/manifest/cache metadata fixtures and continue operating after rewriting them in FlatBuffers form.
-- Golden FlatBuffers fixture tests plus schema-conformance checks for the new metadata formats.
+- Golden FlatBuffers fixture tests plus local schema-conformance/source-of-truth checks for the new metadata formats.
 - Restart, recovery, offload, backup, and cache-rebuild tests proving behavior is unchanged apart from the payload encoding.
 - Corruption and unsupported-schema tests proving malformed FlatBuffers or incompatible schema changes fail closed.
 - Tests and comments making it explicit that commit-log frames and SSTable hot-data layouts remain custom formats after this migration.
