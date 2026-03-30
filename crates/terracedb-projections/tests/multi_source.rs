@@ -7,8 +7,11 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
     Db, KvStream, ScanOptions, SequenceNumber, StubFileSystem, StubObjectStore, Table, TableConfig,
-    Value,
-    test_support::{bytes as test_bytes, row_table_config, test_dependencies, tiered_test_config},
+    TieredDurabilityMode, Value,
+    test_support::{
+        bytes as test_bytes, row_table_config, test_dependencies, tiered_test_config,
+        tiered_test_config_with_durability,
+    },
 };
 use terracedb_projections::{
     MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionError,
@@ -414,6 +417,113 @@ async fn snapshot_too_old_rebuilds_from_current_state_when_enabled() {
         ]
     );
 
+    handle
+        .shutdown()
+        .await
+        .expect("stop rebuildable projection");
+}
+
+#[tokio::test]
+async fn snapshot_too_old_rebuild_stays_pinned_to_durable_frontier() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/projection-rebuild-pinned-to-durable-frontier",
+            TieredDurabilityMode::Deferred,
+        ),
+        test_dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let events = db
+        .create_table(retained_row_table_config("events", 1))
+        .await
+        .expect("create retained events table");
+    let output = db
+        .create_table(row_table_config("output"))
+        .await
+        .expect("create output table");
+
+    let first = events
+        .write(b"event:1".to_vec(), test_bytes("a"))
+        .await
+        .expect("write first durable event");
+    db.flush().await.expect("flush first durable event");
+
+    let second = events
+        .write(b"event:2".to_vec(), test_bytes("b"))
+        .await
+        .expect("write second durable event");
+    db.flush().await.expect("flush second durable event");
+
+    let visible_only = events
+        .write(b"event:3".to_vec(), test_bytes("c"))
+        .await
+        .expect("write visible-only event");
+    assert!(
+        visible_only > second,
+        "expected visible-only write to advance past durable frontier"
+    );
+
+    let runtime = ProjectionRuntime::open(db.clone())
+        .await
+        .expect("open projection runtime");
+    let mut handle = runtime
+        .start_multi_source(
+            MultiSourceProjection::new(
+                "durable-pinned-rebuild",
+                [events.clone()],
+                MirrorCurrentStateProjection {
+                    output: output.clone(),
+                },
+            )
+            .with_outputs([output.clone()])
+            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+        )
+        .await
+        .expect("start rebuildable projection");
+
+    wait_for_targets(&mut handle, [(&events, second)])
+        .await
+        .expect("rebuild should stop at the durable frontier");
+
+    assert_eq!(handle.current_frontier().get("events"), Some(&second));
+    assert_eq!(
+        collect_rows(
+            output
+                .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                .await
+                .expect("scan rebuilt output"),
+        )
+        .await,
+        vec![
+            (b"event:1".to_vec(), b"a".to_vec()),
+            (b"event:2".to_vec(), b"b".to_vec()),
+        ]
+    );
+
+    db.flush().await.expect("flush visible-only source write");
+    wait_for_targets(&mut handle, [(&events, visible_only)])
+        .await
+        .expect("tailing should pick up the formerly visible-only write after durability");
+
+    assert_eq!(
+        collect_rows(
+            output
+                .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                .await
+                .expect("scan output after durable catch-up"),
+        )
+        .await,
+        vec![
+            (b"event:1".to_vec(), b"a".to_vec()),
+            (b"event:2".to_vec(), b"b".to_vec()),
+            (b"event:3".to_vec(), b"c".to_vec()),
+        ]
+    );
+
+    assert!(first < second, "durable writes should advance sequences");
     handle
         .shutdown()
         .await

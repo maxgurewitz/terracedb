@@ -13,8 +13,8 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use terracedb::{
     ChangeEntry, ChangeKind, CommitError, CommitOptions, CompactionStrategy, CreateTableError, Db,
-    KvStream, LogCursor, ReadError, ScanOptions, SequenceNumber, SnapshotTooOld, StorageError,
-    SubscriptionClosed, Table, TableConfig, TableFormat, Value, WriteBatch,
+    KvStream, LogCursor, ReadError, ScanOptions, SequenceNumber, Snapshot, SnapshotTooOld,
+    StorageError, SubscriptionClosed, Table, TableConfig, TableFormat, Value, WriteBatch,
 };
 
 pub const PROJECTION_CURSOR_TABLE_NAME: &str = "_projection_cursors";
@@ -149,6 +149,17 @@ impl From<SubscriptionClosed> for ProjectionError {
     }
 }
 
+/// Controls how the runtime recovers after `SnapshotTooOld`.
+///
+/// `FailClosed` is the safe default for history-dependent projections.
+/// `RebuildFromCurrentState` is only correct when scanning each source table at a
+/// pinned frontier fully captures the projection's rebuild input, such as:
+///
+/// - current-state read models and indexes over mutable tables, or
+/// - append-only/event tables whose keys encode the deterministic replay order the
+///   projection relies on.
+///
+/// It does not reconstruct collapsed mutation history from mutable tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecomputeStrategy {
     FailClosed,
@@ -564,6 +575,13 @@ impl ProjectionRuntime {
         Ok(self.monitor(name)?.frontier.borrow().clone())
     }
 
+    /// Waits for visible projection output whose recorded source frontier covers the
+    /// requested sequences.
+    ///
+    /// Exact transitive waits are supported for dependency chains whose nodes are
+    /// single-source. When a dependency path includes a multi-source node, the wait
+    /// remains conservative unless the requested source is part of the current
+    /// projection's direct frontier.
     pub async fn wait_for_frontier<'a, I>(
         &self,
         name: &str,
@@ -1303,6 +1321,7 @@ async fn rebuild_from_current_state(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let durable_snapshot = runtime.db.durable_snapshot().await;
 
     let mut reset_batch = WriteBatch::default();
     for output in &runtime.outputs {
@@ -1337,10 +1356,8 @@ async fn rebuild_from_current_state(
             .get(source_table.name())
             .copied()
             .unwrap_or(SequenceNumber::new(0));
-        let read_sequence = runtime.db.current_sequence();
-
         let synthetic_runs =
-            build_recompute_runs(&source_table, read_sequence, target_sequence).await?;
+            build_recompute_runs(&durable_snapshot, &source_table, target_sequence).await?;
         if synthetic_runs.is_empty() {
             if target_sequence == SequenceNumber::new(0) {
                 continue;
@@ -1433,19 +1450,19 @@ async fn clear_table(table: &Table, batch: &mut WriteBatch) -> Result<(), Projec
 }
 
 async fn build_recompute_runs(
+    snapshot: &Snapshot,
     source: &Table,
-    read_sequence: SequenceNumber,
     logical_sequence: SequenceNumber,
 ) -> Result<Vec<ProjectionSequenceRun>, ProjectionError> {
     if logical_sequence == SequenceNumber::new(0) {
         return Ok(Vec::new());
     }
 
-    let mut rows = source
-        .scan_at(
+    let mut rows = snapshot
+        .scan(
+            source,
             FULL_SCAN_START.to_vec(),
             FULL_SCAN_END.to_vec(),
-            read_sequence,
             ScanOptions::default(),
         )
         .await?;
