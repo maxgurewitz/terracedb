@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/terracedb-simulation",
+    "crates/terracedb-vfs",
     "crates/turmoil-determinism",
     "crates/terracedb-projections",
     "crates/terracedb-workflows",
