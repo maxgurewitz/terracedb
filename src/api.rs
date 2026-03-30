@@ -1593,7 +1593,7 @@ impl CommitRuntime {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => manager.append_batch_and_sync(records).await,
             CommitLogBackend::Memory(log) => {
-                log.records.extend(records.iter().cloned());
+                Arc::make_mut(&mut log.records).extend(records.iter().cloned());
                 Ok(())
             }
         }
@@ -10035,7 +10035,11 @@ fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
-    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use futures::{StreamExt, TryStreamExt};
@@ -10817,6 +10821,10 @@ mod tests {
             .expect("collect change stream")
     }
 
+    fn collected_sequences(changes: &[CollectedChange]) -> Vec<SequenceNumber> {
+        changes.iter().map(|change| change.sequence).collect()
+    }
+
     fn collected_change(
         sequence: u64,
         op_index: u16,
@@ -10833,6 +10841,112 @@ mod tests {
             value,
             table: table.to_string(),
         }
+    }
+
+    async fn active_commit_log_segment_path(db: &Db, root: &str) -> String {
+        let segment_id = db
+            .inner
+            .commit_runtime
+            .lock()
+            .await
+            .enumerate_segments()
+            .last()
+            .map(|segment| segment.segment_id.get())
+            .unwrap_or(1);
+        commit_log_segment_path(root, segment_id)
+    }
+
+    async fn assert_failed_sequence_feed_invariants(
+        db: &Db,
+        table: &crate::Table,
+        successful_sequences: &[SequenceNumber],
+        failed_sequences: &std::collections::BTreeSet<SequenceNumber>,
+        previous_visible: &mut SequenceNumber,
+        previous_durable: &mut SequenceNumber,
+    ) {
+        let visible = db.current_sequence();
+        let durable = db.current_durable_sequence();
+        assert!(
+            visible >= *previous_visible,
+            "visible watermark moved backwards from {:?} to {:?}",
+            previous_visible,
+            visible
+        );
+        assert!(
+            durable >= *previous_durable,
+            "durable watermark moved backwards from {:?} to {:?}",
+            previous_durable,
+            durable
+        );
+        assert!(
+            durable <= visible,
+            "durable watermark {:?} exceeded visible watermark {:?}",
+            durable,
+            visible
+        );
+        *previous_visible = visible;
+        *previous_durable = durable;
+
+        let visible_changes = collect_changes(
+            db.scan_since(table, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan visible changes"),
+        )
+        .await;
+        let durable_changes = collect_changes(
+            db.scan_durable_since(table, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan durable changes"),
+        )
+        .await;
+        assert_eq!(
+            collected_sequences(&visible_changes),
+            successful_sequences,
+            "visible change feed diverged from the successful sequence prefix"
+        );
+        assert_eq!(
+            collected_sequences(&durable_changes),
+            successful_sequences,
+            "durable change feed diverged from the successful sequence prefix"
+        );
+        assert!(
+            visible_changes
+                .iter()
+                .all(|change| !failed_sequences.contains(&change.sequence)),
+            "visible change feed leaked a failed sequence"
+        );
+        assert!(
+            durable_changes
+                .iter()
+                .all(|change| !failed_sequences.contains(&change.sequence)),
+            "durable change feed leaked a failed sequence"
+        );
+    }
+
+    async fn perform_failed_group_commit(
+        db: &Db,
+        table: &crate::Table,
+        file_system: &crate::StubFileSystem,
+        root: &str,
+        key: Vec<u8>,
+        value: &str,
+    ) -> SequenceNumber {
+        let sync_target = active_commit_log_segment_path(db, root).await;
+        file_system.inject_failure(FileSystemFailure::timeout(
+            FileSystemOperation::Sync,
+            sync_target,
+        ));
+        let error = table
+            .write(key, Value::bytes(value))
+            .await
+            .expect_err("group-commit sync should fail");
+        match error {
+            crate::WriteError::Commit(CommitError::Storage(storage)) => {
+                assert_eq!(storage.kind(), crate::StorageErrorKind::Timeout);
+            }
+            other => panic!("expected storage error for failed group commit, got {other:?}"),
+        }
+        db.current_sequence()
     }
 
     fn assert_snapshot_too_old(
@@ -17016,6 +17130,273 @@ mod tests {
         assert_eq!(first.await.expect("join first"), SequenceNumber::new(1));
         assert_eq!(db.current_sequence(), SequenceNumber::new(2));
         assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
+    }
+
+    #[tokio::test]
+    async fn randomized_failed_sequence_watermarks_are_monotonic_and_feeds_skip_aborted_runs() {
+        for seed in [0x19e1_u64, 0x19e2, 0x19e3, 0x19e4] {
+            let root = format!("/failed-sequence-watermarks-{seed}");
+            let file_system = Arc::new(crate::StubFileSystem::default());
+            let object_store = Arc::new(StubObjectStore::default());
+            let db = Db::open(
+                tiered_config(&root),
+                dependencies(file_system.clone(), object_store),
+            )
+            .await
+            .expect("open db");
+            let table = db
+                .create_table(row_table_config("events"))
+                .await
+                .expect("create table");
+            let rng = StubRng::seeded(seed);
+            let mut successful_sequences = Vec::new();
+            let mut failed_sequences = BTreeSet::new();
+            let mut previous_visible = SequenceNumber::new(0);
+            let mut previous_durable = SequenceNumber::new(0);
+
+            let failed = perform_failed_group_commit(
+                &db,
+                &table,
+                file_system.as_ref(),
+                &root,
+                b"failed:bootstrap".to_vec(),
+                "failed-bootstrap",
+            )
+            .await;
+            failed_sequences.insert(failed);
+            assert_failed_sequence_feed_invariants(
+                &db,
+                &table,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await;
+
+            let recovered_gap = table
+                .write(b"ok:bootstrap".to_vec(), Value::bytes("ok-bootstrap"))
+                .await
+                .expect("successful write after failed assigned sequence");
+            successful_sequences.push(recovered_gap);
+            assert_failed_sequence_feed_invariants(
+                &db,
+                &table,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await;
+
+            for step in 0..24_u64 {
+                match rng.next_u64() % 4 {
+                    0 => {
+                        let failed = perform_failed_group_commit(
+                            &db,
+                            &table,
+                            file_system.as_ref(),
+                            &root,
+                            format!("failed:{step}").into_bytes(),
+                            "failed",
+                        )
+                        .await;
+                        failed_sequences.insert(failed);
+                    }
+                    _ => {
+                        let sequence = table
+                            .write(
+                                format!("ok:{step}").into_bytes(),
+                                Value::bytes(format!("value-{step}")),
+                            )
+                            .await
+                            .expect("successful randomized write");
+                        successful_sequences.push(sequence);
+                    }
+                }
+
+                assert_failed_sequence_feed_invariants(
+                    &db,
+                    &table,
+                    &successful_sequences,
+                    &failed_sequences,
+                    &mut previous_visible,
+                    &mut previous_durable,
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn randomized_failed_sequence_invariants_hold_across_reopen() {
+        for seed in [0x29e1_u64, 0x29e2, 0x29e3] {
+            let root = format!("/failed-sequence-reopen-{seed}");
+            let file_system = Arc::new(crate::StubFileSystem::default());
+            let object_store = Arc::new(StubObjectStore::default());
+            let dependencies = dependencies(file_system.clone(), object_store);
+            let db = Db::open(tiered_config(&root), dependencies.clone())
+                .await
+                .expect("open db");
+            let table = db
+                .create_table(row_table_config("events"))
+                .await
+                .expect("create table");
+            let rng = StubRng::seeded(seed ^ 0x55aa_19e0);
+            let mut successful_sequences = Vec::new();
+            let mut failed_sequences = BTreeSet::new();
+            let mut previous_visible = SequenceNumber::new(0);
+            let mut previous_durable = SequenceNumber::new(0);
+
+            let first = table
+                .write(
+                    b"ok:before-restart".to_vec(),
+                    Value::bytes("before-restart"),
+                )
+                .await
+                .expect("write initial success");
+            successful_sequences.push(first);
+            assert_failed_sequence_feed_invariants(
+                &db,
+                &table,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await;
+
+            let failed = perform_failed_group_commit(
+                &db,
+                &table,
+                file_system.as_ref(),
+                &root,
+                b"failed:before-restart".to_vec(),
+                "failed-before-restart",
+            )
+            .await;
+            failed_sequences.insert(failed);
+            assert_failed_sequence_feed_invariants(
+                &db,
+                &table,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await;
+
+            let publish_after_gap = table
+                .write(b"ok:after-gap".to_vec(), Value::bytes("after-gap"))
+                .await
+                .expect("write success after failed sequence");
+            successful_sequences.push(publish_after_gap);
+            assert_failed_sequence_feed_invariants(
+                &db,
+                &table,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await;
+
+            for step in 0..12_u64 {
+                match rng.next_u64() % 3 {
+                    0 => {
+                        let failed = perform_failed_group_commit(
+                            &db,
+                            &table,
+                            file_system.as_ref(),
+                            &root,
+                            format!("failed:pre-restart:{step}").into_bytes(),
+                            "failed-pre-restart",
+                        )
+                        .await;
+                        failed_sequences.insert(failed);
+                    }
+                    _ => {
+                        let sequence = table
+                            .write(
+                                format!("ok:pre-restart:{step}").into_bytes(),
+                                Value::bytes(format!("pre-restart-{step}")),
+                            )
+                            .await
+                            .expect("successful write before restart");
+                        successful_sequences.push(sequence);
+                    }
+                }
+
+                assert_failed_sequence_feed_invariants(
+                    &db,
+                    &table,
+                    &successful_sequences,
+                    &failed_sequences,
+                    &mut previous_visible,
+                    &mut previous_durable,
+                )
+                .await;
+            }
+
+            file_system.crash();
+            let recovered_visible = successful_sequences.last().copied().unwrap_or_default();
+            failed_sequences.retain(|sequence| *sequence < recovered_visible);
+
+            let reopened = Db::open(tiered_config(&root), dependencies.clone())
+                .await
+                .expect("reopen db");
+            let reopened_table = reopened.table("events");
+            assert_eq!(reopened.current_sequence(), recovered_visible);
+            assert_eq!(reopened.current_durable_sequence(), recovered_visible);
+            previous_visible = recovered_visible;
+            previous_durable = recovered_visible;
+            assert_failed_sequence_feed_invariants(
+                &reopened,
+                &reopened_table,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await;
+
+            for step in 0..12_u64 {
+                match rng.next_u64() % 3 {
+                    0 => {
+                        let failed = perform_failed_group_commit(
+                            &reopened,
+                            &reopened_table,
+                            file_system.as_ref(),
+                            &root,
+                            format!("failed:post-restart:{step}").into_bytes(),
+                            "failed-post-restart",
+                        )
+                        .await;
+                        failed_sequences.insert(failed);
+                    }
+                    _ => {
+                        let sequence = reopened_table
+                            .write(
+                                format!("ok:post-restart:{step}").into_bytes(),
+                                Value::bytes(format!("post-restart-{step}")),
+                            )
+                            .await
+                            .expect("successful write after restart");
+                        successful_sequences.push(sequence);
+                    }
+                }
+
+                assert_failed_sequence_feed_invariants(
+                    &reopened,
+                    &reopened_table,
+                    &successful_sequences,
+                    &failed_sequences,
+                    &mut previous_visible,
+                    &mut previous_durable,
+                )
+                .await;
+            }
+        }
     }
 
     #[tokio::test]
