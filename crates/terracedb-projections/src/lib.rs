@@ -1139,7 +1139,7 @@ impl ProjectionRuntime {
                     .iter()
                     .filter(|source| dependency_monitor.metadata.outputs.contains(*source))
                 {
-                    let source_table = self.db.table(source);
+                    let source_table = lookup_table(&self.db, source)?;
                     merge_target(
                         &mut direct_targets,
                         source.clone(),
@@ -1280,7 +1280,7 @@ impl ProjectionHandle {
         &mut self,
         target: SequenceNumber,
     ) -> Result<(), ProjectionError> {
-        let table = self.runtime.db.table(&self.primary_source);
+        let table = lookup_table(&self.runtime.db, &self.primary_source)?;
         self.wait_for_sources([(&table, target)]).await
     }
 
@@ -1795,9 +1795,16 @@ async fn build_recompute_runs(
 async fn ensure_projection_cursor_table(db: &Db) -> Result<Table, ProjectionError> {
     match db.create_table(projection_cursor_table_config()).await {
         Ok(table) => Ok(table),
-        Err(CreateTableError::AlreadyExists(_)) => Ok(db.table(PROJECTION_CURSOR_TABLE_NAME)),
+        Err(CreateTableError::AlreadyExists(_)) => {
+            lookup_table(db, PROJECTION_CURSOR_TABLE_NAME).map_err(Into::into)
+        }
         Err(error) => Err(error.into()),
     }
+}
+
+fn lookup_table(db: &Db, name: &str) -> Result<Table, StorageError> {
+    db.try_table(name)
+        .ok_or_else(|| StorageError::not_found(format!("table does not exist: {name}")))
 }
 
 async fn load_projection_cursor_state(
@@ -1829,7 +1836,12 @@ async fn scan_whole_sequence_run(
         .scan_durable_since(source, cursor, ScanOptions::default())
         .await?;
 
-    let Some(first) = stream.try_next().await? else {
+    let Some(first) = stream
+        .try_next()
+        .await
+        .map_err(ChangeFeedError::Storage)
+        .map_err(ProjectionError::ChangeFeed)?
+    else {
         return Ok(None);
     };
 
@@ -1838,7 +1850,12 @@ async fn scan_whole_sequence_run(
     let mut last_cursor = first.cursor;
     let mut entries = vec![first];
 
-    while let Some(entry) = stream.try_next().await? {
+    while let Some(entry) = stream
+        .try_next()
+        .await
+        .map_err(ChangeFeedError::Storage)
+        .map_err(ProjectionError::ChangeFeed)?
+    {
         if entry.sequence != sequence {
             break;
         }

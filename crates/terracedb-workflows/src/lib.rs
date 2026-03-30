@@ -902,7 +902,12 @@ where
         .await?;
 
     let mut page = Vec::new();
-    while let Some(entry) = stream.try_next().await? {
+    while let Some(entry) = stream
+        .try_next()
+        .await
+        .map_err(ChangeFeedError::Storage)
+        .map_err(WorkflowError::ChangeFeed)?
+    {
         page.push(entry);
     }
 
@@ -1461,9 +1466,14 @@ async fn ensure_workflow_tables(
 async fn ensure_table(db: &Db, name: &str) -> Result<Table, WorkflowError> {
     match db.create_table(workflow_table_config(name)).await {
         Ok(table) => Ok(table),
-        Err(CreateTableError::AlreadyExists(_)) => Ok(db.table(name)),
+        Err(CreateTableError::AlreadyExists(_)) => lookup_table(db, name).map_err(Into::into),
         Err(error) => Err(error.into()),
     }
+}
+
+fn lookup_table(db: &Db, name: &str) -> Result<Table, StorageError> {
+    db.try_table(name)
+        .ok_or_else(|| StorageError::not_found(format!("table does not exist: {name}")))
 }
 
 fn workflow_table_config(name: &str) -> TableConfig {
@@ -1563,7 +1573,7 @@ fn decode_admitted_trigger(
     Ok(AdmittedWorkflowTrigger {
         workflow_instance: stored.workflow_instance,
         trigger_seq: stored.trigger_seq,
-        trigger: stored.trigger.into_runtime_trigger(db),
+        trigger: stored.trigger.into_runtime_trigger(db)?,
         operation_context: stored.operation_context,
     })
 }
@@ -1687,25 +1697,25 @@ impl StoredWorkflowTrigger {
         }
     }
 
-    fn into_runtime_trigger(self, db: &Db) -> WorkflowTrigger {
+    fn into_runtime_trigger(self, db: &Db) -> Result<WorkflowTrigger, WorkflowError> {
         match self {
-            Self::Event { entry } => WorkflowTrigger::Event(entry.into_change_entry(db)),
+            Self::Event { entry } => Ok(WorkflowTrigger::Event(entry.into_change_entry(db)?)),
             Self::Timer {
                 timer_id,
                 fire_at,
                 payload,
-            } => WorkflowTrigger::Timer {
+            } => Ok(WorkflowTrigger::Timer {
                 timer_id,
                 fire_at,
                 payload,
-            },
+            }),
             Self::Callback {
                 callback_id,
                 response,
-            } => WorkflowTrigger::Callback {
+            } => Ok(WorkflowTrigger::Callback {
                 callback_id,
                 response,
-            },
+            }),
         }
     }
 }
@@ -1735,16 +1745,16 @@ impl StoredChangeEntry {
         }
     }
 
-    fn into_change_entry(self, db: &Db) -> ChangeEntry {
-        ChangeEntry {
+    fn into_change_entry(self, db: &Db) -> Result<ChangeEntry, StorageError> {
+        Ok(ChangeEntry {
             key: self.key,
             value: self.value,
             cursor: self.cursor,
             sequence: self.sequence,
             kind: self.kind,
-            table: db.table(self.source_table),
+            table: lookup_table(db, &self.source_table)?,
             operation_context: self.operation_context,
-        }
+        })
     }
 }
 

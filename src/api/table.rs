@@ -89,9 +89,9 @@ impl Table {
         key: Key,
         sequence: SequenceNumber,
     ) -> Result<Option<Value>, ReadError> {
-        let Some(table_id) = self.resolve_id() else {
-            return Ok(None);
-        };
+        let table_id = self
+            .resolve_id()
+            .ok_or_else(|| Db::missing_table_error(self.name()))?;
         self.db.validate_historical_read(table_id, sequence)?;
 
         Ok(self.db.read_visible_value(table_id, &key, sequence).await?)
@@ -104,9 +104,9 @@ impl Table {
         sequence: SequenceNumber,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        let Some(table_id) = self.resolve_id() else {
-            return Ok(Box::pin(stream::empty()));
-        };
+        let table_id = self
+            .resolve_id()
+            .ok_or_else(|| Db::missing_table_error(self.name()))?;
         self.db.validate_historical_read(table_id, sequence)?;
 
         let rows = self
@@ -130,9 +130,9 @@ impl Table {
         sequence: SequenceNumber,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        let Some(table_id) = self.resolve_id() else {
-            return Ok(Box::pin(stream::empty()));
-        };
+        let table_id = self
+            .resolve_id()
+            .ok_or_else(|| Db::missing_table_error(self.name()))?;
         self.db.validate_historical_read(table_id, sequence)?;
 
         let rows = self

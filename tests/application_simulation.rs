@@ -61,7 +61,12 @@ fn row_table_config(name: &str) -> TableConfig {
 async fn ensure_table(db: &Db, config: TableConfig) -> Result<Table, CreateTableError> {
     match db.create_table(config.clone()).await {
         Ok(table) => Ok(table),
-        Err(CreateTableError::AlreadyExists(_)) => Ok(db.table(config.name)),
+        Err(CreateTableError::AlreadyExists(_)) => db.try_table(&config.name).ok_or_else(|| {
+            CreateTableError::Storage(terracedb::StorageError::not_found(format!(
+                "table does not exist: {}",
+                config.name
+            )))
+        }),
         Err(error) => Err(error),
     }
 }

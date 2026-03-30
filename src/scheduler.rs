@@ -219,28 +219,32 @@ mod tests {
     };
 
     fn make_table(name: &str) -> Table {
-        let config = DbConfig {
-            storage: StorageConfig::Tiered(TieredStorageConfig {
-                ssd: SsdConfig {
-                    path: "/scheduler-round-robin".to_string(),
-                },
-                s3: S3Location {
-                    bucket: "terracedb-test".to_string(),
-                    prefix: "scheduler".to_string(),
-                },
-                max_local_bytes: 1024,
-                durability: TieredDurabilityMode::GroupCommit,
-            }),
-            scheduler: None,
-        };
-        let dependencies = DbDependencies::new(
-            Arc::new(StubFileSystem::default()),
-            Arc::new(StubObjectStore::default()),
-            Arc::new(StubClock::default()),
-            Arc::new(StubRng::seeded(1)),
-        );
-        let db = futures::executor::block_on(Db::open(config, dependencies)).expect("open db");
-        db.table(name)
+        futures::executor::block_on(async {
+            let config = DbConfig {
+                storage: StorageConfig::Tiered(TieredStorageConfig {
+                    ssd: SsdConfig {
+                        path: "/scheduler-round-robin".to_string(),
+                    },
+                    s3: S3Location {
+                        bucket: "terracedb-test".to_string(),
+                        prefix: "scheduler".to_string(),
+                    },
+                    max_local_bytes: 1024,
+                    durability: TieredDurabilityMode::GroupCommit,
+                }),
+                scheduler: None,
+            };
+            let dependencies = DbDependencies::new(
+                Arc::new(StubFileSystem::default()),
+                Arc::new(StubObjectStore::default()),
+                Arc::new(StubClock::default()),
+                Arc::new(StubRng::seeded(1)),
+            );
+            let db = Db::open(config, dependencies).await.expect("open db");
+            db.create_table(crate::test_support::row_table_config(name))
+                .await
+                .expect("create scheduler test table")
+        })
     }
 
     #[test]
