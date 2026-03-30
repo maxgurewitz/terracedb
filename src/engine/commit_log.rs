@@ -576,8 +576,56 @@ impl SegmentManager {
     }
 
     pub async fn append(&mut self, record: CommitRecord) -> Result<AppendLocation, StorageError> {
+        self.append_internal(record, true).await
+    }
+
+    pub async fn append_without_seal(
+        &mut self,
+        record: CommitRecord,
+    ) -> Result<AppendLocation, StorageError> {
+        self.append_internal(record, false).await
+    }
+
+    pub fn active_len(&self) -> u64 {
+        self.active.len
+    }
+
+    pub async fn rollback_active_to_len(&mut self, len: u64) -> Result<(), StorageError> {
+        if len >= self.active.len {
+            return Ok(());
+        }
+
+        let bytes = read_file(self.fs.as_ref(), &self.active.path).await?;
+        let repaired = bytes
+            .get(..len as usize)
+            .ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "cannot roll back active segment {} to {len} bytes; current length is {}",
+                    self.active.id.get(),
+                    bytes.len(),
+                ))
+            })?
+            .to_vec();
+        Self::repair_active_segment(self.fs.as_ref(), &self.active.path, &repaired).await?;
+        self.active = ActiveSegment::recover(
+            self.active.id,
+            self.active.path.clone(),
+            FileHandle::new(self.active.path.clone()),
+            repaired,
+            self.options.records_per_block,
+        )?
+        .segment;
+        Ok(())
+    }
+
+    async fn append_internal(
+        &mut self,
+        record: CommitRecord,
+        allow_seal: bool,
+    ) -> Result<AppendLocation, StorageError> {
         let frame = record.encode_frame()?;
-        if self.active.record_count > 0
+        if allow_seal
+            && self.active.record_count > 0
             && self.active.len + frame.len() as u64 > self.options.max_segment_size_bytes
         {
             self.seal_active().await?;

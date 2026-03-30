@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -21,8 +21,8 @@ use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
     DbSimulationScenarioConfig, DbWorkloadOperation, ObjectStoreFaultSpec, OperationResult,
     PointMutation, ScheduledFault, ScheduledFaultKind, SeededSimulationRunner, ShadowOracle,
-    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, StubDbProcess,
-    TraceEvent,
+    SimulationContext, SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec,
+    StubDbProcess, TraceEvent,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
@@ -214,6 +214,80 @@ async fn collect_change_feed(stream: terracedb::ChangeStream) -> Vec<DbOracleCha
         .try_collect::<Vec<_>>()
         .await
         .expect("collect change feed")
+}
+
+fn collected_sequences(changes: &[DbOracleChange]) -> Vec<SequenceNumber> {
+    changes.iter().map(|change| change.sequence).collect()
+}
+
+fn next_schedule_u64(state: &mut u64) -> u64 {
+    let mut next = (*state).max(1);
+    next ^= next << 7;
+    next ^= next >> 9;
+    next ^= next << 8;
+    *state = next;
+    next
+}
+
+async fn simulated_active_commit_log_segment_path(
+    context: &SimulationContext,
+    root: &str,
+) -> Result<String, terracedb::StorageError> {
+    let mut candidates = context
+        .file_system()
+        .list(root)
+        .await?
+        .into_iter()
+        .filter(|path| path.contains("/commitlog/SEG-"))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.pop().ok_or_else(|| {
+        terracedb::StorageError::not_found(format!(
+            "missing active commit-log segment under {root}"
+        ))
+    })
+}
+
+async fn assert_simulated_failed_sequence_invariants(
+    db: &terracedb::Db,
+    table: &terracedb::Table,
+    successful_sequences: &[SequenceNumber],
+    failed_sequences: &BTreeSet<SequenceNumber>,
+    previous_visible: &mut SequenceNumber,
+    previous_durable: &mut SequenceNumber,
+) -> turmoil::Result<()> {
+    let visible = db.current_sequence();
+    let durable = db.current_durable_sequence();
+    assert!(visible >= *previous_visible);
+    assert!(durable >= *previous_durable);
+    assert!(durable <= visible);
+    *previous_visible = visible;
+    *previous_durable = durable;
+
+    let visible_changes = collect_change_feed(
+        db.scan_since(table, LogCursor::beginning(), ScanOptions::default())
+            .await?,
+    )
+    .await;
+    let durable_changes = collect_change_feed(
+        db.scan_durable_since(table, LogCursor::beginning(), ScanOptions::default())
+            .await?,
+    )
+    .await;
+    assert_eq!(collected_sequences(&visible_changes), successful_sequences);
+    assert_eq!(collected_sequences(&durable_changes), successful_sequences);
+    assert!(
+        visible_changes
+            .iter()
+            .all(|change| !failed_sequences.contains(&change.sequence))
+    );
+    assert!(
+        durable_changes
+            .iter()
+            .all(|change| !failed_sequences.contains(&change.sequence))
+    );
+
+    Ok(())
 }
 #[test]
 fn simulation_harness_replays_same_seed() -> turmoil::Result {
@@ -1020,6 +1094,178 @@ fn s3_primary_simulation_failed_flush_recovers_last_durable_prefix() -> turmoil:
             reopened_events.read(b"user:1".to_vec()).await?,
             Some(bytes("v1"))
         );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn group_commit_failed_sequence_simulation_preserves_watermark_prefix_invariants() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x19e5).run_with(|context| async move {
+        let root = "/terracedb/sim/group-failed-sequence-watermarks";
+        let config = simulation_tiered_config(root, TieredDurabilityMode::GroupCommit);
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+        let mut schedule_state = context.seed() ^ 0x5a5a_19e5;
+        let mut successful_sequences = Vec::new();
+        let mut failed_sequences = BTreeSet::new();
+        let mut previous_visible = SequenceNumber::new(0);
+        let mut previous_durable = SequenceNumber::new(0);
+
+        let first = events
+            .write(b"ok:before-gap".to_vec(), bytes("before-gap"))
+            .await?;
+        successful_sequences.push(first);
+        assert_simulated_failed_sequence_invariants(
+            &db,
+            &events,
+            &successful_sequences,
+            &failed_sequences,
+            &mut previous_visible,
+            &mut previous_durable,
+        )
+        .await?;
+
+        let sync_target = simulated_active_commit_log_segment_path(&context, root).await?;
+        context
+            .file_system()
+            .inject_failure(FileSystemFailure::timeout(
+                FileSystemOperation::Sync,
+                sync_target,
+            ));
+        events
+            .write(b"failed:before-gap".to_vec(), bytes("failed-before-gap"))
+            .await
+            .expect_err("group-commit sync should fail");
+        failed_sequences.insert(db.current_sequence());
+        assert_simulated_failed_sequence_invariants(
+            &db,
+            &events,
+            &successful_sequences,
+            &failed_sequences,
+            &mut previous_visible,
+            &mut previous_durable,
+        )
+        .await?;
+
+        let second = events
+            .write(b"ok:after-gap".to_vec(), bytes("after-gap"))
+            .await?;
+        successful_sequences.push(second);
+        assert_simulated_failed_sequence_invariants(
+            &db,
+            &events,
+            &successful_sequences,
+            &failed_sequences,
+            &mut previous_visible,
+            &mut previous_durable,
+        )
+        .await?;
+
+        for step in 0..10_u64 {
+            match next_schedule_u64(&mut schedule_state) % 3 {
+                0 => {
+                    let sync_target =
+                        simulated_active_commit_log_segment_path(&context, root).await?;
+                    context
+                        .file_system()
+                        .inject_failure(FileSystemFailure::timeout(
+                            FileSystemOperation::Sync,
+                            sync_target,
+                        ));
+                    events
+                        .write(
+                            format!("failed:pre-restart:{step}").into_bytes(),
+                            bytes("failed-pre-restart"),
+                        )
+                        .await
+                        .expect_err("pre-restart sync should fail");
+                    failed_sequences.insert(db.current_sequence());
+                }
+                _ => {
+                    let sequence = events
+                        .write(
+                            format!("ok:pre-restart:{step}").into_bytes(),
+                            bytes("ok-pre-restart"),
+                        )
+                        .await?;
+                    successful_sequences.push(sequence);
+                }
+            }
+
+            assert_simulated_failed_sequence_invariants(
+                &db,
+                &events,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await?;
+        }
+
+        let durable_prefix = successful_sequences.last().copied().unwrap_or_default();
+        failed_sequences.retain(|sequence| *sequence < durable_prefix);
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_events = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), durable_prefix);
+        assert_eq!(reopened.current_durable_sequence(), durable_prefix);
+        previous_visible = durable_prefix;
+        previous_durable = durable_prefix;
+        assert_simulated_failed_sequence_invariants(
+            &reopened,
+            &reopened_events,
+            &successful_sequences,
+            &failed_sequences,
+            &mut previous_visible,
+            &mut previous_durable,
+        )
+        .await?;
+
+        for step in 0..10_u64 {
+            match next_schedule_u64(&mut schedule_state) % 3 {
+                0 => {
+                    let sync_target =
+                        simulated_active_commit_log_segment_path(&context, root).await?;
+                    context
+                        .file_system()
+                        .inject_failure(FileSystemFailure::timeout(
+                            FileSystemOperation::Sync,
+                            sync_target,
+                        ));
+                    reopened_events
+                        .write(
+                            format!("failed:post-restart:{step}").into_bytes(),
+                            bytes("failed-post-restart"),
+                        )
+                        .await
+                        .expect_err("post-restart sync should fail");
+                    failed_sequences.insert(reopened.current_sequence());
+                }
+                _ => {
+                    let sequence = reopened_events
+                        .write(
+                            format!("ok:post-restart:{step}").into_bytes(),
+                            bytes("ok-post-restart"),
+                        )
+                        .await?;
+                    successful_sequences.push(sequence);
+                }
+            }
+
+            assert_simulated_failed_sequence_invariants(
+                &reopened,
+                &reopened_events,
+                &successful_sequences,
+                &failed_sequences,
+                &mut previous_visible,
+                &mut previous_durable,
+            )
+            .await?;
+        }
 
         Ok(())
     })
