@@ -14,14 +14,19 @@ use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
 
 use terracedb::{
-    Clock, CommitError, CompactionStrategy, CreateTableError, Db, DbConfig, Key, OpenError,
-    ReadError, S3Location, ScanOptions, StorageConfig, StorageError, Table, TableConfig,
-    TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction,
-    TransactionCommitError, Value,
+    Clock, CommitError, CompactionStrategy, CreateTableError, Db, DbConfig, OpenError, S3Location,
+    ScanOptions, StorageConfig, StorageError, Table, TableConfig, TableFormat,
+    TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction, TransactionCommitError,
+    Value,
 };
 use terracedb_projections::{
-    ProjectionError, ProjectionHandle, ProjectionHandlerError, ProjectionRuntime,
-    RankedMaterializedProjection, RecomputeStrategy, SingleSourceProjection,
+    ProjectionContext, ProjectionError, ProjectionHandle, ProjectionHandler,
+    ProjectionHandlerError, ProjectionRuntime, ProjectionTransaction, RecomputeStrategy,
+    SingleSourceProjection,
+};
+use terracedb_records::{
+    BigEndianU64Codec, JsonValueCodec, RecordCodecError, RecordReadError, RecordStream,
+    RecordTable, RecordTransaction, RecordWriteError, Utf8StringCodec,
 };
 use terracedb_relays::{OutboxRelay, OutboxRelayError, OutboxRelayHandler, RelayEntry};
 use terracedb_workflows::{
@@ -50,6 +55,9 @@ const WEEKLY_PLANNER_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PLANNER_DISPATCH_BATCH_LIMIT: usize = 16;
 const PLANNER_DISPATCH_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+type TodoRecordTable = RecordTable<String, TodoRecord, Utf8StringCodec, JsonValueCodec<TodoRecord>>;
+type RecentTodosTable = RecordTable<u64, TodoRecord, BigEndianU64Codec, JsonValueCodec<TodoRecord>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TodoAppOptions {
     pub planner_schedule: PlannerSchedule,
@@ -62,13 +70,17 @@ pub enum TodoAppError {
     #[error(transparent)]
     CreateTable(#[from] CreateTableError),
     #[error(transparent)]
-    Read(#[from] ReadError),
-    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Commit(#[from] CommitError),
     #[error(transparent)]
     TransactionCommit(#[from] TransactionCommitError),
+    #[error(transparent)]
+    RecordRead(#[from] RecordReadError),
+    #[error(transparent)]
+    RecordWrite(#[from] RecordWriteError),
+    #[error(transparent)]
+    RecordCodec(#[from] RecordCodecError),
     #[error(transparent)]
     Projection(#[from] ProjectionError),
     #[error(transparent)]
@@ -104,7 +116,9 @@ impl From<TodoAppError> for TodoApiError {
 #[derive(Debug, Error)]
 pub enum PlannerRelayHandlerError {
     #[error(transparent)]
-    Read(#[from] ReadError),
+    RecordRead(#[from] RecordReadError),
+    #[error(transparent)]
+    RecordWrite(#[from] RecordWriteError),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
 }
@@ -131,17 +145,25 @@ impl IntoResponse for TodoApiError {
 
 #[derive(Clone, Debug)]
 pub struct TodoTables {
-    todos: Table,
-    recent_todos: Table,
+    todos: TodoRecordTable,
+    recent_todos: RecentTodosTable,
 }
 
 impl TodoTables {
-    pub fn todos(&self) -> &Table {
+    pub fn todos(&self) -> &TodoRecordTable {
         &self.todos
     }
 
-    pub fn recent_todos(&self) -> &Table {
+    pub fn recent_todos(&self) -> &RecentTodosTable {
         &self.recent_todos
+    }
+
+    pub fn todos_raw(&self) -> &Table {
+        self.todos.table()
+    }
+
+    pub fn recent_todos_raw(&self) -> &Table {
+        self.recent_todos.table()
     }
 }
 
@@ -192,19 +214,13 @@ impl TodoApp {
             .start_single_source(
                 SingleSourceProjection::new(
                     RECENT_PROJECTION_NAME,
-                    tables.todos.clone(),
-                    RankedMaterializedProjection::new(
-                        tables.todos.clone(),
-                        tables.recent_todos.clone(),
-                        RECENT_SLOT_COUNT,
-                        decode_ranked_recent_todo,
-                        rank_recent_todo,
-                        tie_break_recent_todo,
-                        recent_slot_for_todo,
-                        encode_ranked_recent_todo,
-                    ),
+                    tables.todos_raw().clone(),
+                    RecentTodosProjection {
+                        todos: tables.todos.clone(),
+                        recent_todos: tables.recent_todos.clone(),
+                    },
                 )
-                .with_outputs([tables.recent_todos.clone()])
+                .with_outputs([tables.recent_todos_raw().clone()])
                 .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
             )
             .await?;
@@ -341,9 +357,9 @@ impl TodoAppState {
             updated_at_ms: now_ms,
         };
 
-        let mut tx = Transaction::begin(&self.db).await;
+        let mut tx = RecordTransaction::begin(&self.db).await;
         if tx
-            .read(&self.tables.todos, todo_id.as_bytes().to_vec())
+            .read_str(&self.tables.todos, &todo_id)
             .await
             .map_err(TodoAppError::from)?
             .is_some()
@@ -354,20 +370,18 @@ impl TodoAppState {
             )));
         }
 
-        tx.write(
-            &self.tables.todos,
-            todo_id.into_bytes(),
-            encode_json_value(&todo).map_err(TodoAppError::from)?,
-        );
+        tx.write_str(&self.tables.todos, &todo_id, &todo)
+            .map_err(TodoAppError::from)?;
         tx.commit().await.map_err(TodoAppError::from)?;
         Ok(todo)
     }
 
     pub async fn get_todo(&self, todo_id: &str) -> Result<Option<TodoRecord>, TodoAppError> {
-        let Some(value) = self.tables.todos.read(todo_id.as_bytes().to_vec()).await? else {
-            return Ok(None);
-        };
-        Ok(Some(decode_json_value(&value, "todo record")?))
+        self.tables
+            .todos
+            .read_str(todo_id)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn update_todo(
@@ -375,16 +389,16 @@ impl TodoAppState {
         todo_id: &str,
         request: UpdateTodoRequest,
     ) -> Result<Option<TodoRecord>, TodoApiError> {
-        let mut tx = Transaction::begin(&self.db).await;
+        let mut tx = RecordTransaction::begin(&self.db).await;
         let Some(existing) = tx
-            .read(&self.tables.todos, todo_id.as_bytes().to_vec())
+            .read_str(&self.tables.todos, todo_id)
             .await
             .map_err(TodoAppError::from)?
         else {
             return Ok(None);
         };
 
-        let mut todo: TodoRecord = decode_json_value(&existing, "todo record")?;
+        let mut todo = existing;
         if let Some(title) = request.title {
             todo.title = normalize_required(&title, "title")?;
         }
@@ -396,65 +410,46 @@ impl TodoAppState {
         }
         todo.updated_at_ms = self.clock.now().get();
 
-        tx.write(
-            &self.tables.todos,
-            todo_id.as_bytes().to_vec(),
-            encode_json_value(&todo).map_err(TodoAppError::from)?,
-        );
+        tx.write_str(&self.tables.todos, todo_id, &todo)
+            .map_err(TodoAppError::from)?;
         tx.commit().await.map_err(TodoAppError::from)?;
         Ok(Some(todo))
     }
 
     pub async fn complete_todo(&self, todo_id: &str) -> Result<Option<TodoRecord>, TodoApiError> {
-        let mut tx = Transaction::begin(&self.db).await;
+        let mut tx = RecordTransaction::begin(&self.db).await;
         let Some(existing) = tx
-            .read(&self.tables.todos, todo_id.as_bytes().to_vec())
+            .read_str(&self.tables.todos, todo_id)
             .await
             .map_err(TodoAppError::from)?
         else {
             return Ok(None);
         };
 
-        let mut todo: TodoRecord = decode_json_value(&existing, "todo record")?;
+        let mut todo = existing;
         todo.status = TodoStatus::Completed;
         todo.updated_at_ms = self.clock.now().get();
-        tx.write(
-            &self.tables.todos,
-            todo_id.as_bytes().to_vec(),
-            encode_json_value(&todo).map_err(TodoAppError::from)?,
-        );
+        tx.write_str(&self.tables.todos, todo_id, &todo)
+            .map_err(TodoAppError::from)?;
         tx.commit().await.map_err(TodoAppError::from)?;
         Ok(Some(todo))
     }
 
     pub async fn list_todos(&self) -> Result<Vec<TodoRecord>, TodoAppError> {
-        let mut todos = collect_todos(
-            self.tables
-                .todos
-                .scan(
-                    FULL_SCAN_START.to_vec(),
-                    FULL_SCAN_END.to_vec(),
-                    ScanOptions::default(),
-                )
-                .await?,
-        )
-        .await?;
+        let mut todos =
+            collect_todos(self.tables.todos.scan_all(ScanOptions::default()).await?).await;
         sort_list_todos(&mut todos);
         Ok(todos)
     }
 
     pub async fn list_recent_todos(&self) -> Result<Vec<TodoRecord>, TodoAppError> {
-        collect_todos(
+        Ok(collect_todos(
             self.tables
                 .recent_todos
-                .scan(
-                    FULL_SCAN_START.to_vec(),
-                    FULL_SCAN_END.to_vec(),
-                    ScanOptions::default(),
-                )
+                .scan_all(ScanOptions::default())
                 .await?,
         )
-        .await
+        .await)
     }
 
     async fn stage_placeholder_commands(
@@ -464,8 +459,10 @@ impl TodoAppState {
     ) -> Result<(), PlannerRelayHandlerError> {
         for entry in commands {
             let command = &entry.message;
-            let exists = tx
-                .read(&self.tables.todos, command.todo_id.as_bytes().to_vec())
+            let exists = self
+                .tables
+                .todos
+                .read_in_str(tx, &command.todo_id)
                 .await?
                 .is_some();
             if !exists {
@@ -479,11 +476,7 @@ impl TodoAppState {
                     created_at_ms: command.created_at_ms,
                     updated_at_ms: command.created_at_ms,
                 };
-                tx.write(
-                    &self.tables.todos,
-                    todo.todo_id.as_bytes().to_vec(),
-                    encode_json_value(&todo)?,
-                );
+                self.tables.todos.write_in_str(tx, &todo.todo_id, &todo)?;
             }
         }
         Ok(())
@@ -509,8 +502,10 @@ pub fn todo_db_config(path: &str, prefix: &str) -> DbConfig {
 
 pub async fn ensure_todo_tables(db: &Db) -> Result<TodoTables, TodoAppError> {
     Ok(TodoTables {
-        todos: ensure_table(db, row_table_config(TODOS_TABLE_NAME)).await?,
-        recent_todos: ensure_table(db, row_table_config(RECENT_TODOS_TABLE_NAME)).await?,
+        todos: todo_table(ensure_table(db, row_table_config(TODOS_TABLE_NAME)).await?),
+        recent_todos: recent_todos_table(
+            ensure_table(db, row_table_config(RECENT_TODOS_TABLE_NAME)).await?,
+        ),
     })
 }
 
@@ -537,16 +532,34 @@ fn row_table_config(name: &str) -> TableConfig {
     }
 }
 
-fn recent_slot_key(slot: usize) -> Key {
-    format!("{slot:02}").into_bytes()
+fn todo_table(table: Table) -> TodoRecordTable {
+    RecordTable::with_codecs(table, Utf8StringCodec, JsonValueCodec::new())
 }
 
-fn recent_slot_for_todo(slot: usize, _todo: &TodoRecord) -> Key {
-    recent_slot_key(slot)
+fn recent_todos_table(table: Table) -> RecentTodosTable {
+    RecordTable::with_codecs(table, BigEndianU64Codec, JsonValueCodec::new())
 }
 
-fn encode_json_value<T: Serialize>(value: &T) -> Result<Value, serde_json::Error> {
-    Ok(Value::bytes(serde_json::to_vec(value)?))
+fn recent_slot_key(slot: usize) -> u64 {
+    slot as u64
+}
+
+fn normalize_required(value: &str, field: &str) -> Result<String, TodoApiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(TodoApiError::BadRequest(format!("{field} cannot be empty")));
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn collect_todos(
+    mut stream: RecordStream<impl Send + 'static, TodoRecord>,
+) -> Vec<TodoRecord> {
+    let mut todos = Vec::new();
+    while let Some((_key, todo)) = stream.next().await {
+        todos.push(todo);
+    }
+    todos
 }
 
 fn decode_json_value<T>(value: &Value, context: &str) -> Result<T, TodoAppError>
@@ -561,41 +574,14 @@ where
     }
 }
 
-fn normalize_required(value: &str, field: &str) -> Result<String, TodoApiError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(TodoApiError::BadRequest(format!("{field} cannot be empty")));
-    }
-    Ok(trimmed.to_string())
-}
-
-async fn collect_todos(mut stream: terracedb::KvStream) -> Result<Vec<TodoRecord>, TodoAppError> {
-    let mut todos = Vec::new();
-    while let Some((_key, value)) = stream.next().await {
-        todos.push(decode_json_value(&value, "todo record")?);
-    }
-    Ok(todos)
-}
-
-fn decode_ranked_recent_todo(
-    _source_key: Vec<u8>,
-    value: Value,
-) -> Result<Option<TodoRecord>, ProjectionHandlerError> {
-    Ok(Some(
-        decode_json_value(&value, "todo record").map_err(ProjectionHandlerError::new)?,
-    ))
-}
-
-fn rank_recent_todo(todo: &TodoRecord) -> (u64, u64) {
-    (todo.updated_at_ms, todo.created_at_ms)
-}
-
-fn tie_break_recent_todo(todo: &TodoRecord) -> String {
-    todo.todo_id.clone()
-}
-
-fn encode_ranked_recent_todo(todo: &TodoRecord) -> Result<Value, ProjectionHandlerError> {
-    encode_json_value(todo).map_err(ProjectionHandlerError::new)
+fn sort_recent_todos(todos: &mut [TodoRecord]) {
+    todos.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+            .then_with(|| left.todo_id.cmp(&right.todo_id))
+    });
 }
 
 fn sort_list_todos(todos: &mut [TodoRecord]) {
@@ -606,6 +592,62 @@ fn sort_list_todos(todos: &mut [TodoRecord]) {
             .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
             .then_with(|| left.todo_id.cmp(&right.todo_id))
     });
+}
+
+struct RecentTodosProjection {
+    todos: TodoRecordTable,
+    recent_todos: RecentTodosTable,
+}
+
+#[async_trait]
+impl ProjectionHandler for RecentTodosProjection {
+    async fn apply_with_context(
+        &self,
+        _run: &terracedb_projections::ProjectionSequenceRun,
+        ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        let mut todos = collect_todos(
+            self.todos
+                .decode_stream(
+                    ctx.scan(
+                        self.todos.table(),
+                        FULL_SCAN_START.to_vec(),
+                        FULL_SCAN_END.to_vec(),
+                        ScanOptions::default(),
+                    )
+                    .await?,
+                )
+                .await
+                .map_err(ProjectionHandlerError::new)?,
+        )
+        .await;
+        sort_recent_todos(&mut todos);
+
+        for slot in 0..RECENT_SLOT_COUNT {
+            let key = recent_slot_key(slot);
+            if let Some(todo) = todos.get(slot) {
+                tx.put(
+                    self.recent_todos.table(),
+                    self.recent_todos
+                        .encode_key(&key)
+                        .map_err(ProjectionHandlerError::new)?,
+                    self.recent_todos
+                        .encode_value(todo)
+                        .map_err(ProjectionHandlerError::new)?,
+                );
+            } else {
+                tx.delete(
+                    self.recent_todos.table(),
+                    self.recent_todos
+                        .encode_key(&key)
+                        .map_err(ProjectionHandlerError::new)?,
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 struct WeeklyPlannerWorkflow {
     schedule: PlannerSchedule,

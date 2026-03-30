@@ -14,6 +14,7 @@ thiserror = "2.0.17"
 tokio = { version = "1.50.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 terracedb = { path = "../.." }
 terracedb-projections = { path = "../../crates/terracedb-projections" }
+terracedb-records = { path = "../../crates/terracedb-records" }
 terracedb-relays = { path = "../../crates/terracedb-relays" }
 terracedb-workflows = { path = "../../crates/terracedb-workflows" }
 
