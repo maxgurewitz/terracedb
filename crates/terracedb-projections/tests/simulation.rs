@@ -10,7 +10,7 @@ use terracedb::{
 use terracedb_projections::{
     MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionHandle,
     ProjectionHandler, ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun,
-    ProjectionTransaction, SingleSourceProjection,
+    ProjectionTransaction, RankedMaterializedProjection, SingleSourceProjection,
 };
 use terracedb_simulation::{
     SeededSimulationRunner, SimulationCheckpoint, SimulationStackBuilder,
@@ -111,46 +111,6 @@ struct RecentTodoSnapshot {
     todo_id: Vec<u8>,
     updated_at_ms: u64,
 }
-
-struct RecentTodosProjection {
-    todos: Table,
-    recent: Table,
-}
-
-#[async_trait]
-impl ProjectionHandler for RecentTodosProjection {
-    async fn apply_with_context(
-        &self,
-        _run: &ProjectionSequenceRun,
-        ctx: &ProjectionContext,
-        tx: &mut ProjectionTransaction,
-    ) -> Result<(), ProjectionHandlerError> {
-        let mut recent = collect_recent_todo_snapshots(
-            ctx.scan(&self.todos, Vec::new(), vec![0xff], ScanOptions::default())
-                .await?,
-        )
-        .await;
-        recent.sort_by(|left, right| {
-            right
-                .updated_at_ms
-                .cmp(&left.updated_at_ms)
-                .then_with(|| left.todo_id.cmp(&right.todo_id))
-        });
-
-        for slot in 0..RECENT_TODO_LIMIT {
-            tx.delete(&self.recent, format!("recent:{slot:02}").into_bytes());
-        }
-        for (slot, todo) in recent.into_iter().take(RECENT_TODO_LIMIT).enumerate() {
-            tx.put(
-                &self.recent,
-                format!("recent:{slot:02}").into_bytes(),
-                Value::bytes(todo.todo_id),
-            );
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MultiSourceProjectionSnapshot {
     frontier: BTreeMap<String, SequenceNumber>,
@@ -180,14 +140,32 @@ async fn collect_rows(stream: KvStream) -> Vec<(Vec<u8>, Vec<u8>)> {
         .await
 }
 
-async fn collect_recent_todo_snapshots(stream: KvStream) -> Vec<RecentTodoSnapshot> {
-    stream
-        .map(|(todo_id, value)| RecentTodoSnapshot {
-            todo_id,
-            updated_at_ms: decode_todo_updated_at(&value),
-        })
-        .collect()
-        .await
+fn decode_recent_todo_snapshot(
+    todo_id: Vec<u8>,
+    value: Value,
+) -> Result<Option<RecentTodoSnapshot>, ProjectionHandlerError> {
+    Ok(Some(RecentTodoSnapshot {
+        todo_id,
+        updated_at_ms: decode_todo_updated_at(&value),
+    }))
+}
+
+fn rank_recent_todo(snapshot: &RecentTodoSnapshot) -> u64 {
+    snapshot.updated_at_ms
+}
+
+fn tie_break_recent_todo(snapshot: &RecentTodoSnapshot) -> Vec<u8> {
+    snapshot.todo_id.clone()
+}
+
+fn recent_todo_slot_key(slot: usize, _snapshot: &RecentTodoSnapshot) -> Vec<u8> {
+    format!("recent:{slot:02}").into_bytes()
+}
+
+fn encode_recent_todo_output(
+    snapshot: &RecentTodoSnapshot,
+) -> Result<Value, ProjectionHandlerError> {
+    Ok(Value::bytes(snapshot.todo_id.clone()))
 }
 
 fn todo_value(updated_at_ms: u64, title: &str) -> Value {
@@ -567,10 +545,16 @@ fn recent_todos_projection_simulation_tracks_last_ten_created_or_modified_rows()
                     SingleSourceProjection::new(
                         "recent-todos",
                         todos.clone(),
-                        RecentTodosProjection {
-                            todos: todos.clone(),
-                            recent: recent.clone(),
-                        },
+                        RankedMaterializedProjection::new(
+                            todos.clone(),
+                            recent.clone(),
+                            RECENT_TODO_LIMIT,
+                            decode_recent_todo_snapshot,
+                            rank_recent_todo,
+                            tie_break_recent_todo,
+                            recent_todo_slot_key,
+                            encode_recent_todo_output,
+                        ),
                     )
                     .with_outputs([recent.clone()]),
                 )

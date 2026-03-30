@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error as StdError,
+    marker::PhantomData,
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -563,11 +564,25 @@ impl ProjectionTransaction {
 #[derive(Clone, Debug)]
 pub struct ProjectionContext {
     frontier: BTreeMap<String, (Table, SequenceNumber)>,
+    snapshot: Option<Snapshot>,
 }
 
 impl ProjectionContext {
     fn new(frontier: BTreeMap<String, (Table, SequenceNumber)>) -> Self {
-        Self { frontier }
+        Self {
+            frontier,
+            snapshot: None,
+        }
+    }
+
+    fn with_snapshot(
+        frontier: BTreeMap<String, (Table, SequenceNumber)>,
+        snapshot: Snapshot,
+    ) -> Self {
+        Self {
+            frontier,
+            snapshot: Some(snapshot),
+        }
     }
 
     pub fn frontier(&self) -> BTreeMap<String, SequenceNumber> {
@@ -588,13 +603,23 @@ impl ProjectionContext {
         table: &Table,
         key: Vec<u8>,
     ) -> Result<Option<Value>, ProjectionContextError> {
-        let Some(sequence) = self.frontier_sequence(table) else {
+        if self.frontier_sequence(table).is_none() {
             return Err(ProjectionContextError::MissingFrontier {
                 table: table.name().to_string(),
             });
-        };
+        }
 
-        table.read_at(key, sequence).await.map_err(Into::into)
+        match &self.snapshot {
+            Some(snapshot) => snapshot.read(table, key).await.map_err(Into::into),
+            None => table
+                .read_at(
+                    key,
+                    self.frontier_sequence(table)
+                        .expect("missing frontier already handled"),
+                )
+                .await
+                .map_err(Into::into),
+        }
     }
 
     pub async fn scan(
@@ -604,16 +629,209 @@ impl ProjectionContext {
         end: Vec<u8>,
         opts: ScanOptions,
     ) -> Result<KvStream, ProjectionContextError> {
-        let Some(sequence) = self.frontier_sequence(table) else {
+        if self.frontier_sequence(table).is_none() {
             return Err(ProjectionContextError::MissingFrontier {
                 table: table.name().to_string(),
             });
-        };
+        }
 
-        table
-            .scan_at(start, end, sequence, opts)
-            .await
-            .map_err(Into::into)
+        match &self.snapshot {
+            Some(snapshot) => snapshot
+                .scan(table, start, end, opts)
+                .await
+                .map_err(Into::into),
+            None => table
+                .scan_at(
+                    start,
+                    end,
+                    self.frontier_sequence(table)
+                        .expect("missing frontier already handled"),
+                    opts,
+                )
+                .await
+                .map_err(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankedMaterializationRange {
+    start: Vec<u8>,
+    end: Vec<u8>,
+}
+
+impl RankedMaterializationRange {
+    pub fn new(start: Vec<u8>, end: Vec<u8>) -> Self {
+        Self { start, end }
+    }
+}
+
+impl Default for RankedMaterializationRange {
+    fn default() -> Self {
+        Self {
+            start: FULL_SCAN_START.to_vec(),
+            end: FULL_SCAN_END.to_vec(),
+        }
+    }
+}
+
+/// Full-recompute helper for projections that materialize the top `N` rows from a
+/// single source table into an owned output range.
+///
+/// On every applied batch, the helper rescans the configured source range at the
+/// projection frontier, ranks rows using the caller-provided ordering hooks, keeps
+/// the highest-ranked `N`, and rewrites the configured output range deterministically.
+///
+/// This intentionally favors correctness and replayability over incremental
+/// efficiency. Callers should treat the configured output range as projection-owned.
+pub struct RankedMaterializedProjection<Row, Decode, Rank, TieBreak, OutputKey, Encode> {
+    source: Table,
+    output: Table,
+    limit: usize,
+    source_range: RankedMaterializationRange,
+    output_range: RankedMaterializationRange,
+    decode: Decode,
+    rank: Rank,
+    tie_break: TieBreak,
+    output_key: OutputKey,
+    encode: Encode,
+    _row: PhantomData<fn() -> Row>,
+}
+
+impl<Row, Decode, Rank, TieBreak, OutputKey, Encode>
+    RankedMaterializedProjection<Row, Decode, Rank, TieBreak, OutputKey, Encode>
+{
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source: Table,
+        output: Table,
+        limit: usize,
+        decode: Decode,
+        rank: Rank,
+        tie_break: TieBreak,
+        output_key: OutputKey,
+        encode: Encode,
+    ) -> Self {
+        Self {
+            source,
+            output,
+            limit,
+            source_range: RankedMaterializationRange::default(),
+            output_range: RankedMaterializationRange::default(),
+            decode,
+            rank,
+            tie_break,
+            output_key,
+            encode,
+            _row: PhantomData,
+        }
+    }
+
+    pub fn with_source_range(mut self, start: Vec<u8>, end: Vec<u8>) -> Self {
+        self.source_range = RankedMaterializationRange::new(start, end);
+        self
+    }
+
+    pub fn with_output_range(mut self, start: Vec<u8>, end: Vec<u8>) -> Self {
+        self.output_range = RankedMaterializationRange::new(start, end);
+        self
+    }
+}
+
+struct RankedMaterializedRow<Row, RankKey, TieBreakKey> {
+    source_key: Vec<u8>,
+    row: Row,
+    rank_key: RankKey,
+    tie_break_key: TieBreakKey,
+}
+
+#[async_trait]
+impl<Row, Decode, Rank, TieBreak, OutputKey, Encode, RankKey, TieBreakKey>
+    MultiSourceProjectionHandler
+    for RankedMaterializedProjection<Row, Decode, Rank, TieBreak, OutputKey, Encode>
+where
+    Row: Send + Sync,
+    Decode: Fn(Vec<u8>, Value) -> Result<Option<Row>, ProjectionHandlerError> + Send + Sync,
+    Rank: Fn(&Row) -> RankKey + Send + Sync,
+    TieBreak: Fn(&Row) -> TieBreakKey + Send + Sync,
+    OutputKey: Fn(usize, &Row) -> Vec<u8> + Send + Sync,
+    Encode: Fn(&Row) -> Result<Value, ProjectionHandlerError> + Send + Sync,
+    RankKey: Ord + Send,
+    TieBreakKey: Ord + Send,
+{
+    async fn apply(
+        &self,
+        _run: &ProjectionSequenceRun,
+        ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        let mut source_rows = ctx
+            .scan(
+                &self.source,
+                self.source_range.start.clone(),
+                self.source_range.end.clone(),
+                ScanOptions::default(),
+            )
+            .await?;
+        let mut ranked_rows = Vec::new();
+
+        while let Some((source_key, value)) = source_rows.next().await {
+            let Some(row) = (self.decode)(source_key.clone(), value)? else {
+                continue;
+            };
+            let rank_key = (self.rank)(&row);
+            let tie_break_key = (self.tie_break)(&row);
+            ranked_rows.push(RankedMaterializedRow {
+                source_key,
+                row,
+                rank_key,
+                tie_break_key,
+            });
+        }
+
+        ranked_rows.sort_by(|left, right| {
+            right
+                .rank_key
+                .cmp(&left.rank_key)
+                .then_with(|| left.tie_break_key.cmp(&right.tie_break_key))
+                .then_with(|| left.source_key.cmp(&right.source_key))
+        });
+        ranked_rows.truncate(self.limit);
+
+        let mut next_rows = Vec::with_capacity(ranked_rows.len());
+        let mut next_keys = BTreeSet::new();
+        for (index, ranked_row) in ranked_rows.into_iter().enumerate() {
+            let output_key = (self.output_key)(index, &ranked_row.row);
+            if !next_keys.insert(output_key.clone()) {
+                return Err(ProjectionHandlerError::new(std::io::Error::other(format!(
+                    "ranked projection {} produced duplicate output key {:?}",
+                    self.output.name(),
+                    output_key
+                ))));
+            }
+            let value = (self.encode)(&ranked_row.row)?;
+            next_rows.push((output_key, value));
+        }
+
+        let mut existing_rows = self
+            .output
+            .scan(
+                self.output_range.start.clone(),
+                self.output_range.end.clone(),
+                ScanOptions::default(),
+            )
+            .await?;
+        while let Some((key, _value)) = existing_rows.next().await {
+            if !next_keys.contains(&key) {
+                tx.delete(&self.output, key);
+            }
+        }
+
+        for (key, value) in next_rows {
+            tx.put(&self.output, key, value);
+        }
+
+        Ok(())
     }
 }
 
@@ -1670,7 +1888,7 @@ async fn rebuild_from_current_state(
             }
 
             for run in synthetic_runs {
-                let context = ProjectionContext::new(
+                let context = ProjectionContext::with_snapshot(
                     runtime
                         .sources
                         .iter()
@@ -1685,6 +1903,7 @@ async fn rebuild_from_current_state(
                             )
                         })
                         .collect(),
+                    durable_snapshot.clone(),
                 );
                 let mut tx = ProjectionTransaction::new(run.last_cursor());
                 runtime

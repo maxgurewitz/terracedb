@@ -69,7 +69,9 @@ This projection:
 - materialize the newest 10 items into fixed slots in the projection table
 - serve as the fast read model for a `recent TODOs` API endpoint
 
-This projection intentionally recomputes the recent-10 view from the source table at the projection frontier and rewrites the 10 projection slots deterministically. That keeps the example simple and makes replay behavior easy to reason about.
+The example uses `terracedb-projections`' `RankedMaterializedProjection` helper for this view.
+
+That helper intentionally recomputes the recent-10 view from the source table at the projection frontier and rewrites the 10 projection slots deterministically. That keeps the example small and makes replay behavior easy to reason about.
 
 It demonstrates the core projection pattern:
 
