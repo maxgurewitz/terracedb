@@ -142,7 +142,7 @@ interface ReadSet {
 }
 ```
 
-`table(name)` is a synchronous handle lookup — it returns an in-memory reference to an already-created table. No I/O, no fallibility. `createTable(config)` is async and fallible because it mutates catalog metadata, which may touch durable storage.
+`table(name)` is a synchronous handle lookup — it returns an in-memory reference to an already-created table. No I/O, and no `Result` in the guaranteed-existing path. It panics if the table is missing; use `tryTable(name)`/`try_table(name)` when existence is not guaranteed. `createTable(config)` is async and fallible because it mutates catalog metadata, which may touch durable storage.
 
 ### Design Notes
 

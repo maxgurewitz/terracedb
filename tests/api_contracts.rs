@@ -148,7 +148,12 @@ async fn public_api_surface_compiles_and_is_instantiable() {
         .expect("create columnar table");
 
     let sync_lookup = db.table("events");
+    let optional_lookup = db
+        .try_table("events")
+        .expect("existing table should be found");
     assert_eq!(sync_lookup.name(), "events");
+    assert_eq!(optional_lookup.id(), row_table.id());
+    assert!(db.try_table("missing").is_none());
     assert_eq!(db.current_sequence(), SequenceNumber::new(0));
     assert_eq!(db.current_durable_sequence(), SequenceNumber::new(0));
 

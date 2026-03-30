@@ -38,6 +38,7 @@ struct DbInner {
     backup_lock: AsyncMutex<()>,
     commit_runtime: AsyncMutex<CommitRuntime>,
     commit_coordinator: Mutex<CommitCoordinator>,
+    commit_log_scans: Mutex<CommitLogScanRegistry>,
     next_table_id: AtomicU32,
     next_sequence: AtomicU64,
     current_sequence: AtomicU64,
@@ -221,6 +222,7 @@ struct ChangeFeedScanner {
     table_id: TableId,
     table: Table,
     remaining: Option<usize>,
+    _scan_guard: CommitLogScanGuard,
     sources: VecDeque<ChangeFeedSourcePlan>,
     current_source: Option<ActiveChangeFeedSource>,
 }
@@ -702,6 +704,7 @@ impl ChangeFeedScanner {
         cursor: LogCursor,
         upper_bound: SequenceNumber,
         remaining: Option<usize>,
+        scan_guard: CommitLogScanGuard,
         sources: VecDeque<ChangeFeedSourcePlan>,
     ) -> Self {
         Self {
@@ -710,6 +713,7 @@ impl ChangeFeedScanner {
             table_id,
             table,
             remaining,
+            _scan_guard: scan_guard,
             sources,
             current_source: None,
         }
@@ -769,7 +773,7 @@ impl ChangeFeedScanner {
                     return Ok(None);
                 }
 
-                let bytes = read_change_feed_file(&plan.fs, &plan.path).await?;
+                let bytes = read_change_feed_file(&plan).await?;
                 Ok(Some(ActiveChangeFeedSource::Segment(
                     ChangeFeedSegmentSource {
                         scanner: SegmentRecordScanner::new(
@@ -955,23 +959,59 @@ fn change_entries_for_record(
         .collect()
 }
 
-async fn read_change_feed_file(
-    fs: &Arc<dyn crate::FileSystem>,
-    path: &str,
-) -> Result<Vec<u8>, StorageError> {
-    let handle = FileHandle::new(path);
+fn pinned_segment_ids(sources: &VecDeque<ChangeFeedSourcePlan>) -> Vec<SegmentId> {
+    sources
+        .iter()
+        .filter_map(|source| match source {
+            ChangeFeedSourcePlan::LocalSegment(plan) => Some(plan.segment_id),
+            ChangeFeedSourcePlan::RemoteSegment(_) | ChangeFeedSourcePlan::BufferedRecords(_) => {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn read_change_feed_file(plan: &LocalSegmentScanPlan) -> Result<Vec<u8>, StorageError> {
+    let handle = FileHandle::new(&plan.path);
     let mut bytes = Vec::new();
     let mut offset = 0_u64;
     loop {
-        let chunk = fs
-            .read_at(&handle, offset, CHANGE_FEED_READ_CHUNK_BYTES)
+        let Some(read_len) = plan.read_len else {
+            let chunk = plan
+                .fs
+                .read_at(&handle, offset, CHANGE_FEED_READ_CHUNK_BYTES)
+                .await?;
+            if chunk.is_empty() {
+                break;
+            }
+            offset = offset.saturating_add(chunk.len() as u64);
+            bytes.extend_from_slice(&chunk);
+            if chunk.len() < CHANGE_FEED_READ_CHUNK_BYTES {
+                break;
+            }
+            continue;
+        };
+
+        if offset >= read_len {
+            break;
+        }
+        let chunk = plan
+            .fs
+            .read_at(
+                &handle,
+                offset,
+                CHANGE_FEED_READ_CHUNK_BYTES.min(read_len.saturating_sub(offset) as usize),
+            )
             .await?;
         if chunk.is_empty() {
-            break;
+            return Err(StorageError::corruption(format!(
+                "segment prefix read ended early for {}: expected {read_len} bytes, reached {offset}",
+                plan.path
+            )));
         }
         offset = offset.saturating_add(chunk.len() as u64);
         bytes.extend_from_slice(&chunk);
-        if chunk.len() < CHANGE_FEED_READ_CHUNK_BYTES {
+        if chunk.len() < CHANGE_FEED_READ_CHUNK_BYTES || offset >= read_len {
             break;
         }
     }
@@ -1022,12 +1062,12 @@ impl CommitRuntime {
     async fn prune_segments_before(
         &mut self,
         sequence_exclusive: SequenceNumber,
+        protected_segments: &BTreeSet<SegmentId>,
     ) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => {
-                let protected_segments = BTreeSet::new();
                 manager
-                    .prune_sealed_before(sequence_exclusive, &protected_segments)
+                    .prune_sealed_before(sequence_exclusive, protected_segments)
                     .await?;
                 Ok(())
             }
@@ -1293,4 +1333,51 @@ struct CommitParticipant {
     sequence: SequenceNumber,
     operations: Vec<ResolvedBatchOperation>,
     group_batch: Option<Arc<GroupCommitBatch>>,
+}
+
+#[derive(Default)]
+struct CommitLogScanRegistry {
+    pinned_segments: BTreeMap<SegmentId, u64>,
+}
+
+impl CommitLogScanRegistry {
+    fn register(&mut self, segment_ids: &[SegmentId]) {
+        for &segment_id in segment_ids {
+            *self.pinned_segments.entry(segment_id).or_default() += 1;
+        }
+    }
+
+    fn release(&mut self, segment_ids: &[SegmentId]) {
+        for &segment_id in segment_ids {
+            let std::collections::btree_map::Entry::Occupied(mut entry) =
+                self.pinned_segments.entry(segment_id)
+            else {
+                continue;
+            };
+            let current = entry.get_mut();
+            if *current <= 1 {
+                entry.remove();
+            } else {
+                *current -= 1;
+            }
+        }
+    }
+
+    fn pinned_segments(&self) -> BTreeSet<SegmentId> {
+        self.pinned_segments.keys().copied().collect()
+    }
+}
+
+struct CommitLogScanGuard {
+    db: Weak<DbInner>,
+    segment_ids: Vec<SegmentId>,
+}
+
+impl Drop for CommitLogScanGuard {
+    fn drop(&mut self) {
+        let Some(db) = self.db.upgrade() else {
+            return;
+        };
+        mutex_lock(&db.commit_log_scans).release(&self.segment_ids);
+    }
 }

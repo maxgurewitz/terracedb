@@ -23,7 +23,7 @@ use crate::{
     ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
     PendingWorkType, ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
     ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SsdConfig,
-    StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng,
+    StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng, Table,
     TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
     TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
 };
@@ -1942,6 +1942,91 @@ async fn table_lookup_is_synchronous_for_existing_tables() {
 }
 
 #[tokio::test]
+async fn try_table_returns_none_for_missing_tables() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/missing-table-lookup"),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+
+    assert!(db.try_table("events").is_none());
+}
+
+#[test]
+#[should_panic(expected = "table does not exist: events")]
+fn table_lookup_panics_for_missing_tables() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = futures::executor::block_on(Db::open(
+        tiered_config("/missing-table-panic"),
+        dependencies(file_system, object_store),
+    ))
+    .expect("open db");
+
+    let _ = db.table("events");
+}
+
+#[tokio::test]
+async fn missing_table_handles_return_not_found_errors() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/missing-table-handle"),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let missing = Table {
+        db: db.clone(),
+        name: Arc::from("events"),
+        id: Some(TableId::new(1)),
+    };
+
+    let read_error = match missing.read(b"user:1".to_vec()).await {
+        Ok(_) => panic!("missing table read should fail loudly"),
+        Err(error) => error,
+    };
+    match read_error {
+        ReadError::Storage(error) => {
+            assert_eq!(error.kind(), crate::StorageErrorKind::NotFound);
+            assert_eq!(error.message(), "table does not exist: events");
+        }
+        other => panic!("expected storage error, got {other:?}"),
+    }
+
+    let scan_error = match missing
+        .scan(Vec::new(), vec![0xff], ScanOptions::default())
+        .await
+    {
+        Ok(_) => panic!("missing table scan should fail loudly"),
+        Err(error) => error,
+    };
+    match scan_error {
+        ReadError::Storage(error) => {
+            assert_eq!(error.kind(), crate::StorageErrorKind::NotFound);
+            assert_eq!(error.message(), "table does not exist: events");
+        }
+        other => panic!("expected storage error, got {other:?}"),
+    }
+
+    let change_feed_error = match db
+        .scan_since(&missing, LogCursor::default(), ScanOptions::default())
+        .await
+    {
+        Ok(_) => panic!("missing table change feed should fail loudly"),
+        Err(error) => error,
+    };
+    let storage = change_feed_error
+        .storage()
+        .expect("missing table change feed should surface a storage error");
+    assert_eq!(storage.kind(), crate::StorageErrorKind::NotFound);
+    assert_eq!(storage.message(), "table does not exist: events");
+}
+
+#[tokio::test]
 async fn tiered_catalog_survives_reopen_with_stable_ids_and_metadata() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
@@ -2021,7 +2106,7 @@ async fn create_table_is_all_or_nothing_across_recovery() {
     let reopened = Db::open(tiered_config("/crash-safe-catalog"), dependencies.clone())
         .await
         .expect("reopen after failed create");
-    assert_eq!(reopened.table("events").id(), None);
+    assert!(reopened.try_table("events").is_none());
 
     let created = reopened
         .create_table(row_table_config("events"))
@@ -8372,19 +8457,31 @@ async fn s3_primary_flush_persists_state_and_durable_change_feed_across_reopen()
         layout.backup_commit_log_segment(SegmentId::new(1)),
     ));
 
+    let mut visible = db
+        .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+        .await
+        .expect("visible remote change-feed scan should open");
     assert_change_feed_storage_error(
-        db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
-            .await
-            .err()
-            .expect("visible remote change-feed scan should surface a storage error"),
+        match visible.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("visible remote change-feed scan should surface a storage error")
+            }
+            Err(error) => ChangeFeedError::Storage(error),
+        },
         crate::StorageErrorKind::Timeout,
         "simulated timeout",
     );
+    let mut durable = db
+        .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+        .await
+        .expect("durable remote change-feed scan should open");
     assert_change_feed_storage_error(
-        db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
-            .await
-            .err()
-            .expect("durable remote change-feed scan should surface a storage error"),
+        match durable.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("durable remote change-feed scan should surface a storage error")
+            }
+            Err(error) => ChangeFeedError::Storage(error),
+        },
         crate::StorageErrorKind::Timeout,
         "simulated timeout",
     );
@@ -8768,19 +8865,31 @@ async fn local_change_feed_scan_failures_return_typed_storage_errors() {
         .persistent(),
     );
 
+    let mut visible = db
+        .scan_since(&table, LogCursor::beginning(), ScanOptions::default())
+        .await
+        .expect("visible change-feed scan should open");
     assert_change_feed_storage_error(
-        db.scan_since(&table, LogCursor::beginning(), ScanOptions::default())
-            .await
-            .err()
-            .expect("visible change-feed scan should surface a storage error"),
+        match visible.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("visible change-feed scan should surface a storage error")
+            }
+            Err(error) => ChangeFeedError::Storage(error),
+        },
         crate::StorageErrorKind::Timeout,
         "simulated timeout",
     );
+    let mut durable = db
+        .scan_durable_since(&table, LogCursor::beginning(), ScanOptions::default())
+        .await
+        .expect("durable change-feed scan should open");
     assert_change_feed_storage_error(
-        db.scan_durable_since(&table, LogCursor::beginning(), ScanOptions::default())
-            .await
-            .err()
-            .expect("durable change-feed scan should surface a storage error"),
+        match durable.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("durable change-feed scan should surface a storage error")
+            }
+            Err(error) => ChangeFeedError::Storage(error),
+        },
         crate::StorageErrorKind::Timeout,
         "simulated timeout",
     );

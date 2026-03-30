@@ -1,12 +1,30 @@
 impl Db {
+    /// Returns a synchronous handle lookup for an already-created table.
+    ///
+    /// Panics if the table does not exist. Use [`Db::try_table`] when
+    /// existence is not guaranteed.
     pub fn table(&self, name: impl Into<String>) -> Table {
         let name = name.into();
-        let id = self.tables_read().get(&name).map(|table| table.id);
+        let Some(id) = self.tables_read().get(&name).map(|table| table.id) else {
+            let error = Self::missing_table_error(&name);
+            panic!("{}", error.message());
+        };
         Table {
             db: self.clone(),
             name: Arc::from(name),
-            id,
+            id: Some(id),
         }
+    }
+
+    /// Returns a synchronous handle lookup when the table already exists.
+    pub fn try_table(&self, name: impl Into<String>) -> Option<Table> {
+        let name = name.into();
+        let id = self.tables_read().get(&name).map(|table| table.id)?;
+        Some(Table {
+            db: self.clone(),
+            name: Arc::from(name),
+            id: Some(id),
+        })
     }
 
     pub async fn create_table(&self, config: TableConfig) -> Result<Table, CreateTableError> {
@@ -776,6 +794,10 @@ impl Db {
         }
     }
 
+    fn missing_table_error(name: &str) -> StorageError {
+        StorageError::not_found(format!("table does not exist: {name}"))
+    }
+
     fn resolve_read_set_entries(
         &self,
         read_set: Option<&ReadSet>,
@@ -785,10 +807,7 @@ impl Db {
             .flat_map(ReadSet::entries)
             .map(|entry| {
                 let table_id = self.resolve_table_id(&entry.table).ok_or_else(|| {
-                    CommitError::Storage(StorageError::not_found(format!(
-                        "table does not exist: {}",
-                        entry.table.name()
-                    )))
+                    CommitError::Storage(Self::missing_table_error(entry.table.name()))
                 })?;
                 Ok(ResolvedReadSetEntry {
                     table_id,
@@ -1245,7 +1264,7 @@ impl Db {
 
         async move {
             let Some(table_id) = self.resolve_table_id(table) else {
-                return Ok(Box::pin(stream::empty()) as ChangeStream);
+                return Err(Self::missing_table_error(table.name()).into());
             };
             if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
                 return Ok(Box::pin(stream::empty()) as ChangeStream);
@@ -1278,12 +1297,14 @@ impl Db {
                 runtime.change_feed_scan_plan(table_id, cursor.sequence())
             };
 
+            let scan_guard = self.register_commit_log_scan(&pinned_segment_ids(&sources));
             let scanner = ChangeFeedScanner::new(
                 table_id,
                 table_handle,
                 cursor,
                 upper_bound,
                 opts.limit,
+                scan_guard,
                 sources,
             );
             Ok(Box::pin(stream::try_unfold(
@@ -1433,10 +1454,7 @@ impl Db {
             .map(|operation| match operation {
                 BatchOperation::Put { table, key, value } => {
                     let stored = self.resolve_stored_table(table).ok_or_else(|| {
-                        CommitError::Storage(StorageError::not_found(format!(
-                            "table does not exist: {}",
-                            table.name()
-                        )))
+                        CommitError::Storage(Self::missing_table_error(table.name()))
                     })?;
                     let value = Self::normalize_value_for_table(&stored, value)
                         .map_err(CommitError::Storage)?;
@@ -1450,10 +1468,7 @@ impl Db {
                 }
                 BatchOperation::Merge { table, key, value } => {
                     let stored = self.resolve_stored_table(table).ok_or_else(|| {
-                        CommitError::Storage(StorageError::not_found(format!(
-                            "table does not exist: {}",
-                            table.name()
-                        )))
+                        CommitError::Storage(Self::missing_table_error(table.name()))
                     })?;
                     if stored.config.merge_operator.is_none() {
                         return Err(CommitError::Storage(StorageError::unsupported(format!(
@@ -1473,10 +1488,7 @@ impl Db {
                 }
                 BatchOperation::Delete { table, key } => {
                     let stored = self.resolve_stored_table(table).ok_or_else(|| {
-                        CommitError::Storage(StorageError::not_found(format!(
-                            "table does not exist: {}",
-                            table.name()
-                        )))
+                        CommitError::Storage(Self::missing_table_error(table.name()))
                     })?;
                     Ok(ResolvedBatchOperation {
                         table_id: stored.id,
@@ -1496,9 +1508,22 @@ impl Db {
     }
 
     fn resolve_table_id(&self, table: &Table) -> Option<TableId> {
-        table
-            .id
-            .or_else(|| self.tables_read().get(table.name()).map(|stored| stored.id))
+        let tables = self.tables_read();
+        let stored = tables.get(table.name())?;
+        if let Some(id) = table.id
+            && id != stored.id
+        {
+            return None;
+        }
+        Some(stored.id)
+    }
+
+    fn register_commit_log_scan(&self, segment_ids: &[SegmentId]) -> CommitLogScanGuard {
+        mutex_lock(&self.inner.commit_log_scans).register(segment_ids);
+        CommitLogScanGuard {
+            db: Arc::downgrade(&self.inner),
+            segment_ids: segment_ids.to_vec(),
+        }
     }
 
     fn stored_table_by_id(
@@ -2376,11 +2401,14 @@ impl Db {
             return Ok(());
         }
 
+        let protected_segments = mutex_lock(&self.inner.commit_log_scans).pinned_segments();
         let mut runtime = self.inner.commit_runtime.lock().await;
         if seal_active {
             runtime.maybe_seal_active().await?;
         }
-        runtime.prune_segments_before(gc_floor).await
+        runtime
+            .prune_segments_before(gc_floor, &protected_segments)
+            .await
     }
 
     fn validate_historical_read(
