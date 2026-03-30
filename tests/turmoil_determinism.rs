@@ -5,9 +5,8 @@ use std::{
     time::Duration,
 };
 
-use terracedb::{
-    Clock, DeterministicRng, Rng as TerraceRng, SeededSimulationRunner, Timestamp, TurmoilClock,
-};
+use terracedb::{Clock, DeterministicRng, Rng as TerraceRng, Timestamp};
+use terracedb_simulation::{SeededSimulationRunner, SimulationScenarioConfig, TurmoilClock};
 
 const EXPECTED_SEEDED_BYTES: [u8; 16] = [
     145, 129, 172, 165, 143, 210, 43, 215, 45, 148, 110, 122, 148, 103, 179, 205,
@@ -55,7 +54,7 @@ fn turmoil_and_seeded_helpers_produce_reproducible_effect_traces() -> turmoil::R
 #[test]
 fn seeded_simulation_runner_is_parallel_safe_across_threads() {
     let seeds = [0x1111_u64, 0x2222, 0x3333, 0x4444];
-    let config = terracedb::SimulationScenarioConfig {
+    let config = SimulationScenarioConfig {
         steps: 8,
         path_count: 3,
         key_count: 3,

@@ -534,6 +534,16 @@ impl WorkflowHandle {
         &self.name
     }
 
+    pub async fn abort(self) -> Result<(), WorkflowError> {
+        self.shutdown.send_replace(true);
+        self.task.abort();
+        match self.task.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn shutdown(self) -> Result<(), WorkflowError> {
         self.shutdown.send_replace(true);
         self.task.await?
@@ -781,12 +791,17 @@ where
                 },
             )
             .await?;
+            runtime.tables.timers.stage_delete_at_in_transaction(
+                &mut tx,
+                timer.timer_id.clone(),
+                timer.fire_at,
+            );
             if ready_seen.insert(stored_timer.workflow_instance.clone()) {
                 newly_ready.push(stored_timer.workflow_instance);
             }
         }
 
-        match tx.commit_no_flush().await {
+        match tx.commit().await {
             Ok(_) => {
                 for instance_id in newly_ready {
                     runtime.scheduler.mark_ready(instance_id);
@@ -815,7 +830,7 @@ where
             return Ok(());
         }
 
-        drain_ready_instances(&runtime).await?;
+        drain_ready_instances(&runtime, &shutdown_rx).await?;
 
         if *shutdown_rx.borrow() {
             return Ok(());
@@ -866,11 +881,18 @@ where
     Ok(())
 }
 
-async fn drain_ready_instances<H>(runtime: &WorkflowRuntimeInner<H>) -> Result<(), WorkflowError>
+async fn drain_ready_instances<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<(), WorkflowError>
 where
     H: WorkflowHandler + 'static,
 {
     loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
         let Some(instance_id) = runtime.scheduler.next_ready_instance().await else {
             return Ok(());
         };
@@ -881,6 +903,10 @@ where
 
         let result = process_one_ready_instance(runtime, &instance_id).await;
         finish_instance_execution(runtime, &instance_id);
+
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
 
         match result {
             Ok(has_more_pending) => {
@@ -968,18 +994,6 @@ where
         })?;
 
     tx.delete(runtime.tables.inbox_table(), inbox_key);
-
-    if let WorkflowTrigger::Timer {
-        timer_id,
-        fire_at,
-        payload: _,
-    } = &trigger
-    {
-        runtime
-            .tables
-            .timers
-            .stage_delete_at_in_transaction(&mut tx, timer_id.clone(), *fire_at);
-    }
 
     match output.state {
         WorkflowStateMutation::Unchanged => {}

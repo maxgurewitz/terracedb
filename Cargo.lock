@@ -913,6 +913,9 @@ dependencies = [
  "rand_chacha 0.10.0",
  "serde",
  "serde_json",
+ "terracedb-projections",
+ "terracedb-simulation",
+ "terracedb-workflows",
  "thiserror",
  "tokio",
  "turmoil",
@@ -928,9 +931,26 @@ dependencies = [
  "async-trait",
  "futures",
  "terracedb",
+ "terracedb-simulation",
  "thiserror",
  "tokio",
  "turmoil",
+]
+
+[[package]]
+name = "terracedb-simulation"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "thiserror",
+ "tokio",
+ "turmoil",
+ "turmoil-determinism",
 ]
 
 [[package]]
@@ -942,6 +962,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
+ "terracedb-simulation",
  "thiserror",
  "tokio",
  "turmoil",

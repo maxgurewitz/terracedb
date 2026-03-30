@@ -160,16 +160,11 @@ impl From<SubscriptionClosed> for ProjectionError {
 ///   projection relies on.
 ///
 /// It does not reconstruct collapsed mutation history from mutable tables.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecomputeStrategy {
+    #[default]
     FailClosed,
     RebuildFromCurrentState,
-}
-
-impl Default for RecomputeStrategy {
-    fn default() -> Self {
-        Self::FailClosed
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

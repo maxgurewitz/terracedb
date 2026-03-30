@@ -6544,7 +6544,7 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn run_next_compaction(&self) -> Result<bool, StorageError> {
+    pub async fn run_next_compaction(&self) -> Result<bool, StorageError> {
         let Some(local_root) = self.local_storage_root().map(str::to_string) else {
             return Ok(false);
         };
@@ -9473,17 +9473,18 @@ mod tests {
         PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key,
         encode_mvcc_key, read_path,
     };
+    use crate::simulation::{PointMutation, ShadowOracle};
     use crate::{
         ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, CutPoint, DbConfig,
         DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
         FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
         ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
-        PendingWorkType, PointMutation, ReadError, Rng, S3Location, S3PrimaryStorageConfig,
-        ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SeededSimulationRunner,
-        SegmentId, SequenceNumber, ShadowOracle, SnapshotTooOld, SsdConfig, StorageConfig,
-        StorageError, StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TableId,
-        TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Timestamp,
-        TraceEvent, TtlCompactionFilter, Value,
+        PendingWorkType, ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
+        ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SnapshotTooOld,
+        SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng, TableConfig,
+        TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
+        TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
+        SeededSimulationRunner, TraceEvent,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {

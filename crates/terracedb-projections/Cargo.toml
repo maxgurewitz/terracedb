@@ -12,5 +12,6 @@ tokio = { version = "1.48.0", features = ["rt", "sync"] }
 
 [dev-dependencies]
 terracedb = { path = "../..", features = ["test-support"] }
+terracedb-simulation = { path = "../terracedb-simulation" }
 tokio = { version = "1.48.0", features = ["macros", "rt", "sync", "time"] }
 turmoil = "0.7.1"

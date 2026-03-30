@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/terracedb-simulation",
     "crates/turmoil-determinism",
     "crates/terracedb-projections",
     "crates/terracedb-workflows",
@@ -28,7 +29,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["io-util", "macros", "rt", "sync", "time"] }
-turmoil = "0.7.1"
-turmoil-determinism = { path = "crates/turmoil-determinism" }
 uuid = "1.23.0"
 walkdir = "2.5.0"
+
+[dev-dependencies]
+terracedb-simulation = { path = "crates/terracedb-simulation" }
+terracedb-projections = { path = "crates/terracedb-projections" }
+terracedb-workflows = { path = "crates/terracedb-workflows" }
+turmoil = "0.7.1"
+turmoil-determinism = { path = "crates/turmoil-determinism" }
