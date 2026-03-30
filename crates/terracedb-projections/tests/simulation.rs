@@ -20,6 +20,7 @@ use terracedb_simulation::{
 const PROJECTION_SIMULATION_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
 const SIMULATION_MIN_MESSAGE_LATENCY: std::time::Duration = std::time::Duration::from_millis(1);
 const SIMULATION_MAX_MESSAGE_LATENCY: std::time::Duration = std::time::Duration::from_millis(1);
+const RECENT_TODO_LIMIT: usize = 10;
 
 struct MirrorProjection {
     output: Table,
@@ -106,6 +107,56 @@ impl MultiSourceProjectionHandler for FrontierMirrorProjection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct RecentTodoSnapshot {
+    todo_id: Vec<u8>,
+    updated_at_ms: u64,
+}
+
+struct RecentTodosProjection {
+    todos: Table,
+    recent: Table,
+}
+
+#[async_trait]
+impl MultiSourceProjectionHandler for RecentTodosProjection {
+    async fn apply(
+        &self,
+        _run: &ProjectionSequenceRun,
+        ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        let mut recent = collect_recent_todo_snapshots(
+            ctx.scan(
+                &self.todos,
+                Vec::new(),
+                vec![0xff],
+                ScanOptions::default(),
+            )
+            .await?,
+        )
+        .await;
+        recent.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.todo_id.cmp(&right.todo_id))
+        });
+
+        for slot in 0..RECENT_TODO_LIMIT {
+            tx.delete(&self.recent, format!("recent:{slot:02}").into_bytes());
+        }
+        for (slot, todo) in recent.into_iter().take(RECENT_TODO_LIMIT).enumerate() {
+            tx.put(
+                &self.recent,
+                format!("recent:{slot:02}").into_bytes(),
+                Value::bytes(todo.todo_id),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MultiSourceProjectionSnapshot {
     frontier: BTreeMap<String, SequenceNumber>,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
@@ -132,6 +183,34 @@ async fn collect_rows(stream: KvStream) -> Vec<(Vec<u8>, Vec<u8>)> {
         })
         .collect()
         .await
+}
+
+async fn collect_recent_todo_snapshots(stream: KvStream) -> Vec<RecentTodoSnapshot> {
+    stream
+        .map(|(todo_id, value)| RecentTodoSnapshot {
+            todo_id,
+            updated_at_ms: decode_todo_updated_at(&value),
+        })
+        .collect()
+        .await
+}
+
+fn todo_value(updated_at_ms: u64, title: &str) -> Value {
+    Value::bytes(format!("{updated_at_ms:020}|{title}"))
+}
+
+fn decode_todo_updated_at(value: &Value) -> u64 {
+    let Value::Bytes(bytes) = value else {
+        panic!("todo simulation only expects byte values");
+    };
+    let updated_at = std::str::from_utf8(bytes)
+        .expect("todo bytes should be utf-8")
+        .split_once('|')
+        .expect("todo value should include an updated_at prefix")
+        .0;
+    updated_at
+        .parse()
+        .expect("todo updated_at prefix should be numeric")
 }
 
 fn planned_batches(seed: u64) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -462,4 +541,106 @@ fn multi_source_projection_simulation_changes_shape_for_different_seeds() -> tur
 
     assert_ne!(left, right);
     Ok(())
+}
+
+#[test]
+fn recent_todos_projection_simulation_tracks_last_ten_created_or_modified_rows()
+-> turmoil::Result {
+    SeededSimulationRunner::new(0x0dd5_eed5)
+        .with_simulation_duration(PROJECTION_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let db = context
+                .open_db(tiered_test_config("/projection-recent-todos"))
+                .await?;
+            let todos = db
+                .create_table(row_table_config("todos"))
+                .await
+                .expect("create todos source");
+            let recent = db
+                .create_table(row_table_config("recent_todos"))
+                .await
+                .expect("create recent projection output");
+            let runtime = ProjectionRuntime::open(db.clone())
+                .await
+                .expect("open projection runtime");
+            let mut handle = runtime
+                .start_multi_source(
+                    MultiSourceProjection::new(
+                        "recent-todos",
+                        [todos.clone()],
+                        RecentTodosProjection {
+                            todos: todos.clone(),
+                            recent: recent.clone(),
+                        },
+                    )
+                    .with_outputs([recent.clone()]),
+                )
+                .await
+                .expect("start recent todos projection");
+
+            let mut create_batch = db.write_batch();
+            for todo_id in 1..=12_u64 {
+                create_batch.put(
+                    &todos,
+                    format!("todo:{todo_id:02}").into_bytes(),
+                    todo_value(todo_id, &format!("todo {todo_id}")),
+                );
+            }
+            let created_sequence = db
+                .commit(create_batch, CommitOptions::default())
+                .await
+                .expect("commit initial todos");
+            handle
+                .wait_for_sources([(&todos, created_sequence)])
+                .await
+                .expect("recent projection should catch up to created todos");
+
+            let mut update_batch = db.write_batch();
+            update_batch.put(&todos, b"todo:02".to_vec(), todo_value(20, "todo 2 updated"));
+            update_batch.put(&todos, b"todo:05".to_vec(), todo_value(21, "todo 5 updated"));
+            update_batch.put(&todos, b"todo:11".to_vec(), todo_value(22, "todo 11 updated"));
+            update_batch.put(&todos, b"todo:01".to_vec(), todo_value(23, "todo 1 updated"));
+            let updated_sequence = db
+                .commit(update_batch, CommitOptions::default())
+                .await
+                .expect("commit todo updates");
+            handle
+                .wait_for_sources([(&todos, updated_sequence)])
+                .await
+                .expect("recent projection should catch up to updated todos");
+
+            let recent_rows = collect_rows(
+                recent
+                    .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                    .await
+                    .expect("scan recent todo projection"),
+            )
+            .await;
+            assert_eq!(
+                recent_rows
+                    .into_iter()
+                    .map(|(_slot, todo_id)| String::from_utf8_lossy(&todo_id).into_owned())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "todo:01".to_string(),
+                    "todo:11".to_string(),
+                    "todo:05".to_string(),
+                    "todo:02".to_string(),
+                    "todo:12".to_string(),
+                    "todo:10".to_string(),
+                    "todo:09".to_string(),
+                    "todo:08".to_string(),
+                    "todo:07".to_string(),
+                    "todo:06".to_string(),
+                ]
+            );
+            assert_eq!(handle.current_frontier().get("todos"), Some(&updated_sequence));
+
+            handle.shutdown().await.expect("stop recent projection");
+            Ok(())
+        })
 }

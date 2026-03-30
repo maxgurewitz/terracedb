@@ -67,7 +67,7 @@ Once Phase 0 is complete, the work naturally splits into eight mostly independen
 - **Track C — change capture:** T17 → T18 → T19
 - **Track D — remote storage:** T20 → T21 / T22 / T23
 - **Track E — columnar:** T24 → T25 → T26 → T27
-- **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T31 depends on T30, T32 depends on T18/T19/T28/T29, and T32a depends on T03a/T31/T32
+- **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T28a follows T28; T31 depends on T30; T31a follows T31 and T31b follows T31a; T32 depends on T18/T19/T28/T29, T32c follows T32, and T32d follows T32c; T32a depends on T03a/T31/T32, T32e depends on T03a, and T32f depends on T28a/T29/T31b/T32d/T32e
 - **Track G — full-stack hardening:** T33 after T32a
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
@@ -1047,7 +1047,7 @@ Complete columnar support by integrating it with compaction, merge operators, an
 
 ## Phase 6 — Composition primitives and higher-level libraries
 
-**Parallelization:** T28, T29, and T30 can begin independently once their own engine dependencies are met. T31 depends on T30. T32 depends on T18, T19, T28, and T29. T32a depends on T03a, T31, and T32.
+**Parallelization:** T28, T29, and T30 can begin independently once their own engine dependencies are met. T28a depends only on T28, so the typed-records work can proceed in parallel with the runtime tasks. T31 depends on T30. T31a depends on T31, and T31b depends on T31a. T32 depends on T18, T19, T28, and T29. T32c depends on T32, and T32d depends on T32c. T32a depends on T03a, T31, and T32. T32e depends on T03a and can proceed in parallel with the projection/workflow ergonomics work. T32b depends on T03a, T16, T31, and T32. T32f is the integration leaf and depends on T28a, T29, T31b, T32d, and T32e.
 
 ### T28. OCC transaction wrapper
 
@@ -1071,6 +1071,31 @@ Implement the user-space optimistic transaction helper described in the architec
 - Conflict tests proving concurrent modification of a read key causes `ConflictError`.
 - Read-your-own-writes tests for both puts and deletes.
 - Simulation tests with crashes before and after transaction commit, verifying underlying batch atomicity.
+
+---
+
+### T28a. Typed record/table helper crate (`terracedb-records`)
+
+**Depends on:** T28
+
+**Description**
+
+Create a dedicated typed-record helper crate on top of `terracedb` so application and example code stop hand-rolling byte keys, value serialization, and repetitive decode/error plumbing. The goal is a lightweight typed layer, not a separate schema engine.
+
+**Implementation steps**
+
+1. Create a new crate boundary, `terracedb-records`, with stable typed wrappers such as `RecordTable<K, V, KC, VC>` and `RecordTransaction`.
+2. Define narrow codec traits for keys and values, plus default codecs for common cases such as UTF-8 strings, fixed-width integers, and serde-backed JSON values.
+3. Implement typed `read`, `write`, `delete`, `scan`, and `scan_prefix` helpers over `Table` and `Transaction` without weakening Terracedb’s existing atomicity or visibility semantics.
+4. Preserve structured errors so callers can distinguish storage failures, decode failures, and application-level validation failures cleanly.
+5. Document migration guidance for example applications so the typed layer is clearly optional but preferred for application-facing code.
+
+**Verification**
+
+- CRUD tests for typed keys and values using both direct table access and transactions.
+- Scan-order tests proving key codecs preserve the ordering guarantees required by range scans.
+- Crash/recovery integration tests proving the typed wrapper does not change batch atomicity or durability behavior.
+- Error-path tests showing invalid payloads surface as typed decode failures rather than panics or opaque storage errors.
 
 ---
 
@@ -1154,6 +1179,56 @@ Extend the projection runtime to support multiple source tables, frontier-pinned
 
 ---
 
+### T31a. Projection API unification for scan-capable single-source handlers
+
+**Depends on:** T31
+
+**Description**
+
+Remove the API mismatch where single-source projections have a less capable handler/context surface than multi-source projections. A single-source projection should be able to scan, read, and rebuild through the same conceptual interface as a multi-source projection; “single source” should be a convenience mode, not a capability restriction.
+
+**Implementation steps**
+
+1. Choose a single canonical handler/context model for projections and make single-source and multi-source constructors target that shared surface.
+2. Ensure single-source handlers can use the same `ProjectionContext` read/scan operations that currently force users onto the multi-source path for simple cases.
+3. Preserve or provide a clear migration path for existing projection code so ergonomic improvements do not require an all-at-once rewrite.
+4. Keep watermarking, recomputation, and dependency semantics unchanged while simplifying the handler API.
+5. Update projection examples and docs to demonstrate the intended single-source path explicitly.
+
+**Verification**
+
+- Tests proving a single-source projection can perform deterministic scans and point reads without going through the multi-source wrapper.
+- Compatibility tests showing existing multi-source behavior and tie-breaking remain unchanged.
+- Rebuild/recompute tests confirming the unified API does not weaken recovery behavior.
+- Example-level tests that no longer need a multi-source wrapper solely to gain `scan` access.
+
+---
+
+### T31b. Generic ranked-materialization helper for projections
+
+**Depends on:** T31a
+
+**Description**
+
+Add a reusable projection helper for “materialize the top N rows according to a caller-defined ranking.” This should be generic over ranking logic and tie-breaking rather than hard-coded to `updated_at`, “recent items,” or any particular application domain.
+
+**Implementation steps**
+
+1. Add a helper in `terracedb-projections` that rescans source state, applies a caller-provided ranking function, truncates to a caller-provided limit, and rewrites the materialized output deterministically.
+2. Require the ranking contract to produce a total order, either directly or via an explicit tie-break callback, so reruns remain deterministic.
+3. Support caller-provided output-key mapping and encoding hooks so the helper can power both example apps and library consumers without forcing a specific schema.
+4. Document the performance/semantic tradeoff clearly: the initial helper may be full-recompute-per-batch, but it must be correct and deterministic.
+5. Add at least one example-oriented adapter or recipe showing how the helper replaces a hand-written “recent items” projection.
+
+**Verification**
+
+- Projection tests covering inserts, updates, deletions, ties, and truncation at the `N` boundary.
+- Deterministic replay tests proving the same source history yields the same ranked output.
+- Recompute tests showing rebuild-from-current-state produces the same result as incremental tailing.
+- Example-oriented tests proving the helper can replace a bespoke “recent TODOs” style projection.
+
+---
+
 ### T32. Workflow runtime
 
 **Depends on:** T18, T19, T28, T29
@@ -1183,6 +1258,56 @@ Implement the workflow runtime: durable trigger admission, per-instance trigger 
   - after delivery but before outbox cursor persistence.
 - Duplicate-trigger tests for timers and callbacks proving state-guarded/idempotent handlers remain correct.
 - Recovery tests proving source cursors, inbox state, timer state, outbox state, and workflow state resume from durable data only.
+
+---
+
+### T32c. Workflow progress modes and safe autonomous defaults
+
+**Depends on:** T32
+
+**Description**
+
+Replace the current boolean durable-progress tuning with an explicit workflow progress policy that makes the safe choice the default. Timer-driven and callback-driven workflows should not require users to discover an obscure flag before they make forward progress correctly under crash/restart.
+
+**Implementation steps**
+
+1. Replace the boolean `with_durable_progress(bool)` style API with a semantic progress-mode configuration that distinguishes durable, buffered, and default/auto behavior.
+2. Define the default policy so autonomous workflow progress paths, especially timers and callbacks, choose durable behavior unless the caller explicitly opts into a weaker mode.
+3. Preserve a deliberate opt-in fast path for advanced users, but make the weaker mode explicit in naming and documentation rather than easy to select accidentally.
+4. Add runtime/docs guidance for when buffered progress is acceptable and when it is not.
+5. Update existing workflow examples and tests to use the new API shape and defaults.
+
+**Verification**
+
+- Timer-chain tests proving the default workflow configuration makes forward progress without unrelated flushes or writes.
+- Crash/restart tests showing autonomous workflows recover from durable state only under the default mode.
+- Migration tests covering the old boolean API shape if compatibility shims are kept temporarily.
+- Negative tests showing an explicitly buffered mode behaves as documented rather than silently acting durable.
+
+---
+
+### T32d. Recurring workflow helper in `terracedb-workflows`
+
+**Depends on:** T32c
+
+**Description**
+
+Add a first-class recurring-workflow helper that owns bootstrap, timer scheduling, next-fire computation, and state persistence so application code only implements “what happens on each tick.” This is the workflow-side counterpart to the relay and projection helpers: it should package a common, easy-to-get-wrong pattern into a safe default.
+
+**Implementation steps**
+
+1. Define a `RecurringWorkflow`-style abstraction that separates bootstrap and tick behavior from the underlying timer/callback plumbing.
+2. Encapsulate stable timer IDs, bootstrap callback admission, next-fire scheduling, and recurring state updates inside the helper.
+3. Make the helper use the safe workflow progress defaults from T32c automatically.
+4. Support both fixed-interval recurrence and caller-defined next-fire calculation so the helper covers weekly planners and similar business schedules.
+5. Migrate at least one example workflow to this helper and update docs to show the helper as the default recommendation.
+
+**Verification**
+
+- Unit and simulation tests for bootstrap, repeated tick execution, skipped duplicate bootstrap callbacks, and crash/restart recovery.
+- Timer-replay tests proving recurring ticks are idempotent when application handlers use stable IDs or state guards.
+- Example migration tests showing a weekly-planner-style workflow becomes smaller without losing deterministic behavior.
+- API tests confirming the helper still allows advanced callers to supply custom scheduling logic where needed.
 
 
 ---
@@ -1258,6 +1383,56 @@ Start with direct DB-call correlation tests. Create an application-level root sp
 Then add async/runtime-correlation tests for projections and workflows. Drive a source event under an application span, let it flow through the projection runtime and workflow runtime, and verify that later asynchronous work is still correlated correctly: either it remains in the same trace with an explicit propagated parent, or it is connected by span links where strict parent/child timing no longer makes sense. Include crash/restart cases in deterministic simulation: emit work, crash after durable admission but before the runtime finishes processing, restart, and assert that the replayed projection/workflow spans are still well-formed and carry enough stable identifiers (projection/workflow name, source table, sequence, trigger ID) to correlate them with the original causal chain. The key property is that replay/recovery may create new execution spans, but it must not lose causal linkage or invent nondeterministic IDs outside the configured tracing/export system.
 
 Add metric and log verification with the same rigor. For metrics, use the test exporter to assert that snapshots include expected gauges/counters/histograms for scheduler backlog, compaction debt, projection lag, workflow queue/inbox depth, and durable-vs-visible watermarks, and that repeated collection updates the same logical instruments rather than generating an ever-growing set of metric names or attribute cardinalities. For logs, emit representative warnings/errors from object-store failure, retry, and recovery paths and assert that they carry the current trace/span context when invoked inside an active span. Finally, add deterministic-simulation tests that run with the test exporter enabled across repeated same-seed runs and verify that emitted span/log/metric shapes are reproducible enough for seed-based debugging: same causal operations should produce the same sequence of Terracedb telemetry records modulo exporter timestamps and other explicitly documented nondeterministic fields.
+
+---
+
+### T32e. Deterministic HTTP simulation harness crate (`terracedb-http`)
+
+**Depends on:** T03a
+
+**Description**
+
+Create a dedicated HTTP simulation harness crate for Terracedb-based applications. The crate should own simulated client/server wiring over turmoil and expose framework adapters as optional integration layers, with `axum` support first and lower-level `hyper` primitives available underneath.
+
+**Implementation steps**
+
+1. Create `terracedb-http` as the authoritative crate for deterministic HTTP server/client helpers layered on top of the reusable simulation framework.
+2. Provide a low-level simulated HTTP server/client harness that can run inside turmoil hosts and surface useful tracing, seed, and barrier/debug hooks.
+3. Add an `axum` integration surface or feature that makes it easy to serve an `axum::Router` inside simulation without every example hand-rolling accept loops.
+4. Keep the crate framework-agnostic at its core so future adapters can target raw `hyper`, TLS, or other Rust HTTP stacks without splitting the concept across multiple crates.
+5. Document fault-injection and debugging patterns for HTTP simulations, including barriers, partitions, retries, and trace capture.
+
+**Verification**
+
+- Simulation tests proving a client can perform create/read/list style HTTP requests against a simulated server host deterministically.
+- Fault-injection tests covering delayed responses, dropped connections, partitions, and restart/retry behavior.
+- Adapter tests proving the `axum` integration uses the same deterministic harness rather than a separate ad hoc path.
+- Same-seed reproducibility tests showing HTTP traces and request/response outcomes are replayable.
+
+---
+
+### T32f. Migrate example applications onto the new ergonomic helper surfaces
+
+**Depends on:** T28a, T29, T31b, T32d, T32e
+
+**Description**
+
+Use the example applications as the final integration point for the new ergonomic layers: typed records, relays, ranked projections, recurring workflows, and deterministic HTTP harnessing. This task turns the example suite into a canonical “pit of success” path for third-party application authors.
+
+**Implementation steps**
+
+1. Migrate the TODO API example to use `terracedb-records`, `terracedb-relays`, the generic ranked-materialization helper, the recurring workflow helper, and `terracedb-http`.
+2. Update example READMEs so they describe the chosen structures and helper crates definitively rather than as suggestions.
+3. Ensure example tests cover normal CRUD behavior, projection behavior, recurring workflow time travel, and end-to-end HTTP simulation through the new helper surfaces.
+4. Record any remaining API sharp edges discovered during migration and feed them back into follow-on tasks or docs rather than leaving them implicit.
+5. Treat the example code as the main consumer ergonomics bar: if a pattern still requires too much boilerplate here, capture that as a concrete improvement item before closing the task.
+
+**Verification**
+
+- Example application tests pass through the shared simulation framework and the new HTTP harness.
+- The example code is materially smaller and less bespoke than the pre-helper version while preserving deterministic behavior.
+- Example READMEs and code paths agree on the authoritative patterns to recommend to users.
+- Any remaining rough edges discovered during migration are documented explicitly rather than hidden in example-only glue code.
 
 ---
 
