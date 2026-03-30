@@ -52,7 +52,7 @@ This repository includes a shared pre-commit script at `scripts/pre-commit.sh`.
 
 The Git hook at `.githooks/pre-commit` calls that script, which runs:
 
-- `cargo test`
+- `cargo test --workspace`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 
