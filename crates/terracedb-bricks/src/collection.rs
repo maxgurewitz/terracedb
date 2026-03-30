@@ -8,22 +8,15 @@ use tokio::sync::watch;
 
 use terracedb::{LogCursor, SequenceNumber, Timestamp};
 
-use crate::store::stream_from_bytes;
 use crate::{
     BlobActivityEntry, BlobActivityId, BlobActivityKind, BlobActivityOptions, BlobActivityReceiver,
     BlobActivityStream, BlobAlias, BlobByteRange, BlobContractError, BlobError, BlobId,
     BlobObjectLayout, BlobPutOptions, BlobStore, BlobStoreByteStream, BlobStoreError, JsonValue,
+    upload_blob_bytes,
 };
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
-}
-
-fn compute_stub_digest(bytes: &[u8]) -> String {
-    let checksum = bytes.iter().fold(0_u64, |acc, byte| {
-        acc.wrapping_mul(1099511628211).wrapping_add(*byte as u64)
-    });
-    format!("stub:{checksum:016x}:{:016x}", bytes.len())
 }
 
 fn map_store_stream(stream: BlobStoreByteStream) -> BlobByteStream {
@@ -426,32 +419,30 @@ impl BlobCollection for InMemoryBlobCollection {
         let tags = input.tags.clone();
         let metadata_fields = input.metadata.clone();
         let bytes = input.data.into_bytes().await?;
-        let digest = compute_stub_digest(&bytes);
+        let upload = upload_blob_bytes(
+            self.inner.blob_store.as_ref(),
+            &self.inner.layout,
+            Bytes::from(bytes.clone()),
+            BlobPutOptions {
+                content_type: content_type.clone(),
+                expected_size: Some(bytes.len() as u64),
+            },
+        )
+        .await?;
+        let digest = upload.digest.clone();
+        let object_key = upload.object.key.clone();
+        let size_bytes = upload.object.size_bytes;
 
-        let (blob_id, object_key) = {
+        let blob_id = {
             let mut state = lock(&self.inner.state);
-            let blob_id = Self::next_blob_id(&mut state);
-            let object_key = self.inner.layout.object_key(&format!("stub/{}", blob_id));
-            (blob_id, object_key)
+            Self::next_blob_id(&mut state)
         };
-
-        self.inner
-            .blob_store
-            .put(
-                &object_key,
-                stream_from_bytes(bytes.clone()),
-                BlobPutOptions {
-                    content_type: content_type.clone(),
-                    expected_size: Some(bytes.len() as u64),
-                },
-            )
-            .await?;
 
         let handle = BlobHandle {
             id: blob_id,
             object_key: object_key.clone(),
             digest: digest.clone(),
-            size_bytes: bytes.len() as u64,
+            size_bytes,
         };
 
         let sequence = {
@@ -473,7 +464,7 @@ impl BlobCollection for InMemoryBlobCollection {
                 alias: alias.clone(),
                 object_key: object_key.clone(),
                 digest,
-                size_bytes: bytes.len() as u64,
+                size_bytes,
                 content_type,
                 tags,
                 metadata: metadata_fields,
