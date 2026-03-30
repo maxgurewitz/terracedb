@@ -238,13 +238,13 @@ fn run_overlay_simulation(seed: u64) -> turmoil::Result<OverlaySimulationCapture
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(50))
         .run_with(move |context| async move {
-            let store = InMemoryAgentFsStore::new(context.clock(), context.rng());
+            let store = InMemoryVfsStore::new(context.clock(), context.rng());
             let base_volume_id = VolumeId::new(0x3a00 + seed as u128);
             let overlay_volume_id = VolumeId::new(0x4a00 + seed as u128);
 
             let base = store
                 .open_volume(
-                    AgentFsConfig::new(base_volume_id)
+                    VolumeConfig::new(base_volume_id)
                         .with_chunk_size(4)
                         .with_create_if_missing(true),
                 )
@@ -286,7 +286,7 @@ fn run_overlay_simulation(seed: u64) -> turmoil::Result<OverlaySimulationCapture
             let overlay = store
                 .create_overlay(
                     base_snapshot,
-                    AgentFsConfig::new(overlay_volume_id)
+                    VolumeConfig::new(overlay_volume_id)
                         .with_chunk_size(4)
                         .with_create_if_missing(true),
                 )
@@ -340,7 +340,7 @@ fn run_overlay_simulation(seed: u64) -> turmoil::Result<OverlaySimulationCapture
                 .is_some();
 
             let reopened = store
-                .open_volume(AgentFsConfig::new(overlay_volume_id).with_chunk_size(4))
+                .open_volume(VolumeConfig::new(overlay_volume_id).with_chunk_size(4))
                 .await
                 .expect("reopen overlay");
             let reopened_names_before_flush = sorted_names(
@@ -371,11 +371,11 @@ fn run_overlay_simulation(seed: u64) -> turmoil::Result<OverlaySimulationCapture
                 .export_volume(terracedb_vfs::CloneVolumeSource::new(overlay_volume_id))
                 .await
                 .expect("export visible overlay");
-            let imported_visible_store = InMemoryAgentFsStore::new(context.clock(), context.rng());
+            let imported_visible_store = InMemoryVfsStore::new(context.clock(), context.rng());
             let imported_visible = imported_visible_store
                 .import_volume(
                     visible_export,
-                    AgentFsConfig::new(VolumeId::new(0x5a00 + seed as u128))
+                    VolumeConfig::new(VolumeId::new(0x5a00 + seed as u128))
                         .with_chunk_size(4)
                         .with_create_if_missing(true),
                 )
@@ -407,11 +407,11 @@ fn run_overlay_simulation(seed: u64) -> turmoil::Result<OverlaySimulationCapture
                 .await
                 .expect("export durable overlay before flush");
             let imported_durable_before_store =
-                InMemoryAgentFsStore::new(context.clock(), context.rng());
+                InMemoryVfsStore::new(context.clock(), context.rng());
             let imported_durable_before = imported_durable_before_store
                 .import_volume(
                     durable_export_before_flush,
-                    AgentFsConfig::new(VolumeId::new(0x6a00 + seed as u128))
+                    VolumeConfig::new(VolumeId::new(0x6a00 + seed as u128))
                         .with_chunk_size(4)
                         .with_create_if_missing(true),
                 )
@@ -445,11 +445,11 @@ fn run_overlay_simulation(seed: u64) -> turmoil::Result<OverlaySimulationCapture
                 .await
                 .expect("export durable overlay after flush");
             let imported_durable_after_store =
-                InMemoryAgentFsStore::new(context.clock(), context.rng());
+                InMemoryVfsStore::new(context.clock(), context.rng());
             let imported_durable_after = imported_durable_after_store
                 .import_volume(
                     durable_export_after_flush,
-                    AgentFsConfig::new(VolumeId::new(0x7a00 + seed as u128))
+                    VolumeConfig::new(VolumeId::new(0x7a00 + seed as u128))
                         .with_chunk_size(4)
                         .with_create_if_missing(true),
                 )
