@@ -1987,6 +1987,8 @@ impl<'a> ByteCursor<'a> {
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
+    use proptest::{prelude::*, prop_oneof};
+
     use crate::{
         adapters::{FileSystemFailure, FileSystemOperation, SimulatedFileSystem},
         api::FieldValue,
@@ -2001,6 +2003,79 @@ mod tests {
     use crate::api::{ChangeKind, Value};
     use crate::ids::{CommitId, FieldId, SegmentId, TableId};
     use crate::io::{FileSystem, OpenOptions};
+
+    fn arb_field_value() -> impl Strategy<Value = FieldValue> {
+        prop_oneof![
+            Just(FieldValue::Null),
+            any::<bool>().prop_map(FieldValue::Bool),
+            any::<i64>().prop_map(FieldValue::Int64),
+            prop::collection::vec(any::<u8>(), 0..16).prop_map(FieldValue::Bytes),
+            prop::collection::vec(any::<char>(), 0..8)
+                .prop_map(|chars| chars.into_iter().collect::<String>())
+                .prop_map(FieldValue::String),
+        ]
+    }
+
+    fn arb_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..32).prop_map(Value::Bytes),
+            prop::collection::btree_map(1_u32..=4, arb_field_value(), 1..=4).prop_map(|fields| {
+                Value::Record(
+                    fields
+                        .into_iter()
+                        .map(|(field_id, value)| (FieldId::new(field_id), value))
+                        .collect(),
+                )
+            }),
+        ]
+    }
+
+    fn arb_entry_payload() -> impl Strategy<Value = (TableId, ChangeKind, Vec<u8>, Option<Value>)> {
+        let table_id = 1_u32..=8;
+        let key = prop::collection::vec(any::<u8>(), 0..24);
+        prop_oneof![
+            (table_id.clone(), key.clone()).prop_map(|(table_id, key)| (
+                TableId::new(table_id),
+                ChangeKind::Delete,
+                key,
+                None
+            )),
+            (table_id.clone(), key.clone(), arb_value()).prop_map(|(table_id, key, value)| (
+                TableId::new(table_id),
+                ChangeKind::Put,
+                key,
+                Some(value),
+            )),
+            (table_id, key, arb_value()).prop_map(|(table_id, key, value)| (
+                TableId::new(table_id),
+                ChangeKind::Merge,
+                key,
+                Some(value),
+            )),
+        ]
+    }
+
+    fn arb_commit_record() -> impl Strategy<Value = CommitRecord> {
+        (
+            any::<u64>(),
+            prop::collection::vec(arb_entry_payload(), 0..8),
+        )
+            .prop_map(|(sequence, entries)| CommitRecord {
+                id: CommitId::new(SequenceNumber::new(sequence)),
+                entries: entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (table_id, kind, key, value))| CommitEntry {
+                        op_index: index as u16,
+                        table_id,
+                        kind,
+                        key,
+                        value,
+                        operation_context: None,
+                    })
+                    .collect(),
+            })
+    }
 
     fn sample_record(sequence: u64) -> CommitRecord {
         let mut record_value = BTreeMap::new();
@@ -2035,6 +2110,15 @@ mod tests {
                     operation_context: None,
                 },
             ],
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn commit_record_frames_round_trip_for_arbitrary_entries(record in arb_commit_record()) {
+            let frame = record.encode_frame().expect("encode frame");
+            let decoded = CommitRecord::decode_frame(&frame).expect("decode frame");
+            prop_assert_eq!(decoded, record);
         }
     }
 

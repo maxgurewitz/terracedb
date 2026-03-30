@@ -1,0 +1,112 @@
+---
+source: crates/terracedb-otel/tests/telemetry.rs
+expression: shape
+---
+NormalizedMetricShape {
+    metric_names: [
+        "terracedb.db.compaction_debt_bytes",
+        "terracedb.db.durable_sequence",
+        "terracedb.db.durable_visible_lag",
+        "terracedb.db.scheduler_backlog",
+        "terracedb.db.visible_sequence",
+        "terracedb.projection.frontier_sequence",
+        "terracedb.projection.lag",
+        "terracedb.telemetry.metric_collection_duration_ms",
+        "terracedb.telemetry.metric_collections",
+        "terracedb.workflow.in_flight_instances",
+        "terracedb.workflow.inbox_depth",
+        "terracedb.workflow.outbox_depth",
+        "terracedb.workflow.source_lag",
+        "terracedb.workflow.timer_depth",
+    ],
+    u64_points: {
+        "terracedb.db.durable_sequence": [
+            (
+                {
+                    "terracedb.db.name": "metric-shape",
+                    "terracedb.storage.mode": "tiered",
+                },
+                2,
+            ),
+        ],
+        "terracedb.db.durable_visible_lag": [
+            (
+                {
+                    "terracedb.db.name": "metric-shape",
+                    "terracedb.storage.mode": "tiered",
+                },
+                0,
+            ),
+        ],
+        "terracedb.db.visible_sequence": [
+            (
+                {
+                    "terracedb.db.name": "metric-shape",
+                    "terracedb.storage.mode": "tiered",
+                },
+                2,
+            ),
+        ],
+        "terracedb.projection.frontier_sequence": [
+            (
+                {
+                    "terracedb.projection.mode": "single_source",
+                    "terracedb.projection.name": "metric-projection",
+                    "terracedb.source.table": "source",
+                },
+                1,
+            ),
+        ],
+        "terracedb.projection.lag": [
+            (
+                {
+                    "terracedb.projection.mode": "single_source",
+                    "terracedb.projection.name": "metric-projection",
+                    "terracedb.source.table": "source",
+                },
+                0,
+            ),
+        ],
+        "terracedb.workflow.in_flight_instances": [
+            (
+                {
+                    "terracedb.workflow.name": "metric-workflow",
+                },
+                0,
+            ),
+        ],
+        "terracedb.workflow.inbox_depth": [
+            (
+                {
+                    "terracedb.workflow.name": "metric-workflow",
+                },
+                0,
+            ),
+        ],
+        "terracedb.workflow.outbox_depth": [
+            (
+                {
+                    "terracedb.workflow.name": "metric-workflow",
+                },
+                0,
+            ),
+        ],
+        "terracedb.workflow.source_lag": [
+            (
+                {
+                    "terracedb.source.table": "source",
+                    "terracedb.workflow.name": "metric-workflow",
+                },
+                1,
+            ),
+        ],
+        "terracedb.workflow.timer_depth": [
+            (
+                {
+                    "terracedb.workflow.name": "metric-workflow",
+                },
+                0,
+            ),
+        ],
+    },
+}

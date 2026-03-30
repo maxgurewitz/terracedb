@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use insta::assert_debug_snapshot;
 use opentelemetry::{
     logs::AnyValue,
     trace::{SpanId, TraceContextExt},
@@ -139,6 +140,12 @@ struct NormalizedSpan {
     link_count: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NormalizedMetricShape {
+    metric_names: Vec<String>,
+    u64_points: BTreeMap<String, Vec<(BTreeMap<String, String>, u64)>>,
+}
+
 fn build_test_telemetry(service_name: &str) -> TerracedbTelemetry {
     TerracedbTelemetry::builder(service_name)
         .with_mode(TelemetryMode::Test)
@@ -247,6 +254,21 @@ fn metric_points_u64(
     Vec::new()
 }
 
+fn normalized_metric_points(
+    snapshot: &ResourceMetrics,
+    name: &str,
+) -> Vec<(BTreeMap<String, String>, u64)> {
+    let mut points = metric_points_u64(snapshot, name)
+        .into_iter()
+        .map(|(mut attrs, value)| {
+            attrs.remove(terracedb::telemetry_attrs::DB_INSTANCE);
+            (attrs, value)
+        })
+        .collect::<Vec<_>>();
+    points.sort();
+    points
+}
+
 fn normalize_terracedb_spans(spans: &[SpanData]) -> Vec<NormalizedSpan> {
     let mut normalized = spans
         .iter()
@@ -333,6 +355,89 @@ async fn capture_db_span_shape(path: &str) -> TestResult<Vec<NormalizedSpan>> {
 
     telemetry.force_flush().await?;
     Ok(normalize_terracedb_spans(&exports.spans()?))
+}
+
+async fn capture_metric_shape(path: &str) -> TestResult<NormalizedMetricShape> {
+    let telemetry = build_test_telemetry("metric-shape");
+    let exports = telemetry
+        .test_exports()
+        .expect("test telemetry should expose in-memory exporters");
+    let env = TestDbEnv::new(path);
+    let db = env.open().await?;
+    let source = db.create_table(row_table_config("source")).await?;
+    let output = db
+        .create_table(row_table_config("projection_output"))
+        .await?;
+    let source_sequence = source
+        .write(b"metric:1".to_vec(), Value::bytes("payload"))
+        .await?;
+    db.flush().await?;
+
+    let (projection_runtime, workflow_runtime) = telemetry
+        .with_subscriber(async {
+            let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
+            let mut projection_handle = projection_runtime
+                .start_single_source(
+                    SingleSourceProjection::new(
+                        "metric-projection",
+                        source.clone(),
+                        MirrorProjection {
+                            output: output.clone(),
+                        },
+                    )
+                    .with_outputs([output.clone()]),
+                )
+                .await?;
+            wait_for_projection(&mut projection_handle, source_sequence).await?;
+            projection_handle.shutdown().await?;
+
+            let workflow_runtime = WorkflowRuntime::open(
+                db.clone(),
+                env.clock.clone(),
+                WorkflowDefinition::new("metric-workflow", [source.clone()], EventTimerWorkflow),
+            )
+            .await?;
+
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                projection_runtime,
+                workflow_runtime,
+            ))
+        })
+        .await?;
+
+    telemetry.observe_db(db);
+    telemetry.observe_projection_runtime(projection_runtime);
+    telemetry.observe_workflow_runtime(workflow_runtime);
+
+    telemetry.force_flush().await?;
+    telemetry.force_flush().await?;
+
+    let latest = exports
+        .metrics()?
+        .into_iter()
+        .last()
+        .expect("latest metric snapshot");
+    let metric_names = metric_names(&latest).into_iter().collect::<Vec<_>>();
+    let u64_points = [
+        "terracedb.db.visible_sequence",
+        "terracedb.db.durable_sequence",
+        "terracedb.db.durable_visible_lag",
+        "terracedb.projection.frontier_sequence",
+        "terracedb.projection.lag",
+        "terracedb.workflow.inbox_depth",
+        "terracedb.workflow.timer_depth",
+        "terracedb.workflow.outbox_depth",
+        "terracedb.workflow.in_flight_instances",
+        "terracedb.workflow.source_lag",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), normalized_metric_points(&latest, name)))
+    .collect();
+
+    Ok(NormalizedMetricShape {
+        metric_names,
+        u64_points,
+    })
 }
 
 #[tokio::test]
@@ -815,6 +920,13 @@ async fn metric_snapshots_keep_stable_names_and_attribute_shapes() -> TestResult
         metric_points_u64(previous, "terracedb.workflow.source_lag")
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn metric_payload_shape_snapshot_is_stable() -> TestResult {
+    let shape = capture_metric_shape("/terracedb/otel/metric-shape").await?;
+    assert_debug_snapshot!("metric_payload_shape", shape);
     Ok(())
 }
 
