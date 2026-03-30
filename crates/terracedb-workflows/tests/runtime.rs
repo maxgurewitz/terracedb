@@ -7,11 +7,11 @@ use std::{
 use async_trait::async_trait;
 use terracedb::{
     ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
-    StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
-    Timestamp, Value,
+    StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table,
+    TieredDurabilityMode, Timestamp, Value,
     test_support::{
-        row_table_config, test_dependencies, test_dependencies_with_clock,
-        tiered_test_config_with_durability,
+        FailpointMode, db_failpoint_registry, failpoint_names, row_table_config, test_dependencies,
+        test_dependencies_with_clock, tiered_test_config_with_durability,
     },
 };
 use terracedb_simulation::{
@@ -289,6 +289,80 @@ async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
         }
         other => panic!("expected typed workflow change-feed failure, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn callback_admission_failpoint_surfaces_storage_error_before_commit() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-callback-failpoint",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+
+    db_failpoint_registry(&db).arm_error(
+        failpoint_names::WORKFLOW_CALLBACK_ADMISSION_BEFORE_COMMIT,
+        StorageError::io("simulated workflow failpoint"),
+        FailpointMode::Once,
+    );
+
+    let error = runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect_err("failpoint should fail callback admission");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Io);
+            assert!(
+                storage.to_string().contains("simulated workflow failpoint"),
+                "expected injected workflow failpoint context, got {storage}"
+            );
+        }
+        other => panic!("expected workflow storage error from failpoint, got {other:?}"),
+    }
+
+    let sequence = runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("retry callback after one-shot failpoint");
+    assert_eq!(sequence, terracedb::SequenceNumber::new(1));
+
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime
+                .load_state("order-1")
+                .await
+                .expect("load callback workflow state")
+                == Some(Value::bytes("processed:cb-1"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("workflow should process the retried callback");
+
+    handle.shutdown().await.expect("shutdown workflow runtime");
 }
 
 struct WorkflowStack<H> {

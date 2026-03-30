@@ -5416,6 +5416,66 @@ async fn orphaned_backup_sstables_are_harmless_before_manifest_publish() {
 }
 
 #[tokio::test]
+async fn backup_manifest_failpoint_can_coordinate_latest_pointer_timeout() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/backup-manifest-failpoint-latest-pointer"),
+        dependencies(file_system, object_store.clone()),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    let layout = tiered_layout();
+
+    table
+        .write(b"apple".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write first value");
+    db.flush().await.expect("flush first generation");
+
+    table
+        .write(b"apple".to_vec(), Value::bytes("v2"))
+        .await
+        .expect("write second value");
+
+    let blocker = db.__failpoint_registry().arm_pause(
+        crate::failpoints::names::DB_BACKUP_MANIFEST_BEFORE_LATEST_POINTER,
+        crate::failpoints::FailpointMode::Once,
+    );
+    let flush_db = db.clone();
+    let flush_task = tokio::spawn(async move { flush_db.flush().await });
+
+    blocker.wait_until_hit().await;
+    object_store.inject_failure(ObjectStoreFailure::timeout(
+        ObjectStoreOperation::Put,
+        layout.backup_manifest_latest(),
+    ));
+    blocker.release();
+
+    flush_task
+        .await
+        .expect("join flush task")
+        .expect("tiered flush should ignore backup pointer failure");
+
+    let latest_pointer = String::from_utf8(
+        object_store
+            .get(&layout.backup_manifest_latest())
+            .await
+            .expect("read latest backup manifest pointer"),
+    )
+    .expect("decode latest pointer");
+    assert_eq!(
+        latest_pointer.trim(),
+        layout.backup_manifest(ManifestId::new(1)),
+        "the injected pointer timeout should keep the previous backup manifest published"
+    );
+}
+
+#[tokio::test]
 async fn tiered_backup_gc_keeps_live_remote_objects_and_removes_old_backup_copies() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
@@ -7263,6 +7323,57 @@ async fn group_commit_sync_failure_flush_and_reopen_do_not_resurrect_failed_writ
             "events",
         )]
     );
+}
+
+#[tokio::test]
+async fn commit_failpoint_before_durability_sync_surfaces_exact_storage_error() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/commit-failpoint-before-sync"),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    db.__failpoint_registry().arm_error(
+        crate::failpoints::names::DB_COMMIT_BEFORE_DURABILITY_SYNC,
+        StorageError::io("simulated commit failpoint"),
+        crate::failpoints::FailpointMode::Once,
+    );
+
+    let error = table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect_err("failpoint should fail the commit");
+    match error {
+        crate::WriteError::Commit(CommitError::Storage(storage)) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Io);
+            assert!(
+                storage.to_string().contains("simulated commit failpoint"),
+                "expected injected failpoint context, got {storage}"
+            );
+        }
+        other => panic!("expected exact storage failure from commit failpoint, got {other:?}"),
+    }
+
+    assert_eq!(
+        table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read after failed commit"),
+        None
+    );
+
+    let retry_sequence = table
+        .write(b"user:1".to_vec(), Value::bytes("v2"))
+        .await
+        .expect("retry write after one-shot failpoint");
+    assert_eq!(retry_sequence, SequenceNumber::new(2));
 }
 
 #[tokio::test]

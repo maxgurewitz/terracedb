@@ -1,4 +1,4 @@
-use std::convert::TryFrom;
+use std::{collections::BTreeMap, convert::TryFrom};
 
 use futures::{StreamExt, TryStreamExt};
 use tracing::Instrument;
@@ -468,6 +468,19 @@ impl DurableOutboxConsumer {
         );
 
         async move {
+            let _ = self
+                .db
+                .__run_failpoint(
+                    crate::failpoints::names::OUTBOX_CURSOR_PERSIST_BEFORE_COMMIT,
+                    BTreeMap::from([(
+                        "cursor".to_string(),
+                        format!("{}:{}", cursor.sequence().get(), cursor.op_index()),
+                    )]),
+                )
+                .await
+                .map_err(|error| {
+                    TransactionCommitError::Commit(crate::CommitError::Storage(error))
+                })?;
             self.cursors
                 .persist(&self.db, self.consumer_id.clone(), cursor)
                 .await?;

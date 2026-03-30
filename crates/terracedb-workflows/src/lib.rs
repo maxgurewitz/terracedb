@@ -36,6 +36,11 @@ const WORKFLOW_TABLE_PREFIX: &str = "_workflow_";
 const INBOX_KEY_SEPARATOR: u8 = 0;
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
+const FAILPOINT_WORKFLOW_CALLBACK_ADMISSION_BEFORE_COMMIT: &str =
+    "workflow.callback_admission.before_commit";
+const FAILPOINT_WORKFLOW_EXECUTION_BEFORE_COMMIT: &str = "workflow.execution.before_commit";
+const FAILPOINT_WORKFLOW_TIMER_ADMISSION_BEFORE_COMMIT: &str =
+    "workflow.timer_admission.before_commit";
 
 fn workflow_trigger_kind(trigger: &WorkflowTrigger) -> &'static str {
     match trigger {
@@ -688,6 +693,18 @@ where
                     operation_context.clone(),
                 )
                 .await?;
+                let _ = self
+                    .inner
+                    .db
+                    .__run_failpoint(
+                        FAILPOINT_WORKFLOW_CALLBACK_ADMISSION_BEFORE_COMMIT,
+                        BTreeMap::from([
+                            ("workflow".to_string(), self.inner.name.clone()),
+                            ("instance_id".to_string(), instance_id.clone()),
+                            ("trigger_seq".to_string(), trigger_seq.to_string()),
+                        ]),
+                    )
+                    .await?;
                 match tx.commit().await {
                     Ok(sequence) => {
                         set_span_attribute(
@@ -1522,6 +1539,16 @@ where
                 }
             }
 
+            let _ = runtime
+                .db
+                .__run_failpoint(
+                    FAILPOINT_WORKFLOW_TIMER_ADMISSION_BEFORE_COMMIT,
+                    BTreeMap::from([
+                        ("workflow".to_string(), runtime.name.clone()),
+                        ("timer_count".to_string(), due.timers.len().to_string()),
+                    ]),
+                )
+                .await?;
             match tx.commit().await {
                 Ok(_) => {
                     for instance_id in newly_ready {
@@ -1816,6 +1843,16 @@ where
             }
         }
 
+        let _ = runtime
+            .db
+            .__run_failpoint(
+                FAILPOINT_WORKFLOW_EXECUTION_BEFORE_COMMIT,
+                BTreeMap::from([
+                    ("workflow".to_string(), runtime.name.clone()),
+                    ("instance_id".to_string(), instance_id.to_string()),
+                ]),
+            )
+            .await?;
         commit_runtime_transaction(runtime, tx).await?;
         Ok(())
     }

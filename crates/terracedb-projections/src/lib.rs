@@ -26,6 +26,11 @@ const PROJECTION_CURSOR_STATE_FORMAT_VERSION: u8 = 2;
 const PROJECTION_CURSOR_KEY_SEPARATOR: u8 = 0;
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
+const FAILPOINT_PROJECTION_APPLY_BEFORE_COMMIT: &str = "projection.apply.before_commit";
+const FAILPOINT_PROJECTION_REBUILD_APPLY_BEFORE_COMMIT: &str =
+    "projection.rebuild.apply.before_commit";
+const FAILPOINT_PROJECTION_REBUILD_RESET_BEFORE_COMMIT: &str =
+    "projection.rebuild.reset.before_commit";
 
 fn collect_operation_contexts(entries: &[ChangeEntry]) -> Vec<OperationContext> {
     let mut seen = BTreeSet::new();
@@ -1781,6 +1786,20 @@ async fn drain_next_ready_run(
             telemetry_attrs::PROJECTION_OPERATION_COUNT,
             operation_count as u64,
         );
+        let _ = runtime
+            .db
+            .__run_failpoint(
+                FAILPOINT_PROJECTION_APPLY_BEFORE_COMMIT,
+                BTreeMap::from([
+                    ("projection".to_string(), runtime.name.clone()),
+                    (
+                        "sequence".to_string(),
+                        new_state.sequence().get().to_string(),
+                    ),
+                    ("source".to_string(), chosen_source.name().to_string()),
+                ]),
+            )
+            .await?;
         runtime
             .db
             .commit(batch, CommitOptions::default().with_current_context())
@@ -1842,6 +1861,13 @@ async fn rebuild_from_current_state(
             );
         }
         if !reset_batch.is_empty() {
+            let _ = runtime
+                .db
+                .__run_failpoint(
+                    FAILPOINT_PROJECTION_REBUILD_RESET_BEFORE_COMMIT,
+                    BTreeMap::from([("projection".to_string(), runtime.name.clone())]),
+                )
+                .await?;
             runtime
                 .db
                 .commit(reset_batch, CommitOptions::default())
@@ -1880,6 +1906,20 @@ async fn rebuild_from_current_state(
                     empty_state,
                     runtime.mode == ProjectionMode::SingleSource,
                 );
+                let _ = runtime
+                    .db
+                    .__run_failpoint(
+                        FAILPOINT_PROJECTION_REBUILD_APPLY_BEFORE_COMMIT,
+                        BTreeMap::from([
+                            ("projection".to_string(), runtime.name.clone()),
+                            (
+                                "sequence".to_string(),
+                                empty_state.sequence().get().to_string(),
+                            ),
+                            ("source".to_string(), source_table.name().to_string()),
+                        ]),
+                    )
+                    .await?;
                 runtime.db.commit(batch, CommitOptions::default()).await?;
                 runtime.sources[index].cursor = empty_state.cursor();
                 runtime.sources[index].sequence = empty_state.sequence();
@@ -1928,6 +1968,20 @@ async fn rebuild_from_current_state(
                     new_state,
                     runtime.mode == ProjectionMode::SingleSource,
                 );
+                let _ = runtime
+                    .db
+                    .__run_failpoint(
+                        FAILPOINT_PROJECTION_REBUILD_APPLY_BEFORE_COMMIT,
+                        BTreeMap::from([
+                            ("projection".to_string(), runtime.name.clone()),
+                            (
+                                "sequence".to_string(),
+                                new_state.sequence().get().to_string(),
+                            ),
+                            ("source".to_string(), source_table.name().to_string()),
+                        ]),
+                    )
+                    .await?;
                 runtime.db.commit(batch, CommitOptions::default()).await?;
                 runtime.sources[index].cursor = new_state.cursor();
                 runtime.sources[index].sequence = new_state.sequence();

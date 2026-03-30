@@ -6,6 +6,7 @@ pub mod composition;
 pub mod config;
 pub mod engine;
 pub mod error;
+mod failpoints;
 pub mod ids;
 pub mod io;
 pub mod remote;
@@ -44,6 +45,11 @@ pub use config::{
 pub use error::{
     ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
     SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
+};
+#[doc(hidden)]
+pub use failpoints::{
+    FailpointAction, FailpointHandle, FailpointHit, FailpointMode, FailpointOutcome,
+    FailpointRegistry,
 };
 pub use ids::{
     CommitId, FieldId, IdEncodingError, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId,

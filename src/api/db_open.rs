@@ -89,12 +89,6 @@ impl Db {
                     )),
                     durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
                     work_deferrals: Mutex::new(BTreeMap::new()),
-                    #[cfg(test)]
-                    commit_phase_blocks: Mutex::new(Vec::new()),
-                    #[cfg(test)]
-                    compaction_phase_blocks: Mutex::new(Vec::new()),
-                    #[cfg(test)]
-                    offload_phase_blocks: Mutex::new(Vec::new()),
                 }),
             };
             db.prune_commit_log(true)
@@ -734,6 +728,18 @@ impl Db {
             Err(error) if error.kind() == StorageErrorKind::NotFound => {}
             Err(error) => last_error = Some(error),
         }
+
+        let _ = dependencies
+            .__failpoint_registry()
+            .trigger(
+                crate::failpoints::names::DB_REMOTE_MANIFEST_RECOVERY_AFTER_POINTER_READ,
+                BTreeMap::from([(
+                    "candidate_count".to_string(),
+                    candidates.len().to_string(),
+                )]),
+            )
+            .await
+            .map_err(OpenError::Storage)?;
 
         let mut listed = dependencies.object_store.list(&manifest_prefix).await?;
         listed.retain(|key| key != &latest_key && Self::parse_manifest_generation(key).is_some());

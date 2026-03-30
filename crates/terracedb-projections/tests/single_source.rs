@@ -7,9 +7,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
     ChangeFeedError, CommitOptions, Db, FileSystemFailure, FileSystemOperation, KvStream,
-    LogCursor, ScanOptions, SequenceNumber, StorageErrorKind, StubFileSystem, StubObjectStore,
-    Table, TieredDurabilityMode, Value,
-    test_support::{bytes as test_bytes, row_table_config, test_dependencies, tiered_test_config},
+    LogCursor, ScanOptions, SequenceNumber, StorageError, StorageErrorKind, StubFileSystem,
+    StubObjectStore, Table, TieredDurabilityMode, Value,
+    test_support::{
+        FailpointMode, bytes as test_bytes, db_failpoint_registry, failpoint_names,
+        row_table_config, test_dependencies, tiered_test_config,
+    },
 };
 use terracedb_projections::{
     PROJECTION_CURSOR_TABLE_NAME, ProjectionContext, ProjectionError, ProjectionHandler,
@@ -263,6 +266,109 @@ async fn projection_catches_up_startup_backlog_without_new_notification() {
     );
 
     handle.shutdown().await.expect("stop projection");
+}
+
+#[tokio::test]
+async fn projection_failpoint_before_commit_preserves_cursor_until_retry() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config("/projection-failpoint-before-commit"),
+        test_dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("source"))
+        .await
+        .expect("create source table");
+    let output = db
+        .create_table(row_table_config("output"))
+        .await
+        .expect("create output table");
+
+    let runtime = ProjectionRuntime::open(db.clone())
+        .await
+        .expect("open projection runtime");
+    let handle = runtime
+        .start_single_source(
+            SingleSourceProjection::new(
+                "mirror-with-failpoint",
+                source.clone(),
+                MirrorProjection {
+                    output: output.clone(),
+                },
+            )
+            .with_outputs([output.clone()]),
+        )
+        .await
+        .expect("start projection");
+
+    db_failpoint_registry(&db).arm_error(
+        failpoint_names::PROJECTION_APPLY_BEFORE_COMMIT,
+        StorageError::io("simulated projection failpoint"),
+        FailpointMode::Once,
+    );
+
+    let sequence = source
+        .write(b"alpha".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write source value");
+    db.flush().await.expect("flush source value");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("projection should fail at the named cut point");
+    match error {
+        ProjectionError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Io);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("simulated projection failpoint"),
+                "expected injected projection failpoint context, got {storage}"
+            );
+        }
+        other => panic!("expected projection storage error, got {other:?}"),
+    }
+
+    assert_eq!(
+        output
+            .read(b"alpha".to_vec())
+            .await
+            .expect("read output after failed projection"),
+        None
+    );
+
+    let mut retry_handle = runtime
+        .start_single_source(
+            SingleSourceProjection::new(
+                "mirror-with-failpoint",
+                source.clone(),
+                MirrorProjection {
+                    output: output.clone(),
+                },
+            )
+            .with_outputs([output.clone()]),
+        )
+        .await
+        .expect("restart projection after one-shot failpoint");
+    wait_for_watermark(&mut retry_handle, sequence).await;
+
+    assert_eq!(
+        output
+            .read(b"alpha".to_vec())
+            .await
+            .expect("read retried projection output"),
+        Some(Value::bytes("v1"))
+    );
+
+    retry_handle
+        .shutdown()
+        .await
+        .expect("stop restarted projection");
 }
 
 #[tokio::test]

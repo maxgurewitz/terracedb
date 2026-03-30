@@ -225,16 +225,19 @@ impl Db {
                     CommitPhase::AfterDurabilitySync,
                     participant.sequence,
                 )
-                .await;
+                .await
+                .map_err(CommitError::Storage)?;
             }
 
             self.maybe_pause_commit_phase(CommitPhase::BeforeMemtableInsert, participant.sequence)
-                .await;
+                .await
+                .map_err(CommitError::Storage)?;
             self.memtables_write()
                 .apply(participant.sequence, &participant.operations);
             self.mark_memtable_inserted(participant.sequence);
             self.maybe_pause_commit_phase(CommitPhase::AfterMemtableInsert, participant.sequence)
-                .await;
+                .await
+                .map_err(CommitError::Storage)?;
 
             self.publish_watermarks();
 
@@ -243,14 +246,16 @@ impl Db {
                     CommitPhase::AfterVisibilityPublish,
                     participant.sequence,
                 )
-                .await;
+                .await
+                .map_err(CommitError::Storage)?;
             }
             if self.current_durable_sequence() >= participant.sequence {
                 self.maybe_pause_commit_phase(
                     CommitPhase::AfterDurablePublish,
                     participant.sequence,
                 )
-                .await;
+                .await
+                .map_err(CommitError::Storage)?;
             }
 
             crate::set_span_attribute(
@@ -1077,7 +1082,8 @@ impl Db {
             }
 
             self.maybe_pause_commit_phase(CommitPhase::BeforeDurabilitySync, sequence)
-                .await;
+                .await
+                .map_err(CommitError::Storage)?;
 
             let should_lead = {
                 let _commit_guard = self.inner.commit_lock.lock().await;
@@ -1094,7 +1100,8 @@ impl Db {
 
             if should_lead {
                 self.maybe_pause_commit_phase(CommitPhase::AfterBatchSeal, sequence)
-                    .await;
+                    .await
+                    .map_err(CommitError::Storage)?;
                 if let Some(predecessor) = batch.predecessor()
                     && let Err(error) = predecessor.await_result().await
                 {
@@ -1323,126 +1330,78 @@ impl Db {
 
     #[cfg(test)]
     fn block_next_commit_phase(&self, phase: CommitPhase) -> CommitPhaseBlocker {
-        let (sequence_tx, sequence_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        mutex_lock(&self.inner.commit_phase_blocks).push(CommitPhaseBlock {
-            phase,
-            sequence_tx: Some(sequence_tx),
-            release_rx: Some(release_rx),
-        });
-
         CommitPhaseBlocker {
-            sequence_rx: Some(sequence_rx),
-            release_tx: Some(release_tx),
+            handle: self
+                .inner
+                .dependencies
+                .__failpoint_registry()
+                .arm_pause(phase.failpoint_name(), crate::failpoints::FailpointMode::Once),
         }
     }
 
     #[cfg(test)]
     fn block_next_compaction_phase(&self, phase: CompactionPhase) -> CompactionPhaseBlocker {
-        let (reached_tx, reached_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        mutex_lock(&self.inner.compaction_phase_blocks).push(CompactionPhaseBlock {
-            phase,
-            reached_tx: Some(reached_tx),
-            release_rx: Some(release_rx),
-        });
-
         CompactionPhaseBlocker {
-            reached_rx: Some(reached_rx),
-            release_tx: Some(release_tx),
+            handle: self
+                .inner
+                .dependencies
+                .__failpoint_registry()
+                .arm_pause(phase.failpoint_name(), crate::failpoints::FailpointMode::Once),
         }
     }
 
     #[cfg(test)]
     fn block_next_offload_phase(&self, phase: OffloadPhase) -> OffloadPhaseBlocker {
-        let (reached_tx, reached_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        mutex_lock(&self.inner.offload_phase_blocks).push(OffloadPhaseBlock {
-            phase,
-            reached_tx: Some(reached_tx),
-            release_rx: Some(release_rx),
-        });
-
         OffloadPhaseBlocker {
-            reached_rx: Some(reached_rx),
-            release_tx: Some(release_tx),
+            handle: self
+                .inner
+                .dependencies
+                .__failpoint_registry()
+                .arm_pause(phase.failpoint_name(), crate::failpoints::FailpointMode::Once),
         }
     }
 
-    #[cfg(test)]
-    async fn maybe_pause_commit_phase(&self, phase: CommitPhase, sequence: SequenceNumber) {
-        let block = {
-            let mut blocks = mutex_lock(&self.inner.commit_phase_blocks);
-            blocks
-                .iter()
-                .position(|block| block.phase == phase)
-                .map(|index| blocks.remove(index))
-        };
-
-        if let Some(mut block) = block {
-            if let Some(sequence_tx) = block.sequence_tx.take() {
-                let _ = sequence_tx.send(sequence);
-            }
-            if let Some(release_rx) = block.release_rx.take() {
-                let _ = release_rx.await;
-            }
-        }
+    async fn maybe_pause_commit_phase(
+        &self,
+        phase: CommitPhase,
+        sequence: SequenceNumber,
+    ) -> Result<(), StorageError> {
+        let metadata = BTreeMap::from([("sequence".to_string(), sequence.get().to_string())]);
+        let _ = self.__run_failpoint(phase.failpoint_name(), metadata).await?;
+        Ok(())
     }
 
-    #[cfg(not(test))]
-    async fn maybe_pause_commit_phase(&self, _phase: CommitPhase, _sequence: SequenceNumber) {}
-
-    #[cfg(test)]
-    async fn maybe_pause_compaction_phase(&self, phase: CompactionPhase) {
-        let block = {
-            let mut blocks = mutex_lock(&self.inner.compaction_phase_blocks);
-            blocks
-                .iter()
-                .position(|block| block.phase == phase)
-                .map(|index| blocks.remove(index))
-        };
-
-        if let Some(mut block) = block {
-            if let Some(reached_tx) = block.reached_tx.take() {
-                let _ = reached_tx.send(());
-            }
-            if let Some(release_rx) = block.release_rx.take() {
-                let _ = release_rx.await;
-            }
-        }
+    async fn maybe_pause_compaction_phase(&self, phase: CompactionPhase) -> Result<(), StorageError> {
+        let _ = self
+            .__run_failpoint(phase.failpoint_name(), BTreeMap::new())
+            .await?;
+        Ok(())
     }
 
-    #[cfg(not(test))]
-    #[allow(dead_code)]
-    async fn maybe_pause_compaction_phase(&self, _phase: CompactionPhase) {}
-
-    #[cfg(test)]
-    async fn maybe_pause_offload_phase(&self, phase: OffloadPhase) {
-        let block = {
-            let mut blocks = mutex_lock(&self.inner.offload_phase_blocks);
-            blocks
-                .iter()
-                .position(|block| block.phase == phase)
-                .map(|index| blocks.remove(index))
-        };
-
-        if let Some(mut block) = block {
-            if let Some(reached_tx) = block.reached_tx.take() {
-                let _ = reached_tx.send(());
-            }
-            if let Some(release_rx) = block.release_rx.take() {
-                let _ = release_rx.await;
-            }
-        }
+    async fn maybe_pause_offload_phase(&self, phase: OffloadPhase) -> Result<(), StorageError> {
+        let _ = self
+            .__run_failpoint(phase.failpoint_name(), BTreeMap::new())
+            .await?;
+        Ok(())
     }
-
-    #[cfg(not(test))]
-    #[allow(dead_code)]
-    async fn maybe_pause_offload_phase(&self, _phase: OffloadPhase) {}
 
     #[allow(dead_code)]
     pub(crate) fn dependencies(&self) -> &DbDependencies {
         &self.inner.dependencies
+    }
+
+    #[doc(hidden)]
+    pub fn __failpoint_registry(&self) -> Arc<crate::failpoints::FailpointRegistry> {
+        self.inner.dependencies.__failpoint_registry()
+    }
+
+    #[doc(hidden)]
+    pub async fn __run_failpoint(
+        &self,
+        name: &str,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<crate::failpoints::FailpointOutcome, StorageError> {
+        self.__failpoint_registry().trigger(name, metadata).await
     }
 
     fn resolve_batch_operations(
