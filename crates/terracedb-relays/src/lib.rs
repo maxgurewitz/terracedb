@@ -127,7 +127,10 @@ where
         Ok(entries.len())
     }
 
-    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), OutboxRelayError<H::Error>> {
+    pub async fn run(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), OutboxRelayError<H::Error>> {
         let mut subscription = self.db.subscribe(&self.outbox_table);
 
         loop {

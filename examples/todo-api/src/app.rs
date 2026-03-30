@@ -26,9 +26,9 @@ use terracedb_projections::{
 };
 use terracedb_relays::{OutboxRelay, OutboxRelayError, OutboxRelayHandler, RelayEntry};
 use terracedb_workflows::{
-    WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowHandle, WorkflowHandler,
-    WorkflowHandlerError, WorkflowOutput, WorkflowRuntime, WorkflowStateMutation,
-    WorkflowTables, WorkflowTelemetrySnapshot, WorkflowTimerCommand, DEFAULT_TIMER_POLL_INTERVAL,
+    DEFAULT_TIMER_POLL_INTERVAL, WorkflowContext, WorkflowDefinition, WorkflowError,
+    WorkflowHandle, WorkflowHandler, WorkflowHandlerError, WorkflowOutput, WorkflowRuntime,
+    WorkflowStateMutation, WorkflowTables, WorkflowTelemetrySnapshot, WorkflowTimerCommand,
 };
 
 use crate::model::{
@@ -244,9 +244,8 @@ impl TodoApp {
         )
         .with_batch_limit(PLANNER_DISPATCH_BATCH_LIMIT)
         .with_idle_poll_interval(PLANNER_DISPATCH_IDLE_POLL_INTERVAL);
-        let dispatcher_task = tokio::spawn(async move {
-            relay.run(dispatcher_rx).await.map_err(TodoAppError::from)
-        });
+        let dispatcher_task =
+            tokio::spawn(async move { relay.run(dispatcher_rx).await.map_err(TodoAppError::from) });
 
         Ok(Self {
             state,
@@ -319,7 +318,10 @@ impl TodoAppState {
         &self.tables
     }
 
-    pub async fn create_todo(&self, request: CreateTodoRequest) -> Result<TodoRecord, TodoApiError> {
+    pub async fn create_todo(
+        &self,
+        request: CreateTodoRequest,
+    ) -> Result<TodoRecord, TodoApiError> {
         let todo_id = normalize_required(&request.todo_id, "todo_id")?;
         let title = normalize_required(&request.title, "title")?;
         let now_ms = self.clock.now().get();
@@ -568,16 +570,12 @@ fn decode_u64(bytes: &[u8], context: &str) -> Result<u64, std::io::Error> {
 fn normalize_required(value: &str, field: &str) -> Result<String, TodoApiError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(TodoApiError::BadRequest(format!(
-            "{field} cannot be empty"
-        )));
+        return Err(TodoApiError::BadRequest(format!("{field} cannot be empty")));
     }
     Ok(trimmed.to_string())
 }
 
-async fn collect_todos(
-    mut stream: terracedb::KvStream,
-) -> Result<Vec<TodoRecord>, TodoAppError> {
+async fn collect_todos(mut stream: terracedb::KvStream) -> Result<Vec<TodoRecord>, TodoAppError> {
     let mut todos = Vec::new();
     while let Some((_key, value)) = stream.next().await {
         todos.push(decode_json_value(&value, "todo record")?);
@@ -597,8 +595,7 @@ fn sort_recent_todos(todos: &mut [TodoRecord]) {
 
 fn sort_list_todos(todos: &mut [TodoRecord]) {
     todos.sort_by(|left, right| {
-        left
-            .scheduled_for_day
+        left.scheduled_for_day
             .unwrap_or(u64::MAX)
             .cmp(&right.scheduled_for_day.unwrap_or(u64::MAX))
             .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
@@ -662,7 +659,10 @@ impl OutboxRelayHandler for PlannerRelayHandler {
     type Message = PlannerCommand;
     type Error = PlannerRelayHandlerError;
 
-    fn decode(&self, entry: terracedb::OutboxEntry) -> Result<RelayEntry<Self::Message>, Self::Error> {
+    fn decode(
+        &self,
+        entry: terracedb::OutboxEntry,
+    ) -> Result<RelayEntry<Self::Message>, Self::Error> {
         Ok(RelayEntry {
             outbox_id: entry.outbox_id,
             idempotency_key: entry.idempotency_key,
@@ -761,16 +761,12 @@ impl WorkflowHandler for WeeklyPlannerWorkflow {
                     }],
                 })
             }
-            terracedb_workflows::WorkflowTrigger::Callback { .. } => {
-                Err(WorkflowHandlerError::new(std::io::Error::other(
-                    "unknown weekly planner callback",
-                )))
-            }
-            terracedb_workflows::WorkflowTrigger::Event(_) => {
-                Err(WorkflowHandlerError::new(std::io::Error::other(
-                    "weekly planner workflow does not consume source events",
-                )))
-            }
+            terracedb_workflows::WorkflowTrigger::Callback { .. } => Err(
+                WorkflowHandlerError::new(std::io::Error::other("unknown weekly planner callback")),
+            ),
+            terracedb_workflows::WorkflowTrigger::Event(_) => Err(WorkflowHandlerError::new(
+                std::io::Error::other("weekly planner workflow does not consume source events"),
+            )),
         }
     }
 }

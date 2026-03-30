@@ -79,7 +79,11 @@ impl OutboxRelayHandler for MirrorRelayHandler {
         for entry in entries {
             let todo_id =
                 String::from_utf8(entry.message.clone()).map_err(|_| MirrorRelayError::Utf8)?;
-            if tx.read(&self.todos, todo_id.as_bytes().to_vec()).await?.is_none() {
+            if tx
+                .read(&self.todos, todo_id.as_bytes().to_vec())
+                .await?
+                .is_none()
+            {
                 tx.write(
                     &self.todos,
                     todo_id.clone().into_bytes(),

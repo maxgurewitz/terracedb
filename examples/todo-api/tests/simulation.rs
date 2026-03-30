@@ -2,14 +2,18 @@ use std::{convert::Infallible, error::Error as StdError, sync::Arc, time::Durati
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request, StatusCode, client::conn::http1, server::conn::http1 as server_http1};
+use hyper::{
+    Method, Request, StatusCode, client::conn::http1, server::conn::http1 as server_http1,
+};
 use hyper_util::rt::TokioIo;
 use terracedb::{Db, DbDependencies, DeterministicRng, SimulatedFileSystem};
 use terracedb_example_todo_api::{
-    CreateTodoRequest, MILLIS_PER_DAY, PlannerSchedule, TODO_SERVER_PORT, TodoApp,
-    TodoAppOptions, TodoRecord, TodoStatus, UpdateTodoRequest, todo_db_config,
+    CreateTodoRequest, MILLIS_PER_DAY, PlannerSchedule, TODO_SERVER_PORT, TodoApp, TodoAppOptions,
+    TodoRecord, TodoStatus, UpdateTodoRequest, todo_db_config,
 };
-use terracedb_simulation::{NetworkObjectStore, SeededSimulationRunner, SimulationHost, TurmoilClock};
+use terracedb_simulation::{
+    NetworkObjectStore, SeededSimulationRunner, SimulationHost, TurmoilClock,
+};
 use tokio::sync::watch;
 use tower::ServiceExt;
 use turmoil::net::{TcpListener, TcpStream};
@@ -45,20 +49,19 @@ fn todo_server_host(
                 todo_db_config(path, prefix),
                 DbDependencies::new(
                     Arc::new(SimulatedFileSystem::default()),
-                    Arc::new(NetworkObjectStore::new(OBJECT_STORE_HOST, OBJECT_STORE_PORT)),
+                    Arc::new(NetworkObjectStore::new(
+                        OBJECT_STORE_HOST,
+                        OBJECT_STORE_PORT,
+                    )),
                     clock.clone(),
                     Arc::new(DeterministicRng::seeded(seed)),
                 ),
             )
             .await
             .map_err(boxed_error)?;
-            let app = TodoApp::open_with_options(
-                db,
-                clock,
-                TodoAppOptions { planner_schedule },
-            )
-            .await
-            .map_err(boxed_error)?;
+            let app = TodoApp::open_with_options(db, clock, TodoAppOptions { planner_schedule })
+                .await
+                .map_err(boxed_error)?;
 
             let serve_result = run_simulated_http_server(app.router(), TODO_SERVER_PORT, shutdown)
                 .await
@@ -153,7 +156,10 @@ async fn send_request(
         let _ = connection.await;
     });
 
-    let mut builder = Request::builder().method(method).uri(path).header("host", host);
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", host);
     if body.is_some() {
         builder = builder.header("content-type", "application/json");
     }
@@ -207,9 +213,14 @@ fn happy_path_client_host(done: watch::Sender<bool>) -> SimulationHost {
                 notes: "first draft".to_string(),
                 scheduled_for_day: Some(2 * MILLIS_PER_DAY),
             };
-            let (status, created): (StatusCode, TodoRecord) =
-                send_json(SERVER_HOST, TODO_SERVER_PORT, Method::POST, "/todos", Some(&create))
-                    .await?;
+            let (status, created): (StatusCode, TodoRecord) = send_json(
+                SERVER_HOST,
+                TODO_SERVER_PORT,
+                Method::POST,
+                "/todos",
+                Some(&create),
+            )
+            .await?;
             assert_eq!(status, StatusCode::CREATED);
             assert_eq!(created.todo_id, "todo-1");
             assert_eq!(created.status, TodoStatus::Open);
@@ -231,15 +242,14 @@ fn happy_path_client_host(done: watch::Sender<bool>) -> SimulationHost {
                 notes: Some("second draft".to_string()),
                 scheduled_for_day: Some(3 * MILLIS_PER_DAY),
             };
-            let (status, updated): (StatusCode, TodoRecord) =
-                send_json(
-                    SERVER_HOST,
-                    TODO_SERVER_PORT,
-                    Method::PATCH,
-                    "/todos/todo-1",
-                    Some(&update),
-                )
-                .await?;
+            let (status, updated): (StatusCode, TodoRecord) = send_json(
+                SERVER_HOST,
+                TODO_SERVER_PORT,
+                Method::PATCH,
+                "/todos/todo-1",
+                Some(&update),
+            )
+            .await?;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(updated.todo_id, "todo-1");
             assert_eq!(updated.title, "Write better docs");

@@ -1,8 +1,6 @@
 use std::{env, sync::Arc};
 
-use terracedb::{
-    Db, DbDependencies, LocalDirObjectStore, SystemClock, SystemRng, TokioFileSystem,
-};
+use terracedb::{Db, DbDependencies, LocalDirObjectStore, SystemClock, SystemRng, TokioFileSystem};
 use terracedb_example_todo_api::{TodoApp, todo_db_config};
 
 #[tokio::main]
