@@ -101,8 +101,6 @@ pub enum ProjectionError {
     #[error(transparent)]
     Commit(#[from] CommitError),
     #[error(transparent)]
-    ChangeFeed(#[from] ChangeFeedError),
-    #[error(transparent)]
     Read(#[from] ReadError),
     #[error(transparent)]
     SnapshotTooOld(#[from] SnapshotTooOld),

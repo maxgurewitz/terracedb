@@ -6,9 +6,9 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    CommitOptions, Db, FileSystemFailure, FileSystemOperation, KvStream, LogCursor, ScanOptions,
-    SequenceNumber, StorageErrorKind, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
-    Value,
+    ChangeFeedError, CommitOptions, Db, FileSystemFailure, FileSystemOperation, KvStream,
+    LogCursor, ScanOptions, SequenceNumber, StorageErrorKind, StubFileSystem, StubObjectStore,
+    Table, TieredDurabilityMode, Value,
     test_support::{bytes as test_bytes, row_table_config, test_dependencies, tiered_test_config},
 };
 use terracedb_projections::{

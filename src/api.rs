@@ -18772,19 +18772,31 @@ mod tests {
             layout.backup_commit_log_segment(SegmentId::new(1)),
         ));
 
+        let mut visible = db
+            .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+            .expect("visible remote change-feed scan should open");
         let visible_storage = assert_change_feed_storage_error(
-            db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
-                .await
-                .err()
-                .expect("visible remote change-feed scan should surface a storage error"),
+            match visible.try_next().await {
+                Ok(Some(_)) | Ok(None) => {
+                    panic!("visible remote change-feed scan should surface a storage error")
+                }
+                Err(error) => error,
+            },
             crate::StorageErrorKind::Timeout,
         );
         assert!(visible_storage.message().contains("simulated timeout"));
+        let mut durable = db
+            .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+            .expect("durable remote change-feed scan should open");
         let durable_storage = assert_change_feed_storage_error(
-            db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
-                .await
-                .err()
-                .expect("durable remote change-feed scan should surface a storage error"),
+            match durable.try_next().await {
+                Ok(Some(_)) | Ok(None) => {
+                    panic!("durable remote change-feed scan should surface a storage error")
+                }
+                Err(error) => error,
+            },
             crate::StorageErrorKind::Timeout,
         );
         assert!(durable_storage.message().contains("simulated timeout"));
@@ -19168,19 +19180,31 @@ mod tests {
             .persistent(),
         );
 
+        let mut visible = db
+            .scan_since(&table, LogCursor::beginning(), ScanOptions::default())
+            .await
+            .expect("visible change-feed scan should open");
         let visible_storage = assert_change_feed_storage_error(
-            db.scan_since(&table, LogCursor::beginning(), ScanOptions::default())
-                .await
-                .err()
-                .expect("visible change-feed scan should surface a storage error"),
+            match visible.try_next().await {
+                Ok(Some(_)) | Ok(None) => {
+                    panic!("visible change-feed scan should surface a storage error")
+                }
+                Err(error) => error,
+            },
             crate::StorageErrorKind::Timeout,
         );
         assert!(visible_storage.message().contains("simulated timeout"));
+        let mut durable = db
+            .scan_durable_since(&table, LogCursor::beginning(), ScanOptions::default())
+            .await
+            .expect("durable change-feed scan should open");
         let durable_storage = assert_change_feed_storage_error(
-            db.scan_durable_since(&table, LogCursor::beginning(), ScanOptions::default())
-                .await
-                .err()
-                .expect("durable change-feed scan should surface a storage error"),
+            match durable.try_next().await {
+                Ok(Some(_)) | Ok(None) => {
+                    panic!("durable change-feed scan should surface a storage error")
+                }
+                Err(error) => error,
+            },
             crate::StorageErrorKind::Timeout,
         );
         assert!(durable_storage.message().contains("simulated timeout"));

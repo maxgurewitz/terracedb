@@ -73,8 +73,6 @@ pub enum WorkflowError {
     #[error(transparent)]
     Read(#[from] ReadError),
     #[error(transparent)]
-    ChangeFeed(#[from] ChangeFeedError),
-    #[error(transparent)]
     SnapshotTooOld(#[from] SnapshotTooOld),
     #[error(transparent)]
     ChangeFeed(#[from] ChangeFeedError),

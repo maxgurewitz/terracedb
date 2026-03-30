@@ -7,16 +7,14 @@ use std::time::Duration;
 
 use futures::{StreamExt, TryStreamExt};
 use terracedb::{
-    ChangeFeedError, Clock, CommitOptions, CompactionStrategy,
-    DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig, FieldDefinition, FieldId, FieldType,
-    FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ManifestId,
-    ObjectKeyLayout, ObjectStore, ObjectStoreOperation, OpenError, PendingWork, PendingWorkType,
-    RemoteCache, RemoteRecoveryHint, S3Location, S3PrimaryStorageConfig, ScanOptions,
-    ScheduleAction, ScheduleDecision, Scheduler, SchemaDefinition, SequenceNumber, SsdConfig,
-    StorageConfig, StorageErrorKind, StorageSource, TableConfig, TableFormat, TableStats,
-    ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage,
-    Value,
-    SegmentId,
+    Clock, CommitOptions, CompactionStrategy, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
+    FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
+    FileSystemOperation, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore, ObjectStoreOperation,
+    OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint, S3Location,
+    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+    SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
+    StorageSource, TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
+    TieredStorageConfig, Transaction, UnifiedStorage, Value,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
