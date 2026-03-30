@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use serde_json::json;
 use terracedb::{
     CompactionStrategy, CreateTableError, Db, DbConfig, DbDependencies, FieldDefinition, FieldId,
-    FieldType, FieldValue, S3Location, SchemaDefinition, SsdConfig, StorageConfig,
-    StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig,
-    TableFormat, TieredDurabilityMode, TieredStorageConfig, Value, WriteError,
+    FieldType, FieldValue, MergeOperator, S3Location, SchemaDefinition, SsdConfig, StorageConfig,
+    StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, StubRng,
+    TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Value, WriteError,
 };
 
 fn tiered_config(path: &str) -> DbConfig {
@@ -137,6 +137,64 @@ fn schema_validation_rejects_invalid_defaults_and_in_place_type_changes() {
 }
 
 #[test]
+fn schema_successors_support_lazy_add_remove_and_rename_rules() {
+    let current = schema_with_nullable_defaults();
+
+    let mut renamed = current.clone();
+    renamed.version = 2;
+    renamed.fields[0].name = "account_id".to_string();
+    current
+        .validate_successor(&renamed)
+        .expect("renames should preserve field ids");
+
+    let mut removed = renamed.clone();
+    removed.version = 3;
+    removed.fields.retain(|field| field.id != FieldId::new(2));
+    renamed
+        .validate_successor(&removed)
+        .expect("removing a field should stay lazy");
+
+    let mut invalid_add = current.clone();
+    invalid_add.version = 2;
+    invalid_add.fields.push(FieldDefinition {
+        id: FieldId::new(4),
+        name: "region".to_string(),
+        field_type: FieldType::String,
+        nullable: false,
+        default: None,
+    });
+    let error = current
+        .validate_successor(&invalid_add)
+        .expect_err("new required fields without defaults should be rejected");
+    assert_eq!(error.kind(), StorageErrorKind::Unsupported);
+    assert!(
+        error
+            .message()
+            .contains("must be nullable or define a default")
+    );
+
+    let invalid_name_reuse = SchemaDefinition {
+        version: 2,
+        fields: vec![
+            FieldDefinition {
+                id: FieldId::new(4),
+                name: "user_id".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                default: None,
+            },
+            current.fields[1].clone(),
+            current.fields[2].clone(),
+        ],
+    };
+    let error = current
+        .validate_successor(&invalid_name_reuse)
+        .expect_err("renames should not change field ids");
+    assert_eq!(error.kind(), StorageErrorKind::Unsupported);
+    assert!(error.message().contains("changes id"));
+}
+
+#[test]
 fn named_records_fill_defaults_and_reject_unknown_fields() {
     let schema = schema_with_nullable_defaults();
 
@@ -259,7 +317,7 @@ async fn columnar_tables_normalize_record_writes_and_reject_bytes() {
 }
 
 #[tokio::test]
-async fn table_creation_rejects_row_schemas_and_columnar_v1_merge_boundary() {
+async fn table_creation_rejects_row_schemas_and_accepts_columnar_merge_config() {
     let db = Db::open(tiered_config("/columnar-config-validation"), dependencies())
         .await
         .expect("open db");
@@ -292,11 +350,11 @@ async fn table_creation_rejects_row_schemas_and_columnar_v1_merge_boundary() {
         .await
         .expect("create baseline row table");
 
-    let error = db
+    let table = db
         .create_table(TableConfig {
             name: "metrics".to_string(),
             format: TableFormat::Columnar,
-            merge_operator: Some(Arc::new(RejectingMergeOperator)),
+            merge_operator: Some(Arc::new(SummingMergeOperator)),
             max_merge_operand_chain_length: Some(2),
             compaction_filter: None,
             bloom_filter_bits_per_key: Some(8),
@@ -306,30 +364,137 @@ async fn table_creation_rejects_row_schemas_and_columnar_v1_merge_boundary() {
             metadata: Default::default(),
         })
         .await
-        .expect_err("columnar tables should reject merge operators in v1");
-    assert!(matches!(error, CreateTableError::InvalidConfig(_)));
-    assert!(error.to_string().contains("merge operators in v1"));
+        .expect("columnar tables should accept merge operators");
+
+    table
+        .write(
+            b"user:1".to_vec(),
+            Value::named_record(
+                &schema_with_nullable_defaults(),
+                [
+                    ("user_id", FieldValue::String("alice".to_string())),
+                    ("count", FieldValue::Int64(2)),
+                ],
+            )
+            .expect("encode base row"),
+        )
+        .await
+        .expect("write base row");
+    table
+        .merge(
+            b"user:1".to_vec(),
+            Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(3))])),
+        )
+        .await
+        .expect("apply partial columnar merge operand");
+
+    assert_eq!(
+        table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read merged row"),
+        Some(Value::record(BTreeMap::from([
+            (FieldId::new(1), FieldValue::String("alice".to_string())),
+            (FieldId::new(2), FieldValue::Int64(5)),
+            (FieldId::new(3), FieldValue::Null),
+        ])))
+    );
 }
 
 #[derive(Debug)]
-struct RejectingMergeOperator;
+struct SummingMergeOperator;
 
-impl terracedb::MergeOperator for RejectingMergeOperator {
+impl MergeOperator for SummingMergeOperator {
     fn full_merge(
         &self,
         _key: &[u8],
-        _existing: Option<&Value>,
-        _operands: &[Value],
-    ) -> Result<Value, terracedb::StorageError> {
-        unreachable!("columnar merge boundary test should reject config before use")
+        existing: Option<&Value>,
+        operands: &[Value],
+    ) -> Result<Value, StorageError> {
+        let mut total = match existing {
+            Some(value) => record_fields(value)?,
+            None => (None, 0, None),
+        };
+        for operand in operands {
+            let (user_id, count, active) = record_fields(operand)?;
+            if total.0.is_none() {
+                total.0 = user_id;
+            }
+            total.1 += count;
+            if active.is_some() {
+                total.2 = active;
+            }
+        }
+
+        Ok(Value::record(BTreeMap::from([
+            (
+                FieldId::new(1),
+                FieldValue::String(
+                    total.0.ok_or_else(|| {
+                        StorageError::unsupported("merge result is missing user_id")
+                    })?,
+                ),
+            ),
+            (FieldId::new(2), FieldValue::Int64(total.1)),
+            (
+                FieldId::new(3),
+                total.2.map(FieldValue::Bool).unwrap_or(FieldValue::Null),
+            ),
+        ])))
     }
 
     fn partial_merge(
         &self,
         _key: &[u8],
-        _left: &Value,
-        _right: &Value,
-    ) -> Result<Option<Value>, terracedb::StorageError> {
-        unreachable!("columnar merge boundary test should reject config before use")
+        left: &Value,
+        right: &Value,
+    ) -> Result<Option<Value>, StorageError> {
+        let (left_user_id, left_count, left_active) = record_fields(left)?;
+        let (right_user_id, right_count, right_active) = record_fields(right)?;
+        let mut record = BTreeMap::new();
+        if let Some(user_id) = right_user_id.or(left_user_id) {
+            record.insert(FieldId::new(1), FieldValue::String(user_id));
+        }
+        record.insert(FieldId::new(2), FieldValue::Int64(left_count + right_count));
+        if let Some(active) = right_active.or(left_active) {
+            record.insert(FieldId::new(3), FieldValue::Bool(active));
+        }
+        Ok(Some(Value::record(record)))
     }
+}
+
+fn record_fields(value: &Value) -> Result<(Option<String>, i64, Option<bool>), StorageError> {
+    let Value::Record(record) = value else {
+        return Err(StorageError::unsupported(
+            "summing merge operator only supports record operands",
+        ));
+    };
+    let user_id = match record.get(&FieldId::new(1)) {
+        Some(FieldValue::String(value)) => Some(value.clone()),
+        Some(FieldValue::Null) | None => None,
+        Some(_) => {
+            return Err(StorageError::unsupported(
+                "user_id field must be a string or null",
+            ));
+        }
+    };
+    let count = match record.get(&FieldId::new(2)) {
+        Some(FieldValue::Int64(value)) => *value,
+        Some(FieldValue::Null) | None => 0,
+        Some(_) => {
+            return Err(StorageError::unsupported(
+                "count field must be an int64 or null",
+            ));
+        }
+    };
+    let active = match record.get(&FieldId::new(3)) {
+        Some(FieldValue::Bool(value)) => Some(*value),
+        Some(FieldValue::Null) | None => None,
+        Some(_) => {
+            return Err(StorageError::unsupported(
+                "active field must be a bool or null",
+            ));
+        }
+    };
+    Ok((user_id, count, active))
 }
