@@ -79,12 +79,12 @@ async fn open_db(
     file_system: Arc<StubFileSystem>,
     object_store: Arc<StubObjectStore>,
 ) -> Db {
-    Db::open(
-        test_config(path),
-        test_dependencies(file_system, object_store),
-    )
-    .await
-    .expect("open db")
+    Db::builder()
+        .config(test_config(path))
+        .dependencies(test_dependencies(file_system, object_store))
+        .open()
+        .await
+        .expect("open db")
 }
 
 async fn open_json_table(

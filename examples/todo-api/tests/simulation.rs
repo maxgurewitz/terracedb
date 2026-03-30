@@ -1,10 +1,10 @@
 use std::{error::Error as StdError, sync::Arc, time::Duration};
 
 use axum::http::{Method, StatusCode};
-use terracedb::{Db, DbDependencies, DeterministicRng, SimulatedFileSystem};
+use terracedb::{DeterministicRng, SimulatedFileSystem};
 use terracedb_example_todo_api::{
     CreateTodoRequest, MILLIS_PER_DAY, PlannerSchedule, TODO_SERVER_PORT, TodoApp, TodoAppOptions,
-    TodoRecord, TodoStatus, UpdateTodoRequest, todo_db_config,
+    TodoRecord, TodoStatus, UpdateTodoRequest, todo_db_builder,
 };
 use terracedb_http::{SimulatedHttpClient, axum_router_server_with_shutdown};
 use terracedb_simulation::{
@@ -39,20 +39,17 @@ fn todo_server_host(
         let shutdown = shutdown.clone();
         async move {
             let clock = Arc::new(TurmoilClock);
-            let db = Db::open(
-                todo_db_config(path, prefix),
-                DbDependencies::new(
-                    Arc::new(SimulatedFileSystem::default()),
-                    Arc::new(NetworkObjectStore::new(
-                        OBJECT_STORE_HOST,
-                        OBJECT_STORE_PORT,
-                    )),
-                    clock.clone(),
-                    Arc::new(DeterministicRng::seeded(seed)),
-                ),
-            )
-            .await
-            .map_err(boxed_error)?;
+            let db = todo_db_builder(path, prefix)
+                .file_system(Arc::new(SimulatedFileSystem::default()))
+                .object_store(Arc::new(NetworkObjectStore::new(
+                    OBJECT_STORE_HOST,
+                    OBJECT_STORE_PORT,
+                )))
+                .clock(clock.clone())
+                .rng(Arc::new(DeterministicRng::seeded(seed)))
+                .open()
+                .await
+                .map_err(boxed_error)?;
             let app = TodoApp::open_with_options(db, clock, TodoAppOptions { planner_schedule })
                 .await
                 .map_err(boxed_error)?;

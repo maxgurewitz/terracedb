@@ -14,10 +14,9 @@ use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
 
 use terracedb::{
-    Clock, CommitError, CompactionStrategy, CreateTableError, Db, DbConfig, OpenError, S3Location,
-    ScanOptions, StorageConfig, StorageError, Table, TableConfig, TableFormat,
+    Clock, CommitError, CompactionStrategy, CreateTableError, Db, DbBuilder, DbConfig, DbSettings,
+    OpenError, S3Location, ScanOptions, StorageError, Table, TableConfig, TableFormat,
     TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction, TransactionCommitError,
-    Value,
 };
 use terracedb_projections::{
     ProjectionContext, ProjectionError, ProjectionHandle, ProjectionHandler,
@@ -483,19 +482,27 @@ impl TodoAppState {
     }
 }
 
+pub fn todo_db_settings(path: &str, prefix: &str) -> DbSettings {
+    DbSettings::tiered_storage(TieredStorageConfig {
+        ssd: terracedb::SsdConfig {
+            path: path.to_string(),
+        },
+        s3: S3Location {
+            bucket: "terracedb-example-todo-api".to_string(),
+            prefix: prefix.to_string(),
+        },
+        max_local_bytes: 1024 * 1024,
+        durability: TieredDurabilityMode::GroupCommit,
+    })
+}
+
+pub fn todo_db_builder(path: &str, prefix: &str) -> DbBuilder {
+    Db::builder().settings(todo_db_settings(path, prefix))
+}
+
 pub fn todo_db_config(path: &str, prefix: &str) -> DbConfig {
     DbConfig {
-        storage: StorageConfig::Tiered(TieredStorageConfig {
-            ssd: terracedb::SsdConfig {
-                path: path.to_string(),
-            },
-            s3: S3Location {
-                bucket: "terracedb-example-todo-api".to_string(),
-                prefix: prefix.to_string(),
-            },
-            max_local_bytes: 1024 * 1024,
-            durability: TieredDurabilityMode::GroupCommit,
-        }),
+        storage: todo_db_settings(path, prefix).into_storage(),
         scheduler: None,
     }
 }
@@ -560,18 +567,6 @@ async fn collect_todos(
         todos.push(todo);
     }
     todos
-}
-
-fn decode_json_value<T>(value: &Value, context: &str) -> Result<T, TodoAppError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    match value {
-        Value::Bytes(bytes) => Ok(serde_json::from_slice(bytes)?),
-        Value::Record(_) => Err(TodoAppError::Io(std::io::Error::other(format!(
-            "{context} must use byte encoding"
-        )))),
-    }
 }
 
 fn sort_recent_todos(todos: &mut [TodoRecord]) {

@@ -1,7 +1,7 @@
 use std::{env, sync::Arc};
 
-use terracedb::{Db, DbDependencies, LocalDirObjectStore, SystemClock, SystemRng, TokioFileSystem};
-use terracedb_example_todo_api::{TodoApp, todo_db_config};
+use terracedb::SystemClock;
+use terracedb_example_todo_api::{TodoApp, todo_db_builder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,16 +10,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ssd_path = format!("{data_root}/ssd");
     let object_store_root = format!("{data_root}/object-store");
     let clock = Arc::new(SystemClock);
-    let db = Db::open(
-        todo_db_config(&ssd_path, "todo-api"),
-        DbDependencies::new(
-            Arc::new(TokioFileSystem::new()),
-            Arc::new(LocalDirObjectStore::new(object_store_root)),
-            clock.clone(),
-            Arc::new(SystemRng::default()),
-        ),
-    )
-    .await?;
+    let db = todo_db_builder(&ssd_path, "todo-api")
+        .local_object_store(object_store_root)
+        .clock(clock.clone())
+        .open()
+        .await?;
     let app = TodoApp::open(db, clock).await?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let router = app.router();

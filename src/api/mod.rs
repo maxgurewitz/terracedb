@@ -103,6 +103,7 @@ include!("operations.rs");
 include!("watermark.rs");
 include!("internals.rs");
 include!("memtable.rs");
+include!("builder.rs");
 include!("db_open.rs");
 include!("sstable_io.rs");
 include!("maintenance.rs");
