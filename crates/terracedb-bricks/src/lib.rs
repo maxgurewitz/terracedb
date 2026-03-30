@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod catalog;
 pub mod collection;
 pub mod error;
 pub mod ids;
@@ -9,6 +10,7 @@ pub use activity::{
     BlobActivityEntry, BlobActivityKind, BlobActivityOptions, BlobActivityReceiver,
     BlobActivityStream,
 };
+pub use catalog::TerracedbBlobCollection;
 pub use collection::{
     BLOB_COLLECTION_SEMANTICS, BlobCollection, BlobCollectionConfig, BlobDeleteSemantics,
     BlobHandle, BlobIndexDurability, BlobIndexState, BlobLibraryConfig, BlobLocator, BlobMetadata,

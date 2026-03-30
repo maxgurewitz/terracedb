@@ -4,7 +4,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use terracedb::{LogCursor, SequenceNumber, SubscriptionClosed, Timestamp};
+use terracedb::{LogCursor, SequenceNumber, SubscriptionClosed, Timestamp, WatermarkReceiver};
 
 use crate::{BlobActivityId, BlobAlias, BlobId, JsonValue};
 
@@ -45,28 +45,57 @@ pub enum BlobActivityKind {
 
 #[derive(Debug)]
 pub struct BlobActivityReceiver {
-    inner: watch::Receiver<SequenceNumber>,
+    inner: BlobActivityReceiverInner,
+}
+
+#[derive(Debug)]
+enum BlobActivityReceiverInner {
+    Watch(watch::Receiver<SequenceNumber>),
+    Watermark(WatermarkReceiver),
 }
 
 impl BlobActivityReceiver {
     pub(crate) fn new(inner: watch::Receiver<SequenceNumber>) -> Self {
-        Self { inner }
+        Self {
+            inner: BlobActivityReceiverInner::Watch(inner),
+        }
+    }
+
+    pub(crate) fn from_watermark(inner: WatermarkReceiver) -> Self {
+        Self {
+            inner: BlobActivityReceiverInner::Watermark(inner),
+        }
     }
 
     pub fn current(&self) -> SequenceNumber {
-        *self.inner.borrow()
+        match &self.inner {
+            BlobActivityReceiverInner::Watch(inner) => *inner.borrow(),
+            BlobActivityReceiverInner::Watermark(inner) => inner.current(),
+        }
     }
 
     pub async fn changed(&mut self) -> Result<SequenceNumber, SubscriptionClosed> {
-        self.inner.changed().await.map_err(|_| SubscriptionClosed)?;
-        Ok(*self.inner.borrow_and_update())
+        match &mut self.inner {
+            BlobActivityReceiverInner::Watch(inner) => {
+                inner.changed().await.map_err(|_| SubscriptionClosed)?;
+                Ok(*inner.borrow_and_update())
+            }
+            BlobActivityReceiverInner::Watermark(inner) => inner.changed().await,
+        }
     }
 }
 
 impl Clone for BlobActivityReceiver {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            inner: match &self.inner {
+                BlobActivityReceiverInner::Watch(inner) => {
+                    BlobActivityReceiverInner::Watch(inner.clone())
+                }
+                BlobActivityReceiverInner::Watermark(inner) => {
+                    BlobActivityReceiverInner::Watermark(inner.clone())
+                }
+            },
         }
     }
 }
