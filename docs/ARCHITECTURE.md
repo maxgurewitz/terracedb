@@ -1838,6 +1838,37 @@ Given the same seed, the simulation produces exactly the same execution trace â€
 
 A **meta-test** in CI reruns the same seed and compares TRACE-level logs between runs. If logs differ, there is an uncontrolled source of non-determinism.
 
+
+### Reusable Simulation Framework for Terracedb Applications
+
+The deterministic simulation substrate should be available as a supported crate for Terracedb-based applications, not only as internal engine test code. The goal is that a user can stand up `DB`, the projection library, and the workflow library inside the same seeded, crashable, fault-injectable harness and test application logic with the same replay guarantees the engine uses.
+
+`turmoil-determinism` remains the **lowest layer only**: seeded turmoil builder configuration plus small time/random helpers. It should stay generic and minimal. The broader Terracedb testing framework belongs in a separate crate layered above it (for example `terracedb-simulation`) rather than expanding `turmoil-determinism` until it accumulates Terracedb-specific DB/process/oracle concepts.
+
+That higher-level crate should expose stable **application-facing** building blocks:
+
+- seeded simulation runner + context,
+- simulated Terracedb dependencies (`FileSystem`, `ObjectStore`, `Clock`, `Rng`),
+- trace capture, seed replay, scheduled fault injection, and crash/restart helpers,
+- extension points for application-defined workloads, invariants, and shadow oracles, and
+- convenience adapters for opening/restarting a DB and optional projection/workflow runtimes inside one simulated process.
+
+Engine-internal workload generators and oracles (for example DB-specific mutation DSLs or the core engine shadow oracle) may live on top of that crate, but they should not define its public surface. Application tests should not need to import engine-internal scenario types just to drive a workflow or projection under simulation.
+
+```typescript
+await TerracedbSimulation.run({ seed }, async (sim) => {
+  const db = await sim.openDb(dbConfig)
+  const projections = await ProjectionRuntime.open(db)
+  const workflows = await WorkflowRuntime.open(db, defs)
+
+  await app.drive(sim, { db, projections, workflows })
+  await sim.crashAndRestart()
+  await app.assertInvariants(sim, { db, projections, workflows })
+})
+```
+
+The same framework should also support simulated external hosts (for callback endpoints, message sinks, or other side-effect targets) so workflow/outbox tests exercise real retry, timeout, partition, and duplicate-delivery behavior under turmoil rather than relying on ad hoc mocks. `terracedb-projections` and the workflow library should use this shared crate for their own deterministic tests so Terracedb exposes one consistent testing story from core engine through end-user applications.
+
 ---
 
 # Part 2: Composition Patterns

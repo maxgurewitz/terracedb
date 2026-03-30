@@ -50,7 +50,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 3** adds unified-log change capture semantics.
 - **Phase 4** adds remote storage modes and disaster recovery.
 - **Phase 5** adds columnar tables.
-- **Phase 6** builds composition helpers, projections, and workflows.
+- **Phase 6** builds composition helpers, projections, workflows, and application-facing simulation harnesses.
 - **Phase 7** expands deterministic simulation to the full stack.
 
 ## Parallel tracks
@@ -62,14 +62,14 @@ Once Phase 0 is complete, the work naturally splits into seven mostly independen
 - **Track C — change capture:** T17 → T18 → T19
 - **Track D — remote storage:** T20 → T21 / T22 / T23
 - **Track E — columnar:** T24 → T25 → T26 → T27
-- **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T31 depends on T30, and T32 depends on T18/T19/T28/T29
-- **Track G — full-stack hardening:** T33
+- **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T31 depends on T30, T32 depends on T18/T19/T28/T29, and T32a depends on T03a/T31/T32
+- **Track G — full-stack hardening:** T33 after T32a
 
 ---
 
 ## Phase 0 — Stable contracts and deterministic substrate
 
-**Parallelization:** T01 first. After that, T02 and T03 can proceed in parallel, with T03 consuming the abstractions established by T02.
+**Parallelization:** T01 first. After that, T02 and T03 can proceed in parallel, with T03 consuming the abstractions established by T02. T03a can follow once the substrate exists.
 
 ### T01. Freeze engine contracts and module seams
 
@@ -148,9 +148,38 @@ Build the deterministic substrate that every later task will extend. This task e
 
 **Verification**
 
+
 - Reproducibility test: same seed under turmoil produces the same workload, fault schedule, and trace.
 - Variance test: different seeds change at least one part of workload shape or execution order.
 - Crash/restart simulation of an empty or stub DB to prove the harness itself is stable before engine logic is added.
+
+---
+
+### T03a. Extract a reusable deterministic simulation framework crate
+
+**Depends on:** T03
+
+**Description**
+
+Package the reusable parts of the deterministic simulation substrate as a dedicated crate (for example `terracedb-simulation`) layered above `turmoil-determinism`. The goal is to let Terracedb consumers test application code against the real DB / projection / workflow runtimes under seeded replay, crash/restart, and fault injection without depending on engine-internal scenario types.
+
+**Implementation steps**
+
+1. Define the crate boundary between:
+   - `turmoil-determinism` as the low-level seed/time/random helper layer,
+   - the reusable Terracedb application simulation framework, and
+   - engine-specific workload generators / oracles that remain layered on top.
+2. Move or wrap the stable reusable pieces of the current simulation substrate: seeded runner, simulation context, trace capture, scheduled faults, crash/restart helpers, simulated dependency construction, and turmoil object-store host wiring.
+3. Provide application-facing extension points for user-defined workload drivers, invariants, and shadow oracles instead of exposing only engine-specific `Db*` scenario types.
+4. Decide the re-export policy from `terracedb` itself. Convenience re-exports are acceptable, but the dedicated crate should be the authoritative home of the framework API.
+5. Add end-user-facing examples/docs for opening and restarting a DB under simulation and for injecting deterministic failures.
+
+**Verification**
+
+- Existing engine deterministic tests continue to pass through the extracted crate surface.
+- Same seed still reproduces the same workload, fault schedule, and trace after the extraction.
+- An integration test can drive a DB under the new crate without importing engine-internal scenario or oracle types.
+- `turmoil-determinism` remains small and generic rather than gaining Terracedb-specific runtime APIs.
 
 ---
 
@@ -781,7 +810,7 @@ Complete columnar support by integrating it with compaction, merge operators, an
 
 ## Phase 6 — Composition primitives and higher-level libraries
 
-**Parallelization:** T28, T29, and T30 can begin independently once their own engine dependencies are met. T31 depends on T30. T32 depends on T18, T19, T28, and T29.
+**Parallelization:** T28, T29, and T30 can begin independently once their own engine dependencies are met. T31 depends on T30. T32 depends on T18, T19, T28, and T29. T32a depends on T03a, T31, and T32.
 
 ### T28. OCC transaction wrapper
 
@@ -918,15 +947,41 @@ Implement the workflow runtime: durable trigger admission, per-instance trigger 
 - Duplicate-trigger tests for timers and callbacks proving state-guarded/idempotent handlers remain correct.
 - Recovery tests proving source cursors, inbox state, timer state, outbox state, and workflow state resume from durable data only.
 
+
+---
+
+### T32a. Adopt the reusable simulation framework across projections, workflows, and application tests
+
+**Depends on:** T03a, T31, T32
+
+**Description**
+
+Build the application-facing Terracedb harnesses on top of the shared simulation crate and use them in the projection and workflow libraries themselves. This task makes the reusable framework real for consumers: a Terracedb-based application should be able to stand up DB + projections + workflows inside one deterministic simulation and assert its own invariants across crashes and injected faults.
+
+**Implementation steps**
+
+1. Add harness adapters/builders for opening, shutting down, and restarting a DB together with projection and workflow runtimes inside the shared simulation context.
+2. Add helpers for simulated external services so workflow/outbox/callback tests can exercise retries, partitions, timeouts, and duplicate delivery against real hosts under turmoil.
+3. Migrate the projection library's deterministic tests and the workflow library's deterministic tests to the shared framework instead of bespoke per-crate harness code.
+4. Add at least one example consumer-style test that runs application code on top of Terracedb under the shared harness, with an application-defined oracle/invariant set.
+5. Ensure failure output includes the seed, trace, injected faults, and enough app/runtime checkpoint metadata to reproduce issues.
+
+**Verification**
+
+- `terracedb-projections` and the workflow library run their deterministic suites through the shared framework.
+- Example application-level tests reproduce the same crash/restart and side-effect behavior from a seed.
+- Same-seed reruns produce identical traces/results across DB + projection/workflow + application code.
+- A consumer does not need direct access to engine-internal workload DSLs or oracles to write deterministic Terracedb application tests.
+
 ---
 
 ## Phase 7 — Full-stack deterministic hardening
 
-**Parallelization:** This final phase should begin only after the main engine, projection, and workflow surfaces exist.
+**Parallelization:** This final phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist.
 
 ### T33. Full-stack randomized scenario generation and invariant suites
 
-**Depends on:** T03, T16, T19, T22, T23, T27, T31, T32
+**Depends on:** T03, T03a, T16, T19, T22, T23, T27, T31, T32, T32a
 
 **Description**
 
@@ -1025,14 +1080,15 @@ At this point the system should additionally support:
 - schema evolution/compaction for columnar data.
 
 ### Milestone E — Libraries
-Complete: T28–T32
+Complete: T28–T32a
 
 At this point the system should additionally support:
 - OCC transaction helpers,
 - durable timers,
 - transactional outbox,
-- durable projections, and
-- durable workflows.
+- durable projections,
+- durable workflows, and
+- a reusable deterministic simulation harness for Terracedb-based applications.
 
 ### Milestone F — Full correctness bar
 Complete: T33
