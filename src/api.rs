@@ -11191,15 +11191,11 @@ mod tests {
     }
 
     fn assert_change_feed_storage_error(
-        error: ChangeFeedError,
+        error: StorageError,
         expected_kind: StorageErrorKind,
     ) -> StorageError {
-        let storage = error
-            .storage()
-            .cloned()
-            .expect("expected change-feed storage error");
-        assert_eq!(storage.kind(), expected_kind);
-        storage
+        assert_eq!(error.kind(), expected_kind);
+        error
     }
 
     fn oracle_rows(
@@ -19360,22 +19356,28 @@ mod tests {
             FileSystemFailure::timeout(FileSystemOperation::ReadAt, segment_path).persistent(),
         );
 
-        let visible_error = match db
+        let mut visible = db
             .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("visible change-feed scan should surface the read failure"),
+            .expect("visible change-feed scan should open");
+        let visible_error = match visible.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("visible change-feed scan should surface the read failure")
+            }
             Err(error) => error,
         };
         let visible_storage =
             assert_change_feed_storage_error(visible_error, StorageErrorKind::Timeout);
         assert!(visible_storage.message().contains("simulated timeout"));
 
-        let durable_error = match db
+        let mut durable = db
             .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("durable change-feed scan should surface the read failure"),
+            .expect("durable change-feed scan should open");
+        let durable_error = match durable.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("durable change-feed scan should surface the read failure")
+            }
             Err(error) => error,
         };
         assert_change_feed_storage_error(durable_error, StorageErrorKind::Timeout);
@@ -19413,20 +19415,22 @@ mod tests {
             .persistent(),
         );
 
-        let visible_error = match db
+        let mut visible = db
             .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("visible scan should surface the remote read failure"),
+            .expect("visible scan should open");
+        let visible_error = match visible.try_next().await {
+            Ok(Some(_)) | Ok(None) => panic!("visible scan should surface the remote read failure"),
             Err(error) => error,
         };
         assert_change_feed_storage_error(visible_error, StorageErrorKind::Timeout);
 
-        let durable_error = match db
+        let mut durable = db
             .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("durable scan should surface the remote read failure"),
+            .expect("durable scan should open");
+        let durable_error = match durable.try_next().await {
+            Ok(Some(_)) | Ok(None) => panic!("durable scan should surface the remote read failure"),
             Err(error) => error,
         };
         assert_change_feed_storage_error(durable_error, StorageErrorKind::Timeout);
@@ -19457,11 +19461,12 @@ mod tests {
         corrupted[0] ^= 0x7f;
         overwrite_file(file_system.as_ref(), &segment_path, &corrupted).await;
 
-        let visible_error = match db
+        let mut visible = db
             .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("visible scan should fail closed on corruption"),
+            .expect("visible scan should open");
+        let visible_error = match visible.try_next().await {
+            Ok(Some(_)) | Ok(None) => panic!("visible scan should fail closed on corruption"),
             Err(error) => error,
         };
         let visible_storage =
@@ -19471,11 +19476,12 @@ mod tests {
                 || visible_storage.message().contains("checksum")
         );
 
-        let durable_error = match db
+        let mut durable = db
             .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("durable scan should fail closed on corruption"),
+            .expect("durable scan should open");
+        let durable_error = match durable.try_next().await {
+            Ok(Some(_)) | Ok(None) => panic!("durable scan should fail closed on corruption"),
             Err(error) => error,
         };
         assert_change_feed_storage_error(durable_error, StorageErrorKind::Corruption);

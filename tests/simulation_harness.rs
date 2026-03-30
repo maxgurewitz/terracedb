@@ -37,11 +37,10 @@ fn bytes(payload: &str) -> Value {
 }
 
 fn assert_change_feed_storage_kind(
-    error: terracedb::ChangeFeedError,
+    error: terracedb::StorageError,
     expected_kind: StorageErrorKind,
 ) {
-    let storage = error.storage().expect("expected change-feed storage error");
-    assert_eq!(storage.kind(), expected_kind);
+    assert_eq!(error.kind(), expected_kind);
 }
 
 #[derive(Default)]
@@ -993,20 +992,26 @@ fn db_change_feed_simulation_surfaces_structured_local_scan_failures() -> turmoi
             .persistent(),
         );
 
-        let visible_error = match db
+        let mut visible = db
             .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("visible scan should surface the injected local corruption"),
+            .expect("visible scan should open");
+        let visible_error = match visible.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("visible scan should surface the injected local corruption")
+            }
             Err(error) => error,
         };
         assert_change_feed_storage_kind(visible_error, StorageErrorKind::Corruption);
 
-        let durable_error = match db
+        let mut durable = db
             .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("durable scan should surface the injected local corruption"),
+            .expect("durable scan should open");
+        let durable_error = match durable.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("durable scan should surface the injected local corruption")
+            }
             Err(error) => error,
         };
         assert_change_feed_storage_kind(durable_error, StorageErrorKind::Corruption);
@@ -1039,11 +1044,14 @@ fn s3_primary_change_feed_simulation_surfaces_structured_remote_scan_failures() 
             })
             .await?;
 
-        let visible_error = match db
+        let mut visible = db
             .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("visible scan should surface the injected remote timeout"),
+            .expect("visible scan should open");
+        let visible_error = match visible.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("visible scan should surface the injected remote timeout")
+            }
             Err(error) => error,
         };
         assert_change_feed_storage_kind(visible_error, StorageErrorKind::Timeout);
@@ -1056,11 +1064,14 @@ fn s3_primary_change_feed_simulation_surfaces_structured_remote_scan_failures() 
             })
             .await?;
 
-        let durable_error = match db
+        let mut durable = db
             .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
             .await
-        {
-            Ok(_) => panic!("durable scan should surface the injected remote timeout"),
+            .expect("durable scan should open");
+        let durable_error = match durable.try_next().await {
+            Ok(Some(_)) | Ok(None) => {
+                panic!("durable scan should surface the injected remote timeout")
+            }
             Err(error) => error,
         };
         assert_change_feed_storage_kind(durable_error, StorageErrorKind::Timeout);

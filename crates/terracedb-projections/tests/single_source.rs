@@ -6,9 +6,9 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    ChangeFeedError, CommitOptions, Db, FileSystemFailure, FileSystemOperation, KvStream,
-    LogCursor, ScanOptions, SequenceNumber, StorageErrorKind, StubFileSystem, StubObjectStore,
-    Table, TieredDurabilityMode, Value,
+    CommitOptions, Db, FileSystemFailure, FileSystemOperation, KvStream, LogCursor, ScanOptions,
+    SequenceNumber, StorageErrorKind, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
+    Value,
     test_support::{bytes as test_bytes, row_table_config, test_dependencies, tiered_test_config},
 };
 use terracedb_projections::{
@@ -502,7 +502,7 @@ async fn projection_runtime_surfaces_typed_change_feed_storage_errors() {
         .await
         .expect_err("projection should fail on the injected change-feed error");
     match error {
-        ProjectionError::ChangeFeed(ChangeFeedError::Storage(storage)) => {
+        ProjectionError::Storage(storage) => {
             assert_eq!(storage.kind(), StorageErrorKind::Timeout);
         }
         other => panic!("expected typed projection change-feed failure, got {other:?}"),

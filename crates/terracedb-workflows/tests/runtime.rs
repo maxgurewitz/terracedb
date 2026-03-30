@@ -6,9 +6,8 @@ use std::{
 
 use async_trait::async_trait;
 use terracedb::{
-    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
-    StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
-    Value,
+    Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry, StorageErrorKind,
+    StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode, Value,
     test_support::{
         row_table_config, test_dependencies, test_dependencies_with_clock,
         tiered_test_config_with_durability,
@@ -258,7 +257,7 @@ async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
         .await
         .expect_err("workflow runtime should fail on change-feed scan");
     match error {
-        WorkflowError::ChangeFeed(ChangeFeedError::Storage(storage)) => {
+        WorkflowError::Storage(storage) => {
             assert_eq!(storage.kind(), StorageErrorKind::Timeout);
         }
         other => panic!("expected typed workflow change-feed failure, got {other:?}"),
