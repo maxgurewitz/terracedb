@@ -121,6 +121,33 @@ impl SchemaDefinition {
             }
         }
 
+        for (&field_id, next_field) in &next.fields_by_id {
+            if current.fields_by_id.contains_key(&field_id) {
+                continue;
+            }
+            if !next_field.nullable && next_field.default.is_none() {
+                return Err(StorageError::unsupported(format!(
+                    "new field {} ({}) must be nullable or define a default for lazy schema evolution",
+                    field_id.get(),
+                    next_field.name
+                )));
+            }
+        }
+
+        for (name, &current_field_id) in &current.field_ids_by_name {
+            let Some(&next_field_id) = next.field_ids_by_name.get(name) else {
+                continue;
+            };
+            if next_field_id != current_field_id {
+                return Err(StorageError::unsupported(format!(
+                    "field name {} changes id from {} to {}; renames must preserve field ids",
+                    name,
+                    current_field_id.get(),
+                    next_field_id.get()
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -129,6 +156,13 @@ impl SchemaDefinition {
         record: &ColumnarRecord,
     ) -> Result<ColumnarRecord, StorageError> {
         SchemaValidation::new(self)?.normalize_record(record)
+    }
+
+    pub fn normalize_merge_operand(
+        &self,
+        record: &ColumnarRecord,
+    ) -> Result<ColumnarRecord, StorageError> {
+        SchemaValidation::new(self)?.normalize_merge_operand(record)
     }
 
     pub fn record_from_names<I, S>(&self, fields: I) -> Result<ColumnarRecord, StorageError>
@@ -238,6 +272,30 @@ impl<'a> SchemaValidation<'a> {
         Ok(normalized)
     }
 
+    fn normalize_merge_operand(
+        &self,
+        record: &ColumnarRecord,
+    ) -> Result<ColumnarRecord, StorageError> {
+        for (&field_id, value) in record {
+            let field = self.fields_by_id.get(&field_id).ok_or_else(|| {
+                StorageError::unsupported(format!(
+                    "record contains unknown field id {}",
+                    field_id.get()
+                ))
+            })?;
+            validate_merge_operand_value_against_definition(field, value, "merge operand value")?;
+        }
+
+        let mut normalized = BTreeMap::new();
+        for field in &self.schema.fields {
+            let value = record.get(&field.id).cloned().unwrap_or(FieldValue::Null);
+            validate_merge_operand_value_against_definition(field, &value, "merge operand value")?;
+            normalized.insert(field.id, value);
+        }
+
+        Ok(normalized)
+    }
+
     fn record_from_names<I, S>(&self, fields: I) -> Result<ColumnarRecord, StorageError>
     where
         I: IntoIterator<Item = (S, FieldValue)>,
@@ -305,6 +363,18 @@ fn validate_field_value_against_definition(
             field.field_type.as_str()
         )))
     }
+}
+
+fn validate_merge_operand_value_against_definition(
+    field: &FieldDefinition,
+    value: &FieldValue,
+    context: &str,
+) -> Result<(), StorageError> {
+    if matches!(value, FieldValue::Null) {
+        return Ok(());
+    }
+
+    validate_field_value_against_definition(field, value, context)
 }
 
 fn field_value_matches_type(field_type: FieldType, value: &FieldValue) -> bool {
@@ -2241,11 +2311,22 @@ impl ResidentRowSstable {
 
         let mut materialized = BTreeMap::new();
         for &row_index in row_indexes {
+            let row_kind = Db::normalized_columnar_row_kind(
+                location,
+                row_index,
+                metadata.tombstones[row_index],
+                metadata.row_kinds[row_index],
+            )?;
+            if row_kind == ChangeKind::Delete {
+                return Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} delete row {row_index} was requested for materialization",
+                )));
+            }
             let mut record = ColumnarRecord::new();
             for field in &projection.fields {
                 let value = match values_by_field.get(&field.id) {
                     Some(values) => values[row_index].clone(),
-                    None => missing_field_value_for_definition(field)?,
+                    None => Db::missing_columnar_projection_value(field, row_kind)?,
                 };
                 record.insert(field.id, value);
             }
@@ -2843,17 +2924,6 @@ impl Db {
                         error.message()
                     ))
                 })?;
-                if config.merge_operator.is_some() {
-                    return Err(CreateTableError::InvalidConfig(
-                        "columnar tables do not support merge operators in v1".to_string(),
-                    ));
-                }
-                if config.max_merge_operand_chain_length.is_some() {
-                    return Err(CreateTableError::InvalidConfig(
-                        "columnar tables do not support max_merge_operand_chain_length in v1"
-                            .to_string(),
-                    ));
-                }
             }
         }
 
@@ -2892,6 +2962,38 @@ impl Db {
                 })?;
                 match value {
                     Value::Record(record) => Ok(Value::Record(schema.normalize_record(record)?)),
+                    Value::Bytes(_) => Err(StorageError::unsupported(format!(
+                        "columnar table {} requires structured record values",
+                        stored.config.name
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn normalize_merge_operand_for_table(
+        stored: &StoredTable,
+        value: &Value,
+    ) -> Result<Value, StorageError> {
+        match stored.config.format {
+            TableFormat::Row => match value {
+                Value::Bytes(_) => Ok(value.clone()),
+                Value::Record(_) => Err(StorageError::unsupported(format!(
+                    "row table {} only accepts byte values",
+                    stored.config.name
+                ))),
+            },
+            TableFormat::Columnar => {
+                let schema = stored.config.schema.as_ref().ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "columnar table {} is missing a schema",
+                        stored.config.name
+                    ))
+                })?;
+                match value {
+                    Value::Record(record) => {
+                        Ok(Value::Record(schema.normalize_merge_operand(record)?))
+                    }
                     Value::Bytes(_) => Err(StorageError::unsupported(format!(
                         "columnar table {} requires structured record values",
                         stored.config.name
@@ -4589,7 +4691,23 @@ impl Db {
                 field.name
             ))
         })?;
-        validate_field_value_against_definition(field, field_value, "columnar row value")?;
+        match row.kind {
+            ChangeKind::Put => {
+                validate_field_value_against_definition(field, field_value, "columnar row value")?;
+            }
+            ChangeKind::Merge => {
+                validate_merge_operand_value_against_definition(
+                    field,
+                    field_value,
+                    "columnar merge operand value",
+                )?;
+            }
+            ChangeKind::Delete => {
+                return Err(StorageError::corruption(
+                    "columnar tombstone row unexpectedly reached field extraction",
+                ));
+            }
+        }
 
         if matches!(field_value, FieldValue::Null) {
             Ok(None)
@@ -5488,10 +5606,6 @@ impl Db {
         table: &StoredTable,
         live: &[ResidentRowSstable],
     ) -> TableCompactionState {
-        if table.config.format != TableFormat::Row {
-            return TableCompactionState::default();
-        }
-
         match table.config.compaction_strategy {
             CompactionStrategy::Leveled => Self::leveled_compaction_state(table, live),
             CompactionStrategy::Tiered => Self::tiered_compaction_state(table, live),
@@ -6142,13 +6256,100 @@ impl Db {
         retained
     }
 
-    fn rewrite_compaction_rows(
+    async fn load_compaction_input_rows(
+        &self,
+        table: &StoredTable,
+        inputs: &[ResidentRowSstable],
+    ) -> Result<Vec<CompactionRow>, StorageError> {
+        let projection = match table.config.format {
+            TableFormat::Row => None,
+            TableFormat::Columnar => {
+                Some(Self::resolve_scan_projection(table, None)?.ok_or_else(|| {
+                    StorageError::corruption("columnar table is missing a schema")
+                })?)
+            }
+        };
+        let mut rows = Vec::new();
+
+        for sstable in inputs {
+            if !sstable.is_columnar() {
+                rows.extend(sstable.rows.iter().cloned().map(|row| CompactionRow {
+                    level: sstable.meta.level,
+                    row,
+                }));
+                continue;
+            }
+
+            let projection = projection.as_ref().ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "row table {} unexpectedly references a columnar SSTable",
+                    table.config.name
+                ))
+            })?;
+            let metadata = sstable
+                .load_columnar_metadata(&self.inner.dependencies)
+                .await?;
+            let location = sstable.meta.storage_descriptor();
+            let mut row_kinds = Vec::with_capacity(metadata.key_index.len());
+            let mut row_indexes = BTreeSet::new();
+            for row_index in 0..metadata.key_index.len() {
+                let kind = Self::normalized_columnar_row_kind(
+                    location,
+                    row_index,
+                    metadata.tombstones[row_index],
+                    metadata.row_kinds[row_index],
+                )?;
+                row_kinds.push(kind);
+                if kind != ChangeKind::Delete {
+                    row_indexes.insert(row_index);
+                }
+            }
+            let values = sstable
+                .materialize_columnar_rows(&self.inner.dependencies, projection, &row_indexes)
+                .await?;
+
+            for (row_index, kind) in row_kinds.iter().copied().enumerate() {
+                let value = if kind == ChangeKind::Delete {
+                    None
+                } else {
+                    Some(values.get(&row_index).cloned().ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "columnar SSTable {} row {} was not materialized for compaction",
+                            location, row_index
+                        ))
+                    })?)
+                };
+                rows.push(CompactionRow {
+                    level: sstable.meta.level,
+                    row: SstableRow {
+                        key: metadata.key_index[row_index].clone(),
+                        sequence: metadata.sequences[row_index],
+                        kind,
+                        value,
+                    },
+                });
+            }
+        }
+
+        Ok(rows)
+    }
+
+    async fn rewrite_compaction_rows(
+        &self,
         tables: &BTreeMap<String, StoredTable>,
         memtables: &MemtableState,
         sstables: &SstableState,
-        table_id: TableId,
+        table: &StoredTable,
         rows: Vec<CompactionRow>,
     ) -> Result<Vec<CompactionRow>, StorageError> {
+        let columnar_projection =
+            if table.config.format == TableFormat::Columnar {
+                Some(Self::resolve_scan_projection(table, None)?.ok_or_else(|| {
+                    StorageError::corruption("columnar table is missing a schema")
+                })?)
+            } else {
+                None
+            };
         let mut rewritten = Vec::with_capacity(rows.len());
         for row in rows {
             if row.row.kind != ChangeKind::Merge {
@@ -6156,14 +6357,29 @@ impl Db {
                 continue;
             }
 
-            let resolved = Self::resolve_visible_value_with_state(
-                tables,
-                memtables,
-                sstables,
-                table_id,
-                &row.row.key,
-                row.row.sequence,
-            )?;
+            let resolved = match table.config.format {
+                TableFormat::Row => Self::resolve_visible_value_with_state(
+                    tables,
+                    memtables,
+                    sstables,
+                    table.id,
+                    &row.row.key,
+                    row.row.sequence,
+                )?,
+                TableFormat::Columnar => {
+                    self.resolve_visible_value_columnar_with_state(
+                        table,
+                        memtables,
+                        sstables,
+                        &row.row.key,
+                        row.row.sequence,
+                        columnar_projection
+                            .as_ref()
+                            .expect("columnar projection should exist"),
+                    )
+                    .await?
+                }
+            };
             let value = resolved.value.ok_or_else(|| {
                 StorageError::corruption("merge resolution unexpectedly produced a tombstone")
             })?;
@@ -6244,10 +6460,9 @@ impl Db {
     async fn write_compaction_outputs(
         &self,
         local_root: &str,
-        table_id: TableId,
+        table: &StoredTable,
         level: u32,
         rows: Vec<SstableRow>,
-        bloom_filter_bits_per_key: Option<u32>,
     ) -> Result<Vec<ResidentRowSstable>, StorageError> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -6276,18 +6491,31 @@ impl Db {
                 "SST-{:06}",
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
-            let path = Self::local_sstable_path(local_root, table_id, &local_id);
-            outputs.push(
-                self.write_row_sstable(
-                    &path,
-                    table_id,
-                    level,
-                    local_id,
-                    rows[start..end].to_vec(),
-                    bloom_filter_bits_per_key,
-                )
-                .await?,
-            );
+            let path = Self::local_sstable_path(local_root, table.id, &local_id);
+            let output = match table.config.format {
+                TableFormat::Row => {
+                    self.write_row_sstable(
+                        &path,
+                        table.id,
+                        level,
+                        local_id,
+                        rows[start..end].to_vec(),
+                        table.config.bloom_filter_bits_per_key,
+                    )
+                    .await?
+                }
+                TableFormat::Columnar => {
+                    self.write_columnar_sstable(
+                        &path,
+                        level,
+                        local_id,
+                        table,
+                        rows[start..end].to_vec(),
+                    )
+                    .await?
+                }
+            };
+            outputs.push(output);
             start = end;
         }
 
@@ -6509,25 +6737,13 @@ impl Db {
 
         let filtered = match job.kind {
             CompactionJobKind::Rewrite => {
-                let mut merged_rows = inputs
-                    .iter()
-                    .flat_map(|sstable| {
-                        sstable.rows.iter().cloned().map(move |row| CompactionRow {
-                            level: sstable.meta.level,
-                            row,
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                let mut merged_rows = self.load_compaction_input_rows(&table, &inputs).await?;
                 merged_rows.sort_by_key(|row| {
                     encode_mvcc_key(&row.row.key, CommitId::new(row.row.sequence))
                 });
-                merged_rows = Self::rewrite_compaction_rows(
-                    &tables,
-                    &memtables,
-                    &sstables,
-                    job.table_id,
-                    merged_rows,
-                )?;
+                merged_rows = self
+                    .rewrite_compaction_rows(&tables, &memtables, &sstables, &table, merged_rows)
+                    .await?;
                 merged_rows = Self::retain_rows_within_horizon(
                     merged_rows,
                     self.history_gc_horizon(job.table_id),
@@ -6542,7 +6758,7 @@ impl Db {
                 let outputs = self
                     .write_compaction_outputs(
                         local_root,
-                        job.table_id,
+                        &table,
                         job.target_level,
                         filtered
                             .rows
@@ -6550,7 +6766,6 @@ impl Db {
                             .cloned()
                             .map(|row| row.row)
                             .collect::<Vec<_>>(),
-                        table.config.bloom_filter_bits_per_key,
                     )
                     .await?;
 
@@ -7853,19 +8068,13 @@ impl Db {
                             table.name()
                         )))
                     })?;
-                    if matches!(stored.config.format, TableFormat::Columnar) {
-                        return Err(CommitError::Storage(StorageError::unsupported(format!(
-                            "columnar table {} does not support merge operands in v1",
-                            table.name()
-                        ))));
-                    }
                     if stored.config.merge_operator.is_none() {
                         return Err(CommitError::Storage(StorageError::unsupported(format!(
                             "merge operator is not configured for table {}",
                             table.name()
                         ))));
                     }
-                    let value = Self::normalize_value_for_table(&stored, value)
+                    let value = Self::normalize_merge_operand_for_table(&stored, value)
                         .map_err(CommitError::Storage)?;
                     Ok(ResolvedBatchOperation {
                         table_id: stored.id,
@@ -8144,9 +8353,20 @@ impl Db {
         Ok(Some(ColumnProjection { fields }))
     }
 
+    fn missing_columnar_projection_value(
+        field: &FieldDefinition,
+        kind: ChangeKind,
+    ) -> Result<FieldValue, StorageError> {
+        match kind {
+            ChangeKind::Merge => Ok(FieldValue::Null),
+            ChangeKind::Put | ChangeKind::Delete => missing_field_value_for_definition(field),
+        }
+    }
+
     fn project_columnar_value(
         value: &Value,
         projection: &ColumnProjection,
+        kind: ChangeKind,
     ) -> Result<Value, StorageError> {
         let Value::Record(record) = value else {
             return Err(StorageError::corruption(
@@ -8158,7 +8378,7 @@ impl Db {
         for field in &projection.fields {
             let value = match record.get(&field.id) {
                 Some(value) => value.clone(),
-                None => missing_field_value_for_definition(field)?,
+                None => Self::missing_columnar_projection_value(field, kind)?,
             };
             projected.insert(field.id, value);
         }
@@ -8173,80 +8393,53 @@ impl Db {
         ))
     }
 
-    fn columnar_merge_read_error(table: &StoredTable, key: &[u8]) -> StorageError {
-        StorageError::unsupported(format!(
-            "columnar table {} does not support merge-row reads in v1 (key {:?})",
-            table.config.name, key
-        ))
+    fn materialized_columnar_value(
+        materialized_by_sstable: &BTreeMap<String, BTreeMap<usize, Value>>,
+        row: &ColumnarRowRef,
+    ) -> Result<Value, StorageError> {
+        let values = materialized_by_sstable.get(&row.local_id).ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {} materialization is missing",
+                row.local_id
+            ))
+        })?;
+        values.get(&row.row_index).cloned().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {} row {} was not materialized",
+                row.local_id, row.row_index
+            ))
+        })
     }
 
-    async fn read_visible_value(
+    async fn resolve_visible_value_columnar_with_state(
         &self,
-        table_id: TableId,
+        table: &StoredTable,
+        memtables: &MemtableState,
+        sstables: &SstableState,
         key: &[u8],
         sequence: SequenceNumber,
-    ) -> Result<Option<Value>, StorageError> {
-        let table = Self::stored_table_by_id(&self.tables_read(), table_id)
-            .cloned()
-            .ok_or_else(|| {
-                StorageError::not_found(format!("table id {} is not registered", table_id.get()))
-            })?;
-        if table.config.format == TableFormat::Row {
-            return self.read_visible_value_row(table_id, key, sequence);
-        }
-
-        let projection = Self::resolve_scan_projection(&table, None)?
-            .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
-        let memtables = self.memtables_read().clone();
-        let live = self.sstables_read().live.clone();
-        let current_sequence = self.current_sequence();
-
+        projection: &ColumnProjection,
+    ) -> Result<VisibleValueResolution, StorageError> {
         let mut mem_rows = Vec::new();
-        memtables.collect_visible_rows(table_id, key, sequence, &mut mem_rows);
+        memtables.collect_visible_rows(table.id, key, sequence, &mut mem_rows);
 
         let mut sstables_by_local_id = BTreeMap::new();
         let mut columnar_rows = Vec::new();
-        let mut persisted_version_count = 0_usize;
-        for sstable in live
+        for sstable in sstables
+            .live
             .iter()
-            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
+            .filter(|sstable| sstable.meta.table_id == table.id && sstable.is_columnar())
         {
             sstables_by_local_id.insert(sstable.meta.local_id.clone(), sstable.clone());
-            if sequence < current_sequence {
-                let persisted_rows = sstable
+            columnar_rows.extend(
+                sstable
                     .collect_visible_row_refs_for_key_columnar(
                         &self.inner.dependencies,
                         key,
-                        current_sequence,
+                        sequence,
                     )
-                    .await?;
-                persisted_version_count += persisted_rows.len();
-                columnar_rows.extend(
-                    persisted_rows
-                        .into_iter()
-                        .filter(|row| row.sequence <= sequence),
-                );
-            } else {
-                columnar_rows.extend(
-                    sstable
-                        .collect_visible_row_refs_for_key_columnar(
-                            &self.inner.dependencies,
-                            key,
-                            sequence,
-                        )
-                        .await?,
-                );
-            }
-        }
-
-        if sequence < current_sequence && persisted_version_count > 1 {
-            return Err(Self::columnar_overwritten_history_error(&table, key));
-        }
-        if columnar_rows
-            .iter()
-            .any(|row| row.kind == ChangeKind::Merge)
-        {
-            return Err(Self::columnar_merge_read_error(&table, key));
+                    .await?,
+            );
         }
 
         enum VisibleCandidate {
@@ -8274,19 +8467,39 @@ impl Db {
         });
 
         let Some(head) = candidates.first() else {
-            return Ok(None);
+            return Ok(VisibleValueResolution {
+                value: None,
+                collapse: None,
+            });
+        };
+        let head_sequence = match head {
+            VisibleCandidate::Memtable(row) => row.sequence,
+            VisibleCandidate::Columnar(row) => row.sequence,
         };
 
         match head {
             VisibleCandidate::Memtable(row) => match row.kind {
-                ChangeKind::Put => Ok(Some(Self::project_columnar_value(
-                    row.value
+                ChangeKind::Put => {
+                    let value = row
+                        .value
                         .as_ref()
-                        .ok_or_else(|| StorageError::corruption("put row is missing a value"))?,
-                    &projection,
-                )?)),
-                ChangeKind::Delete => Ok(None),
-                ChangeKind::Merge => Err(Self::columnar_merge_read_error(&table, key)),
+                        .ok_or_else(|| StorageError::corruption("put row is missing a value"))?;
+                    return Ok(VisibleValueResolution {
+                        value: Some(Self::project_columnar_value(
+                            value,
+                            projection,
+                            ChangeKind::Put,
+                        )?),
+                        collapse: None,
+                    });
+                }
+                ChangeKind::Delete => {
+                    return Ok(VisibleValueResolution {
+                        value: None,
+                        collapse: None,
+                    });
+                }
+                ChangeKind::Merge => {}
             },
             VisibleCandidate::Columnar(row) => match row.kind {
                 ChangeKind::Put => {
@@ -8299,16 +8512,199 @@ impl Db {
                     let values = sstable
                         .materialize_columnar_rows(
                             &self.inner.dependencies,
-                            &projection,
+                            projection,
                             &BTreeSet::from([row.row_index]),
                         )
                         .await?;
-                    Ok(values.get(&row.row_index).cloned())
+                    return Ok(VisibleValueResolution {
+                        value: values.get(&row.row_index).cloned(),
+                        collapse: None,
+                    });
                 }
-                ChangeKind::Delete => Ok(None),
-                ChangeKind::Merge => Err(Self::columnar_merge_read_error(&table, key)),
+                ChangeKind::Delete => {
+                    return Ok(VisibleValueResolution {
+                        value: None,
+                        collapse: None,
+                    });
+                }
+                ChangeKind::Merge => {}
             },
         }
+
+        let operator = table.config.merge_operator.as_ref().ok_or_else(|| {
+            StorageError::unsupported(format!(
+                "merge operator is not configured for table {}",
+                table.config.name
+            ))
+        })?;
+        let full_projection = Self::resolve_scan_projection(table, None)?
+            .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
+        let mut needed_by_sstable = BTreeMap::<String, BTreeSet<usize>>::new();
+        for candidate in &candidates {
+            match candidate {
+                VisibleCandidate::Memtable(row) => {
+                    if matches!(row.kind, ChangeKind::Put | ChangeKind::Delete) {
+                        break;
+                    }
+                }
+                VisibleCandidate::Columnar(row) => {
+                    if row.kind != ChangeKind::Delete {
+                        needed_by_sstable
+                            .entry(row.local_id.clone())
+                            .or_default()
+                            .insert(row.row_index);
+                    }
+                    if row.kind != ChangeKind::Merge {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut materialized_by_sstable = BTreeMap::<String, BTreeMap<usize, Value>>::new();
+        for (local_id, row_indexes) in needed_by_sstable {
+            let sstable = sstables_by_local_id.get(&local_id).ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "columnar SSTable {} disappeared during merge resolution",
+                    local_id
+                ))
+            })?;
+            materialized_by_sstable.insert(
+                local_id.clone(),
+                sstable
+                    .materialize_columnar_rows(
+                        &self.inner.dependencies,
+                        &full_projection,
+                        &row_indexes,
+                    )
+                    .await?,
+            );
+        }
+
+        let mut operands = Vec::new();
+        let mut existing_owned = None;
+        for candidate in &candidates {
+            match candidate {
+                VisibleCandidate::Memtable(row) => match row.kind {
+                    ChangeKind::Merge => operands.push(Self::project_columnar_value(
+                        row.value.as_ref().ok_or_else(|| {
+                            StorageError::corruption("merge row is missing an operand value")
+                        })?,
+                        &full_projection,
+                        ChangeKind::Merge,
+                    )?),
+                    ChangeKind::Put => {
+                        existing_owned = Some(Self::project_columnar_value(
+                            row.value.as_ref().ok_or_else(|| {
+                                StorageError::corruption("put row is missing a value")
+                            })?,
+                            &full_projection,
+                            ChangeKind::Put,
+                        )?);
+                        break;
+                    }
+                    ChangeKind::Delete => break,
+                },
+                VisibleCandidate::Columnar(row) => match row.kind {
+                    ChangeKind::Merge => {
+                        operands.push(Self::materialized_columnar_value(
+                            &materialized_by_sstable,
+                            row,
+                        )?);
+                    }
+                    ChangeKind::Put => {
+                        existing_owned = Some(Self::materialized_columnar_value(
+                            &materialized_by_sstable,
+                            row,
+                        )?);
+                        break;
+                    }
+                    ChangeKind::Delete => break,
+                },
+            }
+        }
+
+        operands.reverse();
+        let collapsed = Self::collapse_merge_operands(operator.as_ref(), key, &operands)?;
+        let full_value = Self::normalize_value_for_table(
+            table,
+            &operator.full_merge(key, existing_owned.as_ref(), &collapsed)?,
+        )?;
+        let collapse =
+            (operands.len() > Self::max_merge_operand_chain_length(&table.config)).then(|| {
+                MergeCollapse {
+                    sequence: head_sequence,
+                    value: full_value.clone(),
+                }
+            });
+
+        Ok(VisibleValueResolution {
+            value: Some(Self::project_columnar_value(
+                &full_value,
+                projection,
+                ChangeKind::Put,
+            )?),
+            collapse,
+        })
+    }
+
+    async fn read_visible_value(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<Option<Value>, StorageError> {
+        let table = Self::stored_table_by_id(&self.tables_read(), table_id)
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::not_found(format!("table id {} is not registered", table_id.get()))
+            })?;
+        if table.config.format == TableFormat::Row {
+            return self.read_visible_value_row(table_id, key, sequence);
+        }
+
+        let projection = Self::resolve_scan_projection(&table, None)?
+            .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
+        let memtables = self.memtables_read().clone();
+        let sstables = self.sstables_read().clone();
+        let current_sequence = self.current_sequence();
+
+        let mut persisted_version_count = 0_usize;
+        for sstable in sstables
+            .live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
+        {
+            if sequence < current_sequence {
+                persisted_version_count += sstable
+                    .collect_visible_row_refs_for_key_columnar(
+                        &self.inner.dependencies,
+                        key,
+                        current_sequence,
+                    )
+                    .await?
+                    .len();
+            }
+        }
+
+        if sequence < current_sequence && persisted_version_count > 1 {
+            return Err(Self::columnar_overwritten_history_error(&table, key));
+        }
+        let resolution = self
+            .resolve_visible_value_columnar_with_state(
+                &table,
+                &memtables,
+                &sstables,
+                key,
+                sequence,
+                &projection,
+            )
+            .await?;
+        if let Some(collapse) = resolution.collapse.clone() {
+            self.force_collapse_merge_chain(table_id, key, collapse);
+        }
+
+        Ok(resolution.value)
     }
 
     async fn scan_visible(
@@ -8335,20 +8731,18 @@ impl Db {
         let projection = Self::resolve_scan_projection(&table, opts.columns.as_deref())?
             .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
         let memtables = self.memtables_read().clone();
-        let live = self.sstables_read().live.clone();
+        let sstables = self.sstables_read().clone();
         let current_sequence = self.current_sequence();
 
         let mut keys = BTreeSet::new();
         memtables.collect_matching_keys(table_id, &matcher, &mut keys);
 
-        let mut sstables_by_local_id = BTreeMap::new();
-        let mut columnar_rows_by_key = BTreeMap::<Key, Vec<ColumnarRowRef>>::new();
         let mut persisted_versions_by_key = BTreeMap::<Key, usize>::new();
-        for sstable in live
+        for sstable in sstables
+            .live
             .iter()
             .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
         {
-            sstables_by_local_id.insert(sstable.meta.local_id.clone(), sstable.clone());
             for row in sstable
                 .collect_scan_row_refs_columnar(
                     &self.inner.dependencies,
@@ -8368,10 +8762,6 @@ impl Db {
                 }
                 if row.sequence <= sequence {
                     keys.insert(row.key.clone());
-                    columnar_rows_by_key
-                        .entry(row.key.clone())
-                        .or_default()
-                        .push(row);
                 }
             }
         }
@@ -8381,18 +8771,8 @@ impl Db {
             ordered_keys.reverse();
         }
 
-        enum ScanResolution {
-            Ready(Value),
-            ColumnarPending { local_id: String, row_index: usize },
-        }
-
-        let mut resolved = Vec::<(Key, ScanResolution)>::new();
-        let mut pending_by_sstable = BTreeMap::<String, BTreeSet<usize>>::new();
+        let mut rows = Vec::new();
         for key in ordered_keys {
-            let mut mem_rows = Vec::new();
-            memtables.collect_visible_rows(table_id, &key, sequence, &mut mem_rows);
-            let columnar_rows = columnar_rows_by_key.remove(&key).unwrap_or_default();
-
             if sequence < current_sequence
                 && persisted_versions_by_key
                     .get(&key)
@@ -8402,118 +8782,25 @@ impl Db {
             {
                 return Err(Self::columnar_overwritten_history_error(&table, &key));
             }
-            if columnar_rows
-                .iter()
-                .any(|row| row.kind == ChangeKind::Merge)
-            {
-                return Err(Self::columnar_merge_read_error(&table, &key));
+            let resolution = self
+                .resolve_visible_value_columnar_with_state(
+                    &table,
+                    &memtables,
+                    &sstables,
+                    &key,
+                    sequence,
+                    &projection,
+                )
+                .await?;
+            if let Some(collapse) = resolution.collapse.clone() {
+                self.force_collapse_merge_chain(table_id, &key, collapse);
             }
-
-            enum VisibleCandidate {
-                Memtable(SstableRow),
-                Columnar(ColumnarRowRef),
-            }
-
-            let mut candidates = mem_rows
-                .into_iter()
-                .map(VisibleCandidate::Memtable)
-                .chain(columnar_rows.into_iter().map(VisibleCandidate::Columnar))
-                .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| {
-                let (left_sequence, left_kind) = match left {
-                    VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
-                    VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
-                };
-                let (right_sequence, right_kind) = match right {
-                    VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
-                    VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
-                };
-                right_sequence.cmp(&left_sequence).then_with(|| {
-                    Self::visible_row_priority(left_kind)
-                        .cmp(&Self::visible_row_priority(right_kind))
-                })
-            });
-
-            let Some(head) = candidates.first() else {
+            let Some(value) = resolution.value else {
                 continue;
             };
-
-            match head {
-                VisibleCandidate::Memtable(row) => match row.kind {
-                    ChangeKind::Put => resolved.push((
-                        key,
-                        ScanResolution::Ready(Self::project_columnar_value(
-                            row.value.as_ref().ok_or_else(|| {
-                                StorageError::corruption("put row is missing a value")
-                            })?,
-                            &projection,
-                        )?),
-                    )),
-                    ChangeKind::Delete => {}
-                    ChangeKind::Merge => return Err(Self::columnar_merge_read_error(&table, &key)),
-                },
-                VisibleCandidate::Columnar(row) => match row.kind {
-                    ChangeKind::Put => {
-                        pending_by_sstable
-                            .entry(row.local_id.clone())
-                            .or_default()
-                            .insert(row.row_index);
-                        resolved.push((
-                            key,
-                            ScanResolution::ColumnarPending {
-                                local_id: row.local_id.clone(),
-                                row_index: row.row_index,
-                            },
-                        ));
-                    }
-                    ChangeKind::Delete => {}
-                    ChangeKind::Merge => return Err(Self::columnar_merge_read_error(&table, &key)),
-                },
-            }
-
-            if resolved.len() >= limit {
+            rows.push((key, value));
+            if rows.len() >= limit {
                 break;
-            }
-        }
-
-        let mut materialized_by_sstable = BTreeMap::<String, BTreeMap<usize, Value>>::new();
-        for (local_id, row_indexes) in pending_by_sstable {
-            let sstable = sstables_by_local_id.get(&local_id).ok_or_else(|| {
-                StorageError::corruption(format!(
-                    "columnar SSTable {} disappeared during scan",
-                    local_id
-                ))
-            })?;
-            materialized_by_sstable.insert(
-                local_id.clone(),
-                sstable
-                    .materialize_columnar_rows(&self.inner.dependencies, &projection, &row_indexes)
-                    .await?,
-            );
-        }
-
-        let mut rows = Vec::with_capacity(resolved.len());
-        for (key, resolution) in resolved {
-            match resolution {
-                ScanResolution::Ready(value) => rows.push((key, value)),
-                ScanResolution::ColumnarPending {
-                    local_id,
-                    row_index,
-                } => {
-                    let values = materialized_by_sstable.get(&local_id).ok_or_else(|| {
-                        StorageError::corruption(format!(
-                            "columnar SSTable {} materialization is missing",
-                            local_id
-                        ))
-                    })?;
-                    let value = values.get(&row_index).cloned().ok_or_else(|| {
-                        StorageError::corruption(format!(
-                            "columnar SSTable {} row {} was not materialized",
-                            local_id, row_index
-                        ))
-                    })?;
-                    rows.push((key, value));
-                }
             }
         }
 
@@ -9178,15 +9465,16 @@ mod tests {
         encode_mvcc_key, read_path,
     };
     use crate::{
-        ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
+        ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, CutPoint, DbConfig,
         DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
         FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
         ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
         PendingWorkType, PointMutation, ReadError, Rng, S3Location, S3PrimaryStorageConfig,
-        ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber,
-        ShadowOracle, SnapshotTooOld, SsdConfig, StorageConfig, StorageError, StubClock,
-        StubObjectStore, StubRng, TableConfig, TableFormat, TableId, TableStats, ThrottleDecision,
-        TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
+        ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SeededSimulationRunner,
+        SegmentId, SequenceNumber, ShadowOracle, SnapshotTooOld, SsdConfig, StorageConfig,
+        StorageError, StubClock, StubObjectStore, StubRng, TableConfig, TableFormat, TableId,
+        TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Timestamp,
+        TraceEvent, TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -9542,6 +9830,64 @@ mod tests {
         Arc::new(AppendMergeOperator)
     }
 
+    #[derive(Debug)]
+    struct SumColumnarCountMergeOperator;
+
+    impl MergeOperator for SumColumnarCountMergeOperator {
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            existing: Option<&Value>,
+            operands: &[Value],
+        ) -> Result<Value, StorageError> {
+            let mut total = existing
+                .map(count_from_record_value)
+                .transpose()?
+                .unwrap_or(0);
+            for operand in operands {
+                total += count_from_record_value(operand)?;
+            }
+            Ok(count_record(total))
+        }
+
+        fn partial_merge(
+            &self,
+            _key: &[u8],
+            left: &Value,
+            right: &Value,
+        ) -> Result<Option<Value>, StorageError> {
+            Ok(Some(count_record(
+                count_from_record_value(left)? + count_from_record_value(right)?,
+            )))
+        }
+    }
+
+    fn sum_columnar_count_merge_operator() -> MergeOperatorRef {
+        Arc::new(SumColumnarCountMergeOperator)
+    }
+
+    fn count_record(count: i64) -> Value {
+        Value::record(BTreeMap::from([(
+            FieldId::new(1),
+            FieldValue::Int64(count),
+        )]))
+    }
+
+    fn count_from_record_value(value: &Value) -> Result<i64, StorageError> {
+        let Value::Record(record) = value else {
+            return Err(StorageError::unsupported(
+                "count merge operator only supports record values",
+            ));
+        };
+        match record.get(&FieldId::new(1)) {
+            Some(FieldValue::Int64(count)) => Ok(*count),
+            Some(FieldValue::Null) | None => Ok(0),
+            Some(_) => Err(StorageError::unsupported(
+                "count merge operator expects an int64 count field",
+            )),
+        }
+    }
+
     fn merge_row_table_config(
         name: &str,
         max_merge_operand_chain_length: Option<u32>,
@@ -9550,6 +9896,33 @@ mod tests {
         config.merge_operator = Some(append_merge_operator());
         config.max_merge_operand_chain_length = max_merge_operand_chain_length;
         config
+    }
+
+    fn merge_columnar_table_config(
+        name: &str,
+        max_merge_operand_chain_length: Option<u32>,
+    ) -> TableConfig {
+        TableConfig {
+            name: name.to_string(),
+            format: TableFormat::Columnar,
+            merge_operator: Some(sum_columnar_count_merge_operator()),
+            max_merge_operand_chain_length,
+            compaction_filter: None,
+            bloom_filter_bits_per_key: Some(6),
+            history_retention_sequences: Some(30),
+            compaction_strategy: CompactionStrategy::Tiered,
+            schema: Some(SchemaDefinition {
+                version: 1,
+                fields: vec![FieldDefinition {
+                    id: FieldId::new(1),
+                    name: "count".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    default: Some(FieldValue::Int64(0)),
+                }],
+            }),
+            metadata: BTreeMap::from([("mode".to_string(), json!("merge"))]),
+        }
     }
 
     fn bytes(value: &str) -> Value {
@@ -10154,6 +10527,53 @@ mod tests {
         db.flush().await.expect("flush third l0");
 
         (db, table, file_system, dependencies, oracle)
+    }
+
+    async fn seed_columnar_compaction_fixture(
+        root: &str,
+    ) -> (
+        Db,
+        crate::Table,
+        Arc<crate::StubFileSystem>,
+        DbDependencies,
+        SchemaDefinition,
+    ) {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let db = Db::open(tiered_config(root), dependencies.clone())
+            .await
+            .expect("open columnar compaction db");
+        let config = columnar_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+        let table = db
+            .create_table(config)
+            .await
+            .expect("create columnar compaction table");
+
+        for (key, user_id, count) in [
+            (b"user:1".to_vec(), "alice", 1),
+            (b"user:2".to_vec(), "bob", 2),
+            (b"user:3".to_vec(), "carol", 3),
+        ] {
+            table
+                .write(
+                    key,
+                    Value::named_record(
+                        &schema,
+                        [
+                            ("user_id", FieldValue::String(user_id.to_string())),
+                            ("count", FieldValue::Int64(count)),
+                        ],
+                    )
+                    .expect("encode columnar fixture row"),
+                )
+                .await
+                .expect("write columnar fixture row");
+            db.flush().await.expect("flush columnar fixture row");
+        }
+
+        (db, table, file_system, dependencies, schema)
     }
 
     async fn seed_leveled_compaction_fixture(
@@ -12529,6 +12949,667 @@ mod tests {
                 (b"user:2".to_vec(), second_record),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn columnar_compaction_rewrites_mixed_schema_versions_without_changing_reads() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store);
+
+        let db = Db::open(
+            tiered_config("/columnar-mixed-schema-compaction"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+
+        let legacy_schema = SchemaDefinition {
+            version: 1,
+            fields: vec![FieldDefinition {
+                id: FieldId::new(1),
+                name: "user_id".to_string(),
+                field_type: FieldType::String,
+                nullable: false,
+                default: None,
+            }],
+        };
+        let mut legacy_config = columnar_table_config("metrics");
+        legacy_config.schema = Some(legacy_schema.clone());
+        let table = db
+            .create_table(legacy_config)
+            .await
+            .expect("create legacy columnar table");
+
+        table
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &legacy_schema,
+                    [("user_id", FieldValue::String("alice".to_string()))],
+                )
+                .expect("encode legacy row"),
+            )
+            .await
+            .expect("write legacy row");
+        db.flush().await.expect("flush legacy row");
+
+        let renamed_and_added_schema = SchemaDefinition {
+            version: 2,
+            fields: vec![
+                FieldDefinition {
+                    id: FieldId::new(1),
+                    name: "account_id".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(2),
+                    name: "count".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    default: Some(FieldValue::Int64(0)),
+                },
+            ],
+        };
+        install_columnar_schema_successor(&db, "metrics", renamed_and_added_schema.clone()).await;
+        table
+            .write(
+                b"user:2".to_vec(),
+                Value::named_record(
+                    &renamed_and_added_schema,
+                    [
+                        ("account_id", FieldValue::String("bob".to_string())),
+                        ("count", FieldValue::Int64(7)),
+                    ],
+                )
+                .expect("encode renamed row"),
+            )
+            .await
+            .expect("write renamed row");
+        db.flush().await.expect("flush renamed row");
+
+        let removed_schema = SchemaDefinition {
+            version: 3,
+            fields: vec![FieldDefinition {
+                id: FieldId::new(1),
+                name: "account_id".to_string(),
+                field_type: FieldType::String,
+                nullable: false,
+                default: None,
+            }],
+        };
+        install_columnar_schema_successor(&db, "metrics", removed_schema.clone()).await;
+        table
+            .write(
+                b"user:3".to_vec(),
+                Value::named_record(
+                    &removed_schema,
+                    [("account_id", FieldValue::String("carol".to_string()))],
+                )
+                .expect("encode removed-column row"),
+            )
+            .await
+            .expect("write removed-column row");
+        db.flush().await.expect("flush removed-column row");
+
+        let expected_rows = vec![
+            (
+                b"user:1".to_vec(),
+                Value::record(BTreeMap::from([(
+                    FieldId::new(1),
+                    FieldValue::String("alice".to_string()),
+                )])),
+            ),
+            (
+                b"user:2".to_vec(),
+                Value::record(BTreeMap::from([(
+                    FieldId::new(1),
+                    FieldValue::String("bob".to_string()),
+                )])),
+            ),
+            (
+                b"user:3".to_vec(),
+                Value::record(BTreeMap::from([(
+                    FieldId::new(1),
+                    FieldValue::String("carol".to_string()),
+                )])),
+            ),
+        ];
+
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                    .await
+                    .expect("scan mixed-schema rows before compaction"),
+            )
+            .await,
+            expected_rows
+        );
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan(
+                        Vec::new(),
+                        vec![0xff],
+                        ScanOptions {
+                            reverse: false,
+                            limit: None,
+                            columns: Some(vec!["account_id".to_string()]),
+                        },
+                    )
+                    .await
+                    .expect("scan renamed projection"),
+            )
+            .await,
+            expected_rows
+        );
+        let projection_error = match table
+            .scan(
+                Vec::new(),
+                vec![0xff],
+                ScanOptions {
+                    reverse: false,
+                    limit: None,
+                    columns: Some(vec!["user_id".to_string()]),
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("removed column name should be rejected"),
+            Err(error) => error,
+        };
+        match projection_error {
+            ReadError::Storage(error) => {
+                assert!(error.message().contains("does not contain column user_id"));
+            }
+            other => panic!("expected unsupported storage error, got {other:?}"),
+        }
+
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run mixed-schema compaction")
+        );
+
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                    .await
+                    .expect("scan mixed-schema rows after compaction"),
+            )
+            .await,
+            expected_rows
+        );
+
+        let live = db.sstables_read().live.clone();
+        assert_eq!(live.len(), 1);
+        assert!(live[0].is_columnar());
+        assert_eq!(live[0].meta.schema_version, Some(removed_schema.version));
+        let metadata = live[0]
+            .load_columnar_metadata(db.dependencies())
+            .await
+            .expect("load compacted columnar metadata");
+        assert_eq!(metadata.footer.columns.len(), 1);
+        assert_eq!(metadata.footer.columns[0].field_id, FieldId::new(1));
+    }
+
+    #[tokio::test]
+    async fn columnar_merge_reads_match_compacted_results() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/columnar-merge-compaction"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(merge_columnar_table_config("metrics", Some(2)))
+            .await
+            .expect("create merge-capable columnar table");
+
+        table
+            .write(b"doc".to_vec(), count_record(1))
+            .await
+            .expect("write base count");
+        db.flush().await.expect("flush base count");
+        table
+            .merge(b"doc".to_vec(), count_record(2))
+            .await
+            .expect("write persisted delta");
+        db.flush().await.expect("flush persisted delta");
+        table
+            .merge(b"doc".to_vec(), count_record(3))
+            .await
+            .expect("write memtable delta");
+
+        assert_eq!(
+            table
+                .read(b"doc".to_vec())
+                .await
+                .expect("resolve merge chain"),
+            Some(count_record(6))
+        );
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan(b"doc".to_vec(), b"doe".to_vec(), ScanOptions::default())
+                    .await
+                    .expect("scan merged row"),
+            )
+            .await,
+            vec![(b"doc".to_vec(), count_record(6))]
+        );
+
+        db.flush().await.expect("flush tail delta");
+        assert_eq!(
+            table
+                .read(b"doc".to_vec())
+                .await
+                .expect("resolve fully persisted merge chain"),
+            Some(count_record(6))
+        );
+        assert!(
+            db.run_next_compaction()
+                .await
+                .expect("run columnar merge compaction")
+        );
+        assert_eq!(
+            table
+                .read(b"doc".to_vec())
+                .await
+                .expect("read merged row after compaction"),
+            Some(count_record(6))
+        );
+
+        let live = db.sstables_read().live.clone();
+        assert_eq!(live.len(), 1);
+        assert!(live[0].is_columnar());
+        let doc_rows = live[0]
+            .rows
+            .iter()
+            .filter(|row| row.key == b"doc")
+            .collect::<Vec<_>>();
+        assert_eq!(doc_rows.len(), 3);
+        assert!(doc_rows.iter().all(|row| row.kind == ChangeKind::Put));
+        assert_eq!(
+            doc_rows
+                .iter()
+                .map(|row| row.value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(count_record(6)),
+                Some(count_record(3)),
+                Some(count_record(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_compaction_output_without_manifest_switch_recovers_prior_generation() {
+        let (db, _table, file_system, dependencies, schema) =
+            seed_columnar_compaction_fixture("/columnar-compaction-manifest-before-switch").await;
+
+        let prior_generation = db.sstables_read().manifest_generation;
+        let next_generation = ManifestId::new(prior_generation.get().saturating_add(1));
+        let manifest_temp_path = format!(
+            "{}{}",
+            Db::local_manifest_path(
+                "/columnar-compaction-manifest-before-switch",
+                next_generation
+            ),
+            LOCAL_MANIFEST_TEMP_SUFFIX
+        );
+        file_system.inject_failure(FileSystemFailure::for_target(
+            FileSystemOperation::Rename,
+            manifest_temp_path,
+            StorageError::io("simulated columnar manifest rename failure"),
+        ));
+
+        let error = db
+            .run_next_compaction()
+            .await
+            .expect_err("columnar compaction should fail before manifest switch");
+        assert!(
+            error
+                .message()
+                .contains("simulated columnar manifest rename failure")
+        );
+
+        file_system.crash();
+        let reopened = Db::open(
+            tiered_config("/columnar-compaction-manifest-before-switch"),
+            dependencies,
+        )
+        .await
+        .expect("reopen after failed columnar compaction");
+        let reopened_table = reopened.table("metrics");
+
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            prior_generation
+        );
+        assert_eq!(
+            collect_rows(
+                reopened_table
+                    .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                    .await
+                    .expect("scan reopened columnar rows"),
+            )
+            .await,
+            vec![
+                (
+                    b"user:1".to_vec(),
+                    Value::named_record(
+                        &schema,
+                        [
+                            ("user_id", FieldValue::String("alice".to_string())),
+                            ("count", FieldValue::Int64(1)),
+                        ],
+                    )
+                    .expect("encode alice"),
+                ),
+                (
+                    b"user:2".to_vec(),
+                    Value::named_record(
+                        &schema,
+                        [
+                            ("user_id", FieldValue::String("bob".to_string())),
+                            ("count", FieldValue::Int64(2)),
+                        ],
+                    )
+                    .expect("encode bob"),
+                ),
+                (
+                    b"user:3".to_vec(),
+                    Value::named_record(
+                        &schema,
+                        [
+                            ("user_id", FieldValue::String("carol".to_string())),
+                            ("count", FieldValue::Int64(3)),
+                        ],
+                    )
+                    .expect("encode carol"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn simulated_columnar_mixed_schema_compaction_recovers_after_crash() -> turmoil::Result {
+        SeededSimulationRunner::new(0x27c0_1001).run_with(|context| async move {
+            let config = tiered_config("/terracedb/sim/columnar-mixed-schema-compaction-crash");
+            let db = context.open_db(config.clone()).await?;
+
+            let legacy_schema = SchemaDefinition {
+                version: 1,
+                fields: vec![FieldDefinition {
+                    id: FieldId::new(1),
+                    name: "user_id".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    default: None,
+                }],
+            };
+            let mut config_v1 = columnar_table_config("metrics");
+            config_v1.schema = Some(legacy_schema.clone());
+            config_v1.compaction_strategy = CompactionStrategy::Leveled;
+            let table = db
+                .create_table(config_v1)
+                .await
+                .expect("create legacy columnar table");
+
+            table
+                .write(
+                    b"user:1".to_vec(),
+                    Value::named_record(
+                        &legacy_schema,
+                        [("user_id", FieldValue::String("alice".to_string()))],
+                    )
+                    .expect("encode legacy row"),
+                )
+                .await
+                .expect("write legacy row");
+            db.flush().await.expect("flush legacy row");
+
+            let successor_schema = SchemaDefinition {
+                version: 2,
+                fields: vec![
+                    FieldDefinition {
+                        id: FieldId::new(1),
+                        name: "account_id".to_string(),
+                        field_type: FieldType::String,
+                        nullable: false,
+                        default: None,
+                    },
+                    FieldDefinition {
+                        id: FieldId::new(2),
+                        name: "count".to_string(),
+                        field_type: FieldType::Int64,
+                        nullable: false,
+                        default: Some(FieldValue::Int64(0)),
+                    },
+                ],
+            };
+            install_columnar_schema_successor(&db, "metrics", successor_schema.clone()).await;
+            table
+                .write(
+                    b"user:2".to_vec(),
+                    Value::named_record(
+                        &successor_schema,
+                        [
+                            ("account_id", FieldValue::String("bob".to_string())),
+                            ("count", FieldValue::Int64(7)),
+                        ],
+                    )
+                    .expect("encode successor row"),
+                )
+                .await
+                .expect("write successor row");
+            db.flush().await.expect("flush successor row");
+
+            let pending = db.pending_compaction_jobs();
+            assert!(
+                pending.iter().any(|job| job.table_name == "metrics"),
+                "tiered columnar runs should schedule compaction before the crash",
+            );
+
+            let mut blocker = db.block_next_compaction_phase(CompactionPhase::OutputWritten);
+            let compact_db = db.clone();
+            let compaction = tokio::spawn(async move { compact_db.run_next_compaction().await });
+            blocker.wait_until_reached().await;
+
+            compaction.abort();
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_table = reopened.table("metrics");
+            assert!(
+                context.trace().iter().any(|event| matches!(
+                    event,
+                    TraceEvent::Crash {
+                        cut_point: CutPoint::AfterStep
+                    }
+                )),
+                "simulation trace should record the crash cut point",
+            );
+            assert!(
+                context
+                    .trace()
+                    .iter()
+                    .any(|event| matches!(event, TraceEvent::Restart)),
+                "simulation trace should record the restart",
+            );
+
+            assert_eq!(
+                collect_rows(
+                    reopened_table
+                        .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                        .await
+                        .expect("scan reopened mixed-schema rows"),
+                )
+                .await,
+                vec![
+                    (
+                        b"user:1".to_vec(),
+                        Value::named_record(
+                            &successor_schema,
+                            [
+                                ("account_id", FieldValue::String("alice".to_string())),
+                                ("count", FieldValue::Int64(0)),
+                            ],
+                        )
+                        .expect("encode default-filled alice"),
+                    ),
+                    (
+                        b"user:2".to_vec(),
+                        Value::named_record(
+                            &successor_schema,
+                            [
+                                ("account_id", FieldValue::String("bob".to_string())),
+                                ("count", FieldValue::Int64(7)),
+                            ],
+                        )
+                        .expect("encode bob"),
+                    ),
+                ],
+            );
+
+            assert!(
+                reopened
+                    .pending_compaction_jobs()
+                    .iter()
+                    .any(|job| job.table_name == "metrics"),
+                "reopened db should still surface the pending columnar compaction",
+            );
+            assert!(
+                reopened
+                    .run_next_compaction()
+                    .await
+                    .expect("retry mixed-schema compaction after restart"),
+            );
+            assert_eq!(
+                collect_rows(
+                    reopened_table
+                        .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                        .await
+                        .expect("scan compacted mixed-schema rows"),
+                )
+                .await,
+                vec![
+                    (
+                        b"user:1".to_vec(),
+                        Value::named_record(
+                            &successor_schema,
+                            [
+                                ("account_id", FieldValue::String("alice".to_string())),
+                                ("count", FieldValue::Int64(0)),
+                            ],
+                        )
+                        .expect("encode compacted alice"),
+                    ),
+                    (
+                        b"user:2".to_vec(),
+                        Value::named_record(
+                            &successor_schema,
+                            [
+                                ("account_id", FieldValue::String("bob".to_string())),
+                                ("count", FieldValue::Int64(7)),
+                            ],
+                        )
+                        .expect("encode compacted bob"),
+                    ),
+                ],
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn simulated_columnar_merge_compaction_recovers_after_crash() -> turmoil::Result {
+        SeededSimulationRunner::new(0x27c0_1002).run_with(|context| async move {
+            let config = tiered_config("/terracedb/sim/columnar-merge-compaction-crash");
+            let db = context.open_db(config.clone()).await?;
+            let table = db
+                .create_table(merge_columnar_table_config("metrics", Some(2)))
+                .await
+                .expect("create merge-capable columnar table");
+
+            table
+                .write(b"doc".to_vec(), count_record(1))
+                .await
+                .expect("write base count");
+            db.flush().await.expect("flush base count");
+            table
+                .merge(b"doc".to_vec(), count_record(2))
+                .await
+                .expect("write first delta");
+            db.flush().await.expect("flush first delta");
+            table
+                .merge(b"doc".to_vec(), count_record(3))
+                .await
+                .expect("write second delta");
+            db.flush().await.expect("flush second delta");
+
+            assert_eq!(
+                table
+                    .read(b"doc".to_vec())
+                    .await
+                    .expect("resolve merge chain"),
+                Some(count_record(6)),
+            );
+            assert!(
+                db.pending_compaction_jobs()
+                    .iter()
+                    .any(|job| job.table_name == "metrics"),
+                "columnar merge runs should schedule compaction before the crash",
+            );
+
+            let mut blocker = db.block_next_compaction_phase(CompactionPhase::OutputWritten);
+            let compact_db = db.clone();
+            let compaction = tokio::spawn(async move { compact_db.run_next_compaction().await });
+            blocker.wait_until_reached().await;
+
+            compaction.abort();
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_table = reopened
+                .create_table(merge_columnar_table_config("metrics", Some(2)))
+                .await
+                .expect("reattach columnar merge operator after restart");
+
+            assert_eq!(
+                reopened_table
+                    .read(b"doc".to_vec())
+                    .await
+                    .expect("recover merged value"),
+                Some(count_record(6)),
+            );
+            assert!(
+                reopened
+                    .pending_compaction_jobs()
+                    .iter()
+                    .any(|job| job.table_name == "metrics"),
+                "reopened db should still surface the pending merge compaction",
+            );
+            assert!(
+                reopened
+                    .run_next_compaction()
+                    .await
+                    .expect("retry merge compaction after restart"),
+            );
+            assert_eq!(
+                reopened_table
+                    .read(b"doc".to_vec())
+                    .await
+                    .expect("read merged value after retried compaction"),
+                Some(count_record(6)),
+            );
+
+            Ok(())
+        })
     }
 
     #[tokio::test]
