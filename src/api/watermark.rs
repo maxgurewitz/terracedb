@@ -1,3 +1,5 @@
+use super::*;
+
 #[derive(Debug)]
 pub struct WatermarkReceiver {
     inner: watch::Receiver<SequenceNumber>,
@@ -5,7 +7,7 @@ pub struct WatermarkReceiver {
 }
 
 impl WatermarkReceiver {
-    fn new(
+    pub(super) fn new(
         registry: &Arc<WatermarkRegistry>,
         table_name: &str,
         inner: watch::Receiver<SequenceNumber>,
@@ -26,7 +28,7 @@ impl WatermarkReceiver {
     }
 
     #[cfg(test)]
-    fn has_changed(&self) -> Result<bool, SubscriptionClosed> {
+    pub(super) fn has_changed(&self) -> Result<bool, SubscriptionClosed> {
         self.inner.has_changed().map_err(|_| SubscriptionClosed)
     }
 }
@@ -41,21 +43,21 @@ impl Clone for WatermarkReceiver {
 }
 
 #[derive(Default)]
-struct WatermarkAdvance {
-    visible_sequence: Option<SequenceNumber>,
-    visible_tables: BTreeMap<String, SequenceNumber>,
-    durable_sequence: Option<SequenceNumber>,
-    durable_tables: BTreeMap<String, SequenceNumber>,
+pub(super) struct WatermarkAdvance {
+    pub(super) visible_sequence: Option<SequenceNumber>,
+    pub(super) visible_tables: BTreeMap<String, SequenceNumber>,
+    pub(super) durable_sequence: Option<SequenceNumber>,
+    pub(super) durable_tables: BTreeMap<String, SequenceNumber>,
 }
 
 #[derive(Debug)]
-struct WatermarkSubscription {
-    registry: Weak<WatermarkRegistry>,
-    table_name: String,
+pub(super) struct WatermarkSubscription {
+    pub(super) registry: Weak<WatermarkRegistry>,
+    pub(super) table_name: String,
 }
 
 impl WatermarkSubscription {
-    fn new(registry: &Arc<WatermarkRegistry>, table_name: &str) -> Self {
+    pub(super) fn new(registry: &Arc<WatermarkRegistry>, table_name: &str) -> Self {
         Self {
             registry: Arc::downgrade(registry),
             table_name: table_name.to_string(),
@@ -85,14 +87,14 @@ impl Drop for WatermarkSubscription {
 }
 
 #[derive(Clone, Debug)]
-struct WatermarkTableState {
-    current: SequenceNumber,
-    sender: Option<watch::Sender<SequenceNumber>>,
-    subscribers: usize,
+pub(super) struct WatermarkTableState {
+    pub(super) current: SequenceNumber,
+    pub(super) sender: Option<watch::Sender<SequenceNumber>>,
+    pub(super) subscribers: usize,
 }
 
 impl WatermarkTableState {
-    fn new(current: SequenceNumber) -> Self {
+    pub(super) fn new(current: SequenceNumber) -> Self {
         Self {
             current,
             sender: None,
@@ -102,13 +104,13 @@ impl WatermarkTableState {
 }
 
 #[derive(Debug)]
-struct WatermarkRegistry {
-    tables: Mutex<BTreeMap<String, WatermarkTableState>>,
-    pulse: watch::Sender<u64>,
+pub(super) struct WatermarkRegistry {
+    pub(super) tables: Mutex<BTreeMap<String, WatermarkTableState>>,
+    pub(super) pulse: watch::Sender<u64>,
 }
 
 impl WatermarkRegistry {
-    fn new(initial: BTreeMap<String, SequenceNumber>) -> Self {
+    pub(super) fn new(initial: BTreeMap<String, SequenceNumber>) -> Self {
         let (pulse, _receiver) = watch::channel(0);
         let tables = initial
             .into_iter()
@@ -120,7 +122,7 @@ impl WatermarkRegistry {
         }
     }
 
-    fn subscribe(self: &Arc<Self>, table_name: &str) -> WatermarkReceiver {
+    pub(super) fn subscribe(self: &Arc<Self>, table_name: &str) -> WatermarkReceiver {
         let receiver = {
             let mut tables = mutex_lock(&self.tables);
             let state = tables
@@ -138,13 +140,13 @@ impl WatermarkRegistry {
         WatermarkReceiver::new(self, table_name, receiver)
     }
 
-    fn increment(&self, table_name: &str) {
+    pub(super) fn increment(&self, table_name: &str) {
         if let Some(state) = mutex_lock(&self.tables).get_mut(table_name) {
             state.subscribers += 1;
         }
     }
 
-    fn decrement(&self, table_name: &str) {
+    pub(super) fn decrement(&self, table_name: &str) {
         if let Some(state) = mutex_lock(&self.tables).get_mut(table_name) {
             state.subscribers = state.subscribers.saturating_sub(1);
             if state.subscribers == 0 {
@@ -153,7 +155,7 @@ impl WatermarkRegistry {
         }
     }
 
-    fn notify(&self, updates: &BTreeMap<String, SequenceNumber>) {
+    pub(super) fn notify(&self, updates: &BTreeMap<String, SequenceNumber>) {
         if updates.is_empty() {
             return;
         }
@@ -183,12 +185,12 @@ impl WatermarkRegistry {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn pulse(&self) -> watch::Receiver<u64> {
+    pub(super) fn pulse(&self) -> watch::Receiver<u64> {
         self.pulse.subscribe()
     }
 
     #[cfg(test)]
-    fn active_subscriber_count(&self, table_name: &str) -> usize {
+    pub(super) fn active_subscriber_count(&self, table_name: &str) -> usize {
         mutex_lock(&self.tables)
             .get(table_name)
             .map(|state| state.subscribers)
@@ -204,9 +206,9 @@ pub struct WatermarkUpdate {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
-struct NamedWatermarkReceiver {
-    table: String,
-    receiver: WatermarkReceiver,
+pub(super) struct NamedWatermarkReceiver {
+    pub(super) table: String,
+    pub(super) receiver: WatermarkReceiver,
 }
 
 #[derive(Debug)]
@@ -217,7 +219,10 @@ pub struct WatermarkSubscriptionSet {
 }
 
 impl WatermarkSubscriptionSet {
-    fn new(registry: &Arc<WatermarkRegistry>, receivers: Vec<(String, WatermarkReceiver)>) -> Self {
+    pub(super) fn new(
+        registry: &Arc<WatermarkRegistry>,
+        receivers: Vec<(String, WatermarkReceiver)>,
+    ) -> Self {
         let mut receivers = receivers;
         receivers.sort_by(|(left, _), (right, _)| left.cmp(right));
 

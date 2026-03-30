@@ -1,8 +1,10 @@
+use super::*;
+
 #[derive(Clone)]
 pub struct Table {
-    db: Db,
-    name: Arc<str>,
-    id: Option<TableId>,
+    pub(super) db: Db,
+    pub(super) name: Arc<str>,
+    pub(super) id: Option<TableId>,
 }
 
 impl Table {
@@ -142,7 +144,7 @@ impl Table {
         Ok(Box::pin(stream::iter(rows)))
     }
 
-    fn resolve_id(&self) -> Option<TableId> {
+    pub(super) fn resolve_id(&self) -> Option<TableId> {
         self.db.resolve_table_id(self)
     }
 }

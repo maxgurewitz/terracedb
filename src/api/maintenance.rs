@@ -1,5 +1,7 @@
+use super::*;
+
 impl Db {
-    fn sort_live_sstables(live: &mut [ResidentRowSstable]) {
+    pub(super) fn sort_live_sstables(live: &mut [ResidentRowSstable]) {
         live.sort_by(|left, right| {
             (
                 left.meta.table_id.get(),
@@ -18,7 +20,7 @@ impl Db {
         });
     }
 
-    fn leveled_level_target_bytes(level: u32) -> u64 {
+    pub(super) fn leveled_level_target_bytes(level: u32) -> u64 {
         if level == 0 {
             return 0;
         }
@@ -30,7 +32,7 @@ impl Db {
         target
     }
 
-    fn table_compaction_state(
+    pub(super) fn table_compaction_state(
         table: &StoredTable,
         live: &[ResidentRowSstable],
     ) -> TableCompactionState {
@@ -41,7 +43,7 @@ impl Db {
         }
     }
 
-    fn table_live_sstables(
+    pub(super) fn table_live_sstables(
         table_id: TableId,
         live: &[ResidentRowSstable],
     ) -> Vec<ResidentRowSstable> {
@@ -51,7 +53,10 @@ impl Db {
             .collect()
     }
 
-    fn sstables_at_level(table_live: &[ResidentRowSstable], level: u32) -> Vec<ResidentRowSstable> {
+    pub(super) fn sstables_at_level(
+        table_live: &[ResidentRowSstable],
+        level: u32,
+    ) -> Vec<ResidentRowSstable> {
         table_live
             .iter()
             .filter(|sstable| sstable.meta.level == level)
@@ -59,7 +64,7 @@ impl Db {
             .collect()
     }
 
-    fn leveled_compaction_state(
+    pub(super) fn leveled_compaction_state(
         table: &StoredTable,
         live: &[ResidentRowSstable],
     ) -> TableCompactionState {
@@ -110,7 +115,7 @@ impl Db {
         }
     }
 
-    fn tiered_compaction_state(
+    pub(super) fn tiered_compaction_state(
         table: &StoredTable,
         live: &[ResidentRowSstable],
     ) -> TableCompactionState {
@@ -155,7 +160,7 @@ impl Db {
         }
     }
 
-    fn fifo_compaction_state(
+    pub(super) fn fifo_compaction_state(
         table: &StoredTable,
         live: &[ResidentRowSstable],
     ) -> TableCompactionState {
@@ -193,7 +198,7 @@ impl Db {
         }
     }
 
-    fn build_leveled_compaction_job(
+    pub(super) fn build_leveled_compaction_job(
         table: &StoredTable,
         table_live: &[ResidentRowSstable],
         source_level: u32,
@@ -218,7 +223,7 @@ impl Db {
         Self::build_rewrite_compaction_job(table, source_level, target_level, &inputs)
     }
 
-    fn build_rewrite_compaction_job(
+    pub(super) fn build_rewrite_compaction_job(
         table: &StoredTable,
         source_level: u32,
         target_level: u32,
@@ -233,7 +238,7 @@ impl Db {
         )
     }
 
-    fn build_delete_only_compaction_job(
+    pub(super) fn build_delete_only_compaction_job(
         table: &StoredTable,
         inputs: &[ResidentRowSstable],
     ) -> Option<CompactionJob> {
@@ -251,7 +256,7 @@ impl Db {
         )
     }
 
-    fn build_compaction_job(
+    pub(super) fn build_compaction_job(
         table: &StoredTable,
         source_level: u32,
         target_level: u32,
@@ -289,7 +294,7 @@ impl Db {
         })
     }
 
-    fn build_offload_job(
+    pub(super) fn build_offload_job(
         table: &StoredTable,
         kind: OffloadJobKind,
         inputs: &[ResidentRowSstable],
@@ -323,7 +328,7 @@ impl Db {
         })
     }
 
-    fn sstable_key_span(sstables: &[ResidentRowSstable]) -> Option<(Key, Key)> {
+    pub(super) fn sstable_key_span(sstables: &[ResidentRowSstable]) -> Option<(Key, Key)> {
         Some((
             sstables
                 .iter()
@@ -336,7 +341,7 @@ impl Db {
         ))
     }
 
-    fn key_ranges_overlap(
+    pub(super) fn key_ranges_overlap(
         left_min: &[u8],
         left_max: &[u8],
         right_min: &[u8],
@@ -345,7 +350,7 @@ impl Db {
         left_min <= right_max && right_min <= left_max
     }
 
-    fn pending_compaction_jobs(&self) -> Vec<CompactionJob> {
+    pub(super) fn pending_compaction_jobs(&self) -> Vec<CompactionJob> {
         let tables = self.tables_read().clone();
         let live = self.sstables_read().live.clone();
         let mut jobs = tables
@@ -367,7 +372,7 @@ impl Db {
         jobs
     }
 
-    fn pending_flush_candidates(&self) -> Vec<PendingWorkCandidate> {
+    pub(super) fn pending_flush_candidates(&self) -> Vec<PendingWorkCandidate> {
         if self.local_storage_root().is_none() {
             return Vec::new();
         }
@@ -400,7 +405,7 @@ impl Db {
         candidates
     }
 
-    fn pending_offload_candidates(&self) -> Vec<PendingWorkCandidate> {
+    pub(super) fn pending_offload_candidates(&self) -> Vec<PendingWorkCandidate> {
         let Some(max_local_bytes) = self.local_sstable_budget_bytes() else {
             return Vec::new();
         };
@@ -485,7 +490,7 @@ impl Db {
         candidates
     }
 
-    fn pending_work_candidates(&self) -> Vec<PendingWorkCandidate> {
+    pub(super) fn pending_work_candidates(&self) -> Vec<PendingWorkCandidate> {
         let mut candidates = self.pending_flush_candidates();
         candidates.extend(self.pending_compaction_jobs().into_iter().map(|job| {
             PendingWorkCandidate {
@@ -508,7 +513,7 @@ impl Db {
         candidates
     }
 
-    fn prune_work_deferrals(&self, candidates: &[PendingWorkCandidate]) {
+    pub(super) fn prune_work_deferrals(&self, candidates: &[PendingWorkCandidate]) {
         let live_work_ids = candidates
             .iter()
             .map(|candidate| candidate.pending.id.as_str())
@@ -517,7 +522,7 @@ impl Db {
             .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
     }
 
-    fn record_deferred_work(
+    pub(super) fn record_deferred_work(
         &self,
         candidates: &[PendingWorkCandidate],
         decisions: &BTreeMap<String, ScheduleAction>,
@@ -539,11 +544,11 @@ impl Db {
         }
     }
 
-    fn reset_work_deferral(&self, work_id: &str) {
+    pub(super) fn reset_work_deferral(&self, work_id: &str) {
         mutex_lock(&self.inner.work_deferrals).remove(work_id);
     }
 
-    fn deferred_work_candidate(
+    pub(super) fn deferred_work_candidate(
         &self,
         candidates: &[PendingWorkCandidate],
     ) -> Option<PendingWorkCandidate> {
@@ -560,7 +565,7 @@ impl Db {
             .cloned()
     }
 
-    fn forced_l0_compaction_candidate(
+    pub(super) fn forced_l0_compaction_candidate(
         &self,
         candidates: &[PendingWorkCandidate],
     ) -> Option<PendingWorkCandidate> {
@@ -584,7 +589,7 @@ impl Db {
             .cloned()
     }
 
-    async fn execute_pending_work(
+    pub(super) async fn execute_pending_work(
         &self,
         local_root: &str,
         candidate: PendingWorkCandidate,
@@ -600,7 +605,10 @@ impl Db {
         }
     }
 
-    async fn run_scheduler_pass(&self, allow_forced_execution: bool) -> Result<bool, StorageError> {
+    pub(super) async fn run_scheduler_pass(
+        &self,
+        allow_forced_execution: bool,
+    ) -> Result<bool, StorageError> {
         let Some(local_root) = self.local_storage_root().map(str::to_string) else {
             return Ok(false);
         };
@@ -663,16 +671,16 @@ impl Db {
     }
 
     #[cfg(test)]
-    async fn run_next_scheduled_work(&self) -> Result<bool, StorageError> {
+    pub(super) async fn run_next_scheduled_work(&self) -> Result<bool, StorageError> {
         self.run_scheduler_pass(true).await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn estimated_sstable_row_bytes(row: &SstableRow) -> u64 {
+    pub(super) fn estimated_sstable_row_bytes(row: &SstableRow) -> u64 {
         (row.key.len() + row.value.as_ref().map(value_size_bytes).unwrap_or_default() + 32) as u64
     }
 
-    fn retain_rows_within_horizon(
+    pub(super) fn retain_rows_within_horizon(
         rows: Vec<CompactionRow>,
         horizon: Option<SequenceNumber>,
     ) -> Vec<CompactionRow> {
@@ -701,7 +709,7 @@ impl Db {
         retained
     }
 
-    async fn load_compaction_input_rows(
+    pub(super) async fn load_compaction_input_rows(
         &self,
         table: &StoredTable,
         inputs: &[ResidentRowSstable],
@@ -787,7 +795,7 @@ impl Db {
         Ok(rows)
     }
 
-    async fn rewrite_compaction_rows(
+    pub(super) async fn rewrite_compaction_rows(
         &self,
         tables: &BTreeMap<String, StoredTable>,
         memtables: &MemtableState,
@@ -851,7 +859,7 @@ impl Db {
         Ok(rewritten)
     }
 
-    fn apply_compaction_filter(
+    pub(super) fn apply_compaction_filter(
         &self,
         table: &StoredTable,
         rows: Vec<CompactionRow>,
@@ -911,7 +919,7 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn write_compaction_outputs(
+    pub(super) async fn write_compaction_outputs(
         &self,
         local_root: &str,
         table: &StoredTable,
@@ -1041,7 +1049,7 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn execute_offload_job(&self, job: OffloadJob) -> Result<(), StorageError> {
+    pub(super) async fn execute_offload_job(&self, job: OffloadJob) -> Result<(), StorageError> {
         let span = tracing::info_span!("terracedb.db.offload.execute");
         apply_db_span_attributes(
             &span,
@@ -1221,7 +1229,7 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn execute_compaction_job(
+    pub(super) async fn execute_compaction_job(
         &self,
         local_root: &str,
         job: CompactionJob,
@@ -1281,7 +1289,13 @@ impl Db {
                         encode_mvcc_key(&row.row.key, CommitId::new(row.row.sequence))
                     });
                     merged_rows = self
-                        .rewrite_compaction_rows(&tables, &memtables, &sstables, &table, merged_rows)
+                        .rewrite_compaction_rows(
+                            &tables,
+                            &memtables,
+                            &sstables,
+                            &table,
+                            merged_rows,
+                        )
                         .await?;
                     merged_rows = Self::retain_rows_within_horizon(
                         merged_rows,
@@ -1294,80 +1308,80 @@ impl Db {
 
             let outputs = match job.kind {
                 CompactionJobKind::Rewrite => {
-                let outputs = self
-                    .write_compaction_outputs(
-                        local_root,
-                        &table,
-                        job.target_level,
-                        filtered
-                            .rows
-                            .iter()
-                            .cloned()
-                            .map(|row| row.row)
-                            .collect::<Vec<_>>(),
-                    )
-                    .await?;
-
-                if !outputs.is_empty() {
-                    self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
+                    let outputs = self
+                        .write_compaction_outputs(
+                            local_root,
+                            &table,
+                            job.target_level,
+                            filtered
+                                .rows
+                                .iter()
+                                .cloned()
+                                .map(|row| row.row)
+                                .collect::<Vec<_>>(),
+                        )
                         .await?;
-                }
 
-                outputs
-            }
+                    if !outputs.is_empty() {
+                        self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
+                            .await?;
+                    }
+
+                    outputs
+                }
                 CompactionJobKind::DeleteOnly => Vec::new(),
             };
 
-        let current_state = self.sstables_read().clone();
-        let mut new_live = current_state
-            .live
-            .into_iter()
-            .filter(|sstable| !input_local_ids.contains(&sstable.meta.local_id))
-            .collect::<Vec<_>>();
-        new_live.extend(outputs);
-        Self::sort_live_sstables(&mut new_live);
+            let current_state = self.sstables_read().clone();
+            let mut new_live = current_state
+                .live
+                .into_iter()
+                .filter(|sstable| !input_local_ids.contains(&sstable.meta.local_id))
+                .collect::<Vec<_>>();
+            new_live.extend(outputs);
+            Self::sort_live_sstables(&mut new_live);
 
-        let next_generation =
-            ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
-        self.install_manifest(
-            next_generation,
-            current_state.last_flushed_sequence,
-            &new_live,
-        )
-        .await?;
-
-        {
-            let mut sstables = self.sstables_write();
-            sstables.manifest_generation = next_generation;
-            sstables.live = new_live;
-        }
-        let state = self.sstables_read().clone();
-        let _ = self
-            .sync_tiered_backup_manifest(
-                state.manifest_generation,
-                state.last_flushed_sequence,
-                &state.live,
+            let next_generation =
+                ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
+            self.install_manifest(
+                next_generation,
+                current_state.last_flushed_sequence,
+                &new_live,
             )
-            .await;
-        self.record_compaction_filter_stats(
-            job.table_id,
-            filtered.removed_bytes,
-            filtered.removed_keys,
-        );
-
-        self.maybe_pause_compaction_phase(CompactionPhase::ManifestSwitched)
             .await?;
 
-        for input in &inputs {
-            self.inner
-                .dependencies
-                .file_system
-                .delete(&input.meta.file_path)
+            {
+                let mut sstables = self.sstables_write();
+                sstables.manifest_generation = next_generation;
+                sstables.live = new_live;
+            }
+            let state = self.sstables_read().clone();
+            let _ = self
+                .sync_tiered_backup_manifest(
+                    state.manifest_generation,
+                    state.last_flushed_sequence,
+                    &state.live,
+                )
+                .await;
+            self.record_compaction_filter_stats(
+                job.table_id,
+                filtered.removed_bytes,
+                filtered.removed_keys,
+            );
+
+            self.maybe_pause_compaction_phase(CompactionPhase::ManifestSwitched)
                 .await?;
-        }
 
-        self.maybe_pause_compaction_phase(CompactionPhase::InputCleanupFinished)
-            .await?;
+            for input in &inputs {
+                self.inner
+                    .dependencies
+                    .file_system
+                    .delete(&input.meta.file_path)
+                    .await?;
+            }
+
+            self.maybe_pause_compaction_phase(CompactionPhase::InputCleanupFinished)
+                .await?;
 
             Ok(())
         }

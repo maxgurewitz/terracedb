@@ -1,259 +1,262 @@
-const CATALOG_FORMAT_VERSION: u32 = 1;
-const CATALOG_READ_CHUNK_LEN: usize = 8 * 1024;
-const LOCAL_CATALOG_RELATIVE_PATH: &str = "catalog/CATALOG.json";
-const LOCAL_CATALOG_TEMP_SUFFIX: &str = ".tmp";
-const LOCAL_COMMIT_LOG_RELATIVE_DIR: &str = "commitlog";
-const OBJECT_CATALOG_RELATIVE_KEY: &str = "catalog/CATALOG.json";
-const LOCAL_CURRENT_RELATIVE_PATH: &str = "CURRENT";
-const LOCAL_MANIFEST_DIR_RELATIVE_PATH: &str = "manifest";
-const LOCAL_MANIFEST_TEMP_SUFFIX: &str = ".tmp";
-const LOCAL_SSTABLE_RELATIVE_DIR: &str = "sst";
-const LOCAL_SSTABLE_SHARD_DIR: &str = "0000";
-const LOCAL_REMOTE_CACHE_RELATIVE_DIR: &str = "cache/remote";
-const MANIFEST_FORMAT_VERSION: u32 = 1;
-const REMOTE_MANIFEST_FORMAT_VERSION: u32 = 1;
-const BACKUP_GC_METADATA_FORMAT_VERSION: u32 = 1;
-const BACKUP_MANIFEST_RETENTION_LIMIT: usize = 1;
-const BACKUP_GC_GRACE_PERIOD_MILLIS: u64 = 60_000;
-const LOCAL_BACKUP_RESTORE_MARKER_RELATIVE_PATH: &str = "backup/RESTORE_INCOMPLETE";
-const LEVELED_BASE_LEVEL_TARGET_BYTES: u64 = 4 * 1024;
-const LEVELED_LEVEL_SIZE_MULTIPLIER: u64 = 10;
-const LEVELED_L0_COMPACTION_TRIGGER: usize = 2;
-const TIERED_LEVEL_RUN_COMPACTION_TRIGGER: usize = 3;
-const FIFO_MAX_LIVE_SSTABLES: usize = 2;
-const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
-const COLUMNAR_SSTABLE_FORMAT_VERSION: u32 = 1;
-const COLUMNAR_SSTABLE_MAGIC: &[u8; 8] = b"TDBCOL1\n";
-const MVCC_KEY_SEPARATOR: u8 = 0;
-const DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH: usize = 8;
-const MAX_SCHEDULER_DEFER_CYCLES: u32 = 3;
+use super::*;
 
-struct DbInner {
-    config: DbConfig,
-    scheduler: Arc<dyn Scheduler>,
-    dependencies: DbDependencies,
+pub(super) const CATALOG_FORMAT_VERSION: u32 = 1;
+pub(super) const CATALOG_READ_CHUNK_LEN: usize = 8 * 1024;
+pub(super) const LOCAL_CATALOG_RELATIVE_PATH: &str = "catalog/CATALOG.json";
+pub(super) const LOCAL_CATALOG_TEMP_SUFFIX: &str = ".tmp";
+pub(super) const LOCAL_COMMIT_LOG_RELATIVE_DIR: &str = "commitlog";
+pub(super) const OBJECT_CATALOG_RELATIVE_KEY: &str = "catalog/CATALOG.json";
+pub(super) const LOCAL_CURRENT_RELATIVE_PATH: &str = "CURRENT";
+pub(super) const LOCAL_MANIFEST_DIR_RELATIVE_PATH: &str = "manifest";
+pub(super) const LOCAL_MANIFEST_TEMP_SUFFIX: &str = ".tmp";
+pub(super) const LOCAL_SSTABLE_RELATIVE_DIR: &str = "sst";
+pub(super) const LOCAL_SSTABLE_SHARD_DIR: &str = "0000";
+pub(super) const LOCAL_REMOTE_CACHE_RELATIVE_DIR: &str = "cache/remote";
+pub(super) const MANIFEST_FORMAT_VERSION: u32 = 1;
+pub(super) const REMOTE_MANIFEST_FORMAT_VERSION: u32 = 1;
+pub(super) const BACKUP_GC_METADATA_FORMAT_VERSION: u32 = 1;
+pub(super) const BACKUP_MANIFEST_RETENTION_LIMIT: usize = 1;
+pub(super) const BACKUP_GC_GRACE_PERIOD_MILLIS: u64 = 60_000;
+pub(super) const LOCAL_BACKUP_RESTORE_MARKER_RELATIVE_PATH: &str = "backup/RESTORE_INCOMPLETE";
+pub(super) const LEVELED_BASE_LEVEL_TARGET_BYTES: u64 = 4 * 1024;
+pub(super) const LEVELED_LEVEL_SIZE_MULTIPLIER: u64 = 10;
+pub(super) const LEVELED_L0_COMPACTION_TRIGGER: usize = 2;
+pub(super) const TIERED_LEVEL_RUN_COMPACTION_TRIGGER: usize = 3;
+pub(super) const FIFO_MAX_LIVE_SSTABLES: usize = 2;
+pub(super) const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
+pub(super) const COLUMNAR_SSTABLE_FORMAT_VERSION: u32 = 1;
+pub(super) const COLUMNAR_SSTABLE_MAGIC: &[u8; 8] = b"TDBCOL1\n";
+pub(super) const MVCC_KEY_SEPARATOR: u8 = 0;
+pub(super) const DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH: usize = 8;
+pub(super) const MAX_SCHEDULER_DEFER_CYCLES: u32 = 3;
+
+pub(super) struct DbInner {
+    pub(super) config: DbConfig,
+    pub(super) scheduler: Arc<dyn Scheduler>,
+    pub(super) dependencies: DbDependencies,
     // Row SSTables stay fully resident after open; this cache only applies to the
     // lazy columnar read path.
-    columnar_read_context: Arc<ColumnarReadContext>,
-    catalog_location: CatalogLocation,
-    catalog_write_lock: AsyncMutex<()>,
-    commit_lock: AsyncMutex<()>,
-    maintenance_lock: AsyncMutex<()>,
-    backup_lock: AsyncMutex<()>,
-    commit_runtime: AsyncMutex<CommitRuntime>,
-    commit_coordinator: Mutex<CommitCoordinator>,
-    commit_log_scans: Mutex<CommitLogScanRegistry>,
-    next_table_id: AtomicU32,
-    next_sequence: AtomicU64,
-    current_sequence: AtomicU64,
-    current_durable_sequence: AtomicU64,
-    tables: RwLock<BTreeMap<String, StoredTable>>,
-    memtables: RwLock<MemtableState>,
-    sstables: RwLock<SstableState>,
-    next_sstable_id: AtomicU64,
-    snapshot_tracker: Mutex<SnapshotTracker>,
-    next_snapshot_id: AtomicU64,
-    compaction_filter_stats: Mutex<BTreeMap<TableId, CompactionFilterStats>>,
-    visible_watchers: Arc<WatermarkRegistry>,
-    durable_watchers: Arc<WatermarkRegistry>,
-    work_deferrals: Mutex<BTreeMap<String, u32>>,
+    pub(super) columnar_read_context: Arc<ColumnarReadContext>,
+    pub(super) catalog_location: CatalogLocation,
+    pub(super) catalog_write_lock: AsyncMutex<()>,
+    pub(super) commit_lock: AsyncMutex<()>,
+    pub(super) maintenance_lock: AsyncMutex<()>,
+    pub(super) backup_lock: AsyncMutex<()>,
+    pub(super) commit_runtime: AsyncMutex<CommitRuntime>,
+    pub(super) commit_coordinator: Mutex<CommitCoordinator>,
+    pub(super) commit_log_scans: Mutex<CommitLogScanRegistry>,
+    pub(super) next_table_id: AtomicU32,
+    pub(super) next_sequence: AtomicU64,
+    pub(super) current_sequence: AtomicU64,
+    pub(super) current_durable_sequence: AtomicU64,
+    pub(super) tables: RwLock<BTreeMap<String, StoredTable>>,
+    pub(super) memtables: RwLock<MemtableState>,
+    pub(super) sstables: RwLock<SstableState>,
+    pub(super) next_sstable_id: AtomicU64,
+    pub(super) snapshot_tracker: Mutex<SnapshotTracker>,
+    pub(super) next_snapshot_id: AtomicU64,
+    pub(super) compaction_filter_stats: Mutex<BTreeMap<TableId, CompactionFilterStats>>,
+    pub(super) visible_watchers: Arc<WatermarkRegistry>,
+    pub(super) durable_watchers: Arc<WatermarkRegistry>,
+    pub(super) work_deferrals: Mutex<BTreeMap<String, u32>>,
 }
 
 #[derive(Clone)]
-struct StoredTable {
-    id: TableId,
-    config: TableConfig,
+pub(super) struct StoredTable {
+    pub(super) id: TableId,
+    pub(super) config: TableConfig,
 }
 
 #[derive(Clone, Debug)]
-enum CatalogLocation {
+pub(super) enum CatalogLocation {
     LocalFile { path: String, temp_path: String },
     ObjectStore { key: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedCatalog {
-    format_version: u32,
-    tables: Vec<PersistedCatalogEntry>,
+pub(super) struct PersistedCatalog {
+    pub(super) format_version: u32,
+    pub(super) tables: Vec<PersistedCatalogEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedCatalogEntry {
-    id: TableId,
-    config: PersistedTableConfig,
+pub(super) struct PersistedCatalogEntry {
+    pub(super) id: TableId,
+    pub(super) config: PersistedTableConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedTableConfig {
-    name: String,
-    format: TableFormat,
-    max_merge_operand_chain_length: Option<u32>,
-    bloom_filter_bits_per_key: Option<u32>,
+pub(super) struct PersistedTableConfig {
+    pub(super) name: String,
+    pub(super) format: TableFormat,
+    pub(super) max_merge_operand_chain_length: Option<u32>,
+    pub(super) bloom_filter_bits_per_key: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    history_retention_sequences: Option<u64>,
-    compaction_strategy: CompactionStrategy,
-    schema: Option<SchemaDefinition>,
-    metadata: TableMetadata,
+    pub(super) history_retention_sequences: Option<u64>,
+    pub(super) compaction_strategy: CompactionStrategy,
+    pub(super) schema: Option<SchemaDefinition>,
+    pub(super) metadata: TableMetadata,
 }
 
 #[derive(Clone, Debug, Default)]
-struct SstableState {
-    manifest_generation: ManifestId,
-    last_flushed_sequence: SequenceNumber,
-    live: Vec<ResidentRowSstable>,
+pub(super) struct SstableState {
+    pub(super) manifest_generation: ManifestId,
+    pub(super) last_flushed_sequence: SequenceNumber,
+    pub(super) live: Vec<ResidentRowSstable>,
 }
 
 #[derive(Clone, Debug)]
-struct ResidentRowSstable {
-    meta: PersistedManifestSstable,
-    rows: Vec<SstableRow>,
-    user_key_bloom_filter: Option<UserKeyBloomFilter>,
-    columnar: Option<ResidentColumnarSstable>,
+pub(super) struct ResidentRowSstable {
+    pub(super) meta: PersistedManifestSstable,
+    pub(super) rows: Vec<SstableRow>,
+    pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
+    pub(super) columnar: Option<ResidentColumnarSstable>,
 }
 
 #[derive(Clone, Debug)]
-struct ResidentColumnarSstable {
-    source: StorageSource,
+pub(super) struct ResidentColumnarSstable {
+    pub(super) source: StorageSource,
 }
 
 #[derive(Clone, Debug)]
-struct ColumnProjection {
-    fields: Vec<FieldDefinition>,
+pub(super) struct ColumnProjection {
+    pub(super) fields: Vec<FieldDefinition>,
 }
 
 #[derive(Clone, Debug)]
-struct ColumnarRowRef {
-    local_id: String,
-    key: Key,
-    sequence: SequenceNumber,
-    kind: ChangeKind,
-    row_index: usize,
+pub(super) struct ColumnarRowRef {
+    pub(super) local_id: String,
+    pub(super) key: Key,
+    pub(super) sequence: SequenceNumber,
+    pub(super) kind: ChangeKind,
+    pub(super) row_index: usize,
 }
 
 #[derive(Clone, Debug)]
-struct LoadedColumnarMetadata {
-    footer: Arc<PersistedColumnarSstableFooter>,
-    footer_start: usize,
-    key_index: Arc<Vec<Key>>,
-    sequences: Arc<Vec<SequenceNumber>>,
-    tombstones: Arc<Vec<bool>>,
-    row_kinds: Arc<Vec<ChangeKind>>,
+pub(super) struct LoadedColumnarMetadata {
+    pub(super) footer: Arc<PersistedColumnarSstableFooter>,
+    pub(super) footer_start: usize,
+    pub(super) key_index: Arc<Vec<Key>>,
+    pub(super) sequences: Arc<Vec<SequenceNumber>>,
+    pub(super) tombstones: Arc<Vec<bool>>,
+    pub(super) row_kinds: Arc<Vec<ChangeKind>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColumnarReadAccessPattern {
+pub(super) enum ColumnarReadAccessPattern {
     Point,
     Scan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColumnarReadArtifact {
+pub(super) enum ColumnarReadArtifact {
     Footer,
     Metadata,
     ColumnBlock,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ColumnarCachePolicy {
-    use_raw_byte_cache: bool,
-    populate_raw_byte_cache: bool,
-    use_decoded_cache: bool,
-    populate_decoded_cache: bool,
+pub(super) struct ColumnarCachePolicy {
+    pub(super) use_raw_byte_cache: bool,
+    pub(super) populate_raw_byte_cache: bool,
+    pub(super) use_decoded_cache: bool,
+    pub(super) populate_decoded_cache: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-struct ColumnarCacheStatsSnapshot {
-    raw_byte_hits: u64,
-    raw_byte_misses: u64,
-    decoded_footer_hits: u64,
-    decoded_footer_misses: u64,
-    decoded_footer_admissions: u64,
-    decoded_metadata_hits: u64,
-    decoded_metadata_misses: u64,
-    decoded_metadata_admissions: u64,
-    decoded_column_block_hits: u64,
-    decoded_column_block_misses: u64,
-    decoded_column_block_admissions: u64,
+pub(super) struct ColumnarCacheStatsSnapshot {
+    pub(super) raw_byte_hits: u64,
+    pub(super) raw_byte_misses: u64,
+    pub(super) decoded_footer_hits: u64,
+    pub(super) decoded_footer_misses: u64,
+    pub(super) decoded_footer_admissions: u64,
+    pub(super) decoded_metadata_hits: u64,
+    pub(super) decoded_metadata_misses: u64,
+    pub(super) decoded_metadata_admissions: u64,
+    pub(super) decoded_column_block_hits: u64,
+    pub(super) decoded_column_block_misses: u64,
+    pub(super) decoded_column_block_admissions: u64,
 }
 
-struct ColumnarReadContext {
-    dependencies: DbDependencies,
-    remote_cache: Option<Arc<RemoteCache>>,
-    decoded_cache: DecodedColumnarCache,
-    raw_byte_cache_enabled: AtomicBool,
-    decoded_cache_enabled: AtomicBool,
-}
-
-#[derive(Default)]
-struct DecodedColumnarCache {
-    footers: RwLock<BTreeMap<ColumnarSstableIdentity, CachedColumnarFooter>>,
-    key_indexes: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<Key>>>>,
-    sequence_columns: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<SequenceNumber>>>>,
-    tombstone_bitmaps: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<bool>>>>,
-    row_kind_columns: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<ChangeKind>>>>,
-    column_blocks: RwLock<BTreeMap<ColumnarColumnCacheKey, Arc<Vec<FieldValue>>>>,
-    stats: ColumnarCacheStats,
+pub(super) struct ColumnarReadContext {
+    pub(super) dependencies: DbDependencies,
+    pub(super) remote_cache: Option<Arc<RemoteCache>>,
+    pub(super) decoded_cache: DecodedColumnarCache,
+    pub(super) raw_byte_cache_enabled: AtomicBool,
+    pub(super) decoded_cache_enabled: AtomicBool,
 }
 
 #[derive(Default)]
-struct ColumnarCacheStats {
-    raw_byte_hits: AtomicU64,
-    raw_byte_misses: AtomicU64,
-    decoded_footer_hits: AtomicU64,
-    decoded_footer_misses: AtomicU64,
-    decoded_footer_admissions: AtomicU64,
-    decoded_metadata_hits: AtomicU64,
-    decoded_metadata_misses: AtomicU64,
-    decoded_metadata_admissions: AtomicU64,
-    decoded_column_block_hits: AtomicU64,
-    decoded_column_block_misses: AtomicU64,
-    decoded_column_block_admissions: AtomicU64,
+pub(super) struct DecodedColumnarCache {
+    pub(super) footers: RwLock<BTreeMap<ColumnarSstableIdentity, CachedColumnarFooter>>,
+    pub(super) key_indexes: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<Key>>>>,
+    pub(super) sequence_columns:
+        RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<SequenceNumber>>>>,
+    pub(super) tombstone_bitmaps: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<bool>>>>,
+    pub(super) row_kind_columns: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<ChangeKind>>>>,
+    pub(super) column_blocks: RwLock<BTreeMap<ColumnarColumnCacheKey, Arc<Vec<FieldValue>>>>,
+    pub(super) stats: ColumnarCacheStats,
+}
+
+#[derive(Default)]
+pub(super) struct ColumnarCacheStats {
+    pub(super) raw_byte_hits: AtomicU64,
+    pub(super) raw_byte_misses: AtomicU64,
+    pub(super) decoded_footer_hits: AtomicU64,
+    pub(super) decoded_footer_misses: AtomicU64,
+    pub(super) decoded_footer_admissions: AtomicU64,
+    pub(super) decoded_metadata_hits: AtomicU64,
+    pub(super) decoded_metadata_misses: AtomicU64,
+    pub(super) decoded_metadata_admissions: AtomicU64,
+    pub(super) decoded_column_block_hits: AtomicU64,
+    pub(super) decoded_column_block_misses: AtomicU64,
+    pub(super) decoded_column_block_admissions: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
-struct CachedColumnarFooter {
-    footer: Arc<PersistedColumnarSstableFooter>,
-    footer_start: usize,
+pub(super) struct CachedColumnarFooter {
+    pub(super) footer: Arc<PersistedColumnarSstableFooter>,
+    pub(super) footer_start: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ColumnarSstableIdentity {
-    table_id: TableId,
-    local_id: String,
-    checksum: u32,
-    data_checksum: u32,
-    length: u64,
-    schema_version: Option<u32>,
+pub(super) struct ColumnarSstableIdentity {
+    pub(super) table_id: TableId,
+    pub(super) local_id: String,
+    pub(super) checksum: u32,
+    pub(super) data_checksum: u32,
+    pub(super) length: u64,
+    pub(super) schema_version: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ColumnarColumnCacheKey {
-    sstable: ColumnarSstableIdentity,
-    field_id: FieldId,
+pub(super) struct ColumnarColumnCacheKey {
+    pub(super) sstable: ColumnarSstableIdentity,
+    pub(super) field_id: FieldId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedManifestSstable {
-    table_id: TableId,
-    level: u32,
-    local_id: String,
-    file_path: String,
+pub(super) struct PersistedManifestSstable {
+    pub(super) table_id: TableId,
+    pub(super) level: u32,
+    pub(super) local_id: String,
+    pub(super) file_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    remote_key: Option<String>,
-    length: u64,
-    checksum: u32,
-    data_checksum: u32,
-    min_key: Key,
-    max_key: Key,
-    min_sequence: SequenceNumber,
-    max_sequence: SequenceNumber,
+    pub(super) remote_key: Option<String>,
+    pub(super) length: u64,
+    pub(super) checksum: u32,
+    pub(super) data_checksum: u32,
+    pub(super) min_key: Key,
+    pub(super) max_key: Key,
+    pub(super) min_sequence: SequenceNumber,
+    pub(super) max_sequence: SequenceNumber,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    schema_version: Option<u32>,
+    pub(super) schema_version: Option<u32>,
 }
 
 impl PersistedManifestSstable {
-    fn storage_source(&self) -> StorageSource {
+    pub(super) fn storage_source(&self) -> StorageSource {
         if !self.file_path.is_empty() {
             StorageSource::local_file(self.file_path.clone())
         } else if let Some(remote_key) = &self.remote_key {
@@ -263,7 +266,7 @@ impl PersistedManifestSstable {
         }
     }
 
-    fn storage_descriptor(&self) -> &str {
+    pub(super) fn storage_descriptor(&self) -> &str {
         if !self.file_path.is_empty() {
             &self.file_path
         } else {
@@ -271,7 +274,7 @@ impl PersistedManifestSstable {
         }
     }
 
-    fn columnar_identity(&self) -> ColumnarSstableIdentity {
+    pub(super) fn columnar_identity(&self) -> ColumnarSstableIdentity {
         ColumnarSstableIdentity {
             table_id: self.table_id,
             local_id: self.local_id.clone(),
@@ -285,29 +288,20 @@ impl PersistedManifestSstable {
 
 impl DecodedColumnarCache {
     #[cfg_attr(not(test), allow(dead_code))]
-    fn snapshot(&self) -> ColumnarCacheStatsSnapshot {
+    pub(super) fn snapshot(&self) -> ColumnarCacheStatsSnapshot {
         ColumnarCacheStatsSnapshot {
             raw_byte_hits: self.stats.raw_byte_hits.load(Ordering::Relaxed),
             raw_byte_misses: self.stats.raw_byte_misses.load(Ordering::Relaxed),
             decoded_footer_hits: self.stats.decoded_footer_hits.load(Ordering::Relaxed),
             decoded_footer_misses: self.stats.decoded_footer_misses.load(Ordering::Relaxed),
-            decoded_footer_admissions: self
-                .stats
-                .decoded_footer_admissions
-                .load(Ordering::Relaxed),
+            decoded_footer_admissions: self.stats.decoded_footer_admissions.load(Ordering::Relaxed),
             decoded_metadata_hits: self.stats.decoded_metadata_hits.load(Ordering::Relaxed),
-            decoded_metadata_misses: self
-                .stats
-                .decoded_metadata_misses
-                .load(Ordering::Relaxed),
+            decoded_metadata_misses: self.stats.decoded_metadata_misses.load(Ordering::Relaxed),
             decoded_metadata_admissions: self
                 .stats
                 .decoded_metadata_admissions
                 .load(Ordering::Relaxed),
-            decoded_column_block_hits: self
-                .stats
-                .decoded_column_block_hits
-                .load(Ordering::Relaxed),
+            decoded_column_block_hits: self.stats.decoded_column_block_hits.load(Ordering::Relaxed),
             decoded_column_block_misses: self
                 .stats
                 .decoded_column_block_misses
@@ -320,7 +314,7 @@ impl DecodedColumnarCache {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn reset_stats(&self) {
+    pub(super) fn reset_stats(&self) {
         self.stats.raw_byte_hits.store(0, Ordering::Relaxed);
         self.stats.raw_byte_misses.store(0, Ordering::Relaxed);
         self.stats.decoded_footer_hits.store(0, Ordering::Relaxed);
@@ -328,9 +322,7 @@ impl DecodedColumnarCache {
         self.stats
             .decoded_footer_admissions
             .store(0, Ordering::Relaxed);
-        self.stats
-            .decoded_metadata_hits
-            .store(0, Ordering::Relaxed);
+        self.stats.decoded_metadata_hits.store(0, Ordering::Relaxed);
         self.stats
             .decoded_metadata_misses
             .store(0, Ordering::Relaxed);
@@ -349,7 +341,7 @@ impl DecodedColumnarCache {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn clear(&self) {
+    pub(super) fn clear(&self) {
         self.footers.write().clear();
         self.key_indexes.write().clear();
         self.sequence_columns.write().clear();
@@ -358,10 +350,15 @@ impl DecodedColumnarCache {
         self.column_blocks.write().clear();
     }
 
-    fn footer(&self, identity: &ColumnarSstableIdentity) -> Option<CachedColumnarFooter> {
+    pub(super) fn footer(
+        &self,
+        identity: &ColumnarSstableIdentity,
+    ) -> Option<CachedColumnarFooter> {
         let cached = self.footers.read().get(identity).cloned();
         if cached.is_some() {
-            self.stats.decoded_footer_hits.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .decoded_footer_hits
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             self.stats
                 .decoded_footer_misses
@@ -370,14 +367,18 @@ impl DecodedColumnarCache {
         cached
     }
 
-    fn insert_footer(&self, identity: ColumnarSstableIdentity, footer: CachedColumnarFooter) {
+    pub(super) fn insert_footer(
+        &self,
+        identity: ColumnarSstableIdentity,
+        footer: CachedColumnarFooter,
+    ) {
         self.footers.write().insert(identity, footer);
         self.stats
             .decoded_footer_admissions
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn key_index(&self, identity: &ColumnarSstableIdentity) -> Option<Arc<Vec<Key>>> {
+    pub(super) fn key_index(&self, identity: &ColumnarSstableIdentity) -> Option<Arc<Vec<Key>>> {
         let cached = self.key_indexes.read().get(identity).cloned();
         if cached.is_some() {
             self.stats
@@ -391,14 +392,18 @@ impl DecodedColumnarCache {
         cached
     }
 
-    fn insert_key_index(&self, identity: ColumnarSstableIdentity, values: Arc<Vec<Key>>) {
+    pub(super) fn insert_key_index(
+        &self,
+        identity: ColumnarSstableIdentity,
+        values: Arc<Vec<Key>>,
+    ) {
         self.key_indexes.write().insert(identity, values);
         self.stats
             .decoded_metadata_admissions
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn sequence_column(
+    pub(super) fn sequence_column(
         &self,
         identity: &ColumnarSstableIdentity,
     ) -> Option<Arc<Vec<SequenceNumber>>> {
@@ -415,7 +420,7 @@ impl DecodedColumnarCache {
         cached
     }
 
-    fn insert_sequence_column(
+    pub(super) fn insert_sequence_column(
         &self,
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<SequenceNumber>>,
@@ -426,7 +431,10 @@ impl DecodedColumnarCache {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn tombstone_bitmap(&self, identity: &ColumnarSstableIdentity) -> Option<Arc<Vec<bool>>> {
+    pub(super) fn tombstone_bitmap(
+        &self,
+        identity: &ColumnarSstableIdentity,
+    ) -> Option<Arc<Vec<bool>>> {
         let cached = self.tombstone_bitmaps.read().get(identity).cloned();
         if cached.is_some() {
             self.stats
@@ -440,14 +448,18 @@ impl DecodedColumnarCache {
         cached
     }
 
-    fn insert_tombstone_bitmap(&self, identity: ColumnarSstableIdentity, values: Arc<Vec<bool>>) {
+    pub(super) fn insert_tombstone_bitmap(
+        &self,
+        identity: ColumnarSstableIdentity,
+        values: Arc<Vec<bool>>,
+    ) {
         self.tombstone_bitmaps.write().insert(identity, values);
         self.stats
             .decoded_metadata_admissions
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn row_kind_column(
+    pub(super) fn row_kind_column(
         &self,
         identity: &ColumnarSstableIdentity,
     ) -> Option<Arc<Vec<ChangeKind>>> {
@@ -464,7 +476,7 @@ impl DecodedColumnarCache {
         cached
     }
 
-    fn insert_row_kind_column(
+    pub(super) fn insert_row_kind_column(
         &self,
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<ChangeKind>>,
@@ -475,7 +487,10 @@ impl DecodedColumnarCache {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn column_block(&self, key: &ColumnarColumnCacheKey) -> Option<Arc<Vec<FieldValue>>> {
+    pub(super) fn column_block(
+        &self,
+        key: &ColumnarColumnCacheKey,
+    ) -> Option<Arc<Vec<FieldValue>>> {
         let cached = self.column_blocks.read().get(key).cloned();
         if cached.is_some() {
             self.stats
@@ -489,7 +504,11 @@ impl DecodedColumnarCache {
         cached
     }
 
-    fn insert_column_block(&self, key: ColumnarColumnCacheKey, values: Arc<Vec<FieldValue>>) {
+    pub(super) fn insert_column_block(
+        &self,
+        key: ColumnarColumnCacheKey,
+        values: Arc<Vec<FieldValue>>,
+    ) {
         self.column_blocks.write().insert(key, values);
         self.stats
             .decoded_column_block_admissions
@@ -498,178 +517,178 @@ impl DecodedColumnarCache {
 }
 
 #[derive(Clone, Debug, Default)]
-struct LoadedManifest {
-    generation: ManifestId,
-    last_flushed_sequence: SequenceNumber,
-    live_sstables: Vec<ResidentRowSstable>,
-    durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
+pub(super) struct LoadedManifest {
+    pub(super) generation: ManifestId,
+    pub(super) last_flushed_sequence: SequenceNumber,
+    pub(super) live_sstables: Vec<ResidentRowSstable>,
+    pub(super) durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedManifestBody {
-    format_version: u32,
-    generation: ManifestId,
-    last_flushed_sequence: SequenceNumber,
-    sstables: Vec<PersistedManifestSstable>,
+pub(super) struct PersistedManifestBody {
+    pub(super) format_version: u32,
+    pub(super) generation: ManifestId,
+    pub(super) last_flushed_sequence: SequenceNumber,
+    pub(super) sstables: Vec<PersistedManifestSstable>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedManifestFile {
-    body: PersistedManifestBody,
-    checksum: u32,
+pub(super) struct PersistedManifestFile {
+    pub(super) body: PersistedManifestBody,
+    pub(super) checksum: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct DurableRemoteCommitLogSegment {
-    object_key: String,
-    footer: SegmentFooter,
+pub(super) struct DurableRemoteCommitLogSegment {
+    pub(super) object_key: String,
+    pub(super) footer: SegmentFooter,
 }
 
 #[derive(Clone)]
-enum ChangeFeedSourcePlan {
+pub(super) enum ChangeFeedSourcePlan {
     LocalSegment(LocalSegmentScanPlan),
     RemoteSegment(DurableRemoteCommitLogSegment),
     BufferedRecords(Arc<Vec<CommitRecord>>),
 }
 
-struct ChangeFeedScanner {
-    cursor: LogCursor,
-    upper_bound: SequenceNumber,
-    table_id: TableId,
-    table: Table,
-    remaining: Option<usize>,
-    _scan_guard: CommitLogScanGuard,
-    sources: VecDeque<ChangeFeedSourcePlan>,
-    current_source: Option<ActiveChangeFeedSource>,
+pub(super) struct ChangeFeedScanner {
+    pub(super) cursor: LogCursor,
+    pub(super) upper_bound: SequenceNumber,
+    pub(super) table_id: TableId,
+    pub(super) table: Table,
+    pub(super) remaining: Option<usize>,
+    pub(super) _scan_guard: CommitLogScanGuard,
+    pub(super) sources: VecDeque<ChangeFeedSourcePlan>,
+    pub(super) current_source: Option<ActiveChangeFeedSource>,
 }
 
-enum ActiveChangeFeedSource {
+pub(super) enum ActiveChangeFeedSource {
     Segment(ChangeFeedSegmentSource),
     BufferedRecords(ChangeFeedBufferedRecordsSource),
 }
 
-struct ChangeFeedSegmentSource {
-    scanner: SegmentRecordScanner,
-    pending: VecDeque<ChangeEntry>,
-    upper_bound_reached: bool,
+pub(super) struct ChangeFeedSegmentSource {
+    pub(super) scanner: SegmentRecordScanner,
+    pub(super) pending: VecDeque<ChangeEntry>,
+    pub(super) upper_bound_reached: bool,
 }
 
-struct ChangeFeedBufferedRecordsSource {
-    records: Arc<Vec<CommitRecord>>,
-    next_index: usize,
-    pending: VecDeque<ChangeEntry>,
-    upper_bound_reached: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedRemoteManifestBody {
-    format_version: u32,
-    generation: ManifestId,
-    last_flushed_sequence: SequenceNumber,
-    sstables: Vec<PersistedManifestSstable>,
-    commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
+pub(super) struct ChangeFeedBufferedRecordsSource {
+    pub(super) records: Arc<Vec<CommitRecord>>,
+    pub(super) next_index: usize,
+    pub(super) pending: VecDeque<ChangeEntry>,
+    pub(super) upper_bound_reached: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedRemoteManifestFile {
-    body: PersistedRemoteManifestBody,
-    checksum: u32,
+pub(super) struct PersistedRemoteManifestBody {
+    pub(super) format_version: u32,
+    pub(super) generation: ManifestId,
+    pub(super) last_flushed_sequence: SequenceNumber,
+    pub(super) sstables: Vec<PersistedManifestSstable>,
+    pub(super) commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct BackupObjectBirthRecord {
-    format_version: u32,
-    object_key: String,
-    first_uploaded_at_millis: u64,
+pub(super) struct PersistedRemoteManifestFile {
+    pub(super) body: PersistedRemoteManifestBody,
+    pub(super) checksum: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedRowSstableBody {
-    format_version: u32,
-    table_id: TableId,
-    level: u32,
-    local_id: String,
-    min_key: Key,
-    max_key: Key,
-    min_sequence: SequenceNumber,
-    max_sequence: SequenceNumber,
-    rows: Vec<SstableRow>,
-    data_checksum: u32,
+pub(super) struct BackupObjectBirthRecord {
+    pub(super) format_version: u32,
+    pub(super) object_key: String,
+    pub(super) first_uploaded_at_millis: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct PersistedRowSstableBody {
+    pub(super) format_version: u32,
+    pub(super) table_id: TableId,
+    pub(super) level: u32,
+    pub(super) local_id: String,
+    pub(super) min_key: Key,
+    pub(super) max_key: Key,
+    pub(super) min_sequence: SequenceNumber,
+    pub(super) max_sequence: SequenceNumber,
+    pub(super) rows: Vec<SstableRow>,
+    pub(super) data_checksum: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    user_key_bloom_filter: Option<UserKeyBloomFilter>,
+    pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedRowSstableFile {
-    body: PersistedRowSstableBody,
-    checksum: u32,
+pub(super) struct PersistedRowSstableFile {
+    pub(super) body: PersistedRowSstableBody,
+    pub(super) checksum: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum ColumnEncoding {
+pub(super) enum ColumnEncoding {
     Plain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum ColumnCompression {
+pub(super) enum ColumnCompression {
     None,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct ColumnarBlockLocation {
-    offset: u64,
-    length: u64,
+pub(super) struct ColumnarBlockLocation {
+    pub(super) offset: u64,
+    pub(super) length: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct PersistedColumnarColumnFooter {
-    field_id: FieldId,
+pub(super) struct PersistedColumnarColumnFooter {
+    pub(super) field_id: FieldId,
     #[serde(rename = "type")]
-    field_type: FieldType,
-    encoding: ColumnEncoding,
-    compression: ColumnCompression,
-    block: ColumnarBlockLocation,
+    pub(super) field_type: FieldType,
+    pub(super) encoding: ColumnEncoding,
+    pub(super) compression: ColumnCompression,
+    pub(super) block: ColumnarBlockLocation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedColumnarSstableFooter {
-    format_version: u32,
-    table_id: TableId,
-    level: u32,
-    local_id: String,
-    row_count: u64,
-    min_key: Key,
-    max_key: Key,
-    min_sequence: SequenceNumber,
-    max_sequence: SequenceNumber,
-    schema_version: u32,
-    data_checksum: u32,
-    key_index: ColumnarBlockLocation,
-    sequence_column: ColumnarBlockLocation,
-    tombstone_bitmap: ColumnarBlockLocation,
-    row_kind_column: ColumnarBlockLocation,
-    columns: Vec<PersistedColumnarColumnFooter>,
+pub(super) struct PersistedColumnarSstableFooter {
+    pub(super) format_version: u32,
+    pub(super) table_id: TableId,
+    pub(super) level: u32,
+    pub(super) local_id: String,
+    pub(super) row_count: u64,
+    pub(super) min_key: Key,
+    pub(super) max_key: Key,
+    pub(super) min_sequence: SequenceNumber,
+    pub(super) max_sequence: SequenceNumber,
+    pub(super) schema_version: u32,
+    pub(super) data_checksum: u32,
+    pub(super) key_index: ColumnarBlockLocation,
+    pub(super) sequence_column: ColumnarBlockLocation,
+    pub(super) tombstone_bitmap: ColumnarBlockLocation,
+    pub(super) row_kind_column: ColumnarBlockLocation,
+    pub(super) columns: Vec<PersistedColumnarColumnFooter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    user_key_bloom_filter: Option<UserKeyBloomFilter>,
+    pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct PersistedNullableColumn<T> {
-    present_bitmap: Vec<bool>,
-    values: Vec<T>,
+pub(super) struct PersistedNullableColumn<T> {
+    pub(super) present_bitmap: Vec<bool>,
+    pub(super) values: Vec<T>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct PersistedFloat64Column {
-    present_bitmap: Vec<bool>,
-    values_bits: Vec<u64>,
+pub(super) struct PersistedFloat64Column {
+    pub(super) present_bitmap: Vec<bool>,
+    pub(super) values_bits: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-enum PersistedColumnBlock {
+pub(super) enum PersistedColumnBlock {
     Int64(PersistedNullableColumn<i64>),
     Float64(PersistedFloat64Column),
     String(PersistedNullableColumn<String>),
@@ -679,95 +698,95 @@ enum PersistedColumnBlock {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompactionJobKind {
+pub(super) enum CompactionJobKind {
     Rewrite,
     DeleteOnly,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
-struct CompactionJob {
-    id: String,
-    table_id: TableId,
-    table_name: String,
-    source_level: u32,
-    target_level: u32,
-    kind: CompactionJobKind,
-    estimated_bytes: u64,
-    input_local_ids: Vec<String>,
+pub(super) struct CompactionJob {
+    pub(super) id: String,
+    pub(super) table_id: TableId,
+    pub(super) table_name: String,
+    pub(super) source_level: u32,
+    pub(super) target_level: u32,
+    pub(super) kind: CompactionJobKind,
+    pub(super) estimated_bytes: u64,
+    pub(super) input_local_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-struct OffloadJob {
-    id: String,
-    table_id: TableId,
-    table_name: String,
-    kind: OffloadJobKind,
-    input_local_ids: Vec<String>,
-    estimated_bytes: u64,
+pub(super) struct OffloadJob {
+    pub(super) id: String,
+    pub(super) table_id: TableId,
+    pub(super) table_name: String,
+    pub(super) kind: OffloadJobKind,
+    pub(super) input_local_ids: Vec<String>,
+    pub(super) estimated_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OffloadJobKind {
+pub(super) enum OffloadJobKind {
     Offload,
     Delete,
 }
 
 #[derive(Clone, Debug, Default)]
-struct TableCompactionState {
-    compaction_debt: u64,
-    next_job: Option<CompactionJob>,
+pub(super) struct TableCompactionState {
+    pub(super) compaction_debt: u64,
+    pub(super) next_job: Option<CompactionJob>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct CompactionFilterStats {
-    removed_bytes: u64,
-    removed_keys: u64,
+pub(super) struct CompactionFilterStats {
+    pub(super) removed_bytes: u64,
+    pub(super) removed_keys: u64,
 }
 
 #[derive(Clone, Debug)]
-enum PendingWorkSpec {
+pub(super) enum PendingWorkSpec {
     Flush,
     Compaction(CompactionJob),
     Offload(OffloadJob),
 }
 
 #[derive(Clone, Debug)]
-struct PendingWorkCandidate {
-    pending: PendingWork,
-    spec: PendingWorkSpec,
+pub(super) struct PendingWorkCandidate {
+    pub(super) pending: PendingWork,
+    pub(super) spec: PendingWorkSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct SstableRow {
-    key: Key,
-    sequence: SequenceNumber,
-    kind: ChangeKind,
-    value: Option<Value>,
+pub(super) struct SstableRow {
+    pub(super) key: Key,
+    pub(super) sequence: SequenceNumber,
+    pub(super) kind: ChangeKind,
+    pub(super) value: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
-struct CompactionRow {
-    level: u32,
-    row: SstableRow,
+pub(super) struct CompactionRow {
+    pub(super) level: u32,
+    pub(super) row: SstableRow,
 }
 
 #[derive(Clone, Debug, Default)]
-struct FilteredCompactionRows {
-    rows: Vec<CompactionRow>,
-    removed_bytes: u64,
-    removed_keys: u64,
+pub(super) struct FilteredCompactionRows {
+    pub(super) rows: Vec<CompactionRow>,
+    pub(super) removed_bytes: u64,
+    pub(super) removed_keys: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct UserKeyBloomFilter {
-    bits_per_key: u32,
-    hash_count: u32,
-    bytes: Vec<u8>,
+pub(super) struct UserKeyBloomFilter {
+    pub(super) bits_per_key: u32,
+    pub(super) hash_count: u32,
+    pub(super) bytes: Vec<u8>,
 }
 
 impl UserKeyBloomFilter {
-    fn build(rows: &[SstableRow], bits_per_key: Option<u32>) -> Option<Self> {
+    pub(super) fn build(rows: &[SstableRow], bits_per_key: Option<u32>) -> Option<Self> {
         let bits_per_key = bits_per_key?.max(1);
 
         let mut unique_keys = BTreeSet::new();
@@ -799,7 +818,7 @@ impl UserKeyBloomFilter {
         Some(filter)
     }
 
-    fn may_contain(&self, key: &[u8]) -> bool {
+    pub(super) fn may_contain(&self, key: &[u8]) -> bool {
         if self.bytes.is_empty() || self.hash_count == 0 {
             return true;
         }
@@ -818,7 +837,7 @@ impl UserKeyBloomFilter {
         true
     }
 
-    fn insert(&mut self, key: &[u8], total_bits: usize) {
+    pub(super) fn insert(&mut self, key: &[u8], total_bits: usize) {
         let (h1, h2) = bloom_hash_pair(key);
         for i in 0..self.hash_count {
             let bit_index = h1.wrapping_add((i as u64).wrapping_mul(h2)) % total_bits as u64;
@@ -830,48 +849,48 @@ impl UserKeyBloomFilter {
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedBatchOperation {
-    table_id: TableId,
-    table_name: String,
-    key: Key,
-    kind: ChangeKind,
-    value: Option<Value>,
+pub(super) struct ResolvedBatchOperation {
+    pub(super) table_id: TableId,
+    pub(super) table_name: String,
+    pub(super) key: Key,
+    pub(super) kind: ChangeKind,
+    pub(super) value: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct MergeCollapse {
-    sequence: SequenceNumber,
-    value: Value,
+pub(super) struct MergeCollapse {
+    pub(super) sequence: SequenceNumber,
+    pub(super) value: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct VisibleValueResolution {
-    value: Option<Value>,
-    collapse: Option<MergeCollapse>,
+pub(super) struct VisibleValueResolution {
+    pub(super) value: Option<Value>,
+    pub(super) collapse: Option<MergeCollapse>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-struct RowScanResult {
-    rows: Vec<(Key, Value)>,
-    collapses: Vec<(Key, MergeCollapse)>,
-    visited_key_groups: usize,
+pub(super) struct RowScanResult {
+    pub(super) rows: Vec<(Key, Value)>,
+    pub(super) collapses: Vec<(Key, MergeCollapse)>,
+    pub(super) visited_key_groups: usize,
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedReadSetEntry {
-    table_id: TableId,
-    key: Key,
-    at_sequence: SequenceNumber,
+pub(super) struct ResolvedReadSetEntry {
+    pub(super) table_id: TableId,
+    pub(super) key: Key,
+    pub(super) at_sequence: SequenceNumber,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct CommitConflictKey {
-    table_id: TableId,
-    key: Key,
+pub(super) struct CommitConflictKey {
+    pub(super) table_id: TableId,
+    pub(super) key: Key,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommitPhase {
+pub(super) enum CommitPhase {
     BeforeDurabilitySync,
     AfterBatchSeal,
     AfterDurabilitySync,
@@ -882,12 +901,16 @@ enum CommitPhase {
 }
 
 impl CommitPhase {
-    fn failpoint_name(self) -> &'static str {
+    pub(super) fn failpoint_name(self) -> &'static str {
         match self {
-            Self::BeforeDurabilitySync => crate::failpoints::names::DB_COMMIT_BEFORE_DURABILITY_SYNC,
+            Self::BeforeDurabilitySync => {
+                crate::failpoints::names::DB_COMMIT_BEFORE_DURABILITY_SYNC
+            }
             Self::AfterBatchSeal => crate::failpoints::names::DB_COMMIT_AFTER_BATCH_SEAL,
             Self::AfterDurabilitySync => crate::failpoints::names::DB_COMMIT_AFTER_DURABILITY_SYNC,
-            Self::BeforeMemtableInsert => crate::failpoints::names::DB_COMMIT_BEFORE_MEMTABLE_INSERT,
+            Self::BeforeMemtableInsert => {
+                crate::failpoints::names::DB_COMMIT_BEFORE_MEMTABLE_INSERT
+            }
             Self::AfterMemtableInsert => crate::failpoints::names::DB_COMMIT_AFTER_MEMTABLE_INSERT,
             Self::AfterVisibilityPublish => {
                 crate::failpoints::names::DB_COMMIT_AFTER_VISIBILITY_PUBLISH
@@ -899,14 +922,14 @@ impl CommitPhase {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompactionPhase {
+pub(super) enum CompactionPhase {
     OutputWritten,
     ManifestSwitched,
     InputCleanupFinished,
 }
 
 impl CompactionPhase {
-    fn failpoint_name(self) -> &'static str {
+    pub(super) fn failpoint_name(self) -> &'static str {
         match self {
             Self::OutputWritten => crate::failpoints::names::DB_COMPACTION_OUTPUT_WRITTEN,
             Self::ManifestSwitched => crate::failpoints::names::DB_COMPACTION_MANIFEST_SWITCHED,
@@ -919,14 +942,14 @@ impl CompactionPhase {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OffloadPhase {
+pub(super) enum OffloadPhase {
     UploadComplete,
     ManifestSwitched,
     LocalCleanupFinished,
 }
 
 impl OffloadPhase {
-    fn failpoint_name(self) -> &'static str {
+    pub(super) fn failpoint_name(self) -> &'static str {
         match self {
             Self::UploadComplete => crate::failpoints::names::DB_OFFLOAD_UPLOAD_COMPLETE,
             Self::ManifestSwitched => crate::failpoints::names::DB_OFFLOAD_MANIFEST_SWITCHED,
@@ -938,24 +961,24 @@ impl OffloadPhase {
 }
 
 #[cfg(test)]
-struct CommitPhaseBlocker {
-    handle: crate::failpoints::FailpointHandle,
+pub(super) struct CommitPhaseBlocker {
+    pub(super) handle: crate::failpoints::FailpointHandle,
 }
 
 #[cfg(test)]
-struct CompactionPhaseBlocker {
-    handle: crate::failpoints::FailpointHandle,
+pub(super) struct CompactionPhaseBlocker {
+    pub(super) handle: crate::failpoints::FailpointHandle,
 }
 
 #[cfg(test)]
 #[allow(dead_code)]
-struct OffloadPhaseBlocker {
-    handle: crate::failpoints::FailpointHandle,
+pub(super) struct OffloadPhaseBlocker {
+    pub(super) handle: crate::failpoints::FailpointHandle,
 }
 
 #[cfg(test)]
 impl CommitPhaseBlocker {
-    async fn sequence(&mut self) -> SequenceNumber {
+    pub(super) async fn sequence(&mut self) -> SequenceNumber {
         let hit = self.handle.next_hit().await;
         let value = hit
             .metadata
@@ -967,18 +990,18 @@ impl CommitPhaseBlocker {
         SequenceNumber::new(value)
     }
 
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         self.handle.release();
     }
 }
 
 #[cfg(test)]
 impl CompactionPhaseBlocker {
-    async fn wait_until_reached(&mut self) {
+    pub(super) async fn wait_until_reached(&mut self) {
         self.handle.wait_until_hit().await;
     }
 
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         self.handle.release();
     }
 }
@@ -986,38 +1009,38 @@ impl CompactionPhaseBlocker {
 #[cfg(test)]
 #[allow(dead_code)]
 impl OffloadPhaseBlocker {
-    async fn wait_until_reached(&mut self) {
+    pub(super) async fn wait_until_reached(&mut self) {
         self.handle.wait_until_hit().await;
     }
 
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         self.handle.release();
     }
 }
 
-struct CommitRuntime {
-    backend: CommitLogBackend,
+pub(super) struct CommitRuntime {
+    pub(super) backend: CommitLogBackend,
 }
 
 #[derive(Clone, Debug, Default)]
-struct RecoveredCommitLogState {
-    memtables: MemtableState,
-    max_sequence: SequenceNumber,
+pub(super) struct RecoveredCommitLogState {
+    pub(super) memtables: MemtableState,
+    pub(super) max_sequence: SequenceNumber,
 }
 
-enum CommitLogBackend {
+pub(super) enum CommitLogBackend {
     Local(Box<SegmentManager>),
     Memory(MemoryCommitLog),
 }
 
-struct MemoryCommitLog {
-    records: Arc<Vec<CommitRecord>>,
-    durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
-    next_segment_id: u64,
+pub(super) struct MemoryCommitLog {
+    pub(super) records: Arc<Vec<CommitRecord>>,
+    pub(super) durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
+    pub(super) next_segment_id: u64,
 }
 
 impl MemoryCommitLog {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             records: Arc::new(Vec::new()),
             durable_commit_log_segments: Vec::new(),
@@ -1027,7 +1050,7 @@ impl MemoryCommitLog {
 }
 
 impl ChangeFeedScanner {
-    fn new(
+    pub(super) fn new(
         table_id: TableId,
         table: Table,
         cursor: LogCursor,
@@ -1048,7 +1071,7 @@ impl ChangeFeedScanner {
         }
     }
 
-    async fn next_change(&mut self) -> Result<Option<ChangeEntry>, StorageError> {
+    pub(super) async fn next_change(&mut self) -> Result<Option<ChangeEntry>, StorageError> {
         if matches!(self.remaining, Some(0)) {
             return Ok(None);
         }
@@ -1086,7 +1109,7 @@ impl ChangeFeedScanner {
         }
     }
 
-    async fn load_source(
+    pub(super) async fn load_source(
         &self,
         source: ChangeFeedSourcePlan,
     ) -> Result<Option<ActiveChangeFeedSource>, StorageError> {
@@ -1152,7 +1175,7 @@ impl ChangeFeedScanner {
 }
 
 impl ActiveChangeFeedSource {
-    fn next_change(
+    pub(super) fn next_change(
         &mut self,
         table_id: TableId,
         table: &Table,
@@ -1167,7 +1190,7 @@ impl ActiveChangeFeedSource {
         }
     }
 
-    fn reached_upper_bound(&self) -> bool {
+    pub(super) fn reached_upper_bound(&self) -> bool {
         match self {
             Self::Segment(source) => source.upper_bound_reached,
             Self::BufferedRecords(source) => source.upper_bound_reached,
@@ -1176,7 +1199,7 @@ impl ActiveChangeFeedSource {
 }
 
 impl ChangeFeedSegmentSource {
-    fn next_change(
+    pub(super) fn next_change(
         &mut self,
         table_id: TableId,
         table: &Table,
@@ -1210,7 +1233,7 @@ impl ChangeFeedSegmentSource {
 }
 
 impl ChangeFeedBufferedRecordsSource {
-    fn new(records: Arc<Vec<CommitRecord>>, cursor_sequence: SequenceNumber) -> Self {
+    pub(super) fn new(records: Arc<Vec<CommitRecord>>, cursor_sequence: SequenceNumber) -> Self {
         let next_index = records
             .iter()
             .position(|record| record.sequence() >= cursor_sequence)
@@ -1223,7 +1246,7 @@ impl ChangeFeedBufferedRecordsSource {
         }
     }
 
-    fn next_change(
+    pub(super) fn next_change(
         &mut self,
         table_id: TableId,
         table: &Table,
@@ -1257,7 +1280,7 @@ impl ChangeFeedBufferedRecordsSource {
     }
 }
 
-fn change_entries_for_record(
+pub(super) fn change_entries_for_record(
     record: CommitRecord,
     table_id: TableId,
     table: &Table,
@@ -1288,7 +1311,7 @@ fn change_entries_for_record(
         .collect()
 }
 
-fn pinned_segment_ids(sources: &VecDeque<ChangeFeedSourcePlan>) -> Vec<SegmentId> {
+pub(super) fn pinned_segment_ids(sources: &VecDeque<ChangeFeedSourcePlan>) -> Vec<SegmentId> {
     sources
         .iter()
         .filter_map(|source| match source {
@@ -1300,7 +1323,9 @@ fn pinned_segment_ids(sources: &VecDeque<ChangeFeedSourcePlan>) -> Vec<SegmentId
         .collect()
 }
 
-async fn read_change_feed_file(plan: &LocalSegmentScanPlan) -> Result<Vec<u8>, StorageError> {
+pub(super) async fn read_change_feed_file(
+    plan: &LocalSegmentScanPlan,
+) -> Result<Vec<u8>, StorageError> {
     let handle = FileHandle::new(&plan.path);
     let mut bytes = Vec::new();
     let mut offset = 0_u64;
@@ -1348,7 +1373,7 @@ async fn read_change_feed_file(plan: &LocalSegmentScanPlan) -> Result<Vec<u8>, S
 }
 
 impl CommitRuntime {
-    async fn append(&mut self, record: CommitRecord) -> Result<(), StorageError> {
+    pub(super) async fn append(&mut self, record: CommitRecord) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => {
                 manager.append(record).await?;
@@ -1361,7 +1386,10 @@ impl CommitRuntime {
         Ok(())
     }
 
-    async fn append_group_batch(&mut self, records: &[CommitRecord]) -> Result<(), StorageError> {
+    pub(super) async fn append_group_batch(
+        &mut self,
+        records: &[CommitRecord],
+    ) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => manager.append_batch_and_sync(records).await,
             CommitLogBackend::Memory(log) => {
@@ -1371,14 +1399,14 @@ impl CommitRuntime {
         }
     }
 
-    async fn sync(&mut self) -> Result<(), StorageError> {
+    pub(super) async fn sync(&mut self) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => manager.sync_active().await,
             CommitLogBackend::Memory(_) => Ok(()),
         }
     }
 
-    async fn maybe_seal_active(&mut self) -> Result<(), StorageError> {
+    pub(super) async fn maybe_seal_active(&mut self) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => {
                 manager.seal_active().await?;
@@ -1388,7 +1416,7 @@ impl CommitRuntime {
         }
     }
 
-    async fn prune_segments_before(
+    pub(super) async fn prune_segments_before(
         &mut self,
         sequence_exclusive: SequenceNumber,
         protected_segments: &BTreeSet<SegmentId>,
@@ -1404,7 +1432,7 @@ impl CommitRuntime {
         }
     }
 
-    async fn recover_after(
+    pub(super) async fn recover_after(
         &self,
         after_sequence: SequenceNumber,
     ) -> Result<RecoveredCommitLogState, StorageError> {
@@ -1425,7 +1453,7 @@ impl CommitRuntime {
         Ok(recovered)
     }
 
-    fn change_feed_scan_plan(
+    pub(super) fn change_feed_scan_plan(
         &self,
         table_id: TableId,
         sequence_inclusive: SequenceNumber,
@@ -1465,7 +1493,7 @@ impl CommitRuntime {
         }
     }
 
-    fn oldest_sequence_for_table(&self, table_id: TableId) -> Option<SequenceNumber> {
+    pub(super) fn oldest_sequence_for_table(&self, table_id: TableId) -> Option<SequenceNumber> {
         match &self.backend {
             CommitLogBackend::Local(manager) => manager.oldest_sequence_for_table(table_id),
             CommitLogBackend::Memory(log) => {
@@ -1493,7 +1521,7 @@ impl CommitRuntime {
         }
     }
 
-    fn oldest_segment_id(&self) -> Option<SegmentId> {
+    pub(super) fn oldest_segment_id(&self) -> Option<SegmentId> {
         match &self.backend {
             CommitLogBackend::Local(manager) => manager.oldest_segment_id(),
             CommitLogBackend::Memory(log) => log
@@ -1507,7 +1535,7 @@ impl CommitRuntime {
     }
 
     #[cfg(test)]
-    fn enumerate_segments(&self) -> Vec<crate::engine::commit_log::SegmentDescriptor> {
+    pub(super) fn enumerate_segments(&self) -> Vec<crate::engine::commit_log::SegmentDescriptor> {
         match &self.backend {
             CommitLogBackend::Local(manager) => manager.enumerate_segments(),
             CommitLogBackend::Memory(log) => {
@@ -1564,48 +1592,51 @@ impl CommitRuntime {
 }
 
 #[derive(Default)]
-struct CommitCoordinator {
-    keys: BTreeMap<CommitConflictKey, BTreeSet<SequenceNumber>>,
-    sequences: BTreeMap<SequenceNumber, SequenceCommitState>,
-    current_batch: Option<Arc<GroupCommitBatch>>,
-    pending_failed_tail: Option<PendingFailedTail>,
+pub(super) struct CommitCoordinator {
+    pub(super) keys: BTreeMap<CommitConflictKey, BTreeSet<SequenceNumber>>,
+    pub(super) sequences: BTreeMap<SequenceNumber, SequenceCommitState>,
+    pub(super) current_batch: Option<Arc<GroupCommitBatch>>,
+    pub(super) pending_failed_tail: Option<PendingFailedTail>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct SequenceCommitState {
-    touched_tables: BTreeSet<String>,
-    conflict_keys: Vec<CommitConflictKey>,
-    group_batch: Option<Arc<GroupCommitBatch>>,
-    memtable_inserted: bool,
-    durable_confirmed: bool,
-    visible_published: bool,
-    durable_published: bool,
-    aborted: bool,
+pub(super) struct SequenceCommitState {
+    pub(super) touched_tables: BTreeSet<String>,
+    pub(super) conflict_keys: Vec<CommitConflictKey>,
+    pub(super) group_batch: Option<Arc<GroupCommitBatch>>,
+    pub(super) memtable_inserted: bool,
+    pub(super) durable_confirmed: bool,
+    pub(super) visible_published: bool,
+    pub(super) durable_published: bool,
+    pub(super) aborted: bool,
 }
 
 #[derive(Clone, Debug)]
-struct PendingFailedTail {
-    start_sequence: SequenceNumber,
-    error: StorageError,
+pub(super) struct PendingFailedTail {
+    pub(super) start_sequence: SequenceNumber,
+    pub(super) error: StorageError,
 }
 
 #[derive(Debug)]
-struct GroupCommitBatch {
-    first_sequence: SequenceNumber,
-    predecessor: Option<Arc<GroupCommitBatch>>,
-    state: Mutex<GroupCommitBatchState>,
-    notify: Notify,
+pub(super) struct GroupCommitBatch {
+    pub(super) first_sequence: SequenceNumber,
+    pub(super) predecessor: Option<Arc<GroupCommitBatch>>,
+    pub(super) state: Mutex<GroupCommitBatchState>,
+    pub(super) notify: Notify,
 }
 
 #[derive(Clone, Debug, Default)]
-struct GroupCommitBatchState {
-    sealed: bool,
-    records: Vec<CommitRecord>,
-    result: Option<Result<(), StorageError>>,
+pub(super) struct GroupCommitBatchState {
+    pub(super) sealed: bool,
+    pub(super) records: Vec<CommitRecord>,
+    pub(super) result: Option<Result<(), StorageError>>,
 }
 
 impl GroupCommitBatch {
-    fn new(first_sequence: SequenceNumber, predecessor: Option<Arc<GroupCommitBatch>>) -> Self {
+    pub(super) fn new(
+        first_sequence: SequenceNumber,
+        predecessor: Option<Arc<GroupCommitBatch>>,
+    ) -> Self {
         Self {
             first_sequence,
             predecessor,
@@ -1614,31 +1645,31 @@ impl GroupCommitBatch {
         }
     }
 
-    fn first_sequence(&self) -> SequenceNumber {
+    pub(super) fn first_sequence(&self) -> SequenceNumber {
         self.first_sequence
     }
 
-    fn is_open(&self) -> bool {
+    pub(super) fn is_open(&self) -> bool {
         !mutex_lock(&self.state).sealed
     }
 
-    fn result(&self) -> Option<Result<(), StorageError>> {
+    pub(super) fn result(&self) -> Option<Result<(), StorageError>> {
         mutex_lock(&self.state).result.clone()
     }
 
-    fn stage_record(&self, record: CommitRecord) {
+    pub(super) fn stage_record(&self, record: CommitRecord) {
         mutex_lock(&self.state).records.push(record);
     }
 
-    fn staged_records(&self) -> Vec<CommitRecord> {
+    pub(super) fn staged_records(&self) -> Vec<CommitRecord> {
         mutex_lock(&self.state).records.clone()
     }
 
-    fn predecessor(&self) -> Option<Arc<GroupCommitBatch>> {
+    pub(super) fn predecessor(&self) -> Option<Arc<GroupCommitBatch>> {
         self.predecessor.clone()
     }
 
-    fn finish(&self, result: Result<(), StorageError>) {
+    pub(super) fn finish(&self, result: Result<(), StorageError>) {
         let mut state = mutex_lock(&self.state);
         if state.result.is_none() {
             state.result = Some(result);
@@ -1647,7 +1678,7 @@ impl GroupCommitBatch {
         }
     }
 
-    async fn await_result(&self) -> Result<(), StorageError> {
+    pub(super) async fn await_result(&self) -> Result<(), StorageError> {
         loop {
             let notified = self.notify.notified();
             if let Some(result) = self.result() {
@@ -1658,25 +1689,25 @@ impl GroupCommitBatch {
     }
 }
 
-struct CommitParticipant {
-    sequence: SequenceNumber,
-    operations: Vec<ResolvedBatchOperation>,
-    group_batch: Option<Arc<GroupCommitBatch>>,
+pub(super) struct CommitParticipant {
+    pub(super) sequence: SequenceNumber,
+    pub(super) operations: Vec<ResolvedBatchOperation>,
+    pub(super) group_batch: Option<Arc<GroupCommitBatch>>,
 }
 
 #[derive(Default)]
-struct CommitLogScanRegistry {
-    pinned_segments: BTreeMap<SegmentId, u64>,
+pub(super) struct CommitLogScanRegistry {
+    pub(super) pinned_segments: BTreeMap<SegmentId, u64>,
 }
 
 impl CommitLogScanRegistry {
-    fn register(&mut self, segment_ids: &[SegmentId]) {
+    pub(super) fn register(&mut self, segment_ids: &[SegmentId]) {
         for &segment_id in segment_ids {
             *self.pinned_segments.entry(segment_id).or_default() += 1;
         }
     }
 
-    fn release(&mut self, segment_ids: &[SegmentId]) {
+    pub(super) fn release(&mut self, segment_ids: &[SegmentId]) {
         for &segment_id in segment_ids {
             let std::collections::btree_map::Entry::Occupied(mut entry) =
                 self.pinned_segments.entry(segment_id)
@@ -1692,14 +1723,14 @@ impl CommitLogScanRegistry {
         }
     }
 
-    fn pinned_segments(&self) -> BTreeSet<SegmentId> {
+    pub(super) fn pinned_segments(&self) -> BTreeSet<SegmentId> {
         self.pinned_segments.keys().copied().collect()
     }
 }
 
-struct CommitLogScanGuard {
-    db: Weak<DbInner>,
-    segment_ids: Vec<SegmentId>,
+pub(super) struct CommitLogScanGuard {
+    pub(super) db: Weak<DbInner>,
+    pub(super) segment_ids: Vec<SegmentId>,
 }
 
 impl Drop for CommitLogScanGuard {

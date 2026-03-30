@@ -1,13 +1,15 @@
+use super::*;
+
 #[derive(Clone)]
 pub struct Snapshot {
-    registration: Arc<SnapshotRegistration>,
+    pub(super) registration: Arc<SnapshotRegistration>,
 }
 
-struct SnapshotRegistration {
-    db: Db,
-    id: u64,
-    sequence: SequenceNumber,
-    released: AtomicBool,
+pub(super) struct SnapshotRegistration {
+    pub(super) db: Db,
+    pub(super) id: u64,
+    pub(super) sequence: SequenceNumber,
+    pub(super) released: AtomicBool,
 }
 
 impl Snapshot {

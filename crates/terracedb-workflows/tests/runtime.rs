@@ -10,7 +10,7 @@ use terracedb::{
     StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table,
     TieredDurabilityMode, Timestamp, Value,
     test_support::{
-        FailpointMode, db_failpoint_registry, failpoint_names, row_table_config, test_dependencies,
+        FailpointMode, db_failpoint_registry, row_table_config, test_dependencies,
         test_dependencies_with_clock, tiered_test_config_with_durability,
     },
 };
@@ -23,6 +23,7 @@ use terracedb_workflows::{
     RecurringWorkflowRuntime, RecurringWorkflowState, WorkflowContext, WorkflowDefinition,
     WorkflowError, WorkflowHandle, WorkflowHandler, WorkflowHandlerError, WorkflowOutput,
     WorkflowProgressMode, WorkflowRuntime, WorkflowStateMutation, WorkflowTimerCommand,
+    failpoints::names as workflow_failpoint_names,
 };
 
 const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(600);
@@ -319,7 +320,7 @@ async fn callback_admission_failpoint_surfaces_storage_error_before_commit() {
     .expect("open workflow runtime");
 
     db_failpoint_registry(&db).arm_error(
-        failpoint_names::WORKFLOW_CALLBACK_ADMISSION_BEFORE_COMMIT,
+        workflow_failpoint_names::WORKFLOW_CALLBACK_ADMISSION_BEFORE_COMMIT,
         StorageError::io("simulated workflow failpoint"),
         FailpointMode::Once,
     );

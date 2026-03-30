@@ -1,3 +1,5 @@
+use super::*;
+
 impl Db {
     /// Returns a synchronous handle lookup for an already-created table.
     ///
@@ -85,7 +87,7 @@ impl Db {
         self.register_snapshot(sequence)
     }
 
-    fn register_snapshot(&self, sequence: SequenceNumber) -> Snapshot {
+    pub(super) fn register_snapshot(&self, sequence: SequenceNumber) -> Snapshot {
         let registration_id = self.inner.next_snapshot_id.fetch_add(1, Ordering::SeqCst) + 1;
         mutex_lock(&self.inner.snapshot_tracker).register(registration_id, sequence);
 
@@ -274,7 +276,10 @@ impl Db {
         self.flush_internal(true).await
     }
 
-    async fn flush_internal(&self, _allow_scheduler_follow_up: bool) -> Result<(), FlushError> {
+    pub(super) async fn flush_internal(
+        &self,
+        _allow_scheduler_follow_up: bool,
+    ) -> Result<(), FlushError> {
         let span = tracing::info_span!("terracedb.db.flush");
         apply_db_span_attributes(
             &span,
@@ -332,9 +337,13 @@ impl Db {
                         Self::sort_live_sstables(&mut new_live);
                         manifest_generation =
                             ManifestId::new(manifest_generation.get().saturating_add(1));
-                        self.install_manifest(manifest_generation, immutable.max_sequence, &new_live)
-                            .await
-                            .map_err(FlushError::Storage)?;
+                        self.install_manifest(
+                            manifest_generation,
+                            immutable.max_sequence,
+                            &new_live,
+                        )
+                        .await
+                        .map_err(FlushError::Storage)?;
                         flushed_count += 1;
                     }
 
@@ -344,9 +353,8 @@ impl Db {
 
                         sstable_state.live = new_live;
                         sstable_state.manifest_generation = manifest_generation;
-                        sstable_state.last_flushed_sequence = sstable_state
-                            .last_flushed_sequence
-                            .max(
+                        sstable_state.last_flushed_sequence =
+                            sstable_state.last_flushed_sequence.max(
                                 immutables
                                     .iter()
                                     .take(flushed_count)
@@ -662,7 +670,7 @@ impl Db {
             .collect()
     }
 
-    async fn apply_write_backpressure(
+    pub(super) async fn apply_write_backpressure(
         &self,
         operations: &[ResolvedBatchOperation],
     ) -> Result<(), CommitError> {
@@ -738,25 +746,25 @@ impl Db {
         Ok(())
     }
 
-    fn memtable_budget_bytes(&self) -> Option<u64> {
+    pub(super) fn memtable_budget_bytes(&self) -> Option<u64> {
         match &self.inner.config.storage {
             StorageConfig::Tiered(config) => Some(config.max_local_bytes),
             StorageConfig::S3Primary(_) => None,
         }
     }
 
-    fn local_sstable_budget_bytes(&self) -> Option<u64> {
+    pub(super) fn local_sstable_budget_bytes(&self) -> Option<u64> {
         self.memtable_budget_bytes()
     }
 
-    fn local_sstable_retention(&self) -> TieredLocalRetentionMode {
+    pub(super) fn local_sstable_retention(&self) -> TieredLocalRetentionMode {
         match &self.inner.config.storage {
             StorageConfig::Tiered(config) => config.local_retention,
             StorageConfig::S3Primary(_) => TieredLocalRetentionMode::Offload,
         }
     }
 
-    fn memtable_budget_exceeded_by(&self, additional_bytes: u64) -> bool {
+    pub(super) fn memtable_budget_exceeded_by(&self, additional_bytes: u64) -> bool {
         self.memtable_budget_bytes().is_some_and(|budget| {
             self.memtables_read()
                 .total_pending_flush_bytes()
@@ -765,7 +773,7 @@ impl Db {
         })
     }
 
-    fn estimated_batch_bytes_by_table(
+    pub(super) fn estimated_batch_bytes_by_table(
         operations: &[ResolvedBatchOperation],
     ) -> BTreeMap<TableId, u64> {
         let mut bytes_by_table = BTreeMap::new();
@@ -779,7 +787,7 @@ impl Db {
         bytes_by_table
     }
 
-    fn estimated_operation_size_bytes(operation: &ResolvedBatchOperation) -> u64 {
+    pub(super) fn estimated_operation_size_bytes(operation: &ResolvedBatchOperation) -> u64 {
         (operation.key.len()
             + encode_mvcc_key(&operation.key, CommitId::new(SequenceNumber::default())).len()
             + operation
@@ -789,7 +797,7 @@ impl Db {
                 .unwrap_or_default()) as u64
     }
 
-    fn throttle_delay(bytes: u64, max_write_bytes_per_second: u64) -> Duration {
+    pub(super) fn throttle_delay(bytes: u64, max_write_bytes_per_second: u64) -> Duration {
         if bytes == 0 || max_write_bytes_per_second == 0 {
             return Duration::ZERO;
         }
@@ -799,18 +807,18 @@ impl Db {
         Duration::from_millis(millis)
     }
 
-    fn flush_error_into_storage(error: FlushError) -> StorageError {
+    pub(super) fn flush_error_into_storage(error: FlushError) -> StorageError {
         match error {
             FlushError::Storage(error) => error,
             FlushError::Unimplemented(message) => StorageError::unsupported(message),
         }
     }
 
-    fn missing_table_error(name: &str) -> StorageError {
+    pub(super) fn missing_table_error(name: &str) -> StorageError {
         StorageError::not_found(format!("table does not exist: {name}"))
     }
 
-    fn resolve_read_set_entries(
+    pub(super) fn resolve_read_set_entries(
         &self,
         read_set: Option<&ReadSet>,
     ) -> Result<Vec<ResolvedReadSetEntry>, CommitError> {
@@ -830,7 +838,10 @@ impl Db {
             .collect()
     }
 
-    fn check_read_conflicts(&self, read_set: &[ResolvedReadSetEntry]) -> Result<(), CommitError> {
+    pub(super) fn check_read_conflicts(
+        &self,
+        read_set: &[ResolvedReadSetEntry],
+    ) -> Result<(), CommitError> {
         let coordinator = mutex_lock(&self.inner.commit_coordinator);
         for entry in read_set {
             let conflict_key = CommitConflictKey {
@@ -850,7 +861,7 @@ impl Db {
         Ok(())
     }
 
-    fn build_commit_record(
+    pub(super) fn build_commit_record(
         sequence: SequenceNumber,
         operations: &[ResolvedBatchOperation],
         operation_context: Option<OperationContext>,
@@ -881,7 +892,7 @@ impl Db {
         })
     }
 
-    fn register_commit(
+    pub(super) fn register_commit(
         &self,
         sequence: SequenceNumber,
         operations: Vec<ResolvedBatchOperation>,
@@ -945,7 +956,7 @@ impl Db {
         }
     }
 
-    fn mark_memtable_inserted(&self, sequence: SequenceNumber) {
+    pub(super) fn mark_memtable_inserted(&self, sequence: SequenceNumber) {
         if let Some(state) = mutex_lock(&self.inner.commit_coordinator)
             .sequences
             .get_mut(&sequence)
@@ -954,7 +965,7 @@ impl Db {
         }
     }
 
-    fn mark_durable_confirmed(&self, sequence: SequenceNumber) {
+    pub(super) fn mark_durable_confirmed(&self, sequence: SequenceNumber) {
         if let Some(state) = mutex_lock(&self.inner.commit_coordinator)
             .sequences
             .get_mut(&sequence)
@@ -963,7 +974,7 @@ impl Db {
         }
     }
 
-    fn mark_all_commits_durable(&self) {
+    pub(super) fn mark_all_commits_durable(&self) {
         let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
         for state in coordinator.sequences.values_mut() {
             if !state.aborted {
@@ -972,7 +983,7 @@ impl Db {
         }
     }
 
-    fn mark_commits_durable_through(&self, upper_bound: SequenceNumber) {
+    pub(super) fn mark_commits_durable_through(&self, upper_bound: SequenceNumber) {
         let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
         for (&sequence, state) in coordinator.sequences.iter_mut() {
             if !state.aborted && sequence <= upper_bound {
@@ -981,7 +992,11 @@ impl Db {
         }
     }
 
-    fn note_failed_provisional_tail(&self, start_sequence: SequenceNumber, error: StorageError) {
+    pub(super) fn note_failed_provisional_tail(
+        &self,
+        start_sequence: SequenceNumber,
+        error: StorageError,
+    ) {
         let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
         match coordinator.pending_failed_tail.as_ref() {
             Some(pending) if pending.start_sequence <= start_sequence => {}
@@ -994,7 +1009,7 @@ impl Db {
         }
     }
 
-    fn pending_failed_provisional_tail_error(
+    pub(super) fn pending_failed_provisional_tail_error(
         &self,
         sequence: SequenceNumber,
     ) -> Option<StorageError> {
@@ -1005,7 +1020,7 @@ impl Db {
             .map(|pending| pending.error.clone())
     }
 
-    async fn resolve_failed_provisional_tail_locked(&self) -> Result<(), StorageError> {
+    pub(super) async fn resolve_failed_provisional_tail_locked(&self) -> Result<(), StorageError> {
         let (pending, affected_sequences, affected_batches) = {
             let coordinator = mutex_lock(&self.inner.commit_coordinator);
             let Some(pending) = coordinator.pending_failed_tail.clone() else {
@@ -1073,7 +1088,7 @@ impl Db {
         Ok(())
     }
 
-    async fn await_group_commit(
+    pub(super) async fn await_group_commit(
         &self,
         batch: Arc<GroupCommitBatch>,
         sequence: SequenceNumber,
@@ -1138,7 +1153,7 @@ impl Db {
         }
     }
 
-    fn publish_watermarks(&self) {
+    pub(super) fn publish_watermarks(&self) {
         let advance = {
             let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
             let mut advance = WatermarkAdvance::default();
@@ -1223,7 +1238,7 @@ impl Db {
         self.notify_table_sequences(&self.inner.durable_watchers, &advance.durable_tables);
     }
 
-    fn record_table_notifications(
+    pub(super) fn record_table_notifications(
         notifications: &mut BTreeMap<String, SequenceNumber>,
         tables: &BTreeSet<String>,
         sequence: SequenceNumber,
@@ -1233,7 +1248,7 @@ impl Db {
         }
     }
 
-    fn notify_table_sequences(
+    pub(super) fn notify_table_sequences(
         &self,
         watchers: &Arc<WatermarkRegistry>,
         updates: &BTreeMap<String, SequenceNumber>,
@@ -1241,7 +1256,7 @@ impl Db {
         watchers.notify(updates);
     }
 
-    fn durable_on_commit(&self) -> bool {
+    pub(super) fn durable_on_commit(&self) -> bool {
         matches!(
             &self.inner.config.storage,
             StorageConfig::Tiered(TieredStorageConfig {
@@ -1251,7 +1266,7 @@ impl Db {
         )
     }
 
-    async fn scan_change_feed(
+    pub(super) async fn scan_change_feed(
         &self,
         table: &Table,
         cursor: LogCursor,
@@ -1321,71 +1336,78 @@ impl Db {
                 scan_guard,
                 sources,
             );
-            Ok(Box::pin(stream::try_unfold(
-                scanner,
-                |mut scanner| async move {
+            Ok(
+                Box::pin(stream::try_unfold(scanner, |mut scanner| async move {
                     match scanner.next_change().await? {
                         Some(entry) => Ok(Some((entry, scanner))),
                         None => Ok(None),
                     }
-                },
-            )) as ChangeStream)
+                })) as ChangeStream,
+            )
         }
         .instrument(span.clone())
         .await
     }
 
     #[cfg(test)]
-    fn block_next_commit_phase(&self, phase: CommitPhase) -> CommitPhaseBlocker {
+    pub(super) fn block_next_commit_phase(&self, phase: CommitPhase) -> CommitPhaseBlocker {
         CommitPhaseBlocker {
-            handle: self
-                .inner
-                .dependencies
-                .__failpoint_registry()
-                .arm_pause(phase.failpoint_name(), crate::failpoints::FailpointMode::Once),
+            handle: self.inner.dependencies.__failpoint_registry().arm_pause(
+                phase.failpoint_name(),
+                crate::failpoints::FailpointMode::Once,
+            ),
         }
     }
 
     #[cfg(test)]
-    fn block_next_compaction_phase(&self, phase: CompactionPhase) -> CompactionPhaseBlocker {
+    pub(super) fn block_next_compaction_phase(
+        &self,
+        phase: CompactionPhase,
+    ) -> CompactionPhaseBlocker {
         CompactionPhaseBlocker {
-            handle: self
-                .inner
-                .dependencies
-                .__failpoint_registry()
-                .arm_pause(phase.failpoint_name(), crate::failpoints::FailpointMode::Once),
+            handle: self.inner.dependencies.__failpoint_registry().arm_pause(
+                phase.failpoint_name(),
+                crate::failpoints::FailpointMode::Once,
+            ),
         }
     }
 
     #[cfg(test)]
-    fn block_next_offload_phase(&self, phase: OffloadPhase) -> OffloadPhaseBlocker {
+    pub(super) fn block_next_offload_phase(&self, phase: OffloadPhase) -> OffloadPhaseBlocker {
         OffloadPhaseBlocker {
-            handle: self
-                .inner
-                .dependencies
-                .__failpoint_registry()
-                .arm_pause(phase.failpoint_name(), crate::failpoints::FailpointMode::Once),
+            handle: self.inner.dependencies.__failpoint_registry().arm_pause(
+                phase.failpoint_name(),
+                crate::failpoints::FailpointMode::Once,
+            ),
         }
     }
 
-    async fn maybe_pause_commit_phase(
+    pub(super) async fn maybe_pause_commit_phase(
         &self,
         phase: CommitPhase,
         sequence: SequenceNumber,
     ) -> Result<(), StorageError> {
         let metadata = BTreeMap::from([("sequence".to_string(), sequence.get().to_string())]);
-        let _ = self.__run_failpoint(phase.failpoint_name(), metadata).await?;
+        let _ = self
+            .__run_failpoint(phase.failpoint_name(), metadata)
+            .await?;
         Ok(())
     }
 
-    async fn maybe_pause_compaction_phase(&self, phase: CompactionPhase) -> Result<(), StorageError> {
+    pub(super) async fn maybe_pause_compaction_phase(
+        &self,
+        phase: CompactionPhase,
+    ) -> Result<(), StorageError> {
         let _ = self
             .__run_failpoint(phase.failpoint_name(), BTreeMap::new())
             .await?;
         Ok(())
     }
 
-    async fn maybe_pause_offload_phase(&self, phase: OffloadPhase) -> Result<(), StorageError> {
+    pub(super) async fn maybe_pause_offload_phase(
+        &self,
+        phase: OffloadPhase,
+    ) -> Result<(), StorageError> {
         let _ = self
             .__run_failpoint(phase.failpoint_name(), BTreeMap::new())
             .await?;
@@ -1411,7 +1433,7 @@ impl Db {
         self.__failpoint_registry().trigger(name, metadata).await
     }
 
-    fn resolve_batch_operations(
+    pub(super) fn resolve_batch_operations(
         &self,
         operations: &[BatchOperation],
     ) -> Result<Vec<ResolvedBatchOperation>, CommitError> {
@@ -1468,12 +1490,12 @@ impl Db {
             .collect()
     }
 
-    fn resolve_stored_table(&self, table: &Table) -> Option<StoredTable> {
+    pub(super) fn resolve_stored_table(&self, table: &Table) -> Option<StoredTable> {
         let table_id = self.resolve_table_id(table)?;
         Self::stored_table_by_id(&self.tables_read(), table_id).cloned()
     }
 
-    fn resolve_table_id(&self, table: &Table) -> Option<TableId> {
+    pub(super) fn resolve_table_id(&self, table: &Table) -> Option<TableId> {
         let tables = self.tables_read();
         let stored = tables.get(table.name())?;
         if let Some(id) = table.id
@@ -1484,7 +1506,7 @@ impl Db {
         Some(stored.id)
     }
 
-    fn register_commit_log_scan(&self, segment_ids: &[SegmentId]) -> CommitLogScanGuard {
+    pub(super) fn register_commit_log_scan(&self, segment_ids: &[SegmentId]) -> CommitLogScanGuard {
         mutex_lock(&self.inner.commit_log_scans).register(segment_ids);
         CommitLogScanGuard {
             db: Arc::downgrade(&self.inner),
@@ -1492,28 +1514,28 @@ impl Db {
         }
     }
 
-    fn stored_table_by_id(
+    pub(super) fn stored_table_by_id(
         tables: &BTreeMap<String, StoredTable>,
         table_id: TableId,
     ) -> Option<&StoredTable> {
         tables.values().find(|stored| stored.id == table_id)
     }
 
-    fn max_merge_operand_chain_length(config: &TableConfig) -> usize {
+    pub(super) fn max_merge_operand_chain_length(config: &TableConfig) -> usize {
         config
             .max_merge_operand_chain_length
             .map(|limit| limit.max(1) as usize)
             .unwrap_or(DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH)
     }
 
-    fn visible_row_priority(kind: ChangeKind) -> u8 {
+    pub(super) fn visible_row_priority(kind: ChangeKind) -> u8 {
         match kind {
             ChangeKind::Merge => 1,
             ChangeKind::Put | ChangeKind::Delete => 0,
         }
     }
 
-    fn collapse_merge_operands(
+    pub(super) fn collapse_merge_operands(
         operator: &dyn crate::config::MergeOperator,
         key: &[u8],
         operands: &[Value],
@@ -1538,7 +1560,7 @@ impl Db {
         Ok(collapsed)
     }
 
-    fn resolve_visible_value_with_state(
+    pub(super) fn resolve_visible_value_with_state(
         tables: &BTreeMap<String, StoredTable>,
         memtables: &MemtableState,
         sstables: &SstableState,
@@ -1555,7 +1577,7 @@ impl Db {
         Self::resolve_visible_value_from_rows(table, key, &rows)
     }
 
-    fn resolve_visible_value_from_rows(
+    pub(super) fn resolve_visible_value_from_rows(
         table: &StoredTable,
         key: &[u8],
         rows: &[SstableRow],
@@ -1628,7 +1650,12 @@ impl Db {
         }
     }
 
-    fn force_collapse_merge_chain(&self, table_id: TableId, key: &[u8], collapse: MergeCollapse) {
+    pub(super) fn force_collapse_merge_chain(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        collapse: MergeCollapse,
+    ) {
         self.memtables_write().force_collapse(
             table_id,
             key.to_vec(),
@@ -1637,7 +1664,7 @@ impl Db {
         );
     }
 
-    fn scan_visible_row_with_state(
+    pub(super) fn scan_visible_row_with_state(
         tables: &BTreeMap<String, StoredTable>,
         memtables: &MemtableState,
         sstables: &SstableState,
@@ -1681,7 +1708,7 @@ impl Db {
         Ok(result)
     }
 
-    fn read_visible_value_row(
+    pub(super) fn read_visible_value_row(
         &self,
         table_id: TableId,
         key: &[u8],
@@ -1703,7 +1730,7 @@ impl Db {
         Ok(resolution.value)
     }
 
-    fn scan_visible_row(
+    pub(super) fn scan_visible_row(
         &self,
         table_id: TableId,
         sequence: SequenceNumber,
@@ -1726,7 +1753,7 @@ impl Db {
         Ok(result.rows)
     }
 
-    fn resolve_scan_projection(
+    pub(super) fn resolve_scan_projection(
         table: &StoredTable,
         requested_columns: Option<&[String]>,
     ) -> Result<Option<ColumnProjection>, StorageError> {
@@ -1769,7 +1796,7 @@ impl Db {
         Ok(Some(ColumnProjection { fields }))
     }
 
-    fn missing_columnar_projection_value(
+    pub(super) fn missing_columnar_projection_value(
         field: &FieldDefinition,
         kind: ChangeKind,
     ) -> Result<FieldValue, StorageError> {
@@ -1779,7 +1806,7 @@ impl Db {
         }
     }
 
-    fn project_columnar_value(
+    pub(super) fn project_columnar_value(
         value: &Value,
         projection: &ColumnProjection,
         kind: ChangeKind,
@@ -1802,14 +1829,17 @@ impl Db {
         Ok(Value::Record(projected))
     }
 
-    fn columnar_overwritten_history_error(table: &StoredTable, key: &[u8]) -> StorageError {
+    pub(super) fn columnar_overwritten_history_error(
+        table: &StoredTable,
+        key: &[u8],
+    ) -> StorageError {
         StorageError::unsupported(format!(
             "columnar table {} does not support historical overwritten-key reads in v1 (key {:?})",
             table.config.name, key
         ))
     }
 
-    fn materialized_columnar_value(
+    pub(super) fn materialized_columnar_value(
         materialized_by_sstable: &BTreeMap<String, BTreeMap<usize, Value>>,
         row: &ColumnarRowRef,
     ) -> Result<Value, StorageError> {
@@ -1828,7 +1858,7 @@ impl Db {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn resolve_visible_value_columnar_with_state(
+    pub(super) async fn resolve_visible_value_columnar_with_state(
         &self,
         table: &StoredTable,
         memtables: &MemtableState,
@@ -2068,7 +2098,7 @@ impl Db {
         })
     }
 
-    async fn read_visible_value(
+    pub(super) async fn read_visible_value(
         &self,
         table_id: TableId,
         key: &[u8],
@@ -2128,7 +2158,7 @@ impl Db {
         Ok(resolution.value)
     }
 
-    async fn scan_visible(
+    pub(super) async fn scan_visible(
         &self,
         table_id: TableId,
         sequence: SequenceNumber,
@@ -2229,19 +2259,19 @@ impl Db {
         Ok(rows)
     }
 
-    fn release_snapshot_registration(&self, id: u64) {
+    pub(super) fn release_snapshot_registration(&self, id: u64) {
         mutex_lock(&self.inner.snapshot_tracker).release(id);
     }
 
-    fn oldest_active_snapshot_sequence(&self) -> Option<SequenceNumber> {
+    pub(super) fn oldest_active_snapshot_sequence(&self) -> Option<SequenceNumber> {
         mutex_lock(&self.inner.snapshot_tracker).oldest_active()
     }
 
-    fn active_snapshot_count(&self) -> u64 {
+    pub(super) fn active_snapshot_count(&self) -> u64 {
         mutex_lock(&self.inner.snapshot_tracker).count()
     }
 
-    fn record_compaction_filter_stats(
+    pub(super) fn record_compaction_filter_stats(
         &self,
         table_id: TableId,
         removed_bytes: u64,
@@ -2257,21 +2287,24 @@ impl Db {
         entry.removed_keys = entry.removed_keys.saturating_add(removed_keys);
     }
 
-    fn compaction_filter_stats(&self, table_id: TableId) -> CompactionFilterStats {
+    pub(super) fn compaction_filter_stats(&self, table_id: TableId) -> CompactionFilterStats {
         mutex_lock(&self.inner.compaction_filter_stats)
             .get(&table_id)
             .copied()
             .unwrap_or_default()
     }
 
-    fn history_retention_sequences(&self, table_id: TableId) -> Option<u64> {
+    pub(super) fn history_retention_sequences(&self, table_id: TableId) -> Option<u64> {
         self.tables_read()
             .values()
             .find(|table| table.id == table_id)
             .and_then(|table| table.config.history_retention_sequences)
     }
 
-    fn history_retention_floor_sequence(&self, table_id: TableId) -> Option<SequenceNumber> {
+    pub(super) fn history_retention_floor_sequence(
+        &self,
+        table_id: TableId,
+    ) -> Option<SequenceNumber> {
         let retained = self.history_retention_sequences(table_id)?;
         Some(SequenceNumber::new(
             self.current_sequence()
@@ -2280,7 +2313,7 @@ impl Db {
         ))
     }
 
-    fn history_gc_horizon(&self, table_id: TableId) -> Option<SequenceNumber> {
+    pub(super) fn history_gc_horizon(&self, table_id: TableId) -> Option<SequenceNumber> {
         let retention_floor = self.history_retention_floor_sequence(table_id)?;
         Some(
             self.oldest_active_snapshot_sequence()
@@ -2289,7 +2322,7 @@ impl Db {
         )
     }
 
-    fn cdc_retention_floor_sequence(
+    pub(super) fn cdc_retention_floor_sequence(
         &self,
         table_id: TableId,
         upper_bound: SequenceNumber,
@@ -2300,14 +2333,17 @@ impl Db {
         ))
     }
 
-    fn cdc_gc_min_sequence(&self, upper_bound: SequenceNumber) -> Option<SequenceNumber> {
+    pub(super) fn cdc_gc_min_sequence(
+        &self,
+        upper_bound: SequenceNumber,
+    ) -> Option<SequenceNumber> {
         self.tables_read()
             .values()
             .filter_map(|table| self.cdc_retention_floor_sequence(table.id, upper_bound))
             .min()
     }
 
-    fn table_change_feed_watermark(&self, table_id: TableId) -> Option<SequenceNumber> {
+    pub(super) fn table_change_feed_watermark(&self, table_id: TableId) -> Option<SequenceNumber> {
         let mut watermark = None;
 
         if let Some(sequence) = self
@@ -2334,7 +2370,7 @@ impl Db {
         watermark
     }
 
-    fn change_feed_floor_from_state(
+    pub(super) fn change_feed_floor_from_state(
         &self,
         table_id: TableId,
         upper_bound: SequenceNumber,
@@ -2359,7 +2395,7 @@ impl Db {
         floor.filter(|sequence| sequence.get() > 0)
     }
 
-    async fn prune_commit_log(&self, seal_active: bool) -> Result<(), StorageError> {
+    pub(super) async fn prune_commit_log(&self, seal_active: bool) -> Result<(), StorageError> {
         if self.local_storage_root().is_none() {
             return Ok(());
         }
@@ -2383,7 +2419,7 @@ impl Db {
             .await
     }
 
-    fn validate_historical_read(
+    pub(super) fn validate_historical_read(
         &self,
         table_id: TableId,
         requested: SequenceNumber,
@@ -2403,27 +2439,27 @@ impl Db {
     }
 
     #[cfg(test)]
-    fn snapshot_gc_horizon(&self) -> SequenceNumber {
+    pub(super) fn snapshot_gc_horizon(&self) -> SequenceNumber {
         self.oldest_active_snapshot_sequence()
             .unwrap_or_else(|| self.current_sequence())
     }
 
     #[cfg(test)]
-    fn visible_subscriber_count(&self, table: &Table) -> usize {
+    pub(super) fn visible_subscriber_count(&self, table: &Table) -> usize {
         self.inner
             .visible_watchers
             .active_subscriber_count(table.name())
     }
 
     #[cfg(test)]
-    fn durable_subscriber_count(&self, table: &Table) -> usize {
+    pub(super) fn durable_subscriber_count(&self, table: &Table) -> usize {
         self.inner
             .durable_watchers
             .active_subscriber_count(table.name())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn subscribe_set<'a, I>(
+    pub(super) fn subscribe_set<'a, I>(
         registry: &Arc<WatermarkRegistry>,
         tables: I,
     ) -> WatermarkSubscriptionSet
@@ -2439,7 +2475,7 @@ impl Db {
         )
     }
 
-    fn initial_table_watermarks(
+    pub(super) fn initial_table_watermarks(
         tables: &BTreeMap<String, StoredTable>,
         memtables: &MemtableState,
         sstables: &SstableState,
@@ -2460,52 +2496,52 @@ impl Db {
             .collect()
     }
 
-    fn tables_read(&self) -> RwLockReadGuard<'_, BTreeMap<String, StoredTable>> {
+    pub(super) fn tables_read(&self) -> RwLockReadGuard<'_, BTreeMap<String, StoredTable>> {
         self.inner.tables.read()
     }
 
-    fn tables_write(&self) -> RwLockWriteGuard<'_, BTreeMap<String, StoredTable>> {
+    pub(super) fn tables_write(&self) -> RwLockWriteGuard<'_, BTreeMap<String, StoredTable>> {
         self.inner.tables.write()
     }
 
-    fn memtables_read(&self) -> RwLockReadGuard<'_, MemtableState> {
+    pub(super) fn memtables_read(&self) -> RwLockReadGuard<'_, MemtableState> {
         self.inner.memtables.read()
     }
 
-    fn memtables_write(&self) -> RwLockWriteGuard<'_, MemtableState> {
+    pub(super) fn memtables_write(&self) -> RwLockWriteGuard<'_, MemtableState> {
         self.inner.memtables.write()
     }
 
-    fn sstables_read(&self) -> RwLockReadGuard<'_, SstableState> {
+    pub(super) fn sstables_read(&self) -> RwLockReadGuard<'_, SstableState> {
         self.inner.sstables.read()
     }
 
-    fn sstables_write(&self) -> RwLockWriteGuard<'_, SstableState> {
+    pub(super) fn sstables_write(&self) -> RwLockWriteGuard<'_, SstableState> {
         self.inner.sstables.write()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn columnar_read_context(&self) -> &ColumnarReadContext {
+    pub(super) fn columnar_read_context(&self) -> &ColumnarReadContext {
         self.inner.columnar_read_context.as_ref()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn columnar_cache_stats_snapshot(&self) -> ColumnarCacheStatsSnapshot {
+    pub(super) fn columnar_cache_stats_snapshot(&self) -> ColumnarCacheStatsSnapshot {
         self.inner.columnar_read_context.decoded_cache.snapshot()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn reset_columnar_cache_stats(&self) {
+    pub(super) fn reset_columnar_cache_stats(&self) {
         self.inner.columnar_read_context.decoded_cache.reset_stats();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn clear_columnar_decoded_cache(&self) {
+    pub(super) fn clear_columnar_decoded_cache(&self) {
         self.inner.columnar_read_context.decoded_cache.clear();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn set_columnar_cache_enabled(&self, raw_byte_cache: bool, decoded_cache: bool) {
+    pub(super) fn set_columnar_cache_enabled(&self, raw_byte_cache: bool, decoded_cache: bool) {
         self.inner
             .columnar_read_context
             .raw_byte_cache_enabled

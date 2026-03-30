@@ -97,20 +97,33 @@ pub struct Db {
     inner: Arc<DbInner>,
 }
 
-include!("schema.rs");
-include!("operations.rs");
-include!("watermark.rs");
-include!("internals.rs");
-include!("metadata_codec.rs");
-include!("memtable.rs");
-include!("builder.rs");
-include!("db_open.rs");
-include!("sstable_io.rs");
-include!("maintenance.rs");
-include!("db_api.rs");
-include!("table.rs");
-include!("snapshot.rs");
-include!("util.rs");
+mod builder;
+mod db_api;
+mod db_open;
+mod internals;
+mod maintenance;
+mod memtable;
+mod metadata_codec;
+mod operations;
+mod schema;
+mod snapshot;
+mod sstable_io;
+mod table;
+mod util;
+mod watermark;
+
+pub use self::builder::*;
+pub use self::operations::*;
+pub use self::schema::*;
+pub use self::snapshot::Snapshot;
+pub use self::table::Table;
+pub use self::watermark::{WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate};
+
+use self::internals::*;
+use self::memtable::*;
+use self::snapshot::SnapshotRegistration;
+use self::util::*;
+use self::watermark::{WatermarkAdvance, WatermarkRegistry};
 #[cfg(test)]
 mod property_tests;
 #[cfg(test)]

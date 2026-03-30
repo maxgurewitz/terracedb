@@ -1,3 +1,5 @@
+use super::*;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaDefinition {
@@ -125,7 +127,7 @@ impl SchemaDefinition {
 }
 
 impl FieldType {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Int64 => "int64",
             Self::Float64 => "float64",
@@ -136,14 +138,14 @@ impl FieldType {
     }
 }
 
-struct SchemaValidation<'a> {
-    schema: &'a SchemaDefinition,
-    fields_by_id: BTreeMap<FieldId, &'a FieldDefinition>,
-    field_ids_by_name: BTreeMap<String, FieldId>,
+pub(super) struct SchemaValidation<'a> {
+    pub(super) schema: &'a SchemaDefinition,
+    pub(super) fields_by_id: BTreeMap<FieldId, &'a FieldDefinition>,
+    pub(super) field_ids_by_name: BTreeMap<String, FieldId>,
 }
 
 impl<'a> SchemaValidation<'a> {
-    fn new(schema: &'a SchemaDefinition) -> Result<Self, StorageError> {
+    pub(super) fn new(schema: &'a SchemaDefinition) -> Result<Self, StorageError> {
         if schema.version == 0 {
             return Err(StorageError::unsupported(
                 "schema version must be greater than zero",
@@ -199,7 +201,10 @@ impl<'a> SchemaValidation<'a> {
         })
     }
 
-    fn normalize_record(&self, record: &ColumnarRecord) -> Result<ColumnarRecord, StorageError> {
+    pub(super) fn normalize_record(
+        &self,
+        record: &ColumnarRecord,
+    ) -> Result<ColumnarRecord, StorageError> {
         for (&field_id, value) in record {
             let field = self.fields_by_id.get(&field_id).ok_or_else(|| {
                 StorageError::unsupported(format!(
@@ -222,7 +227,7 @@ impl<'a> SchemaValidation<'a> {
         Ok(normalized)
     }
 
-    fn normalize_merge_operand(
+    pub(super) fn normalize_merge_operand(
         &self,
         record: &ColumnarRecord,
     ) -> Result<ColumnarRecord, StorageError> {
@@ -246,7 +251,7 @@ impl<'a> SchemaValidation<'a> {
         Ok(normalized)
     }
 
-    fn record_from_names<I, S>(&self, fields: I) -> Result<ColumnarRecord, StorageError>
+    pub(super) fn record_from_names<I, S>(&self, fields: I) -> Result<ColumnarRecord, StorageError>
     where
         I: IntoIterator<Item = (S, FieldValue)>,
         S: Into<String>,
@@ -268,12 +273,17 @@ impl<'a> SchemaValidation<'a> {
         self.normalize_record(&resolved)
     }
 
-    fn missing_field_value(&self, field: &FieldDefinition) -> Result<FieldValue, StorageError> {
+    pub(super) fn missing_field_value(
+        &self,
+        field: &FieldDefinition,
+    ) -> Result<FieldValue, StorageError> {
         missing_field_value_for_definition(field)
     }
 }
 
-fn missing_field_value_for_definition(field: &FieldDefinition) -> Result<FieldValue, StorageError> {
+pub(super) fn missing_field_value_for_definition(
+    field: &FieldDefinition,
+) -> Result<FieldValue, StorageError> {
     if let Some(default) = &field.default {
         return Ok(default.clone());
     }
@@ -287,7 +297,7 @@ fn missing_field_value_for_definition(field: &FieldDefinition) -> Result<FieldVa
     )))
 }
 
-fn validate_field_value_against_definition(
+pub(super) fn validate_field_value_against_definition(
     field: &FieldDefinition,
     value: &FieldValue,
     context: &str,
@@ -315,7 +325,7 @@ fn validate_field_value_against_definition(
     }
 }
 
-fn validate_merge_operand_value_against_definition(
+pub(super) fn validate_merge_operand_value_against_definition(
     field: &FieldDefinition,
     value: &FieldValue,
     context: &str,
@@ -327,7 +337,7 @@ fn validate_merge_operand_value_against_definition(
     validate_field_value_against_definition(field, value, context)
 }
 
-fn field_value_matches_type(field_type: FieldType, value: &FieldValue) -> bool {
+pub(super) fn field_value_matches_type(field_type: FieldType, value: &FieldValue) -> bool {
     matches!(
         (field_type, value),
         (FieldType::Int64, FieldValue::Int64(_))
@@ -338,7 +348,7 @@ fn field_value_matches_type(field_type: FieldType, value: &FieldValue) -> bool {
     )
 }
 
-fn field_value_type_name(value: &FieldValue) -> &'static str {
+pub(super) fn field_value_type_name(value: &FieldValue) -> &'static str {
     match value {
         FieldValue::Null => "null",
         FieldValue::Int64(_) => "int64",

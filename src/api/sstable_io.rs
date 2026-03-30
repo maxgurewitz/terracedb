@@ -1,5 +1,7 @@
+use super::*;
+
 impl ColumnarReadContext {
-    fn cache_policy(
+    pub(super) fn cache_policy(
         &self,
         source: &StorageSource,
         access: ColumnarReadAccessPattern,
@@ -22,7 +24,7 @@ impl ColumnarReadContext {
         }
     }
 
-    async fn read_range(
+    pub(super) async fn read_range(
         &self,
         source: &StorageSource,
         range: std::ops::Range<u64>,
@@ -59,20 +61,21 @@ impl ColumnarReadContext {
             && policy.populate_raw_byte_cache
             && let Some(cache) = &self.remote_cache
         {
-            cache.store(
-                key,
-                crate::remote::CacheSpan::Range {
-                    start: range.start,
-                    end: range.end,
-                },
-                &bytes,
-            )
-            .await?;
+            cache
+                .store(
+                    key,
+                    crate::remote::CacheSpan::Range {
+                        start: range.start,
+                        end: range.end,
+                    },
+                    &bytes,
+                )
+                .await?;
         }
         Ok(bytes)
     }
 
-    async fn footer_from_source(
+    pub(super) async fn footer_from_source(
         &self,
         meta: &PersistedManifestSstable,
         source: &StorageSource,
@@ -154,7 +157,7 @@ impl ColumnarReadContext {
         Ok(cached)
     }
 
-    async fn key_index(
+    pub(super) async fn key_index(
         &self,
         meta: &PersistedManifestSstable,
         source: &StorageSource,
@@ -191,7 +194,7 @@ impl ColumnarReadContext {
         Ok(values)
     }
 
-    async fn sequence_column(
+    pub(super) async fn sequence_column(
         &self,
         meta: &PersistedManifestSstable,
         source: &StorageSource,
@@ -218,9 +221,9 @@ impl ColumnarReadContext {
             .await?;
         let values: Arc<Vec<SequenceNumber>> =
             Arc::new(serde_json::from_slice(&bytes).map_err(|error| {
-            StorageError::corruption(format!(
-                "decode columnar sequence column for {location} failed: {error}"
-            ))
+                StorageError::corruption(format!(
+                    "decode columnar sequence column for {location} failed: {error}"
+                ))
             })?);
         if policy.populate_decoded_cache {
             self.decoded_cache
@@ -229,7 +232,7 @@ impl ColumnarReadContext {
         Ok(values)
     }
 
-    async fn tombstone_bitmap(
+    pub(super) async fn tombstone_bitmap(
         &self,
         meta: &PersistedManifestSstable,
         source: &StorageSource,
@@ -266,7 +269,7 @@ impl ColumnarReadContext {
         Ok(values)
     }
 
-    async fn row_kind_column(
+    pub(super) async fn row_kind_column(
         &self,
         meta: &PersistedManifestSstable,
         source: &StorageSource,
@@ -293,9 +296,9 @@ impl ColumnarReadContext {
             .await?;
         let values: Arc<Vec<ChangeKind>> =
             Arc::new(serde_json::from_slice(&bytes).map_err(|error| {
-            StorageError::corruption(format!(
-                "decode columnar row-kind column for {location} failed: {error}"
-            ))
+                StorageError::corruption(format!(
+                    "decode columnar row-kind column for {location} failed: {error}"
+                ))
             })?);
         if policy.populate_decoded_cache {
             self.decoded_cache
@@ -305,7 +308,7 @@ impl ColumnarReadContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn column_block(
+    pub(super) async fn column_block(
         &self,
         meta: &PersistedManifestSstable,
         source: &StorageSource,
@@ -343,7 +346,7 @@ impl ColumnarReadContext {
 
 impl Db {
     #[allow(dead_code)]
-    async fn load_resident_sstable(
+    pub(super) async fn load_resident_sstable(
         dependencies: &DbDependencies,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
@@ -351,7 +354,7 @@ impl Db {
         Self::load_resident_sstable_with_context(dependencies, &columnar_read_context, meta).await
     }
 
-    async fn load_resident_sstable_with_context(
+    pub(super) async fn load_resident_sstable_with_context(
         dependencies: &DbDependencies,
         columnar_read_context: &ColumnarReadContext,
         meta: &PersistedManifestSstable,
@@ -375,7 +378,7 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    async fn read_exact_source_range(
+    pub(super) async fn read_exact_source_range(
         dependencies: &DbDependencies,
         source: &StorageSource,
         range: std::ops::Range<u64>,
@@ -396,7 +399,7 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    async fn read_exact_source_range_with_context(
+    pub(super) async fn read_exact_source_range_with_context(
         columnar_read_context: &ColumnarReadContext,
         source: &StorageSource,
         range: std::ops::Range<u64>,
@@ -423,7 +426,7 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    async fn columnar_footer_from_source(
+    pub(super) async fn columnar_footer_from_source(
         dependencies: &DbDependencies,
         source: &StorageSource,
         length: u64,
@@ -457,7 +460,7 @@ impl Db {
         Ok(((*footer.footer).clone(), footer.footer_start))
     }
 
-    fn validate_loaded_columnar_footer(
+    pub(super) fn validate_loaded_columnar_footer(
         location: &str,
         meta: &PersistedManifestSstable,
         footer: &PersistedColumnarSstableFooter,
@@ -484,7 +487,7 @@ impl Db {
         Ok(())
     }
 
-    async fn load_lazy_columnar_sstable(
+    pub(super) async fn load_lazy_columnar_sstable(
         columnar_read_context: &ColumnarReadContext,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
@@ -503,7 +506,7 @@ impl Db {
         })
     }
 
-    fn decode_resident_row_sstable(
+    pub(super) fn decode_resident_row_sstable(
         location: &str,
         meta: &PersistedManifestSstable,
         bytes: &[u8],
@@ -576,7 +579,7 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    fn decode_resident_columnar_sstable(
+    pub(super) fn decode_resident_columnar_sstable(
         location: &str,
         meta: &PersistedManifestSstable,
         bytes: &[u8],
@@ -768,7 +771,7 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    fn columnar_footer_from_bytes(
+    pub(super) fn columnar_footer_from_bytes(
         location: &str,
         bytes: &[u8],
     ) -> Result<(PersistedColumnarSstableFooter, usize), StorageError> {
@@ -817,7 +820,7 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    fn columnar_block_slice<'a>(
+    pub(super) fn columnar_block_slice<'a>(
         location: &str,
         bytes: &'a [u8],
         footer_start: usize,
@@ -838,7 +841,7 @@ impl Db {
         Ok(&bytes[start..end])
     }
 
-    fn columnar_block_range(
+    pub(super) fn columnar_block_range(
         location: &str,
         footer_start: usize,
         block_name: &str,
@@ -868,7 +871,7 @@ impl Db {
         Ok(block.offset..block.offset.saturating_add(block.length))
     }
 
-    fn normalized_columnar_row_kind(
+    pub(super) fn normalized_columnar_row_kind(
         location: &str,
         row_index: usize,
         tombstone: bool,
@@ -893,7 +896,7 @@ impl Db {
         Ok(kind)
     }
 
-    fn decode_columnar_field_values(
+    pub(super) fn decode_columnar_field_values(
         location: &str,
         column: &PersistedColumnarColumnFooter,
         row_count: usize,
@@ -962,7 +965,7 @@ impl Db {
         }
     }
 
-    fn decode_nullable_column_values(
+    pub(super) fn decode_nullable_column_values(
         location: &str,
         column: &PersistedColumnarColumnFooter,
         row_count: usize,
@@ -1006,7 +1009,7 @@ impl Db {
         Ok(decoded)
     }
 
-    fn summarize_sstable_rows(
+    pub(super) fn summarize_sstable_rows(
         table_id: TableId,
         level: u32,
         local_id: &str,
@@ -1050,7 +1053,7 @@ impl Db {
         })
     }
 
-    async fn flush_immutable(
+    pub(super) async fn flush_immutable(
         &self,
         local_root: &str,
         immutable: &ImmutableMemtable,
@@ -1113,7 +1116,7 @@ impl Db {
         Ok(outputs)
     }
 
-    async fn flush_immutable_remote(
+    pub(super) async fn flush_immutable_remote(
         &self,
         config: &S3PrimaryStorageConfig,
         immutable: &ImmutableMemtable,
@@ -1176,7 +1179,7 @@ impl Db {
         Ok(outputs)
     }
 
-    fn encode_row_sstable(
+    pub(super) fn encode_row_sstable(
         table_id: TableId,
         level: u32,
         local_id: String,
@@ -1227,12 +1230,18 @@ impl Db {
         ))
     }
 
-    fn encode_json_block<T: Serialize>(label: &str, value: &T) -> Result<Vec<u8>, StorageError> {
+    pub(super) fn encode_json_block<T: Serialize>(
+        label: &str,
+        value: &T,
+    ) -> Result<Vec<u8>, StorageError> {
         serde_json::to_vec(value)
             .map_err(|error| StorageError::corruption(format!("encode {label} failed: {error}")))
     }
 
-    fn append_columnar_block(bytes: &mut Vec<u8>, block_bytes: &[u8]) -> ColumnarBlockLocation {
+    pub(super) fn append_columnar_block(
+        bytes: &mut Vec<u8>,
+        block_bytes: &[u8],
+    ) -> ColumnarBlockLocation {
         let location = ColumnarBlockLocation {
             offset: bytes.len() as u64,
             length: block_bytes.len() as u64,
@@ -1241,7 +1250,7 @@ impl Db {
         location
     }
 
-    fn columnar_row_is_tombstone(row: &SstableRow) -> Result<bool, StorageError> {
+    pub(super) fn columnar_row_is_tombstone(row: &SstableRow) -> Result<bool, StorageError> {
         match row.kind {
             ChangeKind::Delete => {
                 if row.value.is_some() {
@@ -1262,7 +1271,7 @@ impl Db {
         }
     }
 
-    fn columnar_field_value_for_row(
+    pub(super) fn columnar_field_value_for_row(
         field: &FieldDefinition,
         row: &SstableRow,
     ) -> Result<Option<FieldValue>, StorageError> {
@@ -1314,7 +1323,7 @@ impl Db {
         }
     }
 
-    fn encode_columnar_field_block(
+    pub(super) fn encode_columnar_field_block(
         field: &FieldDefinition,
         rows: &[SstableRow],
     ) -> Result<Vec<u8>, StorageError> {
@@ -1457,7 +1466,7 @@ impl Db {
         }
     }
 
-    fn encode_columnar_sstable(
+    pub(super) fn encode_columnar_sstable(
         table_id: TableId,
         level: u32,
         local_id: String,
@@ -1559,7 +1568,7 @@ impl Db {
         ))
     }
 
-    async fn write_row_sstable(
+    pub(super) async fn write_row_sstable(
         &self,
         path: &str,
         table_id: TableId,
@@ -1597,7 +1606,7 @@ impl Db {
         Ok(resident)
     }
 
-    async fn write_columnar_sstable(
+    pub(super) async fn write_columnar_sstable(
         &self,
         path: &str,
         level: u32,
@@ -1649,7 +1658,7 @@ impl Db {
         Ok(resident)
     }
 
-    async fn write_row_sstable_remote(
+    pub(super) async fn write_row_sstable_remote(
         &self,
         object_key: &str,
         table_id: TableId,
@@ -1669,7 +1678,7 @@ impl Db {
         Ok(resident)
     }
 
-    async fn write_columnar_sstable_remote(
+    pub(super) async fn write_columnar_sstable_remote(
         &self,
         object_key: &str,
         level: u32,
@@ -1703,7 +1712,7 @@ impl Db {
         Ok(resident)
     }
 
-    async fn install_manifest(
+    pub(super) async fn install_manifest(
         &self,
         generation: ManifestId,
         last_flushed_sequence: SequenceNumber,
@@ -1805,7 +1814,7 @@ impl Db {
         Ok(())
     }
 
-    async fn install_remote_manifest(
+    pub(super) async fn install_remote_manifest(
         &self,
         config: &S3PrimaryStorageConfig,
         generation: ManifestId,
@@ -1844,14 +1853,14 @@ impl Db {
         Ok(())
     }
 
-    fn tiered_backup_layout(&self) -> Option<ObjectKeyLayout> {
+    pub(super) fn tiered_backup_layout(&self) -> Option<ObjectKeyLayout> {
         match &self.inner.config.storage {
             StorageConfig::Tiered(config) => Some(Self::tiered_object_layout(config)),
             StorageConfig::S3Primary(_) => None,
         }
     }
 
-    async fn write_remote_backup_object(
+    pub(super) async fn write_remote_backup_object(
         &self,
         layout: &ObjectKeyLayout,
         object_key: &str,
@@ -1869,7 +1878,7 @@ impl Db {
         Ok(())
     }
 
-    async fn note_backup_object_birth(
+    pub(super) async fn note_backup_object_birth(
         dependencies: &DbDependencies,
         layout: &ObjectKeyLayout,
         object_key: &str,
@@ -1895,7 +1904,7 @@ impl Db {
         let _ = dependencies.object_store.put(&metadata_key, &payload).await;
     }
 
-    async fn read_backup_object_birth(
+    pub(super) async fn read_backup_object_birth(
         dependencies: &DbDependencies,
         layout: &ObjectKeyLayout,
         object_key: &str,
@@ -1911,7 +1920,7 @@ impl Db {
             .then_some(record)
     }
 
-    async fn collect_tiered_commit_log_snapshots(
+    pub(super) async fn collect_tiered_commit_log_snapshots(
         &self,
         layout: &ObjectKeyLayout,
     ) -> Result<Vec<(DurableRemoteCommitLogSegment, Vec<u8>)>, StorageError> {
@@ -1940,7 +1949,7 @@ impl Db {
         Ok(snapshots)
     }
 
-    async fn sync_tiered_backup_catalog(&self) -> Result<(), StorageError> {
+    pub(super) async fn sync_tiered_backup_catalog(&self) -> Result<(), StorageError> {
         let Some(layout) = self.tiered_backup_layout() else {
             return Ok(());
         };
@@ -1950,7 +1959,7 @@ impl Db {
             .await
     }
 
-    async fn sync_tiered_commit_log_tail(&self) -> Result<(), StorageError> {
+    pub(super) async fn sync_tiered_commit_log_tail(&self) -> Result<(), StorageError> {
         let Some(layout) = self.tiered_backup_layout() else {
             return Ok(());
         };
@@ -1963,7 +1972,7 @@ impl Db {
         Ok(())
     }
 
-    async fn sync_tiered_backup_manifest(
+    pub(super) async fn sync_tiered_backup_manifest(
         &self,
         generation: ManifestId,
         last_flushed_sequence: SequenceNumber,
@@ -2035,7 +2044,7 @@ impl Db {
         self.run_tiered_backup_gc_locked(&layout).await
     }
 
-    async fn run_tiered_backup_gc_locked(
+    pub(super) async fn run_tiered_backup_gc_locked(
         &self,
         layout: &ObjectKeyLayout,
     ) -> Result<(), StorageError> {

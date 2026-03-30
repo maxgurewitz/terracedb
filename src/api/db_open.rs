@@ -1,3 +1,5 @@
+use super::*;
+
 impl Db {
     pub async fn open(
         mut config: DbConfig,
@@ -109,7 +111,7 @@ impl Db {
         .await
     }
 
-    fn validate_storage_config(storage: &StorageConfig) -> Result<(), OpenError> {
+    pub(super) fn validate_storage_config(storage: &StorageConfig) -> Result<(), OpenError> {
         match storage {
             StorageConfig::Tiered(TieredStorageConfig {
                 ssd,
@@ -154,7 +156,7 @@ impl Db {
         Ok(())
     }
 
-    fn validate_table_config(config: &TableConfig) -> Result<(), CreateTableError> {
+    pub(super) fn validate_table_config(config: &TableConfig) -> Result<(), CreateTableError> {
         if config.name.is_empty() {
             return Err(CreateTableError::InvalidConfig(
                 "table name cannot be empty".to_string(),
@@ -194,7 +196,7 @@ impl Db {
         Ok(())
     }
 
-    fn same_persisted_table_config(left: &TableConfig, right: &TableConfig) -> bool {
+    pub(super) fn same_persisted_table_config(left: &TableConfig, right: &TableConfig) -> bool {
         left.name == right.name
             && left.format == right.format
             && left.max_merge_operand_chain_length == right.max_merge_operand_chain_length
@@ -205,7 +207,7 @@ impl Db {
             && left.metadata == right.metadata
     }
 
-    fn normalize_value_for_table(
+    pub(super) fn normalize_value_for_table(
         stored: &StoredTable,
         value: &Value,
     ) -> Result<Value, StorageError> {
@@ -235,7 +237,7 @@ impl Db {
         }
     }
 
-    fn normalize_merge_operand_for_table(
+    pub(super) fn normalize_merge_operand_for_table(
         stored: &StoredTable,
         value: &Value,
     ) -> Result<Value, StorageError> {
@@ -267,7 +269,7 @@ impl Db {
         }
     }
 
-    fn catalog_location(storage: &StorageConfig) -> CatalogLocation {
+    pub(super) fn catalog_location(storage: &StorageConfig) -> CatalogLocation {
         match storage {
             StorageConfig::Tiered(config) => {
                 let path = Self::join_fs_path(&config.ssd.path, LOCAL_CATALOG_RELATIVE_PATH);
@@ -282,7 +284,7 @@ impl Db {
         }
     }
 
-    async fn open_commit_runtime(
+    pub(super) async fn open_commit_runtime(
         storage: &StorageConfig,
         dependencies: &DbDependencies,
     ) -> Result<CommitRuntime, OpenError> {
@@ -304,7 +306,7 @@ impl Db {
         Ok(CommitRuntime { backend })
     }
 
-    async fn load_tables(
+    pub(super) async fn load_tables(
         dependencies: &DbDependencies,
         catalog_location: &CatalogLocation,
     ) -> Result<(BTreeMap<String, StoredTable>, u32), OpenError> {
@@ -342,7 +344,7 @@ impl Db {
         Ok((tables, next_table_id))
     }
 
-    async fn load_catalog(
+    pub(super) async fn load_catalog(
         dependencies: &DbDependencies,
         catalog_location: &CatalogLocation,
     ) -> Result<PersistedCatalog, OpenError> {
@@ -382,7 +384,7 @@ impl Db {
         }
     }
 
-    async fn persist_tables(
+    pub(super) async fn persist_tables(
         &self,
         tables: &BTreeMap<String, StoredTable>,
     ) -> Result<(), CreateTableError> {
@@ -404,7 +406,7 @@ impl Db {
         Ok(())
     }
 
-    async fn persist_catalog_file(
+    pub(super) async fn persist_catalog_file(
         &self,
         path: &str,
         temp_path: &str,
@@ -465,14 +467,14 @@ impl Db {
         Ok(())
     }
 
-    fn join_fs_path(root: &str, relative: &str) -> String {
+    pub(super) fn join_fs_path(root: &str, relative: &str) -> String {
         PathBuf::from(root)
             .join(relative)
             .to_string_lossy()
             .into_owned()
     }
 
-    fn join_object_key(prefix: &str, relative: &str) -> String {
+    pub(super) fn join_object_key(prefix: &str, relative: &str) -> String {
         let prefix = prefix.trim_matches('/');
         if prefix.is_empty() {
             relative.to_string()
@@ -481,34 +483,34 @@ impl Db {
         }
     }
 
-    fn local_storage_root_for(storage: &StorageConfig) -> Option<&str> {
+    pub(super) fn local_storage_root_for(storage: &StorageConfig) -> Option<&str> {
         match storage {
             StorageConfig::Tiered(config) => Some(config.ssd.path.as_str()),
             StorageConfig::S3Primary(_) => None,
         }
     }
 
-    fn local_storage_root(&self) -> Option<&str> {
+    pub(super) fn local_storage_root(&self) -> Option<&str> {
         Self::local_storage_root_for(&self.inner.config.storage)
     }
 
-    fn local_current_path(root: &str) -> String {
+    pub(super) fn local_current_path(root: &str) -> String {
         Self::join_fs_path(root, LOCAL_CURRENT_RELATIVE_PATH)
     }
 
-    fn local_manifest_dir(root: &str) -> String {
+    pub(super) fn local_manifest_dir(root: &str) -> String {
         Self::join_fs_path(root, LOCAL_MANIFEST_DIR_RELATIVE_PATH)
     }
 
-    fn local_commit_log_dir(root: &str) -> String {
+    pub(super) fn local_commit_log_dir(root: &str) -> String {
         Self::join_fs_path(root, LOCAL_COMMIT_LOG_RELATIVE_DIR)
     }
 
-    fn manifest_filename(generation: ManifestId) -> String {
+    pub(super) fn manifest_filename(generation: ManifestId) -> String {
         format!("MANIFEST-{:06}", generation.get())
     }
 
-    fn local_manifest_path(root: &str, generation: ManifestId) -> String {
+    pub(super) fn local_manifest_path(root: &str, generation: ManifestId) -> String {
         Self::join_fs_path(
             root,
             &format!(
@@ -518,7 +520,7 @@ impl Db {
         )
     }
 
-    fn local_sstable_path(root: &str, table_id: TableId, local_id: &str) -> String {
+    pub(super) fn local_sstable_path(root: &str, table_id: TableId, local_id: &str) -> String {
         Self::join_fs_path(
             root,
             &format!(
@@ -528,7 +530,7 @@ impl Db {
         )
     }
 
-    fn parse_manifest_generation(path: &str) -> Option<ManifestId> {
+    pub(super) fn parse_manifest_generation(path: &str) -> Option<ManifestId> {
         let path_buf = PathBuf::from(path);
         let file_name = path_buf.file_name()?.to_str()?;
         let suffix = file_name.strip_prefix("MANIFEST-")?;
@@ -538,11 +540,11 @@ impl Db {
         suffix.parse::<u64>().ok().map(ManifestId::new)
     }
 
-    fn parse_sstable_local_id(local_id: &str) -> Option<u64> {
+    pub(super) fn parse_sstable_local_id(local_id: &str) -> Option<u64> {
         local_id.strip_prefix("SST-")?.parse::<u64>().ok()
     }
 
-    fn parse_segment_id(path: &str) -> Option<SegmentId> {
+    pub(super) fn parse_segment_id(path: &str) -> Option<SegmentId> {
         let path_buf = PathBuf::from(path);
         let file_name = path_buf.file_name()?.to_str()?;
         let suffix = file_name.strip_prefix("SEG-")?;
@@ -552,7 +554,7 @@ impl Db {
         suffix.parse::<u64>().ok().map(SegmentId::new)
     }
 
-    fn local_commit_log_segment_path(root: &str, segment_id: SegmentId) -> String {
+    pub(super) fn local_commit_log_segment_path(root: &str, segment_id: SegmentId) -> String {
         Self::join_fs_path(
             root,
             &format!(
@@ -562,15 +564,15 @@ impl Db {
         )
     }
 
-    fn backup_restore_marker_path(root: &str) -> String {
+    pub(super) fn backup_restore_marker_path(root: &str) -> String {
         Self::join_fs_path(root, LOCAL_BACKUP_RESTORE_MARKER_RELATIVE_PATH)
     }
 
-    fn object_key_layout(location: &S3Location) -> ObjectKeyLayout {
+    pub(super) fn object_key_layout(location: &S3Location) -> ObjectKeyLayout {
         ObjectKeyLayout::new(location)
     }
 
-    fn storage_cache_namespace(location: &S3Location) -> String {
+    pub(super) fn storage_cache_namespace(location: &S3Location) -> String {
         let mut encoded = String::new();
         for byte in format!("{}/{}", location.bucket, location.prefix).bytes() {
             encoded.push_str(&format!("{byte:02x}"));
@@ -578,7 +580,7 @@ impl Db {
         encoded
     }
 
-    fn s3_primary_remote_cache_root(config: &S3PrimaryStorageConfig) -> String {
+    pub(super) fn s3_primary_remote_cache_root(config: &S3PrimaryStorageConfig) -> String {
         std::env::temp_dir()
             .join("terracedb-object-cache")
             .join(Self::storage_cache_namespace(&config.s3))
@@ -586,14 +588,15 @@ impl Db {
             .into_owned()
     }
 
-    async fn open_columnar_read_context(
+    pub(super) async fn open_columnar_read_context(
         storage: &StorageConfig,
         dependencies: &DbDependencies,
     ) -> Result<ColumnarReadContext, StorageError> {
         let remote_cache_root = match storage {
-            StorageConfig::Tiered(config) => {
-                Some(Self::join_fs_path(&config.ssd.path, LOCAL_REMOTE_CACHE_RELATIVE_DIR))
-            }
+            StorageConfig::Tiered(config) => Some(Self::join_fs_path(
+                &config.ssd.path,
+                LOCAL_REMOTE_CACHE_RELATIVE_DIR,
+            )),
             StorageConfig::S3Primary(config) => Some(Self::s3_primary_remote_cache_root(config)),
         };
         let remote_cache = match remote_cache_root {
@@ -612,7 +615,9 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn ephemeral_columnar_read_context(dependencies: &DbDependencies) -> ColumnarReadContext {
+    pub(super) fn ephemeral_columnar_read_context(
+        dependencies: &DbDependencies,
+    ) -> ColumnarReadContext {
         ColumnarReadContext {
             dependencies: dependencies.clone(),
             remote_cache: None,
@@ -622,7 +627,7 @@ impl Db {
         }
     }
 
-    async fn load_local_manifest(
+    pub(super) async fn load_local_manifest(
         storage: &StorageConfig,
         dependencies: &DbDependencies,
         columnar_read_context: &ColumnarReadContext,
@@ -697,30 +702,33 @@ impl Db {
         }
     }
 
-    fn remote_object_layout(config: &S3PrimaryStorageConfig) -> ObjectKeyLayout {
+    pub(super) fn remote_object_layout(config: &S3PrimaryStorageConfig) -> ObjectKeyLayout {
         Self::object_key_layout(&config.s3)
     }
 
-    fn tiered_object_layout(config: &TieredStorageConfig) -> ObjectKeyLayout {
+    pub(super) fn tiered_object_layout(config: &TieredStorageConfig) -> ObjectKeyLayout {
         Self::object_key_layout(&config.s3)
     }
 
-    fn remote_manifest_path(config: &S3PrimaryStorageConfig, generation: ManifestId) -> String {
+    pub(super) fn remote_manifest_path(
+        config: &S3PrimaryStorageConfig,
+        generation: ManifestId,
+    ) -> String {
         Self::remote_object_layout(config).backup_manifest(generation)
     }
 
-    fn remote_manifest_latest_key(config: &S3PrimaryStorageConfig) -> String {
+    pub(super) fn remote_manifest_latest_key(config: &S3PrimaryStorageConfig) -> String {
         Self::remote_object_layout(config).backup_manifest_latest()
     }
 
-    fn remote_commit_log_segment_key(
+    pub(super) fn remote_commit_log_segment_key(
         config: &S3PrimaryStorageConfig,
         segment_id: crate::SegmentId,
     ) -> String {
         Self::remote_object_layout(config).backup_commit_log_segment(segment_id)
     }
 
-    fn remote_sstable_key(
+    pub(super) fn remote_sstable_key(
         config: &S3PrimaryStorageConfig,
         table_id: TableId,
         local_id: &str,
@@ -728,7 +736,7 @@ impl Db {
         Self::remote_object_layout(config).backup_sstable(table_id, 0, local_id)
     }
 
-    async fn load_remote_manifest(
+    pub(super) async fn load_remote_manifest(
         config: &S3PrimaryStorageConfig,
         dependencies: &DbDependencies,
         columnar_read_context: &ColumnarReadContext,
@@ -741,7 +749,7 @@ impl Db {
         .await
     }
 
-    async fn load_remote_manifest_from_layout(
+    pub(super) async fn load_remote_manifest_from_layout(
         layout: &ObjectKeyLayout,
         dependencies: &DbDependencies,
         columnar_read_context: &ColumnarReadContext,
@@ -756,7 +764,7 @@ impl Db {
             .map_err(OpenError::Storage)
     }
 
-    async fn load_remote_manifest_file_from_layout(
+    pub(super) async fn load_remote_manifest_file_from_layout(
         layout: &ObjectKeyLayout,
         dependencies: &DbDependencies,
     ) -> Result<Option<(String, PersistedRemoteManifestFile)>, OpenError> {
@@ -787,10 +795,7 @@ impl Db {
             .__failpoint_registry()
             .trigger(
                 crate::failpoints::names::DB_REMOTE_MANIFEST_RECOVERY_AFTER_POINTER_READ,
-                BTreeMap::from([(
-                    "candidate_count".to_string(),
-                    candidates.len().to_string(),
-                )]),
+                BTreeMap::from([("candidate_count".to_string(), candidates.len().to_string())]),
             )
             .await
             .map_err(OpenError::Storage)?;
@@ -829,7 +834,7 @@ impl Db {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn read_manifest_at_path(
+    pub(super) async fn read_manifest_at_path(
         dependencies: &DbDependencies,
         path: &str,
     ) -> Result<LoadedManifest, StorageError> {
@@ -837,7 +842,7 @@ impl Db {
         Self::read_manifest_at_path_with_context(dependencies, &columnar_read_context, path).await
     }
 
-    async fn read_manifest_at_path_with_context(
+    pub(super) async fn read_manifest_at_path_with_context(
         dependencies: &DbDependencies,
         columnar_read_context: &ColumnarReadContext,
         path: &str,
@@ -887,7 +892,7 @@ impl Db {
         })
     }
 
-    async fn read_remote_manifest_file_at_key(
+    pub(super) async fn read_remote_manifest_file_at_key(
         dependencies: &DbDependencies,
         key: &str,
     ) -> Result<PersistedRemoteManifestFile, StorageError> {
@@ -911,7 +916,7 @@ impl Db {
         Ok(file)
     }
 
-    async fn loaded_manifest_from_remote_file(
+    pub(super) async fn loaded_manifest_from_remote_file(
         dependencies: &DbDependencies,
         columnar_read_context: &ColumnarReadContext,
         key: &str,
@@ -953,7 +958,7 @@ impl Db {
         })
     }
 
-    async fn maybe_restore_tiered_from_backup(
+    pub(super) async fn maybe_restore_tiered_from_backup(
         config: &TieredStorageConfig,
         dependencies: &DbDependencies,
     ) -> Result<(), OpenError> {

@@ -275,16 +275,6 @@ pub mod names {
     pub const DB_REMOTE_MANIFEST_RECOVERY_AFTER_POINTER_READ: &str =
         "db.remote_manifest.recovery.after_pointer_read";
     pub const OUTBOX_CURSOR_PERSIST_BEFORE_COMMIT: &str = "outbox.cursor_persist.before_commit";
-    pub const PROJECTION_APPLY_BEFORE_COMMIT: &str = "projection.apply.before_commit";
-    pub const PROJECTION_REBUILD_APPLY_BEFORE_COMMIT: &str =
-        "projection.rebuild.apply.before_commit";
-    pub const PROJECTION_REBUILD_RESET_BEFORE_COMMIT: &str =
-        "projection.rebuild.reset.before_commit";
-    pub const WORKFLOW_CALLBACK_ADMISSION_BEFORE_COMMIT: &str =
-        "workflow.callback_admission.before_commit";
-    pub const WORKFLOW_EXECUTION_BEFORE_COMMIT: &str = "workflow.execution.before_commit";
-    pub const WORKFLOW_TIMER_ADMISSION_BEFORE_COMMIT: &str =
-        "workflow.timer_admission.before_commit";
 }
 
 impl DbDependencies {
