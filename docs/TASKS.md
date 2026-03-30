@@ -24,6 +24,7 @@ Included in this plan:
 - projection and workflow libraries,
 - an embedded virtual filesystem library, and
 - a `terracedb-bricks` blob / large-object library for out-of-line bytes plus metadata search, and
+- an optional Arrow-ecosystem analytical export crate for derived snapshot / CDC-friendly outputs, and
 - deterministic simulation coverage for the full stack.
 
 Explicitly excluded from the main execution plan:
@@ -57,20 +58,22 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 7** expands deterministic simulation to the full stack.
 - **Phase 8** adds an embedded virtual filesystem library on top of Terracedb.
 - **Phase 9** adds the `terracedb-bricks` blob / large-object library on top of Terracedb.
+- **Phase 10** adds an optional Arrow-ecosystem analytical export crate on top of Terracedb.
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into eight mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into ten mostly independent tracks:
 
-- **Track A — local engine core:** T04 and T06 in parallel; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
+- **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
 - **Track C — change capture:** T17 → T18 → T19
-- **Track D — remote storage:** T20 → T21 / T22 / T23
-- **Track E — columnar:** T24 → T25 → T26 → T27
+- **Track D — remote storage:** T20 → T21 / T22 / T23; then T23a → T23b
+- **Track E — columnar:** T24 → T25 → T26; then T26a and T27 can proceed in parallel
 - **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T28a follows T28; T31 depends on T30; T31a follows T31 and T31b follows T31a; T32 depends on T18/T19/T28/T29, T32c follows T32, and T32d follows T32c; T32a depends on T03a/T31/T32, and T32e depends on T03a
-- **Track G — full-stack hardening:** T33 after T32a
+- **Track G — full-stack hardening:** T33b and T33c can begin once the relevant engine/runtime surfaces exist; T33 follows T33c; T33a and T33d follow T33
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
+- **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
 
 ---
 
@@ -192,7 +195,7 @@ Package the reusable parts of the deterministic simulation substrate as a dedica
 
 ## Phase 1 — Minimal local row-engine vertical slice
 
-**Parallelization:** After Phase 0, T04 and T06 can start together. T05 depends on T04. T07 depends on T05 and T06. T08 depends on T04, T05, and T06. T09 depends on T07 and T08.
+**Parallelization:** After Phase 0, T04 and T06 can start together. T04a depends on T04 and can proceed in parallel with T05. T05 depends on T04. T07 depends on T05 and T06. T08 depends on T04, T05, and T06. T09 depends on T07 and T08.
 
 ### T04. Catalog, DB open, table creation, and metadata persistence
 
@@ -215,6 +218,33 @@ Implement DB open/close scaffolding, in-memory table-handle lookup, durable tabl
 - Tests that `table(name)` is synchronous and fallibility-free for existing tables.
 - Restart tests proving table IDs, format, schema metadata, compaction strategy, and user metadata survive reopen.
 - Crash/recovery tests around table creation showing the table exists fully or not at all after recovery.
+
+---
+
+### T04a. Builder-based DB open API and settings-vs-components split
+
+**Depends on:** T04
+
+**Description**
+
+Add a higher-level builder API for opening Terracedb before the public surface area grows further. The goal is to separate ordinary user-facing settings from swappable runtime components: storage mode, durability knobs, cache sizes, and scheduler selection should read like configuration, while filesystem/object-store/clock/RNG overrides remain explicit advanced hooks for tests and embedding. The existing low-level `Db::open(config, dependencies)` path should remain available as an escape hatch or compatibility wrapper, but most callers should no longer need to construct every dependency by hand.
+
+**Implementation steps**
+
+1. Define a `DbBuilder` public surface (for example via `Db::builder()`) that can construct Terracedb with production defaults while still supporting explicit overrides.
+2. Split the builder API between:
+   - settings methods for storage mode and tuning knobs, and
+   - component methods for injected runtime implementations such as filesystem, object store, clock, RNG, and scheduler.
+3. Add ergonomic constructors/helpers for the common storage modes so simple tiered and s3-primary setups do not require callers to manually assemble the full `DbConfig`/`DbDependencies` graph.
+4. Keep the low-level `Db::open(config, dependencies)` path as a lower-level wrapper/escape hatch, and document which API is intended for ordinary users versus advanced embedders/tests.
+5. Ensure later configuration growth can extend the builder API additively rather than forcing breaking changes to the main open signature.
+
+**Verification**
+
+- API tests proving a caller can open a DB with production defaults through the builder without manually constructing filesystem/object-store/clock/RNG dependencies.
+- Tests proving builder-specified component overrides actually flow through to the runtime, including deterministic fake clock/RNG and object-store/file-system adapters.
+- Backward-compatibility tests showing the low-level `Db::open(config, dependencies)` path continues to work and remains behaviorally equivalent to the builder-produced configuration.
+- Documentation/examples demonstrating simple tiered setup, simple s3-primary setup, and one advanced embedding/test setup with custom components.
 
 ---
 
@@ -838,7 +868,7 @@ Add property-style and randomized invariant tests around visibility/durability w
 
 ## Phase 4 — Remote storage modes
 
-**Parallelization:** T20 starts first. After T20, T21, T22, and T23 can proceed in parallel subject to their listed dependencies.
+**Parallelization:** T20 starts first. After T20, T21, T22, and T23 can proceed in parallel subject to their listed dependencies. T23a follows once the durable remote/control-plane formats and their consumers exist. T23b follows T23a.
 
 ### T20. Object-store integration substrate, caches, and range-read plumbing
 
@@ -940,9 +970,60 @@ Implement memory + S3 mode, including buffered visible commits, explicit `flush(
 
 ---
 
+### T23a. Durable-format compatibility contracts, golden fixtures, and CI checks
+
+**Depends on:** T04, T06, T08, T20, T22, T23
+
+**Description**
+
+Treat Terracedb's persisted bytes as long-lived contracts before changing any of the metadata/control-plane encodings. This task inventories the durable formats already in use, defines explicit compatibility expectations for each, and adds golden fixtures plus CI guardrails so accidental format drift fails during development instead of surfacing as reopen/recovery breakage later. Scope includes the catalog, commit-log frames, segment footers, local manifests, remote manifests, remote-cache metadata, and backup-GC metadata; hot SSTable layout evolution remains owned by the SSTable tasks.
+
+**Implementation steps**
+
+1. Write down the compatibility policy for each durable format: what must remain byte-stable, what only needs backward-readable semantic compatibility, how version bumps work, and what must fail closed.
+2. Add golden fixtures for representative versions and variants of catalog files, commit-record frames, segment footers, local manifests, remote manifests, remote-cache metadata, and backup-GC metadata.
+3. Add tests proving current decoders can still read the prior fixtures, preserve checksum/version semantics, and reject corrupt or unsupported variants predictably.
+4. Add encode/regression tests for formats where canonical bytes are intentionally part of the contract, and semantic round-trip assertions where exact byte identity is not the compatibility boundary.
+5. Add a documented fixture-regeneration workflow and CI gating so intentional durable-format changes require explicit review.
+
+**Verification**
+
+- Golden compatibility tests for catalog, commit-log frame, segment-footer, manifest, remote-manifest, remote-cache metadata, and backup-GC metadata fixtures.
+- Corruption and unsupported-version tests proving each format fails closed rather than silently accepting malformed bytes.
+- Upgrade-style tests proving current open/recovery/cache-rebuild paths can consume older fixtures without behavioral changes.
+- CI coverage that fails when durable-format bytes or schemas change without an explicit fixture/schema update.
+
+---
+
+### T23b. FlatBuffers for catalog, manifests, and remote metadata
+
+**Depends on:** T23a
+
+**Description**
+
+Replace JSON only for structured metadata/control-plane formats where schema discipline and lower parse overhead are worth the complexity, while deliberately keeping custom binary framing for the commit log and custom/raw layouts for SSTable data blocks. This task moves the catalog, local manifest, remote manifest, remote-cache metadata, and backup-GC metadata onto FlatBuffers with explicit schema evolution rules and backward-compatible readers for legacy JSON payloads.
+
+**Implementation steps**
+
+1. Define FlatBuffers schemas for the catalog, local manifest, remote manifest, remote-cache metadata, and backup-GC metadata, including reserved fields and explicit evolution/versioning rules.
+2. Generate Rust bindings and add schema-evolution checks in CI so incompatible FlatBuffers schema changes fail review automatically.
+3. Implement readers that accept both legacy JSON payloads and the new FlatBuffers payloads during upgrade, and switch writers to emit canonical FlatBuffers payloads.
+4. Preserve existing outer file/object naming, checksums, and fail-closed validation behavior where possible; do not migrate commit-log frames, row SSTables, or columnar data blocks in this task.
+5. Update open, recovery, cache-rebuild, and backup-GC paths plus their fixtures/tests so the new schemas are exercised end to end.
+
+**Verification**
+
+- Upgrade tests proving Terracedb can read legacy JSON catalog/manifest/cache metadata fixtures and continue operating after rewriting them in FlatBuffers form.
+- Golden FlatBuffers fixture tests plus schema-conformance checks for the new metadata formats.
+- Restart, recovery, offload, backup, and cache-rebuild tests proving behavior is unchanged apart from the payload encoding.
+- Corruption and unsupported-schema tests proving malformed FlatBuffers or incompatible schema changes fail closed.
+- Tests and comments making it explicit that commit-log frames and SSTable hot-data layouts remain custom formats after this migration.
+
+---
+
 ## Phase 5 — Columnar tables
 
-**Parallelization:** T24 can begin once metadata contracts exist. T25 depends on T24 plus flush machinery. T26 depends on T25. T27 depends on T26 plus compaction/merge support.
+**Parallelization:** T24 can begin once metadata contracts exist. T25 depends on T24 plus flush machinery. T26 depends on T25. T26a depends on T20 + T26. T27 depends on T26 plus compaction/merge support, and can proceed in parallel with T26a.
 
 ### T24. Schema model, validation, and columnar table creation rules
 
@@ -1017,6 +1098,37 @@ Implement local and remote read paths for columnar SSTables, including point loo
 - Remote-range tests proving only the expected byte ranges are read for selected columns.
 - Schema-evolution tests where older SSTables lack a new field and reads correctly fill defaults.
 - Supported-semantics tests for `readAt` / `scanAt` on columnar tables, including explicit failure/guardrail cases if full overwritten-key history is not claimed.
+
+---
+
+### T26a. Lazy columnar read-path caching and mode-aware cache admission
+
+**Depends on:** T20, T26
+
+**Description**
+
+Harden the lazy columnar read path with cache layers that match Terracedb's two storage modes and current implementation shape. This task is intentionally scoped to columnar SSTables: row SSTables are already loaded as resident decoded structures, so the immediate goal is to stop repeated footer/index/metadata/column-block fetch and decode work on lazy columnar reads. Wire remote columnar range reads through the existing raw-byte cache where appropriate and add an in-memory decoded cache for reusable columnar metadata and hot decoded column blocks in both tiered and s3-primary mode.
+
+**Implementation steps**
+
+1. Thread a shared storage/cache context through the lazy columnar read helpers so remote range fetches actually benefit from the object-store cache substrate introduced in T20 instead of bypassing it.
+2. Add an in-memory decoded cache for reusable lazy-columnar read artifacts such as footers, key indexes, sequence columns, tombstone bitmaps, row-kind metadata, and hot decoded column blocks.
+3. Make cache admission mode-aware:
+   - local tiered reads should use the decoded cache without pretending the local SSD is a remote-byte cache,
+   - remote tiered cold reads and s3-primary reads may use both the raw-byte cache and the decoded cache, and
+   - point reads and scans should be allowed to use different population rules to avoid scan pollution.
+4. Key cache entries by immutable SSTable identity plus block/column identity so cached decode results remain valid across compaction output replacement and reopen.
+5. Keep the scope specific to lazy columnar metadata and column blocks for now; if row SSTables later move to block-oriented lazy reads, extend the cache design in a follow-on task rather than broadening this one implicitly.
+6. Add lightweight observability for cache hit/miss behavior and decode avoidance so later tuning work can compare point-read vs scan-heavy workloads.
+
+**Verification**
+
+- Tests proving repeated columnar point reads in tiered mode avoid redundant footer/index/metadata/column-block decoding even when the SSTable is local.
+- Tests proving remote columnar reads in tiered cold-storage mode and s3-primary mode hit the raw-byte cache when re-reading the same ranges, while local tiered reads do not require any remote-byte cache layer.
+- Tests proving point reads and scans can use different cache-population rules without changing query results.
+- Cache-on/cache-off equivalence tests showing decoded caching changes latency/CPU behavior but not logical reads, MVCC visibility, or schema-default filling.
+- Restart tests proving decoded caches can be dropped and rebuilt safely, while durable raw-byte cache metadata still rebuilds from object-store state.
+- Tests and comments making it explicit that row SSTables are out of scope for this task because they are already loaded as resident decoded structures.
 
 ---
 
@@ -1413,7 +1525,7 @@ Create a dedicated HTTP simulation harness crate for Terracedb-based application
 
 ## Phase 7 — Full-stack deterministic hardening
 
-**Parallelization:** This hardening phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist.
+**Parallelization:** This hardening phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist. T33b and T33c can start once their dependencies are ready; T33 should follow once the reusable failpoint/cut-point layer exists; T33a and T33d then operationalize the deterministic and real-remote suites.
 
 ### T33. Full-stack randomized scenario generation and invariant suites
 
@@ -1490,6 +1602,89 @@ Operationalize the deterministic simulation bar by running larger seeded campaig
 - A failing CI seed produces an artifact bundle with the seed and replay metadata needed for local reproduction.
 - Replay tooling or documented commands can rerun a captured failing seed locally and reproduce the same failure.
 - Campaign tiers demonstrate that larger seed counts can be added operationally without replacing the fast must-pass smoke coverage.
+
+---
+
+### T33b. Property-based, parameterized, and snapshot-style invariant suites
+
+**Depends on:** T23a, T27, T31, T32
+
+**Description**
+
+Add a complementary invariant-testing layer on top of Terracedb's simulation-heavy strategy by adopting `proptest`, `rstest`, and targeted `insta` snapshots where each tool fits best. The goal is not to replace deterministic simulation or durable-format golden fixtures, but to cover the awkward middle ground: broad low-level state-space exploration, configuration-matrix collapse, and stable structured-output assertions. Durable byte-format compatibility should continue to live under T23a's golden fixtures; this task is about semantic invariants and test ergonomics across the engine, projections, and workflows.
+
+**Implementation steps**
+
+1. Add `proptest`, `rstest`, and `insta` to the dev/test stack together with project conventions for when each should be used.
+2. Introduce property-based tests for low-level invariants such as commit-log frame round-trips, MVCC key ordering, watermark/prefix monotonicity, manifest/object-layout invariants, and supported row-vs-columnar read equivalence.
+3. Use `rstest` or an equivalent parameterized style to collapse repeated test matrices across storage mode, durability mode, row vs columnar, and local vs remote/offloaded placement.
+4. Add targeted `insta` snapshot coverage only for stable structured outputs where human-reviewed diffs are helpful, such as normalized debug renderings, telemetry payload shapes, or simulation summaries; do not use snapshot assertions as a substitute for durable-format golden fixtures.
+5. Document shrink/repro workflows so property-test failures produce small repro cases that developers can rerun locally.
+
+**Verification**
+
+- Property tests find and shrink invariant violations in core encode/decode, ordering, and visibility/durability logic rather than relying only on hand-written examples.
+- Parameterized tests reduce duplicated mode-matrix coverage while keeping row/columnar and tiered/s3-primary behaviors explicit.
+- Snapshot tests prove stable structured outputs stay reviewable and intentional without becoming the authoritative durability contract.
+- Tests and docs make the split explicit: durable byte-format fixtures remain under T23a, while T33b owns semantic/property/snapshot coverage.
+
+---
+
+### T33c. Unified failpoint and cut-point framework for deterministic and async tests
+
+**Depends on:** T22, T23, T27, T31, T32
+
+**Description**
+
+Generalize Terracedb's existing ad hoc phase blockers and adapter-level fault injection into a named failpoint/cut-point framework that ordinary async tests and deterministic simulation can share. The point is to make exact failure sites easy to express and reuse: tests should be able to pause, error, corrupt, or drop work at precise storage/runtime boundaries without adding one-off test-only APIs every time a new crash or retry path needs coverage.
+
+**Implementation steps**
+
+1. Design a reusable failpoint registry/helper layer with named hooks, one-shot vs persistent modes, and actions such as pause, injected error, dropped response, timeout, or corruption.
+2. Instrument critical production paths with named cut points, including commit phases, manifest installation/publication, backup upload ordering, offload transitions, remote-manifest recovery, projection cursor/output commits, workflow trigger admission/execution, timer handling, and outbox delivery.
+3. Preserve and integrate the existing adapter-level filesystem/object-store fault injection so transport-level failures and exact internal cut-point failures can be composed in the same tests.
+4. Migrate the current bespoke blocker-style tests toward the shared failpoint layer where it improves clarity, while keeping the public runtime API free of test-only complexity.
+5. Add documentation and helpers so seeded simulations and ordinary `tokio::test` integration tests can activate the same failpoints consistently.
+
+**Verification**
+
+- Tests can deterministically force exact cut-point failures in commit, manifest, offload, projection, and workflow paths without bespoke per-subsystem blocker plumbing.
+- Existing crash/recovery tests remain reproducible after migration to the shared failpoint layer.
+- Combined tests can compose internal failpoints with adapter/object-store failures to exercise multi-layer retry and recovery behavior.
+- Production builds remain cheap/no-op when failpoints are disabled.
+
+---
+
+### T33d. Real object-store chaos suite with LocalStack, Toxiproxy, and HTTP fault injection
+
+**Depends on:** T20, T22, T23, T26a, T33
+
+**Description**
+
+Add a real remote-integration hardening layer that complements Terracedb's stubbed object-store faults with actual S3-compatible traffic under network- and HTTP-level chaos. This task should stand up a reproducible local environment using LocalStack plus proxy-based fault injection and exercise the real object-store adapter path for s3-primary flush/recovery, tiered backup/offload behavior, cache rebuilds, and remote columnar range reads.
+
+**Implementation steps**
+
+1. Add a Docker Compose or equivalent local/CI environment for at least:
+   - LocalStack (or another S3-compatible service),
+   - Toxiproxy for TCP/network faults, and
+   - an HTTP-level fault proxy or equivalent for transient 429/503 and related request-path failures.
+2. Build a real-remote integration harness that can point Terracedb at the chaos environment without changing production code paths.
+3. Cover baseline and faulted scenarios for:
+   - s3-primary `flush()` durability and recovery,
+   - tiered backup manifest ordering and disaster recovery,
+   - cold offload plus remote reads,
+   - remote-cache rebuilds,
+   - remote columnar exact-range reads and cache-assisted rereads.
+4. Add representative chaos scenarios such as latency/jitter, bandwidth caps, intermittent resets, timeouts, stale-list-like behavior where possible, and transient HTTP 429/503 responses.
+5. Integrate the suite into CI in tiers: a smaller must-pass smoke slice for pull requests and larger/nightly chaos campaigns with artifact capture for logs, proxy state, and failing scenario inputs.
+
+**Verification**
+
+- Real object-store integration tests pass against a baseline LocalStack-backed environment with no proxy faults.
+- Faulted scenarios prove Terracedb fails closed, retries where appropriate, and recovers to the correct durable prefix rather than panicking or inventing state.
+- Remote-manifest load/recovery, backup/offload ordering, cache rebuild, and remote columnar range-read behavior remain correct under injected network and HTTP faults.
+- CI/nightly jobs preserve enough logs and scenario metadata to reproduce a failing chaos run locally.
 
 ---
 
@@ -1900,12 +2095,43 @@ Bring the bricks library up to the same correctness bar as the rest of Terracedb
 
 ---
 
+## Phase 10 — Arrow-ecosystem analytical export crate
+
+**Parallelization:** T47 can begin once the durable projection runtime and blob-store substrate exist. Workflow adapters for scheduling/retention are optional and should be added inside the task only as thin integrations rather than as a core dependency of the crate.
+
+### T47. Build an Arrow-ecosystem analytical export crate for snapshots and incremental feeds
+
+**Depends on:** T31, T42
+
+**Description**
+
+Build a separate add-on crate that turns Terracedb state into analytics-friendly derived artifacts rather than changing the authoritative backup format. The crate should expose Arrow-native in-process batches and persisted Parquet-or-Arrow export files under a dedicated export prefix, using durable projections for incremental materialization and the blob-store substrate for large output files. The core design rule is that these exports are disposable, tooling-friendly views over Terracedb data, not the recovery source of truth; native Terracedb backup artifacts remain authoritative for disaster recovery.
+
+**Implementation steps**
+
+1. Freeze the crate boundary (for example `terracedb-analytics-export`): export job/config types, snapshot-export APIs, incremental-export APIs, sink abstractions built on the blob-store substrate, and stable reserved tables for export cursors/manifests/retention metadata.
+2. Implement point-in-time snapshot export from row and columnar tables into Arrow `RecordBatch`es and persisted Parquet-or-Arrow files, including schema mapping, partitioning/layout policy, and explicit handling of MVCC cuts.
+3. Implement durable incremental export using the projection runtime so exported files/manifests and cursor advancement are published with explicit upload-before-publish ordering and replay-safe idempotency.
+4. Keep export object layout separate from Terracedb backup/cold-storage prefixes and from general-purpose blob-library object prefixes unless explicitly configured to reuse the same physical backend with disjoint namespaces.
+5. Handle schema evolution and unsupported source semantics explicitly: support straightforward additive/renaming-safe export cases where possible, and fail closed rather than silently producing misleading external analytics files when a source table's semantics cannot be represented faithfully.
+6. Add optional workflow helpers for scheduled snapshot exports, retention windows, or compaction/cleanup of derived export files, but keep those as adapters/examples so the base crate remains usable with `terracedb` + projections alone.
+
+**Verification**
+
+- Snapshot-export tests proving exported Arrow/Parquet data matches snapshot-consistent Terracedb reads for both row and columnar tables.
+- Interoperability tests proving standard Arrow-ecosystem readers can consume the emitted files and recover the expected schema and values.
+- Incremental-export tests proving projection cursor advancement and published export metadata/files remain replay-safe across crash/restart and do not require exports to be the authoritative recovery format.
+- Schema-evolution tests covering additive column changes, renamed-field mappings where supported, and explicit fail-closed cases for unsupported history/merge semantics.
+- Prefix/layout tests proving analytical export objects are disjoint from Terracedb backup/cold-storage paths and from other blob-library namespaces by default.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
 
 ### Milestone A — Minimal usable local engine
-Complete: T01–T10
+Complete: T01–T10, T04a
 
 At this point the system should support:
 - local tables,
@@ -1930,13 +2156,14 @@ At this point the system should additionally support:
 - commit-log retention rules.
 
 ### Milestone C — Remote durability modes
-Complete: T20–T23
+Complete: T20–T23b
 
 At this point the system should additionally support:
 - tiered cold storage,
 - backup/disaster recovery,
 - s3-primary durability semantics, and
-- hybrid local change capture in s3-primary mode.
+- hybrid local change capture in s3-primary mode, and
+- compatibility-checked durable metadata formats with FlatBuffers-backed control-plane metadata.
 
 ### Milestone D — Columnar support
 Complete: T24–T27
@@ -1959,9 +2186,13 @@ At this point the system should additionally support:
 - a reusable deterministic simulation harness for Terracedb-based applications.
 
 ### Milestone F — Full correctness bar
-Complete: T33
+Complete: T33–T33d
 
-At this point the system should have the deterministic simulation coverage needed to validate the entire stack under randomized failures.
+At this point the system should have:
+- deterministic seeded simulation coverage for the full DB / projection / workflow stack,
+- property-based and parameterized invariant suites for low-level and cross-mode semantics,
+- reusable failpoints/cut points for exact crash and retry-path testing, and
+- a real object-store chaos suite for remote-storage behavior under network and HTTP faults.
 
 ### Milestone G — Embedded virtual filesystem library
 Complete: T34–T40
@@ -1982,6 +2213,15 @@ At this point the system should additionally support:
 - durable metadata and extracted-text search indexes maintained with projections,
 - safe orphan-object handling and external-object GC, and
 - deterministic simulation coverage for blob publish/read/delete/index/GC behavior.
+
+### Milestone I — Analytical export crate
+Complete: T47
+
+At this point the system should additionally support:
+- a separate Arrow-ecosystem export crate on top of Terracedb,
+- snapshot and incremental derived exports for external analytics tooling,
+- analytics-friendly Parquet-or-Arrow objects stored under dedicated export prefixes, and
+- a clean separation between authoritative Terracedb backups and disposable analytical exports.
 
 ---
 
