@@ -7,8 +7,8 @@ use terracedb::{
     test_support::{row_table_config, tiered_test_config},
 };
 use terracedb_projections::{
-    MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionHandler,
-    ProjectionHandle, ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun,
+    MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionHandle,
+    ProjectionHandler, ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun,
     ProjectionTransaction, SingleSourceProjection,
 };
 use terracedb_simulation::{

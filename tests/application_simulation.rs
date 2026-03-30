@@ -564,3 +564,37 @@ fn consumer_application_simulation_replays_same_seed() -> turmoil::Result {
     assert_eq!(first, second);
     Ok(())
 }
+
+#[test]
+fn consumer_application_simulation_changes_shape_for_different_seeds() -> turmoil::Result {
+    let left = run_order_app_simulation(0x4203)?;
+    let right = run_order_app_simulation(0x4204)?;
+
+    assert_ne!(left, right);
+    Ok(())
+}
+
+#[test]
+fn consumer_application_simulation_seed_campaign_is_reproducible() -> turmoil::Result {
+    let seeds = [0x4210_u64, 0x4211, 0x4212];
+
+    let first_pass = seeds
+        .into_iter()
+        .map(|seed| run_order_app_simulation(seed).map(|capture| (seed, capture)))
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+    let second_pass = seeds
+        .into_iter()
+        .map(|seed| run_order_app_simulation(seed).map(|capture| (seed, capture)))
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+
+    assert_eq!(first_pass, second_pass);
+    assert!(
+        first_pass.values().all(|capture| capture
+            .trace
+            .iter()
+            .any(|event| matches!(event, TraceEvent::Restart))),
+        "each seeded app campaign run should include the simulated restart"
+    );
+
+    Ok(())
+}
