@@ -14,14 +14,15 @@ use terracedb::{Clock, DbDependencies, LogCursor, Rng, SequenceNumber, Timestamp
 
 use crate::{
     ActivityEntry, ActivityId, ActivityKind, ActivityOptions, ActivityReceiver, ActivityStream,
-    AgentFileSystem, AgentFsError, AgentKvStore, AgentToolRuns, CreateOptions, DirEntry,
-    DirEntryPlus, FileKind, InodeId, JsonValue, MkdirOptions, ReadOnlyAgentFileSystem,
+    AgentFileSystem, AgentFsError, AgentKvStore, AgentToolRuns, AllocatorKind, CreateOptions,
+    DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue, MkdirOptions, ReadOnlyAgentFileSystem,
     ReadOnlyAgentKvStore, ReadOnlyAgentToolRuns, Stats, ToolRun, ToolRunId, ToolRunStatus,
 };
 
 pub const VFS_FORMAT_VERSION: u8 = 1;
 pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024;
 pub const ROOT_INODE_ID: InodeId = InodeId::new(1);
+const DEFAULT_ALLOCATOR_BLOCK_SIZE: u64 = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentFsConfig {
@@ -151,6 +152,7 @@ pub struct InMemoryAgentFsStore {
 struct InMemoryStoreInner {
     clock: Arc<dyn Clock>,
     _rng: Arc<dyn Rng>,
+    allocator_block_size: u64,
     volumes: Mutex<BTreeMap<crate::VolumeId, Arc<InMemoryVolumeInner>>>,
 }
 
@@ -160,6 +162,7 @@ impl InMemoryAgentFsStore {
             inner: Arc::new(InMemoryStoreInner {
                 clock,
                 _rng: rng,
+                allocator_block_size: DEFAULT_ALLOCATOR_BLOCK_SIZE,
                 volumes: Mutex::new(BTreeMap::new()),
             }),
         }
@@ -215,6 +218,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
         let volume = Arc::new(InMemoryVolumeInner::new_empty(
             info,
             self.inner.clock.clone(),
+            self.inner.allocator_block_size,
         ));
         volumes.insert(config.volume_id, volume.clone());
         Ok(Arc::new(InMemoryAgentFsVolume { inner: volume }))
@@ -269,6 +273,8 @@ impl AgentFsStore for InMemoryAgentFsStore {
             target_info,
             self.inner.clock.clone(),
             &snapshot,
+            self.inner.allocator_block_size,
+            true,
         ));
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -323,6 +329,8 @@ impl AgentFsStore for InMemoryAgentFsStore {
             target_info,
             self.inner.clock.clone(),
             &base_snapshot.state,
+            self.inner.allocator_block_size,
+            true,
         ));
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -388,8 +396,12 @@ impl AgentFsVolume for InMemoryAgentFsVolume {
     ) -> Result<ActivityStream, AgentFsError> {
         let entries = {
             let state = self.inner.state.lock().expect("volume state lock poisoned");
-            let mut entries = state
-                .activities
+            let activity_slice = if opts.durable {
+                &state.activities[..state.durable.activity_len]
+            } else {
+                &state.activities[..]
+            };
+            let mut entries = activity_slice
                 .iter()
                 .filter(|entry| entry.cursor > cursor)
                 .cloned()
@@ -403,11 +415,16 @@ impl AgentFsVolume for InMemoryAgentFsVolume {
         Ok(Box::pin(stream::iter(entries.into_iter().map(Ok))))
     }
 
-    fn subscribe_activity(&self, _opts: ActivityOptions) -> ActivityReceiver {
-        ActivityReceiver::new(self.inner.activity_watch.subscribe())
+    fn subscribe_activity(&self, opts: ActivityOptions) -> ActivityReceiver {
+        if opts.durable {
+            ActivityReceiver::new(self.inner.durable_activity_watch.subscribe())
+        } else {
+            ActivityReceiver::new(self.inner.activity_watch.subscribe())
+        }
     }
 
     async fn flush(&self) -> Result<(), AgentFsError> {
+        self.inner.promote_durable_cut();
         Ok(())
     }
 }
@@ -541,7 +558,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        lookup_stats(&state.paths, &state.inodes, path)
+        lookup_stats(&state.read_view(), path)
     }
 
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
@@ -550,7 +567,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_file_bytes(&state.paths, &state.inodes, path)
+        read_file_bytes(&state.read_view(), path)
     }
 
     async fn pread(
@@ -564,7 +581,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        pread_file_bytes(&state.paths, &state.inodes, path, offset, len)
+        pread_file_bytes(&state.read_view(), path, offset, len)
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
@@ -573,7 +590,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_dir_entries(&state.paths, &state.inodes, path)
+        read_dir_entries(&state.read_view(), path)
     }
 
     async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
@@ -582,7 +599,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_dir_entries_plus(&state.paths, &state.inodes, path)
+        read_dir_entries_plus(&state.read_view(), path)
     }
 
     async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
@@ -591,7 +608,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_link_target(&state.paths, &state.inodes, path)
+        read_link_target(&state.read_view(), path)
     }
 }
 
@@ -602,11 +619,11 @@ impl ReadOnlyAgentFileSystem for InMemorySnapshotFileSystem {
     }
 
     async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
-        lookup_stats(&self.state.paths, &self.state.inodes, path)
+        lookup_stats(&self.state.read_view(), path)
     }
 
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
-        read_file_bytes(&self.state.paths, &self.state.inodes, path)
+        read_file_bytes(&self.state.read_view(), path)
     }
 
     async fn pread(
@@ -615,19 +632,19 @@ impl ReadOnlyAgentFileSystem for InMemorySnapshotFileSystem {
         offset: u64,
         len: u64,
     ) -> Result<Option<Vec<u8>>, AgentFsError> {
-        pread_file_bytes(&self.state.paths, &self.state.inodes, path, offset, len)
+        pread_file_bytes(&self.state.read_view(), path, offset, len)
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
-        read_dir_entries(&self.state.paths, &self.state.inodes, path)
+        read_dir_entries(&self.state.read_view(), path)
     }
 
     async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
-        read_dir_entries_plus(&self.state.paths, &self.state.inodes, path)
+        read_dir_entries_plus(&self.state.read_view(), path)
     }
 
     async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
-        read_link_target(&self.state.paths, &self.state.inodes, path)
+        read_link_target(&self.state.read_view(), path)
     }
 }
 
@@ -645,6 +662,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                 return Err(AgentFsError::RootInvariant);
             }
             ensure_parent_directory(state, &path, opts.create_parents, now)?;
+            let chunk_size = state.info.chunk_size;
 
             match state.paths.get(&path).copied() {
                 Some(inode_id) => {
@@ -662,12 +680,12 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                         InodeData::Symlink(_) => {
                             return Err(AgentFsError::NotFile { path: path.clone() });
                         }
-                        InodeData::File(bytes) => {
+                        InodeData::File(chunks) => {
                             if !opts.overwrite {
                                 return Err(AgentFsError::AlreadyExists { path: path.clone() });
                             }
-                            *bytes = data;
-                            inode.stats.size = bytes.len() as u64;
+                            chunks.overwrite_all(&data, chunk_size);
+                            inode.stats.size = data.len() as u64;
                             inode.stats.modified_at = now;
                             inode.stats.changed_at = now;
                             inode.stats.accessed_at = now;
@@ -683,7 +701,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                         inode_id,
                         InodeRecord {
                             stats,
-                            data: InodeData::File(data),
+                            data: InodeData::File(FileChunks::from_bytes(&data, chunk_size)),
                         },
                     );
                 }
@@ -703,27 +721,19 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                 .paths
                 .get(&path)
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+            let chunk_size = state.info.chunk_size;
             let inode = state
                 .inodes
                 .get_mut(&inode_id)
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let InodeData::File(bytes) = &mut inode.data else {
+            let InodeData::File(chunks) = &mut inode.data else {
                 return match inode.stats.kind {
                     FileKind::Directory => Err(AgentFsError::IsDirectory { path: path.clone() }),
                     _ => Err(AgentFsError::NotFile { path: path.clone() }),
                 };
             };
 
-            let offset = offset as usize;
-            if bytes.len() < offset {
-                bytes.resize(offset, 0);
-            }
-            let end = offset.saturating_add(data.len());
-            if bytes.len() < end {
-                bytes.resize(end, 0);
-            }
-            bytes[offset..end].copy_from_slice(&data);
-            inode.stats.size = bytes.len() as u64;
+            inode.stats.size = chunks.write_at(offset, &data, inode.stats.size, chunk_size);
             inode.stats.modified_at = now;
             inode.stats.changed_at = now;
             inode.stats.accessed_at = now;
@@ -742,18 +752,19 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                 .paths
                 .get(&path)
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+            let chunk_size = state.info.chunk_size;
             let inode = state
                 .inodes
                 .get_mut(&inode_id)
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let InodeData::File(bytes) = &mut inode.data else {
+            let InodeData::File(chunks) = &mut inode.data else {
                 return match inode.stats.kind {
                     FileKind::Directory => Err(AgentFsError::IsDirectory { path: path.clone() }),
                     _ => Err(AgentFsError::NotFile { path: path.clone() }),
                 };
             };
 
-            bytes.resize(size as usize, 0);
+            chunks.truncate(size, inode.stats.size, chunk_size);
             inode.stats.size = size;
             inode.stats.modified_at = now;
             inode.stats.changed_at = now;
@@ -1004,6 +1015,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
             }
         }
 
+        self.volume.promote_durable_cut();
         Ok(())
     }
 }
@@ -1236,15 +1248,23 @@ struct InMemoryVolumeInner {
     clock: Arc<dyn Clock>,
     state: Mutex<VolumeState>,
     activity_watch: watch::Sender<SequenceNumber>,
+    durable_activity_watch: watch::Sender<SequenceNumber>,
 }
 
 impl InMemoryVolumeInner {
-    fn new_empty(info: AgentFsVolumeInfo, clock: Arc<dyn Clock>) -> Self {
-        let (activity_watch, _receiver) = watch::channel(SequenceNumber::new(0));
+    fn new_empty(
+        info: AgentFsVolumeInfo,
+        clock: Arc<dyn Clock>,
+        allocator_block_size: u64,
+    ) -> Self {
+        let state = VolumeState::new(info, allocator_block_size);
+        let (activity_watch, _receiver) = watch::channel(state.sequence);
+        let (durable_activity_watch, _receiver) = watch::channel(state.durable.sequence);
         Self {
             clock,
-            state: Mutex::new(VolumeState::new(info)),
+            state: Mutex::new(state),
             activity_watch,
+            durable_activity_watch,
         }
     }
 
@@ -1252,12 +1272,18 @@ impl InMemoryVolumeInner {
         info: AgentFsVolumeInfo,
         clock: Arc<dyn Clock>,
         snapshot: &SnapshotState,
+        allocator_block_size: u64,
+        initialize_durable: bool,
     ) -> Self {
-        let (activity_watch, _receiver) = watch::channel(SequenceNumber::new(0));
+        let state =
+            VolumeState::from_snapshot(info, snapshot, allocator_block_size, initialize_durable);
+        let (activity_watch, _receiver) = watch::channel(state.sequence);
+        let (durable_activity_watch, _receiver) = watch::channel(state.durable.sequence);
         Self {
             clock,
-            state: Mutex::new(VolumeState::from_snapshot(info, snapshot)),
+            state: Mutex::new(state),
             activity_watch,
+            durable_activity_watch,
         }
     }
 
@@ -1271,14 +1297,10 @@ impl InMemoryVolumeInner {
 
     fn snapshot_state(&self, durable: bool) -> SnapshotState {
         let state = self.state.lock().expect("volume state lock poisoned");
-        SnapshotState {
-            info: state.info.clone(),
-            sequence: state.sequence,
-            durable,
-            paths: state.paths.clone(),
-            inodes: state.inodes.clone(),
-            kv: state.kv.clone(),
-            tool_runs: state.tool_runs.clone(),
+        if durable {
+            state.durable.snapshot(state.info.clone())
+        } else {
+            state.visible_snapshot()
         }
     }
 
@@ -1289,7 +1311,7 @@ impl InMemoryVolumeInner {
         tool_run_id: Option<ToolRunId>,
         metadata: BTreeMap<String, JsonValue>,
     ) {
-        let next_sequence = {
+        let (next_sequence, durable_sequence) = {
             let mut state = self.state.lock().expect("volume state lock poisoned");
             append_activity(
                 &mut state,
@@ -1299,9 +1321,10 @@ impl InMemoryVolumeInner {
                 tool_run_id,
                 metadata,
             );
-            state.sequence
+            (state.sequence, state.durable.sequence)
         };
         self.activity_watch.send_replace(next_sequence);
+        self.durable_activity_watch.send_replace(durable_sequence);
     }
 
     fn mutate<T, F>(&self, f: F) -> Result<T, AgentFsError>
@@ -1310,7 +1333,7 @@ impl InMemoryVolumeInner {
         T: Default,
     {
         let now = self.clock.now();
-        let (result, next_sequence) = {
+        let (result, next_sequence, durable_sequence) = {
             let mut state = self.state.lock().expect("volume state lock poisoned");
             let change = f(&mut state, now)?;
             let result = if let Some((result, activity)) = change {
@@ -1326,10 +1349,21 @@ impl InMemoryVolumeInner {
             } else {
                 T::default()
             };
-            (result, state.sequence)
+            (result, state.sequence, state.durable.sequence)
         };
         self.activity_watch.send_replace(next_sequence);
+        self.durable_activity_watch.send_replace(durable_sequence);
         Ok(result)
+    }
+
+    fn promote_durable_cut(&self) {
+        let (visible_sequence, durable_sequence) = {
+            let mut state = self.state.lock().expect("volume state lock poisoned");
+            state.promote_durable_cut();
+            (state.sequence, state.durable.sequence)
+        };
+        self.activity_watch.send_replace(visible_sequence);
+        self.durable_activity_watch.send_replace(durable_sequence);
     }
 }
 
@@ -1344,21 +1378,26 @@ struct SnapshotState {
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
 }
 
+impl SnapshotState {
+    fn read_view(&self) -> VolumeReadView<'_> {
+        VolumeReadView::new(&self.info, &self.paths, &self.inodes)
+    }
+}
+
 struct VolumeState {
     info: AgentFsVolumeInfo,
     sequence: SequenceNumber,
-    next_inode: u64,
-    next_activity: u64,
-    next_tool_run_id: u64,
+    allocators: BTreeMap<AllocatorKind, BlockLeaseAllocator>,
     paths: BTreeMap<String, InodeId>,
     inodes: BTreeMap<InodeId, InodeRecord>,
     kv: BTreeMap<String, JsonValue>,
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
     activities: Vec<ActivityEntry>,
+    durable: DurableViewState,
 }
 
 impl VolumeState {
-    fn new(info: AgentFsVolumeInfo) -> Self {
+    fn new(info: AgentFsVolumeInfo, allocator_block_size: u64) -> Self {
         let root = InodeRecord {
             stats: file_stats(
                 ROOT_INODE_ID,
@@ -1373,22 +1412,34 @@ impl VolumeState {
         paths.insert("/".to_string(), ROOT_INODE_ID);
         let mut inodes = BTreeMap::new();
         inodes.insert(ROOT_INODE_ID, root);
+        let durable = DurableViewState {
+            sequence: SequenceNumber::new(0),
+            paths: paths.clone(),
+            inodes: inodes.clone(),
+            kv: BTreeMap::new(),
+            tool_runs: BTreeMap::new(),
+            activity_len: 0,
+        };
 
         Self {
             info,
             sequence: SequenceNumber::new(0),
-            next_inode: ROOT_INODE_ID.get() + 1,
-            next_activity: 1,
-            next_tool_run_id: 1,
+            allocators: allocator_map(ROOT_INODE_ID.get() + 1, 1, 1, allocator_block_size),
             paths,
             inodes,
             kv: BTreeMap::new(),
             tool_runs: BTreeMap::new(),
             activities: Vec::new(),
+            durable,
         }
     }
 
-    fn from_snapshot(info: AgentFsVolumeInfo, snapshot: &SnapshotState) -> Self {
+    fn from_snapshot(
+        info: AgentFsVolumeInfo,
+        snapshot: &SnapshotState,
+        allocator_block_size: u64,
+        initialize_durable: bool,
+    ) -> Self {
         let next_inode = snapshot
             .inodes
             .keys()
@@ -1403,19 +1454,62 @@ impl VolumeState {
             .max()
             .unwrap_or(0)
             + 1;
+        let durable = if initialize_durable {
+            DurableViewState {
+                sequence: SequenceNumber::new(0),
+                paths: snapshot.paths.clone(),
+                inodes: snapshot.inodes.clone(),
+                kv: snapshot.kv.clone(),
+                tool_runs: snapshot.tool_runs.clone(),
+                activity_len: 0,
+            }
+        } else {
+            DurableViewState::default()
+        };
 
         Self {
             info,
             sequence: SequenceNumber::new(0),
-            next_inode,
-            next_activity: 1,
-            next_tool_run_id,
+            allocators: allocator_map(next_inode, 1, next_tool_run_id, allocator_block_size),
             paths: snapshot.paths.clone(),
             inodes: snapshot.inodes.clone(),
             kv: snapshot.kv.clone(),
             tool_runs: snapshot.tool_runs.clone(),
             activities: Vec::new(),
+            durable,
         }
+    }
+
+    fn visible_snapshot(&self) -> SnapshotState {
+        SnapshotState {
+            info: self.info.clone(),
+            sequence: self.sequence,
+            durable: false,
+            paths: self.paths.clone(),
+            inodes: self.inodes.clone(),
+            kv: self.kv.clone(),
+            tool_runs: self.tool_runs.clone(),
+        }
+    }
+
+    fn read_view(&self) -> VolumeReadView<'_> {
+        VolumeReadView::new(&self.info, &self.paths, &self.inodes)
+    }
+
+    fn promote_durable_cut(&mut self) {
+        self.durable.sequence = self.sequence;
+        self.durable.paths = self.paths.clone();
+        self.durable.inodes = self.inodes.clone();
+        self.durable.kv = self.kv.clone();
+        self.durable.tool_runs = self.tool_runs.clone();
+        self.durable.activity_len = self.activities.len();
+    }
+
+    fn allocate(&mut self, kind: AllocatorKind) -> u64 {
+        self.allocators
+            .entry(kind)
+            .or_insert_with(|| BlockLeaseAllocator::new(1, DEFAULT_ALLOCATOR_BLOCK_SIZE))
+            .allocate()
     }
 }
 
@@ -1428,8 +1522,194 @@ struct InodeRecord {
 #[derive(Clone)]
 enum InodeData {
     Directory,
-    File(Vec<u8>),
+    File(FileChunks),
     Symlink(String),
+}
+
+#[derive(Clone, Default)]
+struct DurableViewState {
+    sequence: SequenceNumber,
+    paths: BTreeMap<String, InodeId>,
+    inodes: BTreeMap<InodeId, InodeRecord>,
+    kv: BTreeMap<String, JsonValue>,
+    tool_runs: BTreeMap<ToolRunId, ToolRun>,
+    activity_len: usize,
+}
+
+impl DurableViewState {
+    fn snapshot(&self, info: AgentFsVolumeInfo) -> SnapshotState {
+        SnapshotState {
+            info,
+            sequence: self.sequence,
+            durable: true,
+            paths: self.paths.clone(),
+            inodes: self.inodes.clone(),
+            kv: self.kv.clone(),
+            tool_runs: self.tool_runs.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct FileChunks {
+    chunks: BTreeMap<u64, Vec<u8>>,
+}
+
+impl FileChunks {
+    fn from_bytes(bytes: &[u8], chunk_size: u32) -> Self {
+        let mut chunks = BTreeMap::new();
+        if bytes.is_empty() {
+            return Self { chunks };
+        }
+
+        let chunk_len = chunk_size as usize;
+        for (index, chunk) in bytes.chunks(chunk_len).enumerate() {
+            chunks.insert(index as u64, chunk.to_vec());
+        }
+        Self { chunks }
+    }
+
+    fn read_all(&self, size: u64, chunk_size: u32) -> Vec<u8> {
+        self.read_range(0, size, size, chunk_size)
+    }
+
+    fn read_range(&self, offset: u64, len: u64, size: u64, chunk_size: u32) -> Vec<u8> {
+        if len == 0 || offset >= size {
+            return Vec::new();
+        }
+
+        let end = size.min(offset.saturating_add(len));
+        let first_chunk = offset / chunk_size as u64;
+        let last_chunk = end.saturating_sub(1) / chunk_size as u64 + 1;
+        let mut bytes = vec![0; end.saturating_sub(offset) as usize];
+
+        for chunk in self.scan_range(first_chunk, last_chunk) {
+            let chunk_start = chunk.chunk_index * chunk_size as u64;
+            let chunk_end = chunk_start.saturating_add(chunk.bytes.len() as u64);
+            let read_start = offset.max(chunk_start);
+            let read_end = end.min(chunk_end);
+            if read_start >= read_end {
+                continue;
+            }
+
+            let source_start = (read_start - chunk_start) as usize;
+            let source_end = source_start + (read_end - read_start) as usize;
+            let target_start = (read_start - offset) as usize;
+            let target_end = target_start + (read_end - read_start) as usize;
+            bytes[target_start..target_end].copy_from_slice(&chunk.bytes[source_start..source_end]);
+        }
+
+        bytes
+    }
+
+    fn overwrite_all(&mut self, bytes: &[u8], chunk_size: u32) {
+        *self = Self::from_bytes(bytes, chunk_size);
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8], size: u64, chunk_size: u32) -> u64 {
+        let mut bytes = self.read_all(size, chunk_size);
+        let offset = offset as usize;
+        if bytes.len() < offset {
+            bytes.resize(offset, 0);
+        }
+        let end = offset.saturating_add(data.len());
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        bytes[offset..end].copy_from_slice(data);
+        self.overwrite_all(&bytes, chunk_size);
+        bytes.len() as u64
+    }
+
+    fn truncate(&mut self, size: u64, current_size: u64, chunk_size: u32) {
+        let mut bytes = self.read_all(current_size, chunk_size);
+        bytes.resize(size as usize, 0);
+        self.overwrite_all(&bytes, chunk_size);
+    }
+
+    fn scan_range(&self, first_chunk: u64, last_chunk: u64) -> Vec<ChunkRecord> {
+        self.chunks
+            .range(first_chunk..last_chunk)
+            .map(|(chunk_index, bytes)| ChunkRecord {
+                chunk_index: *chunk_index,
+                bytes: bytes.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+struct ChunkRecord {
+    chunk_index: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockLeaseAllocator {
+    next_persisted: u64,
+    lease_next: u64,
+    lease_end: u64,
+    block_size: u64,
+}
+
+impl BlockLeaseAllocator {
+    fn new(next_available: u64, block_size: u64) -> Self {
+        let block_size = block_size.max(1);
+        Self {
+            next_persisted: next_available,
+            lease_next: next_available,
+            lease_end: next_available,
+            block_size,
+        }
+    }
+
+    fn allocate(&mut self) -> u64 {
+        if self.lease_next == self.lease_end {
+            self.refresh_lease();
+        }
+        let next = self.lease_next;
+        self.lease_next = self.lease_next.saturating_add(1);
+        next
+    }
+
+    fn refresh_lease(&mut self) {
+        let start = self.next_persisted;
+        self.next_persisted = self.next_persisted.saturating_add(self.block_size);
+        self.lease_next = start;
+        self.lease_end = self.next_persisted;
+    }
+
+    #[allow(dead_code)]
+    fn persisted_next(&self) -> u64 {
+        self.next_persisted
+    }
+
+    #[allow(dead_code)]
+    fn recover_after_crash(&self) -> Self {
+        Self::new(self.next_persisted, self.block_size)
+    }
+}
+
+fn allocator_map(
+    next_inode: u64,
+    next_activity: u64,
+    next_tool_run_id: u64,
+    block_size: u64,
+) -> BTreeMap<AllocatorKind, BlockLeaseAllocator> {
+    BTreeMap::from([
+        (
+            AllocatorKind::Inode,
+            BlockLeaseAllocator::new(next_inode, block_size),
+        ),
+        (
+            AllocatorKind::Activity,
+            BlockLeaseAllocator::new(next_activity, block_size),
+        ),
+        (
+            AllocatorKind::ToolRun,
+            BlockLeaseAllocator::new(next_tool_run_id, block_size),
+        ),
+    ])
 }
 
 #[derive(Clone)]
@@ -1462,8 +1742,7 @@ fn append_activity(
     tool_run_id: Option<ToolRunId>,
     metadata: BTreeMap<String, JsonValue>,
 ) {
-    let activity_id = ActivityId::new(state.next_activity);
-    state.next_activity = state.next_activity.saturating_add(1);
+    let activity_id = ActivityId::new(state.allocate(AllocatorKind::Activity));
     let sequence = SequenceNumber::new(state.sequence.get().saturating_add(1));
     state.sequence = sequence;
     state.activities.push(ActivityEntry {
@@ -1480,15 +1759,11 @@ fn append_activity(
 }
 
 fn allocate_inode(state: &mut VolumeState) -> InodeId {
-    let inode = InodeId::new(state.next_inode);
-    state.next_inode = state.next_inode.saturating_add(1);
-    inode
+    InodeId::new(state.allocate(AllocatorKind::Inode))
 }
 
 fn allocate_tool_run_id(state: &mut VolumeState) -> ToolRunId {
-    let tool_run_id = ToolRunId::new(state.next_tool_run_id);
-    state.next_tool_run_id = state.next_tool_run_id.saturating_add(1);
-    tool_run_id
+    ToolRunId::new(state.allocate(AllocatorKind::ToolRun))
 }
 
 fn recent_tool_runs(
@@ -1656,138 +1931,220 @@ fn ensure_existing_parent_directory(state: &VolumeState, path: &str) -> Result<(
     Ok(())
 }
 
-fn lookup_stats(
-    paths: &BTreeMap<String, InodeId>,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
-    path: &str,
-) -> Result<Option<Stats>, AgentFsError> {
-    let path = normalize_path(path)?;
-    let Some(inode_id) = paths.get(&path) else {
-        return Ok(None);
-    };
-    let inode = inodes
-        .get(inode_id)
-        .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-    Ok(Some(inode.stats.clone()))
+struct VolumeReadView<'a> {
+    info: &'a AgentFsVolumeInfo,
+    paths: &'a BTreeMap<String, InodeId>,
+    inodes: &'a BTreeMap<InodeId, InodeRecord>,
 }
 
-fn read_file_bytes(
-    paths: &BTreeMap<String, InodeId>,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
-    path: &str,
-) -> Result<Option<Vec<u8>>, AgentFsError> {
-    let path = normalize_path(path)?;
-    let Some(inode_id) = paths.get(&path) else {
+impl<'a> VolumeReadView<'a> {
+    fn new(
+        info: &'a AgentFsVolumeInfo,
+        paths: &'a BTreeMap<String, InodeId>,
+        inodes: &'a BTreeMap<InodeId, InodeRecord>,
+    ) -> Self {
+        Self {
+            info,
+            paths,
+            inodes,
+        }
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<Option<ResolvedPath<'a>>, AgentFsError> {
+        let path = normalize_path(path)?;
+        let Some(inode_id) = self.paths.get(&path).copied() else {
+            return Ok(None);
+        };
+        let inode = self
+            .inodes
+            .get(&inode_id)
+            .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+        Ok(Some(ResolvedPath { path, inode }))
+    }
+
+    #[allow(dead_code)]
+    fn parent_lookup(&self, path: &str) -> Result<ResolvedPath<'a>, AgentFsError> {
+        let path = normalize_path(path)?;
+        let Some(parent) = parent_path(&path) else {
+            return Err(AgentFsError::RootInvariant);
+        };
+        let Some(resolved) = self.resolve_path(&parent)? else {
+            return Err(AgentFsError::NotFound { path: parent });
+        };
+        if resolved.inode.stats.kind != FileKind::Directory {
+            return Err(AgentFsError::NotDirectory {
+                path: resolved.path.clone(),
+            });
+        }
+        Ok(resolved)
+    }
+
+    fn dentry_scan(&self, path: &str) -> Result<Vec<ScannedDentry<'a>>, AgentFsError> {
+        let resolved = self
+            .resolve_path(path)?
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: normalize_path(path).unwrap_or_else(|_| path.to_string()),
+            })?;
+        if resolved.inode.stats.kind != FileKind::Directory {
+            return Err(AgentFsError::NotDirectory {
+                path: resolved.path.clone(),
+            });
+        }
+
+        let mut entries = Vec::new();
+        for (candidate, inode_id) in self.paths {
+            if let Some(name) = direct_child_name(&resolved.path, candidate) {
+                let inode = self
+                    .inodes
+                    .get(inode_id)
+                    .ok_or_else(|| AgentFsError::NotFound {
+                        path: candidate.clone(),
+                    })?;
+                entries.push(ScannedDentry {
+                    name,
+                    inode_id: *inode_id,
+                    inode,
+                });
+            }
+        }
+        Ok(entries)
+    }
+
+    fn chunk_range_scan(
+        &self,
+        resolved: &ResolvedPath<'a>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<ChunkRecord>, AgentFsError> {
+        match &resolved.inode.data {
+            InodeData::File(chunks) => {
+                if len == 0 || offset >= resolved.inode.stats.size {
+                    return Ok(Vec::new());
+                }
+                let chunk_size = self.info.chunk_size as u64;
+                let first_chunk = offset / chunk_size;
+                let end = resolved.inode.stats.size.min(offset.saturating_add(len));
+                let last_chunk = end.saturating_sub(1) / chunk_size + 1;
+                Ok(chunks.scan_range(first_chunk, last_chunk))
+            }
+            InodeData::Directory => Err(AgentFsError::IsDirectory {
+                path: resolved.path.clone(),
+            }),
+            InodeData::Symlink(_) => Err(AgentFsError::NotFile {
+                path: resolved.path.clone(),
+            }),
+        }
+    }
+}
+
+struct ResolvedPath<'a> {
+    path: String,
+    inode: &'a InodeRecord,
+}
+
+struct ScannedDentry<'a> {
+    name: String,
+    inode_id: InodeId,
+    inode: &'a InodeRecord,
+}
+
+fn lookup_stats(view: &VolumeReadView<'_>, path: &str) -> Result<Option<Stats>, AgentFsError> {
+    Ok(view
+        .resolve_path(path)?
+        .map(|resolved| resolved.inode.stats.clone()))
+}
+
+fn read_file_bytes(view: &VolumeReadView<'_>, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
+    let Some(resolved) = view.resolve_path(path)? else {
         return Ok(None);
     };
-    let inode = inodes
-        .get(inode_id)
-        .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-    match &inode.data {
-        InodeData::File(bytes) => Ok(Some(bytes.clone())),
-        InodeData::Directory => Err(AgentFsError::IsDirectory { path }),
-        InodeData::Symlink(_) => Err(AgentFsError::NotFile { path }),
+
+    match &resolved.inode.data {
+        InodeData::File(chunks) => Ok(Some(
+            chunks.read_all(resolved.inode.stats.size, view.info.chunk_size),
+        )),
+        InodeData::Directory => Err(AgentFsError::IsDirectory {
+            path: resolved.path,
+        }),
+        InodeData::Symlink(_) => Err(AgentFsError::NotFile {
+            path: resolved.path,
+        }),
     }
 }
 
 fn pread_file_bytes(
-    paths: &BTreeMap<String, InodeId>,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
+    view: &VolumeReadView<'_>,
     path: &str,
     offset: u64,
     len: u64,
 ) -> Result<Option<Vec<u8>>, AgentFsError> {
-    let Some(bytes) = read_file_bytes(paths, inodes, path)? else {
+    let Some(resolved) = view.resolve_path(path)? else {
         return Ok(None);
     };
-    let offset = offset as usize;
-    if offset >= bytes.len() {
-        return Ok(Some(Vec::new()));
-    }
-    let end = bytes.len().min(offset.saturating_add(len as usize));
-    Ok(Some(bytes[offset..end].to_vec()))
-}
 
-fn read_dir_entries(
-    paths: &BTreeMap<String, InodeId>,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
-    path: &str,
-) -> Result<Vec<DirEntry>, AgentFsError> {
-    let path = normalize_path(path)?;
-    ensure_directory(paths, inodes, &path)?;
-    let mut entries = Vec::new();
-    for (candidate, inode_id) in paths {
-        if let Some(name) = direct_child_name(&path, candidate) {
-            let inode = inodes.get(inode_id).ok_or_else(|| AgentFsError::NotFound {
-                path: candidate.clone(),
-            })?;
-            entries.push(DirEntry {
-                name,
-                inode: *inode_id,
-                kind: inode.stats.kind,
-            });
+    match &resolved.inode.data {
+        InodeData::File(chunks) => {
+            let _scan = view.chunk_range_scan(&resolved, offset, len)?;
+            Ok(Some(chunks.read_range(
+                offset,
+                len,
+                resolved.inode.stats.size,
+                view.info.chunk_size,
+            )))
         }
+        InodeData::Directory => Err(AgentFsError::IsDirectory {
+            path: resolved.path,
+        }),
+        InodeData::Symlink(_) => Err(AgentFsError::NotFile {
+            path: resolved.path,
+        }),
     }
-    Ok(entries)
 }
 
-fn read_dir_entries_plus(
-    paths: &BTreeMap<String, InodeId>,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
-    path: &str,
-) -> Result<Vec<DirEntryPlus>, AgentFsError> {
-    read_dir_entries(paths, inodes, path)?
+fn read_dir_entries(view: &VolumeReadView<'_>, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
+    view.dentry_scan(path)?
         .into_iter()
         .map(|entry| {
-            let stats = inodes
-                .get(&entry.inode)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: format!("{path}/{}", entry.name),
-                })?
-                .stats
-                .clone();
-            Ok(DirEntryPlus { entry, stats })
+            Ok(DirEntry {
+                name: entry.name,
+                inode: entry.inode_id,
+                kind: entry.inode.stats.kind,
+            })
         })
         .collect()
 }
 
-fn read_link_target(
-    paths: &BTreeMap<String, InodeId>,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
+fn read_dir_entries_plus(
+    view: &VolumeReadView<'_>,
     path: &str,
-) -> Result<String, AgentFsError> {
-    let path = normalize_path(path)?;
-    let inode_id = paths
-        .get(&path)
-        .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-    let inode = inodes
-        .get(inode_id)
-        .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-    match &inode.data {
-        InodeData::Symlink(target) => Ok(target.clone()),
-        _ => Err(AgentFsError::NotSymlink { path }),
-    }
+) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+    view.dentry_scan(path)?
+        .into_iter()
+        .map(|entry| {
+            Ok(DirEntryPlus {
+                entry: DirEntry {
+                    name: entry.name,
+                    inode: entry.inode_id,
+                    kind: entry.inode.stats.kind,
+                },
+                stats: entry.inode.stats.clone(),
+            })
+        })
+        .collect()
 }
 
-fn ensure_directory(
-    paths: &BTreeMap<String, InodeId>,
-    inodes: &BTreeMap<InodeId, InodeRecord>,
-    path: &str,
-) -> Result<(), AgentFsError> {
-    let inode_id = paths.get(path).ok_or_else(|| AgentFsError::NotFound {
-        path: path.to_string(),
-    })?;
-    let inode = inodes
-        .get(inode_id)
-        .ok_or_else(|| AgentFsError::NotDirectory {
-            path: path.to_string(),
+fn read_link_target(view: &VolumeReadView<'_>, path: &str) -> Result<String, AgentFsError> {
+    let resolved = view
+        .resolve_path(path)?
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: normalize_path(path).unwrap_or_else(|_| path.to_string()),
         })?;
-    if inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory {
-            path: path.to_string(),
-        });
+    match &resolved.inode.data {
+        InodeData::Symlink(target) => Ok(target.clone()),
+        _ => Err(AgentFsError::NotSymlink {
+            path: resolved.path,
+        }),
     }
-    Ok(())
 }
 
 fn direct_child_name(parent: &str, child: &str) -> Option<String> {
@@ -1824,4 +2181,65 @@ fn rebase_path(path: &str, from: &str, to: &str) -> Option<String> {
     }
     let suffix = path.strip_prefix(&format!("{from}/"))?;
     Some(format!("{to}/{suffix}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_volume_info() -> AgentFsVolumeInfo {
+        AgentFsVolumeInfo {
+            volume_id: crate::VolumeId::new(1),
+            chunk_size: 4,
+            format_version: VFS_FORMAT_VERSION,
+            root_inode: ROOT_INODE_ID,
+            created_at: Timestamp::new(7),
+            overlay_base: None,
+        }
+    }
+
+    #[test]
+    fn block_allocator_recovers_monotonicity_after_crash_during_lease_refresh() {
+        let mut allocator = BlockLeaseAllocator::new(2, 4);
+        allocator.refresh_lease();
+        assert_eq!(allocator.persisted_next(), 6);
+
+        let mut recovered = allocator.recover_after_crash();
+        assert_eq!(recovered.allocate(), 6);
+    }
+
+    #[test]
+    fn durable_cut_promotes_visible_state_without_mixing_versions() {
+        let mut state = VolumeState::new(test_volume_info(), 2);
+        let inode = allocate_inode(&mut state);
+        state.paths.insert("/notes.txt".to_string(), inode);
+        state.inodes.insert(
+            inode,
+            InodeRecord {
+                stats: file_stats(inode, FileKind::File, 0o644, Timestamp::new(9), 8),
+                data: InodeData::File(FileChunks::from_bytes(b"abcdefgh", 4)),
+            },
+        );
+        append_activity(
+            &mut state,
+            Timestamp::new(9),
+            ActivityKind::FileWritten,
+            Some("/notes.txt".to_string()),
+            None,
+            BTreeMap::new(),
+        );
+
+        let durable_before = state.durable.snapshot(state.info.clone());
+        assert_eq!(
+            read_file_bytes(&durable_before.read_view(), "/notes.txt").expect("read durable"),
+            None
+        );
+
+        state.promote_durable_cut();
+        let durable_after = state.durable.snapshot(state.info.clone());
+        assert_eq!(
+            read_file_bytes(&durable_after.read_view(), "/notes.txt").expect("read durable"),
+            Some(b"abcdefgh".to_vec())
+        );
+    }
 }
