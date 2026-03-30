@@ -1593,7 +1593,7 @@ impl CommitRuntime {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => manager.append_batch_and_sync(records).await,
             CommitLogBackend::Memory(log) => {
-                log.records.extend(records.iter().cloned());
+                Arc::make_mut(&mut log.records).extend(records.iter().cloned());
                 Ok(())
             }
         }
@@ -14918,6 +14918,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tiered_backup_restore_does_not_reintroduce_failed_group_commit_writes() {
+        let primary_file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let primary_dependencies = dependencies(primary_file_system.clone(), object_store.clone());
+        let config = tiered_config("/remote-dr-failed-group-commit");
+
+        let db = Db::open(config.clone(), primary_dependencies)
+            .await
+            .expect("open primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        assert_eq!(
+            events
+                .write(b"user:1".to_vec(), Value::bytes("v1"))
+                .await
+                .expect("write first durable value"),
+            SequenceNumber::new(1)
+        );
+
+        primary_file_system.inject_failure(FileSystemFailure::timeout(
+            FileSystemOperation::Sync,
+            commit_log_segment_path("/remote-dr-failed-group-commit", 1),
+        ));
+        let error = events
+            .write(b"user:2".to_vec(), Value::bytes("failed"))
+            .await
+            .expect_err("failed group commit should return an error");
+        assert_group_commit_sync_failure(error);
+
+        assert_eq!(
+            events
+                .write(b"user:3".to_vec(), Value::bytes("v3"))
+                .await
+                .expect("write second durable value"),
+            SequenceNumber::new(3)
+        );
+
+        let restored = Db::open(
+            config,
+            dependencies(Arc::new(crate::StubFileSystem::default()), object_store),
+        )
+        .await
+        .expect("restore from remote backup");
+        let restored_events = restored.table("events");
+        assert_eq!(restored.current_sequence(), SequenceNumber::new(3));
+        assert_eq!(restored.current_durable_sequence(), SequenceNumber::new(3));
+        assert_eq!(
+            restored_events
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read restored first value"),
+            Some(Value::bytes("v1"))
+        );
+        assert_eq!(
+            restored_events
+                .read(b"user:2".to_vec())
+                .await
+                .expect("read failed value after restore"),
+            None
+        );
+        assert_eq!(
+            restored_events
+                .read(b"user:3".to_vec())
+                .await
+                .expect("read restored later value"),
+            Some(Value::bytes("v3"))
+        );
+        assert_eq!(
+            visible_changes(&restored, &restored_events).await,
+            vec![
+                collected_change(1, 0, ChangeKind::Put, b"user:1", Some(bytes("v1")), "events"),
+                collected_change(3, 0, ChangeKind::Put, b"user:3", Some(bytes("v3")), "events"),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn tiered_backup_falls_back_to_generation_list_when_latest_pointer_is_corrupt() {
         let primary_file_system = Arc::new(crate::StubFileSystem::default());
         let object_store = Arc::new(StubObjectStore::default());
@@ -16796,6 +16876,65 @@ mod tests {
         assert_eq!(
             file_system.operation_count(FileSystemOperation::Sync) - before_syncs,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_before_group_commit_sync_drops_staged_batch() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let config = tiered_config("/group-commit-crash-before-sync");
+
+        let db = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        let mut blocker = db.block_next_commit_phase(CommitPhase::BeforeDurabilitySync);
+        let pending_table = table.clone();
+        let pending = tokio::spawn(async move {
+            pending_table
+                .write(b"user:1".to_vec(), Value::bytes("volatile"))
+                .await
+        });
+
+        assert_eq!(blocker.sequence().await, SequenceNumber::new(1));
+        pending.abort();
+        drop(blocker);
+        drop(table);
+        drop(db);
+
+        file_system.crash();
+        let reopened = Db::open(config, dependencies)
+            .await
+            .expect("reopen after crash");
+        let reopened_table = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), SequenceNumber::new(0));
+        assert_eq!(reopened.current_durable_sequence(), SequenceNumber::new(0));
+        assert_eq!(
+            reopened_table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read after crash"),
+            None
+        );
+        assert!(
+            collect_changes(
+                reopened
+                    .scan_since(
+                        &reopened_table,
+                        LogCursor::beginning(),
+                        ScanOptions::default(),
+                    )
+                    .await
+                    .expect("visible scan after crash"),
+            )
+            .await
+            .is_empty()
         );
     }
 
