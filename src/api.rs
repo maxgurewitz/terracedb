@@ -261,18 +261,22 @@ impl<'a> SchemaValidation<'a> {
     }
 
     fn missing_field_value(&self, field: &FieldDefinition) -> Result<FieldValue, StorageError> {
-        if let Some(default) = &field.default {
-            return Ok(default.clone());
-        }
-        if field.nullable {
-            return Ok(FieldValue::Null);
-        }
-
-        Err(StorageError::unsupported(format!(
-            "record is missing required field {}",
-            field.name
-        )))
+        missing_field_value_for_definition(field)
     }
+}
+
+fn missing_field_value_for_definition(field: &FieldDefinition) -> Result<FieldValue, StorageError> {
+    if let Some(default) = &field.default {
+        return Ok(default.clone());
+    }
+    if field.nullable {
+        return Ok(FieldValue::Null);
+    }
+
+    Err(StorageError::unsupported(format!(
+        "record is missing required field {}",
+        field.name
+    )))
 }
 
 fn validate_field_value_against_definition(
@@ -630,6 +634,36 @@ struct ResidentRowSstable {
     meta: PersistedManifestSstable,
     rows: Vec<SstableRow>,
     user_key_bloom_filter: Option<UserKeyBloomFilter>,
+    columnar: Option<ResidentColumnarSstable>,
+}
+
+#[derive(Clone, Debug)]
+struct ResidentColumnarSstable {
+    source: StorageSource,
+}
+
+#[derive(Clone, Debug)]
+struct ColumnProjection {
+    fields: Vec<FieldDefinition>,
+}
+
+#[derive(Clone, Debug)]
+struct ColumnarRowRef {
+    local_id: String,
+    key: Key,
+    sequence: SequenceNumber,
+    kind: ChangeKind,
+    row_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedColumnarMetadata {
+    footer: PersistedColumnarSstableFooter,
+    footer_start: usize,
+    key_index: Vec<Key>,
+    sequences: Vec<SequenceNumber>,
+    tombstones: Vec<bool>,
+    row_kinds: Vec<ChangeKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1861,6 +1895,10 @@ impl Memtable {
 }
 
 impl ResidentRowSstable {
+    fn is_columnar(&self) -> bool {
+        self.columnar.is_some()
+    }
+
     fn collect_matching_keys(&self, matcher: &KeyMatcher<'_>, keys: &mut BTreeSet<Key>) {
         let start = match matcher {
             KeyMatcher::Range { start, .. } | KeyMatcher::Prefix(start) => self.lower_bound(start),
@@ -1919,6 +1957,302 @@ impl ResidentRowSstable {
 
     fn lower_bound(&self, target: &[u8]) -> usize {
         self.rows.partition_point(|row| row.key.as_slice() < target)
+    }
+
+    async fn load_columnar_metadata(
+        &self,
+        dependencies: &DbDependencies,
+    ) -> Result<LoadedColumnarMetadata, StorageError> {
+        let columnar = self.columnar.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {} is missing a storage source",
+                self.meta.storage_descriptor()
+            ))
+        })?;
+        let location = self.meta.storage_descriptor();
+        let (footer, footer_start) = Db::columnar_footer_from_source(
+            dependencies,
+            &columnar.source,
+            self.meta.length,
+            location,
+        )
+        .await?;
+        Db::validate_loaded_columnar_footer(location, &self.meta, &footer)?;
+
+        let row_count = usize::try_from(footer.row_count).map_err(|_| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} row count exceeds platform limits"
+            ))
+        })?;
+        let key_index_range =
+            Db::columnar_block_range(location, footer_start, "key index", &footer.key_index)?;
+        let sequence_range = Db::columnar_block_range(
+            location,
+            footer_start,
+            "sequence column",
+            &footer.sequence_column,
+        )?;
+        let tombstone_range = Db::columnar_block_range(
+            location,
+            footer_start,
+            "tombstone bitmap",
+            &footer.tombstone_bitmap,
+        )?;
+        let row_kind_range = Db::columnar_block_range(
+            location,
+            footer_start,
+            "row-kind column",
+            &footer.row_kind_column,
+        )?;
+
+        let key_index: Vec<Key> = serde_json::from_slice(
+            &Db::read_exact_source_range(
+                dependencies,
+                &columnar.source,
+                key_index_range,
+                location,
+                "key index",
+            )
+            .await?,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar key index for {location} failed: {error}"
+            ))
+        })?;
+        let sequences: Vec<SequenceNumber> = serde_json::from_slice(
+            &Db::read_exact_source_range(
+                dependencies,
+                &columnar.source,
+                sequence_range,
+                location,
+                "sequence column",
+            )
+            .await?,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar sequence column for {location} failed: {error}"
+            ))
+        })?;
+        let tombstones: Vec<bool> = serde_json::from_slice(
+            &Db::read_exact_source_range(
+                dependencies,
+                &columnar.source,
+                tombstone_range,
+                location,
+                "tombstone bitmap",
+            )
+            .await?,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar tombstone bitmap for {location} failed: {error}"
+            ))
+        })?;
+        let row_kinds: Vec<ChangeKind> = serde_json::from_slice(
+            &Db::read_exact_source_range(
+                dependencies,
+                &columnar.source,
+                row_kind_range,
+                location,
+                "row-kind column",
+            )
+            .await?,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar row-kind column for {location} failed: {error}"
+            ))
+        })?;
+
+        if key_index.len() != row_count
+            || sequences.len() != row_count
+            || tombstones.len() != row_count
+            || row_kinds.len() != row_count
+        {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} contains inconsistent block lengths",
+            )));
+        }
+
+        Ok(LoadedColumnarMetadata {
+            footer,
+            footer_start,
+            key_index,
+            sequences,
+            tombstones,
+            row_kinds,
+        })
+    }
+
+    async fn collect_visible_row_refs_for_key_columnar(
+        &self,
+        dependencies: &DbDependencies,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<Vec<ColumnarRowRef>, StorageError> {
+        if key < self.meta.min_key.as_slice()
+            || key > self.meta.max_key.as_slice()
+            || sequence < self.meta.min_sequence
+        {
+            return Ok(Vec::new());
+        }
+        if let Some(filter) = &self.user_key_bloom_filter
+            && !filter.may_contain(key)
+        {
+            return Ok(Vec::new());
+        }
+
+        let metadata = self.load_columnar_metadata(dependencies).await?;
+        let start = metadata
+            .key_index
+            .partition_point(|candidate| candidate.as_slice() < key);
+        let mut rows = Vec::new();
+
+        for row_index in start..metadata.key_index.len() {
+            match metadata.key_index[row_index].as_slice().cmp(key) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {
+                    if metadata.sequences[row_index] > sequence {
+                        continue;
+                    }
+                    rows.push(ColumnarRowRef {
+                        local_id: self.meta.local_id.clone(),
+                        key: metadata.key_index[row_index].clone(),
+                        sequence: metadata.sequences[row_index],
+                        kind: Db::normalized_columnar_row_kind(
+                            self.meta.storage_descriptor(),
+                            row_index,
+                            metadata.tombstones[row_index],
+                            metadata.row_kinds[row_index],
+                        )?,
+                        row_index,
+                    });
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    async fn collect_scan_row_refs_columnar(
+        &self,
+        dependencies: &DbDependencies,
+        matcher: &KeyMatcher<'_>,
+        sequence: SequenceNumber,
+    ) -> Result<Vec<ColumnarRowRef>, StorageError> {
+        if sequence < self.meta.min_sequence {
+            return Ok(Vec::new());
+        }
+
+        let metadata = self.load_columnar_metadata(dependencies).await?;
+        let start = match matcher {
+            KeyMatcher::Range { start, .. } | KeyMatcher::Prefix(start) => metadata
+                .key_index
+                .partition_point(|key| key.as_slice() < *start),
+        };
+        let mut rows = Vec::new();
+
+        for row_index in start..metadata.key_index.len() {
+            let key = &metadata.key_index[row_index];
+            if !matcher.matches(key) {
+                if matcher.is_past_end(key) {
+                    break;
+                }
+                continue;
+            }
+            if metadata.sequences[row_index] > sequence {
+                continue;
+            }
+            rows.push(ColumnarRowRef {
+                local_id: self.meta.local_id.clone(),
+                key: key.clone(),
+                sequence: metadata.sequences[row_index],
+                kind: Db::normalized_columnar_row_kind(
+                    self.meta.storage_descriptor(),
+                    row_index,
+                    metadata.tombstones[row_index],
+                    metadata.row_kinds[row_index],
+                )?,
+                row_index,
+            });
+        }
+
+        Ok(rows)
+    }
+
+    async fn materialize_columnar_rows(
+        &self,
+        dependencies: &DbDependencies,
+        projection: &ColumnProjection,
+        row_indexes: &BTreeSet<usize>,
+    ) -> Result<BTreeMap<usize, Value>, StorageError> {
+        if row_indexes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let columnar = self.columnar.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {} is missing a storage source",
+                self.meta.storage_descriptor()
+            ))
+        })?;
+        let metadata = self.load_columnar_metadata(dependencies).await?;
+        let location = self.meta.storage_descriptor();
+        let row_count = metadata.key_index.len();
+        let columns_by_field = metadata
+            .footer
+            .columns
+            .iter()
+            .map(|column| (column.field_id, column))
+            .collect::<BTreeMap<_, _>>();
+        let mut values_by_field = BTreeMap::<FieldId, Vec<FieldValue>>::new();
+
+        for field in &projection.fields {
+            if let Some(column) = columns_by_field.get(&field.id) {
+                if column.field_type != field.field_type {
+                    return Err(StorageError::corruption(format!(
+                        "columnar SSTable {location} field {} type metadata does not match schema",
+                        field.id.get()
+                    )));
+                }
+                let range = Db::columnar_block_range(
+                    location,
+                    metadata.footer_start,
+                    "column block",
+                    &column.block,
+                )?;
+                let block = Db::read_exact_source_range(
+                    dependencies,
+                    &columnar.source,
+                    range,
+                    location,
+                    "column block",
+                )
+                .await?;
+                values_by_field.insert(
+                    field.id,
+                    Db::decode_columnar_field_values(location, column, row_count, &block)?,
+                );
+            }
+        }
+
+        let mut materialized = BTreeMap::new();
+        for &row_index in row_indexes {
+            let mut record = ColumnarRecord::new();
+            for field in &projection.fields {
+                let value = match values_by_field.get(&field.id) {
+                    Some(values) => values[row_index].clone(),
+                    None => missing_field_value_for_definition(field)?,
+                };
+                record.insert(field.id, value);
+            }
+            materialized.insert(row_index, Value::Record(record));
+        }
+
+        Ok(materialized)
     }
 }
 
@@ -3316,23 +3650,157 @@ impl Db {
         dependencies: &DbDependencies,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
-        let source = meta.storage_source();
-        let location = meta.storage_descriptor();
-        let bytes = read_source(dependencies, &source).await?;
-        if bytes.len() as u64 != meta.length {
+        if meta.schema_version.is_some() {
+            Self::load_lazy_columnar_sstable(dependencies, meta).await
+        } else {
+            let source = meta.storage_source();
+            let location = meta.storage_descriptor();
+            let bytes = read_source(dependencies, &source).await?;
+            if bytes.len() as u64 != meta.length {
+                return Err(StorageError::corruption(format!(
+                    "sstable {} length mismatch: manifest={}, file={}",
+                    location,
+                    meta.length,
+                    bytes.len()
+                )));
+            }
+            Self::decode_resident_row_sstable(location, meta, &bytes)
+        }
+    }
+
+    async fn read_exact_source_range(
+        dependencies: &DbDependencies,
+        source: &StorageSource,
+        range: std::ops::Range<u64>,
+        location: &str,
+        label: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        let expected_len =
+            usize::try_from(range.end.saturating_sub(range.start)).map_err(|_| {
+                StorageError::corruption(format!(
+                    "columnar SSTable {location} {label} length exceeds platform limits",
+                ))
+            })?;
+        let bytes = UnifiedStorage::from_dependencies(dependencies)
+            .read_range(source, range)
+            .await
+            .map_err(|error| error.into_storage_error())?;
+        if bytes.len() != expected_len {
             return Err(StorageError::corruption(format!(
-                "sstable {} length mismatch: manifest={}, file={}",
-                location,
-                meta.length,
-                bytes.len()
+                "columnar SSTable {location} {label} is truncated",
+            )));
+        }
+        Ok(bytes)
+    }
+
+    async fn columnar_footer_from_source(
+        dependencies: &DbDependencies,
+        source: &StorageSource,
+        length: u64,
+        location: &str,
+    ) -> Result<(PersistedColumnarSstableFooter, usize), StorageError> {
+        let min_len = (COLUMNAR_SSTABLE_MAGIC.len() * 2 + std::mem::size_of::<u64>()) as u64;
+        if length < min_len {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} is too short",
             )));
         }
 
-        if meta.schema_version.is_some() {
-            Self::decode_resident_columnar_sstable(location, meta, &bytes)
-        } else {
-            Self::decode_resident_row_sstable(location, meta, &bytes)
+        let trailer_start = length
+            .saturating_sub((COLUMNAR_SSTABLE_MAGIC.len() + std::mem::size_of::<u64>()) as u64);
+        let trailer = Self::read_exact_source_range(
+            dependencies,
+            source,
+            trailer_start..length,
+            location,
+            "footer trailer",
+        )
+        .await?;
+        let footer_len = u64::from_le_bytes(
+            trailer[..std::mem::size_of::<u64>()]
+                .try_into()
+                .map_err(|_| {
+                    StorageError::corruption(format!(
+                        "columnar SSTable {location} footer length trailer is truncated",
+                    ))
+                })?,
+        );
+        if &trailer[std::mem::size_of::<u64>()..] != COLUMNAR_SSTABLE_MAGIC {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} is missing the trailer magic",
+            )));
         }
+
+        let footer_start_u64 = trailer_start.checked_sub(footer_len).ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} footer length points before the file start",
+            ))
+        })?;
+        let footer_bytes = Self::read_exact_source_range(
+            dependencies,
+            source,
+            footer_start_u64..trailer_start,
+            location,
+            "footer",
+        )
+        .await?;
+        let footer = serde_json::from_slice(&footer_bytes).map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar SSTable footer for {location} failed: {error}"
+            ))
+        })?;
+
+        let footer_start = usize::try_from(footer_start_u64).map_err(|_| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} footer offset exceeds platform limits",
+            ))
+        })?;
+        Ok((footer, footer_start))
+    }
+
+    fn validate_loaded_columnar_footer(
+        location: &str,
+        meta: &PersistedManifestSstable,
+        footer: &PersistedColumnarSstableFooter,
+    ) -> Result<(), StorageError> {
+        if footer.format_version != COLUMNAR_SSTABLE_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported columnar SSTable version {}",
+                footer.format_version
+            )));
+        }
+        if footer.table_id != meta.table_id
+            || footer.level != meta.level
+            || footer.local_id != meta.local_id
+            || footer.min_key != meta.min_key
+            || footer.max_key != meta.max_key
+            || footer.min_sequence != meta.min_sequence
+            || footer.max_sequence != meta.max_sequence
+            || Some(footer.schema_version) != meta.schema_version
+        {
+            return Err(StorageError::corruption(format!(
+                "manifest metadata does not match SSTable {location}",
+            )));
+        }
+        Ok(())
+    }
+
+    async fn load_lazy_columnar_sstable(
+        dependencies: &DbDependencies,
+        meta: &PersistedManifestSstable,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let source = meta.storage_source();
+        let location = meta.storage_descriptor();
+        let (footer, _) =
+            Self::columnar_footer_from_source(dependencies, &source, meta.length, location).await?;
+        Self::validate_loaded_columnar_footer(location, meta, &footer)?;
+
+        Ok(ResidentRowSstable {
+            meta: meta.clone(),
+            rows: Vec::new(),
+            user_key_bloom_filter: footer.user_key_bloom_filter.clone(),
+            columnar: Some(ResidentColumnarSstable { source }),
+        })
     }
 
     fn decode_resident_row_sstable(
@@ -3403,9 +3871,11 @@ impl Db {
             meta: meta.clone(),
             rows: file.body.rows,
             user_key_bloom_filter: file.body.user_key_bloom_filter,
+            columnar: None,
         })
     }
 
+    #[allow(dead_code)]
     fn decode_resident_columnar_sstable(
         location: &str,
         meta: &PersistedManifestSstable,
@@ -3591,9 +4061,13 @@ impl Db {
             meta: meta.clone(),
             rows,
             user_key_bloom_filter: footer.user_key_bloom_filter,
+            columnar: Some(ResidentColumnarSstable {
+                source: meta.storage_source(),
+            }),
         })
     }
 
+    #[allow(dead_code)]
     fn columnar_footer_from_bytes(
         location: &str,
         bytes: &[u8],
@@ -3642,6 +4116,7 @@ impl Db {
         Ok((footer, footer_start))
     }
 
+    #[allow(dead_code)]
     fn columnar_block_slice<'a>(
         location: &str,
         bytes: &'a [u8],
@@ -3649,6 +4124,26 @@ impl Db {
         block_name: &str,
         block: &ColumnarBlockLocation,
     ) -> Result<&'a [u8], StorageError> {
+        let range = Self::columnar_block_range(location, footer_start, block_name, block)?;
+        let start = usize::try_from(range.start).map_err(|_| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} {block_name} offset exceeds platform limits",
+            ))
+        })?;
+        let end = usize::try_from(range.end).map_err(|_| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} {block_name} length exceeds platform limits",
+            ))
+        })?;
+        Ok(&bytes[start..end])
+    }
+
+    fn columnar_block_range(
+        location: &str,
+        footer_start: usize,
+        block_name: &str,
+        block: &ColumnarBlockLocation,
+    ) -> Result<std::ops::Range<u64>, StorageError> {
         let offset = usize::try_from(block.offset).map_err(|_| {
             StorageError::corruption(format!(
                 "columnar SSTable {location} {block_name} offset exceeds platform limits",
@@ -3670,7 +4165,32 @@ impl Db {
             )));
         }
 
-        Ok(&bytes[offset..end])
+        Ok(block.offset..block.offset.saturating_add(block.length))
+    }
+
+    fn normalized_columnar_row_kind(
+        location: &str,
+        row_index: usize,
+        tombstone: bool,
+        kind: ChangeKind,
+    ) -> Result<ChangeKind, StorageError> {
+        if tombstone {
+            if kind != ChangeKind::Delete {
+                return Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} marks non-delete row {} as a tombstone",
+                    row_index
+                )));
+            }
+            return Ok(ChangeKind::Delete);
+        }
+        if kind == ChangeKind::Delete {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} stores delete row {} without a tombstone",
+                row_index
+            )));
+        }
+
+        Ok(kind)
     }
 
     fn decode_columnar_field_values(
@@ -4001,6 +4521,7 @@ impl Db {
                 meta,
                 rows,
                 user_key_bloom_filter,
+                columnar: None,
             },
             bytes,
         ))
@@ -4316,6 +4837,7 @@ impl Db {
                 meta,
                 rows,
                 user_key_bloom_filter,
+                columnar: None,
             },
             bytes,
         ))
@@ -4405,6 +4927,9 @@ impl Db {
         self.inner.dependencies.file_system.sync(&handle).await?;
 
         resident.meta.file_path = path.to_string();
+        resident.columnar = Some(ResidentColumnarSstable {
+            source: StorageSource::local_file(path.to_string()),
+        });
         Ok(resident)
     }
 
@@ -4456,6 +4981,9 @@ impl Db {
             .put(object_key, &bytes)
             .await?;
         resident.meta.remote_key = Some(object_key.to_string());
+        resident.columnar = Some(ResidentColumnarSstable {
+            source: StorageSource::remote_object(object_key.to_string()),
+        });
         Ok(resident)
     }
 
@@ -7513,7 +8041,7 @@ impl Db {
         );
     }
 
-    fn read_visible_value(
+    fn read_visible_value_row(
         &self,
         table_id: TableId,
         key: &[u8],
@@ -7535,7 +8063,7 @@ impl Db {
         Ok(resolution.value)
     }
 
-    fn scan_visible(
+    fn scan_visible_row(
         &self,
         table_id: TableId,
         sequence: SequenceNumber,
@@ -7560,13 +8088,432 @@ impl Db {
 
         let mut rows = Vec::new();
         for key in ordered_keys {
-            let Some(value) = self.read_visible_value(table_id, &key, sequence)? else {
+            let Some(value) = self.read_visible_value_row(table_id, &key, sequence)? else {
                 continue;
             };
 
             rows.push((key, value));
             if rows.len() >= limit {
                 break;
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn resolve_scan_projection(
+        table: &StoredTable,
+        requested_columns: Option<&[String]>,
+    ) -> Result<Option<ColumnProjection>, StorageError> {
+        let Some(schema) = table.config.schema.as_ref() else {
+            return Ok(None);
+        };
+
+        let fields = if let Some(requested_columns) = requested_columns {
+            let validation = SchemaValidation::new(schema)?;
+            let mut seen = BTreeSet::new();
+            let mut fields = Vec::with_capacity(requested_columns.len());
+            for column_name in requested_columns {
+                let field_id = validation
+                    .field_ids_by_name
+                    .get(column_name)
+                    .copied()
+                    .ok_or_else(|| {
+                        StorageError::unsupported(format!(
+                            "columnar table {} does not contain column {}",
+                            table.config.name, column_name
+                        ))
+                    })?;
+                if !seen.insert(field_id) {
+                    continue;
+                }
+                let field = validation.fields_by_id.get(&field_id).ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "columnar table {} schema is missing field id {}",
+                        table.config.name,
+                        field_id.get()
+                    ))
+                })?;
+                fields.push((*field).clone());
+            }
+            fields
+        } else {
+            schema.fields.clone()
+        };
+
+        Ok(Some(ColumnProjection { fields }))
+    }
+
+    fn project_columnar_value(
+        value: &Value,
+        projection: &ColumnProjection,
+    ) -> Result<Value, StorageError> {
+        let Value::Record(record) = value else {
+            return Err(StorageError::corruption(
+                "columnar value is stored as bytes during read projection",
+            ));
+        };
+
+        let mut projected = ColumnarRecord::new();
+        for field in &projection.fields {
+            let value = match record.get(&field.id) {
+                Some(value) => value.clone(),
+                None => missing_field_value_for_definition(field)?,
+            };
+            projected.insert(field.id, value);
+        }
+
+        Ok(Value::Record(projected))
+    }
+
+    fn columnar_overwritten_history_error(table: &StoredTable, key: &[u8]) -> StorageError {
+        StorageError::unsupported(format!(
+            "columnar table {} does not support historical overwritten-key reads in v1 (key {:?})",
+            table.config.name, key
+        ))
+    }
+
+    fn columnar_merge_read_error(table: &StoredTable, key: &[u8]) -> StorageError {
+        StorageError::unsupported(format!(
+            "columnar table {} does not support merge-row reads in v1 (key {:?})",
+            table.config.name, key
+        ))
+    }
+
+    async fn read_visible_value(
+        &self,
+        table_id: TableId,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<Option<Value>, StorageError> {
+        let table = Self::stored_table_by_id(&self.tables_read(), table_id)
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::not_found(format!("table id {} is not registered", table_id.get()))
+            })?;
+        if table.config.format == TableFormat::Row {
+            return self.read_visible_value_row(table_id, key, sequence);
+        }
+
+        let projection = Self::resolve_scan_projection(&table, None)?
+            .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
+        let memtables = self.memtables_read().clone();
+        let live = self.sstables_read().live.clone();
+        let current_sequence = self.current_sequence();
+
+        let mut mem_rows = Vec::new();
+        memtables.collect_visible_rows(table_id, key, sequence, &mut mem_rows);
+
+        let mut sstables_by_local_id = BTreeMap::new();
+        let mut columnar_rows = Vec::new();
+        let mut persisted_version_count = 0_usize;
+        for sstable in live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
+        {
+            sstables_by_local_id.insert(sstable.meta.local_id.clone(), sstable.clone());
+            if sequence < current_sequence {
+                let persisted_rows = sstable
+                    .collect_visible_row_refs_for_key_columnar(
+                        &self.inner.dependencies,
+                        key,
+                        current_sequence,
+                    )
+                    .await?;
+                persisted_version_count += persisted_rows.len();
+                columnar_rows.extend(
+                    persisted_rows
+                        .into_iter()
+                        .filter(|row| row.sequence <= sequence),
+                );
+            } else {
+                columnar_rows.extend(
+                    sstable
+                        .collect_visible_row_refs_for_key_columnar(
+                            &self.inner.dependencies,
+                            key,
+                            sequence,
+                        )
+                        .await?,
+                );
+            }
+        }
+
+        if sequence < current_sequence && persisted_version_count > 1 {
+            return Err(Self::columnar_overwritten_history_error(&table, key));
+        }
+        if columnar_rows
+            .iter()
+            .any(|row| row.kind == ChangeKind::Merge)
+        {
+            return Err(Self::columnar_merge_read_error(&table, key));
+        }
+
+        enum VisibleCandidate {
+            Memtable(SstableRow),
+            Columnar(ColumnarRowRef),
+        }
+
+        let mut candidates = mem_rows
+            .into_iter()
+            .map(VisibleCandidate::Memtable)
+            .chain(columnar_rows.into_iter().map(VisibleCandidate::Columnar))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let (left_sequence, left_kind) = match left {
+                VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
+                VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
+            };
+            let (right_sequence, right_kind) = match right {
+                VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
+                VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
+            };
+            right_sequence.cmp(&left_sequence).then_with(|| {
+                Self::visible_row_priority(left_kind).cmp(&Self::visible_row_priority(right_kind))
+            })
+        });
+
+        let Some(head) = candidates.first() else {
+            return Ok(None);
+        };
+
+        match head {
+            VisibleCandidate::Memtable(row) => match row.kind {
+                ChangeKind::Put => Ok(Some(Self::project_columnar_value(
+                    row.value
+                        .as_ref()
+                        .ok_or_else(|| StorageError::corruption("put row is missing a value"))?,
+                    &projection,
+                )?)),
+                ChangeKind::Delete => Ok(None),
+                ChangeKind::Merge => Err(Self::columnar_merge_read_error(&table, key)),
+            },
+            VisibleCandidate::Columnar(row) => match row.kind {
+                ChangeKind::Put => {
+                    let sstable = sstables_by_local_id.get(&row.local_id).ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "columnar SSTable {} disappeared during point read",
+                            row.local_id
+                        ))
+                    })?;
+                    let values = sstable
+                        .materialize_columnar_rows(
+                            &self.inner.dependencies,
+                            &projection,
+                            &BTreeSet::from([row.row_index]),
+                        )
+                        .await?;
+                    Ok(values.get(&row.row_index).cloned())
+                }
+                ChangeKind::Delete => Ok(None),
+                ChangeKind::Merge => Err(Self::columnar_merge_read_error(&table, key)),
+            },
+        }
+    }
+
+    async fn scan_visible(
+        &self,
+        table_id: TableId,
+        sequence: SequenceNumber,
+        matcher: KeyMatcher<'_>,
+        opts: &ScanOptions,
+    ) -> Result<Vec<(Key, Value)>, StorageError> {
+        let table = Self::stored_table_by_id(&self.tables_read(), table_id)
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::not_found(format!("table id {} is not registered", table_id.get()))
+            })?;
+        if table.config.format == TableFormat::Row {
+            return self.scan_visible_row(table_id, sequence, matcher, opts);
+        }
+
+        let limit = opts.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let projection = Self::resolve_scan_projection(&table, opts.columns.as_deref())?
+            .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
+        let memtables = self.memtables_read().clone();
+        let live = self.sstables_read().live.clone();
+        let current_sequence = self.current_sequence();
+
+        let mut keys = BTreeSet::new();
+        memtables.collect_matching_keys(table_id, &matcher, &mut keys);
+
+        let mut sstables_by_local_id = BTreeMap::new();
+        let mut columnar_rows_by_key = BTreeMap::<Key, Vec<ColumnarRowRef>>::new();
+        let mut persisted_versions_by_key = BTreeMap::<Key, usize>::new();
+        for sstable in live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
+        {
+            sstables_by_local_id.insert(sstable.meta.local_id.clone(), sstable.clone());
+            for row in sstable
+                .collect_scan_row_refs_columnar(
+                    &self.inner.dependencies,
+                    &matcher,
+                    if sequence < current_sequence {
+                        current_sequence
+                    } else {
+                        sequence
+                    },
+                )
+                .await?
+            {
+                if sequence < current_sequence {
+                    *persisted_versions_by_key
+                        .entry(row.key.clone())
+                        .or_default() += 1;
+                }
+                if row.sequence <= sequence {
+                    keys.insert(row.key.clone());
+                    columnar_rows_by_key
+                        .entry(row.key.clone())
+                        .or_default()
+                        .push(row);
+                }
+            }
+        }
+
+        let mut ordered_keys = keys.into_iter().collect::<Vec<_>>();
+        if opts.reverse {
+            ordered_keys.reverse();
+        }
+
+        enum ScanResolution {
+            Ready(Value),
+            ColumnarPending { local_id: String, row_index: usize },
+        }
+
+        let mut resolved = Vec::<(Key, ScanResolution)>::new();
+        let mut pending_by_sstable = BTreeMap::<String, BTreeSet<usize>>::new();
+        for key in ordered_keys {
+            let mut mem_rows = Vec::new();
+            memtables.collect_visible_rows(table_id, &key, sequence, &mut mem_rows);
+            let columnar_rows = columnar_rows_by_key.remove(&key).unwrap_or_default();
+
+            if sequence < current_sequence
+                && persisted_versions_by_key
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+            {
+                return Err(Self::columnar_overwritten_history_error(&table, &key));
+            }
+            if columnar_rows
+                .iter()
+                .any(|row| row.kind == ChangeKind::Merge)
+            {
+                return Err(Self::columnar_merge_read_error(&table, &key));
+            }
+
+            enum VisibleCandidate {
+                Memtable(SstableRow),
+                Columnar(ColumnarRowRef),
+            }
+
+            let mut candidates = mem_rows
+                .into_iter()
+                .map(VisibleCandidate::Memtable)
+                .chain(columnar_rows.into_iter().map(VisibleCandidate::Columnar))
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                let (left_sequence, left_kind) = match left {
+                    VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
+                    VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
+                };
+                let (right_sequence, right_kind) = match right {
+                    VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
+                    VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
+                };
+                right_sequence.cmp(&left_sequence).then_with(|| {
+                    Self::visible_row_priority(left_kind)
+                        .cmp(&Self::visible_row_priority(right_kind))
+                })
+            });
+
+            let Some(head) = candidates.first() else {
+                continue;
+            };
+
+            match head {
+                VisibleCandidate::Memtable(row) => match row.kind {
+                    ChangeKind::Put => resolved.push((
+                        key,
+                        ScanResolution::Ready(Self::project_columnar_value(
+                            row.value.as_ref().ok_or_else(|| {
+                                StorageError::corruption("put row is missing a value")
+                            })?,
+                            &projection,
+                        )?),
+                    )),
+                    ChangeKind::Delete => {}
+                    ChangeKind::Merge => return Err(Self::columnar_merge_read_error(&table, &key)),
+                },
+                VisibleCandidate::Columnar(row) => match row.kind {
+                    ChangeKind::Put => {
+                        pending_by_sstable
+                            .entry(row.local_id.clone())
+                            .or_default()
+                            .insert(row.row_index);
+                        resolved.push((
+                            key,
+                            ScanResolution::ColumnarPending {
+                                local_id: row.local_id.clone(),
+                                row_index: row.row_index,
+                            },
+                        ));
+                    }
+                    ChangeKind::Delete => {}
+                    ChangeKind::Merge => return Err(Self::columnar_merge_read_error(&table, &key)),
+                },
+            }
+
+            if resolved.len() >= limit {
+                break;
+            }
+        }
+
+        let mut materialized_by_sstable = BTreeMap::<String, BTreeMap<usize, Value>>::new();
+        for (local_id, row_indexes) in pending_by_sstable {
+            let sstable = sstables_by_local_id.get(&local_id).ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "columnar SSTable {} disappeared during scan",
+                    local_id
+                ))
+            })?;
+            materialized_by_sstable.insert(
+                local_id.clone(),
+                sstable
+                    .materialize_columnar_rows(&self.inner.dependencies, &projection, &row_indexes)
+                    .await?,
+            );
+        }
+
+        let mut rows = Vec::with_capacity(resolved.len());
+        for (key, resolution) in resolved {
+            match resolution {
+                ScanResolution::Ready(value) => rows.push((key, value)),
+                ScanResolution::ColumnarPending {
+                    local_id,
+                    row_index,
+                } => {
+                    let values = materialized_by_sstable.get(&local_id).ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "columnar SSTable {} materialization is missing",
+                            local_id
+                        ))
+                    })?;
+                    let value = values.get(&row_index).cloned().ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "columnar SSTable {} row {} was not materialized",
+                            local_id, row_index
+                        ))
+                    })?;
+                    rows.push((key, value));
+                }
             }
         }
 
@@ -7902,7 +8849,7 @@ impl Table {
         };
         self.db.validate_historical_read(table_id, sequence)?;
 
-        Ok(self.db.read_visible_value(table_id, &key, sequence)?)
+        Ok(self.db.read_visible_value(table_id, &key, sequence).await?)
     }
 
     pub async fn scan_at(
@@ -7917,15 +8864,18 @@ impl Table {
         };
         self.db.validate_historical_read(table_id, sequence)?;
 
-        let rows = self.db.scan_visible(
-            table_id,
-            sequence,
-            KeyMatcher::Range {
-                start: &start,
-                end: &end,
-            },
-            &opts,
-        )?;
+        let rows = self
+            .db
+            .scan_visible(
+                table_id,
+                sequence,
+                KeyMatcher::Range {
+                    start: &start,
+                    end: &end,
+                },
+                &opts,
+            )
+            .await?;
         Ok(Box::pin(stream::iter(rows)))
     }
 
@@ -7942,7 +8892,8 @@ impl Table {
 
         let rows = self
             .db
-            .scan_visible(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts)?;
+            .scan_visible(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts)
+            .await?;
         Ok(Box::pin(stream::iter(rows)))
     }
 
@@ -8213,6 +9164,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+    use async_trait::async_trait;
     use futures::StreamExt;
     use parking_lot::Mutex;
     use serde_json::json;
@@ -8314,6 +9266,94 @@ mod tests {
             clock,
             Arc::new(StubRng::seeded(7)),
         )
+    }
+
+    #[derive(Clone)]
+    struct RecordingObjectStore {
+        inner: Arc<StubObjectStore>,
+        get_calls: Arc<Mutex<Vec<String>>>,
+        range_calls: Arc<Mutex<Vec<(String, u64, u64)>>>,
+    }
+
+    impl RecordingObjectStore {
+        fn new(inner: Arc<StubObjectStore>) -> Self {
+            Self {
+                inner,
+                get_calls: Arc::new(Mutex::new(Vec::new())),
+                range_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn clear_calls(&self) {
+            self.get_calls.lock().clear();
+            self.range_calls.lock().clear();
+        }
+
+        fn get_calls(&self) -> Vec<String> {
+            self.get_calls.lock().clone()
+        }
+
+        fn range_calls(&self) -> Vec<(String, u64, u64)> {
+            self.range_calls.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RecordingObjectStore {
+        async fn put(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
+            self.inner.put(key, data).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+            self.get_calls.lock().push(key.to_string());
+            self.inner.get(key).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            start: u64,
+            end: u64,
+        ) -> Result<Vec<u8>, StorageError> {
+            self.range_calls.lock().push((key.to_string(), start, end));
+            self.inner.get_range(key, start, end).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.delete(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn copy(&self, from: &str, to: &str) -> Result<(), StorageError> {
+            self.inner.copy(from, to).await
+        }
+    }
+
+    async fn install_columnar_schema_successor(
+        db: &Db,
+        table_name: &str,
+        successor: SchemaDefinition,
+    ) {
+        let mut tables = db.tables_read().clone();
+        let stored = tables
+            .get_mut(table_name)
+            .expect("table should exist for schema successor");
+        let current = stored
+            .config
+            .schema
+            .clone()
+            .expect("columnar table should have a current schema");
+        current
+            .validate_successor(&successor)
+            .expect("schema successor should be valid");
+        stored.config.schema = Some(successor);
+        db.persist_tables(&tables)
+            .await
+            .expect("persist schema successor");
+        *db.tables_write() = tables;
     }
 
     fn tiered_config_with_scheduler(path: &str, scheduler: Arc<dyn Scheduler>) -> DbConfig {
@@ -10960,6 +12000,534 @@ mod tests {
                 .await
                 .expect("read reopened remote record"),
             Some(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_reads_and_scans_reconstruct_rows_and_guard_historical_overwrites() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store);
+
+        let db = Db::open(
+            tiered_config("/columnar-read-semantics"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let config = columnar_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+        let table = db.create_table(config).await.expect("create table");
+
+        let first = table
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("user_id", FieldValue::String("alice".to_string())),
+                        ("count", FieldValue::Int64(1)),
+                    ],
+                )
+                .expect("encode first record"),
+            )
+            .await
+            .expect("write first record");
+        let second = table
+            .write(
+                b"user:2".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![("user_id", FieldValue::String("bob".to_string()))],
+                )
+                .expect("encode second record"),
+            )
+            .await
+            .expect("write second record");
+        db.flush().await.expect("flush first batch");
+
+        let updated = Value::named_record(
+            &schema,
+            vec![
+                ("user_id", FieldValue::String("alice".to_string())),
+                ("count", FieldValue::Int64(9)),
+            ],
+        )
+        .expect("encode updated record");
+        let latest = table
+            .write(b"user:1".to_vec(), updated.clone())
+            .await
+            .expect("write updated record");
+        db.flush().await.expect("flush overwritten key");
+
+        let defaulted = Value::named_record(
+            &schema,
+            vec![("user_id", FieldValue::String("bob".to_string()))],
+        )
+        .expect("encode defaulted row");
+        assert_eq!(
+            table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("latest point read"),
+            Some(updated.clone())
+        );
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan_prefix(b"user:".to_vec(), ScanOptions::default())
+                    .await
+                    .expect("latest scan"),
+            )
+            .await,
+            vec![
+                (b"user:1".to_vec(), updated.clone()),
+                (b"user:2".to_vec(), defaulted.clone()),
+            ]
+        );
+        assert_eq!(
+            table
+                .read_at(b"user:2".to_vec(), second)
+                .await
+                .expect("historical single-version read"),
+            Some(defaulted)
+        );
+        assert_eq!(
+            table
+                .read_at(b"user:1".to_vec(), latest)
+                .await
+                .expect("latest read_at still succeeds"),
+            Some(updated)
+        );
+
+        let point_error = table
+            .read_at(b"user:1".to_vec(), first)
+            .await
+            .expect_err("historical overwritten key should fail closed");
+        match point_error {
+            ReadError::Storage(error) => {
+                assert!(error.message().contains("historical overwritten-key"));
+            }
+            other => panic!("expected unsupported storage error, got {other:?}"),
+        }
+
+        let scan_error = match table
+            .scan_at(Vec::new(), vec![0xff], first, ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("historical scan with overwritten key should fail closed"),
+            Err(error) => error,
+        };
+        match scan_error {
+            ReadError::Storage(error) => {
+                assert!(error.message().contains("historical overwritten-key"));
+            }
+            other => panic!("expected unsupported storage error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_scan_pruning_skips_unrequested_column_decodes() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(tiered_config("/columnar-pruned-scan"), dependencies.clone())
+            .await
+            .expect("open db");
+        let config = columnar_all_types_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+        let table = db.create_table(config).await.expect("create table");
+
+        table
+            .write(
+                b"row:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("metric", FieldValue::String("cpu".to_string())),
+                        ("count", FieldValue::Int64(7)),
+                        ("ratio", FieldValue::Float64(1.25)),
+                        ("payload", FieldValue::Bytes(vec![1, 2, 3])),
+                        ("active", FieldValue::Bool(true)),
+                    ],
+                )
+                .expect("encode row"),
+            )
+            .await
+            .expect("write row");
+        db.flush().await.expect("flush columnar row");
+
+        let live = db
+            .sstables_read()
+            .live
+            .first()
+            .cloned()
+            .expect("live columnar sstable");
+        let file_bytes = read_path(&dependencies, &live.meta.file_path)
+            .await
+            .expect("read local columnar file");
+        let (footer, _) = Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes)
+            .expect("decode local columnar footer");
+        let count_block = footer
+            .columns
+            .iter()
+            .find(|column| column.field_id == FieldId::new(2))
+            .expect("count column");
+        let handle = file_system
+            .open(
+                &live.meta.file_path,
+                crate::OpenOptions {
+                    create: false,
+                    read: true,
+                    write: true,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .await
+            .expect("open local columnar file for corruption");
+        file_system
+            .write_at(&handle, count_block.block.offset, b"{not-valid-json")
+            .await
+            .expect("corrupt unrequested count column");
+        file_system
+            .sync(&handle)
+            .await
+            .expect("sync corrupted column");
+
+        let pruned_rows = collect_rows(
+            table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["metric".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("pruned scan should ignore corrupted count column"),
+        )
+        .await;
+        assert_eq!(
+            pruned_rows,
+            vec![(
+                b"row:1".to_vec(),
+                Value::record(BTreeMap::from([(
+                    FieldId::new(1),
+                    FieldValue::String("cpu".to_string()),
+                )])),
+            )]
+        );
+
+        let full_scan_error = match table
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("full scan should decode the corrupted count column"),
+            Err(error) => error,
+        };
+        match full_scan_error {
+            ReadError::Storage(error) => {
+                assert!(error.message().contains("decode columnar field 2"));
+            }
+            other => panic!("expected storage error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_columnar_scan_fetches_only_requested_ranges() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let inner_store = Arc::new(StubObjectStore::default());
+        let recording_store = Arc::new(RecordingObjectStore::new(inner_store.clone()));
+        let dependencies = DbDependencies::new(
+            file_system,
+            recording_store.clone(),
+            Arc::new(StubClock::default()),
+            Arc::new(StubRng::seeded(7)),
+        );
+
+        let db = Db::open(
+            s3_primary_config("columnar-range-fetch"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let config = columnar_all_types_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+        let table = db.create_table(config).await.expect("create table");
+
+        table
+            .write(
+                b"row:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("metric", FieldValue::String("cpu".to_string())),
+                        ("count", FieldValue::Int64(11)),
+                        ("ratio", FieldValue::Float64(2.5)),
+                        ("payload", FieldValue::Bytes(vec![9, 8, 7])),
+                        ("active", FieldValue::Bool(true)),
+                    ],
+                )
+                .expect("encode row:1"),
+            )
+            .await
+            .expect("write row:1");
+        table
+            .write(
+                b"row:2".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("metric", FieldValue::String("mem".to_string())),
+                        ("count", FieldValue::Int64(5)),
+                        ("ratio", FieldValue::Float64(1.0)),
+                        ("payload", FieldValue::Bytes(vec![1, 2])),
+                        ("active", FieldValue::Bool(false)),
+                    ],
+                )
+                .expect("encode row:2"),
+            )
+            .await
+            .expect("write row:2");
+        db.flush().await.expect("flush remote columnar rows");
+
+        let live = db
+            .sstables_read()
+            .live
+            .first()
+            .cloned()
+            .expect("live remote columnar sstable");
+        let remote_key = live.meta.remote_key.clone().expect("remote object key");
+        let file_bytes = inner_store
+            .get(&remote_key)
+            .await
+            .expect("read remote bytes from inner store");
+        let (footer, footer_start) =
+            Db::columnar_footer_from_bytes(&remote_key, &file_bytes).expect("decode footer");
+        let metric_block = footer
+            .columns
+            .iter()
+            .find(|column| column.field_id == FieldId::new(1))
+            .expect("metric block");
+        let count_block = footer
+            .columns
+            .iter()
+            .find(|column| column.field_id == FieldId::new(2))
+            .expect("count block");
+
+        let footer_range = (
+            remote_key.clone(),
+            footer_start as u64,
+            live.meta.length
+                - (COLUMNAR_SSTABLE_MAGIC.len() as u64 + std::mem::size_of::<u64>() as u64),
+        );
+        let expected_ranges = [
+            (
+                remote_key.clone(),
+                live.meta.length
+                    - (COLUMNAR_SSTABLE_MAGIC.len() as u64 + std::mem::size_of::<u64>() as u64),
+                live.meta.length,
+            ),
+            footer_range.clone(),
+            (
+                remote_key.clone(),
+                footer.key_index.offset,
+                footer.key_index.offset + footer.key_index.length,
+            ),
+            (
+                remote_key.clone(),
+                footer.sequence_column.offset,
+                footer.sequence_column.offset + footer.sequence_column.length,
+            ),
+            (
+                remote_key.clone(),
+                footer.tombstone_bitmap.offset,
+                footer.tombstone_bitmap.offset + footer.tombstone_bitmap.length,
+            ),
+            (
+                remote_key.clone(),
+                footer.row_kind_column.offset,
+                footer.row_kind_column.offset + footer.row_kind_column.length,
+            ),
+            (
+                remote_key.clone(),
+                metric_block.block.offset,
+                metric_block.block.offset + metric_block.block.length,
+            ),
+        ];
+
+        recording_store.clear_calls();
+        let rows = collect_rows(
+            table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["metric".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("remote pruned scan"),
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    b"row:1".to_vec(),
+                    Value::record(BTreeMap::from([(
+                        FieldId::new(1),
+                        FieldValue::String("cpu".to_string()),
+                    )])),
+                ),
+                (
+                    b"row:2".to_vec(),
+                    Value::record(BTreeMap::from([(
+                        FieldId::new(1),
+                        FieldValue::String("mem".to_string()),
+                    )])),
+                ),
+            ]
+        );
+
+        assert!(
+            recording_store
+                .get_calls()
+                .into_iter()
+                .all(|key| key != remote_key),
+            "columnar scan should not issue a full-object get for the SSTable",
+        );
+
+        let range_calls = recording_store
+            .range_calls()
+            .into_iter()
+            .filter(|(key, _, _)| key == &remote_key)
+            .collect::<Vec<_>>();
+        assert!(!range_calls.is_empty(), "scan should issue range reads");
+        assert!(
+            range_calls
+                .iter()
+                .all(|range| expected_ranges.contains(range)),
+            "all remote range reads should stay within the footer, metadata columns, and requested metric column",
+        );
+        assert!(
+            !range_calls.contains(&(
+                remote_key,
+                count_block.block.offset,
+                count_block.block.offset + count_block.block.length,
+            )),
+            "count column should not be fetched for a metric-only scan",
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_reads_fill_defaults_when_older_sstables_lack_new_fields() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store);
+
+        let db = Db::open(
+            tiered_config("/columnar-schema-default-fill"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+
+        let legacy_schema = SchemaDefinition {
+            version: 1,
+            fields: vec![FieldDefinition {
+                id: FieldId::new(1),
+                name: "user_id".to_string(),
+                field_type: FieldType::String,
+                nullable: false,
+                default: None,
+            }],
+        };
+        let mut legacy_config = columnar_table_config("metrics");
+        legacy_config.schema = Some(legacy_schema.clone());
+        let table = db
+            .create_table(legacy_config)
+            .await
+            .expect("create legacy columnar table");
+
+        let first = table
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &legacy_schema,
+                    vec![("user_id", FieldValue::String("alice".to_string()))],
+                )
+                .expect("encode legacy row"),
+            )
+            .await
+            .expect("write legacy row");
+        db.flush().await.expect("flush legacy row");
+
+        let successor_schema = columnar_table_config("metrics")
+            .schema
+            .expect("successor schema");
+        install_columnar_schema_successor(&db, "metrics", successor_schema.clone()).await;
+        let second_record = Value::named_record(
+            &successor_schema,
+            vec![
+                ("user_id", FieldValue::String("bob".to_string())),
+                ("count", FieldValue::Int64(7)),
+            ],
+        )
+        .expect("encode successor row");
+        table
+            .write(b"user:2".to_vec(), second_record.clone())
+            .await
+            .expect("write successor row");
+        db.flush().await.expect("flush successor row");
+
+        let expected_legacy = Value::named_record(
+            &successor_schema,
+            vec![("user_id", FieldValue::String("alice".to_string()))],
+        )
+        .expect("encode default-filled legacy row");
+        assert_eq!(
+            table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read default-filled legacy row"),
+            Some(expected_legacy.clone())
+        );
+        assert_eq!(
+            table
+                .read_at(b"user:1".to_vec(), first)
+                .await
+                .expect("historical read of single-version legacy row"),
+            Some(expected_legacy.clone())
+        );
+
+        let reopened = Db::open(tiered_config("/columnar-schema-default-fill"), dependencies)
+            .await
+            .expect("reopen mixed-schema db");
+        let reopened_table = reopened.table("metrics");
+        assert_eq!(
+            reopened_table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read reopened default-filled legacy row"),
+            Some(expected_legacy.clone())
+        );
+        assert_eq!(
+            collect_rows(
+                reopened_table
+                    .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                    .await
+                    .expect("scan mixed-schema rows"),
+            )
+            .await,
+            vec![
+                (b"user:1".to_vec(), expected_legacy),
+                (b"user:2".to_vec(), second_record),
+            ]
         );
     }
 
