@@ -310,6 +310,15 @@ pub struct SegmentDescriptor {
     pub tables: Vec<TableSegmentMeta>,
 }
 
+#[derive(Clone)]
+pub(crate) struct LocalSegmentScanPlan {
+    pub fs: Arc<dyn FileSystem>,
+    pub segment_id: SegmentId,
+    pub path: String,
+    pub min_sequence: Option<SequenceNumber>,
+    pub max_sequence: Option<SequenceNumber>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendLocation {
     pub segment_id: SegmentId,
@@ -755,6 +764,34 @@ impl SegmentManager {
         Ok(records)
     }
 
+    pub(crate) fn table_scan_plans_since(
+        &self,
+        table_id: TableId,
+        sequence_inclusive: SequenceNumber,
+    ) -> Vec<LocalSegmentScanPlan> {
+        self.enumerate_segments()
+            .into_iter()
+            .filter(|descriptor| descriptor.max_sequence >= Some(sequence_inclusive))
+            .filter(|descriptor| {
+                descriptor
+                    .tables
+                    .iter()
+                    .any(|table| table.table_id == table_id)
+            })
+            .map(|descriptor| LocalSegmentScanPlan {
+                fs: self.fs.clone(),
+                segment_id: descriptor.segment_id,
+                path: if descriptor.sealed {
+                    segment_path(&self.dir, descriptor.segment_id)
+                } else {
+                    self.active.path.clone()
+                },
+                min_sequence: descriptor.min_sequence,
+                max_sequence: descriptor.max_sequence,
+            })
+            .collect()
+    }
+
     async fn repair_active_segment(
         fs: &dyn FileSystem,
         path: &str,
@@ -1086,6 +1123,59 @@ impl SegmentReader {
     }
 }
 
+pub(crate) struct SegmentRecordScanner {
+    bytes: Vec<u8>,
+    offset: usize,
+    end_offset: usize,
+    min_sequence: SequenceNumber,
+}
+
+impl SegmentRecordScanner {
+    pub(crate) fn new(
+        segment_id: SegmentId,
+        bytes: Vec<u8>,
+        sequence_inclusive: SequenceNumber,
+    ) -> Result<Self, StorageError> {
+        let (offset, end_offset) = match parse_segment_footer(&bytes)? {
+            Some(footer) => (
+                footer.seek_offset(sequence_inclusive) as usize,
+                footer.data_end_offset as usize,
+            ),
+            None => (0, bytes.len()),
+        };
+        if offset > end_offset || end_offset > bytes.len() {
+            return Err(StorageError::corruption(format!(
+                "segment {} scan range is out of bounds",
+                segment_id.get()
+            )));
+        }
+
+        Ok(Self {
+            bytes,
+            offset,
+            end_offset,
+            min_sequence: sequence_inclusive,
+        })
+    }
+
+    pub(crate) fn next_record(&mut self) -> Result<Option<CommitRecord>, StorageError> {
+        while self.offset < self.end_offset {
+            let (record, next_offset) = parse_record_frame(&self.bytes, self.offset)?;
+            if next_offset > self.end_offset {
+                return Err(StorageError::corruption(
+                    "commit record frame extends beyond declared data range",
+                ));
+            }
+            self.offset = next_offset;
+            if record.sequence() >= self.min_sequence {
+                return Ok(Some(record));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
 pub(crate) fn encode_segment_bytes(
     segment_id: SegmentId,
     records: &[CommitRecord],
@@ -1195,37 +1285,6 @@ pub(crate) fn encode_segment_bytes(
     bytes.extend_from_slice(&trailer);
 
     Ok((bytes, footer))
-}
-
-pub(crate) fn scan_table_from_segment_bytes(
-    bytes: &[u8],
-    table_id: TableId,
-    sequence_inclusive: SequenceNumber,
-) -> Result<Vec<CommitRecord>, StorageError> {
-    let footer = parse_segment_footer(bytes)?.ok_or_else(|| {
-        StorageError::corruption("commit-log segment is missing a footer trailer")
-    })?;
-    let Some(table_meta) = footer
-        .tables
-        .iter()
-        .find(|table| table.table_id == table_id)
-    else {
-        return Ok(Vec::new());
-    };
-    if table_meta.max_sequence < sequence_inclusive {
-        return Ok(Vec::new());
-    }
-
-    Ok(parse_records_range(
-        bytes,
-        footer.seek_offset(sequence_inclusive) as usize,
-        footer.data_end_offset as usize,
-        Some(sequence_inclusive),
-    )?
-    .into_iter()
-    .filter(|record| record.sequence() >= sequence_inclusive)
-    .filter(|record| record_touches_table(record, table_id))
-    .collect())
 }
 
 #[async_trait]

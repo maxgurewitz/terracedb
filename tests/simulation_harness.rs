@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use terracedb::{
     Clock, CommitOptions, CompactionStrategy, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
     FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
@@ -195,21 +195,24 @@ fn simulation_s3_primary_config(prefix: &str) -> DbConfig {
 
 async fn collect_change_feed(stream: terracedb::ChangeStream) -> Vec<DbOracleChange> {
     stream
-        .map(|entry| DbOracleChange {
-            table: entry.table.name().to_string(),
-            key: entry.key,
-            value: entry.value.map(|value| match value {
-                Value::Bytes(bytes) => bytes,
-                Value::Record(_) => {
-                    panic!("simulation change-feed tests only support byte row values")
-                }
-            }),
-            cursor: entry.cursor,
-            sequence: entry.sequence,
-            kind: entry.kind,
+        .map(|entry| {
+            entry.map(|entry| DbOracleChange {
+                table: entry.table.name().to_string(),
+                key: entry.key,
+                value: entry.value.map(|value| match value {
+                    Value::Bytes(bytes) => bytes,
+                    Value::Record(_) => {
+                        panic!("simulation change-feed tests only support byte row values")
+                    }
+                }),
+                cursor: entry.cursor,
+                sequence: entry.sequence,
+                kind: entry.kind,
+            })
         })
-        .collect::<Vec<_>>()
+        .try_collect::<Vec<_>>()
         .await
+        .expect("collect change feed")
 }
 #[test]
 fn simulation_harness_replays_same_seed() -> turmoil::Result {

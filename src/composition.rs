@@ -1,6 +1,6 @@
 use std::convert::TryFrom;
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::{
     ChangeKind, Db, Key, LogCursor, ReadError, ScanOptions, SequenceNumber, StorageError, Table,
@@ -357,7 +357,7 @@ impl DurableOutboxConsumer {
             .map_err(ReadError::from)?;
 
         let mut entries = Vec::new();
-        while let Some(change) = stream.next().await {
+        while let Some(change) = stream.try_next().await.map_err(ReadError::from)? {
             entries.push(decode_outbox_message(change).map_err(ReadError::from)?);
         }
 

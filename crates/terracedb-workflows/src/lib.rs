@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -658,7 +658,7 @@ where
         .await?;
 
     let mut page = Vec::new();
-    while let Some(entry) = stream.next().await {
+    while let Some(entry) = stream.try_next().await? {
         page.push(entry);
     }
 
