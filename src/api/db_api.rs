@@ -1244,13 +1244,48 @@ impl Db {
         upper_bound: SequenceNumber,
         opts: ScanOptions,
     ) -> Result<ChangeStream, ChangeFeedError> {
+<<<<<<< HEAD
         let span = tracing::debug_span!("terracedb.db.change_feed.scan");
         apply_db_span_attributes(
             &span,
             &self.telemetry_db_name(),
             &self.telemetry_db_instance(),
             self.telemetry_storage_mode(),
-        );
+=======
+        let Some(table_id) = self.resolve_table_id(table) else {
+            return Err(Self::missing_table_error(table.name()).into());
+        };
+        if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
+            return Ok(Box::pin(stream::empty()));
+        }
+        let table_watermark = self.table_change_feed_watermark(table_id);
+
+        let table_handle = Table {
+            db: self.clone(),
+            name: Arc::from(table.name()),
+            id: Some(table_id),
+        };
+        let sources = {
+            let runtime = self.inner.commit_runtime.lock().await;
+            let floor = self.change_feed_floor_from_state(
+                table_id,
+                upper_bound,
+                runtime.oldest_sequence_for_table(table_id),
+                runtime.oldest_segment_id(),
+                table_watermark,
+            );
+            if let Some(oldest_available) = floor
+                && cursor.sequence() < oldest_available
+            {
+                return Err(ChangeFeedError::SnapshotTooOld(SnapshotTooOld {
+                    requested: cursor.sequence(),
+                    oldest_available,
+                }));
+            }
+
+            runtime.change_feed_scan_plan(table_id, cursor.sequence())
+        };
+
         apply_table_span_attribute(&span, table.name());
         crate::set_span_attribute(
             &span,
@@ -1297,12 +1332,14 @@ impl Db {
                 runtime.change_feed_scan_plan(table_id, cursor.sequence())
             };
 
+            let scan_guard = self.register_commit_log_scan(&pinned_segment_ids(&sources));
             let scanner = ChangeFeedScanner::new(
                 table_id,
                 table_handle,
                 cursor,
                 upper_bound,
                 opts.limit,
+                scan_guard,
                 sources,
             );
             Ok(Box::pin(stream::try_unfold(
@@ -1514,6 +1551,14 @@ impl Db {
             return None;
         }
         Some(stored.id)
+    }
+
+    fn register_commit_log_scan(&self, segment_ids: &[SegmentId]) -> CommitLogScanGuard {
+        mutex_lock(&self.inner.commit_log_scans).register(segment_ids);
+        CommitLogScanGuard {
+            db: Arc::downgrade(&self.inner),
+            segment_ids: segment_ids.to_vec(),
+        }
     }
 
     fn stored_table_by_id(
@@ -2391,11 +2436,14 @@ impl Db {
             return Ok(());
         }
 
+        let protected_segments = mutex_lock(&self.inner.commit_log_scans).pinned_segments();
         let mut runtime = self.inner.commit_runtime.lock().await;
         if seal_active {
             runtime.maybe_seal_active().await?;
         }
-        runtime.prune_segments_before(gc_floor).await
+        runtime
+            .prune_segments_before(gc_floor, &protected_segments)
+            .await
     }
 
     fn validate_historical_read(

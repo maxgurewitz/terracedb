@@ -72,6 +72,7 @@ impl Db {
                     backup_lock: AsyncMutex::new(()),
                     commit_runtime: AsyncMutex::new(commit_runtime),
                     commit_coordinator: Mutex::new(CommitCoordinator::default()),
+                    commit_log_scans: Mutex::new(CommitLogScanRegistry::default()),
                     next_table_id: AtomicU32::new(next_table_id),
                     next_sequence: AtomicU64::new(recovered_sequence.get()),
                     current_sequence: AtomicU64::new(recovered_sequence.get()),
