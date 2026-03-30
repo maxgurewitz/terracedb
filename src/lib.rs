@@ -23,7 +23,7 @@ pub use api::{
     BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarRecord, CommitOptions, Db,
     FieldDefinition, FieldType, FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet,
     ReadSetEntry, ScanOptions, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
-    WriteBatch,
+    WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
 };
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
