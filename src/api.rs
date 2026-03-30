@@ -637,6 +637,7 @@ struct DbInner {
     backup_lock: AsyncMutex<()>,
     commit_runtime: AsyncMutex<CommitRuntime>,
     commit_coordinator: Mutex<CommitCoordinator>,
+    commit_log_scans: Mutex<CommitLogScanRegistry>,
     next_table_id: AtomicU32,
     next_sequence: AtomicU64,
     current_sequence: AtomicU64,
@@ -657,6 +658,8 @@ struct DbInner {
     compaction_phase_blocks: Mutex<Vec<CompactionPhaseBlock>>,
     #[cfg(test)]
     offload_phase_blocks: Mutex<Vec<OffloadPhaseBlock>>,
+    #[cfg(test)]
+    commit_log_scan_phase_blocks: Mutex<Vec<CommitLogScanPhaseBlock>>,
 }
 
 #[derive(Clone)]
@@ -820,6 +823,7 @@ struct ChangeFeedScanner {
     table_id: TableId,
     table: Table,
     remaining: Option<usize>,
+    _scan_guard: CommitLogScanGuard,
     sources: VecDeque<ChangeFeedSourcePlan>,
     current_source: Option<ActiveChangeFeedSource>,
 }
@@ -1170,6 +1174,12 @@ enum OffloadPhase {
     LocalCleanupFinished,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitLogScanPhase {
+    AfterMetadataSnapshot,
+}
+
 #[cfg(test)]
 struct CommitPhaseBlock {
     phase: CommitPhase,
@@ -1198,6 +1208,13 @@ struct OffloadPhaseBlock {
 }
 
 #[cfg(test)]
+struct CommitLogScanPhaseBlock {
+    phase: CommitLogScanPhase,
+    reached_tx: Option<oneshot::Sender<()>>,
+    release_rx: Option<oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
 struct CompactionPhaseBlocker {
     reached_rx: Option<oneshot::Receiver<()>>,
     release_tx: Option<oneshot::Sender<()>>,
@@ -1206,6 +1223,12 @@ struct CompactionPhaseBlocker {
 #[cfg(test)]
 #[allow(dead_code)]
 struct OffloadPhaseBlocker {
+    reached_rx: Option<oneshot::Receiver<()>>,
+    release_tx: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+struct CommitLogScanPhaseBlocker {
     reached_rx: Option<oneshot::Receiver<()>>,
     release_tx: Option<oneshot::Sender<()>>,
 }
@@ -1262,6 +1285,23 @@ impl OffloadPhaseBlocker {
     }
 }
 
+#[cfg(test)]
+impl CommitLogScanPhaseBlocker {
+    async fn wait_until_reached(&mut self) {
+        self.reached_rx
+            .take()
+            .expect("commit-log scan phase blocker should have a receiver")
+            .await
+            .expect("commit-log scan phase blocker should observe the phase");
+    }
+
+    fn release(&mut self) {
+        if let Some(release_tx) = self.release_tx.take() {
+            let _ = release_tx.send(());
+        }
+    }
+}
+
 struct CommitRuntime {
     backend: CommitLogBackend,
 }
@@ -1300,6 +1340,7 @@ impl ChangeFeedScanner {
         cursor: LogCursor,
         upper_bound: SequenceNumber,
         remaining: Option<usize>,
+        scan_guard: CommitLogScanGuard,
         sources: VecDeque<ChangeFeedSourcePlan>,
     ) -> Self {
         Self {
@@ -1308,6 +1349,7 @@ impl ChangeFeedScanner {
             table_id,
             table,
             remaining,
+            _scan_guard: scan_guard,
             sources,
             current_source: None,
         }
@@ -1367,7 +1409,7 @@ impl ChangeFeedScanner {
                     return Ok(None);
                 }
 
-                let bytes = read_change_feed_file(&plan.fs, &plan.path).await?;
+                let bytes = read_change_feed_file(&plan).await?;
                 Ok(Some(ActiveChangeFeedSource::Segment(
                     ChangeFeedSegmentSource {
                         scanner: SegmentRecordScanner::new(
@@ -1552,29 +1594,64 @@ fn change_entries_for_record(
         .collect()
 }
 
-async fn read_change_feed_file(
-    fs: &Arc<dyn crate::FileSystem>,
-    path: &str,
-) -> Result<Vec<u8>, StorageError> {
-    let handle = FileHandle::new(path);
+fn pinned_segment_ids(sources: &VecDeque<ChangeFeedSourcePlan>) -> Vec<SegmentId> {
+    sources
+        .iter()
+        .filter_map(|source| match source {
+            ChangeFeedSourcePlan::LocalSegment(plan) => Some(plan.segment_id),
+            ChangeFeedSourcePlan::RemoteSegment(_) | ChangeFeedSourcePlan::BufferedRecords(_) => {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn read_change_feed_file(plan: &LocalSegmentScanPlan) -> Result<Vec<u8>, StorageError> {
+    let handle = FileHandle::new(&plan.path);
     let mut bytes = Vec::new();
     let mut offset = 0_u64;
     loop {
-        let chunk = fs
-            .read_at(&handle, offset, CHANGE_FEED_READ_CHUNK_BYTES)
+        let Some(read_len) = plan.read_len else {
+            let chunk = plan
+                .fs
+                .read_at(&handle, offset, CHANGE_FEED_READ_CHUNK_BYTES)
+                .await?;
+            if chunk.is_empty() {
+                break;
+            }
+            offset = offset.saturating_add(chunk.len() as u64);
+            bytes.extend_from_slice(&chunk);
+            if chunk.len() < CHANGE_FEED_READ_CHUNK_BYTES {
+                break;
+            }
+            continue;
+        };
+
+        if offset >= read_len {
+            break;
+        }
+        let chunk = plan
+            .fs
+            .read_at(
+                &handle,
+                offset,
+                CHANGE_FEED_READ_CHUNK_BYTES.min(read_len.saturating_sub(offset) as usize),
+            )
             .await?;
         if chunk.is_empty() {
-            break;
+            return Err(StorageError::corruption(format!(
+                "segment prefix read ended early for {}: expected {read_len} bytes, reached {offset}",
+                plan.path
+            )));
         }
         offset = offset.saturating_add(chunk.len() as u64);
         bytes.extend_from_slice(&chunk);
-        if chunk.len() < CHANGE_FEED_READ_CHUNK_BYTES {
+        if chunk.len() < CHANGE_FEED_READ_CHUNK_BYTES || offset >= read_len {
             break;
         }
     }
     Ok(bytes)
 }
-
 impl CommitRuntime {
     async fn append(&mut self, record: CommitRecord) -> Result<(), StorageError> {
         match &mut self.backend {
@@ -1619,10 +1696,13 @@ impl CommitRuntime {
     async fn prune_segments_before(
         &mut self,
         sequence_exclusive: SequenceNumber,
+        protected_segments: &BTreeSet<SegmentId>,
     ) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => {
-                manager.prune_sealed_before(sequence_exclusive).await?;
+                manager
+                    .prune_sealed_before(sequence_exclusive, protected_segments)
+                    .await?;
                 Ok(())
             }
             CommitLogBackend::Memory(_) => Ok(()),
@@ -1847,6 +1927,80 @@ struct CommitParticipant {
     operations: Vec<ResolvedBatchOperation>,
     conflict_keys: Vec<CommitConflictKey>,
     group_batch: Option<Arc<GroupCommitBatch>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CommitLogScanMetrics {
+    snapshots_started: u64,
+    active_scans: u64,
+    max_concurrent_scans: u64,
+    max_pinned_segments: usize,
+}
+
+#[derive(Default)]
+struct CommitLogScanRegistry {
+    pinned_segments: BTreeMap<SegmentId, u64>,
+    metrics: CommitLogScanMetrics,
+}
+
+impl CommitLogScanRegistry {
+    fn register(&mut self, segment_ids: &[SegmentId]) {
+        self.metrics.snapshots_started = self.metrics.snapshots_started.saturating_add(1);
+        self.metrics.active_scans = self.metrics.active_scans.saturating_add(1);
+        self.metrics.max_concurrent_scans = self
+            .metrics
+            .max_concurrent_scans
+            .max(self.metrics.active_scans);
+
+        for &segment_id in segment_ids {
+            *self.pinned_segments.entry(segment_id).or_default() += 1;
+        }
+        self.metrics.max_pinned_segments = self
+            .metrics
+            .max_pinned_segments
+            .max(self.pinned_segments.len());
+    }
+
+    fn release(&mut self, segment_ids: &[SegmentId]) {
+        self.metrics.active_scans = self.metrics.active_scans.saturating_sub(1);
+
+        for &segment_id in segment_ids {
+            let std::collections::btree_map::Entry::Occupied(mut entry) =
+                self.pinned_segments.entry(segment_id)
+            else {
+                continue;
+            };
+            let current = entry.get_mut();
+            if *current <= 1 {
+                entry.remove();
+            } else {
+                *current -= 1;
+            }
+        }
+    }
+
+    fn pinned_segments(&self) -> BTreeSet<SegmentId> {
+        self.pinned_segments.keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    fn metrics(&self) -> CommitLogScanMetrics {
+        self.metrics.clone()
+    }
+}
+
+struct CommitLogScanGuard {
+    db: Weak<DbInner>,
+    segment_ids: Vec<SegmentId>,
+}
+
+impl Drop for CommitLogScanGuard {
+    fn drop(&mut self) {
+        let Some(db) = self.db.upgrade() else {
+            return;
+        };
+        mutex_lock(&db.commit_log_scans).release(&self.segment_ids);
+    }
 }
 
 #[derive(Default)]
@@ -3359,6 +3513,7 @@ impl Db {
                 backup_lock: AsyncMutex::new(()),
                 commit_runtime: AsyncMutex::new(commit_runtime),
                 commit_coordinator: Mutex::new(CommitCoordinator::default()),
+                commit_log_scans: Mutex::new(CommitLogScanRegistry::default()),
                 next_table_id: AtomicU32::new(next_table_id),
                 next_sequence: AtomicU64::new(recovered_sequence.get()),
                 current_sequence: AtomicU64::new(recovered_sequence.get()),
@@ -3381,6 +3536,8 @@ impl Db {
                 compaction_phase_blocks: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 offload_phase_blocks: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                commit_log_scan_phase_blocks: Mutex::new(Vec::new()),
             }),
         };
         db.prune_commit_log(true)
@@ -8438,16 +8595,18 @@ impl Db {
                     oldest_available,
                 }));
             }
-
             runtime.change_feed_scan_plan(table_id, cursor.sequence())
         };
-
+        let scan_guard = self.register_commit_log_scan(&pinned_segment_ids(&sources));
+        self.maybe_pause_commit_log_scan_phase(CommitLogScanPhase::AfterMetadataSnapshot)
+            .await;
         let scanner = ChangeFeedScanner::new(
             table_id,
             table_handle,
             cursor,
             upper_bound,
             opts.limit,
+            scan_guard,
             sources,
         );
         Ok(Box::pin(stream::try_unfold(
@@ -8504,6 +8663,25 @@ impl Db {
         });
 
         OffloadPhaseBlocker {
+            reached_rx: Some(reached_rx),
+            release_tx: Some(release_tx),
+        }
+    }
+
+    #[cfg(test)]
+    fn block_next_commit_log_scan_phase(
+        &self,
+        phase: CommitLogScanPhase,
+    ) -> CommitLogScanPhaseBlocker {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        mutex_lock(&self.inner.commit_log_scan_phase_blocks).push(CommitLogScanPhaseBlock {
+            phase,
+            reached_tx: Some(reached_tx),
+            release_rx: Some(release_rx),
+        });
+
+        CommitLogScanPhaseBlocker {
             reached_rx: Some(reached_rx),
             release_tx: Some(release_tx),
         }
@@ -8579,6 +8757,42 @@ impl Db {
     #[cfg(not(test))]
     #[allow(dead_code)]
     async fn maybe_pause_offload_phase(&self, _phase: OffloadPhase) {}
+
+    #[cfg(test)]
+    async fn maybe_pause_commit_log_scan_phase(&self, phase: CommitLogScanPhase) {
+        let block = {
+            let mut blocks = mutex_lock(&self.inner.commit_log_scan_phase_blocks);
+            blocks
+                .iter()
+                .position(|block| block.phase == phase)
+                .map(|index| blocks.remove(index))
+        };
+
+        if let Some(mut block) = block {
+            if let Some(reached_tx) = block.reached_tx.take() {
+                let _ = reached_tx.send(());
+            }
+            if let Some(release_rx) = block.release_rx.take() {
+                let _ = release_rx.await;
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn maybe_pause_commit_log_scan_phase(&self, _phase: CommitLogScanPhase) {}
+
+    fn register_commit_log_scan(&self, segment_ids: &[SegmentId]) -> CommitLogScanGuard {
+        mutex_lock(&self.inner.commit_log_scans).register(segment_ids);
+        CommitLogScanGuard {
+            db: Arc::downgrade(&self.inner),
+            segment_ids: segment_ids.to_vec(),
+        }
+    }
+
+    #[cfg(test)]
+    fn commit_log_scan_metrics(&self) -> CommitLogScanMetrics {
+        mutex_lock(&self.inner.commit_log_scans).metrics()
+    }
 
     #[allow(dead_code)]
     pub(crate) fn dependencies(&self) -> &DbDependencies {
@@ -9537,11 +9751,14 @@ impl Db {
             return Ok(());
         }
 
+        let protected_segments = mutex_lock(&self.inner.commit_log_scans).pinned_segments();
         let mut runtime = self.inner.commit_runtime.lock().await;
         if seal_active {
             runtime.maybe_seal_active().await?;
         }
-        runtime.prune_segments_before(gc_floor).await
+        runtime
+            .prune_segments_before(gc_floor, &protected_segments)
+            .await
     }
 
     fn validate_historical_read(
@@ -10047,12 +10264,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, CommitPhase, CompactionJobKind,
-        CompactionPhase, Db, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
-        LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR,
-        LOCAL_SSTABLE_SHARD_DIR, ManifestId, OffloadPhase, PendingWorkSpec,
-        PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key,
-        encode_mvcc_key, read_path,
+        COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, CommitLogScanPhase, CommitPhase,
+        CompactionJobKind, CompactionPhase, Db, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
+        LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
+        LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, OffloadPhase,
+        PendingWorkSpec, PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate,
+        decode_mvcc_key, encode_mvcc_key, read_path,
     };
     use crate::simulation::{
         CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
@@ -19390,6 +19607,173 @@ mod tests {
             .expect_err("second segment get should fail mid-stream");
         assert_eq!(error.kind(), crate::StorageErrorKind::Timeout);
         assert!(error.message().contains("simulated timeout"));
+    }
+
+    #[tokio::test]
+    async fn blocked_change_feed_scan_does_not_block_independent_commits() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/cdc-scan-contention-commit"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first event");
+
+        let mut blocker =
+            db.block_next_commit_log_scan_phase(CommitLogScanPhase::AfterMetadataSnapshot);
+        let scan_db = db.clone();
+        let scan_table = events.clone();
+        let scan = tokio::spawn(async move {
+            collect_changes(
+                scan_db
+                    .scan_since(&scan_table, LogCursor::beginning(), ScanOptions::default())
+                    .await
+                    .expect("scan while blocked"),
+            )
+            .await
+        });
+
+        blocker.wait_until_reached().await;
+
+        let second_sequence = tokio::time::timeout(
+            Duration::from_secs(1),
+            events.write(b"user:2".to_vec(), bytes("v2")),
+        )
+        .await
+        .expect("commit should not wait on a blocked change-feed scan")
+        .expect("write second event");
+        assert_eq!(second_sequence, SequenceNumber::new(2));
+
+        let blocked_metrics = db.commit_log_scan_metrics();
+        assert_eq!(blocked_metrics.snapshots_started, 1);
+        assert_eq!(blocked_metrics.active_scans, 1);
+        assert!(blocked_metrics.max_pinned_segments >= 1);
+
+        blocker.release();
+
+        let scanned = scan.await.expect("join blocked scan");
+        assert_eq!(
+            scanned,
+            vec![collected_change(
+                1,
+                0,
+                ChangeKind::Put,
+                b"user:1",
+                Some(bytes("v1")),
+                "events",
+            )]
+        );
+
+        let final_metrics = db.commit_log_scan_metrics();
+        assert_eq!(final_metrics.snapshots_started, 1);
+        assert_eq!(final_metrics.active_scans, 0);
+        assert_eq!(final_metrics.max_concurrent_scans, 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_change_feed_scan_keeps_segments_available_during_flush_gc() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/cdc-scan-contention-gc"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first event");
+        force_seal_commit_log(&db).await;
+
+        events
+            .write(b"user:2".to_vec(), bytes("v2"))
+            .await
+            .expect("write second event");
+        force_seal_commit_log(&db).await;
+
+        assert_eq!(
+            commit_log_segment_ids(&db).await,
+            vec![SegmentId::new(1), SegmentId::new(2), SegmentId::new(3)]
+        );
+
+        let mut blocker =
+            db.block_next_commit_log_scan_phase(CommitLogScanPhase::AfterMetadataSnapshot);
+        let scan_db = db.clone();
+        let scan_table = events.clone();
+        let scan = tokio::spawn(async move {
+            collect_changes(
+                scan_db
+                    .scan_since(&scan_table, LogCursor::beginning(), ScanOptions::default())
+                    .await
+                    .expect("scan pinned history"),
+            )
+            .await
+        });
+
+        blocker.wait_until_reached().await;
+
+        tokio::time::timeout(Duration::from_secs(1), db.flush())
+            .await
+            .expect("flush should not block on a pinned change-feed scan")
+            .expect("flush while scan is pinned");
+
+        assert_eq!(
+            commit_log_segment_ids(&db).await,
+            vec![SegmentId::new(1), SegmentId::new(2), SegmentId::new(3)],
+            "the oldest segment should stay available until the blocked scan releases it"
+        );
+
+        let blocked_metrics = db.commit_log_scan_metrics();
+        assert_eq!(blocked_metrics.active_scans, 1);
+        assert!(blocked_metrics.max_pinned_segments >= 2);
+
+        blocker.release();
+
+        let scanned = scan.await.expect("join pinned scan");
+        assert_eq!(
+            scanned,
+            vec![
+                collected_change(
+                    1,
+                    0,
+                    ChangeKind::Put,
+                    b"user:1",
+                    Some(bytes("v1")),
+                    "events",
+                ),
+                collected_change(
+                    2,
+                    0,
+                    ChangeKind::Put,
+                    b"user:2",
+                    Some(bytes("v2")),
+                    "events",
+                ),
+            ]
+        );
+
+        db.flush().await.expect("flush after pinned scan completes");
+        assert_eq!(
+            commit_log_segment_ids(&db).await,
+            vec![SegmentId::new(2), SegmentId::new(3)]
+        );
+        assert_eq!(db.commit_log_scan_metrics().active_scans, 0);
     }
 
     #[tokio::test]
