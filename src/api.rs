@@ -1566,11 +1566,10 @@ impl WatermarkRegistry {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WatermarkUpdate {
-    pub(crate) table: String,
-    pub(crate) sequence: SequenceNumber,
+pub struct WatermarkUpdate {
+    pub table: String,
+    pub sequence: SequenceNumber,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1580,15 +1579,13 @@ struct NamedWatermarkReceiver {
     receiver: WatermarkReceiver,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
-pub(crate) struct WatermarkSubscriptionSet {
+pub struct WatermarkSubscriptionSet {
     pulse: watch::Receiver<u64>,
     receivers: Vec<NamedWatermarkReceiver>,
     observed: Vec<SequenceNumber>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WatermarkSubscriptionSet {
     fn new(registry: &Arc<WatermarkRegistry>, receivers: Vec<(String, WatermarkReceiver)>) -> Self {
         let mut receivers = receivers;
@@ -1609,7 +1606,7 @@ impl WatermarkSubscriptionSet {
         }
     }
 
-    pub(crate) fn drain_pending(&mut self) -> Vec<WatermarkUpdate> {
+    pub fn drain_pending(&mut self) -> Vec<WatermarkUpdate> {
         let mut pending = Vec::new();
         for (observed, receiver) in self.observed.iter_mut().zip(self.receivers.iter_mut()) {
             let current = receiver.receiver.current();
@@ -1631,7 +1628,7 @@ impl WatermarkSubscriptionSet {
         pending
     }
 
-    pub(crate) async fn changed(&mut self) -> Result<Vec<WatermarkUpdate>, SubscriptionClosed> {
+    pub async fn changed(&mut self) -> Result<Vec<WatermarkUpdate>, SubscriptionClosed> {
         loop {
             let pending = self.drain_pending();
             if !pending.is_empty() {
@@ -6478,16 +6475,14 @@ impl Db {
         self.inner.durable_watchers.subscribe(table.name())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn subscribe_visible_set<'a, I>(&self, tables: I) -> WatermarkSubscriptionSet
+    pub fn subscribe_visible_set<'a, I>(&self, tables: I) -> WatermarkSubscriptionSet
     where
         I: IntoIterator<Item = &'a Table>,
     {
         Self::subscribe_set(&self.inner.visible_watchers, tables)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn subscribe_durable_set<'a, I>(&self, tables: I) -> WatermarkSubscriptionSet
+    pub fn subscribe_durable_set<'a, I>(&self, tables: I) -> WatermarkSubscriptionSet
     where
         I: IntoIterator<Item = &'a Table>,
     {
