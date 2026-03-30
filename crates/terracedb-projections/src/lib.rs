@@ -10,12 +10,13 @@ use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use terracedb::{
     ChangeEntry, ChangeFeedError, ChangeKind, CommitError, CommitOptions, CompactionStrategy,
-    CreateTableError, Db, KvStream, LogCursor, ReadError, ScanOptions, SequenceNumber, Snapshot,
-    SnapshotTooOld, StorageError, SubscriptionClosed, Table, TableConfig, TableFormat, Value,
-    WriteBatch,
+    CreateTableError, Db, KvStream, LogCursor, OperationContext, ReadError, ScanOptions,
+    SequenceNumber, Snapshot, SnapshotTooOld, SpanRelation, StorageError, SubscriptionClosed,
+    Table, TableConfig, TableFormat, Value, WriteBatch, set_span_attribute, telemetry_attrs,
 };
 
 pub const PROJECTION_CURSOR_TABLE_NAME: &str = "_projection_cursors";
@@ -24,6 +25,93 @@ const PROJECTION_CURSOR_STATE_FORMAT_VERSION: u8 = 2;
 const PROJECTION_CURSOR_KEY_SEPARATOR: u8 = 0;
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
+
+fn collect_operation_contexts(entries: &[ChangeEntry]) -> Vec<OperationContext> {
+    let mut seen = BTreeSet::new();
+    let mut contexts = Vec::new();
+    for entry in entries {
+        let Some(context) = entry.operation_context.clone() else {
+            continue;
+        };
+        if context.is_empty() {
+            continue;
+        }
+        let key = (
+            context.traceparent().map(str::to_string),
+            context.tracestate().map(str::to_string),
+        );
+        if seen.insert(key) {
+            contexts.push(context);
+        }
+    }
+    contexts
+}
+
+fn attach_operation_contexts(span: &tracing::Span, contexts: &[OperationContext]) {
+    if let Some(parent) = contexts.first() {
+        parent.attach_to_span(span, SpanRelation::Parent);
+        for context in contexts.iter().skip(1) {
+            context.attach_to_span(span, SpanRelation::Link);
+        }
+    }
+}
+
+fn projection_mode_name(mode: ProjectionMode) -> &'static str {
+    match mode {
+        ProjectionMode::SingleSource => "single_source",
+        ProjectionMode::MultiSource => "multi_source",
+    }
+}
+
+fn projection_status_name(status: &ProjectionTaskStatus) -> &'static str {
+    match status {
+        ProjectionTaskStatus::Running => "running",
+        ProjectionTaskStatus::Stopped => "stopped",
+        ProjectionTaskStatus::Failed(_) => "failed",
+    }
+}
+
+fn apply_projection_span_attributes(
+    span: &tracing::Span,
+    projection_name: &str,
+    mode: ProjectionMode,
+    source_count: usize,
+    output_count: usize,
+) {
+    set_span_attribute(
+        span,
+        telemetry_attrs::PROJECTION_NAME,
+        projection_name.to_string(),
+    );
+    set_span_attribute(
+        span,
+        telemetry_attrs::PROJECTION_MODE,
+        projection_mode_name(mode),
+    );
+    set_span_attribute(
+        span,
+        telemetry_attrs::PROJECTION_SOURCE_COUNT,
+        source_count as u64,
+    );
+    set_span_attribute(
+        span,
+        telemetry_attrs::PROJECTION_OUTPUT_COUNT,
+        output_count as u64,
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionTelemetrySnapshot {
+    pub projection_name: String,
+    pub projection_mode: String,
+    pub source_table: String,
+    pub source_count: usize,
+    pub output_count: usize,
+    pub frontier_sequence: SequenceNumber,
+    pub durable_sequence: SequenceNumber,
+    pub lag: u64,
+    pub status: String,
+}
 
 #[derive(Debug)]
 pub struct ProjectionHandlerError {
@@ -515,13 +603,30 @@ impl std::fmt::Debug for ProjectionRuntime {
 
 impl ProjectionRuntime {
     pub async fn open(db: Db) -> Result<Self, ProjectionError> {
-        let cursor_table = ensure_projection_cursor_table(&db).await?;
-        Ok(Self {
-            db,
-            cursor_table,
-            running: Arc::new(Mutex::new(BTreeSet::new())),
-            monitors: Arc::new(Mutex::new(BTreeMap::new())),
-        })
+        let span = tracing::info_span!("terracedb.projection.runtime.open");
+        set_span_attribute(&span, telemetry_attrs::DB_NAME, db.telemetry_db_name());
+        set_span_attribute(
+            &span,
+            telemetry_attrs::DB_INSTANCE,
+            db.telemetry_db_instance(),
+        );
+        set_span_attribute(
+            &span,
+            telemetry_attrs::STORAGE_MODE,
+            db.telemetry_storage_mode(),
+        );
+
+        async move {
+            let cursor_table = ensure_projection_cursor_table(&db).await?;
+            Ok(Self {
+                db,
+                cursor_table,
+                running: Arc::new(Mutex::new(BTreeSet::new())),
+                monitors: Arc::new(Mutex::new(BTreeMap::new())),
+            })
+        }
+        .instrument(span.clone())
+        .await
     }
 
     pub async fn load_projection_cursor(&self, name: &str) -> Result<LogCursor, ProjectionError> {
@@ -609,6 +714,41 @@ impl ProjectionRuntime {
         name: &str,
     ) -> Result<BTreeMap<String, SequenceNumber>, ProjectionError> {
         Ok(self.monitor(name)?.frontier.borrow().clone())
+    }
+
+    pub fn telemetry_snapshots(&self) -> Vec<ProjectionTelemetrySnapshot> {
+        let monitors = self
+            .monitors
+            .lock()
+            .expect("projection monitors lock poisoned")
+            .clone();
+        let mut snapshots = Vec::new();
+        for (name, monitor) in monitors {
+            let frontier = monitor.frontier.borrow().clone();
+            let status = projection_status_name(&monitor.status.borrow().clone()).to_string();
+            for source_name in &monitor.metadata.sources {
+                let source = self.db.table(source_name);
+                let durable_sequence = self.db.subscribe_durable(&source).current();
+                let frontier_sequence = frontier
+                    .get(source_name.as_str())
+                    .copied()
+                    .unwrap_or(SequenceNumber::new(0));
+                snapshots.push(ProjectionTelemetrySnapshot {
+                    projection_name: name.clone(),
+                    projection_mode: projection_mode_name(monitor.metadata.mode).to_string(),
+                    source_table: source_name.clone(),
+                    source_count: monitor.metadata.sources.len(),
+                    output_count: monitor.metadata.outputs.len(),
+                    frontier_sequence,
+                    durable_sequence,
+                    lag: durable_sequence
+                        .get()
+                        .saturating_sub(frontier_sequence.get()),
+                    status: status.clone(),
+                });
+            }
+        }
+        snapshots
     }
 
     /// Waits for visible projection output whose recorded source frontier covers the
@@ -709,6 +849,7 @@ impl ProjectionRuntime {
                 .map(|table| table.name().to_string())
                 .collect(),
             dependencies: projection.dependencies.clone(),
+            mode: projection.mode,
         };
         self.monitors
             .lock()
@@ -734,12 +875,11 @@ impl ProjectionRuntime {
             running: self.running.clone(),
         };
 
-        let task = tokio::spawn(run_projection_task(
-            runtime,
-            frontier_tx,
-            status_tx,
-            shutdown_rx,
-        ));
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        let task = tokio::spawn(
+            run_projection_task(runtime, frontier_tx, status_tx, shutdown_rx)
+                .with_subscriber(dispatch),
+        );
 
         Ok(ProjectionHandle {
             name: projection.name,
@@ -1048,6 +1188,7 @@ struct ProjectionMetadata {
     sources: Vec<String>,
     outputs: Vec<String>,
     dependencies: Vec<String>,
+    mode: ProjectionMode,
 }
 
 struct ProjectionSpec {
@@ -1177,23 +1318,51 @@ async fn run_projection_task(
     status_tx: watch::Sender<ProjectionTaskStatus>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), ProjectionError> {
-    let result = AssertUnwindSafe(run_projection_loop(&mut runtime, frontier_tx, shutdown_rx))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|payload| {
-            Err(ProjectionError::Panic {
-                name: runtime.name.clone(),
-                reason: panic_payload_to_string(payload),
-            })
+    let span = tracing::info_span!("terracedb.projection.runtime");
+    set_span_attribute(
+        &span,
+        telemetry_attrs::DB_NAME,
+        runtime.db.telemetry_db_name(),
+    );
+    set_span_attribute(
+        &span,
+        telemetry_attrs::DB_INSTANCE,
+        runtime.db.telemetry_db_instance(),
+    );
+    set_span_attribute(
+        &span,
+        telemetry_attrs::STORAGE_MODE,
+        runtime.db.telemetry_storage_mode(),
+    );
+    apply_projection_span_attributes(
+        &span,
+        &runtime.name,
+        runtime.mode,
+        runtime.sources.len(),
+        runtime.outputs.len(),
+    );
+
+    async move {
+        let result = AssertUnwindSafe(run_projection_loop(&mut runtime, frontier_tx, shutdown_rx))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|payload| {
+                Err(ProjectionError::Panic {
+                    name: runtime.name.clone(),
+                    reason: panic_payload_to_string(payload),
+                })
+            });
+
+        runtime.release_running_slot();
+        status_tx.send_replace(match &result {
+            Ok(()) => ProjectionTaskStatus::Stopped,
+            Err(error) => ProjectionTaskStatus::Failed(error.to_string()),
         });
 
-    runtime.release_running_slot();
-    status_tx.send_replace(match &result {
-        Ok(()) => ProjectionTaskStatus::Stopped,
-        Err(error) => ProjectionTaskStatus::Failed(error.to_string()),
-    });
-
-    result
+        result
+    }
+    .instrument(span.clone())
+    .await
 }
 
 async fn run_projection_loop(
@@ -1230,6 +1399,10 @@ async fn run_projection_loop(
                 if changed.is_err() {
                     return Err(ProjectionError::SubscriptionClosed);
                 }
+                tracing::debug!(
+                    projection = %runtime.name,
+                    "projection durable wake"
+                );
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -1280,193 +1453,256 @@ async fn drain_next_ready_run(
         return Ok(false);
     };
 
-    let chosen_source = runtime.sources[chosen_index].table.clone();
-    let mut frontier = frontier_from_states(&runtime.sources);
-    frontier.insert(chosen_source.name().to_string(), run.sequence());
-    let context = ProjectionContext::new(
-        runtime
-            .sources
-            .iter()
-            .map(|source| {
-                let sequence = frontier
-                    .get(source.table.name())
-                    .copied()
-                    .unwrap_or(source.sequence);
-                (
-                    source.table.name().to_string(),
-                    (source.table.clone(), sequence),
-                )
-            })
-            .collect(),
+    let operation_contexts = collect_operation_contexts(run.entries());
+    let span = tracing::info_span!("terracedb.projection.batch");
+    apply_projection_span_attributes(
+        &span,
+        &runtime.name,
+        runtime.mode,
+        runtime.sources.len(),
+        runtime.outputs.len(),
     );
+    set_span_attribute(
+        &span,
+        telemetry_attrs::SOURCE_TABLE,
+        run.source().name().to_string(),
+    );
+    set_span_attribute(&span, telemetry_attrs::SEQUENCE, run.sequence().get());
+    set_span_attribute(
+        &span,
+        telemetry_attrs::LOG_CURSOR,
+        format!(
+            "{}:{}",
+            run.last_cursor().sequence().get(),
+            run.last_cursor().op_index()
+        ),
+    );
+    set_span_attribute(
+        &span,
+        "terracedb.projection.batch.entry_count",
+        run.len() as u64,
+    );
+    attach_operation_contexts(&span, &operation_contexts);
+    let span_for_attrs = span.clone();
 
-    let mut tx = ProjectionTransaction::new(run.last_cursor());
-    if let Err(source) = runtime.handler.apply(&run, &context, &mut tx).await {
-        if source.snapshot_too_old().is_some() {
-            if runtime.recompute == RecomputeStrategy::FailClosed {
-                return Err(ProjectionError::UnsupportedRecomputation {
-                    name: runtime.name.clone(),
-                    source_name: chosen_source.name().to_string(),
-                });
+    async move {
+        let chosen_source = runtime.sources[chosen_index].table.clone();
+        let mut frontier = frontier_from_states(&runtime.sources);
+        frontier.insert(chosen_source.name().to_string(), run.sequence());
+        let context = ProjectionContext::new(
+            runtime
+                .sources
+                .iter()
+                .map(|source| {
+                    let sequence = frontier
+                        .get(source.table.name())
+                        .copied()
+                        .unwrap_or(source.sequence);
+                    (
+                        source.table.name().to_string(),
+                        (source.table.clone(), sequence),
+                    )
+                })
+                .collect(),
+        );
+
+        let mut tx = ProjectionTransaction::new(run.last_cursor());
+        if let Err(source) = runtime.handler.apply(&run, &context, &mut tx).await {
+            if source.snapshot_too_old().is_some() {
+                if runtime.recompute == RecomputeStrategy::FailClosed {
+                    return Err(ProjectionError::UnsupportedRecomputation {
+                        name: runtime.name.clone(),
+                        source_name: chosen_source.name().to_string(),
+                    });
+                }
+
+                rebuild_from_current_state(runtime, frontier_tx).await?;
+                return Ok(true);
             }
 
-            rebuild_from_current_state(runtime, frontier_tx).await?;
-            return Ok(true);
+            return Err(ProjectionError::Handler {
+                name: runtime.name.clone(),
+                source,
+            });
         }
 
-        return Err(ProjectionError::Handler {
-            name: runtime.name.clone(),
-            source,
-        });
+        let operation_count = tx.operation_count();
+        let mut batch = tx.into_batch();
+        let new_state = ProjectionCursorState {
+            cursor: run.last_cursor(),
+            sequence: run.sequence(),
+        };
+        stage_projection_cursor_state(
+            &mut batch,
+            &runtime.cursor_table,
+            &runtime.name,
+            &chosen_source,
+            new_state,
+            runtime.mode == ProjectionMode::SingleSource,
+        );
+
+        set_span_attribute(
+            &span_for_attrs,
+            telemetry_attrs::PROJECTION_OPERATION_COUNT,
+            operation_count as u64,
+        );
+        runtime
+            .db
+            .commit(batch, CommitOptions::default().with_current_context())
+            .await?;
+
+        runtime.sources[chosen_index].cursor = new_state.cursor();
+        runtime.sources[chosen_index].sequence = new_state.sequence();
+        frontier_tx.send_replace(frontier_from_states(&runtime.sources));
+
+        Ok(true)
     }
-
-    let mut batch = tx.into_batch();
-    let new_state = ProjectionCursorState {
-        cursor: run.last_cursor(),
-        sequence: run.sequence(),
-    };
-    stage_projection_cursor_state(
-        &mut batch,
-        &runtime.cursor_table,
-        &runtime.name,
-        &chosen_source,
-        new_state,
-        runtime.mode == ProjectionMode::SingleSource,
-    );
-
-    runtime.db.commit(batch, CommitOptions::default()).await?;
-
-    runtime.sources[chosen_index].cursor = new_state.cursor();
-    runtime.sources[chosen_index].sequence = new_state.sequence();
-    frontier_tx.send_replace(frontier_from_states(&runtime.sources));
-
-    Ok(true)
+    .instrument(span.clone())
+    .await
 }
 
 async fn rebuild_from_current_state(
     runtime: &mut ProjectionTaskRuntime,
     frontier_tx: &watch::Sender<BTreeMap<String, SequenceNumber>>,
 ) -> Result<(), ProjectionError> {
-    let rebuild_frontier = runtime
-        .sources
-        .iter()
-        .map(|source| {
-            (
-                source.table.name().to_string(),
-                runtime.db.subscribe_durable(&source.table).current(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let durable_snapshot = runtime.db.durable_snapshot().await;
+    let span = tracing::info_span!("terracedb.projection.rebuild");
+    apply_projection_span_attributes(
+        &span,
+        &runtime.name,
+        runtime.mode,
+        runtime.sources.len(),
+        runtime.outputs.len(),
+    );
+    set_span_attribute(
+        &span,
+        telemetry_attrs::WORK_KIND,
+        "rebuild_from_current_state",
+    );
 
-    let mut reset_batch = WriteBatch::default();
-    for output in &runtime.outputs {
-        clear_table(output, &mut reset_batch).await?;
-    }
-    for source in &runtime.sources {
-        stage_projection_cursor_state(
-            &mut reset_batch,
-            &runtime.cursor_table,
-            &runtime.name,
-            &source.table,
-            ProjectionCursorState::beginning(),
-            runtime.mode == ProjectionMode::SingleSource,
-        );
-    }
-    if !reset_batch.is_empty() {
-        runtime
-            .db
-            .commit(reset_batch, CommitOptions::default())
-            .await?;
-    }
+    async move {
+        let rebuild_frontier = runtime
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.table.name().to_string(),
+                    runtime.db.subscribe_durable(&source.table).current(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let durable_snapshot = runtime.db.durable_snapshot().await;
 
-    for source in &mut runtime.sources {
-        source.cursor = LogCursor::beginning();
-        source.sequence = SequenceNumber::new(0);
-    }
-    frontier_tx.send_replace(frontier_from_states(&runtime.sources));
+        let mut reset_batch = WriteBatch::default();
+        for output in &runtime.outputs {
+            clear_table(output, &mut reset_batch).await?;
+        }
+        for source in &runtime.sources {
+            stage_projection_cursor_state(
+                &mut reset_batch,
+                &runtime.cursor_table,
+                &runtime.name,
+                &source.table,
+                ProjectionCursorState::beginning(),
+                runtime.mode == ProjectionMode::SingleSource,
+            );
+        }
+        if !reset_batch.is_empty() {
+            runtime
+                .db
+                .commit(reset_batch, CommitOptions::default())
+                .await?;
+        }
 
-    for index in 0..runtime.sources.len() {
-        let source_table = runtime.sources[index].table.clone();
-        let target_sequence = rebuild_frontier
-            .get(source_table.name())
-            .copied()
-            .unwrap_or(SequenceNumber::new(0));
-        let synthetic_runs =
-            build_recompute_runs(&durable_snapshot, &source_table, target_sequence).await?;
-        if synthetic_runs.is_empty() {
-            if target_sequence == SequenceNumber::new(0) {
+        for source in &mut runtime.sources {
+            source.cursor = LogCursor::beginning();
+            source.sequence = SequenceNumber::new(0);
+        }
+        frontier_tx.send_replace(frontier_from_states(&runtime.sources));
+
+        for index in 0..runtime.sources.len() {
+            let source_table = runtime.sources[index].table.clone();
+            let target_sequence = rebuild_frontier
+                .get(source_table.name())
+                .copied()
+                .unwrap_or(SequenceNumber::new(0));
+            let synthetic_runs =
+                build_recompute_runs(&durable_snapshot, &source_table, target_sequence).await?;
+            if synthetic_runs.is_empty() {
+                if target_sequence == SequenceNumber::new(0) {
+                    continue;
+                }
+
+                let empty_state = ProjectionCursorState {
+                    cursor: LogCursor::new(target_sequence, u16::MAX),
+                    sequence: target_sequence,
+                };
+                let mut batch = WriteBatch::default();
+                stage_projection_cursor_state(
+                    &mut batch,
+                    &runtime.cursor_table,
+                    &runtime.name,
+                    &source_table,
+                    empty_state,
+                    runtime.mode == ProjectionMode::SingleSource,
+                );
+                runtime.db.commit(batch, CommitOptions::default()).await?;
+                runtime.sources[index].cursor = empty_state.cursor();
+                runtime.sources[index].sequence = empty_state.sequence();
+                frontier_tx.send_replace(frontier_from_states(&runtime.sources));
                 continue;
             }
 
-            let empty_state = ProjectionCursorState {
-                cursor: LogCursor::new(target_sequence, u16::MAX),
-                sequence: target_sequence,
-            };
-            let mut batch = WriteBatch::default();
-            stage_projection_cursor_state(
-                &mut batch,
-                &runtime.cursor_table,
-                &runtime.name,
-                &source_table,
-                empty_state,
-                runtime.mode == ProjectionMode::SingleSource,
-            );
-            runtime.db.commit(batch, CommitOptions::default()).await?;
-            runtime.sources[index].cursor = empty_state.cursor();
-            runtime.sources[index].sequence = empty_state.sequence();
-            frontier_tx.send_replace(frontier_from_states(&runtime.sources));
-            continue;
-        }
-
-        for run in synthetic_runs {
-            let context = ProjectionContext::new(
+            for run in synthetic_runs {
+                let context = ProjectionContext::new(
+                    runtime
+                        .sources
+                        .iter()
+                        .map(|source| {
+                            let sequence = rebuild_frontier
+                                .get(source.table.name())
+                                .copied()
+                                .unwrap_or(source.sequence);
+                            (
+                                source.table.name().to_string(),
+                                (source.table.clone(), sequence),
+                            )
+                        })
+                        .collect(),
+                );
+                let mut tx = ProjectionTransaction::new(run.last_cursor());
                 runtime
-                    .sources
-                    .iter()
-                    .map(|source| {
-                        let sequence = rebuild_frontier
-                            .get(source.table.name())
-                            .copied()
-                            .unwrap_or(source.sequence);
-                        (
-                            source.table.name().to_string(),
-                            (source.table.clone(), sequence),
-                        )
-                    })
-                    .collect(),
-            );
-            let mut tx = ProjectionTransaction::new(run.last_cursor());
-            runtime
-                .handler
-                .apply(&run, &context, &mut tx)
-                .await
-                .map_err(|source| ProjectionError::Handler {
-                    name: runtime.name.clone(),
-                    source,
-                })?;
+                    .handler
+                    .apply(&run, &context, &mut tx)
+                    .await
+                    .map_err(|source| ProjectionError::Handler {
+                        name: runtime.name.clone(),
+                        source,
+                    })?;
 
-            let mut batch = tx.into_batch();
-            let new_state = ProjectionCursorState {
-                cursor: run.last_cursor(),
-                sequence: run.sequence(),
-            };
-            stage_projection_cursor_state(
-                &mut batch,
-                &runtime.cursor_table,
-                &runtime.name,
-                &source_table,
-                new_state,
-                runtime.mode == ProjectionMode::SingleSource,
-            );
-            runtime.db.commit(batch, CommitOptions::default()).await?;
-            runtime.sources[index].cursor = new_state.cursor();
-            runtime.sources[index].sequence = new_state.sequence();
-            frontier_tx.send_replace(frontier_from_states(&runtime.sources));
+                let mut batch = tx.into_batch();
+                let new_state = ProjectionCursorState {
+                    cursor: run.last_cursor(),
+                    sequence: run.sequence(),
+                };
+                stage_projection_cursor_state(
+                    &mut batch,
+                    &runtime.cursor_table,
+                    &runtime.name,
+                    &source_table,
+                    new_state,
+                    runtime.mode == ProjectionMode::SingleSource,
+                );
+                runtime.db.commit(batch, CommitOptions::default()).await?;
+                runtime.sources[index].cursor = new_state.cursor();
+                runtime.sources[index].sequence = new_state.sequence();
+                frontier_tx.send_replace(frontier_from_states(&runtime.sources));
+            }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
+    .instrument(span.clone())
+    .await
 }
 
 async fn clear_table(table: &Table, batch: &mut WriteBatch) -> Result<(), ProjectionError> {
@@ -1540,6 +1776,7 @@ async fn build_recompute_runs(
                 sequence: logical_sequence,
                 kind: ChangeKind::Put,
                 table: source.clone(),
+                operation_context: None,
             })
             .collect();
 

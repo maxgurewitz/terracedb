@@ -97,6 +97,18 @@ impl Db {
         ReadSet::default()
     }
 
+    pub fn telemetry_db_name(&self) -> String {
+        db_name_from_storage(&self.inner.config.storage)
+    }
+
+    pub fn telemetry_db_instance(&self) -> String {
+        db_instance_from_storage(&self.inner.config.storage)
+    }
+
+    pub fn telemetry_storage_mode(&self) -> &'static str {
+        storage_mode_name(&self.inner.config.storage)
+    }
+
     pub async fn commit(
         &self,
         batch: WriteBatch,
@@ -106,81 +118,133 @@ impl Db {
             return Err(CommitError::EmptyBatch);
         }
 
-        let resolved_operations = self.resolve_batch_operations(batch.operations())?;
-        let resolved_read_set = self.resolve_read_set_entries(opts.read_set.as_ref())?;
-        self.apply_write_backpressure(&resolved_operations).await?;
+        let span = tracing::info_span!("terracedb.db.commit");
+        apply_db_span_attributes(
+            &span,
+            &self.telemetry_db_name(),
+            &self.telemetry_db_instance(),
+            self.telemetry_storage_mode(),
+        );
+        crate::set_span_attribute(
+            &span,
+            crate::telemetry_attrs::OPERATION,
+            opentelemetry::Value::String("commit".into()),
+        );
+        crate::set_span_attribute(&span, "terracedb.batch.operation_count", batch.len() as u64);
+        crate::set_span_attribute(
+            &span,
+            "terracedb.commit.read_set_count",
+            opts.read_set
+                .as_ref()
+                .map(|read_set| read_set.entries().len() as u64)
+                .unwrap_or(0),
+        );
+        let span_for_attrs = span.clone();
 
-        let participant = {
-            let _commit_guard = self.inner.commit_lock.lock().await;
-            self.resolve_failed_provisional_tail_locked()
-                .await
-                .map_err(CommitError::Storage)?;
-            self.check_read_conflicts(&resolved_read_set)?;
+        async move {
+            let resolved_operations = self.resolve_batch_operations(batch.operations())?;
+            let resolved_read_set = self.resolve_read_set_entries(opts.read_set.as_ref())?;
+            self.apply_write_backpressure(&resolved_operations).await?;
 
-            let sequence = SequenceNumber::new(self.inner.next_sequence.load(Ordering::SeqCst) + 1);
-            let record = Self::build_commit_record(sequence, &resolved_operations)?;
-            let participant = if self.durable_on_commit() {
-                let participant = self.register_commit(sequence, resolved_operations.clone());
-                participant
-                    .group_batch
-                    .as_ref()
-                    .expect("group-commit participants should always have a batch")
-                    .stage_record(record);
-                participant
-            } else {
-                self.inner
-                    .commit_runtime
-                    .lock()
-                    .await
-                    .append(record)
+            let participant = {
+                let _commit_guard = self.inner.commit_lock.lock().await;
+                self.resolve_failed_provisional_tail_locked()
                     .await
                     .map_err(CommitError::Storage)?;
-                self.register_commit(sequence, resolved_operations.clone())
-            };
-            self.inner
-                .next_sequence
-                .store(sequence.get(), Ordering::SeqCst);
-            participant
-        };
+                self.check_read_conflicts(&resolved_read_set)?;
 
-        if let Some(batch) = participant.group_batch.clone() {
-            if let Err(error) = self.await_group_commit(batch, participant.sequence).await {
-                let cleanup = {
-                    let _commit_guard = self.inner.commit_lock.lock().await;
-                    self.resolve_failed_provisional_tail_locked().await
+                let sequence =
+                    SequenceNumber::new(self.inner.next_sequence.load(Ordering::SeqCst) + 1);
+                let operation_context = opts
+                    .operation_context
+                    .clone()
+                    .or_else(|| Some(OperationContext::current()))
+                    .filter(|context| !context.is_empty());
+                let record =
+                    Self::build_commit_record(sequence, &resolved_operations, operation_context)?;
+                let participant = if self.durable_on_commit() {
+                    let participant = self.register_commit(sequence, resolved_operations.clone());
+                    participant
+                        .group_batch
+                        .as_ref()
+                        .expect("group-commit participants should always have a batch")
+                        .stage_record(record);
+                    participant
+                } else {
+                    self.inner
+                        .commit_runtime
+                        .lock()
+                        .await
+                        .append(record)
+                        .await
+                        .map_err(CommitError::Storage)?;
+                    self.register_commit(sequence, resolved_operations.clone())
                 };
-                return Err(cleanup.map(|_| error).unwrap_or_else(CommitError::Storage));
+                self.inner
+                    .next_sequence
+                    .store(sequence.get(), Ordering::SeqCst);
+                participant
+            };
+
+            crate::set_span_attribute(
+                &span_for_attrs,
+                crate::telemetry_attrs::SEQUENCE,
+                participant.sequence.get(),
+            );
+
+            if let Some(batch) = participant.group_batch.clone() {
+                if let Err(error) = self.await_group_commit(batch, participant.sequence).await {
+                    let cleanup = {
+                        let _commit_guard = self.inner.commit_lock.lock().await;
+                        self.resolve_failed_provisional_tail_locked().await
+                    };
+                    return Err(cleanup.map(|_| error).unwrap_or_else(CommitError::Storage));
+                }
+
+                self.mark_durable_confirmed(participant.sequence);
+                let _ = self.sync_tiered_commit_log_tail().await;
+                self.maybe_pause_commit_phase(
+                    CommitPhase::AfterDurabilitySync,
+                    participant.sequence,
+                )
+                .await;
             }
 
-            self.mark_durable_confirmed(participant.sequence);
-            let _ = self.sync_tiered_commit_log_tail().await;
-            self.maybe_pause_commit_phase(CommitPhase::AfterDurabilitySync, participant.sequence)
+            self.maybe_pause_commit_phase(CommitPhase::BeforeMemtableInsert, participant.sequence)
                 .await;
-        }
-
-        self.maybe_pause_commit_phase(CommitPhase::BeforeMemtableInsert, participant.sequence)
-            .await;
-        self.memtables_write()
-            .apply(participant.sequence, &participant.operations);
-        self.mark_memtable_inserted(participant.sequence);
-        self.maybe_pause_commit_phase(CommitPhase::AfterMemtableInsert, participant.sequence)
-            .await;
-
-        self.publish_watermarks();
-
-        if self.current_sequence() >= participant.sequence {
-            self.maybe_pause_commit_phase(
-                CommitPhase::AfterVisibilityPublish,
-                participant.sequence,
-            )
-            .await;
-        }
-        if self.current_durable_sequence() >= participant.sequence {
-            self.maybe_pause_commit_phase(CommitPhase::AfterDurablePublish, participant.sequence)
+            self.memtables_write()
+                .apply(participant.sequence, &participant.operations);
+            self.mark_memtable_inserted(participant.sequence);
+            self.maybe_pause_commit_phase(CommitPhase::AfterMemtableInsert, participant.sequence)
                 .await;
-        }
 
-        Ok(participant.sequence)
+            self.publish_watermarks();
+
+            if self.current_sequence() >= participant.sequence {
+                self.maybe_pause_commit_phase(
+                    CommitPhase::AfterVisibilityPublish,
+                    participant.sequence,
+                )
+                .await;
+            }
+            if self.current_durable_sequence() >= participant.sequence {
+                self.maybe_pause_commit_phase(
+                    CommitPhase::AfterDurablePublish,
+                    participant.sequence,
+                )
+                .await;
+            }
+
+            crate::set_span_attribute(
+                &span_for_attrs,
+                crate::telemetry_attrs::DURABLE_SEQUENCE,
+                self.current_durable_sequence().get(),
+            );
+
+            Ok(participant.sequence)
+        }
+        .instrument(span.clone())
+        .await
     }
 
     pub async fn flush(&self) -> Result<(), FlushError> {
@@ -188,199 +252,225 @@ impl Db {
     }
 
     async fn flush_internal(&self, _allow_scheduler_follow_up: bool) -> Result<(), FlushError> {
-        let _maintenance_guard = self.inner.maintenance_lock.lock().await;
-        match &self.inner.config.storage {
-            StorageConfig::Tiered(_) => {
-                let local_root = self
-                    .local_storage_root()
-                    .expect("tiered storage should have local root")
-                    .to_string();
-                let immutables = {
-                    let _commit_guard = self.inner.commit_lock.lock().await;
-                    self.resolve_failed_provisional_tail_locked()
-                        .await
-                        .map_err(FlushError::Storage)?;
-                    self.memtables_write().rotate_mutable();
+        let span = tracing::info_span!("terracedb.db.flush");
+        apply_db_span_attributes(
+            &span,
+            &self.telemetry_db_name(),
+            &self.telemetry_db_instance(),
+            self.telemetry_storage_mode(),
+        );
+        crate::set_span_attribute(
+            &span,
+            crate::telemetry_attrs::OPERATION,
+            opentelemetry::Value::String("flush".into()),
+        );
+        let span_for_attrs = span.clone();
 
-                    self.inner
-                        .commit_runtime
-                        .lock()
-                        .await
-                        .sync()
-                        .await
-                        .map_err(FlushError::Storage)?;
-                    self.mark_all_commits_durable();
-                    self.publish_watermarks();
-                    self.memtables_read().immutables.clone()
-                };
+        async move {
+            let _maintenance_guard = self.inner.maintenance_lock.lock().await;
+            match &self.inner.config.storage {
+                StorageConfig::Tiered(_) => {
+                    let local_root = self
+                        .local_storage_root()
+                        .expect("tiered storage should have local root")
+                        .to_string();
+                    let immutables = {
+                        let _commit_guard = self.inner.commit_lock.lock().await;
+                        self.resolve_failed_provisional_tail_locked()
+                            .await
+                            .map_err(FlushError::Storage)?;
+                        self.memtables_write().rotate_mutable();
 
-                let mut flushed_count = 0_usize;
-                let mut sstable_state = self.sstables_read().clone();
-                let mut new_live = sstable_state.live.clone();
-                let mut manifest_generation = sstable_state.manifest_generation;
+                        self.inner
+                            .commit_runtime
+                            .lock()
+                            .await
+                            .sync()
+                            .await
+                            .map_err(FlushError::Storage)?;
+                        self.mark_all_commits_durable();
+                        self.publish_watermarks();
+                        self.memtables_read().immutables.clone()
+                    };
 
-                for immutable in &immutables {
-                    let outputs = self.flush_immutable(&local_root, immutable).await?;
-                    if outputs.is_empty() {
-                        flushed_count += 1;
-                        continue;
-                    }
+                    let mut flushed_count = 0_usize;
+                    let mut sstable_state = self.sstables_read().clone();
+                    let mut new_live = sstable_state.live.clone();
+                    let mut manifest_generation = sstable_state.manifest_generation;
 
-                    new_live.extend(outputs);
-                    Self::sort_live_sstables(&mut new_live);
-                    manifest_generation =
-                        ManifestId::new(manifest_generation.get().saturating_add(1));
-                    self.install_manifest(manifest_generation, immutable.max_sequence, &new_live)
-                        .await
-                        .map_err(FlushError::Storage)?;
-                    flushed_count += 1;
-                }
-
-                if flushed_count > 0 {
-                    let mut memtables = self.memtables_write();
-                    memtables.immutables.drain(0..flushed_count);
-
-                    sstable_state.live = new_live;
-                    sstable_state.manifest_generation = manifest_generation;
-                    sstable_state.last_flushed_sequence = sstable_state.last_flushed_sequence.max(
-                        immutables
-                            .iter()
-                            .take(flushed_count)
-                            .map(|immutable| immutable.max_sequence)
-                            .max()
-                            .unwrap_or_default(),
-                    );
-                    *self.sstables_write() = sstable_state;
-                }
-
-                let backup_result = if flushed_count > 0 {
-                    let state = self.sstables_read().clone();
-                    self.sync_tiered_backup_manifest(
-                        state.manifest_generation,
-                        state.last_flushed_sequence,
-                        &state.live,
-                    )
-                    .await
-                } else {
-                    self.sync_tiered_commit_log_tail().await
-                };
-                let _ = backup_result;
-
-                self.prune_commit_log(true)
-                    .await
-                    .map_err(FlushError::Storage)?;
-            }
-            StorageConfig::S3Primary(config) => {
-                let (immutables, buffered_records, mut durable_segments, next_segment_id) = {
-                    let _commit_guard = self.inner.commit_lock.lock().await;
-                    self.resolve_failed_provisional_tail_locked()
-                        .await
-                        .map_err(FlushError::Storage)?;
-                    self.memtables_write().rotate_mutable();
-
-                    let immutables = self.memtables_read().immutables.clone();
-                    let mut commit_runtime = self.inner.commit_runtime.lock().await;
-                    commit_runtime.sync().await.map_err(FlushError::Storage)?;
-                    match &mut commit_runtime.backend {
-                        CommitLogBackend::Memory(log) => (
-                            immutables,
-                            log.records.clone(),
-                            log.durable_commit_log_segments.clone(),
-                            log.next_segment_id,
-                        ),
-                        CommitLogBackend::Local(_) => {
-                            return Err(FlushError::Storage(StorageError::unsupported(
-                                "s3-primary flush requires the memory commit-log backend",
-                            )));
+                    for immutable in &immutables {
+                        let outputs = self.flush_immutable(&local_root, immutable).await?;
+                        if outputs.is_empty() {
+                            flushed_count += 1;
+                            continue;
                         }
+
+                        new_live.extend(outputs);
+                        Self::sort_live_sstables(&mut new_live);
+                        manifest_generation =
+                            ManifestId::new(manifest_generation.get().saturating_add(1));
+                        self.install_manifest(manifest_generation, immutable.max_sequence, &new_live)
+                            .await
+                            .map_err(FlushError::Storage)?;
+                        flushed_count += 1;
                     }
-                };
 
-                if immutables.is_empty() && buffered_records.is_empty() {
-                    return Ok(());
-                }
+                    if flushed_count > 0 {
+                        let mut memtables = self.memtables_write();
+                        memtables.immutables.drain(0..flushed_count);
 
-                if !buffered_records.is_empty() {
-                    let (segment_bytes, footer) = encode_segment_bytes(
-                        crate::SegmentId::new(next_segment_id),
-                        &buffered_records,
-                        SegmentOptions::default().records_per_block,
-                    )
-                    .map_err(FlushError::Storage)?;
-                    let object_key = Self::remote_commit_log_segment_key(config, footer.segment_id);
-                    self.inner
-                        .dependencies
-                        .object_store
-                        .put(&object_key, &segment_bytes)
+                        sstable_state.live = new_live;
+                        sstable_state.manifest_generation = manifest_generation;
+                        sstable_state.last_flushed_sequence = sstable_state
+                            .last_flushed_sequence
+                            .max(
+                                immutables
+                                    .iter()
+                                    .take(flushed_count)
+                                    .map(|immutable| immutable.max_sequence)
+                                    .max()
+                                    .unwrap_or_default(),
+                            );
+                        *self.sstables_write() = sstable_state;
+                    }
+
+                    let backup_result = if flushed_count > 0 {
+                        let state = self.sstables_read().clone();
+                        self.sync_tiered_backup_manifest(
+                            state.manifest_generation,
+                            state.last_flushed_sequence,
+                            &state.live,
+                        )
+                        .await
+                    } else {
+                        self.sync_tiered_commit_log_tail().await
+                    };
+                    let _ = backup_result;
+
+                    self.prune_commit_log(true)
                         .await
                         .map_err(FlushError::Storage)?;
-                    durable_segments.push(DurableRemoteCommitLogSegment { object_key, footer });
-                    durable_segments.sort_by_key(|segment| segment.footer.segment_id.get());
                 }
+                StorageConfig::S3Primary(config) => {
+                    let (immutables, buffered_records, mut durable_segments, next_segment_id) = {
+                        let _commit_guard = self.inner.commit_lock.lock().await;
+                        self.resolve_failed_provisional_tail_locked()
+                            .await
+                            .map_err(FlushError::Storage)?;
+                        self.memtables_write().rotate_mutable();
 
-                let mut sstable_state = self.sstables_read().clone();
-                let mut new_live = sstable_state.live.clone();
-                for immutable in &immutables {
-                    new_live.extend(self.flush_immutable_remote(config, immutable).await?);
-                }
-                Self::sort_live_sstables(&mut new_live);
-
-                let flushed_through = buffered_records
-                    .last()
-                    .map(CommitRecord::sequence)
-                    .into_iter()
-                    .chain(immutables.iter().map(|immutable| immutable.max_sequence))
-                    .max()
-                    .unwrap_or(sstable_state.last_flushed_sequence)
-                    .max(sstable_state.last_flushed_sequence);
-                let next_generation =
-                    ManifestId::new(sstable_state.manifest_generation.get().saturating_add(1));
-                self.install_remote_manifest(
-                    config,
-                    next_generation,
-                    flushed_through,
-                    &new_live,
-                    &durable_segments,
-                )
-                .await
-                .map_err(FlushError::Storage)?;
-
-                {
-                    let _commit_guard = self.inner.commit_lock.lock().await;
-                    let mut commit_runtime = self.inner.commit_runtime.lock().await;
-                    match &mut commit_runtime.backend {
-                        CommitLogBackend::Memory(log) => {
-                            Arc::make_mut(&mut log.records)
-                                .retain(|record| record.sequence() > flushed_through);
-                            log.durable_commit_log_segments = durable_segments.clone();
-                            if !buffered_records.is_empty() {
-                                log.next_segment_id = next_segment_id.saturating_add(1);
+                        let immutables = self.memtables_read().immutables.clone();
+                        let mut commit_runtime = self.inner.commit_runtime.lock().await;
+                        commit_runtime.sync().await.map_err(FlushError::Storage)?;
+                        match &mut commit_runtime.backend {
+                            CommitLogBackend::Memory(log) => (
+                                immutables,
+                                log.records.clone(),
+                                log.durable_commit_log_segments.clone(),
+                                log.next_segment_id,
+                            ),
+                            CommitLogBackend::Local(_) => {
+                                return Err(FlushError::Storage(StorageError::unsupported(
+                                    "s3-primary flush requires the memory commit-log backend",
+                                )));
                             }
                         }
-                        CommitLogBackend::Local(_) => {
-                            return Err(FlushError::Storage(StorageError::unsupported(
-                                "s3-primary flush requires the memory commit-log backend",
-                            )));
+                    };
+
+                    if immutables.is_empty() && buffered_records.is_empty() {
+                        return Ok(());
+                    }
+
+                    if !buffered_records.is_empty() {
+                        let (segment_bytes, footer) = encode_segment_bytes(
+                            crate::SegmentId::new(next_segment_id),
+                            &buffered_records,
+                            SegmentOptions::default().records_per_block,
+                        )
+                        .map_err(FlushError::Storage)?;
+                        let object_key =
+                            Self::remote_commit_log_segment_key(config, footer.segment_id);
+                        self.inner
+                            .dependencies
+                            .object_store
+                            .put(&object_key, &segment_bytes)
+                            .await
+                            .map_err(FlushError::Storage)?;
+                        durable_segments.push(DurableRemoteCommitLogSegment { object_key, footer });
+                        durable_segments.sort_by_key(|segment| segment.footer.segment_id.get());
+                    }
+
+                    let mut sstable_state = self.sstables_read().clone();
+                    let mut new_live = sstable_state.live.clone();
+                    for immutable in &immutables {
+                        new_live.extend(self.flush_immutable_remote(config, immutable).await?);
+                    }
+                    Self::sort_live_sstables(&mut new_live);
+
+                    let flushed_through = buffered_records
+                        .last()
+                        .map(CommitRecord::sequence)
+                        .into_iter()
+                        .chain(immutables.iter().map(|immutable| immutable.max_sequence))
+                        .max()
+                        .unwrap_or(sstable_state.last_flushed_sequence)
+                        .max(sstable_state.last_flushed_sequence);
+                    let next_generation =
+                        ManifestId::new(sstable_state.manifest_generation.get().saturating_add(1));
+                    self.install_remote_manifest(
+                        config,
+                        next_generation,
+                        flushed_through,
+                        &new_live,
+                        &durable_segments,
+                    )
+                    .await
+                    .map_err(FlushError::Storage)?;
+
+                    {
+                        let _commit_guard = self.inner.commit_lock.lock().await;
+                        let mut commit_runtime = self.inner.commit_runtime.lock().await;
+                        match &mut commit_runtime.backend {
+                            CommitLogBackend::Memory(log) => {
+                                Arc::make_mut(&mut log.records)
+                                    .retain(|record| record.sequence() > flushed_through);
+                                log.durable_commit_log_segments = durable_segments.clone();
+                                if !buffered_records.is_empty() {
+                                    log.next_segment_id = next_segment_id.saturating_add(1);
+                                }
+                            }
+                            CommitLogBackend::Local(_) => {
+                                return Err(FlushError::Storage(StorageError::unsupported(
+                                    "s3-primary flush requires the memory commit-log backend",
+                                )));
+                            }
                         }
+
+                        if !immutables.is_empty() {
+                            let mut memtables = self.memtables_write();
+                            memtables.immutables.drain(0..immutables.len());
+                        }
+
+                        self.mark_commits_durable_through(flushed_through);
+                        self.publish_watermarks();
                     }
 
-                    if !immutables.is_empty() {
-                        let mut memtables = self.memtables_write();
-                        memtables.immutables.drain(0..immutables.len());
-                    }
-
-                    self.mark_commits_durable_through(flushed_through);
-                    self.publish_watermarks();
+                    sstable_state.live = new_live;
+                    sstable_state.manifest_generation = next_generation;
+                    sstable_state.last_flushed_sequence = flushed_through;
+                    *self.sstables_write() = sstable_state;
                 }
-
-                sstable_state.live = new_live;
-                sstable_state.manifest_generation = next_generation;
-                sstable_state.last_flushed_sequence = flushed_through;
-                *self.sstables_write() = sstable_state;
             }
-        }
 
-        Ok(())
+            crate::set_span_attribute(
+                &span_for_attrs,
+                crate::telemetry_attrs::DURABLE_SEQUENCE,
+                self.current_durable_sequence().get(),
+            );
+            Ok(())
+        }
+        .instrument(span.clone())
+        .await
     }
 
     pub async fn scan_since(
@@ -732,6 +822,7 @@ impl Db {
     fn build_commit_record(
         sequence: SequenceNumber,
         operations: &[ResolvedBatchOperation],
+        operation_context: Option<OperationContext>,
     ) -> Result<CommitRecord, CommitError> {
         let entries = operations
             .iter()
@@ -748,6 +839,7 @@ impl Db {
                     kind: operation.kind,
                     key: operation.key.clone(),
                     value: operation.value.clone(),
+                    operation_context: operation_context.clone(),
                 })
             })
             .collect::<Result<Vec<_>, CommitError>>()?;
@@ -1133,57 +1225,79 @@ impl Db {
         upper_bound: SequenceNumber,
         opts: ScanOptions,
     ) -> Result<ChangeStream, ChangeFeedError> {
-        let Some(table_id) = self.resolve_table_id(table) else {
-            return Ok(Box::pin(stream::empty()));
-        };
-        if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
-            return Ok(Box::pin(stream::empty()));
-        }
-        let table_watermark = self.table_change_feed_watermark(table_id);
-
-        let table_handle = Table {
-            db: self.clone(),
-            name: Arc::from(table.name()),
-            id: Some(table_id),
-        };
-        let sources = {
-            let runtime = self.inner.commit_runtime.lock().await;
-            let floor = self.change_feed_floor_from_state(
-                table_id,
-                upper_bound,
-                runtime.oldest_sequence_for_table(table_id),
-                runtime.oldest_segment_id(),
-                table_watermark,
-            );
-            if let Some(oldest_available) = floor
-                && cursor.sequence() < oldest_available
-            {
-                return Err(ChangeFeedError::SnapshotTooOld(SnapshotTooOld {
-                    requested: cursor.sequence(),
-                    oldest_available,
-                }));
-            }
-
-            runtime.change_feed_scan_plan(table_id, cursor.sequence())
-        };
-
-        let scanner = ChangeFeedScanner::new(
-            table_id,
-            table_handle,
-            cursor,
-            upper_bound,
-            opts.limit,
-            sources,
+        let span = tracing::debug_span!("terracedb.db.change_feed.scan");
+        apply_db_span_attributes(
+            &span,
+            &self.telemetry_db_name(),
+            &self.telemetry_db_instance(),
+            self.telemetry_storage_mode(),
         );
-        Ok(Box::pin(stream::try_unfold(
-            scanner,
-            |mut scanner| async move {
-                match scanner.next_change().await? {
-                    Some(entry) => Ok(Some((entry, scanner))),
-                    None => Ok(None),
+        apply_table_span_attribute(&span, table.name());
+        crate::set_span_attribute(
+            &span,
+            crate::telemetry_attrs::LOG_CURSOR,
+            opentelemetry::Value::String(log_cursor_attribute(cursor).into()),
+        );
+        crate::set_span_attribute(&span, crate::telemetry_attrs::SEQUENCE, upper_bound.get());
+        if let Some(limit) = opts.limit {
+            crate::set_span_attribute(&span, "terracedb.change_feed.limit", limit as u64);
+        }
+
+        async move {
+            let Some(table_id) = self.resolve_table_id(table) else {
+                return Ok(Box::pin(stream::empty()) as ChangeStream);
+            };
+            if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
+                return Ok(Box::pin(stream::empty()) as ChangeStream);
+            }
+            let table_watermark = self.table_change_feed_watermark(table_id);
+
+            let table_handle = Table {
+                db: self.clone(),
+                name: Arc::from(table.name()),
+                id: Some(table_id),
+            };
+            let sources = {
+                let runtime = self.inner.commit_runtime.lock().await;
+                let floor = self.change_feed_floor_from_state(
+                    table_id,
+                    upper_bound,
+                    runtime.oldest_sequence_for_table(table_id),
+                    runtime.oldest_segment_id(),
+                    table_watermark,
+                );
+                if let Some(oldest_available) = floor
+                    && cursor.sequence() < oldest_available
+                {
+                    return Err(ChangeFeedError::SnapshotTooOld(SnapshotTooOld {
+                        requested: cursor.sequence(),
+                        oldest_available,
+                    }));
                 }
-            },
-        )))
+
+                runtime.change_feed_scan_plan(table_id, cursor.sequence())
+            };
+
+            let scanner = ChangeFeedScanner::new(
+                table_id,
+                table_handle,
+                cursor,
+                upper_bound,
+                opts.limit,
+                sources,
+            );
+            Ok(Box::pin(stream::try_unfold(
+                scanner,
+                |mut scanner| async move {
+                    match scanner.next_change().await? {
+                        Some(entry) => Ok(Some((entry, scanner))),
+                        None => Ok(None),
+                    }
+                },
+            )) as ChangeStream)
+        }
+        .instrument(span.clone())
+        .await
     }
 
     #[cfg(test)]

@@ -19,30 +19,50 @@ impl Table {
     }
 
     pub async fn write(&self, key: Key, value: Value) -> Result<SequenceNumber, WriteError> {
+        self.write_with_options(key, value, CommitOptions::default())
+            .await
+    }
+
+    pub async fn write_with_options(
+        &self,
+        key: Key,
+        value: Value,
+        opts: CommitOptions,
+    ) -> Result<SequenceNumber, WriteError> {
         let mut batch = self.db.write_batch();
         batch.put(self, key, value);
-        self.db
-            .commit(batch, CommitOptions::default())
-            .await
-            .map_err(Into::into)
+        self.db.commit(batch, opts).await.map_err(Into::into)
     }
 
     pub async fn delete(&self, key: Key) -> Result<SequenceNumber, WriteError> {
+        self.delete_with_options(key, CommitOptions::default())
+            .await
+    }
+
+    pub async fn delete_with_options(
+        &self,
+        key: Key,
+        opts: CommitOptions,
+    ) -> Result<SequenceNumber, WriteError> {
         let mut batch = self.db.write_batch();
         batch.delete(self, key);
-        self.db
-            .commit(batch, CommitOptions::default())
-            .await
-            .map_err(Into::into)
+        self.db.commit(batch, opts).await.map_err(Into::into)
     }
 
     pub async fn merge(&self, key: Key, delta: Value) -> Result<SequenceNumber, WriteError> {
+        self.merge_with_options(key, delta, CommitOptions::default())
+            .await
+    }
+
+    pub async fn merge_with_options(
+        &self,
+        key: Key,
+        delta: Value,
+        opts: CommitOptions,
+    ) -> Result<SequenceNumber, WriteError> {
         let mut batch = self.db.write_batch();
         batch.merge(self, key, delta);
-        self.db
-            .commit(batch, CommitOptions::default())
-            .await
-            .map_err(Into::into)
+        self.db.commit(batch, opts).await.map_err(Into::into)
     }
 
     pub async fn scan(

@@ -47,6 +47,29 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
+fn emit_remote_error(error: &RemoteStorageError) {
+    let operation = format!("{:?}", error.operation());
+    let kind = format!("{:?}", error.kind());
+    let recovery_hint = format!("{:?}", error.recovery_hint());
+    if error.is_retryable() {
+        tracing::warn!(
+            terracedb_remote_operation = %operation,
+            terracedb_remote_target = %error.target(),
+            terracedb_remote_kind = %kind,
+            terracedb_remote_recovery = %recovery_hint,
+            "terracedb remote operation failed"
+        );
+    } else {
+        tracing::error!(
+            terracedb_remote_operation = %operation,
+            terracedb_remote_target = %error.target(),
+            terracedb_remote_kind = %kind,
+            terracedb_remote_recovery = %recovery_hint,
+            "terracedb remote operation failed"
+        );
+    }
+}
+
 async fn open_local_file(
     file_system: &dyn FileSystem,
     path: &str,
@@ -671,11 +694,9 @@ impl UnifiedStorage {
                 }
 
                 let bytes = self.object_store.get(key).await.map_err(|error| {
-                    UnifiedStorageError::Remote(RemoteStorageError::classify(
-                        RemoteOperation::Get,
-                        key,
-                        error,
-                    ))
+                    let error = RemoteStorageError::classify(RemoteOperation::Get, key, error);
+                    emit_remote_error(&error);
+                    UnifiedStorageError::Remote(error)
                 })?;
                 if let Some(cache) = &self.cache {
                     cache
@@ -711,11 +732,10 @@ impl UnifiedStorage {
                     .get_range(key, range.start, range.end)
                     .await
                     .map_err(|error| {
-                        UnifiedStorageError::Remote(RemoteStorageError::classify(
-                            RemoteOperation::GetRange,
-                            key,
-                            error,
-                        ))
+                        let error =
+                            RemoteStorageError::classify(RemoteOperation::GetRange, key, error);
+                        emit_remote_error(&error);
+                        UnifiedStorageError::Remote(error)
                     })?;
                 if let Some(cache) = &self.cache {
                     cache
@@ -748,48 +768,59 @@ impl UnifiedStorage {
     }
 
     pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, RemoteStorageError> {
-        self.object_store
-            .list(prefix)
-            .await
-            .map_err(|error| RemoteStorageError::classify(RemoteOperation::List, prefix, error))
+        self.object_store.list(prefix).await.map_err(|error| {
+            let error = RemoteStorageError::classify(RemoteOperation::List, prefix, error);
+            emit_remote_error(&error);
+            error
+        })
     }
 
     pub async fn put_object(&self, key: &str, data: &[u8]) -> Result<(), RemoteStorageError> {
-        self.object_store
-            .put(key, data)
-            .await
-            .map_err(|error| RemoteStorageError::classify(RemoteOperation::Put, key, error))?;
+        self.object_store.put(key, data).await.map_err(|error| {
+            let error = RemoteStorageError::classify(RemoteOperation::Put, key, error);
+            emit_remote_error(&error);
+            error
+        })?;
         if let Some(cache) = &self.cache {
             cache
                 .store(key, CacheSpan::Full, data)
                 .await
-                .map_err(|error| RemoteStorageError::classify(RemoteOperation::Put, key, error))?;
+                .map_err(|error| {
+                    let error = RemoteStorageError::classify(RemoteOperation::Put, key, error);
+                    emit_remote_error(&error);
+                    error
+                })?;
         }
         Ok(())
     }
 
     pub async fn copy_object(&self, from: &str, to: &str) -> Result<(), RemoteStorageError> {
-        self.object_store
-            .copy(from, to)
-            .await
-            .map_err(|error| RemoteStorageError::classify(RemoteOperation::Copy, from, error))?;
+        self.object_store.copy(from, to).await.map_err(|error| {
+            let error = RemoteStorageError::classify(RemoteOperation::Copy, from, error);
+            emit_remote_error(&error);
+            error
+        })?;
         if let Some(cache) = &self.cache {
-            cache
-                .remove_object(to)
-                .await
-                .map_err(|error| RemoteStorageError::classify(RemoteOperation::Copy, to, error))?;
+            cache.remove_object(to).await.map_err(|error| {
+                let error = RemoteStorageError::classify(RemoteOperation::Copy, to, error);
+                emit_remote_error(&error);
+                error
+            })?;
         }
         Ok(())
     }
 
     pub async fn delete_object(&self, key: &str) -> Result<(), RemoteStorageError> {
-        self.object_store
-            .delete(key)
-            .await
-            .map_err(|error| RemoteStorageError::classify(RemoteOperation::Delete, key, error))?;
+        self.object_store.delete(key).await.map_err(|error| {
+            let error = RemoteStorageError::classify(RemoteOperation::Delete, key, error);
+            emit_remote_error(&error);
+            error
+        })?;
         if let Some(cache) = &self.cache {
             cache.remove_object(key).await.map_err(|error| {
-                RemoteStorageError::classify(RemoteOperation::Delete, key, error)
+                let error = RemoteStorageError::classify(RemoteOperation::Delete, key, error);
+                emit_remote_error(&error);
+                error
             })?;
         }
         Ok(())

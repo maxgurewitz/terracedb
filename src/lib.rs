@@ -14,6 +14,7 @@ pub mod scheduler;
 #[allow(dead_code)]
 mod simulation;
 pub mod stubs;
+pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod transaction;
@@ -61,6 +62,10 @@ pub use scheduler::{
     TableStats, ThrottleDecision,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
+pub use telemetry::{
+    OperationContext, SpanRelation, add_span_event, db_instance_from_storage, db_name_from_storage,
+    set_span_attribute, set_span_attributes, storage_mode_name, telemetry_attrs,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use test_support::{
     bytes as test_bytes, row_table_config, test_dependencies, test_dependencies_with_clock,

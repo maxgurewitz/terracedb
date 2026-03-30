@@ -1,10 +1,12 @@
 use std::convert::TryFrom;
 
 use futures::{StreamExt, TryStreamExt};
+use tracing::Instrument;
 
 use crate::{
-    ChangeKind, Db, Key, LogCursor, ReadError, ScanOptions, SequenceNumber, StorageError, Table,
-    Timestamp, Transaction, TransactionCommitError, Value, WatermarkReceiver, WriteBatch,
+    ChangeKind, Db, Key, LogCursor, OperationContext, ReadError, ScanOptions, SequenceNumber,
+    SpanRelation, StorageError, Table, Timestamp, Transaction, TransactionCommitError, Value,
+    WatermarkReceiver, WriteBatch, set_span_attribute, telemetry_attrs,
 };
 
 const TIMER_KEY_SEPARATOR: u8 = 0;
@@ -12,6 +14,15 @@ const TIMER_SCHEDULE_VALUE_VERSION: u8 = 1;
 const TIMER_LOOKUP_VALUE_VERSION: u8 = 1;
 const OUTBOX_VALUE_VERSION: u8 = 1;
 const CURSOR_VALUE_VERSION: u8 = 1;
+
+fn attach_operation_contexts(span: &tracing::Span, contexts: &[OperationContext]) {
+    if let Some(parent) = contexts.first() {
+        parent.attach_to_span(span, SpanRelation::Parent);
+        for context in contexts.iter().skip(1) {
+            context.attach_to_span(span, SpanRelation::Link);
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduledTimer {
@@ -159,30 +170,51 @@ impl DurableTimerSet {
         now: Timestamp,
         limit: Option<usize>,
     ) -> Result<DueTimerBatch, ReadError> {
-        let durable_sequence = db.current_durable_sequence();
-        let mut rows = self
-            .schedule_table
-            .scan_at(
-                timer_due_scan_start_key(),
-                timer_due_scan_end_key(now),
-                durable_sequence,
-                ScanOptions {
-                    limit,
-                    ..ScanOptions::default()
-                },
-            )
-            .await?;
-
-        let mut timers = Vec::new();
-        while let Some((schedule_key, value)) = rows.next().await {
-            timers.push(decode_due_timer(schedule_key, value).map_err(ReadError::from)?);
+        let span = tracing::debug_span!("terracedb.timer.scan_due");
+        set_span_attribute(&span, telemetry_attrs::DB_NAME, db.telemetry_db_name());
+        set_span_attribute(
+            &span,
+            telemetry_attrs::DB_INSTANCE,
+            db.telemetry_db_instance(),
+        );
+        set_span_attribute(
+            &span,
+            telemetry_attrs::STORAGE_MODE,
+            db.telemetry_storage_mode(),
+        );
+        set_span_attribute(&span, "terracedb.timer.now", now.get());
+        if let Some(limit) = limit {
+            set_span_attribute(&span, "terracedb.timer.limit", limit as u64);
         }
 
-        Ok(DueTimerBatch {
-            durable_sequence,
-            now,
-            timers,
-        })
+        async move {
+            let durable_sequence = db.current_durable_sequence();
+            let mut rows = self
+                .schedule_table
+                .scan_at(
+                    timer_due_scan_start_key(),
+                    timer_due_scan_end_key(now),
+                    durable_sequence,
+                    ScanOptions {
+                        limit,
+                        ..ScanOptions::default()
+                    },
+                )
+                .await?;
+
+            let mut timers = Vec::new();
+            while let Some((schedule_key, value)) = rows.next().await {
+                timers.push(decode_due_timer(schedule_key, value).map_err(ReadError::from)?);
+            }
+
+            Ok(DueTimerBatch {
+                durable_sequence,
+                now,
+                timers,
+            })
+        }
+        .instrument(span.clone())
+        .await
     }
 }
 
@@ -198,6 +230,7 @@ pub struct OutboxMessage {
     pub entry: OutboxEntry,
     pub cursor: LogCursor,
     pub sequence: SequenceNumber,
+    pub operation_context: Option<OperationContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,39 +376,106 @@ impl DurableOutboxConsumer {
     }
 
     pub async fn poll(&self, limit: Option<usize>) -> Result<OutboxBatch, ReadError> {
-        let mut stream = self
-            .db
-            .scan_durable_since(
-                self.outbox.outbox_table(),
-                self.cursor,
-                ScanOptions {
-                    limit,
-                    ..ScanOptions::default()
-                },
-            )
-            .await
-            .map_err(ReadError::from)?;
-
-        let mut entries = Vec::new();
-        while let Some(change) = stream.try_next().await.map_err(ReadError::from)? {
-            entries.push(decode_outbox_message(change).map_err(ReadError::from)?);
+        let span = tracing::info_span!("terracedb.outbox.poll");
+        set_span_attribute(&span, telemetry_attrs::DB_NAME, self.db.telemetry_db_name());
+        set_span_attribute(
+            &span,
+            telemetry_attrs::DB_INSTANCE,
+            self.db.telemetry_db_instance(),
+        );
+        set_span_attribute(
+            &span,
+            telemetry_attrs::STORAGE_MODE,
+            self.db.telemetry_storage_mode(),
+        );
+        set_span_attribute(
+            &span,
+            telemetry_attrs::LOG_CURSOR,
+            format!(
+                "{}:{}",
+                self.cursor.sequence().get(),
+                self.cursor.op_index()
+            ),
+        );
+        if let Some(limit) = limit {
+            set_span_attribute(&span, "terracedb.outbox.limit", limit as u64);
         }
+        let span_for_attrs = span.clone();
 
-        Ok(OutboxBatch {
-            start_cursor: self.cursor,
-            entries,
-        })
+        async move {
+            let mut stream = self
+                .db
+                .scan_durable_since(
+                    self.outbox.outbox_table(),
+                    self.cursor,
+                    ScanOptions {
+                        limit,
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .map_err(ReadError::from)?;
+
+            let mut entries = Vec::new();
+            while let Some(change) = stream.try_next().await.map_err(ReadError::from)? {
+                entries.push(decode_outbox_message(change).map_err(ReadError::from)?);
+            }
+            let contexts = entries
+                .iter()
+                .filter_map(|entry| entry.operation_context.clone())
+                .collect::<Vec<_>>();
+            attach_operation_contexts(&span_for_attrs, &contexts);
+            set_span_attribute(
+                &span_for_attrs,
+                "terracedb.outbox.entry_count",
+                entries.len() as u64,
+            );
+
+            Ok(OutboxBatch {
+                start_cursor: self.cursor,
+                entries,
+            })
+        }
+        .instrument(span.clone())
+        .await
     }
 
     pub async fn persist_through(
         &mut self,
         cursor: LogCursor,
     ) -> Result<(), TransactionCommitError> {
-        self.cursors
-            .persist(&self.db, self.consumer_id.clone(), cursor)
-            .await?;
-        self.cursor = cursor;
-        Ok(())
+        let span = tracing::info_span!("terracedb.outbox.persist_through");
+        set_span_attribute(&span, telemetry_attrs::DB_NAME, self.db.telemetry_db_name());
+        set_span_attribute(
+            &span,
+            telemetry_attrs::DB_INSTANCE,
+            self.db.telemetry_db_instance(),
+        );
+        set_span_attribute(
+            &span,
+            telemetry_attrs::STORAGE_MODE,
+            self.db.telemetry_storage_mode(),
+        );
+        set_span_attribute(
+            &span,
+            telemetry_attrs::LOG_CURSOR,
+            format!("{}:{}", cursor.sequence().get(), cursor.op_index()),
+        );
+        set_span_attribute(
+            &span,
+            "terracedb.outbox.consumer_id",
+            String::from_utf8_lossy(&self.consumer_id).into_owned(),
+        );
+
+        async move {
+            self.cursors
+                .persist(&self.db, self.consumer_id.clone(), cursor)
+                .await?;
+            self.cursor = cursor;
+            Ok(())
+        }
+        .instrument(span.clone())
+        .await
     }
 }
 
@@ -533,6 +633,7 @@ fn decode_outbox_message(change: crate::ChangeEntry) -> Result<OutboxMessage, St
         },
         cursor: change.cursor,
         sequence: change.sequence,
+        operation_context: change.operation_context,
     })
 }
 

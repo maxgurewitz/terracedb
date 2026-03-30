@@ -20,6 +20,7 @@ use tokio::sync::Notify;
 #[cfg(test)]
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, watch};
+use tracing::Instrument;
 
 use crate::{
     config::{
@@ -42,6 +43,9 @@ use crate::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
         ScheduleAction, Scheduler, TableStats,
     },
+    telemetry::{
+        OperationContext, db_instance_from_storage, db_name_from_storage, storage_mode_name,
+    },
 };
 
 pub type Key = Vec<u8>;
@@ -49,6 +53,43 @@ pub type KeyPrefix = Vec<u8>;
 pub type KvStream = Pin<Box<dyn Stream<Item = (Key, Value)> + Send + 'static>>;
 pub type ChangeStream =
     Pin<Box<dyn Stream<Item = Result<ChangeEntry, StorageError>> + Send + 'static>>;
+
+fn log_cursor_attribute(cursor: LogCursor) -> String {
+    format!("{}:{}", cursor.sequence().get(), cursor.op_index())
+}
+
+fn apply_db_span_attributes(
+    span: &tracing::Span,
+    db_name: &str,
+    db_instance: &str,
+    storage_mode: &str,
+) {
+    crate::set_span_attributes(
+        span,
+        [
+            (
+                crate::telemetry_attrs::DB_NAME,
+                opentelemetry::Value::String(db_name.to_string().into()),
+            ),
+            (
+                crate::telemetry_attrs::DB_INSTANCE,
+                opentelemetry::Value::String(db_instance.to_string().into()),
+            ),
+            (
+                crate::telemetry_attrs::STORAGE_MODE,
+                opentelemetry::Value::String(storage_mode.to_string().into()),
+            ),
+        ],
+    );
+}
+
+fn apply_table_span_attribute(span: &tracing::Span, table_name: &str) {
+    crate::set_span_attribute(
+        span,
+        crate::telemetry_attrs::TABLE,
+        opentelemetry::Value::String(table_name.to_string().into()),
+    );
+}
 
 const CHANGE_FEED_READ_CHUNK_BYTES: usize = 64 * 1024;
 
