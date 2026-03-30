@@ -22,9 +22,9 @@ pub use ids::{
 pub use kv::{AgentKvStore, ReadOnlyAgentKvStore};
 pub use serde_json::Value as JsonValue;
 pub use store::{
-    AgentFsConfig, AgentFsOverlay, AgentFsSnapshot, AgentFsStore, AgentFsVolume, AgentFsVolumeInfo,
-    CloneVolumeSource, DEFAULT_CHUNK_SIZE, InMemoryAgentFsStore, OverlayBaseDescriptor,
-    ROOT_INODE_ID, SnapshotOptions, VFS_FORMAT_VERSION,
+    AgentFsConfig, AgentFsExport, AgentFsOverlay, AgentFsSnapshot, AgentFsStore, AgentFsVolume,
+    AgentFsVolumeInfo, CloneVolumeSource, DEFAULT_CHUNK_SIZE, InMemoryAgentFsStore,
+    OverlayBaseDescriptor, ROOT_INODE_ID, SnapshotOptions, VFS_FORMAT_VERSION,
 };
 pub use tables::{
     RESERVED_TABLES, ReservedTableDescriptor, VFS_ACTIVITY_TABLE_NAME, VFS_ALLOCATOR_TABLE_NAME,
