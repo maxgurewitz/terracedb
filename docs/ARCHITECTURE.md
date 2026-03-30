@@ -67,12 +67,12 @@ interface DB {
   flush(): Promise<Result<void, FlushError>>
 
   // Visible change capture — may include committed-but-not-yet-durable entries in deferred modes.
-  scanSince(table: Table, cursor: LogCursor, opts?: ScanOptions): Promise<Result<AsyncIterator<ChangeEntry>, SnapshotTooOld>>
+  scanSince(table: Table, cursor: LogCursor, opts?: ScanOptions): Promise<Result<AsyncIterator<ChangeEntry>, ChangeFeedError>>
   // Coalescing visible-prefix watermark notifications for driving event loops.
   subscribe(table: Table): Receiver<SequenceNumber>
 
   // Durable change capture — authoritative consumers must use these variants.
-  scanDurableSince(table: Table, cursor: LogCursor, opts?: ScanOptions): Promise<Result<AsyncIterator<ChangeEntry>, SnapshotTooOld>>
+  scanDurableSince(table: Table, cursor: LogCursor, opts?: ScanOptions): Promise<Result<AsyncIterator<ChangeEntry>, ChangeFeedError>>
   // Coalescing durable-prefix watermark notifications for driving event loops.
   subscribeDurable(table: Table): Receiver<SequenceNumber>
 
@@ -261,7 +261,7 @@ The `cursor` is an opaque `LogCursor` that encodes `(sequence, op_index)` intern
 
 This is the engine-level primitive for change capture. Unlike `scanAt` (which reads a point-in-time snapshot organized by user key), `scanSince` / `scanDurableSince` return entries ordered by when they were committed. The visible surface is appropriate for in-process best-effort maintenance; the durable surface is the correct primitive for authoritative consumers such as workflow ingress, outbox delivery, and any async state whose progress must survive crashes.
 
-**Gap-free guarantee:** both APIs provide strict gap-free change delivery within the retained history window of the surface they expose. If the cursor precedes the oldest retained commit log history for the table, the call fails with `SnapshotTooOld` rather than silently skipping entries. This is governed by **commit log retention**, not by SSTable compaction — these APIs read from the commit log, not the LSM. On receiving this error, the caller should fall back to a full recomputation or rebuild from a checkpoint.
+**Gap-free guarantee:** both APIs provide strict gap-free change delivery within the retained history window of the surface they expose. If the cursor precedes the oldest retained commit log history for the table, the call fails with `ChangeFeedError::SnapshotTooOld` rather than silently skipping entries. Ordinary scan I/O, corruption, or remote-read failures surface as `ChangeFeedError::Storage`. This is governed by **commit log retention**, not by SSTable compaction — these APIs read from the commit log, not the LSM. On receiving `SnapshotTooOld`, the caller should fall back to a full recomputation or rebuild from a checkpoint.
 
 **Multiple writes to the same key:** if key K is written 3 times after cursor C, `scanSince(table, C)` yields all 3 entries in commit order. If a single `WriteBatch` contains multiple writes to different keys, each appears as a separate entry, all sharing the same sequence number but with distinct cursors.
 
@@ -328,7 +328,8 @@ Best-effort in-process maintenance may use the visible pair instead.
 All read and write operations are fallible. Errors include:
 - `WriteError` — commit log failure, disk full, throttled/stalled by scheduler, serialization failure.
 - `ReadError` — I/O failure, corruption.
-- `SnapshotTooOld` — requested position is older than the retained history. For `readAt`/`scanAt`, this means MVCC versions have been reclaimed by LSM compaction. For `scanSince`, this means commit log segments have been GC'd past the requested cursor. Same error type, different underlying mechanisms.
+- `ChangeFeedError` — change-feed scan failure. `ChangeFeedError::SnapshotTooOld` means the requested cursor is older than retained commit-log history; `ChangeFeedError::Storage` means the scan hit an ordinary storage/runtime failure such as I/O, corruption, or remote-read failure.
+- `SnapshotTooOld` — requested point-in-time read position is older than retained MVCC history for `readAt` / `scanAt`.
 - `ConflictError` — read set violated during commit.
 - `FlushError` — S3 upload failure, disk full.
 
@@ -775,10 +776,10 @@ Old versions are dropped during compaction when they fall outside the GC horizon
 
 A compaction filter must not remove data still visible to an active snapshot. Long-running snapshots pin the GC horizon and prevent space reclamation — unreleased snapshots are a resource leak.
 
-**History availability:** the engine uses `SnapshotTooOld` for any request that references history older than what is retained, but the retention mechanism differs by operation:
+**History availability:** the engine uses `SnapshotTooOld`-style retention failures for any request that references history older than what is retained, but the surfaced error type and retention mechanism differ by operation:
 
 - `readAt` / `scanAt`: fail when MVCC versions have been reclaimed from the LSM by compaction or version GC. Governed by the **MVCC GC horizon**.
-- `scanSince`: fails when commit log segments have been GC'd past the cursor's sequence. Governed by **commit log retention** (see **Commit Log → Retention and GC**).
+- `scanSince` / `scanDurableSince`: return `ChangeFeedError::SnapshotTooOld` when commit log segments have been GC'd past the cursor's sequence. Governed by **commit log retention** (see **Commit Log → Retention and GC**).
 
 These horizons may differ — commit log retention can be configured independently of MVCC version GC. Snapshot creation (`db.snapshot()`) always succeeds because it captures the current sequence, which is by definition within both horizons.
 

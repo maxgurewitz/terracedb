@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::{
     api::{BatchOperation, ChangeStream, ScanOptions, Table, WriteBatch},
     config::TableConfig,
-    error::{CommitError, CreateTableError, OpenError, SnapshotTooOld, StorageError},
+    error::{ChangeFeedError, CommitError, CreateTableError, OpenError, StorageError},
     ids::{LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     scheduler::{PendingWork, ScheduleDecision, TableStats},
 };
@@ -220,13 +220,13 @@ pub mod change_capture {
             table: &Table,
             cursor: LogCursor,
             opts: ScanOptions,
-        ) -> Result<ChangeStream, SnapshotTooOld>;
+        ) -> Result<ChangeStream, ChangeFeedError>;
         async fn durable_scan(
             &self,
             table: &Table,
             cursor: LogCursor,
             opts: ScanOptions,
-        ) -> Result<ChangeStream, SnapshotTooOld>;
+        ) -> Result<ChangeStream, ChangeFeedError>;
     }
 
     #[derive(Debug, Default)]
@@ -239,7 +239,7 @@ pub mod change_capture {
             _table: &Table,
             _cursor: LogCursor,
             _opts: ScanOptions,
-        ) -> Result<ChangeStream, SnapshotTooOld> {
+        ) -> Result<ChangeStream, ChangeFeedError> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -248,7 +248,7 @@ pub mod change_capture {
             _table: &Table,
             _cursor: LogCursor,
             _opts: ScanOptions,
-        ) -> Result<ChangeStream, SnapshotTooOld> {
+        ) -> Result<ChangeStream, ChangeFeedError> {
             Ok(Box::pin(futures::stream::empty()))
         }
     }

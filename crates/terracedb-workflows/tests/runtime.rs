@@ -6,8 +6,10 @@ use std::{
 
 use async_trait::async_trait;
 use terracedb::{
-    Clock, LogCursor, OutboxEntry, Table, TieredDurabilityMode, Value,
-    test_support::{row_table_config, tiered_test_config_with_durability},
+    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
+    StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
+    Value,
+    test_support::{row_table_config, test_dependencies, tiered_test_config_with_durability},
 };
 use terracedb_simulation::{
     CutPoint, SeededSimulationRunner, SimulationStackBuilder, TerracedbSimulationHarness,
@@ -628,4 +630,72 @@ fn timer_loop_waits_for_durable_timer_rows_before_firing() -> turmoil::Result {
             harness.shutdown().await?;
             Ok(())
         })
+}
+
+#[tokio::test]
+async fn workflow_runtime_surfaces_change_feed_scan_failures_without_panicking() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-change-feed-failure",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies(file_system.clone(), object_store),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("workflow_source"))
+        .await
+        .expect("create source table");
+
+    source
+        .write(b"order-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write source event");
+
+    file_system.inject_failure(
+        FileSystemFailure::timeout(
+            FileSystemOperation::ReadAt,
+            "/workflow-change-feed-failure/commitlog/SEG-000001",
+        )
+        .persistent(),
+    );
+
+    let runtime = WorkflowRuntime::open(
+        db.clone(),
+        Arc::new(StubClock::default()),
+        WorkflowDefinition::new(
+            "orders",
+            [source.clone()],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+    let handle = runtime.start().await.expect("start workflow runtime");
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    match tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("workflow shutdown should return promptly")
+        .expect_err("workflow runtime should surface the underlying change-feed error")
+    {
+        WorkflowError::ChangeFeed(ChangeFeedError::Storage(error)) => {
+            assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("unexpected workflow error: {other}"),
+    }
+
+    assert_eq!(
+        runtime
+            .load_source_cursor(&source)
+            .await
+            .expect("load source cursor after failed workflow runtime"),
+        LogCursor::beginning()
+    );
 }

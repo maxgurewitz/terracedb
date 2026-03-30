@@ -12,9 +12,10 @@ use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
 
 use terracedb::{
-    ChangeEntry, ChangeKind, CommitError, CommitOptions, CompactionStrategy, CreateTableError, Db,
-    KvStream, LogCursor, ReadError, ScanOptions, SequenceNumber, Snapshot, SnapshotTooOld,
-    StorageError, SubscriptionClosed, Table, TableConfig, TableFormat, Value, WriteBatch,
+    ChangeEntry, ChangeFeedError, ChangeKind, CommitError, CommitOptions, CompactionStrategy,
+    CreateTableError, Db, KvStream, LogCursor, ReadError, ScanOptions, SequenceNumber, Snapshot,
+    SnapshotTooOld, StorageError, SubscriptionClosed, Table, TableConfig, TableFormat, Value,
+    WriteBatch,
 };
 
 pub const PROJECTION_CURSOR_TABLE_NAME: &str = "_projection_cursors";
@@ -41,6 +42,9 @@ impl ProjectionHandlerError {
 
     fn snapshot_too_old(&self) -> Option<SnapshotTooOld> {
         if let Some(error) = self.inner.downcast_ref::<ProjectionContextError>() {
+            return error.snapshot_too_old().cloned();
+        }
+        if let Some(error) = self.inner.downcast_ref::<ChangeFeedError>() {
             return error.snapshot_too_old().cloned();
         }
         if let Some(error) = self.inner.downcast_ref::<ReadError>() {
@@ -78,6 +82,12 @@ impl From<ReadError> for ProjectionHandlerError {
     }
 }
 
+impl From<ChangeFeedError> for ProjectionHandlerError {
+    fn from(error: ChangeFeedError) -> Self {
+        Self::new(error)
+    }
+}
+
 impl From<SnapshotTooOld> for ProjectionHandlerError {
     fn from(error: SnapshotTooOld) -> Self {
         Self::new(error)
@@ -94,6 +104,8 @@ pub enum ProjectionError {
     Read(#[from] ReadError),
     #[error(transparent)]
     SnapshotTooOld(#[from] SnapshotTooOld),
+    #[error(transparent)]
+    ChangeFeed(#[from] ChangeFeedError),
     #[error("projection runtime subscription closed unexpectedly")]
     SubscriptionClosed,
     #[error("projection {name} is already running")]
@@ -1210,7 +1222,7 @@ async fn drain_next_ready_run(
         match scan_whole_sequence_run(&runtime.db, &source.table, source.cursor).await {
             Ok(Some(run)) => ready.push((index, run)),
             Ok(None) => {}
-            Err(ProjectionError::SnapshotTooOld(_)) => {
+            Err(ProjectionError::ChangeFeed(ChangeFeedError::SnapshotTooOld(_))) => {
                 snapshot_too_old_source = Some(index);
                 break;
             }
