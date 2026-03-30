@@ -126,12 +126,20 @@ pub enum TieredDurabilityMode {
     Deferred,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TieredLocalRetentionMode {
+    #[default]
+    Offload,
+    Delete,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TieredStorageConfig {
     pub ssd: SsdConfig,
     pub s3: S3Location,
     pub max_local_bytes: u64,
     pub durability: TieredDurabilityMode,
+    pub local_retention: TieredLocalRetentionMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

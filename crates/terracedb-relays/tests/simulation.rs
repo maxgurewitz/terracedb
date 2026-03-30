@@ -26,6 +26,7 @@ fn simulation_config(root_path: &str) -> DbConfig {
             },
             max_local_bytes: 1024 * 1024,
             durability: TieredDurabilityMode::Deferred,
+            local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
         scheduler: None,
     }

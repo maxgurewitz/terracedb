@@ -211,6 +211,7 @@ fn simulation_db_config(
             },
             max_local_bytes,
             durability: TieredDurabilityMode::GroupCommit,
+            local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
         scheduler: Some(scheduler),
     }
@@ -228,6 +229,7 @@ fn simulation_tiered_config(root_path: &str, durability: TieredDurabilityMode) -
             },
             max_local_bytes: 1024 * 1024,
             durability,
+            local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
         scheduler: None,
     }
@@ -1743,6 +1745,7 @@ fn occ_transaction_simulation_respects_flush_modes_across_restart() -> turmoil::
                 },
                 max_local_bytes: 1024 * 1024,
                 durability: TieredDurabilityMode::Deferred,
+                local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
             scheduler: None,
         };
@@ -2067,6 +2070,7 @@ fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state
                 },
                 max_local_bytes: 1024 * 1024,
                 durability: TieredDurabilityMode::GroupCommit,
+                local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
             scheduler: Some(Arc::new(OffloadSimulationScheduler)),
         };
@@ -2081,6 +2085,7 @@ fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state
                 },
                 max_local_bytes: 1,
                 durability: TieredDurabilityMode::GroupCommit,
+                local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
             scheduler: Some(Arc::new(OffloadSimulationScheduler)),
         };
@@ -2152,6 +2157,105 @@ fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state
 
         Ok(())
     })
+}
+
+#[test]
+fn delete_retention_simulation_bypasses_cold_uploads_and_recovers_expired_state() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x2123)
+        .with_simulation_duration(Duration::from_secs(5))
+        .run_with(|context| async move {
+            let setup_config = DbConfig {
+                storage: StorageConfig::Tiered(TieredStorageConfig {
+                    ssd: SsdConfig {
+                        path: "/terracedb/sim/t21-delete-retention".to_string(),
+                    },
+                    s3: S3Location {
+                        bucket: "terracedb-sim".to_string(),
+                        prefix: "delete-retention".to_string(),
+                    },
+                    max_local_bytes: 1024 * 1024,
+                    durability: TieredDurabilityMode::GroupCommit,
+                    local_retention: terracedb::TieredLocalRetentionMode::Delete,
+                }),
+                scheduler: Some(Arc::new(OffloadSimulationScheduler)),
+            };
+            let config = DbConfig {
+                storage: StorageConfig::Tiered(TieredStorageConfig {
+                    ssd: SsdConfig {
+                        path: "/terracedb/sim/t21-delete-retention".to_string(),
+                    },
+                    s3: S3Location {
+                        bucket: "terracedb-sim".to_string(),
+                        prefix: "delete-retention".to_string(),
+                    },
+                    max_local_bytes: 1,
+                    durability: TieredDurabilityMode::GroupCommit,
+                    local_retention: terracedb::TieredLocalRetentionMode::Delete,
+                }),
+                scheduler: Some(Arc::new(OffloadSimulationScheduler)),
+            };
+
+            let setup_db = context.open_db(setup_config).await?;
+            let table = setup_db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            table
+                .write(b"apple".to_vec(), Value::Bytes(vec![b'a'; 256]))
+                .await?;
+            setup_db.flush().await?;
+            table
+                .write(b"banana".to_vec(), Value::Bytes(vec![b'b'; 256]))
+                .await?;
+            setup_db.flush().await?;
+
+            let db = context
+                .restart_db(config.clone(), CutPoint::AfterStep)
+                .await?;
+            let table = db.table("events");
+
+            let cold_prefix = "delete-retention/cold/".to_string();
+            context
+                .object_store()
+                .inject_failure(ObjectStoreFaultSpec::Timeout {
+                    operation: ObjectStoreOperation::Put,
+                    target_prefix: cold_prefix.clone(),
+                })
+                .await?;
+
+            assert!(
+                db.pending_work()
+                    .await
+                    .iter()
+                    .any(|work| work.work_type == PendingWorkType::Offload)
+            );
+            assert!(db.run_next_offload().await?);
+
+            let stats = db.table_stats(&table).await;
+            assert_eq!(stats.local_bytes, 0);
+            assert_eq!(stats.s3_bytes, 0);
+            assert_eq!(table.read(b"apple".to_vec()).await?, None);
+            assert_eq!(table.read(b"banana".to_vec()).await?, None);
+            assert!(context.object_store().list(&cold_prefix).await?.is_empty());
+            assert!(
+                !context
+                    .object_store()
+                    .list("delete-retention/backup/sst/")
+                    .await?
+                    .is_empty(),
+                "backup copies can remain until the GC grace window elapses"
+            );
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_table = reopened.table("events");
+            assert_eq!(reopened_table.read(b"apple".to_vec()).await?, None);
+            assert_eq!(reopened_table.read(b"banana".to_vec()).await?, None);
+            let reopened_stats = reopened.table_stats(&reopened_table).await;
+            assert_eq!(reopened_stats.local_bytes, 0);
+            assert_eq!(reopened_stats.s3_bytes, 0);
+
+            Ok(())
+        })
 }
 
 #[test]

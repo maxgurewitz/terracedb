@@ -191,6 +191,7 @@ async fn public_bricks_surface_compiles_and_is_instantiable() {
                 },
                 max_local_bytes: 1024 * 1024,
                 durability: TieredDurabilityMode::GroupCommit,
+                local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
             scheduler: None,
         },

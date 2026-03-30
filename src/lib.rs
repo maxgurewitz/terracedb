@@ -41,7 +41,8 @@ pub use config::{
     CompactionDecision, CompactionDecisionContext, CompactionFilter, CompactionFilterRef,
     CompactionStrategy, DbConfig, MergeOperator, MergeOperatorRef, S3Location,
     S3PrimaryStorageConfig, SsdConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
-    TieredDurabilityMode, TieredStorageConfig, TtlCompactionFilter, TtlExpiryExtractor,
+    TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, TtlCompactionFilter,
+    TtlExpiryExtractor,
 };
 pub use error::{
     ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,

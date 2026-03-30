@@ -48,6 +48,7 @@ impl Harness {
                     },
                     max_local_bytes: 1024 * 1024,
                     durability: self.durability,
+                    local_retention: terracedb::TieredLocalRetentionMode::Offload,
                 }),
                 scheduler: None,
             },

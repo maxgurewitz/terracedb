@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, sync::Ar
 use crate::{
     CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
     StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat,
-    TieredDurabilityMode, TieredStorageConfig, Value,
+    TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, Value,
 };
 
 pub use crate::failpoints::{
@@ -41,6 +41,7 @@ pub fn tiered_test_config_with_durability(
             },
             max_local_bytes: 1024 * 1024,
             durability,
+            local_retention: TieredLocalRetentionMode::Offload,
         }),
         scheduler: None,
     }

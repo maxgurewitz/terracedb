@@ -19,6 +19,7 @@ fn tiered_config(path: &str, durability: TieredDurabilityMode) -> DbConfig {
             },
             max_local_bytes: 1024 * 1024,
             durability,
+            local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
         scheduler: None,
     }

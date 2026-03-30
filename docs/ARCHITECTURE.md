@@ -680,6 +680,7 @@ type StorageConfig =
       ssd: { path: string }
       s3: { bucket: string, prefix: string }
       maxLocalBytes: number  // per-table size limit on SSD
+      localRetention: "offload" | "delete"  // oldest-first reclaim policy once over budget
     }
   | {
       mode: "s3-primary"
@@ -690,11 +691,12 @@ type StorageConfig =
 
 ### Tiered Mode (SSD + S3)
 
-Data starts on SSD and is offloaded to S3 when a table exceeds its configured `maxLocalBytes` limit. Offload evicts the oldest SSTables first (by sequence number range), preserving recent data locally for fast access. Separately, a continuous backup process replicates commit log segments and SSTables to S3 for disaster recovery. See **Backup and Replication** for details.
+Data starts on SSD and is reclaimed when a table exceeds its configured `maxLocalBytes` limit. In the default `localRetention: "offload"` mode, Terracedb uploads the oldest SSTables to S3 cold storage while preserving them for reads. In `localRetention: "delete"` mode, Terracedb expires the oldest SSTables instead of publishing them to the cold prefix. Separately, a continuous backup process replicates commit log segments and SSTables to S3 for disaster recovery. See **Backup and Replication** for details.
 
 - **Write path:** commit log append (within mutex) → group commit fsync → memtable insert → visibility. Commit is durable after group fsync completes. In deferred durability mode, fsync is background/explicit. See **Commit Log** for the unified log design and **Commit Path and Group Commit** in the API Design Notes.
 - **Flush to SSTable:** memtable → SSTable on local SSD.
-- **Offload (cold storage):** background process monitors per-table size on SSD. When a table exceeds `maxLocalBytes`, it uploads the oldest SSTables to S3, updates the manifest, and reclaims local space — repeating until the table is back under the limit.
+- **Offload (cold storage):** in `localRetention: "offload"`, a background process monitors per-table size on SSD. When a table exceeds `maxLocalBytes`, it uploads the oldest SSTables to S3, updates the manifest, and reclaims local space — repeating until the table is back under the limit.
+- **Delete retention:** in `localRetention: "delete"`, the same oldest-first selection logic removes SSTables from the live manifest instead of moving them to the cold prefix. Reads no longer see that expired data, and backup GC later removes the unreferenced remote copies.
 - **Backup (replication):** background process continuously copies commit log segments and SSTables to S3. If the SSD is lost, the database can be fully recovered.
 - **Read path:** memtable → local SSTables (bloom filter assisted) → S3 SSTables (with in-memory LRU cache).
 - **Disaster recovery:** pull latest manifest from S3, download live SSTables, replay commit log tail.
