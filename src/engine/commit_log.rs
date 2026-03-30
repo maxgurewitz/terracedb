@@ -591,6 +591,57 @@ impl SegmentManager {
         })
     }
 
+    pub async fn append_batch_and_sync(
+        &mut self,
+        records: &[CommitRecord],
+    ) -> Result<(), StorageError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut frames = Vec::with_capacity(records.len());
+        let mut batch_bytes = 0_u64;
+        for record in records {
+            let frame = record.encode_frame()?;
+            batch_bytes = batch_bytes.saturating_add(frame.len() as u64);
+            frames.push(frame);
+        }
+
+        if self.active.record_count > 0
+            && self.active.len.saturating_add(batch_bytes) > self.options.max_segment_size_bytes
+        {
+            self.seal_active().await?;
+        }
+
+        let committed_len = self.active.len;
+        let mut offset = committed_len;
+        for frame in &frames {
+            if let Err(error) = self.fs.write_at(&self.active.handle, offset, frame).await {
+                self.restore_active_prefix(committed_len).await?;
+                return Err(error);
+            }
+            offset = offset.saturating_add(frame.len() as u64);
+        }
+
+        if let Err(error) = self.fs.sync(&self.active.handle).await {
+            self.restore_active_prefix(committed_len).await?;
+            return Err(error);
+        }
+
+        let mut observed_offset = committed_len;
+        for (record, frame) in records.iter().zip(frames.iter()) {
+            self.active.observe(
+                observed_offset,
+                record,
+                frame.len() as u64,
+                self.options.records_per_block,
+            );
+            observed_offset = observed_offset.saturating_add(frame.len() as u64);
+        }
+
+        Ok(())
+    }
+
     pub async fn seal_active(&mut self) -> Result<Option<SegmentFooter>, StorageError> {
         if self.active.record_count == 0 {
             return Ok(None);
@@ -663,6 +714,33 @@ impl SegmentManager {
         }
 
         self.fs.sync(&self.active.handle).await
+    }
+
+    async fn restore_active_prefix(&self, len: u64) -> Result<(), StorageError> {
+        let prefix = if len == 0 {
+            Vec::new()
+        } else {
+            let mut bytes = read_file(self.fs.as_ref(), &self.active.path).await?;
+            bytes.truncate(len as usize);
+            bytes
+        };
+        let handle = self
+            .fs
+            .open(
+                &self.active.path,
+                OpenOptions {
+                    create: false,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await?;
+        if !prefix.is_empty() {
+            self.fs.write_at(&handle, 0, &prefix).await?;
+        }
+        Ok(())
     }
 
     pub async fn read_from_sequence(

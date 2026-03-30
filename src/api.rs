@@ -1263,6 +1263,16 @@ impl CommitRuntime {
         Ok(())
     }
 
+    async fn append_group_batch(&mut self, records: &[CommitRecord]) -> Result<(), StorageError> {
+        match &mut self.backend {
+            CommitLogBackend::Local(manager) => manager.append_batch_and_sync(records).await,
+            CommitLogBackend::Memory(log) => {
+                log.records.extend(records.iter().cloned());
+                Ok(())
+            }
+        }
+    }
+
     async fn sync(&mut self) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => manager.sync_active().await,
@@ -1487,6 +1497,7 @@ struct GroupCommitBatch {
 #[derive(Clone, Debug, Default)]
 struct GroupCommitBatchState {
     sealed: bool,
+    records: Vec<CommitRecord>,
     result: Option<Result<(), StorageError>>,
 }
 
@@ -1504,6 +1515,14 @@ impl GroupCommitBatch {
 
     fn result(&self) -> Option<Result<(), StorageError>> {
         mutex_lock(&self.state).result.clone()
+    }
+
+    fn stage_record(&self, record: CommitRecord) {
+        mutex_lock(&self.state).records.push(record);
+    }
+
+    fn staged_records(&self) -> Vec<CommitRecord> {
+        mutex_lock(&self.state).records.clone()
     }
 }
 
@@ -6953,18 +6972,28 @@ impl Db {
 
             let sequence = SequenceNumber::new(self.inner.next_sequence.load(Ordering::SeqCst) + 1);
             let record = Self::build_commit_record(sequence, &resolved_operations)?;
-            self.inner
-                .commit_runtime
-                .lock()
-                .await
-                .append(record)
-                .await
-                .map_err(CommitError::Storage)?;
+            let participant = if self.durable_on_commit() {
+                let participant = self.register_commit(sequence, resolved_operations.clone());
+                participant
+                    .group_batch
+                    .as_ref()
+                    .expect("group-commit participants should always have a batch")
+                    .stage_record(record);
+                participant
+            } else {
+                self.inner
+                    .commit_runtime
+                    .lock()
+                    .await
+                    .append(record)
+                    .await
+                    .map_err(CommitError::Storage)?;
+                self.register_commit(sequence, resolved_operations.clone())
+            };
             self.inner
                 .next_sequence
                 .store(sequence.get(), Ordering::SeqCst);
-
-            self.register_commit(sequence, resolved_operations.clone())
+            participant
         };
 
         if let Some(batch) = participant.group_batch.clone() {
@@ -7701,6 +7730,7 @@ impl Db {
                 .await;
 
             let should_lead = {
+                let _commit_guard = self.inner.commit_lock.lock().await;
                 let mut state = mutex_lock(&batch.state);
                 if state.result.is_some() {
                     false
@@ -7713,7 +7743,14 @@ impl Db {
             };
 
             if should_lead {
-                let result = self.inner.commit_runtime.lock().await.sync().await;
+                let records = batch.staged_records();
+                let result = self
+                    .inner
+                    .commit_runtime
+                    .lock()
+                    .await
+                    .append_group_batch(&records)
+                    .await;
                 let notify_result = result.clone();
                 {
                     let mut state = mutex_lock(&batch.state);
@@ -7743,6 +7780,7 @@ impl Db {
                 if state.aborted {
                     state.visible_published = true;
                     visible = next;
+                    advance.visible_sequence = Some(visible);
                     continue;
                 }
                 if !state.memtable_inserted {
@@ -7772,6 +7810,7 @@ impl Db {
                 if state.aborted {
                     state.durable_published = true;
                     durable = next;
+                    advance.durable_sequence = Some(durable);
                     continue;
                 }
                 if !state.durable_confirmed {
@@ -9483,9 +9522,9 @@ mod tests {
         ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
         PendingWorkType, ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
         ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SnapshotTooOld,
-        SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng, TableConfig,
-        TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
-        TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
+        SsdConfig, StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore,
+        StubRng, TableConfig, TableFormat, TableId, TableStats, ThrottleDecision,
+        TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -10387,6 +10426,37 @@ mod tests {
             root,
             &format!("{LOCAL_COMMIT_LOG_RELATIVE_DIR}/SEG-{segment_id:06}"),
         )
+    }
+
+    fn assert_group_commit_sync_failure(error: crate::WriteError) {
+        let crate::WriteError::Commit(CommitError::Storage(storage)) = error else {
+            panic!("expected storage-backed write error from failed group commit");
+        };
+        assert_eq!(storage.kind(), StorageErrorKind::Timeout);
+        assert!(storage.message().contains("simulated timeout"));
+    }
+
+    async fn visible_changes(db: &Db, table: &crate::Table) -> Vec<CollectedChange> {
+        collect_changes(
+            db.scan_since(table, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan visible changes"),
+        )
+        .await
+    }
+
+    async fn durable_changes(db: &Db, table: &crate::Table) -> Vec<CollectedChange> {
+        collect_changes(
+            db.scan_durable_since(table, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .expect("scan durable changes"),
+        )
+        .await
+    }
+
+    async fn assert_no_visible_or_durable_changes(db: &Db, table: &crate::Table) {
+        assert!(visible_changes(db, table).await.is_empty());
+        assert!(durable_changes(db, table).await.is_empty());
     }
 
     async fn commit_log_segment_ids(db: &Db) -> Vec<SegmentId> {
@@ -16042,6 +16112,183 @@ mod tests {
             file_system.operation_count(FileSystemOperation::Sync) - before_syncs,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn group_commit_sync_failure_flush_and_reopen_do_not_resurrect_failed_write() {
+        let root = "/group-commit-sync-failure-flush";
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let db = Db::open(tiered_config(root), dependencies.clone())
+            .await
+            .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        file_system.inject_failure(FileSystemFailure::timeout(
+            FileSystemOperation::Sync,
+            commit_log_segment_path(root, 1),
+        ));
+
+        let error = events
+            .write(b"user:failed".to_vec(), bytes("failed"))
+            .await
+            .expect_err("group-commit sync should fail");
+        assert_group_commit_sync_failure(error);
+
+        assert_eq!(
+            events
+                .read(b"user:failed".to_vec())
+                .await
+                .expect("read failed key after rejected commit"),
+            None
+        );
+        assert_no_visible_or_durable_changes(&db, &events).await;
+
+        db.flush()
+            .await
+            .expect("flush should not resurrect failed group-commit writes");
+
+        assert_eq!(
+            events
+                .read(b"user:failed".to_vec())
+                .await
+                .expect("read failed key after flush"),
+            None
+        );
+        assert_no_visible_or_durable_changes(&db, &events).await;
+
+        file_system.crash();
+
+        let reopened = Db::open(tiered_config(root), dependencies)
+            .await
+            .expect("reopen db");
+        let reopened_events = reopened.table("events");
+
+        assert_eq!(
+            reopened_events
+                .read(b"user:failed".to_vec())
+                .await
+                .expect("read failed key after reopen"),
+            None
+        );
+        assert_no_visible_or_durable_changes(&reopened, &reopened_events).await;
+    }
+
+    #[tokio::test]
+    async fn group_commit_sync_failure_keeps_failed_write_out_of_change_feeds_and_watermarks() {
+        let root = "/group-commit-sync-failure-watermarks";
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let db = Db::open(tiered_config(root), dependencies.clone())
+            .await
+            .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+        let mut visible = db.subscribe(&events);
+        let mut durable = db.subscribe_durable(&events);
+
+        file_system.inject_failure(FileSystemFailure::timeout(
+            FileSystemOperation::Sync,
+            commit_log_segment_path(root, 1),
+        ));
+
+        let error = events
+            .write(b"user:failed".to_vec(), bytes("failed"))
+            .await
+            .expect_err("group-commit sync should fail");
+        assert_group_commit_sync_failure(error);
+
+        assert_eq!(
+            events
+                .read(b"user:failed".to_vec())
+                .await
+                .expect("read failed key after rejected commit"),
+            None
+        );
+        assert_no_visible_or_durable_changes(&db, &events).await;
+        assert_eq!(visible.current(), SequenceNumber::default());
+        assert_eq!(durable.current(), SequenceNumber::default());
+        assert!(
+            !visible
+                .has_changed()
+                .expect("visible subscription should stay idle")
+        );
+        assert!(
+            !durable
+                .has_changed()
+                .expect("durable subscription should stay idle")
+        );
+
+        let committed = events
+            .write(b"user:ok".to_vec(), bytes("ok"))
+            .await
+            .expect("write later successful value");
+        let expected = vec![collected_change(
+            committed.get(),
+            0,
+            ChangeKind::Put,
+            b"user:ok",
+            Some(bytes("ok")),
+            "events",
+        )];
+
+        assert_eq!(
+            events
+                .read(b"user:failed".to_vec())
+                .await
+                .expect("failed key should remain absent"),
+            None
+        );
+        assert_eq!(
+            events
+                .read(b"user:ok".to_vec())
+                .await
+                .expect("read later successful key"),
+            Some(bytes("ok"))
+        );
+        assert_eq!(
+            visible.changed().await.expect("visible watermark update"),
+            committed
+        );
+        assert_eq!(
+            durable.changed().await.expect("durable watermark update"),
+            committed
+        );
+        assert_eq!(visible.current(), committed);
+        assert_eq!(durable.current(), committed);
+        assert_eq!(visible_changes(&db, &events).await, expected);
+        assert_eq!(durable_changes(&db, &events).await, expected);
+
+        file_system.crash();
+
+        let reopened = Db::open(tiered_config(root), dependencies)
+            .await
+            .expect("reopen db");
+        let reopened_events = reopened.table("events");
+
+        assert_eq!(
+            reopened_events
+                .read(b"user:failed".to_vec())
+                .await
+                .expect("failed key should stay absent after reopen"),
+            None
+        );
+        assert_eq!(
+            reopened_events
+                .read(b"user:ok".to_vec())
+                .await
+                .expect("read successful key after reopen"),
+            Some(bytes("ok"))
+        );
+        assert_eq!(visible_changes(&reopened, &reopened_events).await, expected);
+        assert_eq!(durable_changes(&reopened, &reopened_events).await, expected);
     }
 
     #[tokio::test]
