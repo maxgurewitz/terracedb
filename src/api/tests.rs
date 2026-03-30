@@ -17,7 +17,7 @@ use crate::simulation::{
     CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
 };
 use crate::{
-    ChangeFeedError, ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy,
+    ChangeFeedError, ChangeKind, Clock, CommitError, CommitId, CommitOptions, CompactionStrategy,
     DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
     FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
     ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
@@ -25,7 +25,7 @@ use crate::{
     ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SsdConfig,
     StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng, Table,
     TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
+    TieredStorageConfig, Timestamp, Transaction, TtlCompactionFilter, Value,
 };
 
 fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -305,6 +305,55 @@ impl Scheduler for DeferringThrottleScheduler {
 
         ThrottleDecision::default()
     }
+}
+
+#[derive(Default)]
+struct TableRateLimitScheduler {
+    rates_by_table: BTreeMap<String, u64>,
+}
+
+impl Scheduler for TableRateLimitScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        self.rates_by_table
+            .get(table.name())
+            .copied()
+            .map(|max_write_bytes_per_second| ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: Some(max_write_bytes_per_second),
+                stall: false,
+            })
+            .unwrap_or_default()
+    }
+}
+
+async fn advance_clock_until_task_finishes<T>(
+    clock: &StubClock,
+    handle: &tokio::task::JoinHandle<T>,
+    step: Duration,
+    max_steps: usize,
+) -> u64 {
+    let start = clock.now().get();
+    for _ in 0..max_steps {
+        if handle.is_finished() {
+            break;
+        }
+        clock.advance(step);
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        handle.is_finished(),
+        "task should finish after advancing the simulated clock"
+    );
+    clock.now().get().saturating_sub(start)
 }
 
 #[derive(Debug)]
@@ -1387,6 +1436,194 @@ async fn scheduler_choice_controls_which_compaction_runs_first() {
 
     assert!(db.table_stats(&alpha).await.compaction_debt > 0);
     assert_eq!(db.table_stats(&beta).await.compaction_debt, 0);
+}
+
+#[tokio::test]
+async fn round_robin_scheduler_services_three_backlogged_tables_within_three_passes() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/scheduler-round-robin-fairness",
+            Arc::new(crate::RoundRobinScheduler::default()),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let alpha = db
+        .create_table(row_table_config("alpha"))
+        .await
+        .expect("create alpha");
+    let beta = db
+        .create_table(row_table_config("beta"))
+        .await
+        .expect("create beta");
+    let gamma = db
+        .create_table(row_table_config("gamma"))
+        .await
+        .expect("create gamma");
+
+    for round in 0..2_u8 {
+        alpha
+            .write(vec![b'a', round], Value::Bytes(vec![round]))
+            .await
+            .expect("write alpha");
+        beta.write(vec![b'b', round], Value::Bytes(vec![round]))
+            .await
+            .expect("write beta");
+        gamma
+            .write(vec![b'g', round], Value::Bytes(vec![round]))
+            .await
+            .expect("write gamma");
+        db.flush().await.expect("flush round");
+    }
+
+    assert!(db.table_stats(&alpha).await.compaction_debt > 0);
+    assert!(db.table_stats(&beta).await.compaction_debt > 0);
+    assert!(db.table_stats(&gamma).await.compaction_debt > 0);
+
+    assert!(
+        db.run_next_scheduled_work()
+            .await
+            .expect("run first scheduled work")
+    );
+    assert_eq!(db.table_stats(&alpha).await.compaction_debt, 0);
+    assert!(db.table_stats(&beta).await.compaction_debt > 0);
+    assert!(db.table_stats(&gamma).await.compaction_debt > 0);
+    let mut remaining = db
+        .pending_work()
+        .await
+        .into_iter()
+        .map(|work| work.table)
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(remaining, vec!["beta".to_string(), "gamma".to_string()]);
+
+    assert!(
+        db.run_next_scheduled_work()
+            .await
+            .expect("run second scheduled work")
+    );
+    assert_eq!(db.table_stats(&beta).await.compaction_debt, 0);
+    assert!(db.table_stats(&gamma).await.compaction_debt > 0);
+    let remaining = db
+        .pending_work()
+        .await
+        .into_iter()
+        .map(|work| work.table)
+        .collect::<Vec<_>>();
+    assert_eq!(remaining, vec!["gamma".to_string()]);
+
+    assert!(
+        db.run_next_scheduled_work()
+            .await
+            .expect("run third scheduled work")
+    );
+    assert_eq!(db.table_stats(&gamma).await.compaction_debt, 0);
+    assert!(db.pending_work().await.is_empty());
+}
+
+#[tokio::test]
+async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let scheduler = Arc::new(TableRateLimitScheduler {
+        rates_by_table: BTreeMap::from([
+            ("fast".to_string(), 128_u64),
+            ("slow".to_string(), 16_u64),
+        ]),
+    });
+    let db = Db::open(
+        tiered_config_with_scheduler("/scheduler-slowest-table-rate-limit", scheduler),
+        dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let fast = db
+        .create_table(row_table_config("fast"))
+        .await
+        .expect("create fast");
+    let slow = db
+        .create_table(row_table_config("slow"))
+        .await
+        .expect("create slow");
+
+    let fast_only_db = db.clone();
+    let fast_only_table = fast.clone();
+    let fast_only = tokio::spawn(async move {
+        let mut tx = Transaction::begin(&fast_only_db).await;
+        tx.write(
+            &fast_only_table,
+            b"fast-only".to_vec(),
+            Value::Bytes(vec![b'f'; 64]),
+        );
+        tx.commit_no_flush().await.expect("commit fast-only tx")
+    });
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !fast_only.is_finished(),
+        "fast-only commit should wait for the simulated clock"
+    );
+    let fast_elapsed = advance_clock_until_task_finishes(
+        clock.as_ref(),
+        &fast_only,
+        Duration::from_millis(250),
+        40,
+    )
+    .await;
+    assert_eq!(
+        fast_only.await.expect("join fast-only commit"),
+        SequenceNumber::new(1)
+    );
+
+    let mixed_db = db.clone();
+    let mixed_fast = fast.clone();
+    let mixed_slow = slow.clone();
+    let mixed = tokio::spawn(async move {
+        let mut tx = Transaction::begin(&mixed_db).await;
+        tx.write(
+            &mixed_fast,
+            b"fast-mixed".to_vec(),
+            Value::Bytes(vec![b'f'; 64]),
+        );
+        tx.write(
+            &mixed_slow,
+            b"slow-mixed".to_vec(),
+            Value::Bytes(vec![b's'; 64]),
+        );
+        tx.commit_no_flush().await.expect("commit mixed tx")
+    });
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !mixed.is_finished(),
+        "mixed commit should wait for the simulated clock"
+    );
+    let mixed_elapsed =
+        advance_clock_until_task_finishes(clock.as_ref(), &mixed, Duration::from_millis(250), 80)
+            .await;
+    assert_eq!(
+        mixed.await.expect("join mixed commit"),
+        SequenceNumber::new(2)
+    );
+
+    assert!(
+        fast_elapsed >= 500,
+        "fast-only commit should incur a modeled delay"
+    );
+    assert!(
+        mixed_elapsed > fast_elapsed,
+        "mixed commit should be gated by the slower table budget"
+    );
+    assert!(
+        mixed_elapsed >= fast_elapsed + 2_000,
+        "slow-table budget should materially dominate the mixed commit: fast={fast_elapsed}ms mixed={mixed_elapsed}ms"
+    );
 }
 
 #[tokio::test]

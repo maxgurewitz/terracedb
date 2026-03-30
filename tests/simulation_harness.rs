@@ -10,8 +10,8 @@ use terracedb::{
     Clock, CommitOptions, CompactionStrategy, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
     FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
     FileSystemOperation, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore, ObjectStoreOperation,
-    OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint, S3Location,
-    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+    OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint, RoundRobinScheduler,
+    S3Location, S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
     SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
     StorageSource, TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
     TieredStorageConfig, Transaction, UnifiedStorage, Value,
@@ -145,6 +145,53 @@ impl Scheduler for OffloadSimulationScheduler {
 
     fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
         ThrottleDecision::default()
+    }
+}
+
+struct FixedRateLimitSimulationScheduler {
+    max_write_bytes_per_second: u64,
+}
+
+impl Scheduler for FixedRateLimitSimulationScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision {
+            throttle: true,
+            max_write_bytes_per_second: Some(self.max_write_bytes_per_second),
+            stall: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SinglePassRoundRobinSimulationScheduler {
+    inner: RoundRobinScheduler,
+    throttle_calls: AtomicU64,
+}
+
+impl Scheduler for SinglePassRoundRobinSimulationScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        self.inner.on_work_available(work)
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        let throttle = self
+            .throttle_calls
+            .fetch_add(1, Ordering::SeqCst)
+            .is_multiple_of(2);
+        ThrottleDecision {
+            throttle,
+            max_write_bytes_per_second: None,
+            stall: false,
+        }
     }
 }
 
@@ -1758,6 +1805,144 @@ fn occ_transaction_simulation_respects_flush_modes_across_restart() -> turmoil::
 
         Ok(())
     })
+}
+
+#[test]
+fn rate_limited_simulation_writes_consume_more_time_for_larger_payloads() -> turmoil::Result {
+    SeededSimulationRunner::new(0x3030)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16a-rate-limit",
+                    Arc::new(FixedRateLimitSimulationScheduler {
+                        max_write_bytes_per_second: 128,
+                    }),
+                    1024 * 1024,
+                ))
+                .await?;
+            let table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let clock = context.clock();
+
+            let small_start = clock.now().get();
+            table.write(b"small".to_vec(), Value::Bytes(vec![b's'; 16]))
+                .await?;
+            let small_elapsed = clock.now().get().saturating_sub(small_start);
+
+            let large_start = clock.now().get();
+            table.write(b"large".to_vec(), Value::Bytes(vec![b'l'; 256]))
+                .await?;
+            let large_elapsed = clock.now().get().saturating_sub(large_start);
+
+            assert!(small_elapsed > 0, "rate-limited small write should advance simulated time");
+            assert!(
+                large_elapsed > small_elapsed,
+                "larger payload should consume more simulated time: small={small_elapsed}ms large={large_elapsed}ms"
+            );
+            assert!(
+                large_elapsed >= small_elapsed + 1_000,
+                "larger payload should materially increase modeled delay: small={small_elapsed}ms large={large_elapsed}ms"
+            );
+            assert_eq!(
+                table.read(b"small".to_vec()).await?,
+                Some(Value::Bytes(vec![b's'; 16]))
+            );
+            assert_eq!(
+                table.read(b"large".to_vec()).await?,
+                Some(Value::Bytes(vec![b'l'; 256]))
+            );
+
+            Ok(())
+        })
+}
+
+#[test]
+fn throttled_round_robin_simulation_services_three_backlogged_tables_without_starvation()
+-> turmoil::Result {
+    SeededSimulationRunner::new(0x3131)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16a-round-robin-fairness",
+                    Arc::new(SinglePassRoundRobinSimulationScheduler::default()),
+                    1024 * 1024,
+                ))
+                .await?;
+            let alpha = db
+                .create_table(SimulationTableSpec::row("alpha").table_config())
+                .await?;
+            let beta = db
+                .create_table(SimulationTableSpec::row("beta").table_config())
+                .await?;
+            let gamma = db
+                .create_table(SimulationTableSpec::row("gamma").table_config())
+                .await?;
+            let trigger = db
+                .create_table(SimulationTableSpec::row("trigger").table_config())
+                .await?;
+
+            for round in 0..2_u8 {
+                alpha
+                    .write(vec![b'a', round], Value::Bytes(vec![round]))
+                    .await?;
+                beta.write(vec![b'b', round], Value::Bytes(vec![round]))
+                    .await?;
+                gamma
+                    .write(vec![b'g', round], Value::Bytes(vec![round]))
+                    .await?;
+                db.flush().await?;
+            }
+
+            let mut pending_tables = db
+                .pending_work()
+                .await
+                .into_iter()
+                .map(|work| work.table)
+                .collect::<Vec<_>>();
+            pending_tables.sort();
+            assert_eq!(
+                pending_tables,
+                vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+            );
+
+            trigger
+                .write(b"tick-1".to_vec(), Value::bytes("tick"))
+                .await?;
+
+            let mut pending_tables = db
+                .pending_work()
+                .await
+                .into_iter()
+                .map(|work| work.table)
+                .collect::<Vec<_>>();
+            pending_tables.sort();
+            assert_eq!(
+                pending_tables,
+                vec!["beta".to_string(), "gamma".to_string()]
+            );
+
+            trigger
+                .write(b"tick-2".to_vec(), Value::bytes("tick"))
+                .await?;
+
+            let pending_tables = db
+                .pending_work()
+                .await
+                .into_iter()
+                .map(|work| work.table)
+                .collect::<Vec<_>>();
+            assert_eq!(pending_tables, vec!["gamma".to_string()]);
+
+            trigger
+                .write(b"tick-3".to_vec(), Value::bytes("tick"))
+                .await?;
+            assert!(db.pending_work().await.is_empty());
+
+            Ok(())
+        })
 }
 
 #[test]

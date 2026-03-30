@@ -549,6 +549,31 @@ Implement background-work observability, scheduler callbacks, default scheduling
 
 ---
 
+### T16a. Deterministic performance-invariant test coverage
+
+**Depends on:** T16
+
+**Description**
+
+Add deterministic tests for performance-adjacent invariants that the current simulation/runtime model can actually prove: bounded backlog, starvation-free service, scheduler fairness, modeled throttling delay, and bounded catch-up under injected latency. This task is explicitly about **performance invariants under a deterministic model**, not about claiming production throughput or wall-clock latency on real hardware.
+
+**Implementation steps**
+
+1. Extend the scheduler/simulation test suites with service-curve checks for write throttling, including monotonic delay growth as batch size grows and multi-table commits being gated by the slowest modeled table budget.
+2. Add starvation/fairness tests showing backlogged tables are serviced within a bounded number of scheduler passes under round-robin-style policies, even when new foreground writes continue to arrive.
+3. Add backlog-bound tests showing hostile or random scheduler choices cannot push flush/compaction pressure past the engine's hard guardrails under the existing model.
+4. Add modeled catch-up tests for restart/startup scenarios, asserting that backlog replay drains within bounded simulated time under fixed message-latency settings.
+5. Document the boundary of these tests clearly in code/comments: they validate deterministic control laws and liveness/performance invariants, not hardware-calibrated benchmarks.
+
+**Verification**
+
+- Deterministic tests proving larger writes incur larger modeled throttling delays than smaller writes.
+- Tests proving multi-table commits wait for the slowest applicable write budget rather than the fastest table touched.
+- Tests proving round-robin scheduler service clears three or more backlogged tables without starvation in a bounded number of passes.
+- Simulation tests proving modeled backlog drains and replay/catch-up complete within explicit simulated-time bounds.
+
+---
+
 ## Phase 3 — Unified-log change capture
 
 **Parallelization:** T17 starts first. T18 can proceed once the commit coordinator exists. T19 depends on T17.

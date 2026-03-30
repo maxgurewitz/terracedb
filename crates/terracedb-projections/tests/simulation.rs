@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    CommitOptions, DeterministicRng, KvStream, Rng, ScanOptions, SequenceNumber, Table, Value,
+    Clock, CommitOptions, DeterministicRng, KvStream, Rng, ScanOptions, SequenceNumber, Table,
+    Value,
     test_support::{row_table_config, tiered_test_config},
 };
 use terracedb_projections::{
@@ -293,6 +294,55 @@ fn run_projection_simulation(seed: u64) -> turmoil::Result<ProjectionSimulationC
             };
             harness.shutdown().await?;
             Ok(capture)
+        })
+}
+
+#[test]
+fn projection_simulation_catches_up_each_batch_within_bounded_simulated_time() -> turmoil::Result {
+    let seed = 0x5151_u64;
+    SeededSimulationRunner::new(seed)
+        .with_simulation_duration(PROJECTION_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(move |context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config("/projection-sim-bounded-catchup"),
+                projection_stack_builder(),
+            )
+            .await?;
+            let clock = harness.context().clock();
+            let source = harness.stack().source.clone();
+
+            for (step, writes) in planned_batches(seed).into_iter().enumerate() {
+                let mut batch = harness.db().write_batch();
+                for (key, value) in writes {
+                    batch.put(&source, key, Value::bytes(value));
+                }
+
+                let sequence = harness
+                    .db()
+                    .commit(batch, CommitOptions::default())
+                    .await
+                    .expect("commit simulated source batch");
+                let start = clock.now().get();
+                harness
+                    .stack_mut()
+                    .handle
+                    .wait_for_watermark(sequence)
+                    .await
+                    .expect("projection should reach simulated watermark");
+                let elapsed = clock.now().get().saturating_sub(start);
+                assert!(
+                    elapsed <= 25,
+                    "projection step {step} should catch up within a bounded simulated time budget: elapsed={elapsed}ms"
+                );
+            }
+
+            harness.shutdown().await?;
+            Ok(())
         })
 }
 
