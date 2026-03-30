@@ -749,6 +749,13 @@ impl Db {
         self.memtable_budget_bytes()
     }
 
+    fn local_sstable_retention(&self) -> TieredLocalRetentionMode {
+        match &self.inner.config.storage {
+            StorageConfig::Tiered(config) => config.local_retention,
+            StorageConfig::S3Primary(_) => TieredLocalRetentionMode::Offload,
+        }
+    }
+
     fn memtable_budget_exceeded_by(&self, additional_bytes: u64) -> bool {
         self.memtable_budget_bytes().is_some_and(|budget| {
             self.memtables_read()

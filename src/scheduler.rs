@@ -231,6 +231,7 @@ mod tests {
                     },
                     max_local_bytes: 1024,
                     durability: TieredDurabilityMode::GroupCommit,
+                    local_retention: crate::TieredLocalRetentionMode::Offload,
                 }),
                 scheduler: None,
             };

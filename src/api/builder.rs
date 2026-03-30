@@ -31,6 +31,7 @@ impl DbSettings {
             s3,
             max_local_bytes: DEFAULT_TIERED_MAX_LOCAL_BYTES,
             durability: TieredDurabilityMode::GroupCommit,
+            local_retention: TieredLocalRetentionMode::Offload,
         })
     }
 

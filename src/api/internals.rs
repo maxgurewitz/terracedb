@@ -702,8 +702,15 @@ struct OffloadJob {
     id: String,
     table_id: TableId,
     table_name: String,
+    kind: OffloadJobKind,
     input_local_ids: Vec<String>,
     estimated_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OffloadJobKind {
+    Offload,
+    Delete,
 }
 
 #[derive(Clone, Debug, Default)]

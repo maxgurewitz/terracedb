@@ -42,6 +42,7 @@ fn tiered_test_config_with_budget(
             },
             max_local_bytes,
             durability,
+            local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
         scheduler: None,
     }

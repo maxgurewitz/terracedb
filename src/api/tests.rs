@@ -13,7 +13,7 @@ use super::{
     DurableRemoteCommitLogSegment, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
     LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
     LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, MANIFEST_FORMAT_VERSION, ManifestId,
-    OffloadPhase, PendingWorkSpec, PersistedManifestBody, PersistedManifestFile,
+    OffloadJobKind, OffloadPhase, PendingWorkSpec, PersistedManifestBody, PersistedManifestFile,
     PersistedManifestSstable, PersistedRemoteManifestBody, PersistedRemoteManifestFile,
     PersistedRowSstableFile, REMOTE_MANIFEST_FORMAT_VERSION, ResidentColumnarSstable,
     SchemaDefinition, StorageSource, StoredTable, WatermarkUpdate, decode_mvcc_key,
@@ -31,7 +31,8 @@ use crate::{
     ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SsdConfig,
     StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng, Table,
     TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, Timestamp, Transaction, TtlCompactionFilter, Value,
+    TieredLocalRetentionMode, TieredStorageConfig, Timestamp, Transaction, TtlCompactionFilter,
+    Value,
     engine::commit_log::{BlockIndexEntry, SegmentFooter, TableSegmentMeta},
     metadata_flatbuffers as metadata_fb,
 };
@@ -48,6 +49,7 @@ fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -
             },
             max_local_bytes: 1024 * 1024,
             durability,
+            local_retention: TieredLocalRetentionMode::Offload,
         }),
         scheduler: None,
     }
@@ -65,6 +67,18 @@ fn tiered_layout() -> ObjectKeyLayout {
 }
 
 fn tiered_config_with_max_local_bytes(path: &str, max_local_bytes: u64) -> DbConfig {
+    tiered_config_with_max_local_bytes_and_retention(
+        path,
+        max_local_bytes,
+        TieredLocalRetentionMode::Offload,
+    )
+}
+
+fn tiered_config_with_max_local_bytes_and_retention(
+    path: &str,
+    max_local_bytes: u64,
+    local_retention: TieredLocalRetentionMode,
+) -> DbConfig {
     DbConfig {
         storage: StorageConfig::Tiered(TieredStorageConfig {
             ssd: SsdConfig {
@@ -76,6 +90,7 @@ fn tiered_config_with_max_local_bytes(path: &str, max_local_bytes: u64) -> DbCon
             },
             max_local_bytes,
             durability: TieredDurabilityMode::GroupCommit,
+            local_retention,
         }),
         scheduler: None,
     }
@@ -2188,6 +2203,174 @@ async fn cold_offload_selects_oldest_local_sstables_until_table_is_back_under_bu
         .await
         .expect("list cold objects");
     assert_eq!(cold_keys.len(), expected_ids.len());
+}
+
+#[tokio::test]
+async fn delete_retention_selects_oldest_local_sstables_until_table_is_back_under_budget() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let dependencies =
+        dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone());
+    let setup_db = Db::open(
+        tiered_config_with_max_local_bytes("/delete-retention-selection", 1024 * 1024),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open delete retention setup db");
+    let setup_table = setup_db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    for (key, byte) in [
+        (b"apple".to_vec(), b'a'),
+        (b"banana".to_vec(), b'b'),
+        (b"carrot".to_vec(), b'c'),
+    ] {
+        setup_table
+            .write(key, Value::Bytes(vec![byte; 512]))
+            .await
+            .expect("write delete-retention seed");
+        setup_db.flush().await.expect("flush delete-retention seed");
+    }
+
+    drop(setup_table);
+    drop(setup_db);
+    clock.advance(Duration::from_secs(120));
+
+    let config = tiered_config_with_max_local_bytes_and_retention(
+        "/delete-retention-selection",
+        1200,
+        TieredLocalRetentionMode::Delete,
+    );
+    let db = Db::open(config.clone(), dependencies)
+        .await
+        .expect("reopen delete-retention db");
+    let table = db.table("events");
+
+    let budget = match &config.storage {
+        StorageConfig::Tiered(config) => config.max_local_bytes,
+        StorageConfig::S3Primary(_) => unreachable!("selection test uses tiered storage"),
+    };
+    let table_id = table.id().expect("table id");
+    let live_before = db
+        .sstables_read()
+        .live
+        .iter()
+        .filter(|sstable| sstable.meta.table_id == table_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let local_before = live_before
+        .iter()
+        .map(|sstable| sstable.meta.length)
+        .sum::<u64>();
+    assert!(
+        local_before > budget,
+        "fixture should exceed the local-byte budget"
+    );
+
+    let mut expected = live_before.clone();
+    expected.sort_by(|left, right| {
+        (
+            left.meta.max_sequence.get(),
+            left.meta.min_sequence.get(),
+            left.meta.level,
+            left.meta.local_id.as_str(),
+        )
+            .cmp(&(
+                right.meta.max_sequence.get(),
+                right.meta.min_sequence.get(),
+                right.meta.level,
+                right.meta.local_id.as_str(),
+            ))
+    });
+    let mut remaining = local_before;
+    let mut expected_ids = Vec::new();
+    let mut expected_deleted_keys = Vec::new();
+    for sstable in &expected {
+        if remaining <= budget {
+            break;
+        }
+        remaining = remaining.saturating_sub(sstable.meta.length);
+        expected_ids.push(sstable.meta.local_id.clone());
+        expected_deleted_keys.extend(sstable.rows.iter().map(|row| row.key.clone()));
+    }
+    let expected_remaining_keys = expected
+        .iter()
+        .filter(|sstable| !expected_ids.contains(&sstable.meta.local_id))
+        .flat_map(|sstable| sstable.rows.iter().map(|row| row.key.clone()))
+        .collect::<Vec<_>>();
+
+    let offload_job = db
+        .pending_offload_candidates()
+        .into_iter()
+        .find_map(|candidate| match candidate.spec {
+            PendingWorkSpec::Offload(job) => Some(job),
+            PendingWorkSpec::Flush | PendingWorkSpec::Compaction(_) => None,
+        })
+        .expect("pending delete-retention job");
+    assert_eq!(offload_job.kind, OffloadJobKind::Delete);
+    assert_eq!(offload_job.input_local_ids, expected_ids);
+
+    assert!(db.run_next_offload().await.expect("run delete retention"));
+
+    let stats = db.table_stats(&table).await;
+    assert!(stats.local_bytes <= budget);
+    assert_eq!(stats.total_bytes, stats.local_bytes);
+    assert_eq!(stats.s3_bytes, 0);
+
+    let live_after = db
+        .sstables_read()
+        .live
+        .iter()
+        .filter(|sstable| sstable.meta.table_id == table_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        live_after
+            .iter()
+            .all(|sstable| !sstable.meta.file_path.is_empty() && sstable.meta.remote_key.is_none())
+    );
+
+    for key in expected_deleted_keys {
+        assert_eq!(
+            table
+                .read(key)
+                .await
+                .expect("expired read after delete retention"),
+            None
+        );
+    }
+    for key in expected_remaining_keys {
+        assert!(
+            table
+                .read(key)
+                .await
+                .expect("surviving read after delete retention")
+                .is_some()
+        );
+    }
+
+    let layout = tiered_layout();
+    let cold_keys = object_store
+        .list(&layout.cold_prefix())
+        .await
+        .expect("list cold objects");
+    assert!(
+        cold_keys.is_empty(),
+        "delete retention should not create cold objects"
+    );
+
+    let backup_keys = object_store
+        .list(&layout.backup_sstable_prefix())
+        .await
+        .expect("list backup copies");
+    assert_eq!(
+        backup_keys.len(),
+        live_after.len(),
+        "only the still-live SSTables should remain backed up after GC"
+    );
 }
 
 #[tokio::test]

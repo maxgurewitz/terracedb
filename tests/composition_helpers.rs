@@ -56,6 +56,7 @@ impl TestEnv {
                 },
                 max_local_bytes: 1024 * 1024,
                 durability,
+                local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
             scheduler: None,
         };
@@ -488,6 +489,7 @@ fn simulation_config(root_path: &str, durability: TieredDurabilityMode) -> DbCon
             },
             max_local_bytes: 1024 * 1024,
             durability,
+            local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
         scheduler: None,
     }

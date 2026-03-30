@@ -24,7 +24,7 @@ use crate::{
     config::{
         CompactionDecision, CompactionDecisionContext, CompactionStrategy, DbConfig, S3Location,
         S3PrimaryStorageConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
-        TieredDurabilityMode, TieredStorageConfig,
+        TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig,
     },
     engine::commit_log::{
         CommitEntry, CommitRecord, LocalSegmentScanPlan, SegmentFooter, SegmentManager,

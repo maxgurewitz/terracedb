@@ -289,7 +289,11 @@ impl Db {
         })
     }
 
-    fn build_offload_job(table: &StoredTable, inputs: &[ResidentRowSstable]) -> Option<OffloadJob> {
+    fn build_offload_job(
+        table: &StoredTable,
+        kind: OffloadJobKind,
+        inputs: &[ResidentRowSstable],
+    ) -> Option<OffloadJob> {
         if inputs.is_empty() {
             return None;
         }
@@ -298,14 +302,19 @@ impl Db {
             .iter()
             .map(|sstable| sstable.meta.local_id.clone())
             .collect::<Vec<_>>();
+        let work_prefix = match kind {
+            OffloadJobKind::Offload => "offload",
+            OffloadJobKind::Delete => "expire",
+        };
         Some(OffloadJob {
             id: format!(
-                "offload:{}:{}",
+                "{work_prefix}:{}:{}",
                 table.config.name,
                 input_local_ids.join("+")
             ),
             table_id: table.id,
             table_name: table.config.name.clone(),
+            kind,
             estimated_bytes: inputs
                 .iter()
                 .map(|sstable| sstable.meta.length)
@@ -395,6 +404,7 @@ impl Db {
         let Some(max_local_bytes) = self.local_sstable_budget_bytes() else {
             return Vec::new();
         };
+        let retention = self.local_sstable_retention();
 
         let tables = self.tables_read().clone();
         let live = self.sstables_read().live.clone();
@@ -446,7 +456,14 @@ impl Db {
                     selected.push(sstable);
                 }
 
-                let job = Self::build_offload_job(table, &selected)?;
+                let job = Self::build_offload_job(
+                    table,
+                    match retention {
+                        TieredLocalRetentionMode::Offload => OffloadJobKind::Offload,
+                        TieredLocalRetentionMode::Delete => OffloadJobKind::Delete,
+                    },
+                    &selected,
+                )?;
                 Some(PendingWorkCandidate {
                     pending: PendingWork {
                         id: job.id.clone(),
@@ -1095,56 +1112,70 @@ impl Db {
             }
 
             let layout = ObjectKeyLayout::new(&config.s3);
-            let storage = UnifiedStorage::from_dependencies(&self.inner.dependencies);
-            let mut updated_inputs = BTreeMap::new();
-            for input in &inputs {
-                let remote_key = layout.cold_sstable(
-                    input.meta.table_id,
-                    0,
-                    input.meta.min_sequence,
-                    input.meta.max_sequence,
-                    &input.meta.local_id,
-                );
-                let bytes = read_path(&self.inner.dependencies, &input.meta.file_path).await?;
-                storage
-                    .put_object(&remote_key, &bytes)
-                    .await
-                    .map_err(|error| error.into_storage_error())?;
-                Self::note_backup_object_birth(&self.inner.dependencies, &layout, &remote_key)
-                    .await;
-
-                let mut updated = input.clone();
-                updated.meta.file_path.clear();
-                updated.meta.remote_key = Some(remote_key);
-                updated_inputs.insert(updated.meta.local_id.clone(), updated);
-            }
-
-            self.maybe_pause_offload_phase(OffloadPhase::UploadComplete)
-                .await?;
-
             let current_state = self.sstables_read().clone();
-            let mut replaced = 0_usize;
-            let mut new_live = current_state
-                .live
-                .into_iter()
-                .map(|sstable| {
-                    if let Some(updated) = updated_inputs.get(&sstable.meta.local_id) {
-                        replaced += 1;
-                        updated.clone()
-                    } else {
-                        sstable
+            let current_live = current_state.live.clone();
+            let input_local_ids = job.input_local_ids.iter().cloned().collect::<BTreeSet<_>>();
+            let new_live = match job.kind {
+                OffloadJobKind::Offload => {
+                    let storage = UnifiedStorage::from_dependencies(&self.inner.dependencies);
+                    let mut updated_inputs = BTreeMap::new();
+                    for input in &inputs {
+                        let remote_key = layout.cold_sstable(
+                            input.meta.table_id,
+                            0,
+                            input.meta.min_sequence,
+                            input.meta.max_sequence,
+                            &input.meta.local_id,
+                        );
+                        let bytes = read_path(&self.inner.dependencies, &input.meta.file_path).await?;
+                        storage
+                            .put_object(&remote_key, &bytes)
+                            .await
+                            .map_err(|error| error.into_storage_error())?;
+                        Self::note_backup_object_birth(&self.inner.dependencies, &layout, &remote_key)
+                            .await;
+
+                        let mut updated = input.clone();
+                        updated.meta.file_path.clear();
+                        updated.meta.remote_key = Some(remote_key);
+                        updated_inputs.insert(updated.meta.local_id.clone(), updated);
                     }
-                })
-                .collect::<Vec<_>>();
-            if replaced != job.input_local_ids.len() {
-                return Err(StorageError::corruption(format!(
-                    "offload job {} replaced {} of {} SSTables",
-                    job.id,
-                    replaced,
-                    job.input_local_ids.len()
-                )));
-            }
-            Self::sort_live_sstables(&mut new_live);
+
+                    self.maybe_pause_offload_phase(OffloadPhase::UploadComplete)
+                        .await?;
+
+                    let mut replaced = 0_usize;
+                    let mut new_live = current_live
+                        .into_iter()
+                        .map(|sstable| {
+                            if let Some(updated) = updated_inputs.get(&sstable.meta.local_id) {
+                                replaced += 1;
+                                updated.clone()
+                            } else {
+                                sstable
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    if replaced != job.input_local_ids.len() {
+                        return Err(StorageError::corruption(format!(
+                            "offload job {} replaced {} of {} SSTables",
+                            job.id,
+                            replaced,
+                            job.input_local_ids.len()
+                        )));
+                    }
+                    Self::sort_live_sstables(&mut new_live);
+                    new_live
+                }
+                OffloadJobKind::Delete => {
+                    let mut new_live = current_live
+                        .into_iter()
+                        .filter(|sstable| !input_local_ids.contains(&sstable.meta.local_id))
+                        .collect::<Vec<_>>();
+                    Self::sort_live_sstables(&mut new_live);
+                    new_live
+                }
+            };
 
             let next_generation =
                 ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
