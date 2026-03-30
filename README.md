@@ -52,9 +52,18 @@ This repository includes a shared pre-commit script at `scripts/pre-commit.sh`.
 
 The Git hook at `.githooks/pre-commit` calls that script, which runs:
 
+- `scripts/check-durable-format-fixtures.sh`
 - `cargo test --workspace`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
+
+Durable-format policy, fixture inventory, and the checked FlatBuffers schema reference live in `docs/DURABLE_FORMATS.md` and `schemas/durable_metadata.fbs`.
+
+When an intentional durable-format change updates canonical bytes, regenerate the reviewed fixtures with:
+
+```bash
+scripts/regenerate-durable-format-fixtures.sh
+```
 
 Enable it locally with:
 

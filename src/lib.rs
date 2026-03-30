@@ -9,6 +9,7 @@ pub mod error;
 mod failpoints;
 pub mod ids;
 pub mod io;
+mod metadata_flatbuffers;
 pub mod remote;
 pub mod scheduler;
 #[cfg(test)]

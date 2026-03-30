@@ -36,6 +36,7 @@ use crate::{
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, OpenOptions},
+    metadata_flatbuffers as metadata_fb,
     remote::{ObjectKeyLayout, RemoteCache, StorageSource, UnifiedStorage},
     scheduler::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
@@ -100,6 +101,7 @@ include!("schema.rs");
 include!("operations.rs");
 include!("watermark.rs");
 include!("internals.rs");
+include!("metadata_codec.rs");
 include!("memtable.rs");
 include!("builder.rs");
 include!("db_open.rs");

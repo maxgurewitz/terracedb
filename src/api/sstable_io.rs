@@ -1703,50 +1703,6 @@ impl Db {
         Ok(resident)
     }
 
-    fn encode_manifest_payload_from_sstables(
-        generation: ManifestId,
-        last_flushed_sequence: SequenceNumber,
-        sstables: &[PersistedManifestSstable],
-    ) -> Result<Vec<u8>, StorageError> {
-        let body = PersistedManifestBody {
-            format_version: MANIFEST_FORMAT_VERSION,
-            generation,
-            last_flushed_sequence,
-            sstables: sstables.to_vec(),
-        };
-        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
-            StorageError::corruption(format!("encode manifest body failed: {error}"))
-        })?;
-        let checksum = checksum32(&encoded_body);
-        serde_json::to_vec_pretty(&PersistedManifestFile { body, checksum }).map_err(|error| {
-            StorageError::corruption(format!("encode manifest file failed: {error}"))
-        })
-    }
-
-    fn encode_remote_manifest_payload(
-        generation: ManifestId,
-        last_flushed_sequence: SequenceNumber,
-        sstables: &[PersistedManifestSstable],
-        durable_commit_log_segments: &[DurableRemoteCommitLogSegment],
-    ) -> Result<Vec<u8>, StorageError> {
-        let body = PersistedRemoteManifestBody {
-            format_version: REMOTE_MANIFEST_FORMAT_VERSION,
-            generation,
-            last_flushed_sequence,
-            sstables: sstables.to_vec(),
-            commit_log_segments: durable_commit_log_segments.to_vec(),
-        };
-        let encoded_body = serde_json::to_vec(&body).map_err(|error| {
-            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
-        })?;
-        let checksum = checksum32(&encoded_body);
-        serde_json::to_vec_pretty(&PersistedRemoteManifestFile { body, checksum }).map_err(
-            |error| {
-                StorageError::corruption(format!("encode remote manifest file failed: {error}"))
-            },
-        )
-    }
-
     async fn install_manifest(
         &self,
         generation: ManifestId,
@@ -1933,7 +1889,7 @@ impl Db {
             object_key: object_key.to_string(),
             first_uploaded_at_millis: dependencies.clock.now().get(),
         };
-        let Ok(payload) = serde_json::to_vec_pretty(&record) else {
+        let Ok(payload) = Self::encode_backup_object_birth_payload(&record) else {
             return;
         };
         let _ = dependencies.object_store.put(&metadata_key, &payload).await;
@@ -1949,7 +1905,7 @@ impl Db {
             .await
             .ok()
             .flatten()?;
-        let record: BackupObjectBirthRecord = serde_json::from_slice(&bytes).ok()?;
+        let record = Self::decode_backup_object_birth_payload(&bytes).ok()?;
         (record.format_version == BACKUP_GC_METADATA_FORMAT_VERSION
             && record.object_key == object_key)
             .then_some(record)

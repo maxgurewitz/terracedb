@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, sync::Arc};
 
 use crate::{
     CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
@@ -83,4 +83,89 @@ pub fn row_table_config(name: &str) -> TableConfig {
 
 pub fn bytes(value: &str) -> Value {
     Value::bytes(value.as_bytes().to_vec())
+}
+
+pub fn durable_format_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/durable-formats")
+}
+
+pub fn durable_format_fixture_path(name: &str) -> PathBuf {
+    durable_format_fixture_dir().join(name)
+}
+
+pub fn durable_format_fixture_regeneration_requested() -> bool {
+    env::var("TERRACEDB_REGENERATE_DURABLE_FIXTURES")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+pub fn assert_durable_format_fixture(name: &str, actual: &[u8]) {
+    let path = durable_format_fixture_path(name);
+    match fs::read(&path) {
+        Ok(expected) if expected == actual => {}
+        Ok(_) => {
+            if durable_format_fixture_regeneration_requested() {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap_or_else(|create_error| {
+                        panic!(
+                            "failed to create durable format fixture directory {}: {create_error}",
+                            parent.display()
+                        )
+                    });
+                }
+                fs::write(&path, actual).unwrap_or_else(|write_error| {
+                    panic!(
+                        "failed to write durable format fixture {}: {write_error}",
+                        path.display()
+                    )
+                });
+                return;
+            }
+
+            panic!(
+                "durable format fixture {} is missing or out of date; run `scripts/regenerate-durable-format-fixtures.sh` if this change is intentional",
+                path.display()
+            );
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if durable_format_fixture_regeneration_requested() {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap_or_else(|create_error| {
+                        panic!(
+                            "failed to create durable format fixture directory {}: {create_error}",
+                            parent.display()
+                        )
+                    });
+                }
+                fs::write(&path, actual).unwrap_or_else(|write_error| {
+                    panic!(
+                        "failed to write durable format fixture {}: {write_error}",
+                        path.display()
+                    )
+                });
+                return;
+            }
+
+            panic!(
+                "durable format fixture {} is missing or out of date; run `scripts/regenerate-durable-format-fixtures.sh` if this change is intentional",
+                path.display()
+            );
+        }
+        Err(error) => {
+            panic!(
+                "failed to read durable format fixture {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+pub fn durable_format_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }

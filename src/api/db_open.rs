@@ -465,25 +465,6 @@ impl Db {
         Ok(())
     }
 
-    fn encode_catalog(tables: &BTreeMap<String, StoredTable>) -> Result<Vec<u8>, StorageError> {
-        serde_json::to_vec_pretty(&PersistedCatalog::from_tables(tables))
-            .map_err(|error| StorageError::corruption(format!("encode catalog failed: {error}")))
-    }
-
-    fn decode_catalog(bytes: &[u8]) -> Result<PersistedCatalog, StorageError> {
-        let catalog: PersistedCatalog = serde_json::from_slice(bytes)
-            .map_err(|error| StorageError::corruption(format!("decode catalog failed: {error}")))?;
-
-        if catalog.format_version != CATALOG_FORMAT_VERSION {
-            return Err(StorageError::unsupported(format!(
-                "unsupported catalog version {}",
-                catalog.format_version
-            )));
-        }
-
-        Ok(catalog)
-    }
-
     fn join_fs_path(root: &str, relative: &str) -> String {
         PathBuf::from(root)
             .join(relative)
@@ -862,9 +843,7 @@ impl Db {
         path: &str,
     ) -> Result<LoadedManifest, StorageError> {
         let bytes = read_source(dependencies, &StorageSource::local_file(path)).await?;
-        let file: PersistedManifestFile = serde_json::from_slice(&bytes).map_err(|error| {
-            StorageError::corruption(format!("decode manifest {path} failed: {error}"))
-        })?;
+        let file = Self::decode_manifest_file_flatbuffer(&bytes)?;
 
         if file.body.format_version != MANIFEST_FORMAT_VERSION {
             return Err(StorageError::unsupported(format!(
@@ -873,9 +852,7 @@ impl Db {
             )));
         }
 
-        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
-            StorageError::corruption(format!("encode manifest body failed: {error}"))
-        })?;
+        let encoded_body = Self::encode_manifest_body_flatbuffer(&file.body)?;
         if checksum32(&encoded_body) != file.checksum {
             return Err(StorageError::corruption(format!(
                 "manifest checksum mismatch for {path}"
@@ -915,10 +892,7 @@ impl Db {
         key: &str,
     ) -> Result<PersistedRemoteManifestFile, StorageError> {
         let bytes = read_source(dependencies, &StorageSource::remote_object(key)).await?;
-        let file: PersistedRemoteManifestFile =
-            serde_json::from_slice(&bytes).map_err(|error| {
-                StorageError::corruption(format!("decode remote manifest {key} failed: {error}"))
-            })?;
+        let file = Self::decode_remote_manifest_file_flatbuffer(&bytes)?;
 
         if file.body.format_version != REMOTE_MANIFEST_FORMAT_VERSION {
             return Err(StorageError::unsupported(format!(
@@ -927,9 +901,7 @@ impl Db {
             )));
         }
 
-        let encoded_body = serde_json::to_vec(&file.body).map_err(|error| {
-            StorageError::corruption(format!("encode remote manifest body failed: {error}"))
-        })?;
+        let encoded_body = Self::encode_remote_manifest_body_flatbuffer(&file.body)?;
         if checksum32(&encoded_body) != file.checksum {
             return Err(StorageError::corruption(format!(
                 "remote manifest checksum mismatch for {key}"
