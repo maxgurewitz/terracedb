@@ -1,5 +1,10 @@
 [workspace]
-members = [".", "crates/turmoil-determinism", "crates/terracedb-projections"]
+members = [
+    ".",
+    "crates/turmoil-determinism",
+    "crates/terracedb-projections",
+    "crates/terracedb-workflows",
+]
 resolver = "2"
 [package]
 name = "terracedb"
