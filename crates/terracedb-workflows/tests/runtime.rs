@@ -9,7 +9,10 @@ use terracedb::{
     ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
     StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
     Value,
-    test_support::{row_table_config, test_dependencies, tiered_test_config_with_durability},
+    test_support::{
+        row_table_config, test_dependencies, test_dependencies_with_clock,
+        tiered_test_config_with_durability,
+    },
 };
 use terracedb_simulation::{
     CutPoint, SeededSimulationRunner, SimulationStackBuilder, TerracedbSimulationHarness,
@@ -199,6 +202,66 @@ impl WorkflowHandler for TimerHandler {
                 panic!("timer workflow does not process source events")
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-change-feed-timeout",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system.clone(), object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("workflow_source"))
+        .await
+        .expect("create workflow source");
+
+    source
+        .write(b"order-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write workflow backlog");
+    file_system.inject_failure(
+        FileSystemFailure::timeout(
+            FileSystemOperation::ReadAt,
+            "/workflow-change-feed-timeout/commitlog/SEG-000001",
+        )
+        .persistent(),
+    );
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [source],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+    let handle = runtime.start().await.expect("start workflow runtime");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail on change-feed scan");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("expected typed workflow change-feed failure, got {other:?}"),
     }
 }
 

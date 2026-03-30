@@ -446,3 +446,111 @@ async fn projection_runtime_surfaces_change_feed_scan_failures_without_panicking
         0
     );
 }
+
+#[tokio::test]
+async fn projection_runtime_surfaces_typed_change_feed_storage_errors() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config("/projection-change-feed-timeout"),
+        test_dependencies(file_system.clone(), object_store),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("source"))
+        .await
+        .expect("create source table");
+    let output = db
+        .create_table(row_table_config("output"))
+        .await
+        .expect("create output table");
+
+    source
+        .write(b"user:1".to_vec(), test_bytes("queued"))
+        .await
+        .expect("write source backlog");
+    file_system.inject_failure(
+        FileSystemFailure::timeout(
+            FileSystemOperation::ReadAt,
+            "/projection-change-feed-timeout/commitlog/SEG-000001",
+        )
+        .persistent(),
+    );
+
+    let runtime = ProjectionRuntime::open(db.clone())
+        .await
+        .expect("open projection runtime");
+    let handle = runtime
+        .start_single_source(
+            SingleSourceProjection::new(
+                "mirror",
+                source.clone(),
+                MirrorProjection {
+                    output: output.clone(),
+                },
+            )
+            .with_outputs([output.clone()]),
+        )
+        .await
+        .expect("start projection");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("projection should fail on the injected change-feed error");
+    match error {
+        ProjectionError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("expected typed projection change-feed failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn projection_scan_helper_keeps_snapshot_too_old_distinct() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config("/projection-snapshot-too-old"),
+        test_dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let mut source_config = row_table_config("source");
+    source_config.history_retention_sequences = Some(1);
+    let source = db
+        .create_table(source_config)
+        .await
+        .expect("create source table");
+
+    let first = source
+        .write(b"user:1".to_vec(), test_bytes("v1"))
+        .await
+        .expect("write first source event");
+    let second = source
+        .write(b"user:2".to_vec(), test_bytes("v2"))
+        .await
+        .expect("write second source event");
+
+    let runtime = ProjectionRuntime::open(db)
+        .await
+        .expect("open projection runtime");
+    let error = runtime
+        .scan_whole_sequence_run(&source, LogCursor::new(first, 0))
+        .await
+        .expect_err("stale projection cursor should surface SnapshotTooOld");
+
+    match error {
+        ProjectionError::ChangeFeed(error) => {
+            let snapshot_too_old = error
+                .snapshot_too_old()
+                .expect("projection helper should preserve SnapshotTooOld");
+            assert_eq!(snapshot_too_old.requested, first);
+            assert_eq!(snapshot_too_old.oldest_available, second);
+        }
+        other => panic!("expected change-feed SnapshotTooOld, got {other:?}"),
+    }
+}
