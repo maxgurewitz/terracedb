@@ -127,9 +127,30 @@ impl DurableTimerSet {
         batch.delete(&self.lookup_table, timer.timer_id.clone());
     }
 
+    pub fn stage_delete_at(&self, batch: &mut WriteBatch, timer_id: Key, fire_at: Timestamp) {
+        batch.delete(
+            &self.schedule_table,
+            encode_timer_schedule_key(fire_at, &timer_id),
+        );
+        batch.delete(&self.lookup_table, timer_id);
+    }
+
     pub fn stage_due_deletion_in_transaction(&self, tx: &mut Transaction, timer: &DueTimer) {
         tx.delete(&self.schedule_table, timer.schedule_key.clone());
         tx.delete(&self.lookup_table, timer.timer_id.clone());
+    }
+
+    pub fn stage_delete_at_in_transaction(
+        &self,
+        tx: &mut Transaction,
+        timer_id: Key,
+        fire_at: Timestamp,
+    ) {
+        tx.delete(
+            &self.schedule_table,
+            encode_timer_schedule_key(fire_at, &timer_id),
+        );
+        tx.delete(&self.lookup_table, timer_id);
     }
 
     pub async fn scan_due_durable(

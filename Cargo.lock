@@ -934,6 +934,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-workflows"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "thiserror",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
