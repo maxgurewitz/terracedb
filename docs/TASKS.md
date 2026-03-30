@@ -67,7 +67,7 @@ Once Phase 0 is complete, the work naturally splits into eight mostly independen
 - **Track C — change capture:** T17 → T18 → T19
 - **Track D — remote storage:** T20 → T21 / T22 / T23
 - **Track E — columnar:** T24 → T25 → T26 → T27
-- **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T28a follows T28; T31 depends on T30; T31a follows T31 and T31b follows T31a; T32 depends on T18/T19/T28/T29, T32c follows T32, and T32d follows T32c; T32a depends on T03a/T31/T32, T32e depends on T03a, and T32f depends on T28a/T29/T31b/T32d/T32e
+- **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T28a follows T28; T31 depends on T30; T31a follows T31 and T31b follows T31a; T32 depends on T18/T19/T28/T29, T32c follows T32, and T32d follows T32c; T32a depends on T03a/T31/T32, and T32e depends on T03a
 - **Track G — full-stack hardening:** T33 after T32a
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
@@ -1047,7 +1047,7 @@ Complete columnar support by integrating it with compaction, merge operators, an
 
 ## Phase 6 — Composition primitives and higher-level libraries
 
-**Parallelization:** T28, T29, and T30 can begin independently once their own engine dependencies are met. T28a depends only on T28, so the typed-records work can proceed in parallel with the runtime tasks. T31 depends on T30. T31a depends on T31, and T31b depends on T31a. T32 depends on T18, T19, T28, and T29. T32c depends on T32, and T32d depends on T32c. T32a depends on T03a, T31, and T32. T32e depends on T03a and can proceed in parallel with the projection/workflow ergonomics work. T32b depends on T03a, T16, T31, and T32. T32f is the integration leaf and depends on T28a, T29, T31b, T32d, and T32e.
+**Parallelization:** T28, T29, and T30 can begin independently once their own engine dependencies are met. T28a depends only on T28, so the typed-records work can proceed in parallel with the runtime tasks. T31 depends on T30. T31a depends on T31, and T31b depends on T31a. T32 depends on T18, T19, T28, and T29. T32c depends on T32, and T32d depends on T32c. T32a depends on T03a, T31, and T32. T32e depends on T03a and can proceed in parallel with the projection/workflow ergonomics work. T32b depends on T03a, T16, T31, and T32.
 
 ### T28. OCC transaction wrapper
 
@@ -1408,31 +1408,6 @@ Create a dedicated HTTP simulation harness crate for Terracedb-based application
 - Fault-injection tests covering delayed responses, dropped connections, partitions, and restart/retry behavior.
 - Adapter tests proving the `axum` integration uses the same deterministic harness rather than a separate ad hoc path.
 - Same-seed reproducibility tests showing HTTP traces and request/response outcomes are replayable.
-
----
-
-### T32f. Migrate example applications onto the new ergonomic helper surfaces
-
-**Depends on:** T28a, T29, T31b, T32d, T32e
-
-**Description**
-
-Use the example applications as the final integration point for the new ergonomic layers: typed records, relays, ranked projections, recurring workflows, and deterministic HTTP harnessing. This task turns the example suite into a canonical “pit of success” path for third-party application authors.
-
-**Implementation steps**
-
-1. Migrate the TODO API example to use `terracedb-records`, `terracedb-relays`, the generic ranked-materialization helper, the recurring workflow helper, and `terracedb-http`.
-2. Update example READMEs so they describe the chosen structures and helper crates definitively rather than as suggestions.
-3. Ensure example tests cover normal CRUD behavior, projection behavior, recurring workflow time travel, and end-to-end HTTP simulation through the new helper surfaces.
-4. Record any remaining API sharp edges discovered during migration and feed them back into follow-on tasks or docs rather than leaving them implicit.
-5. Treat the example code as the main consumer ergonomics bar: if a pattern still requires too much boilerplate here, capture that as a concrete improvement item before closing the task.
-
-**Verification**
-
-- Example application tests pass through the shared simulation framework and the new HTTP harness.
-- The example code is materially smaller and less bespoke than the pre-helper version while preserving deterministic behavior.
-- Example READMEs and code paths agree on the authoritative patterns to recommend to users.
-- Any remaining rough edges discovered during migration are documented explicitly rather than hidden in example-only glue code.
 
 ---
 

@@ -4,8 +4,8 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 
 use terracedb::{
-    Clock, Db, DbConfig, DbDependencies, Rng, S3Location, StorageConfig, StubClock,
-    StubFileSystem, StubObjectStore, StubRng, TieredDurabilityMode, TieredStorageConfig,
+    Clock, Db, DbConfig, DbDependencies, Rng, S3Location, StorageConfig, StubClock, StubFileSystem,
+    StubObjectStore, StubRng, TieredDurabilityMode, TieredStorageConfig,
 };
 use terracedb_bricks::{
     BlobAlias, BlobCollection, BlobCollectionConfig, BlobHandle, BlobLocator, BlobObjectLayout,
@@ -215,7 +215,10 @@ async fn seeded_reopen_state_machine_preserves_current_alias_state() {
                 }
 
                 let read = collection
-                    .get(BlobLocator::Alias(alias.clone()), BlobReadOptions::default())
+                    .get(
+                        BlobLocator::Alias(alias.clone()),
+                        BlobReadOptions::default(),
+                    )
                     .await
                     .expect("get alias")
                     .data

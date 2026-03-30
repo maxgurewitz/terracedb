@@ -6,9 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use terracedb::{
-    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor,
-    OutboxEntry, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table,
-    TieredDurabilityMode, Value,
+    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
+    StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
+    Value,
     test_support::{
         row_table_config, test_dependencies, test_dependencies_with_clock,
         tiered_test_config_with_durability,

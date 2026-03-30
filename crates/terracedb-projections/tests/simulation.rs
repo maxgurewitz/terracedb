@@ -126,13 +126,8 @@ impl MultiSourceProjectionHandler for RecentTodosProjection {
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError> {
         let mut recent = collect_recent_todo_snapshots(
-            ctx.scan(
-                &self.todos,
-                Vec::new(),
-                vec![0xff],
-                ScanOptions::default(),
-            )
-            .await?,
+            ctx.scan(&self.todos, Vec::new(), vec![0xff], ScanOptions::default())
+                .await?,
         )
         .await;
         recent.sort_by(|left, right| {
@@ -544,8 +539,8 @@ fn multi_source_projection_simulation_changes_shape_for_different_seeds() -> tur
 }
 
 #[test]
-fn recent_todos_projection_simulation_tracks_last_ten_created_or_modified_rows()
--> turmoil::Result {
+fn recent_todos_projection_simulation_tracks_last_ten_created_or_modified_rows() -> turmoil::Result
+{
     SeededSimulationRunner::new(0x0dd5_eed5)
         .with_simulation_duration(PROJECTION_SIMULATION_DURATION)
         .with_message_latency(
@@ -600,10 +595,26 @@ fn recent_todos_projection_simulation_tracks_last_ten_created_or_modified_rows()
                 .expect("recent projection should catch up to created todos");
 
             let mut update_batch = db.write_batch();
-            update_batch.put(&todos, b"todo:02".to_vec(), todo_value(20, "todo 2 updated"));
-            update_batch.put(&todos, b"todo:05".to_vec(), todo_value(21, "todo 5 updated"));
-            update_batch.put(&todos, b"todo:11".to_vec(), todo_value(22, "todo 11 updated"));
-            update_batch.put(&todos, b"todo:01".to_vec(), todo_value(23, "todo 1 updated"));
+            update_batch.put(
+                &todos,
+                b"todo:02".to_vec(),
+                todo_value(20, "todo 2 updated"),
+            );
+            update_batch.put(
+                &todos,
+                b"todo:05".to_vec(),
+                todo_value(21, "todo 5 updated"),
+            );
+            update_batch.put(
+                &todos,
+                b"todo:11".to_vec(),
+                todo_value(22, "todo 11 updated"),
+            );
+            update_batch.put(
+                &todos,
+                b"todo:01".to_vec(),
+                todo_value(23, "todo 1 updated"),
+            );
             let updated_sequence = db
                 .commit(update_batch, CommitOptions::default())
                 .await
@@ -638,7 +649,10 @@ fn recent_todos_projection_simulation_tracks_last_ten_created_or_modified_rows()
                     "todo:06".to_string(),
                 ]
             );
-            assert_eq!(handle.current_frontier().get("todos"), Some(&updated_sequence));
+            assert_eq!(
+                handle.current_frontier().get("todos"),
+                Some(&updated_sequence)
+            );
 
             handle.shutdown().await.expect("stop recent projection");
             Ok(())
