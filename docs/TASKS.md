@@ -60,10 +60,11 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 9** adds the `terracedb-bricks` blob / large-object library on top of Terracedb.
 - **Phase 10** adds an optional Arrow-ecosystem analytical export crate on top of Terracedb.
 - **Phase 11** hardens the hybrid OLTP/OLAP path with columnar-v2 layout contracts, selective-read execution, segmented remote caching, stronger publish/recovery semantics, and a small analytically shaped example app.
+- **Phase 12** adds generalized current-state retention and ranking policies.
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into eleven mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into twelve mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -76,6 +77,7 @@ Once Phase 0 is complete, the work naturally splits into eleven mostly independe
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
 - **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
 - **Track K — hybrid-read and columnar-v2 hardening:** T48 first; T49 follows T48; then T50, T51, T53, T55, and T56 can proceed in parallel; T52 depends on T50 + T51; T54 depends on T51 + T52 + T55; T57 depends on T50 + T51 + T52 + T53 + T55 + T56; T58 depends on T52 + T53 + T54 + T55 + T56 + T57
+- **Track L — generalized current-state retention and ranking:** T59 first; T60 and T61 proceed in parallel once the contracts and shared simulation/oracle seams from T59 exist; T62 follows once both policy families exist and can be coordinated with scheduler/offload behavior
 
 ---
 
@@ -2501,6 +2503,115 @@ Add a sibling example to `examples/todo-api` that is as small and teachable as t
 - Equivalence tests proving the accelerator profile returns the same logical answers as the base profile while richer skip indexes, sidecars, and hot-to-cold promotion are enabled.
 - Fallback simulations proving disabled, missing, or corrupt accelerants degrade to the base path rather than breaking the example or changing results.
 
+## Phase 12 — Generalized current-state retention and ranking
+
+**Parallelization:** T59 first. After that, T60 and T61 can proceed in parallel against the frozen contracts and shared simulation/oracle scaffolding. T62 follows once both policy families exist and can be integrated with scheduler/backpressure and physical reclamation behavior.
+
+### T59. Freeze generalized current-state retention contracts, planner seams, and shared simulation/oracle scaffolding
+
+**Depends on:** T15, T19, T21, T31b
+
+**Description**
+
+Separate generalized **current-state retention** from the existing sequence-based MVCC/CDC retention surfaces, then freeze the caller-extensible ordering and planning contracts before implementation branches diverge. The goal is to make threshold-style and rank-style retention work parallelizable without weakening `SnapshotTooOld` or commit-log retention semantics.
+
+**Implementation steps**
+
+1. Define a `CurrentStateRetentionPolicy`-style contract that is explicitly distinct from `history_retention_sequences` and commit-log retention, covering at least:
+   - threshold retention over a caller-defined sortable key plus cutoff,
+   - global-rank retention over a caller-defined total order plus limit, and
+   - any required metadata/stat surfaces for policy observability and rebuild.
+2. Freeze the deterministic ordering contract up front: sort-key encoding/comparison rules, required tie-break semantics, ascending/descending direction, missing-value behavior, and fail-closed handling when the caller cannot provide a total order.
+3. Freeze planner/executor seams for:
+   - compaction-time row removal,
+   - projection-owned or derived ranked materializations,
+   - physical offload/delete integration, and
+   - rebuild/recompute behavior after restart or policy revision.
+4. Add shared retained-set oracle helpers and deterministic simulation scaffolding immediately, including sortable-threshold scenarios, top-N boundary churn, tie storms, snapshot-pinning cases, and crash/restart skeletons that later tasks will extend rather than re-invent.
+5. Define introspection for the effective logical floor/cutoff, current retained-set summary, rows/bytes reclaimed, policy revision, and explicit reasons a policy was skipped, blocked by snapshots, or degraded to derived-only behavior.
+
+**Verification**
+
+- Compile-only/API tests that instantiate every policy family and planner seam without requiring full storage implementations.
+- Deterministic unit tests proving sort-key and tie-break contracts yield a stable total order across reruns.
+- Oracle tests for retained-set model helpers covering threshold and rank policies before real reclaim logic lands.
+- Simulation smoke tests that exercise stub threshold/rank policies under updates, deletes, policy revision, and restart, proving the contract layer itself is deterministic.
+
+---
+
+### T60. Threshold-based sortable current-state retention
+
+**Depends on:** T13, T15, T21, T59
+
+**Description**
+
+Generalize TTL-style row removal and oldest-first local retention into threshold-based current-state retention over caller-defined sortable values rather than hard-coded internal timestamps or sequence heuristics. This task covers policies such as `created_at >= cutoff`, `score >= watermark`, or similar single-row threshold rules while preserving snapshot safety and leaving MVCC/CDC history retention sequence-based.
+
+**Implementation steps**
+
+1. Implement threshold evaluation over caller-provided sortable keys in the row-retention path, reusing the ordering contract from T59 and supporting engine-derived cutoffs (for example injected-clock windows) plus explicit application-provided cutoffs.
+2. Extend the shared oracle/simulation scaffolding in lockstep with the production path: add moving-threshold workloads, rows with missing keys, updates that cross the threshold, and restart cases before wiring full reclaim/executor behavior.
+3. Preserve snapshot safety and history semantics by ensuring threshold removals obey the active-snapshot horizon, surface clear introspection when snapshots pin reclaim, and never redefine `SnapshotTooOld` or change-feed retention rules.
+4. Integrate threshold policies with local space-reclamation planning where exact semantics are available, and make unsupported or approximation-prone layouts fail closed rather than silently reclaiming the wrong files.
+5. Add stats/admin surfaces reporting the effective threshold, rows/bytes reclaimed, backlog caused by snapshot pins, and any rows/files deferred because exact reclaim was not yet possible.
+
+**Verification**
+
+- Tests covering threshold retention across inserts, updates, deletes, and rows that move above/below the cutoff.
+- Deterministic restart tests proving the same retained current state is reconstructed after reopen.
+- Oracle tests proving retained membership matches the model for all rows at a chosen cutoff.
+- Simulation tests with moving cutoffs, long-lived snapshots, compaction/offload interleavings, and crash/recovery during partially completed reclaim work.
+
+---
+
+### T61. Ranked and computed-measure current-state retention/materialization
+
+**Depends on:** T31b, T59
+
+**Description**
+
+Implement top-N / leaderboard-style current-state retention over caller-defined computed rankings, including multi-field measures and deterministic tie-breaking. This task owns the planner/materializer semantics for rank-based retention so the engine does not pretend a global rank is a local row filter.
+
+**Implementation steps**
+
+1. Implement a global-rank planner over current state or projection-owned source ranges, requiring rank key + tie-break + source key to form a deterministic total order.
+2. Extend the shared oracle/simulation scaffolding immediately with N-boundary churn, tie storms, score recomputation, membership oscillation, and rebuild-vs-incremental equivalence cases before optimizing or broadening the planner.
+3. Support computed rankings derived from multiple caller-defined values and add recipe-style helpers for common patterns such as leaderboards, recent items, and hybrid orderings like `(points, created_at, id)`.
+4. Publish ranked retention as projection-owned/materialized outputs by default, and allow destructive source-table retention only when the source is explicitly declared rebuildable; otherwise fail closed rather than silently turning a derived ranking into irreversible source deletion.
+5. Add introspection for the effective cutoff rank, retained membership changes, evaluation cost, and whether a policy is running in derived-only mode or destructive mode.
+
+**Verification**
+
+- Tests covering inserts, updates, deletes, ties, truncation at the N boundary, and deterministic tie-break behavior.
+- Replay and rebuild-equivalence tests proving full recompute and incremental maintenance converge on the same ranked retained set.
+- Example-oriented tests showing leaderboard-style and “recent items” policies can be expressed through the new ranking hooks.
+- Simulation tests with crash/restart during rank-plan publication, output rewrite, rebuild fallback, and rapid score churn near the cutoff.
+
+---
+
+### T62. Policy coordination, physical reclamation, and deterministic hardening for generalized retention
+
+**Depends on:** T16, T21, T60, T61
+
+**Description**
+
+Coordinate generalized logical retention with compaction, offload/delete, scheduler/backpressure, and recovery so policies reclaim space safely without producing hidden approximation boundaries or semantic drift across restarts.
+
+**Implementation steps**
+
+1. Teach the maintenance/scheduler pipeline to consume generalized retention planner outputs, explicitly separating logical row eviction from physical SSTable movement/deletion and documenting where exact reclaim requires rewrite compaction instead of file-level selection.
+2. Add crash points and deterministic simulation cases at each new coordination boundary as the code lands: plan computation, manifest publication, local cleanup, rebuild fallback, and policy-revision changes.
+3. Ensure concurrent writes, policy changes, and restarts do not cause oscillation, duplicate reclamation, or retained-set drift; persist enough metadata to resume or recompute safely after reopen.
+4. Integrate observability/backpressure so operators can see when a policy is CPU-bound, rank-churn-heavy, blocked on rewrite compaction, or pinned by snapshots before physical space can actually be reclaimed.
+5. Document exact-vs-derived semantics clearly for row tables, columnar tables, and projection-owned outputs so callers know when a policy is logical-only, derived-only, or truly reclaiming physical bytes.
+
+**Verification**
+
+- Tests proving policy revisions and restart/recovery do not corrupt retained membership, manifests, or derived outputs.
+- Tests proving scheduler/offload/backpressure decisions never violate logical retention guarantees or degrade into silent approximation.
+- Cross-mode tests covering tiered/offload and other supported storage layouts, with explicit fail-closed assertions for unsupported combinations.
+- Simulation tests with oscillating budgets, rapid rank churn, concurrent compaction/offload, and crash/restart around every coordination boundary introduced by the new policies.
+
 ---
 
 ## Suggested execution milestones
@@ -2621,6 +2732,15 @@ At this point the system should additionally support:
 - a default example profile that demonstrates the universal Phase 11 features without turning on optional accelerants,
 - an explicit accelerator profile that can enable richer skip indexes, sidecars, and hot-to-cold promotion without changing logical answers, and
 - deterministic end-to-end simulation coverage for ingest, filtered scans, cold remote reads, restart/fault handling, and low-footprint operation for the example workload.
+
+### Milestone L — Generalized current-state retention and ranking
+Complete: T59–T62
+
+At this point the system should additionally support:
+- threshold-based current-state retention over caller-defined sortable keys,
+- rank-based current-state retention/materialization over computed measures with deterministic tie-breaking,
+- explicit separation between sequence-based MVCC/CDC retention and generalized current-state retention, and
+- coordinated logical and physical reclamation behavior with deterministic simulation coverage for policy churn, crashes, and restart.
 
 ---
 
