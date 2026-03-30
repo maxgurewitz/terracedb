@@ -315,6 +315,7 @@ pub(crate) struct LocalSegmentScanPlan {
     pub fs: Arc<dyn FileSystem>,
     pub segment_id: SegmentId,
     pub path: String,
+    #[allow(dead_code)]
     pub read_len: Option<u64>,
     pub min_sequence: Option<SequenceNumber>,
     pub max_sequence: Option<SequenceNumber>,
@@ -696,6 +697,80 @@ impl SegmentManager {
             );
             observed_offset = observed_offset.saturating_add(frame.len() as u64);
         }
+
+        Ok(())
+    }
+
+    pub async fn rollback_to(&mut self, location: AppendLocation) -> Result<(), StorageError> {
+        let target_path = segment_path(&self.dir, location.segment_id);
+        let target_bytes = if self.active.id == location.segment_id {
+            read_file(self.fs.as_ref(), &self.active.path).await?
+        } else {
+            read_file(self.fs.as_ref(), &target_path).await?
+        };
+        let rollback_offset = usize::try_from(location.offset).map_err(|_| {
+            StorageError::corruption(format!(
+                "rollback offset {} does not fit in usize",
+                location.offset
+            ))
+        })?;
+        if rollback_offset > target_bytes.len() {
+            return Err(StorageError::corruption(format!(
+                "rollback offset {} exceeds segment {} length {}",
+                location.offset,
+                location.segment_id.get(),
+                target_bytes.len()
+            )));
+        }
+
+        let prefix = target_bytes[..rollback_offset].to_vec();
+        let removed_catalog_ids = self
+            .catalog
+            .footers()
+            .iter()
+            .filter(|footer| footer.segment_id >= location.segment_id)
+            .map(|footer| footer.segment_id)
+            .collect::<BTreeSet<_>>();
+        let deleted_segment_ids = removed_catalog_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| *segment_id > location.segment_id)
+            .collect::<Vec<_>>();
+
+        for segment_id in &deleted_segment_ids {
+            self.fs
+                .delete(&segment_path(&self.dir, *segment_id))
+                .await?;
+        }
+        if self.active.id > location.segment_id {
+            self.fs.delete(&self.active.path).await?;
+        }
+        self.catalog.remove_segments(&removed_catalog_ids);
+
+        Self::repair_active_segment(self.fs.as_ref(), &target_path, &prefix).await?;
+        self.fs.sync_dir(&self.dir).await?;
+
+        let handle = self
+            .fs
+            .open(
+                &target_path,
+                OpenOptions {
+                    create: false,
+                    read: true,
+                    write: true,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .await?;
+        let recovered = ActiveSegment::recover(
+            location.segment_id,
+            target_path,
+            handle,
+            prefix,
+            self.options.records_per_block,
+        )?;
+        self.active = recovered.segment;
 
         Ok(())
     }

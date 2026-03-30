@@ -112,6 +112,9 @@ impl Db {
 
         let participant = {
             let _commit_guard = self.inner.commit_lock.lock().await;
+            self.resolve_failed_provisional_tail_locked()
+                .await
+                .map_err(CommitError::Storage)?;
             self.check_read_conflicts(&resolved_read_set)?;
 
             let sequence = SequenceNumber::new(self.inner.next_sequence.load(Ordering::SeqCst) + 1);
@@ -142,9 +145,11 @@ impl Db {
 
         if let Some(batch) = participant.group_batch.clone() {
             if let Err(error) = self.await_group_commit(batch, participant.sequence).await {
-                self.abort_commit(&participant);
-                self.publish_watermarks();
-                return Err(error);
+                let cleanup = {
+                    let _commit_guard = self.inner.commit_lock.lock().await;
+                    self.resolve_failed_provisional_tail_locked().await
+                };
+                return Err(cleanup.map(|_| error).unwrap_or_else(CommitError::Storage));
             }
 
             self.mark_durable_confirmed(participant.sequence);
@@ -192,6 +197,9 @@ impl Db {
                     .to_string();
                 let immutables = {
                     let _commit_guard = self.inner.commit_lock.lock().await;
+                    self.resolve_failed_provisional_tail_locked()
+                        .await
+                        .map_err(FlushError::Storage)?;
                     self.memtables_write().rotate_mutable();
 
                     self.inner
@@ -265,6 +273,9 @@ impl Db {
             StorageConfig::S3Primary(config) => {
                 let (immutables, buffered_records, mut durable_segments, next_segment_id) = {
                     let _commit_guard = self.inner.commit_lock.lock().await;
+                    self.resolve_failed_provisional_tail_locked()
+                        .await
+                        .map_err(FlushError::Storage)?;
                     self.memtables_write().rotate_mutable();
 
                     let immutables = self.memtables_read().immutables.clone();
@@ -773,19 +784,16 @@ impl Db {
                     .or_default()
                     .insert(sequence);
             }
-            coordinator.sequences.insert(
-                sequence,
-                SequenceCommitState {
-                    touched_tables: touched_tables.clone(),
-                    ..SequenceCommitState::default()
-                },
-            );
-
-            if self.durable_on_commit() {
+            let group_batch = if self.durable_on_commit() {
                 let batch = match coordinator.current_batch.as_ref() {
                     Some(batch) if batch.is_open() => batch.clone(),
                     _ => {
-                        let batch = Arc::new(GroupCommitBatch::new());
+                        let predecessor = coordinator
+                            .current_batch
+                            .as_ref()
+                            .filter(|batch| batch.result().is_none())
+                            .cloned();
+                        let batch = Arc::new(GroupCommitBatch::new(sequence, predecessor));
                         coordinator.current_batch = Some(batch.clone());
                         batch
                     }
@@ -793,13 +801,23 @@ impl Db {
                 Some(batch)
             } else {
                 None
-            }
+            };
+            coordinator.sequences.insert(
+                sequence,
+                SequenceCommitState {
+                    touched_tables: touched_tables.clone(),
+                    conflict_keys: conflict_keys.clone(),
+                    group_batch: group_batch.clone(),
+                    ..SequenceCommitState::default()
+                },
+            );
+
+            group_batch
         };
 
         CommitParticipant {
             sequence,
             operations,
-            conflict_keys,
             group_batch,
         }
     }
@@ -840,23 +858,96 @@ impl Db {
         }
     }
 
-    fn abort_commit(&self, participant: &CommitParticipant) {
+    fn note_failed_provisional_tail(&self, start_sequence: SequenceNumber, error: StorageError) {
         let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
-        for key in &participant.conflict_keys {
-            let remove_key = if let Some(sequences) = coordinator.keys.get_mut(key) {
-                sequences.remove(&participant.sequence);
-                sequences.is_empty()
-            } else {
-                false
-            };
-            if remove_key {
-                coordinator.keys.remove(key);
+        match coordinator.pending_failed_tail.as_ref() {
+            Some(pending) if pending.start_sequence <= start_sequence => {}
+            _ => {
+                coordinator.pending_failed_tail = Some(PendingFailedTail {
+                    start_sequence,
+                    error,
+                });
             }
         }
+    }
 
-        if let Some(state) = coordinator.sequences.get_mut(&participant.sequence) {
-            state.aborted = true;
+    fn pending_failed_provisional_tail_error(
+        &self,
+        sequence: SequenceNumber,
+    ) -> Option<StorageError> {
+        mutex_lock(&self.inner.commit_coordinator)
+            .pending_failed_tail
+            .as_ref()
+            .filter(|pending| pending.start_sequence <= sequence)
+            .map(|pending| pending.error.clone())
+    }
+
+    async fn resolve_failed_provisional_tail_locked(&self) -> Result<(), StorageError> {
+        let (pending, affected_sequences, affected_batches) = {
+            let coordinator = mutex_lock(&self.inner.commit_coordinator);
+            let Some(pending) = coordinator.pending_failed_tail.clone() else {
+                return Ok(());
+            };
+
+            let mut seen_batches = BTreeSet::new();
+            let mut affected_batches = Vec::new();
+            let affected_sequences = coordinator
+                .sequences
+                .range(pending.start_sequence..)
+                .map(|(&sequence, state)| {
+                    if let Some(batch) = state.group_batch.as_ref() {
+                        let batch_ptr = Arc::as_ptr(batch) as usize;
+                        if seen_batches.insert(batch_ptr) {
+                            affected_batches.push(batch.clone());
+                        }
+                    }
+                    sequence
+                })
+                .collect::<Vec<_>>();
+
+            (pending, affected_sequences, affected_batches)
+        };
+
+        {
+            let mut coordinator = mutex_lock(&self.inner.commit_coordinator);
+            if coordinator
+                .pending_failed_tail
+                .as_ref()
+                .is_some_and(|current| current.start_sequence != pending.start_sequence)
+            {
+                return Ok(());
+            }
+
+            for sequence in &affected_sequences {
+                let Some(state) = coordinator.sequences.remove(sequence) else {
+                    continue;
+                };
+                for key in state.conflict_keys {
+                    let remove_key = if let Some(sequences) = coordinator.keys.get_mut(&key) {
+                        sequences.remove(sequence);
+                        sequences.is_empty()
+                    } else {
+                        false
+                    };
+                    if remove_key {
+                        coordinator.keys.remove(&key);
+                    }
+                }
+            }
+
+            coordinator.pending_failed_tail = None;
+            coordinator.current_batch = None;
         }
+
+        self.inner.next_sequence.store(
+            pending.start_sequence.get().saturating_sub(1),
+            Ordering::SeqCst,
+        );
+        for batch in affected_batches {
+            batch.finish(Err(pending.error.clone()));
+        }
+
+        Ok(())
     }
 
     async fn await_group_commit(
@@ -868,6 +959,10 @@ impl Db {
             let notified = batch.notify.notified();
             if let Some(result) = batch.result() {
                 return result.map_err(CommitError::Storage);
+            }
+            if let Some(error) = self.pending_failed_provisional_tail_error(sequence) {
+                batch.finish(Err(error.clone()));
+                return Err(CommitError::Storage(error));
             }
 
             self.maybe_pause_commit_phase(CommitPhase::BeforeDurabilitySync, sequence)
@@ -887,6 +982,18 @@ impl Db {
             };
 
             if should_lead {
+                self.maybe_pause_commit_phase(CommitPhase::AfterBatchSeal, sequence)
+                    .await;
+                if let Some(predecessor) = batch.predecessor()
+                    && let Err(error) = predecessor.await_result().await
+                {
+                    batch.finish(Err(error.clone()));
+                    return Err(CommitError::Storage(error));
+                }
+                if let Some(error) = self.pending_failed_provisional_tail_error(sequence) {
+                    batch.finish(Err(error.clone()));
+                    return Err(CommitError::Storage(error));
+                }
                 let records = batch.staged_records();
                 let result = self
                     .inner
@@ -895,12 +1002,10 @@ impl Db {
                     .await
                     .append_group_batch(&records)
                     .await;
-                let notify_result = result.clone();
-                {
-                    let mut state = mutex_lock(&batch.state);
-                    state.result = Some(notify_result);
+                if let Err(error) = result.as_ref() {
+                    self.note_failed_provisional_tail(batch.first_sequence(), error.clone());
                 }
-                batch.notify.notify_waiters();
+                batch.finish(result.clone());
                 return result.map_err(CommitError::Storage);
             }
 
