@@ -1337,6 +1337,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-bricks"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "terracedb-otel"
 version = "0.1.0"
 dependencies = [
