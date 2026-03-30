@@ -1446,6 +1446,7 @@ dependencies = [
  "terracedb",
  "terracedb-http",
  "terracedb-projections",
+ "terracedb-records",
  "terracedb-relays",
  "terracedb-simulation",
  "terracedb-workflows",
@@ -1505,6 +1506,18 @@ dependencies = [
  "tokio",
  "tracing",
  "turmoil",
+]
+
+[[package]]
+name = "terracedb-records"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

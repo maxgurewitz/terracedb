@@ -5,11 +5,17 @@ This example app is a small durable TODO service exposed through a basic HTTP AP
 It is intentionally simple, but it exercises the full Terracedb stack:
 
 - `terracedb` stores the durable application state
+- `terracedb-records` gives the app typed table wrappers for TODO rows and planner state
 - `terracedb-projections` maintains a read model of recently changed TODOs
 - `terracedb-workflows` drives a weekly recurring background task that creates placeholder TODOs
 - `terracedb-http` and `terracedb-simulation` test the system end to end from client to server to embedded database
 
 The goal is to provide a first example that is easy to understand without giving up the parts that make Terracedb interesting.
+
+Application-facing code in this example now uses typed `RecordTable` helpers instead of manually
+building byte keys and JSON-encoded `Value::Bytes` payloads. Raw `Table` handles are still used
+where the lower-level projection and workflow libraries expect them, which is the intended
+migration pattern for Terracedb applications.
 
 ## What the app does
 

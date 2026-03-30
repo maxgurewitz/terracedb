@@ -124,7 +124,7 @@ impl Table {
         Ok(Box::pin(stream::iter(rows)))
     }
 
-    async fn scan_prefix_at(
+    pub async fn scan_prefix_at(
         &self,
         prefix: KeyPrefix,
         sequence: SequenceNumber,
