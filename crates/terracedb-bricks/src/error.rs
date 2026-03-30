@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use terracedb::StorageErrorKind;
+
 use crate::{BlobAlias, BlobId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -35,6 +37,70 @@ pub enum BlobStoreError {
     Contract(#[from] BlobContractError),
     #[error(transparent)]
     Storage(#[from] terracedb::StorageError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobStoreOperation {
+    Put,
+    Get,
+    Stat,
+    Delete,
+    List,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobStoreRecoveryHint {
+    Retry,
+    ConfirmWithStat,
+    RefreshListing,
+    FailClosed,
+}
+
+impl BlobStoreError {
+    pub fn kind(&self) -> Option<StorageErrorKind> {
+        match self {
+            Self::Storage(error) => Some(error.kind()),
+            Self::NotFound { .. }
+            | Self::InvalidRange { .. }
+            | Self::UnsupportedOperation { .. }
+            | Self::Contract(_) => None,
+        }
+    }
+
+    pub fn recovery_hint(&self, operation: BlobStoreOperation) -> BlobStoreRecoveryHint {
+        match self {
+            Self::NotFound { .. }
+            | Self::InvalidRange { .. }
+            | Self::UnsupportedOperation { .. }
+            | Self::Contract(_) => BlobStoreRecoveryHint::FailClosed,
+            Self::Storage(error) => match (operation, error.kind()) {
+                (BlobStoreOperation::Put, StorageErrorKind::Timeout)
+                | (BlobStoreOperation::Put, StorageErrorKind::Io)
+                | (BlobStoreOperation::Put, StorageErrorKind::DurabilityBoundary) => {
+                    BlobStoreRecoveryHint::ConfirmWithStat
+                }
+                (BlobStoreOperation::List, StorageErrorKind::DurabilityBoundary) => {
+                    BlobStoreRecoveryHint::RefreshListing
+                }
+                (_, StorageErrorKind::Timeout) | (_, StorageErrorKind::Io) => {
+                    BlobStoreRecoveryHint::Retry
+                }
+                (_, StorageErrorKind::Corruption)
+                | (_, StorageErrorKind::Unsupported)
+                | (_, StorageErrorKind::NotFound)
+                | (_, StorageErrorKind::DurabilityBoundary) => BlobStoreRecoveryHint::FailClosed,
+            },
+        }
+    }
+
+    pub fn is_retryable(&self, operation: BlobStoreOperation) -> bool {
+        matches!(
+            self.recovery_hint(operation),
+            BlobStoreRecoveryHint::Retry
+                | BlobStoreRecoveryHint::ConfirmWithStat
+                | BlobStoreRecoveryHint::RefreshListing
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

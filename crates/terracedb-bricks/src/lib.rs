@@ -16,7 +16,9 @@ pub use collection::{
     BlobReadOptions, BlobReadResult, BlobSearchRow, BlobSearchStream, BlobSemantics, BlobWrite,
     BlobWriteData, InMemoryBlobCollection,
 };
-pub use error::{BlobContractError, BlobError, BlobStoreError};
+pub use error::{
+    BlobContractError, BlobError, BlobStoreError, BlobStoreOperation, BlobStoreRecoveryHint,
+};
 pub use ids::{
     BlobActivityId, BlobActivityKey, BlobAlias, BlobAliasKey, BlobCatalogKey,
     BlobEmbeddingIndexKey, BlobId, BlobObjectGcKey, BlobTermIndexKey, BlobTextChunkKey,
@@ -24,7 +26,10 @@ pub use ids::{
 pub use serde_json::Value as JsonValue;
 pub use store::{
     BlobByteRange, BlobGetOptions, BlobObjectInfo, BlobObjectLayout, BlobPutOptions, BlobStore,
-    BlobStoreByteStream, BlobStoreObjectStoreAdapter, InMemoryBlobStore,
+    BlobStoreByteStream, BlobStoreFailure, BlobStoreObjectStoreAdapter,
+    BlobStoreStandardObjectStoreAdapter, BlobUploadReceipt, DEFAULT_MULTIPART_CHUNK_BYTES,
+    InMemoryBlobStore, collect_blob_stream_bytes, compute_blob_digest, read_blob_bytes,
+    upload_blob_bytes, upload_blob_stream,
 };
 pub use tables::{
     BLOB_ACTIVITY_TABLE_NAME, BLOB_ALIAS_TABLE_NAME, BLOB_CATALOG_TABLE_NAME,

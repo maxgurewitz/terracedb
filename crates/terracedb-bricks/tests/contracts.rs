@@ -90,6 +90,8 @@ async fn public_bricks_surface_compiles_and_is_instantiable() {
         })
         .await
         .expect("put blob");
+    assert!(handle.digest.starts_with("sha256:"));
+    assert!(handle.object_key.contains("blobs/docs/objects/sha256/"));
 
     let by_id = collection
         .stat(BlobLocator::Id(handle.id))
