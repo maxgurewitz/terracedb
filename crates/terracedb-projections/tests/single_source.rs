@@ -6,13 +6,14 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    CommitOptions, Db, KvStream, LogCursor, ScanOptions, SequenceNumber, StubFileSystem,
-    StubObjectStore, Table, TieredDurabilityMode, Value,
+    ChangeFeedError, CommitOptions, Db, FileSystemFailure, FileSystemOperation, KvStream,
+    LogCursor, ScanOptions, SequenceNumber, StorageErrorKind, StubFileSystem, StubObjectStore,
+    Table, TieredDurabilityMode, Value,
     test_support::{bytes as test_bytes, row_table_config, test_dependencies, tiered_test_config},
 };
 use terracedb_projections::{
-    PROJECTION_CURSOR_TABLE_NAME, ProjectionHandler, ProjectionHandlerError, ProjectionRuntime,
-    ProjectionSequenceRun, ProjectionTransaction, SingleSourceProjection,
+    PROJECTION_CURSOR_TABLE_NAME, ProjectionError, ProjectionHandler, ProjectionHandlerError,
+    ProjectionRuntime, ProjectionSequenceRun, ProjectionTransaction, SingleSourceProjection,
 };
 
 struct SequenceRecorder {
@@ -358,4 +359,90 @@ async fn projection_cursor_and_output_recover_together_after_crash() {
         .shutdown()
         .await
         .expect("stop replay projection");
+}
+
+#[tokio::test]
+async fn projection_runtime_surfaces_change_feed_scan_failures_without_panicking() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config("/projection-change-feed-failure"),
+        test_dependencies(file_system.clone(), object_store),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("source"))
+        .await
+        .expect("create source table");
+    let output = db
+        .create_table(row_table_config("output"))
+        .await
+        .expect("create output table");
+
+    let sequence = source
+        .write(b"user:1".to_vec(), test_bytes("v1"))
+        .await
+        .expect("write source row");
+
+    file_system.inject_failure(
+        FileSystemFailure::timeout(
+            FileSystemOperation::ReadAt,
+            "/projection-change-feed-failure/commitlog/SEG-000001",
+        )
+        .persistent(),
+    );
+
+    let runtime = ProjectionRuntime::open(db.clone())
+        .await
+        .expect("open projection runtime");
+    let mut handle = runtime
+        .start_single_source(
+            SingleSourceProjection::new(
+                "mirror",
+                source.clone(),
+                MirrorProjection {
+                    output: output.clone(),
+                },
+            )
+            .with_outputs([output.clone()]),
+        )
+        .await
+        .expect("start projection");
+
+    let wait_error =
+        tokio::time::timeout(Duration::from_secs(1), handle.wait_for_watermark(sequence))
+            .await
+            .expect("projection failure should be observed")
+            .expect_err("projection should fail on change-feed scan error");
+    match wait_error {
+        ProjectionError::Runtime { reason, .. } => {
+            assert!(
+                reason.contains("simulated timeout"),
+                "unexpected runtime reason: {reason}"
+            );
+        }
+        other => panic!("unexpected wait error: {other}"),
+    }
+
+    match tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("shutdown should return promptly")
+        .expect_err("projection task should return the underlying change-feed error")
+    {
+        ProjectionError::ChangeFeed(ChangeFeedError::Storage(error)) => {
+            assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("unexpected shutdown error: {other}"),
+    }
+
+    assert_eq!(
+        output
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+            .expect("scan output after failed projection")
+            .count()
+            .await,
+        0
+    );
 }

@@ -16,10 +16,10 @@ use tokio::{
 };
 
 use terracedb::{
-    ChangeEntry, ChangeKind, Clock, CommitError, CreateTableError, Db, DurableCursorStore,
-    DurableTimerSet, Key, LogCursor, OutboxEntry, ReadError, ScanOptions, ScheduledTimer,
-    SnapshotTooOld, StorageError, Table, TableConfig, TableFormat, Timestamp, Transaction,
-    TransactionCommitError, TransactionalOutbox, Value,
+    ChangeEntry, ChangeFeedError, ChangeKind, Clock, CommitError, CreateTableError, Db,
+    DurableCursorStore, DurableTimerSet, Key, LogCursor, OutboxEntry, ReadError, ScanOptions,
+    ScheduledTimer, SnapshotTooOld, StorageError, Table, TableConfig, TableFormat, Timestamp,
+    Transaction, TransactionCommitError, TransactionalOutbox, Value,
 };
 use terracedb::{CompactionStrategy, SequenceNumber};
 
@@ -60,6 +60,12 @@ impl StdError for WorkflowHandlerError {
     }
 }
 
+impl From<ChangeFeedError> for WorkflowHandlerError {
+    fn from(error: ChangeFeedError) -> Self {
+        Self::new(error)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WorkflowError {
     #[error(transparent)]
@@ -68,6 +74,8 @@ pub enum WorkflowError {
     Read(#[from] ReadError),
     #[error(transparent)]
     SnapshotTooOld(#[from] SnapshotTooOld),
+    #[error(transparent)]
+    ChangeFeed(#[from] ChangeFeedError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]

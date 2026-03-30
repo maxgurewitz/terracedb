@@ -137,5 +137,38 @@ pub struct SnapshotTooOld {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ChangeFeedError {
+    #[error(transparent)]
+    SnapshotTooOld(#[from] SnapshotTooOld),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+impl ChangeFeedError {
+    pub fn snapshot_too_old(&self) -> Option<&SnapshotTooOld> {
+        match self {
+            Self::SnapshotTooOld(error) => Some(error),
+            Self::Storage(_) => None,
+        }
+    }
+
+    pub fn storage(&self) -> Option<&StorageError> {
+        match self {
+            Self::Storage(error) => Some(error),
+            Self::SnapshotTooOld(_) => None,
+        }
+    }
+}
+
+impl From<ChangeFeedError> for ReadError {
+    fn from(error: ChangeFeedError) -> Self {
+        match error {
+            ChangeFeedError::SnapshotTooOld(error) => Self::SnapshotTooOld(error),
+            ChangeFeedError::Storage(error) => Self::Storage(error),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error("subscription closed")]
 pub struct SubscriptionClosed;

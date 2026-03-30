@@ -40,8 +40,8 @@ pub use config::{
     TieredDurabilityMode, TieredStorageConfig, TtlCompactionFilter, TtlExpiryExtractor,
 };
 pub use error::{
-    CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld, StorageError,
-    StorageErrorKind, SubscriptionClosed, WriteError,
+    ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
+    SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
 };
 pub use ids::{
     CommitId, FieldId, IdEncodingError, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId,

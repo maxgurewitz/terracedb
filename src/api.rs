@@ -32,8 +32,8 @@ use crate::{
         SegmentOptions, SegmentRecordScanner, encode_segment_bytes, segment_footer_from_bytes,
     },
     error::{
-        CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
-        StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
+        ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
+        SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, OpenOptions},
@@ -1593,7 +1593,7 @@ impl CommitRuntime {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => manager.append_batch_and_sync(records).await,
             CommitLogBackend::Memory(log) => {
-                log.records.extend(records.iter().cloned());
+                Arc::make_mut(&mut log.records).extend(records.iter().cloned());
                 Ok(())
             }
         }
@@ -7757,7 +7757,7 @@ impl Db {
         table: &Table,
         cursor: LogCursor,
         opts: ScanOptions,
-    ) -> Result<ChangeStream, SnapshotTooOld> {
+    ) -> Result<ChangeStream, ChangeFeedError> {
         self.scan_change_feed(table, cursor, self.current_sequence(), opts)
             .await
     }
@@ -7771,7 +7771,7 @@ impl Db {
         table: &Table,
         cursor: LogCursor,
         opts: ScanOptions,
-    ) -> Result<ChangeStream, SnapshotTooOld> {
+    ) -> Result<ChangeStream, ChangeFeedError> {
         self.scan_change_feed(table, cursor, self.current_durable_sequence(), opts)
             .await
     }
@@ -8407,7 +8407,7 @@ impl Db {
         cursor: LogCursor,
         upper_bound: SequenceNumber,
         opts: ScanOptions,
-    ) -> Result<ChangeStream, SnapshotTooOld> {
+    ) -> Result<ChangeStream, ChangeFeedError> {
         let Some(table_id) = self.resolve_table_id(table) else {
             return Ok(Box::pin(stream::empty()));
         };
@@ -8433,10 +8433,10 @@ impl Db {
             if let Some(oldest_available) = floor
                 && cursor.sequence() < oldest_available
             {
-                return Err(SnapshotTooOld {
+                return Err(ChangeFeedError::SnapshotTooOld(SnapshotTooOld {
                     requested: cursor.sequence(),
                     oldest_available,
-                });
+                }));
             }
 
             runtime.change_feed_scan_plan(table_id, cursor.sequence())
@@ -10054,15 +10054,15 @@ mod tests {
         CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
     };
     use crate::{
-        ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
-        DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
+        ChangeFeedError, ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy,
+        DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
         FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
         ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
         PendingWorkType, ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
-        ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SnapshotTooOld,
-        SsdConfig, StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore,
-        StubRng, TableConfig, TableFormat, TableId, TableStats, ThrottleDecision,
-        TieredDurabilityMode, TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
+        ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SsdConfig,
+        StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng,
+        TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
+        TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -10848,12 +10848,31 @@ mod tests {
     }
 
     fn assert_change_feed_snapshot_too_old(
-        error: SnapshotTooOld,
+        error: ChangeFeedError,
         requested: SequenceNumber,
         oldest_available: SequenceNumber,
     ) {
-        assert_eq!(error.requested, requested);
-        assert_eq!(error.oldest_available, oldest_available);
+        let snapshot_too_old = error
+            .snapshot_too_old()
+            .expect("expected SnapshotTooOld change-feed error");
+        assert_eq!(snapshot_too_old.requested, requested);
+        assert_eq!(snapshot_too_old.oldest_available, oldest_available);
+    }
+
+    fn assert_change_feed_storage_error(
+        error: ChangeFeedError,
+        kind: crate::StorageErrorKind,
+        message_fragment: &str,
+    ) {
+        let storage = error
+            .storage()
+            .expect("expected storage-backed change-feed error");
+        assert_eq!(storage.kind(), kind);
+        assert!(
+            storage.message().contains(message_fragment),
+            "expected {:?} to contain {message_fragment:?}",
+            storage.message(),
+        );
     }
 
     fn oracle_rows(
@@ -17962,7 +17981,7 @@ mod tests {
     async fn s3_primary_flush_persists_state_and_durable_change_feed_across_reopen() {
         let file_system = Arc::new(crate::StubFileSystem::default());
         let object_store = Arc::new(StubObjectStore::default());
-        let dependencies = dependencies(file_system, object_store);
+        let dependencies = dependencies(file_system, object_store.clone());
         let config = s3_primary_config("s3-flush-reopen");
 
         let db = Db::open(config.clone(), dependencies.clone())
@@ -18010,6 +18029,36 @@ mod tests {
         )
         .await;
         assert_eq!(durable_after_flush, visible_before_flush);
+
+        let layout = ObjectKeyLayout::new(&S3Location {
+            bucket: "terracedb-test".to_string(),
+            prefix: "s3-flush-reopen".to_string(),
+        });
+        object_store.inject_failure(ObjectStoreFailure::timeout(
+            ObjectStoreOperation::Get,
+            layout.backup_commit_log_segment(SegmentId::new(1)),
+        ));
+        object_store.inject_failure(ObjectStoreFailure::timeout(
+            ObjectStoreOperation::Get,
+            layout.backup_commit_log_segment(SegmentId::new(1)),
+        ));
+
+        assert_change_feed_storage_error(
+            db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .err()
+                .expect("visible remote change-feed scan should surface a storage error"),
+            crate::StorageErrorKind::Timeout,
+            "simulated timeout",
+        );
+        assert_change_feed_storage_error(
+            db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .err()
+                .expect("durable remote change-feed scan should surface a storage error"),
+            crate::StorageErrorKind::Timeout,
+            "simulated timeout",
+        );
 
         let reopened = Db::open(config, dependencies)
             .await
@@ -18359,6 +18408,52 @@ mod tests {
                     "events",
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_change_feed_scan_failures_return_typed_storage_errors() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/change-feed-local-scan-failure"),
+            dependencies(file_system.clone(), object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        table
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write event");
+
+        file_system.inject_failure(
+            FileSystemFailure::timeout(
+                FileSystemOperation::ReadAt,
+                commit_log_segment_path("/change-feed-local-scan-failure", 1),
+            )
+            .persistent(),
+        );
+
+        assert_change_feed_storage_error(
+            db.scan_since(&table, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .err()
+                .expect("visible change-feed scan should surface a storage error"),
+            crate::StorageErrorKind::Timeout,
+            "simulated timeout",
+        );
+        assert_change_feed_storage_error(
+            db.scan_durable_since(&table, LogCursor::beginning(), ScanOptions::default())
+                .await
+                .err()
+                .expect("durable change-feed scan should surface a storage error"),
+            crate::StorageErrorKind::Timeout,
+            "simulated timeout",
         );
     }
 

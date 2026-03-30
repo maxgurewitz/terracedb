@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{ChangeKind, ChangeStream, FieldValue, ScanOptions, Table, Value},
-    error::{CommitError, FlushError, SnapshotTooOld, StorageError},
+    error::{ChangeFeedError, CommitError, FlushError, StorageError},
     ids::{CommitId, FieldId, LogCursor, SegmentId, SequenceNumber, TableId},
     io::{FileHandle, FileSystem, OpenOptions},
 };
@@ -1374,7 +1374,7 @@ pub trait CommitLog: Send + Sync {
         table: &Table,
         cursor: LogCursor,
         opts: ScanOptions,
-    ) -> Result<ChangeStream, SnapshotTooOld>;
+    ) -> Result<ChangeStream, ChangeFeedError>;
 }
 
 #[derive(Debug, Default)]
@@ -1395,7 +1395,7 @@ impl CommitLog for StubCommitLog {
         _table: &Table,
         _cursor: LogCursor,
         _opts: ScanOptions,
-    ) -> Result<ChangeStream, SnapshotTooOld> {
+    ) -> Result<ChangeStream, ChangeFeedError> {
         Ok(Box::pin(stream::empty()))
     }
 }

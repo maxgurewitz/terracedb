@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use futures::{StreamExt, TryStreamExt};
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
-    FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
-    FileSystemOperation, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore, ObjectStoreOperation,
-    OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint, S3Location,
-    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
-    SchemaDefinition, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind, StorageSource,
-    TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, Transaction, UnifiedStorage, Value,
+    ChangeFeedError, Clock, CommitOptions, CompactionStrategy,
+    DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig, FieldDefinition, FieldId, FieldType,
+    FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ManifestId,
+    ObjectKeyLayout, ObjectStore, ObjectStoreOperation, OpenError, PendingWork, PendingWorkType,
+    RemoteCache, RemoteRecoveryHint, S3Location, S3PrimaryStorageConfig, ScanOptions,
+    ScheduleAction, ScheduleDecision, Scheduler, SchemaDefinition, SequenceNumber, SsdConfig,
+    StorageConfig, StorageErrorKind, StorageSource, TableConfig, TableFormat, TableStats,
+    ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage,
+    Value,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
@@ -858,8 +859,13 @@ fn db_change_feed_simulation_surfaces_snapshot_too_old_for_lagging_tables_after_
                 .await
                 .err()
                 .expect("fast table should be past its retained change-feed floor");
-            assert_eq!(fast_error.requested, first_sequence);
-            assert_eq!(fast_error.oldest_available, SequenceNumber::new(2));
+            match fast_error {
+                ChangeFeedError::SnapshotTooOld(error) => {
+                    assert_eq!(error.requested, first_sequence);
+                    assert_eq!(error.oldest_available, SequenceNumber::new(2));
+                }
+                other => panic!("expected SnapshotTooOld, got {other:?}"),
+            }
 
             let slow_changes = collect_change_feed(
                 reopened
