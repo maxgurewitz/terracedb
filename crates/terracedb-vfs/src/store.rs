@@ -15,9 +15,8 @@ use terracedb::{Clock, DbDependencies, LogCursor, Rng, SequenceNumber, Timestamp
 use crate::{
     ActivityEntry, ActivityId, ActivityKind, ActivityOptions, ActivityReceiver, ActivityStream,
     AgentFileSystem, AgentFsError, AgentKvStore, AgentToolRuns, AllocatorKind, CreateOptions,
-    DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue, MkdirOptions,
-    ReadOnlyAgentFileSystem, ReadOnlyAgentKvStore, ReadOnlyAgentToolRuns, Stats, ToolRun,
-    ToolRunId, ToolRunStatus,
+    DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue, MkdirOptions, ReadOnlyAgentFileSystem,
+    ReadOnlyAgentKvStore, ReadOnlyAgentToolRuns, Stats, ToolRun, ToolRunId, ToolRunStatus,
 };
 
 pub const VFS_FORMAT_VERSION: u8 = 1;
