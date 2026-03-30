@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     hash::{Hash, Hasher},
     ops::Bound,
@@ -28,15 +28,15 @@ use crate::{
         TieredDurabilityMode, TieredStorageConfig,
     },
     engine::commit_log::{
-        CommitEntry, CommitRecord, SegmentFooter, SegmentManager, SegmentOptions,
-        encode_segment_bytes, scan_table_from_segment_bytes, segment_footer_from_bytes,
+        CommitEntry, CommitRecord, LocalSegmentScanPlan, SegmentFooter, SegmentManager,
+        SegmentOptions, SegmentRecordScanner, encode_segment_bytes, segment_footer_from_bytes,
     },
     error::{
         CommitError, CreateTableError, FlushError, OpenError, ReadError, SnapshotTooOld,
         StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
-    io::{DbDependencies, ObjectStore, OpenOptions},
+    io::{DbDependencies, FileHandle, OpenOptions},
     remote::{ObjectKeyLayout, StorageSource, UnifiedStorage},
     scheduler::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
@@ -47,7 +47,10 @@ use crate::{
 pub type Key = Vec<u8>;
 pub type KeyPrefix = Vec<u8>;
 pub type KvStream = Pin<Box<dyn Stream<Item = (Key, Value)> + Send + 'static>>;
-pub type ChangeStream = Pin<Box<dyn Stream<Item = ChangeEntry> + Send + 'static>>;
+pub type ChangeStream =
+    Pin<Box<dyn Stream<Item = Result<ChangeEntry, StorageError>> + Send + 'static>>;
+
+const CHANGE_FEED_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -804,6 +807,41 @@ struct DurableRemoteCommitLogSegment {
     footer: SegmentFooter,
 }
 
+#[derive(Clone)]
+enum ChangeFeedSourcePlan {
+    LocalSegment(LocalSegmentScanPlan),
+    RemoteSegment(DurableRemoteCommitLogSegment),
+    BufferedRecords(Arc<Vec<CommitRecord>>),
+}
+
+struct ChangeFeedScanner {
+    cursor: LogCursor,
+    upper_bound: SequenceNumber,
+    table_id: TableId,
+    table: Table,
+    remaining: Option<usize>,
+    sources: VecDeque<ChangeFeedSourcePlan>,
+    current_source: Option<ActiveChangeFeedSource>,
+}
+
+enum ActiveChangeFeedSource {
+    Segment(ChangeFeedSegmentSource),
+    BufferedRecords(ChangeFeedBufferedRecordsSource),
+}
+
+struct ChangeFeedSegmentSource {
+    scanner: SegmentRecordScanner,
+    pending: VecDeque<ChangeEntry>,
+    upper_bound_reached: bool,
+}
+
+struct ChangeFeedBufferedRecordsSource {
+    records: Arc<Vec<CommitRecord>>,
+    next_index: usize,
+    pending: VecDeque<ChangeEntry>,
+    upper_bound_reached: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedRemoteManifestBody {
     format_version: u32,
@@ -1240,21 +1278,301 @@ enum CommitLogBackend {
 }
 
 struct MemoryCommitLog {
-    object_store: Arc<dyn ObjectStore>,
-    records: Vec<CommitRecord>,
+    records: Arc<Vec<CommitRecord>>,
     durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
     next_segment_id: u64,
 }
 
 impl MemoryCommitLog {
-    fn new(object_store: Arc<dyn ObjectStore>) -> Self {
+    fn new() -> Self {
         Self {
-            object_store,
-            records: Vec::new(),
+            records: Arc::new(Vec::new()),
             durable_commit_log_segments: Vec::new(),
             next_segment_id: 1,
         }
     }
+}
+
+impl ChangeFeedScanner {
+    fn new(
+        table_id: TableId,
+        table: Table,
+        cursor: LogCursor,
+        upper_bound: SequenceNumber,
+        remaining: Option<usize>,
+        sources: VecDeque<ChangeFeedSourcePlan>,
+    ) -> Self {
+        Self {
+            cursor,
+            upper_bound,
+            table_id,
+            table,
+            remaining,
+            sources,
+            current_source: None,
+        }
+    }
+
+    async fn next_change(&mut self) -> Result<Option<ChangeEntry>, StorageError> {
+        if matches!(self.remaining, Some(0)) {
+            return Ok(None);
+        }
+
+        loop {
+            if let Some(source) = self.current_source.as_mut() {
+                match source.next_change(
+                    self.table_id,
+                    &self.table,
+                    self.cursor,
+                    self.upper_bound,
+                )? {
+                    Some(entry) => {
+                        if let Some(remaining) = &mut self.remaining {
+                            *remaining = remaining.saturating_sub(1);
+                        }
+                        return Ok(Some(entry));
+                    }
+                    None if source.reached_upper_bound() => {
+                        self.current_source = None;
+                        self.sources.clear();
+                        return Ok(None);
+                    }
+                    None => {
+                        self.current_source = None;
+                        continue;
+                    }
+                }
+            }
+
+            let Some(source) = self.sources.pop_front() else {
+                return Ok(None);
+            };
+            self.current_source = self.load_source(source).await?;
+        }
+    }
+
+    async fn load_source(
+        &self,
+        source: ChangeFeedSourcePlan,
+    ) -> Result<Option<ActiveChangeFeedSource>, StorageError> {
+        match source {
+            ChangeFeedSourcePlan::LocalSegment(plan) => {
+                if plan
+                    .max_sequence
+                    .is_some_and(|max| max < self.cursor.sequence())
+                {
+                    return Ok(None);
+                }
+                if plan.min_sequence.is_some_and(|min| min > self.upper_bound) {
+                    return Ok(None);
+                }
+
+                let bytes = read_change_feed_file(&plan.fs, &plan.path).await?;
+                Ok(Some(ActiveChangeFeedSource::Segment(
+                    ChangeFeedSegmentSource {
+                        scanner: SegmentRecordScanner::new(
+                            plan.segment_id,
+                            bytes,
+                            self.cursor.sequence(),
+                        )?,
+                        pending: VecDeque::new(),
+                        upper_bound_reached: false,
+                    },
+                )))
+            }
+            ChangeFeedSourcePlan::RemoteSegment(segment) => {
+                if segment.footer.max_sequence < self.cursor.sequence()
+                    || segment.footer.min_sequence > self.upper_bound
+                {
+                    return Ok(None);
+                }
+
+                let bytes = self
+                    .table
+                    .db
+                    .inner
+                    .dependencies
+                    .object_store
+                    .get(&segment.object_key)
+                    .await?;
+                Ok(Some(ActiveChangeFeedSource::Segment(
+                    ChangeFeedSegmentSource {
+                        scanner: SegmentRecordScanner::new(
+                            segment.footer.segment_id,
+                            bytes,
+                            self.cursor.sequence(),
+                        )?,
+                        pending: VecDeque::new(),
+                        upper_bound_reached: false,
+                    },
+                )))
+            }
+            ChangeFeedSourcePlan::BufferedRecords(records) => {
+                Ok(Some(ActiveChangeFeedSource::BufferedRecords(
+                    ChangeFeedBufferedRecordsSource::new(records, self.cursor.sequence()),
+                )))
+            }
+        }
+    }
+}
+
+impl ActiveChangeFeedSource {
+    fn next_change(
+        &mut self,
+        table_id: TableId,
+        table: &Table,
+        cursor: LogCursor,
+        upper_bound: SequenceNumber,
+    ) -> Result<Option<ChangeEntry>, StorageError> {
+        match self {
+            Self::Segment(source) => source.next_change(table_id, table, cursor, upper_bound),
+            Self::BufferedRecords(source) => {
+                source.next_change(table_id, table, cursor, upper_bound)
+            }
+        }
+    }
+
+    fn reached_upper_bound(&self) -> bool {
+        match self {
+            Self::Segment(source) => source.upper_bound_reached,
+            Self::BufferedRecords(source) => source.upper_bound_reached,
+        }
+    }
+}
+
+impl ChangeFeedSegmentSource {
+    fn next_change(
+        &mut self,
+        table_id: TableId,
+        table: &Table,
+        cursor: LogCursor,
+        upper_bound: SequenceNumber,
+    ) -> Result<Option<ChangeEntry>, StorageError> {
+        if let Some(entry) = self.pending.pop_front() {
+            return Ok(Some(entry));
+        }
+
+        while let Some(record) = self.scanner.next_record()? {
+            if record.sequence() > upper_bound {
+                self.upper_bound_reached = true;
+                return Ok(None);
+            }
+
+            self.pending.extend(change_entries_for_record(
+                record,
+                table_id,
+                table,
+                cursor,
+                upper_bound,
+            ));
+            if let Some(entry) = self.pending.pop_front() {
+                return Ok(Some(entry));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+impl ChangeFeedBufferedRecordsSource {
+    fn new(records: Arc<Vec<CommitRecord>>, cursor_sequence: SequenceNumber) -> Self {
+        let next_index = records
+            .iter()
+            .position(|record| record.sequence() >= cursor_sequence)
+            .unwrap_or(records.len());
+        Self {
+            records,
+            next_index,
+            pending: VecDeque::new(),
+            upper_bound_reached: false,
+        }
+    }
+
+    fn next_change(
+        &mut self,
+        table_id: TableId,
+        table: &Table,
+        cursor: LogCursor,
+        upper_bound: SequenceNumber,
+    ) -> Result<Option<ChangeEntry>, StorageError> {
+        if let Some(entry) = self.pending.pop_front() {
+            return Ok(Some(entry));
+        }
+
+        while let Some(record) = self.records.get(self.next_index).cloned() {
+            self.next_index = self.next_index.saturating_add(1);
+            if record.sequence() > upper_bound {
+                self.upper_bound_reached = true;
+                return Ok(None);
+            }
+
+            self.pending.extend(change_entries_for_record(
+                record,
+                table_id,
+                table,
+                cursor,
+                upper_bound,
+            ));
+            if let Some(entry) = self.pending.pop_front() {
+                return Ok(Some(entry));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+fn change_entries_for_record(
+    record: CommitRecord,
+    table_id: TableId,
+    table: &Table,
+    cursor: LogCursor,
+    upper_bound: SequenceNumber,
+) -> VecDeque<ChangeEntry> {
+    let sequence = record.sequence();
+    if sequence > upper_bound {
+        return VecDeque::new();
+    }
+
+    record
+        .entries
+        .into_iter()
+        .filter(|entry| entry.table_id == table_id)
+        .filter_map(|entry| {
+            let entry_cursor = LogCursor::new(sequence, entry.op_index);
+            (entry_cursor > cursor).then(|| ChangeEntry {
+                key: entry.key,
+                value: entry.value,
+                cursor: entry_cursor,
+                sequence,
+                kind: entry.kind,
+                table: table.clone(),
+            })
+        })
+        .collect()
+}
+
+async fn read_change_feed_file(
+    fs: &Arc<dyn crate::FileSystem>,
+    path: &str,
+) -> Result<Vec<u8>, StorageError> {
+    let handle = FileHandle::new(path);
+    let mut bytes = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let chunk = fs
+            .read_at(&handle, offset, CHANGE_FEED_READ_CHUNK_BYTES)
+            .await?;
+        if chunk.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(chunk.len() as u64);
+        bytes.extend_from_slice(&chunk);
+        if chunk.len() < CHANGE_FEED_READ_CHUNK_BYTES {
+            break;
+        }
+    }
+    Ok(bytes)
 }
 
 impl CommitRuntime {
@@ -1264,7 +1582,7 @@ impl CommitRuntime {
                 manager.append(record).await?;
             }
             CommitLogBackend::Memory(log) => {
-                log.records.push(record);
+                Arc::make_mut(&mut log.records).push(record);
             }
         }
 
@@ -1332,52 +1650,42 @@ impl CommitRuntime {
         Ok(recovered)
     }
 
-    async fn scan_table_from_sequence(
+    fn change_feed_scan_plan(
         &self,
         table_id: TableId,
         sequence_inclusive: SequenceNumber,
-    ) -> Result<Vec<CommitRecord>, StorageError> {
+    ) -> VecDeque<ChangeFeedSourcePlan> {
         match &self.backend {
-            CommitLogBackend::Local(manager) => {
-                manager
-                    .scan_table_from_sequence(table_id, sequence_inclusive)
-                    .await
-            }
+            CommitLogBackend::Local(manager) => manager
+                .table_scan_plans_since(table_id, sequence_inclusive)
+                .into_iter()
+                .map(ChangeFeedSourcePlan::LocalSegment)
+                .collect(),
             CommitLogBackend::Memory(log) => {
-                let mut records = Vec::new();
-                for segment in &log.durable_commit_log_segments {
-                    let Some(table_meta) = segment
-                        .footer
-                        .tables
-                        .iter()
-                        .find(|table| table.table_id == table_id)
-                    else {
-                        continue;
-                    };
-                    if table_meta.max_sequence < sequence_inclusive {
-                        continue;
-                    }
-
-                    let bytes = log.object_store.get(&segment.object_key).await?;
-                    records.extend(scan_table_from_segment_bytes(
-                        &bytes,
-                        table_id,
-                        sequence_inclusive,
-                    )?);
+                let mut sources = log
+                    .durable_commit_log_segments
+                    .iter()
+                    .filter(|segment| {
+                        segment
+                            .footer
+                            .tables
+                            .iter()
+                            .find(|table| table.table_id == table_id)
+                            .is_some_and(|table| table.max_sequence >= sequence_inclusive)
+                    })
+                    .cloned()
+                    .map(ChangeFeedSourcePlan::RemoteSegment)
+                    .collect::<VecDeque<_>>();
+                if log.records.iter().any(|record| {
+                    record.sequence() >= sequence_inclusive
+                        && record
+                            .entries
+                            .iter()
+                            .any(|entry| entry.table_id == table_id)
+                }) {
+                    sources.push_back(ChangeFeedSourcePlan::BufferedRecords(log.records.clone()));
                 }
-                records.extend(
-                    log.records
-                        .iter()
-                        .filter(|record| record.sequence() >= sequence_inclusive)
-                        .filter(|record| {
-                            record
-                                .entries
-                                .iter()
-                                .any(|entry| entry.table_id == table_id)
-                        })
-                        .cloned(),
-                );
-                Ok(records)
+                sources
             }
         }
     }
@@ -1438,7 +1746,7 @@ impl CommitRuntime {
                 if !log.records.is_empty() {
                     let mut tables =
                         BTreeMap::<TableId, (SequenceNumber, SequenceNumber, u32)>::new();
-                    for record in &log.records {
+                    for record in log.records.iter() {
                         for entry in &record.entries {
                             tables
                                 .entry(entry.table_id)
@@ -3271,9 +3579,7 @@ impl Db {
                     .await?,
                 ))
             }
-            StorageConfig::S3Primary(_) => {
-                CommitLogBackend::Memory(MemoryCommitLog::new(dependencies.object_store.clone()))
-            }
+            StorageConfig::S3Primary(_) => CommitLogBackend::Memory(MemoryCommitLog::new()),
         };
 
         Ok(CommitRuntime { backend })
@@ -7413,7 +7719,7 @@ impl Db {
                     let mut commit_runtime = self.inner.commit_runtime.lock().await;
                     match &mut commit_runtime.backend {
                         CommitLogBackend::Memory(log) => {
-                            log.records
+                            Arc::make_mut(&mut log.records)
                                 .retain(|record| record.sequence() > flushed_through);
                             log.durable_commit_log_segments = durable_segments.clone();
                             if !buffered_records.is_empty() {
@@ -8115,7 +8421,7 @@ impl Db {
             name: Arc::from(table.name()),
             id: Some(table_id),
         };
-        let records = {
+        let sources = {
             let runtime = self.inner.commit_runtime.lock().await;
             let floor = self.change_feed_floor_from_state(
                 table_id,
@@ -8133,50 +8439,26 @@ impl Db {
                 });
             }
 
-            runtime
-                .scan_table_from_sequence(table_id, cursor.sequence())
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "change capture scan failed for table {}: {error}",
-                        table.name()
-                    )
-                })
+            runtime.change_feed_scan_plan(table_id, cursor.sequence())
         };
 
-        let mut changes = Vec::new();
-        for record in records {
-            let sequence = record.sequence();
-            if sequence > upper_bound {
-                break;
-            }
-
-            for entry in record.entries {
-                if entry.table_id != table_id {
-                    continue;
+        let scanner = ChangeFeedScanner::new(
+            table_id,
+            table_handle,
+            cursor,
+            upper_bound,
+            opts.limit,
+            sources,
+        );
+        Ok(Box::pin(stream::try_unfold(
+            scanner,
+            |mut scanner| async move {
+                match scanner.next_change().await? {
+                    Some(entry) => Ok(Some((entry, scanner))),
+                    None => Ok(None),
                 }
-
-                let entry_cursor = LogCursor::new(sequence, entry.op_index);
-                if entry_cursor <= cursor {
-                    continue;
-                }
-
-                changes.push(ChangeEntry {
-                    key: entry.key,
-                    value: entry.value,
-                    cursor: entry_cursor,
-                    sequence,
-                    kind: entry.kind,
-                    table: table_handle.clone(),
-                });
-
-                if opts.limit.is_some_and(|limit| changes.len() >= limit) {
-                    return Ok(Box::pin(stream::iter(changes)));
-                }
-            }
-        }
-
-        Ok(Box::pin(stream::iter(changes)))
+            },
+        )))
     }
 
     #[cfg(test)]
@@ -9756,7 +10038,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
-    use futures::StreamExt;
+    use futures::{StreamExt, TryStreamExt};
     use parking_lot::Mutex;
     use serde_json::json;
 
@@ -10520,16 +10802,19 @@ mod tests {
 
     async fn collect_changes(stream: crate::ChangeStream) -> Vec<CollectedChange> {
         stream
-            .map(|entry| CollectedChange {
-                sequence: entry.sequence,
-                cursor: entry.cursor,
-                kind: entry.kind,
-                key: entry.key,
-                value: entry.value,
-                table: entry.table.name().to_string(),
+            .map(|entry| {
+                entry.map(|entry| CollectedChange {
+                    sequence: entry.sequence,
+                    cursor: entry.cursor,
+                    kind: entry.kind,
+                    key: entry.key,
+                    value: entry.value,
+                    table: entry.table.name().to_string(),
+                })
             })
-            .collect::<Vec<_>>()
+            .try_collect::<Vec<_>>()
             .await
+            .expect("collect change stream")
     }
 
     fn collected_change(
@@ -18361,6 +18646,135 @@ mod tests {
         )
         .await;
         assert_eq!(resumed, expected[2..].to_vec());
+    }
+
+    #[tokio::test]
+    async fn remote_durable_change_feed_limit_stops_before_fetching_later_segments() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let inner_store = Arc::new(StubObjectStore::default());
+        let recording_store = Arc::new(RecordingObjectStore::new(inner_store));
+        let dependencies = DbDependencies::new(
+            file_system,
+            recording_store.clone(),
+            Arc::new(StubClock::default()),
+            Arc::new(StubRng::seeded(7)),
+        );
+        let config = s3_primary_config("cdc-remote-limit");
+        let remote_config = match &config.storage {
+            StorageConfig::S3Primary(config) => config,
+            _ => unreachable!("expected s3-primary config"),
+        };
+
+        let db = Db::open(config.clone(), dependencies)
+            .await
+            .expect("open s3-primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        let first = events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first event");
+        db.flush().await.expect("flush first segment");
+
+        let second = events
+            .write(b"user:2".to_vec(), bytes("v2"))
+            .await
+            .expect("write second event");
+        db.flush().await.expect("flush second segment");
+
+        recording_store.clear_calls();
+        let first_page = db
+            .scan_durable_since(
+                &events,
+                LogCursor::beginning(),
+                ScanOptions {
+                    limit: Some(1),
+                    ..ScanOptions::default()
+                },
+            )
+            .await
+            .expect("scan first durable page")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect first durable page");
+
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].sequence, first);
+        assert_eq!(
+            recording_store.get_calls(),
+            vec![Db::remote_commit_log_segment_key(
+                remote_config,
+                SegmentId::new(1),
+            )]
+        );
+        assert_eq!(second, SequenceNumber::new(2));
+    }
+
+    #[tokio::test]
+    async fn remote_durable_change_feed_surfaces_mid_stream_get_errors_after_yielding_prefix() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let inner_store = Arc::new(StubObjectStore::default());
+        let recording_store = Arc::new(RecordingObjectStore::new(inner_store.clone()));
+        let dependencies = DbDependencies::new(
+            file_system,
+            recording_store,
+            Arc::new(StubClock::default()),
+            Arc::new(StubRng::seeded(7)),
+        );
+        let config = s3_primary_config("cdc-mid-stream-error");
+        let remote_config = match &config.storage {
+            StorageConfig::S3Primary(config) => config,
+            _ => unreachable!("expected s3-primary config"),
+        };
+
+        let db = Db::open(config.clone(), dependencies)
+            .await
+            .expect("open s3-primary db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create events table");
+
+        let first = events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write first event");
+        db.flush().await.expect("flush first segment");
+
+        events
+            .write(b"user:2".to_vec(), bytes("v2"))
+            .await
+            .expect("write second event");
+        db.flush().await.expect("flush second segment");
+
+        let second_key = Db::remote_commit_log_segment_key(remote_config, SegmentId::new(2));
+        inner_store.inject_failure(ObjectStoreFailure::timeout(
+            ObjectStoreOperation::Get,
+            second_key.clone(),
+        ));
+
+        let mut stream = db
+            .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+            .expect("open durable change feed");
+
+        let first_entry = stream
+            .try_next()
+            .await
+            .expect("first segment should stream successfully")
+            .expect("first entry should exist");
+        assert_eq!(first_entry.sequence, first);
+        assert_eq!(first_entry.key, b"user:1".to_vec());
+
+        let error = stream
+            .try_next()
+            .await
+            .expect_err("second segment get should fail mid-stream");
+        assert_eq!(error.kind(), crate::StorageErrorKind::Timeout);
+        assert!(error.message().contains("simulated timeout"));
     }
 
     #[tokio::test]

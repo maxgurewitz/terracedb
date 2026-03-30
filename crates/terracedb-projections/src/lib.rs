@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -1551,7 +1551,7 @@ async fn scan_whole_sequence_run(
         .scan_durable_since(source, cursor, ScanOptions::default())
         .await?;
 
-    let Some(first) = stream.next().await else {
+    let Some(first) = stream.try_next().await? else {
         return Ok(None);
     };
 
@@ -1560,7 +1560,7 @@ async fn scan_whole_sequence_run(
     let mut last_cursor = first.cursor;
     let mut entries = vec![first];
 
-    while let Some(entry) = stream.next().await {
+    while let Some(entry) = stream.try_next().await? {
         if entry.sequence != sequence {
             break;
         }
