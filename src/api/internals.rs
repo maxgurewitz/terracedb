@@ -9,6 +9,7 @@ const LOCAL_MANIFEST_DIR_RELATIVE_PATH: &str = "manifest";
 const LOCAL_MANIFEST_TEMP_SUFFIX: &str = ".tmp";
 const LOCAL_SSTABLE_RELATIVE_DIR: &str = "sst";
 const LOCAL_SSTABLE_SHARD_DIR: &str = "0000";
+const LOCAL_REMOTE_CACHE_RELATIVE_DIR: &str = "cache/remote";
 const MANIFEST_FORMAT_VERSION: u32 = 1;
 const REMOTE_MANIFEST_FORMAT_VERSION: u32 = 1;
 const BACKUP_GC_METADATA_FORMAT_VERSION: u32 = 1;
@@ -31,6 +32,9 @@ struct DbInner {
     config: DbConfig,
     scheduler: Arc<dyn Scheduler>,
     dependencies: DbDependencies,
+    // Row SSTables stay fully resident after open; this cache only applies to the
+    // lazy columnar read path.
+    columnar_read_context: Arc<ColumnarReadContext>,
     catalog_location: CatalogLocation,
     catalog_write_lock: AsyncMutex<()>,
     commit_lock: AsyncMutex<()>,
@@ -128,12 +132,105 @@ struct ColumnarRowRef {
 
 #[derive(Clone, Debug)]
 struct LoadedColumnarMetadata {
-    footer: PersistedColumnarSstableFooter,
+    footer: Arc<PersistedColumnarSstableFooter>,
     footer_start: usize,
-    key_index: Vec<Key>,
-    sequences: Vec<SequenceNumber>,
-    tombstones: Vec<bool>,
-    row_kinds: Vec<ChangeKind>,
+    key_index: Arc<Vec<Key>>,
+    sequences: Arc<Vec<SequenceNumber>>,
+    tombstones: Arc<Vec<bool>>,
+    row_kinds: Arc<Vec<ChangeKind>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnarReadAccessPattern {
+    Point,
+    Scan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnarReadArtifact {
+    Footer,
+    Metadata,
+    ColumnBlock,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ColumnarCachePolicy {
+    use_raw_byte_cache: bool,
+    populate_raw_byte_cache: bool,
+    use_decoded_cache: bool,
+    populate_decoded_cache: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ColumnarCacheStatsSnapshot {
+    raw_byte_hits: u64,
+    raw_byte_misses: u64,
+    decoded_footer_hits: u64,
+    decoded_footer_misses: u64,
+    decoded_footer_admissions: u64,
+    decoded_metadata_hits: u64,
+    decoded_metadata_misses: u64,
+    decoded_metadata_admissions: u64,
+    decoded_column_block_hits: u64,
+    decoded_column_block_misses: u64,
+    decoded_column_block_admissions: u64,
+}
+
+struct ColumnarReadContext {
+    dependencies: DbDependencies,
+    remote_cache: Option<Arc<RemoteCache>>,
+    decoded_cache: DecodedColumnarCache,
+    raw_byte_cache_enabled: AtomicBool,
+    decoded_cache_enabled: AtomicBool,
+}
+
+#[derive(Default)]
+struct DecodedColumnarCache {
+    footers: RwLock<BTreeMap<ColumnarSstableIdentity, CachedColumnarFooter>>,
+    key_indexes: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<Key>>>>,
+    sequence_columns: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<SequenceNumber>>>>,
+    tombstone_bitmaps: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<bool>>>>,
+    row_kind_columns: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<ChangeKind>>>>,
+    column_blocks: RwLock<BTreeMap<ColumnarColumnCacheKey, Arc<Vec<FieldValue>>>>,
+    stats: ColumnarCacheStats,
+}
+
+#[derive(Default)]
+struct ColumnarCacheStats {
+    raw_byte_hits: AtomicU64,
+    raw_byte_misses: AtomicU64,
+    decoded_footer_hits: AtomicU64,
+    decoded_footer_misses: AtomicU64,
+    decoded_footer_admissions: AtomicU64,
+    decoded_metadata_hits: AtomicU64,
+    decoded_metadata_misses: AtomicU64,
+    decoded_metadata_admissions: AtomicU64,
+    decoded_column_block_hits: AtomicU64,
+    decoded_column_block_misses: AtomicU64,
+    decoded_column_block_admissions: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedColumnarFooter {
+    footer: Arc<PersistedColumnarSstableFooter>,
+    footer_start: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ColumnarSstableIdentity {
+    table_id: TableId,
+    local_id: String,
+    checksum: u32,
+    data_checksum: u32,
+    length: u64,
+    schema_version: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ColumnarColumnCacheKey {
+    sstable: ColumnarSstableIdentity,
+    field_id: FieldId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -172,6 +269,231 @@ impl PersistedManifestSstable {
         } else {
             self.remote_key.as_deref().unwrap_or("")
         }
+    }
+
+    fn columnar_identity(&self) -> ColumnarSstableIdentity {
+        ColumnarSstableIdentity {
+            table_id: self.table_id,
+            local_id: self.local_id.clone(),
+            checksum: self.checksum,
+            data_checksum: self.data_checksum,
+            length: self.length,
+            schema_version: self.schema_version,
+        }
+    }
+}
+
+impl DecodedColumnarCache {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn snapshot(&self) -> ColumnarCacheStatsSnapshot {
+        ColumnarCacheStatsSnapshot {
+            raw_byte_hits: self.stats.raw_byte_hits.load(Ordering::Relaxed),
+            raw_byte_misses: self.stats.raw_byte_misses.load(Ordering::Relaxed),
+            decoded_footer_hits: self.stats.decoded_footer_hits.load(Ordering::Relaxed),
+            decoded_footer_misses: self.stats.decoded_footer_misses.load(Ordering::Relaxed),
+            decoded_footer_admissions: self
+                .stats
+                .decoded_footer_admissions
+                .load(Ordering::Relaxed),
+            decoded_metadata_hits: self.stats.decoded_metadata_hits.load(Ordering::Relaxed),
+            decoded_metadata_misses: self
+                .stats
+                .decoded_metadata_misses
+                .load(Ordering::Relaxed),
+            decoded_metadata_admissions: self
+                .stats
+                .decoded_metadata_admissions
+                .load(Ordering::Relaxed),
+            decoded_column_block_hits: self
+                .stats
+                .decoded_column_block_hits
+                .load(Ordering::Relaxed),
+            decoded_column_block_misses: self
+                .stats
+                .decoded_column_block_misses
+                .load(Ordering::Relaxed),
+            decoded_column_block_admissions: self
+                .stats
+                .decoded_column_block_admissions
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn reset_stats(&self) {
+        self.stats.raw_byte_hits.store(0, Ordering::Relaxed);
+        self.stats.raw_byte_misses.store(0, Ordering::Relaxed);
+        self.stats.decoded_footer_hits.store(0, Ordering::Relaxed);
+        self.stats.decoded_footer_misses.store(0, Ordering::Relaxed);
+        self.stats
+            .decoded_footer_admissions
+            .store(0, Ordering::Relaxed);
+        self.stats
+            .decoded_metadata_hits
+            .store(0, Ordering::Relaxed);
+        self.stats
+            .decoded_metadata_misses
+            .store(0, Ordering::Relaxed);
+        self.stats
+            .decoded_metadata_admissions
+            .store(0, Ordering::Relaxed);
+        self.stats
+            .decoded_column_block_hits
+            .store(0, Ordering::Relaxed);
+        self.stats
+            .decoded_column_block_misses
+            .store(0, Ordering::Relaxed);
+        self.stats
+            .decoded_column_block_admissions
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn clear(&self) {
+        self.footers.write().clear();
+        self.key_indexes.write().clear();
+        self.sequence_columns.write().clear();
+        self.tombstone_bitmaps.write().clear();
+        self.row_kind_columns.write().clear();
+        self.column_blocks.write().clear();
+    }
+
+    fn footer(&self, identity: &ColumnarSstableIdentity) -> Option<CachedColumnarFooter> {
+        let cached = self.footers.read().get(identity).cloned();
+        if cached.is_some() {
+            self.stats.decoded_footer_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .decoded_footer_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cached
+    }
+
+    fn insert_footer(&self, identity: ColumnarSstableIdentity, footer: CachedColumnarFooter) {
+        self.footers.write().insert(identity, footer);
+        self.stats
+            .decoded_footer_admissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn key_index(&self, identity: &ColumnarSstableIdentity) -> Option<Arc<Vec<Key>>> {
+        let cached = self.key_indexes.read().get(identity).cloned();
+        if cached.is_some() {
+            self.stats
+                .decoded_metadata_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .decoded_metadata_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cached
+    }
+
+    fn insert_key_index(&self, identity: ColumnarSstableIdentity, values: Arc<Vec<Key>>) {
+        self.key_indexes.write().insert(identity, values);
+        self.stats
+            .decoded_metadata_admissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn sequence_column(
+        &self,
+        identity: &ColumnarSstableIdentity,
+    ) -> Option<Arc<Vec<SequenceNumber>>> {
+        let cached = self.sequence_columns.read().get(identity).cloned();
+        if cached.is_some() {
+            self.stats
+                .decoded_metadata_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .decoded_metadata_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cached
+    }
+
+    fn insert_sequence_column(
+        &self,
+        identity: ColumnarSstableIdentity,
+        values: Arc<Vec<SequenceNumber>>,
+    ) {
+        self.sequence_columns.write().insert(identity, values);
+        self.stats
+            .decoded_metadata_admissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn tombstone_bitmap(&self, identity: &ColumnarSstableIdentity) -> Option<Arc<Vec<bool>>> {
+        let cached = self.tombstone_bitmaps.read().get(identity).cloned();
+        if cached.is_some() {
+            self.stats
+                .decoded_metadata_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .decoded_metadata_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cached
+    }
+
+    fn insert_tombstone_bitmap(&self, identity: ColumnarSstableIdentity, values: Arc<Vec<bool>>) {
+        self.tombstone_bitmaps.write().insert(identity, values);
+        self.stats
+            .decoded_metadata_admissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn row_kind_column(
+        &self,
+        identity: &ColumnarSstableIdentity,
+    ) -> Option<Arc<Vec<ChangeKind>>> {
+        let cached = self.row_kind_columns.read().get(identity).cloned();
+        if cached.is_some() {
+            self.stats
+                .decoded_metadata_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .decoded_metadata_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cached
+    }
+
+    fn insert_row_kind_column(
+        &self,
+        identity: ColumnarSstableIdentity,
+        values: Arc<Vec<ChangeKind>>,
+    ) {
+        self.row_kind_columns.write().insert(identity, values);
+        self.stats
+            .decoded_metadata_admissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn column_block(&self, key: &ColumnarColumnCacheKey) -> Option<Arc<Vec<FieldValue>>> {
+        let cached = self.column_blocks.read().get(key).cloned();
+        if cached.is_some() {
+            self.stats
+                .decoded_column_block_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .decoded_column_block_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cached
+    }
+
+    fn insert_column_block(&self, key: ColumnarColumnCacheKey, values: Arc<Vec<FieldValue>>) {
+        self.column_blocks.write().insert(key, values);
+        self.stats
+            .decoded_column_block_admissions
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 

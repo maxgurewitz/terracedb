@@ -1820,6 +1820,7 @@ impl Db {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_visible_value_columnar_with_state(
         &self,
         table: &StoredTable,
@@ -1828,6 +1829,7 @@ impl Db {
         key: &[u8],
         sequence: SequenceNumber,
         projection: &ColumnProjection,
+        access: ColumnarReadAccessPattern,
     ) -> Result<VisibleValueResolution, StorageError> {
         let mut mem_rows = Vec::new();
         memtables.collect_visible_rows(table.id, key, sequence, &mut mem_rows);
@@ -1843,7 +1845,7 @@ impl Db {
             columnar_rows.extend(
                 sstable
                     .collect_visible_row_refs_for_key_columnar(
-                        &self.inner.dependencies,
+                        &self.inner.columnar_read_context,
                         key,
                         sequence,
                     )
@@ -1920,9 +1922,10 @@ impl Db {
                     })?;
                     let values = sstable
                         .materialize_columnar_rows(
-                            &self.inner.dependencies,
+                            &self.inner.columnar_read_context,
                             projection,
                             &BTreeSet::from([row.row_index]),
+                            access,
                         )
                         .await?;
                     return Ok(VisibleValueResolution {
@@ -1982,9 +1985,10 @@ impl Db {
                 local_id.clone(),
                 sstable
                     .materialize_columnar_rows(
-                        &self.inner.dependencies,
+                        &self.inner.columnar_read_context,
                         &full_projection,
                         &row_indexes,
+                        access,
                     )
                     .await?,
             );
@@ -2087,7 +2091,7 @@ impl Db {
             if sequence < current_sequence {
                 persisted_version_count += sstable
                     .collect_visible_row_refs_for_key_columnar(
-                        &self.inner.dependencies,
+                        &self.inner.columnar_read_context,
                         key,
                         current_sequence,
                     )
@@ -2107,6 +2111,7 @@ impl Db {
                 key,
                 sequence,
                 &projection,
+                ColumnarReadAccessPattern::Point,
             )
             .await?;
         if let Some(collapse) = resolution.collapse.clone() {
@@ -2154,7 +2159,7 @@ impl Db {
         {
             for row in sstable
                 .collect_scan_row_refs_columnar(
-                    &self.inner.dependencies,
+                    &self.inner.columnar_read_context,
                     &matcher,
                     if sequence < current_sequence {
                         current_sequence
@@ -2199,6 +2204,7 @@ impl Db {
                     &key,
                     sequence,
                     &projection,
+                    ColumnarReadAccessPattern::Scan,
                 )
                 .await?;
             if let Some(collapse) = resolution.collapse.clone() {
@@ -2469,5 +2475,37 @@ impl Db {
 
     fn sstables_write(&self) -> RwLockWriteGuard<'_, SstableState> {
         self.inner.sstables.write()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn columnar_read_context(&self) -> &ColumnarReadContext {
+        self.inner.columnar_read_context.as_ref()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn columnar_cache_stats_snapshot(&self) -> ColumnarCacheStatsSnapshot {
+        self.inner.columnar_read_context.decoded_cache.snapshot()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn reset_columnar_cache_stats(&self) {
+        self.inner.columnar_read_context.decoded_cache.reset_stats();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn clear_columnar_decoded_cache(&self) {
+        self.inner.columnar_read_context.decoded_cache.clear();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn set_columnar_cache_enabled(&self, raw_byte_cache: bool, decoded_cache: bool) {
+        self.inner
+            .columnar_read_context
+            .raw_byte_cache_enabled
+            .store(raw_byte_cache, Ordering::Relaxed);
+        self.inner
+            .columnar_read_context
+            .decoded_cache_enabled
+            .store(decoded_cache, Ordering::Relaxed);
     }
 }

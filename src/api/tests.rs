@@ -7,11 +7,13 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use super::{
-    COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, CommitPhase, CompactionJobKind,
-    CompactionPhase, Db, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
-    LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR,
-    LOCAL_SSTABLE_SHARD_DIR, ManifestId, OffloadPhase, PendingWorkSpec, PersistedRowSstableFile,
-    SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key, encode_mvcc_key, read_path,
+    COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, ColumnarCacheStatsSnapshot,
+    ColumnarReadAccessPattern, CommitPhase, CompactionJobKind, CompactionPhase, Db, KeyMatcher,
+    LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR,
+    LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId,
+    OffloadPhase, PendingWorkSpec, PersistedRowSstableFile, ResidentColumnarSstable,
+    SchemaDefinition, StorageSource, StoredTable, WatermarkUpdate, decode_mvcc_key,
+    encode_mvcc_key, read_path,
 };
 use crate::simulation::{
     CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
@@ -269,6 +271,55 @@ async fn install_columnar_schema_successor(db: &Db, table_name: &str, successor:
         .await
         .expect("persist schema successor");
     *db.tables_write() = tables;
+}
+
+async fn move_live_columnar_sstable_to_remote_for_test(db: &Db) -> String {
+    let live = db
+        .sstables_read()
+        .live
+        .first()
+        .cloned()
+        .expect("live columnar sstable");
+    let bytes = read_path(db.dependencies(), &live.meta.file_path)
+        .await
+        .expect("read local columnar sstable");
+    let remote_key = tiered_layout().cold_sstable(
+        live.meta.table_id,
+        0,
+        live.meta.min_sequence,
+        live.meta.max_sequence,
+        &live.meta.local_id,
+    );
+    db.dependencies()
+        .object_store
+        .put(&remote_key, &bytes)
+        .await
+        .expect("upload columnar sstable to remote object");
+
+    let mut updated = live.clone();
+    updated.meta.file_path.clear();
+    updated.meta.remote_key = Some(remote_key.clone());
+    updated.rows.clear();
+    updated.columnar = Some(ResidentColumnarSstable {
+        source: StorageSource::remote_object(remote_key.clone()),
+    });
+
+    let state = db.sstables_read().clone();
+    let next_generation = ManifestId::new(state.manifest_generation.get().saturating_add(1));
+    db.install_manifest(
+        next_generation,
+        state.last_flushed_sequence,
+        &[updated.clone()],
+    )
+    .await
+    .expect("install remote-only manifest for columnar test");
+
+    let mut sstables = db.sstables_write();
+    sstables.manifest_generation = next_generation;
+    sstables.last_flushed_sequence = state.last_flushed_sequence;
+    sstables.live = vec![updated];
+
+    remote_key
 }
 
 fn tiered_config_with_scheduler(path: &str, scheduler: Arc<dyn Scheduler>) -> DbConfig {
@@ -3987,6 +4038,636 @@ async fn remote_columnar_scan_fetches_only_requested_ranges() {
 }
 
 #[tokio::test]
+async fn local_columnar_point_reads_reuse_decoded_cache_without_extra_file_reads() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+
+    let db = Db::open(
+        tiered_config("/columnar-local-read-cache"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = columnar_table_config("metrics");
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+    let expected = Value::named_record(
+        &schema,
+        vec![
+            ("user_id", FieldValue::String("alice".to_string())),
+            ("count", FieldValue::Int64(7)),
+        ],
+    )
+    .expect("encode record");
+    table
+        .write(b"user:1".to_vec(), expected.clone())
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush local columnar row");
+
+    let reopened = Db::open(tiered_config("/columnar-local-read-cache"), dependencies)
+        .await
+        .expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+
+    let reads_before = file_system.operation_count(FileSystemOperation::ReadAt);
+    assert_eq!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("first lazy point read"),
+        Some(expected.clone())
+    );
+    let reads_after_first = file_system.operation_count(FileSystemOperation::ReadAt);
+    assert!(
+        reads_after_first > reads_before,
+        "first lazy point read should touch local columnar blocks",
+    );
+    let first_stats = reopened.columnar_cache_stats_snapshot();
+    assert!(first_stats.decoded_footer_misses > 0);
+    assert!(first_stats.decoded_metadata_misses > 0);
+    assert!(first_stats.decoded_column_block_misses > 0);
+
+    assert_eq!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("second lazy point read"),
+        Some(expected)
+    );
+    let reads_after_second = file_system.operation_count(FileSystemOperation::ReadAt);
+    assert_eq!(
+        reads_after_second, reads_after_first,
+        "second point read should reuse decoded cache instead of re-reading local blocks",
+    );
+    let second_stats = reopened.columnar_cache_stats_snapshot();
+    assert!(second_stats.decoded_footer_hits > first_stats.decoded_footer_hits);
+    assert!(second_stats.decoded_metadata_hits > first_stats.decoded_metadata_hits);
+    assert!(second_stats.decoded_column_block_hits > first_stats.decoded_column_block_hits);
+}
+
+#[tokio::test]
+async fn remote_columnar_point_reads_reuse_raw_byte_cache_in_s3_primary_mode() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let inner_store = Arc::new(StubObjectStore::default());
+    let recording_store = Arc::new(RecordingObjectStore::new(inner_store));
+    let dependencies = DbDependencies::new(
+        file_system,
+        recording_store.clone(),
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(7)),
+    );
+    let config = s3_primary_config("columnar-raw-cache-s3");
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open db");
+    let table_config = columnar_table_config("metrics");
+    let schema = table_config.schema.clone().expect("columnar schema");
+    let table = db
+        .create_table(table_config)
+        .await
+        .expect("create columnar table");
+    let expected = Value::named_record(
+        &schema,
+        vec![
+            ("user_id", FieldValue::String("alice".to_string())),
+            ("count", FieldValue::Int64(9)),
+        ],
+    )
+    .expect("encode remote record");
+    table
+        .write(b"user:1".to_vec(), expected.clone())
+        .await
+        .expect("write remote row");
+    db.flush().await.expect("flush remote row");
+
+    let reopened = Db::open(config, dependencies).await.expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    recording_store.clear_calls();
+
+    assert_eq!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("first remote point read"),
+        Some(expected.clone())
+    );
+    let first_range_calls = recording_store.range_calls();
+    assert!(
+        !first_range_calls.is_empty(),
+        "first remote point read should fetch ranges from object storage",
+    );
+
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+    recording_store.clear_calls();
+    assert_eq!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("second remote point read"),
+        Some(expected)
+    );
+    assert!(
+        recording_store.range_calls().is_empty(),
+        "second remote point read should come entirely from the raw-byte cache after decoded cache reset",
+    );
+    assert!(reopened.columnar_cache_stats_snapshot().raw_byte_hits > 0);
+}
+
+#[tokio::test]
+async fn remote_columnar_point_reads_reuse_raw_byte_cache_in_tiered_cold_mode() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let inner_store = Arc::new(StubObjectStore::default());
+    let recording_store = Arc::new(RecordingObjectStore::new(inner_store));
+    let dependencies = DbDependencies::new(
+        file_system,
+        recording_store.clone(),
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(7)),
+    );
+
+    let db = Db::open(
+        tiered_config("/columnar-raw-cache-tiered"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open tiered db");
+    let table_config = columnar_table_config("metrics");
+    let schema = table_config.schema.clone().expect("columnar schema");
+    let table = db
+        .create_table(table_config)
+        .await
+        .expect("create columnar table");
+    let expected = Value::named_record(
+        &schema,
+        vec![
+            ("user_id", FieldValue::String("alice".to_string())),
+            ("count", FieldValue::Int64(11)),
+        ],
+    )
+    .expect("encode tiered record");
+    table
+        .write(b"user:1".to_vec(), expected.clone())
+        .await
+        .expect("write tiered row");
+    db.flush().await.expect("flush tiered row");
+    let remote_key = move_live_columnar_sstable_to_remote_for_test(&db).await;
+
+    let reopened = Db::open(tiered_config("/columnar-raw-cache-tiered"), dependencies)
+        .await
+        .expect("reopen tiered db");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    recording_store.clear_calls();
+
+    assert_eq!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("first cold point read"),
+        Some(expected.clone())
+    );
+    let first_remote_calls = recording_store
+        .range_calls()
+        .into_iter()
+        .filter(|(key, _, _)| key == &remote_key)
+        .collect::<Vec<_>>();
+    assert!(
+        !first_remote_calls.is_empty(),
+        "first cold point read should fetch remote ranges",
+    );
+
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+    recording_store.clear_calls();
+    assert_eq!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("second cold point read"),
+        Some(expected)
+    );
+    let second_remote_calls = recording_store
+        .range_calls()
+        .into_iter()
+        .filter(|(key, _, _)| key == &remote_key)
+        .collect::<Vec<_>>();
+    assert!(
+        second_remote_calls.is_empty(),
+        "second cold point read should hit the raw-byte cache instead of refetching ranges",
+    );
+    assert!(reopened.columnar_cache_stats_snapshot().raw_byte_hits > 0);
+}
+
+#[tokio::test]
+async fn columnar_scans_avoid_column_block_cache_pollution_while_point_reads_can_warm_it() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let inner_store = Arc::new(StubObjectStore::default());
+    let recording_store = Arc::new(RecordingObjectStore::new(inner_store.clone()));
+    let dependencies = DbDependencies::new(
+        file_system,
+        recording_store.clone(),
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(7)),
+    );
+    let config = s3_primary_config("columnar-scan-cache-admission");
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open db");
+    let table_config = columnar_all_types_table_config("metrics");
+    let schema = table_config.schema.clone().expect("columnar schema");
+    let table = db
+        .create_table(table_config)
+        .await
+        .expect("create columnar table");
+    let full_record = Value::named_record(
+        &schema,
+        vec![
+            ("metric", FieldValue::String("cpu".to_string())),
+            ("count", FieldValue::Int64(3)),
+            ("ratio", FieldValue::Float64(1.5)),
+            ("payload", FieldValue::Bytes(vec![1, 2, 3])),
+            ("active", FieldValue::Bool(true)),
+        ],
+    )
+    .expect("encode full record");
+    table
+        .write(b"row:1".to_vec(), full_record.clone())
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush row");
+
+    let live = db
+        .sstables_read()
+        .live
+        .first()
+        .cloned()
+        .expect("live remote sstable");
+    let remote_key = live.meta.remote_key.clone().expect("remote key");
+    let file_bytes = inner_store
+        .get(&remote_key)
+        .await
+        .expect("read remote bytes");
+    let (footer, _) =
+        Db::columnar_footer_from_bytes(&remote_key, &file_bytes).expect("decode footer");
+    let metric_block = footer
+        .columns
+        .iter()
+        .find(|column| column.field_id == FieldId::new(1))
+        .expect("metric block");
+
+    let reopened = Db::open(config, dependencies).await.expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+    recording_store.clear_calls();
+
+    let expected_projection = vec![(
+        b"row:1".to_vec(),
+        Value::record(BTreeMap::from([(
+            FieldId::new(1),
+            FieldValue::String("cpu".to_string()),
+        )])),
+    )];
+    assert_eq!(
+        collect_rows(
+            reopened_table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["metric".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("first projected scan"),
+        )
+        .await,
+        expected_projection
+    );
+    let scan_stats = reopened.columnar_cache_stats_snapshot();
+    assert_eq!(
+        scan_stats.decoded_column_block_admissions, 0,
+        "scan-only column blocks should not enter the decoded hot cache",
+    );
+    assert!(scan_stats.decoded_metadata_admissions > 0);
+
+    reopened.clear_columnar_decoded_cache();
+    recording_store.clear_calls();
+    assert_eq!(
+        collect_rows(
+            reopened_table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["metric".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("second projected scan"),
+        )
+        .await,
+        expected_projection
+    );
+    let second_scan_calls = recording_store
+        .range_calls()
+        .into_iter()
+        .filter(|(key, _, _)| key == &remote_key)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_scan_calls,
+        vec![(
+            remote_key.clone(),
+            metric_block.block.offset,
+            metric_block.block.offset + metric_block.block.length,
+        )],
+        "scan should reuse cached metadata but refetch the projected column block to avoid cache pollution",
+    );
+
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+    recording_store.clear_calls();
+    assert_eq!(
+        reopened_table
+            .read(b"row:1".to_vec())
+            .await
+            .expect("first point read"),
+        Some(full_record.clone())
+    );
+    assert!(
+        reopened
+            .columnar_cache_stats_snapshot()
+            .decoded_column_block_admissions
+            > 0,
+        "point reads should admit hot column blocks into the decoded cache",
+    );
+
+    reopened.clear_columnar_decoded_cache();
+    recording_store.clear_calls();
+    assert_eq!(
+        reopened_table
+            .read(b"row:1".to_vec())
+            .await
+            .expect("second point read"),
+        Some(full_record)
+    );
+    assert!(
+        recording_store.range_calls().is_empty(),
+        "point-read-warmed column blocks should be reusable from the raw-byte cache after decoded cache reset",
+    );
+}
+
+#[tokio::test]
+async fn columnar_cache_disable_preserves_read_results_and_default_filling() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(
+        tiered_config("/columnar-cache-equivalence"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let legacy_schema = SchemaDefinition {
+        version: 1,
+        fields: vec![FieldDefinition {
+            id: FieldId::new(1),
+            name: "user_id".to_string(),
+            field_type: FieldType::String,
+            nullable: false,
+            default: None,
+        }],
+    };
+    let mut legacy_config = columnar_table_config("metrics");
+    legacy_config.schema = Some(legacy_schema.clone());
+    let table = db
+        .create_table(legacy_config)
+        .await
+        .expect("create legacy table");
+    let first = table
+        .write(
+            b"user:1".to_vec(),
+            Value::named_record(
+                &legacy_schema,
+                vec![("user_id", FieldValue::String("alice".to_string()))],
+            )
+            .expect("encode legacy row"),
+        )
+        .await
+        .expect("write legacy row");
+    db.flush().await.expect("flush legacy row");
+
+    let successor_schema = columnar_table_config("metrics")
+        .schema
+        .expect("successor schema");
+    install_columnar_schema_successor(&db, "metrics", successor_schema.clone()).await;
+    let successor_record = Value::named_record(
+        &successor_schema,
+        vec![
+            ("user_id", FieldValue::String("bob".to_string())),
+            ("count", FieldValue::Int64(5)),
+        ],
+    )
+    .expect("encode successor row");
+    table
+        .write(b"user:2".to_vec(), successor_record.clone())
+        .await
+        .expect("write successor row");
+    db.flush().await.expect("flush successor row");
+
+    let reopened = Db::open(tiered_config("/columnar-cache-equivalence"), dependencies)
+        .await
+        .expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    let expected_legacy = Value::named_record(
+        &successor_schema,
+        vec![("user_id", FieldValue::String("alice".to_string()))],
+    )
+    .expect("encode default-filled legacy row");
+
+    let cached_point = reopened_table
+        .read(b"user:1".to_vec())
+        .await
+        .expect("cached point read");
+    let cached_historical = reopened_table
+        .read_at(b"user:1".to_vec(), first)
+        .await
+        .expect("cached historical read");
+    let cached_scan = collect_rows(
+        reopened_table
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+            .expect("cached scan"),
+    )
+    .await;
+
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+    reopened.set_columnar_cache_enabled(false, false);
+
+    let uncached_point = reopened_table
+        .read(b"user:1".to_vec())
+        .await
+        .expect("uncached point read");
+    let uncached_historical = reopened_table
+        .read_at(b"user:1".to_vec(), first)
+        .await
+        .expect("uncached historical read");
+    let uncached_scan = collect_rows(
+        reopened_table
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+            .expect("uncached scan"),
+    )
+    .await;
+
+    assert_eq!(cached_point, Some(expected_legacy.clone()));
+    assert_eq!(cached_point, uncached_point);
+    assert_eq!(cached_historical, Some(expected_legacy.clone()));
+    assert_eq!(cached_historical, uncached_historical);
+    assert_eq!(
+        cached_scan,
+        vec![
+            (b"user:1".to_vec(), expected_legacy),
+            (b"user:2".to_vec(), successor_record),
+        ]
+    );
+    assert_eq!(cached_scan, uncached_scan);
+    assert_eq!(
+        reopened.columnar_cache_stats_snapshot(),
+        ColumnarCacheStatsSnapshot::default(),
+        "cache-disabled reads should preserve results without recording cache hits or admissions",
+    );
+}
+
+#[tokio::test]
+async fn columnar_decoded_cache_drops_on_restart_while_raw_byte_cache_rebuilds() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let inner_store = Arc::new(StubObjectStore::default());
+    let recording_store = Arc::new(RecordingObjectStore::new(inner_store));
+    let dependencies = DbDependencies::new(
+        file_system,
+        recording_store.clone(),
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(7)),
+    );
+    let config = s3_primary_config("columnar-cache-restart");
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open db");
+    let table_config = columnar_table_config("metrics");
+    let schema = table_config.schema.clone().expect("columnar schema");
+    let table = db
+        .create_table(table_config)
+        .await
+        .expect("create columnar table");
+    let expected = Value::named_record(
+        &schema,
+        vec![
+            ("user_id", FieldValue::String("alice".to_string())),
+            ("count", FieldValue::Int64(13)),
+        ],
+    )
+    .expect("encode row");
+    table
+        .write(b"user:1".to_vec(), expected.clone())
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush row");
+
+    let warmed = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("reopen warmed db");
+    let warmed_table = warmed.table("metrics");
+    warmed.clear_columnar_decoded_cache();
+    warmed.reset_columnar_cache_stats();
+    recording_store.clear_calls();
+    assert_eq!(
+        warmed_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("warm raw cache"),
+        Some(expected.clone())
+    );
+    let warmed_stats = warmed.columnar_cache_stats_snapshot();
+    assert!(warmed_stats.raw_byte_misses > 0);
+    assert!(warmed_stats.decoded_column_block_misses > 0);
+
+    let reopened = Db::open(config, dependencies)
+        .await
+        .expect("reopen db again");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+    recording_store.clear_calls();
+    assert_eq!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("post-restart read"),
+        Some(expected)
+    );
+    assert!(
+        recording_store.range_calls().is_empty(),
+        "reopened DB should rebuild raw-byte cache metadata and satisfy reads without new remote range calls",
+    );
+    let restarted_stats = reopened.columnar_cache_stats_snapshot();
+    assert!(restarted_stats.raw_byte_hits > 0);
+    assert!(restarted_stats.decoded_column_block_misses > 0);
+    assert_eq!(restarted_stats.decoded_column_block_hits, 0);
+}
+
+#[tokio::test]
+async fn row_sstable_reads_do_not_touch_columnar_lazy_cache_stats() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(tiered_config("/row-cache-scope"), dependencies.clone())
+        .await
+        .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create row table");
+    table
+        .write(b"event:1".to_vec(), bytes("payload"))
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush row table");
+
+    let reopened = Db::open(tiered_config("/row-cache-scope"), dependencies)
+        .await
+        .expect("reopen db");
+    let reopened_table = reopened.table("events");
+    reopened.reset_columnar_cache_stats();
+    assert_eq!(
+        reopened_table
+            .read(b"event:1".to_vec())
+            .await
+            .expect("row table read"),
+        Some(bytes("payload"))
+    );
+    assert_eq!(
+        reopened.columnar_cache_stats_snapshot(),
+        ColumnarCacheStatsSnapshot::default(),
+        "row SSTables are out of scope for the lazy columnar cache because they stay resident after open",
+    );
+}
+
+#[tokio::test]
 async fn columnar_reads_fill_defaults_when_older_sstables_lack_new_fields() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
@@ -4292,7 +4973,7 @@ async fn columnar_compaction_rewrites_mixed_schema_versions_without_changing_rea
     assert!(live[0].is_columnar());
     assert_eq!(live[0].meta.schema_version, Some(removed_schema.version));
     let metadata = live[0]
-        .load_columnar_metadata(db.dependencies())
+        .load_columnar_metadata(db.columnar_read_context(), ColumnarReadAccessPattern::Scan)
         .await
         .expect("load compacted columnar metadata");
     assert_eq!(metadata.footer.columns.len(), 1);

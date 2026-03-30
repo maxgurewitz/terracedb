@@ -1,74 +1,110 @@
-impl Db {
-    async fn load_resident_sstable(
-        dependencies: &DbDependencies,
-        meta: &PersistedManifestSstable,
-    ) -> Result<ResidentRowSstable, StorageError> {
-        if meta.schema_version.is_some() {
-            Self::load_lazy_columnar_sstable(dependencies, meta).await
-        } else {
-            let source = meta.storage_source();
-            let location = meta.storage_descriptor();
-            let bytes = read_source(dependencies, &source).await?;
-            if bytes.len() as u64 != meta.length {
-                return Err(StorageError::corruption(format!(
-                    "sstable {} length mismatch: manifest={}, file={}",
-                    location,
-                    meta.length,
-                    bytes.len()
-                )));
-            }
-            Self::decode_resident_row_sstable(location, meta, &bytes)
+impl ColumnarReadContext {
+    fn cache_policy(
+        &self,
+        source: &StorageSource,
+        access: ColumnarReadAccessPattern,
+        artifact: ColumnarReadArtifact,
+    ) -> ColumnarCachePolicy {
+        let use_decoded_cache = self.decoded_cache_enabled.load(Ordering::Relaxed);
+        let use_raw_byte_cache = matches!(source, StorageSource::RemoteObject { .. })
+            && self.raw_byte_cache_enabled.load(Ordering::Relaxed)
+            && self.remote_cache.is_some();
+        let populate_hot_data = match artifact {
+            ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata => true,
+            ColumnarReadArtifact::ColumnBlock => access == ColumnarReadAccessPattern::Point,
+        };
+
+        ColumnarCachePolicy {
+            use_raw_byte_cache,
+            populate_raw_byte_cache: use_raw_byte_cache && populate_hot_data,
+            use_decoded_cache,
+            populate_decoded_cache: use_decoded_cache && populate_hot_data,
         }
     }
 
-    async fn read_exact_source_range(
-        dependencies: &DbDependencies,
+    async fn read_range(
+        &self,
         source: &StorageSource,
         range: std::ops::Range<u64>,
-        location: &str,
-        label: &str,
+        access: ColumnarReadAccessPattern,
+        artifact: ColumnarReadArtifact,
     ) -> Result<Vec<u8>, StorageError> {
-        let expected_len =
-            usize::try_from(range.end.saturating_sub(range.start)).map_err(|_| {
-                StorageError::corruption(format!(
-                    "columnar SSTable {location} {label} length exceeds platform limits",
-                ))
-            })?;
-        let bytes = UnifiedStorage::from_dependencies(dependencies)
-            .read_range(source, range)
-            .await
-            .map_err(|error| error.into_storage_error())?;
-        if bytes.len() != expected_len {
-            return Err(StorageError::corruption(format!(
-                "columnar SSTable {location} {label} is truncated",
-            )));
+        let policy = self.cache_policy(source, access, artifact);
+        if let StorageSource::RemoteObject { key } = source
+            && policy.use_raw_byte_cache
+            && let Some(cache) = &self.remote_cache
+        {
+            if let Some(bytes) = cache.read_range(key, range.clone()).await? {
+                self.decoded_cache
+                    .stats
+                    .raw_byte_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(bytes);
+            }
+            self.decoded_cache
+                .stats
+                .raw_byte_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let bytes = UnifiedStorage::new(
+            self.dependencies.file_system.clone(),
+            self.dependencies.object_store.clone(),
+            None,
+        )
+        .read_range(source, range.clone())
+        .await
+        .map_err(|error| error.into_storage_error())?;
+        if let StorageSource::RemoteObject { key } = source
+            && policy.populate_raw_byte_cache
+            && let Some(cache) = &self.remote_cache
+        {
+            cache.store(
+                key,
+                crate::remote::CacheSpan::Range {
+                    start: range.start,
+                    end: range.end,
+                },
+                &bytes,
+            )
+            .await?;
         }
         Ok(bytes)
     }
 
-    async fn columnar_footer_from_source(
-        dependencies: &DbDependencies,
+    async fn footer_from_source(
+        &self,
+        meta: &PersistedManifestSstable,
         source: &StorageSource,
-        length: u64,
         location: &str,
-    ) -> Result<(PersistedColumnarSstableFooter, usize), StorageError> {
+        access: ColumnarReadAccessPattern,
+    ) -> Result<CachedColumnarFooter, StorageError> {
+        let identity = meta.columnar_identity();
+        let policy = self.cache_policy(source, access, ColumnarReadArtifact::Footer);
+        if policy.use_decoded_cache
+            && let Some(cached) = self.decoded_cache.footer(&identity)
+        {
+            return Ok(cached);
+        }
+
         let min_len = (COLUMNAR_SSTABLE_MAGIC.len() * 2 + std::mem::size_of::<u64>()) as u64;
-        if length < min_len {
+        if meta.length < min_len {
             return Err(StorageError::corruption(format!(
                 "columnar SSTable {location} is too short",
             )));
         }
 
-        let trailer_start = length
+        let trailer_start = meta
+            .length
             .saturating_sub((COLUMNAR_SSTABLE_MAGIC.len() + std::mem::size_of::<u64>()) as u64);
-        let trailer = Self::read_exact_source_range(
-            dependencies,
-            source,
-            trailer_start..length,
-            location,
-            "footer trailer",
-        )
-        .await?;
+        let trailer = self
+            .read_range(
+                source,
+                trailer_start..meta.length,
+                access,
+                ColumnarReadArtifact::Footer,
+            )
+            .await?;
         let footer_len = u64::from_le_bytes(
             trailer[..std::mem::size_of::<u64>()]
                 .try_into()
@@ -89,26 +125,336 @@ impl Db {
                 "columnar SSTable {location} footer length points before the file start",
             ))
         })?;
-        let footer_bytes = Self::read_exact_source_range(
-            dependencies,
-            source,
-            footer_start_u64..trailer_start,
-            location,
-            "footer",
-        )
-        .await?;
-        let footer = serde_json::from_slice(&footer_bytes).map_err(|error| {
+        let footer_bytes = self
+            .read_range(
+                source,
+                footer_start_u64..trailer_start,
+                access,
+                ColumnarReadArtifact::Footer,
+            )
+            .await?;
+        let footer = Arc::new(serde_json::from_slice(&footer_bytes).map_err(|error| {
             StorageError::corruption(format!(
                 "decode columnar SSTable footer for {location} failed: {error}"
             ))
-        })?;
+        })?);
 
         let footer_start = usize::try_from(footer_start_u64).map_err(|_| {
             StorageError::corruption(format!(
                 "columnar SSTable {location} footer offset exceeds platform limits",
             ))
         })?;
-        Ok((footer, footer_start))
+        let cached = CachedColumnarFooter {
+            footer,
+            footer_start,
+        };
+        if policy.populate_decoded_cache {
+            self.decoded_cache.insert_footer(identity, cached.clone());
+        }
+        Ok(cached)
+    }
+
+    async fn key_index(
+        &self,
+        meta: &PersistedManifestSstable,
+        source: &StorageSource,
+        footer: &CachedColumnarFooter,
+        location: &str,
+        access: ColumnarReadAccessPattern,
+    ) -> Result<Arc<Vec<Key>>, StorageError> {
+        let identity = meta.columnar_identity();
+        let policy = self.cache_policy(source, access, ColumnarReadArtifact::Metadata);
+        if policy.use_decoded_cache
+            && let Some(cached) = self.decoded_cache.key_index(&identity)
+        {
+            return Ok(cached);
+        }
+
+        let range = Db::columnar_block_range(
+            location,
+            footer.footer_start,
+            "key index",
+            &footer.footer.key_index,
+        )?;
+        let bytes = self
+            .read_range(source, range, access, ColumnarReadArtifact::Metadata)
+            .await?;
+        let values: Arc<Vec<Key>> = Arc::new(serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar key index for {location} failed: {error}"
+            ))
+        })?);
+        if policy.populate_decoded_cache {
+            self.decoded_cache
+                .insert_key_index(identity, values.clone());
+        }
+        Ok(values)
+    }
+
+    async fn sequence_column(
+        &self,
+        meta: &PersistedManifestSstable,
+        source: &StorageSource,
+        footer: &CachedColumnarFooter,
+        location: &str,
+        access: ColumnarReadAccessPattern,
+    ) -> Result<Arc<Vec<SequenceNumber>>, StorageError> {
+        let identity = meta.columnar_identity();
+        let policy = self.cache_policy(source, access, ColumnarReadArtifact::Metadata);
+        if policy.use_decoded_cache
+            && let Some(cached) = self.decoded_cache.sequence_column(&identity)
+        {
+            return Ok(cached);
+        }
+
+        let range = Db::columnar_block_range(
+            location,
+            footer.footer_start,
+            "sequence column",
+            &footer.footer.sequence_column,
+        )?;
+        let bytes = self
+            .read_range(source, range, access, ColumnarReadArtifact::Metadata)
+            .await?;
+        let values: Arc<Vec<SequenceNumber>> =
+            Arc::new(serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar sequence column for {location} failed: {error}"
+            ))
+            })?);
+        if policy.populate_decoded_cache {
+            self.decoded_cache
+                .insert_sequence_column(identity, values.clone());
+        }
+        Ok(values)
+    }
+
+    async fn tombstone_bitmap(
+        &self,
+        meta: &PersistedManifestSstable,
+        source: &StorageSource,
+        footer: &CachedColumnarFooter,
+        location: &str,
+        access: ColumnarReadAccessPattern,
+    ) -> Result<Arc<Vec<bool>>, StorageError> {
+        let identity = meta.columnar_identity();
+        let policy = self.cache_policy(source, access, ColumnarReadArtifact::Metadata);
+        if policy.use_decoded_cache
+            && let Some(cached) = self.decoded_cache.tombstone_bitmap(&identity)
+        {
+            return Ok(cached);
+        }
+
+        let range = Db::columnar_block_range(
+            location,
+            footer.footer_start,
+            "tombstone bitmap",
+            &footer.footer.tombstone_bitmap,
+        )?;
+        let bytes = self
+            .read_range(source, range, access, ColumnarReadArtifact::Metadata)
+            .await?;
+        let values: Arc<Vec<bool>> = Arc::new(serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar tombstone bitmap for {location} failed: {error}"
+            ))
+        })?);
+        if policy.populate_decoded_cache {
+            self.decoded_cache
+                .insert_tombstone_bitmap(identity, values.clone());
+        }
+        Ok(values)
+    }
+
+    async fn row_kind_column(
+        &self,
+        meta: &PersistedManifestSstable,
+        source: &StorageSource,
+        footer: &CachedColumnarFooter,
+        location: &str,
+        access: ColumnarReadAccessPattern,
+    ) -> Result<Arc<Vec<ChangeKind>>, StorageError> {
+        let identity = meta.columnar_identity();
+        let policy = self.cache_policy(source, access, ColumnarReadArtifact::Metadata);
+        if policy.use_decoded_cache
+            && let Some(cached) = self.decoded_cache.row_kind_column(&identity)
+        {
+            return Ok(cached);
+        }
+
+        let range = Db::columnar_block_range(
+            location,
+            footer.footer_start,
+            "row-kind column",
+            &footer.footer.row_kind_column,
+        )?;
+        let bytes = self
+            .read_range(source, range, access, ColumnarReadArtifact::Metadata)
+            .await?;
+        let values: Arc<Vec<ChangeKind>> =
+            Arc::new(serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar row-kind column for {location} failed: {error}"
+            ))
+            })?);
+        if policy.populate_decoded_cache {
+            self.decoded_cache
+                .insert_row_kind_column(identity, values.clone());
+        }
+        Ok(values)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn column_block(
+        &self,
+        meta: &PersistedManifestSstable,
+        source: &StorageSource,
+        footer: &CachedColumnarFooter,
+        column: &PersistedColumnarColumnFooter,
+        row_count: usize,
+        location: &str,
+        access: ColumnarReadAccessPattern,
+    ) -> Result<Arc<Vec<FieldValue>>, StorageError> {
+        let key = ColumnarColumnCacheKey {
+            sstable: meta.columnar_identity(),
+            field_id: column.field_id,
+        };
+        let policy = self.cache_policy(source, access, ColumnarReadArtifact::ColumnBlock);
+        if policy.use_decoded_cache
+            && let Some(cached) = self.decoded_cache.column_block(&key)
+        {
+            return Ok(cached);
+        }
+
+        let range =
+            Db::columnar_block_range(location, footer.footer_start, "column block", &column.block)?;
+        let bytes = self
+            .read_range(source, range, access, ColumnarReadArtifact::ColumnBlock)
+            .await?;
+        let values = Arc::new(Db::decode_columnar_field_values(
+            location, column, row_count, &bytes,
+        )?);
+        if policy.populate_decoded_cache {
+            self.decoded_cache.insert_column_block(key, values.clone());
+        }
+        Ok(values)
+    }
+}
+
+impl Db {
+    #[allow(dead_code)]
+    async fn load_resident_sstable(
+        dependencies: &DbDependencies,
+        meta: &PersistedManifestSstable,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
+        Self::load_resident_sstable_with_context(dependencies, &columnar_read_context, meta).await
+    }
+
+    async fn load_resident_sstable_with_context(
+        dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
+        meta: &PersistedManifestSstable,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        if meta.schema_version.is_some() {
+            Self::load_lazy_columnar_sstable(columnar_read_context, meta).await
+        } else {
+            let source = meta.storage_source();
+            let location = meta.storage_descriptor();
+            let bytes = read_source(dependencies, &source).await?;
+            if bytes.len() as u64 != meta.length {
+                return Err(StorageError::corruption(format!(
+                    "sstable {} length mismatch: manifest={}, file={}",
+                    location,
+                    meta.length,
+                    bytes.len()
+                )));
+            }
+            Self::decode_resident_row_sstable(location, meta, &bytes)
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn read_exact_source_range(
+        dependencies: &DbDependencies,
+        source: &StorageSource,
+        range: std::ops::Range<u64>,
+        location: &str,
+        label: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
+        Self::read_exact_source_range_with_context(
+            &columnar_read_context,
+            source,
+            range,
+            location,
+            label,
+            ColumnarReadAccessPattern::Point,
+            ColumnarReadArtifact::Metadata,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    async fn read_exact_source_range_with_context(
+        columnar_read_context: &ColumnarReadContext,
+        source: &StorageSource,
+        range: std::ops::Range<u64>,
+        location: &str,
+        label: &str,
+        access: ColumnarReadAccessPattern,
+        artifact: ColumnarReadArtifact,
+    ) -> Result<Vec<u8>, StorageError> {
+        let expected_len =
+            usize::try_from(range.end.saturating_sub(range.start)).map_err(|_| {
+                StorageError::corruption(format!(
+                    "columnar SSTable {location} {label} length exceeds platform limits",
+                ))
+            })?;
+        let bytes = columnar_read_context
+            .read_range(source, range, access, artifact)
+            .await?;
+        if bytes.len() != expected_len {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} {label} is truncated",
+            )));
+        }
+        Ok(bytes)
+    }
+
+    #[allow(dead_code)]
+    async fn columnar_footer_from_source(
+        dependencies: &DbDependencies,
+        source: &StorageSource,
+        length: u64,
+        location: &str,
+    ) -> Result<(PersistedColumnarSstableFooter, usize), StorageError> {
+        let meta = PersistedManifestSstable {
+            table_id: TableId::new(0),
+            level: 0,
+            local_id: location.to_string(),
+            file_path: match source {
+                StorageSource::LocalFile { path } => path.clone(),
+                StorageSource::RemoteObject { .. } => String::new(),
+            },
+            remote_key: match source {
+                StorageSource::RemoteObject { key } => Some(key.clone()),
+                StorageSource::LocalFile { .. } => None,
+            },
+            length,
+            checksum: 0,
+            data_checksum: 0,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            min_sequence: SequenceNumber::new(0),
+            max_sequence: SequenceNumber::new(0),
+            schema_version: Some(0),
+        };
+        let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
+        let footer = columnar_read_context
+            .footer_from_source(&meta, source, location, ColumnarReadAccessPattern::Point)
+            .await?;
+        Ok(((*footer.footer).clone(), footer.footer_start))
     }
 
     fn validate_loaded_columnar_footer(
@@ -139,19 +485,20 @@ impl Db {
     }
 
     async fn load_lazy_columnar_sstable(
-        dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
         let source = meta.storage_source();
         let location = meta.storage_descriptor();
-        let (footer, _) =
-            Self::columnar_footer_from_source(dependencies, &source, meta.length, location).await?;
-        Self::validate_loaded_columnar_footer(location, meta, &footer)?;
+        let footer = columnar_read_context
+            .footer_from_source(meta, &source, location, ColumnarReadAccessPattern::Point)
+            .await?;
+        Self::validate_loaded_columnar_footer(location, meta, footer.footer.as_ref())?;
 
         Ok(ResidentRowSstable {
             meta: meta.clone(),
             rows: Vec::new(),
-            user_key_bloom_filter: footer.user_key_bloom_filter.clone(),
+            user_key_bloom_filter: footer.footer.user_key_bloom_filter.clone(),
             columnar: Some(ResidentColumnarSstable { source }),
         })
     }
