@@ -16,6 +16,7 @@ use terracedb::{
     StorageConfig, StorageErrorKind, StorageSource, TableConfig, TableFormat, TableStats,
     ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage,
     Value,
+    SegmentId,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
@@ -33,6 +34,14 @@ fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
 
 fn bytes(payload: &str) -> Value {
     Value::Bytes(payload.as_bytes().to_vec())
+}
+
+fn assert_change_feed_storage_kind(
+    error: terracedb::ChangeFeedError,
+    expected_kind: StorageErrorKind,
+) {
+    let storage = error.storage().expect("expected change-feed storage error");
+    assert_eq!(storage.kind(), expected_kind);
 }
 
 #[derive(Default)]
@@ -933,13 +942,11 @@ fn db_change_feed_simulation_surfaces_snapshot_too_old_for_lagging_tables_after_
                 .await
                 .err()
                 .expect("fast table should be past its retained change-feed floor");
-            match fast_error {
-                ChangeFeedError::SnapshotTooOld(error) => {
-                    assert_eq!(error.requested, first_sequence);
-                    assert_eq!(error.oldest_available, SequenceNumber::new(2));
-                }
-                other => panic!("expected SnapshotTooOld, got {other:?}"),
-            }
+            let snapshot_too_old = fast_error
+                .snapshot_too_old()
+                .expect("fast table should surface SnapshotTooOld");
+            assert_eq!(snapshot_too_old.requested, first_sequence);
+            assert_eq!(snapshot_too_old.oldest_available, SequenceNumber::new(2));
 
             let slow_changes = collect_change_feed(
                 reopened
@@ -963,6 +970,102 @@ fn db_change_feed_simulation_surfaces_snapshot_too_old_for_lagging_tables_after_
 
             Ok(())
         }
+    })
+}
+
+#[test]
+fn db_change_feed_simulation_surfaces_structured_local_scan_failures() -> turmoil::Result {
+    SeededSimulationRunner::new(0xcdc4).run_with(|context| async move {
+        let config = simulation_tiered_config(
+            "/terracedb/sim/cdc-local-scan-failure",
+            TieredDurabilityMode::GroupCommit,
+        );
+        let db = context.open_db(config).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        events.write(b"user:1".to_vec(), bytes("v1")).await?;
+        context.file_system().inject_failure(
+            FileSystemFailure::partial_read(
+                "/terracedb/sim/cdc-local-scan-failure/commitlog/SEG-000001",
+            )
+            .persistent(),
+        );
+
+        let visible_error = match db
+            .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("visible scan should surface the injected local corruption"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_kind(visible_error, StorageErrorKind::Corruption);
+
+        let durable_error = match db
+            .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("durable scan should surface the injected local corruption"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_kind(durable_error, StorageErrorKind::Corruption);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn s3_primary_change_feed_simulation_surfaces_structured_remote_scan_failures() -> turmoil::Result {
+    SeededSimulationRunner::new(0xcdc5).run_with(|context| async move {
+        let config = simulation_s3_primary_config("sim/s3-cdc-scan-failure");
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        events.write(b"user:1".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+
+        let layout = ObjectKeyLayout::new(&S3Location {
+            bucket: "terracedb-sim".to_string(),
+            prefix: "sim/s3-cdc-scan-failure".to_string(),
+        });
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Get,
+                target_prefix: layout.backup_commit_log_segment(SegmentId::new(1)),
+            })
+            .await?;
+
+        let visible_error = match db
+            .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("visible scan should surface the injected remote timeout"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_kind(visible_error, StorageErrorKind::Timeout);
+
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Get,
+                target_prefix: layout.backup_commit_log_segment(SegmentId::new(1)),
+            })
+            .await?;
+
+        let durable_error = match db
+            .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("durable scan should surface the injected remote timeout"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_kind(durable_error, StorageErrorKind::Timeout);
+
+        Ok(())
     })
 }
 

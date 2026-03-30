@@ -73,6 +73,8 @@ pub enum WorkflowError {
     #[error(transparent)]
     Read(#[from] ReadError),
     #[error(transparent)]
+    ChangeFeed(#[from] ChangeFeedError),
+    #[error(transparent)]
     SnapshotTooOld(#[from] SnapshotTooOld),
     #[error(transparent)]
     ChangeFeed(#[from] ChangeFeedError),
@@ -98,6 +100,26 @@ pub enum WorkflowError {
     },
     #[error("workflow {name} panicked: {reason}")]
     Panic { name: String, reason: String },
+}
+
+impl WorkflowError {
+    pub fn snapshot_too_old(&self) -> Option<&SnapshotTooOld> {
+        match self {
+            Self::ChangeFeed(error) => error.snapshot_too_old(),
+            Self::SnapshotTooOld(error) => Some(error),
+            Self::CreateTable(_)
+            | Self::Read(_)
+            | Self::Storage(_)
+            | Self::TransactionCommit(_)
+            | Self::Join(_)
+            | Self::EmptyName
+            | Self::EmptyInstanceId
+            | Self::AlreadyRunning { .. }
+            | Self::SubscriptionClosed { .. }
+            | Self::Handler { .. }
+            | Self::Panic { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

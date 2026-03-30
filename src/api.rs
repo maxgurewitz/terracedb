@@ -11192,18 +11192,14 @@ mod tests {
 
     fn assert_change_feed_storage_error(
         error: ChangeFeedError,
-        kind: crate::StorageErrorKind,
-        message_fragment: &str,
-    ) {
+        expected_kind: StorageErrorKind,
+    ) -> StorageError {
         let storage = error
             .storage()
-            .expect("expected storage-backed change-feed error");
-        assert_eq!(storage.kind(), kind);
-        assert!(
-            storage.message().contains(message_fragment),
-            "expected {:?} to contain {message_fragment:?}",
-            storage.message(),
-        );
+            .cloned()
+            .expect("expected change-feed storage error");
+        assert_eq!(storage.kind(), expected_kind);
+        storage
     }
 
     fn oracle_rows(
@@ -18780,22 +18776,22 @@ mod tests {
             layout.backup_commit_log_segment(SegmentId::new(1)),
         ));
 
-        assert_change_feed_storage_error(
+        let visible_storage = assert_change_feed_storage_error(
             db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
                 .await
                 .err()
                 .expect("visible remote change-feed scan should surface a storage error"),
             crate::StorageErrorKind::Timeout,
-            "simulated timeout",
         );
-        assert_change_feed_storage_error(
+        assert!(visible_storage.message().contains("simulated timeout"));
+        let durable_storage = assert_change_feed_storage_error(
             db.scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
                 .await
                 .err()
                 .expect("durable remote change-feed scan should surface a storage error"),
             crate::StorageErrorKind::Timeout,
-            "simulated timeout",
         );
+        assert!(durable_storage.message().contains("simulated timeout"));
 
         let reopened = Db::open(config, dependencies)
             .await
@@ -19176,22 +19172,22 @@ mod tests {
             .persistent(),
         );
 
-        assert_change_feed_storage_error(
+        let visible_storage = assert_change_feed_storage_error(
             db.scan_since(&table, LogCursor::beginning(), ScanOptions::default())
                 .await
                 .err()
                 .expect("visible change-feed scan should surface a storage error"),
             crate::StorageErrorKind::Timeout,
-            "simulated timeout",
         );
-        assert_change_feed_storage_error(
+        assert!(visible_storage.message().contains("simulated timeout"));
+        let durable_storage = assert_change_feed_storage_error(
             db.scan_durable_since(&table, LogCursor::beginning(), ScanOptions::default())
                 .await
                 .err()
                 .expect("durable change-feed scan should surface a storage error"),
             crate::StorageErrorKind::Timeout,
-            "simulated timeout",
         );
+        assert!(durable_storage.message().contains("simulated timeout"));
     }
 
     #[tokio::test]
@@ -19337,6 +19333,152 @@ mod tests {
             .await
             .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn change_feed_scans_return_typed_storage_errors_for_local_commit_log_read_failures() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/cdc-local-scan-failure"),
+            dependencies(file_system.clone(), object_store),
+        )
+        .await
+        .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write durable event");
+
+        let segment_path = commit_log_segment_path("/cdc-local-scan-failure", 1);
+        file_system.inject_failure(
+            FileSystemFailure::timeout(FileSystemOperation::ReadAt, segment_path).persistent(),
+        );
+
+        let visible_error = match db
+            .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("visible change-feed scan should surface the read failure"),
+            Err(error) => error,
+        };
+        let visible_storage =
+            assert_change_feed_storage_error(visible_error, StorageErrorKind::Timeout);
+        assert!(visible_storage.message().contains("simulated timeout"));
+
+        let durable_error = match db
+            .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("durable change-feed scan should surface the read failure"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_error(durable_error, StorageErrorKind::Timeout);
+    }
+
+    #[tokio::test]
+    async fn s3_primary_change_feed_scans_return_typed_storage_errors_for_remote_segment_reads() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store.clone());
+        let config = s3_primary_config("s3-cdc-scan-failure");
+
+        let db = Db::open(config.clone(), dependencies)
+            .await
+            .expect("open s3 db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write durable event");
+        db.flush().await.expect("flush durable event");
+
+        let StorageConfig::S3Primary(s3_config) = &config.storage else {
+            panic!("test config should use s3-primary storage");
+        };
+        object_store.inject_failure(
+            ObjectStoreFailure::timeout(
+                ObjectStoreOperation::Get,
+                Db::remote_commit_log_segment_key(s3_config, SegmentId::new(1)),
+            )
+            .persistent(),
+        );
+
+        let visible_error = match db
+            .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("visible scan should surface the remote read failure"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_error(visible_error, StorageErrorKind::Timeout);
+
+        let durable_error = match db
+            .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("durable scan should surface the remote read failure"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_error(durable_error, StorageErrorKind::Timeout);
+    }
+
+    #[tokio::test]
+    async fn change_feed_scans_return_typed_storage_errors_for_corrupt_segment_frames() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+        let db = Db::open(tiered_config("/cdc-corrupt-segment"), dependencies.clone())
+            .await
+            .expect("open db");
+        let events = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        events
+            .write(b"user:1".to_vec(), bytes("v1"))
+            .await
+            .expect("write durable event");
+
+        let segment_path = commit_log_segment_path("/cdc-corrupt-segment", 1);
+        let mut corrupted = read_path(&dependencies, &segment_path)
+            .await
+            .expect("read commit-log segment");
+        corrupted[0] ^= 0x7f;
+        overwrite_file(file_system.as_ref(), &segment_path, &corrupted).await;
+
+        let visible_error = match db
+            .scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("visible scan should fail closed on corruption"),
+            Err(error) => error,
+        };
+        let visible_storage =
+            assert_change_feed_storage_error(visible_error, StorageErrorKind::Corruption);
+        assert!(
+            visible_storage.message().contains("magic")
+                || visible_storage.message().contains("checksum")
+        );
+
+        let durable_error = match db
+            .scan_durable_since(&events, LogCursor::beginning(), ScanOptions::default())
+            .await
+        {
+            Ok(_) => panic!("durable scan should fail closed on corruption"),
+            Err(error) => error,
+        };
+        assert_change_feed_storage_error(durable_error, StorageErrorKind::Corruption);
     }
 
     #[tokio::test]

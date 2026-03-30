@@ -101,6 +101,8 @@ pub enum ProjectionError {
     #[error(transparent)]
     Commit(#[from] CommitError),
     #[error(transparent)]
+    ChangeFeed(#[from] ChangeFeedError),
+    #[error(transparent)]
     Read(#[from] ReadError),
     #[error(transparent)]
     SnapshotTooOld(#[from] SnapshotTooOld),
@@ -158,6 +160,35 @@ pub enum ProjectionError {
 impl From<SubscriptionClosed> for ProjectionError {
     fn from(_: SubscriptionClosed) -> Self {
         Self::SubscriptionClosed
+    }
+}
+
+impl ProjectionError {
+    pub fn snapshot_too_old(&self) -> Option<&SnapshotTooOld> {
+        match self {
+            Self::ChangeFeed(error) => error.snapshot_too_old(),
+            Self::SnapshotTooOld(error) => Some(error),
+            Self::CreateTable(_)
+            | Self::Commit(_)
+            | Self::Read(_)
+            | Self::SubscriptionClosed
+            | Self::AlreadyRunning { .. }
+            | Self::EmptyName
+            | Self::EmptySources { .. }
+            | Self::DuplicateSource { .. }
+            | Self::Handler { .. }
+            | Self::StoppedBeforeWatermark { .. }
+            | Self::StoppedBeforeFrontier { .. }
+            | Self::Runtime { .. }
+            | Self::Panic { .. }
+            | Self::Join(_)
+            | Self::CursorCorruption { .. }
+            | Self::UnknownProjection { .. }
+            | Self::UnsupportedWaitTarget { .. }
+            | Self::DependencyCycle { .. }
+            | Self::UnsupportedRecomputation { .. }
+            | Self::Storage(_) => None,
+        }
     }
 }
 
@@ -1222,7 +1253,7 @@ async fn drain_next_ready_run(
         match scan_whole_sequence_run(&runtime.db, &source.table, source.cursor).await {
             Ok(Some(run)) => ready.push((index, run)),
             Ok(None) => {}
-            Err(ProjectionError::ChangeFeed(ChangeFeedError::SnapshotTooOld(_))) => {
+            Err(error) if error.snapshot_too_old().is_some() => {
                 snapshot_too_old_source = Some(index);
                 break;
             }
