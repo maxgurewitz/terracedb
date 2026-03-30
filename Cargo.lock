@@ -954,6 +954,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-vfs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "terracedb-workflows"
 version = "0.1.0"
 dependencies = [
