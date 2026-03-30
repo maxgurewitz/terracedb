@@ -59,10 +59,11 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 8** adds an embedded virtual filesystem library on top of Terracedb.
 - **Phase 9** adds the `terracedb-bricks` blob / large-object library on top of Terracedb.
 - **Phase 10** adds an optional Arrow-ecosystem analytical export crate on top of Terracedb.
+- **Phase 11** hardens the hybrid OLTP/OLAP path with columnar-v2 layout contracts, selective-read execution, segmented remote caching, stronger publish/recovery semantics, and a small analytically shaped example app.
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into ten mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into eleven mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -74,6 +75,7 @@ Once Phase 0 is complete, the work naturally splits into ten mostly independent 
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
 - **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
+- **Track K — hybrid-read and columnar-v2 hardening:** T48 first; T49 follows T48; then T50, T51, T53, T55, and T56 can proceed in parallel; T52 depends on T50 + T51; T54 depends on T51 + T52 + T55; T57 depends on T50 + T51 + T52 + T53 + T55 + T56; T58 depends on T52 + T53 + T54 + T55 + T56 + T57
 
 ---
 
@@ -2124,6 +2126,383 @@ Build a separate add-on crate that turns Terracedb state into analytics-friendly
 
 ---
 
+## Phase 11 — Columnar v2, hybrid read path, and performance hardening
+
+**Parallelization:** T48 first. T49 follows T48. After that, T50, T51, T53, T55, and T56 can proceed in parallel. T52 depends on T50 + T51. T54 depends on T51 + T52 + T55. T57 depends on T50 + T51 + T52 + T53 + T55 + T56. T58 depends on T52 + T53 + T54 + T55 + T56 + T57.
+
+**Phase rule:** Every task in this phase must add the related deterministic oracle extensions, cut points, and simulation coverage at the same time as the production-path change. Do not defer crash/recovery, pruning-correctness, or cache-state coverage to a later hardening-only step.
+
+**Adoption rule:** Treat T48-T53 and T55 as the universal foundation for the core engine, with T56 shipping only conservative bounded defaults. Treat T54 and T57, plus any aggressive settings introduced by T56, as incremental opt-in accelerants that must remain explicitly configurable and default-off until workload evidence justifies broader adoption.
+
+### T48. Freeze columnar-v2, scan-engine, cache, and repair contracts
+
+**Depends on:** T23b, T27
+
+**Description**
+
+Freeze the interfaces that will let the hybrid-read work fan out safely. The goal of this task is to formalize the storage, execution, cache, and recovery seams before implementation branches diverge.
+
+**Implementation steps**
+
+1. Define a versioned columnar-v2 physical model for:
+   - typed substreams,
+   - per-granule/page marks,
+   - granule-level synopsis sidecars,
+   - per-part checksums/digests, and
+   - optional sidecar artifacts such as skip indexes and projection-sidecar metadata.
+2. Freeze internal interfaces for:
+   - columnar footer/page-directory loading,
+   - row-ref batch iteration,
+   - selection-mask / survivor-set propagation,
+   - raw-byte remote segment cache lookup/fill,
+   - verify/quarantine/repair entry points, and
+   - compact-to-wide promotion policy.
+3. Decide crate ownership up front:
+   - core `terracedb` owns physical layout, scan execution, caching, checksums, and repair,
+   - `terracedb-projections` may consume planner-visible sidecar/projection hooks but does not own the physical SSTable format, and
+   - `terracedb-simulation` owns reusable workload/oracle harness helpers for this phase.
+4. Reserve explicit format/version tags and compatibility rules for:
+   - columnar-v2 base parts,
+   - synopsis sidecars,
+   - projection sidecars, and
+   - compact checksum digests embedded in manifests or other publish records.
+5. Define configuration/defaulting rules up front:
+   - bounded caches are required,
+   - zone maps are part of the base format,
+   - richer skip indexes and projection sidecars are optional,
+   - any aggressive background behavior must be tunable and default-off.
+6. Add compile-time stubs and internal placeholder types so downstream tasks can build against stable seams before the real logic exists.
+
+**Verification**
+
+- Compile-only tests that exercise all new internal interfaces and prove the core/projections/simulation crate boundaries compile without circular dependencies.
+- Round-trip tests for the version-tagged footer/header/checksum metadata shapes introduced by this phase.
+- Deterministic smoke tests proving the new scan/cache/repair stubs can be instantiated through injected dependencies without touching real I/O.
+
+---
+
+### T49. Extend deterministic simulation and oracle scaffolding for hybrid-read work
+
+**Depends on:** T33, T33c, T48
+
+**Description**
+
+Build the reusable simulation substrate for this phase before the storage and execution work lands. The point is to make later tasks add production behavior against already-existing oracle and cut-point hooks rather than bolting simulation on at the end.
+
+**Implementation steps**
+
+1. Extend the simulation framework with a reusable reference model for:
+   - visible rows by key and by scan order,
+   - projected-column reads versus full-row reads,
+   - survivor-bitmask filtering semantics, and
+   - sidecar fallback semantics when skip indexes or projection sidecars are absent or corrupt.
+2. Add crash/restart cut points for:
+   - v2 SSTable write before footer publish,
+   - per-part checksum/digest publish,
+   - remote-cache segment admission and background completion,
+   - sidecar publish before and after base-part visibility,
+   - verify/quarantine/repair transitions, and
+   - compact-to-wide promotion / replacement.
+3. Add a simulation-friendly cache reference model that can reason about:
+   - exact misses,
+   - overlapping range requests,
+   - downloader election,
+   - partial population, and
+   - cache restart/index rebuild behavior.
+4. Add reusable workload generators for:
+   - mixed point-read, short-range, projection-heavy, and remote-scan traffic,
+   - low-memory / low-cache-budget configurations,
+   - feature-disabled runs where optional accelerants remain off, and
+   - feature-enabled runs where optional accelerants are selectively turned on.
+5. Expose these helpers from the simulation crate in a way that later core/projection tasks can extend without reaching into engine-private test modules.
+
+**Verification**
+
+- Reproducibility tests proving the new hybrid-read workload and fault schedules are seed-stable.
+- Oracle smoke tests proving the reference model agrees with the current v1 row/columnar behavior before any new production logic is introduced.
+- Crash/restart harness tests proving each new cut point can be triggered and replayed without leaving the harness itself in an inconsistent state.
+- Feature-toggle tests proving optional accelerants can remain disabled without changing baseline semantics or requiring extra runtime state.
+
+---
+
+### T50. Implement columnar-v2 typed substreams and codec pipeline
+
+**Depends on:** T48, T49
+
+**Description**
+
+Replace JSON-backed column blocks with typed binary substreams while preserving the existing logical schema/default semantics. This task should establish the base physical format that later mark/granule and selective-read work will build on.
+
+**Implementation steps**
+
+1. Extend the T49 oracle/harness first to understand binary substream encoding and versioned v1/v2 read expectations.
+2. Introduce typed physical substreams for:
+   - fixed-width numeric/bool values,
+   - null/present bitmaps,
+   - offset-plus-bytes streams for variable-width values, and
+   - codec descriptors per stream.
+3. Implement the initial codec set in core:
+   - `None`,
+   - `LZ4`,
+   - `ZSTD`,
+   while leaving room for later delta/dictionary composition.
+4. Preserve existing logical default/nullability semantics at read time so schema evolution continues to fill missing fields correctly.
+5. Keep v1 read support explicit and fail-closed on unsupported v2 variants rather than silently accepting malformed bytes.
+
+**Verification**
+
+- Round-trip tests for every field type and codec combination introduced by the task.
+- Restart tests proving mixed v1/v2 SSTable sets can be reopened and read correctly where compatibility is intended.
+- Deterministic simulation tests, introduced in the same change, covering write/crash/restart at codec/footer publish cut points, low-cache-budget runs, and verifying logical reads match the oracle.
+
+---
+
+### T51. Implement marks, granules, page directories, and zone-map synopses
+
+**Depends on:** T48, T49
+
+**Description**
+
+Add the sparse page/granule layer that lets the engine prune work without loading full metadata arrays or whole column blocks. This task should establish the first planner-visible synopsis mechanism and the core structure that later skip indexes and late materialization depend on.
+
+**Implementation steps**
+
+1. Extend the T49 oracle first with expected mark/granule pruning behavior and over-read bounds.
+2. Implement per-granule/page metadata covering:
+   - sampled/first key,
+   - row start/count,
+   - sequence min/max,
+   - tombstone presence, and
+   - per-column stream offsets.
+3. Replace the current full metadata-array loading path with page-directory reads and narrow row-ref collection for point and range scans.
+4. Implement the first synopsis type as base-format zone maps / min-max summaries on configured fields.
+5. Add explicit planner interfaces for future optional skip-index and sidecar types without implementing them all here.
+
+**Verification**
+
+- Unit tests proving point reads and bounded scans only inspect the expected granules/pages.
+- Pruning tests proving zone maps exclude impossible granules without dropping valid rows.
+- Deterministic simulation tests for pruning correctness, crash/restart around granule metadata publish, fail-closed behavior on corrupt page-directory bytes, and low-memory runs that confirm the base mark directory remains usable under tight cache budgets.
+
+---
+
+### T52. Implement row-ref batch scanning, PREWHERE-lite, and late materialization
+
+**Depends on:** T49, T50, T51
+
+**Description**
+
+Add a lightweight internal scan engine that works on row-ref batches and selection masks before materializing projected values. The goal is to make selective scans cheap without importing a heavyweight general-purpose query planner.
+
+**Implementation steps**
+
+1. Extend the T49 oracle/harness first so it can compare:
+   - full materialization,
+   - projected materialization, and
+   - staged predicate-first materialization
+   for the same logical scan.
+2. Introduce internal batch/header types for row refs, projected fields, and survivor masks.
+3. Build a row-ref scan path that streams row refs/granules rather than collecting every matching key up front.
+4. Implement PREWHERE-lite:
+   - read predicate columns first,
+   - derive a survivor bitmap,
+   - fetch remaining projected columns only for survivors.
+5. Keep merge-operator-heavy keys on a safe fallback path until a batch-friendly merge resolution plan is intentionally introduced.
+
+**Verification**
+
+- Deterministic equivalence tests proving row-table and columnar-table scan results remain unchanged for the same logical workload.
+- Focused tests for all-pass, all-drop, and mixed survivor masks, including reverse scans and limits.
+- Simulation tests in the same task covering staged filtering under crash/restart, failpoints, mixed point-read/scan workloads, and constrained-cache runs that prove the optimization degrades gracefully rather than requiring a large memory floor.
+
+---
+
+### T53. Replace exact-range remote caching with segmented cache and coalesced async reads
+
+**Depends on:** T23b, T48, T49
+
+**Description**
+
+Upgrade the remote cache and read path so overlapping scans and nearby point reads share work. This task should introduce the segment/page cache state machine, downloader election, and coalesced range reading needed for S3-primary and tiered cold-read efficiency.
+
+**Implementation steps**
+
+1. Extend the T49 simulation cache model first to cover segment ownership, partial population, downloader election, and restart-time index rebuild.
+2. Replace exact-range cache records with aligned segments/pages and explicit per-segment ownership/progress states.
+3. Add a coalescing read cursor for remote reads that can:
+   - merge nearby ranges,
+   - avoid reissuing short forward seeks,
+   - prefetch ahead within a bounded budget, and
+   - background-complete partially downloaded segments.
+4. Keep raw-byte cache policy separate from decoded columnar caches and make segment admission/eviction explicit. No cache introduced by this task may be unbounded.
+5. Add startup reconciliation for cache metadata/index files so crash recovery can rebuild or discard incomplete state deterministically.
+
+**Verification**
+
+- Unit tests for overlapping range reuse, aligned-segment lookup, downloader election, and background completion semantics.
+- Restart tests proving incomplete or corrupt cache metadata is rebuilt or ignored safely.
+- Deterministic simulation and real object-store chaos tests, added with the task, covering concurrent readers, partial downloads, stale listings, timeout/retry paths, and explicit cache-budget ceilings that prove the engine stays correct when the cache is small or disabled.
+
+---
+
+### T54. Implement skip indexes and per-SSTable projection sidecars
+
+**Depends on:** T49, T51, T52, T55
+
+**Description**
+
+Add optional planner-visible sidecars that improve selective reads beyond base zone maps. This includes richer skip indexes and optional per-SSTable projection sidecars, with strict fallback semantics when sidecars are missing or corrupt. Nothing in this task should become required for the default engine profile.
+
+**Implementation steps**
+
+1. Extend the T49 oracle first with sidecar-aware pruning expectations and explicit fallback-to-base behavior.
+2. Implement additional skip-index families on top of the T51 synopsis interface, starting with:
+   - bloom-style membership summaries, and
+   - bounded set summaries where appropriate.
+3. Implement per-SSTable projection sidecar metadata and build/read paths in core, keeping them physically tied to the base SSTable lifecycle.
+4. Gate all richer skip indexes and sidecars behind explicit per-table or per-feature configuration, with default-off behavior.
+5. Expose optional planner/runtime hooks that let higher-level libraries consume these sidecars without moving physical ownership out of the core crate.
+6. Ensure sidecar corruption or absence degrades to base SSTable reads rather than causing incorrect answers or whole-table failure.
+
+**Verification**
+
+- Pruning tests proving each skip-index family can exclude work without changing results.
+- Crash/restart tests proving base parts remain readable when sidecar publish fails before or after base visibility.
+- Deterministic simulation tests, landed with the task, covering sidecar loss/corruption, rebuild/fallback, explicit disabled-by-default runs, and mixed workloads that use or ignore the sidecars.
+
+---
+
+### T55. Harden publish/recovery semantics for immutable parts and sidecars
+
+**Depends on:** T23b, T33c, T48, T49
+
+**Description**
+
+Strengthen the correctness boundary around SSTable, sidecar, and manifest publication. The goal is to make every immutable artifact publish last, verify cleanly, quarantine safely, and GC only after metadata says it is dead.
+
+**Implementation steps**
+
+1. Extend the T49 recovery harness first with cut points for temp-write, checksum publish, manifest switch, quarantine, repair, and delayed delete.
+2. Move immutable-part and sidecar publication to an explicit `temp -> finalize checksums/digests -> rename/publish -> visible` flow.
+3. Add:
+   - full per-file checksums,
+   - a compact digest embedded in manifest/publish metadata,
+   - per-part applied generation/schema-version records, and
+   - delete-as-metadata with delayed physical GC.
+4. Implement verify/quarantine/repair entry points that can:
+   - recompute checksums from storage,
+   - quarantine corrupted artifacts,
+   - repair reconstructible metadata where safe, and
+   - fail closed otherwise.
+5. Ensure sidecars follow the same visibility and quarantine model as base parts, with explicit fallback-to-base semantics.
+
+**Verification**
+
+- Crash/restart simulation matrix proving artifacts are either fully published, fully invisible, or quarantined after faults at every cut point.
+- Recovery tests proving delayed deletes do not resurrect dead state and quarantined artifacts are not served.
+- Verification-path tests proving checksum mismatch, digest mismatch, and schema/generation mismatch all fail closed and surface actionable repair states, including when optional sidecars are disabled or absent.
+
+---
+
+### T56. Add resource-efficiency primitives and adaptive backpressure for hybrid workloads
+
+**Depends on:** T16, T48, T49
+
+**Description**
+
+Add the low-level efficiency pieces needed to keep the new hybrid-read path cheap: scratch arenas/slabs, bounded scheduler budgets, and adaptive batching/backpressure for flush, compaction, offload, and prefetch work. This task should improve efficiency without raising the default memory floor or enabling aggressive background work by default.
+
+**Implementation steps**
+
+1. Extend the T49 harness first with scheduler/budget observability so fairness and forced-progress behavior can be checked deterministically.
+2. Introduce short-lived scratch allocation helpers for encode/merge/materialization hot paths without changing public semantics.
+3. Extend the scheduler API with explicit budget surfaces such as:
+   - bytes-per-second ceilings,
+   - in-flight byte/request limits, and
+   - work-class-specific concurrency caps.
+4. Add adaptive batching/timeouts for flush, offload, and prefetch work so the engine can force progress under pressure without immediately stalling all writers, but keep aggressive concurrency/prefetch settings explicit and default-off.
+5. Make any new caches or buffers introduced by this task byte-bounded and observable.
+6. Surface telemetry and table stats needed to reason about these controls without making them authoritative correctness signals.
+
+**Verification**
+
+- Unit tests for budget accounting, work-class concurrency caps, and adaptive timeout decisions.
+- Deterministic scheduler tests proving forced progress still occurs under sustained deferral.
+- Simulation tests, added in the same task, covering mixed write/scan workloads under constrained local bytes, remote prefetch pressure, compaction backlog, and default-off aggressive settings so the base profile remains low-footprint.
+
+---
+
+### T57. Implement compact-to-wide promotion and the hot-row-to-cold-columnar path
+
+**Depends on:** T50, T51, T52, T53, T55, T56
+
+**Description**
+
+Introduce the staged hybrid layout that lets TerraceDB handle small writes and point reads without giving up efficient colder columnar storage. The goal is not a single magic format, but a deliberate promotion path from write-friendly compact/hot layout to colder wide-columnar layout. This task is workload-driven and should remain opt-in until workload evidence shows it improves real mixed OLTP/OLAP cases without unacceptable complexity or resource overhead.
+
+**Implementation steps**
+
+1. Extend the T49 oracle first with promotion/replacement semantics so hot and cold representations are checked against the same logical state model.
+2. Define the compact/hot segment layout and the promotion policy boundary:
+   - when a write-friendly segment stays compact,
+   - when it promotes during flush/compaction,
+   - how replacement is published, and
+   - how point reads/scans choose between hot and cold representations.
+3. Keep the feature configurable per table so hybrid behavior can be tuned rather than forced globally, with default-off behavior until explicitly enabled.
+4. Implement compaction/promotion flows that preserve sequence ordering, visibility, and recovery semantics established in T55.
+5. Integrate the T52 scan engine so point reads and short scans can exploit the hot path while longer analytical scans benefit from wide-columnar storage.
+
+**Verification**
+
+- Mixed-workload tests proving hot and cold representations return identical logical results through promotion and replacement.
+- Restart tests proving promotion artifacts do not become visible early and old compact state is not resurrected after crashes.
+- Deterministic simulation suites, landed with the task, covering point-read-heavy, scan-heavy, and mixed hybrid workloads across flush, compaction, promotion, offload, and recovery, plus explicit disabled-by-default runs that prove the base engine does not depend on this feature.
+
+---
+
+### T58. Build a tiny telemetry example app for the hybrid OLTP/OLAP path
+
+**Depends on:** T49, T52, T53, T54, T55, T56, T57
+
+**Description**
+
+Add a sibling example to `examples/todo-api` that is as small and teachable as the TODO app but analytically shaped. The example should show a basic hybrid application: point-write and point-read current device state plus filtered historical scans over a columnar telemetry table. It should exercise the universal Phase 11 foundation by default, and optionally enable the T54/T57 accelerants via explicit configuration rather than making them mandatory.
+
+**Implementation steps**
+
+1. Extend the T49 simulation/oracle helpers first with an example-oriented telemetry workload model and app-level invariants before the example implementation branches from the engine work.
+2. Create `examples/telemetry-api` with a minimal HTTP surface and README, using the TODO example's structure as a template but keeping the data model focused on hybrid reads:
+   - a row-oriented or hot `device_state` table keyed by device,
+   - a historical `sensor_readings` table configured for columnar-v2 scans, and
+   - typed request/response shapes and table helpers so the example stays approachable.
+3. Add the smallest API that still exercises the new read path:
+   - ingest one or a small batch of readings,
+   - fetch the latest state for one device,
+   - run a filtered time-window scan with caller-selected projected columns, and
+   - run one simple analytical endpoint such as alert counts or min/max/avg over a window, implemented on top of the scan path rather than a separate query engine.
+4. Configure the default example profile to demonstrate the universal Phase 11 path:
+   - binary columnar-v2 encoding,
+   - marks/granules with base zone maps,
+   - PREWHERE-lite and late materialization on filterable fields,
+   - segmented remote caching in a tiered or S3-primary simulation profile, and
+   - publish/recovery and bounded-budget defaults.
+5. Add an explicit accelerator profile for the same example workload that can opt into:
+   - richer skip indexes or projection sidecars from T54,
+   - compact-to-wide promotion from T57, and
+   - any non-default T56 knobs needed for side-by-side evaluation,
+   while keeping the base profile authoritative and fully supported when the accelerants are off.
+6. Document clearly which endpoints and workload patterns exercise which engine features, and call out which behaviors are default versus opt-in.
+
+**Verification**
+
+- End-to-end deterministic simulation tests, added in the same task, covering base-profile ingest, point reads, filtered scans, and the analytical endpoint with seed-stable results.
+- Low-memory and low-cache-budget simulation runs proving the default example profile still behaves correctly without requiring a large memory floor.
+- Remote cold-read and restart simulations proving segmented cache reuse, publish/recovery correctness, and crash-safe reopen behavior for the telemetry workload.
+- Equivalence tests proving the accelerator profile returns the same logical answers as the base profile while richer skip indexes, sidecars, and hot-to-cold promotion are enabled.
+- Fallback simulations proving disabled, missing, or corrupt accelerants degrade to the base path rather than breaking the example or changing results.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
@@ -2220,6 +2599,28 @@ At this point the system should additionally support:
 - snapshot and incremental derived exports for external analytics tooling,
 - analytics-friendly Parquet-or-Arrow objects stored under dedicated export prefixes, and
 - a clean separation between authoritative Terracedb backups and disposable analytical exports.
+
+### Milestone J — Hybrid columnar-v2 and selective-read hardening
+Complete: T48–T57
+
+At this point the system should additionally support:
+- a formalized columnar-v2 contract with stable internal seams for format, scan, cache, and repair work,
+- typed binary columnar substreams with an initial codec pipeline,
+- sparse marks/granules and zone-map pruning,
+- batch-based selective-read execution with PREWHERE-lite and late materialization,
+- segmented remote caching with coalesced async reads and downloader election,
+- immutable publish-last parts and sidecars with checksums, digests, quarantine, and repair paths,
+- adaptive resource budgets and backpressure for mixed OLTP/OLAP pressure with conservative bounded defaults, and
+- optional richer skip indexes, sidecars, and hot-row/compact-to-cold-columnar promotion paths that remain explicitly configurable rather than mandatory for the base engine profile.
+
+### Milestone K — Hybrid telemetry example app
+Complete: T58
+
+At this point the system should additionally support:
+- a small `telemetry-api` example that pairs point-read device state with historical columnar scans,
+- a default example profile that demonstrates the universal Phase 11 features without turning on optional accelerants,
+- an explicit accelerator profile that can enable richer skip indexes, sidecars, and hot-to-cold promotion without changing logical answers, and
+- deterministic end-to-end simulation coverage for ingest, filtered scans, cold remote reads, restart/fault handling, and low-footprint operation for the example workload.
 
 ---
 
