@@ -20,9 +20,8 @@ use terracedb::{
     TransactionCommitError, Value,
 };
 use terracedb_projections::{
-    ProjectionContext, ProjectionError, ProjectionHandle, ProjectionHandler,
-    ProjectionHandlerError, ProjectionRuntime, ProjectionTransaction, RecomputeStrategy,
-    SingleSourceProjection,
+    ProjectionError, ProjectionHandle, ProjectionHandlerError, ProjectionRuntime,
+    RankedMaterializedProjection, RecomputeStrategy, SingleSourceProjection,
 };
 use terracedb_relays::{OutboxRelay, OutboxRelayError, OutboxRelayHandler, RelayEntry};
 use terracedb_workflows::{
@@ -194,10 +193,16 @@ impl TodoApp {
                 SingleSourceProjection::new(
                     RECENT_PROJECTION_NAME,
                     tables.todos.clone(),
-                    RecentTodosProjection {
-                        todos: tables.todos.clone(),
-                        recent_todos: tables.recent_todos.clone(),
-                    },
+                    RankedMaterializedProjection::new(
+                        tables.todos.clone(),
+                        tables.recent_todos.clone(),
+                        RECENT_SLOT_COUNT,
+                        decode_ranked_recent_todo,
+                        rank_recent_todo,
+                        tie_break_recent_todo,
+                        recent_slot_for_todo,
+                        encode_ranked_recent_todo,
+                    ),
                 )
                 .with_outputs([tables.recent_todos.clone()])
                 .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
@@ -536,6 +541,10 @@ fn recent_slot_key(slot: usize) -> Key {
     format!("{slot:02}").into_bytes()
 }
 
+fn recent_slot_for_todo(slot: usize, _todo: &TodoRecord) -> Key {
+    recent_slot_key(slot)
+}
+
 fn encode_json_value<T: Serialize>(value: &T) -> Result<Value, serde_json::Error> {
     Ok(Value::bytes(serde_json::to_vec(value)?))
 }
@@ -568,14 +577,25 @@ async fn collect_todos(mut stream: terracedb::KvStream) -> Result<Vec<TodoRecord
     Ok(todos)
 }
 
-fn sort_recent_todos(todos: &mut [TodoRecord]) {
-    todos.sort_by(|left, right| {
-        right
-            .updated_at_ms
-            .cmp(&left.updated_at_ms)
-            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
-            .then_with(|| left.todo_id.cmp(&right.todo_id))
-    });
+fn decode_ranked_recent_todo(
+    _source_key: Vec<u8>,
+    value: Value,
+) -> Result<Option<TodoRecord>, ProjectionHandlerError> {
+    Ok(Some(
+        decode_json_value(&value, "todo record").map_err(ProjectionHandlerError::new)?,
+    ))
+}
+
+fn rank_recent_todo(todo: &TodoRecord) -> (u64, u64) {
+    (todo.updated_at_ms, todo.created_at_ms)
+}
+
+fn tie_break_recent_todo(todo: &TodoRecord) -> String {
+    todo.todo_id.clone()
+}
+
+fn encode_ranked_recent_todo(todo: &TodoRecord) -> Result<Value, ProjectionHandlerError> {
+    encode_json_value(todo).map_err(ProjectionHandlerError::new)
 }
 
 fn sort_list_todos(todos: &mut [TodoRecord]) {
@@ -587,50 +607,6 @@ fn sort_list_todos(todos: &mut [TodoRecord]) {
             .then_with(|| left.todo_id.cmp(&right.todo_id))
     });
 }
-
-struct RecentTodosProjection {
-    todos: Table,
-    recent_todos: Table,
-}
-
-#[async_trait]
-impl ProjectionHandler for RecentTodosProjection {
-    async fn apply_with_context(
-        &self,
-        _run: &terracedb_projections::ProjectionSequenceRun,
-        ctx: &ProjectionContext,
-        tx: &mut ProjectionTransaction,
-    ) -> Result<(), ProjectionHandlerError> {
-        let mut todos = collect_todos(
-            ctx.scan(
-                &self.todos,
-                FULL_SCAN_START.to_vec(),
-                FULL_SCAN_END.to_vec(),
-                ScanOptions::default(),
-            )
-            .await?,
-        )
-        .await
-        .map_err(ProjectionHandlerError::new)?;
-        sort_recent_todos(&mut todos);
-
-        for slot in 0..RECENT_SLOT_COUNT {
-            let key = recent_slot_key(slot);
-            if let Some(todo) = todos.get(slot) {
-                tx.put(
-                    &self.recent_todos,
-                    key,
-                    encode_json_value(todo).map_err(ProjectionHandlerError::new)?,
-                );
-            } else {
-                tx.delete(&self.recent_todos, key);
-            }
-        }
-
-        Ok(())
-    }
-}
-
 struct WeeklyPlannerWorkflow {
     schedule: PlannerSchedule,
 }
