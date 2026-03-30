@@ -9473,9 +9473,11 @@ mod tests {
         PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key,
         encode_mvcc_key, read_path,
     };
-    use crate::simulation::{PointMutation, ShadowOracle};
+    use crate::simulation::{
+        CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
+    };
     use crate::{
-        ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, CutPoint, DbConfig,
+        ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
         DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
         FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
         ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
@@ -9484,7 +9486,6 @@ mod tests {
         SsdConfig, StorageConfig, StorageError, StubClock, StubObjectStore, StubRng, TableConfig,
         TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
         TieredStorageConfig, Timestamp, TtlCompactionFilter, Value,
-        SeededSimulationRunner, TraceEvent,
     };
 
     fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {

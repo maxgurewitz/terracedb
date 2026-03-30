@@ -1074,6 +1074,50 @@ fn db_merge_simulation_changes_shape_for_different_seeds() -> turmoil::Result {
 }
 
 #[test]
+fn db_merge_simulation_seed_campaign_is_reproducible() -> turmoil::Result {
+    let config = DbSimulationScenarioConfig {
+        root_path: "/terracedb/sim/db-seeded-campaign".to_string(),
+        tables: vec![SimulationTableSpec::merge_row(
+            "events",
+            SimulationMergeOperatorId::AppendBytes,
+            Some(2),
+        )],
+        steps: 20,
+        key_count: 4,
+        max_payload_len: 8,
+    };
+    let seeds = [0x5101_u64, 0x5102, 0x5103];
+
+    let first_pass = seeds
+        .into_iter()
+        .map(|seed| {
+            SeededSimulationRunner::new(seed)
+                .run_db_generated(config.clone())
+                .map(|outcome| (seed, outcome))
+        })
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+    let second_pass = seeds
+        .into_iter()
+        .map(|seed| {
+            SeededSimulationRunner::new(seed)
+                .run_db_generated(config.clone())
+                .map(|outcome| (seed, outcome))
+        })
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+
+    assert_eq!(first_pass, second_pass);
+    assert!(
+        first_pass.values().all(|outcome| outcome
+            .trace
+            .iter()
+            .any(|event| matches!(event, TraceEvent::DbStepResult { .. }))),
+        "every generated campaign run should record db step results"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn db_merge_simulation_recovers_after_crash_following_read_triggered_collapse() -> turmoil::Result {
     let scenario = DbGeneratedScenario {
         seed: 0xfeed,
