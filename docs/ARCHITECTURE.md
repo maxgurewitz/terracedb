@@ -6,7 +6,7 @@ An embedded database library (not a server) built on LSM tree fundamentals. The 
 
 All I/O, time, and randomness are abstracted behind traits, enabling deterministic simulation testing in the style of FoundationDB. The engine is verified via large-scale randomized scenario generation with fault injection and invariant checking, reproducible from a seed.
 
-Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns both libraries use (Part 2), then the projection library (Part 3) and workflow library (Part 4).
+Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, and embedded virtual filesystems — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), and an embedded virtual filesystem library (Part 5).
 
 ### Load-Bearing Decisions
 
@@ -19,9 +19,11 @@ These are the architectural choices that most constrain the rest of the design:
 - **Colocated derived state is synchronous** (one `WriteBatch`). Cross-entity derived state is asynchronous via `scanSince` with notification-driven consistency (`subscribe` + `waitForWatermark`).
 - **Projections are deterministic state updaters with read access.** They declare output writes; they do not cause side effects or commit their own batches.
 - **Workflows are stateful orchestrators with side effects.** They use the outbox pattern for at-least-once external delivery and durable timers for scheduling.
+- **Embedded virtual filesystems are libraries, not engine modes.** Their current-state filesystem/KV/tool rows live in ordinary tables; timelines and watchers are layered on top of append-only activity rows and change capture.
+- **Virtual filesystem compatibility is semantic, not SQLite-format compatibility.** The goal is to provide an in-process virtual filesystem/KV/tool model on Terracedb, not SQL, a single-file transport format, or SQLite WAL behavior.
 - **Event sourcing is recommended** for data that drives history-dependent projections. Mutable-record projections cannot be safely recomputed from SSTables after `SnapshotTooOld`.
 - **Tokio is the sole runtime.** io_uring is an optional backend optimization behind the `FileSystem` trait, not a semantic requirement.
-- **Deterministic simulation testing** covers the full stack — DB, projections, and workflows — via injected I/O traits, virtual clock, and seeded PRNG.
+- **Deterministic simulation testing** covers the full stack — DB, projections, workflows, and higher-level libraries such as the embedded virtual filesystem layer — via injected I/O traits, virtual clock, and seeded PRNG.
 
 Note on examples: Code snippets in this document are written in TypeScript-style pseudocode for readability and to make control flow and APIs easier to follow. They are not intended as literal implementation code. The actual implementation is expected to be written in Rust, and the examples should be read as illustrating semantics, invariants, and library boundaries rather than exact syntax or concrete type signatures.
 
@@ -1873,11 +1875,11 @@ The same framework should also support simulated external hosts (for callback en
 
 # Part 2: Composition Patterns
 
-Building blocks used by the projection library, the workflow library, and application code directly. These patterns are implemented in user space on top of core DB primitives. The engine does not know about transactions, views, windows, timers, or events — these are conventions built using tables, writes, scans, batches, snapshots, and sequence numbers.
+Building blocks used by the projection library, the workflow library, the embedded virtual filesystem library, and application code directly. These patterns are implemented in user space on top of core DB primitives. The engine does not know about transactions, views, windows, timers, events, or filesystems — these are conventions built using tables, writes, scans, batches, snapshots, and sequence numbers.
 
 These patterns fall into two categories based on data locality: **colocated** patterns update source and derived data in the same `WriteBatch` (fast, immediate consistency), while **cross-entity** patterns propagate changes asynchronously via `subscribe` + `scanSince` (flexible, eventually consistent with notification-driven read-after-write). Where relevant, each pattern notes which category it falls into.
 
-**Note on pseudocode:** examples in Parts 2–4 use `await` on DB operations to reflect the async API, but omit `Result` unwrapping for brevity. All engine operations return `Promise<Result<...>>` types; the `Result` unwrapping is implicit. Sequence numbers used as watermarks are **visibility** markers unless the library explicitly consumes the durable stream (`scanDurableSince` / `subscribeDurable`). Authoritative consumers in Parts 3 and 4 use the durable stream; best-effort maintenance may use the visible stream.
+**Note on pseudocode:** examples in Parts 2–5 use `await` on DB operations to reflect the async API, but omit `Result` unwrapping for brevity. All engine operations return `Promise<Result<...>>` types; the `Result` unwrapping is implicit. Sequence numbers used as watermarks are **visibility** markers unless the library explicitly consumes the durable stream (`scanDurableSince` / `subscribeDurable`). Authoritative consumers in Parts 3, 4, and the durable surfaces described in Part 5 use the durable stream; best-effort maintenance may use the visible stream.
 
 ---
 
@@ -3338,3 +3340,277 @@ const orderWorkflow: WorkflowHandler = {
 ```
 
 Timers are identified by explicit keys (e.g., `payment-timeout:{orderId}`), stored in the workflow state, and cancelled by key. An empty `timers` array means "no timer changes," not "cancel all timers."
+
+---
+
+# Part 5: Embedded Virtual Filesystem Library
+
+This part describes a separate library, tentatively `terracedb-vfs`, that provides an embedded virtual filesystem on top of Terracedb rather than SQLite. The intended use is narrow: embed a virtual filesystem inside the Rust process, expose it to an AI agent or agent runtime, and persist its state with the same durability, queryability, and deterministic-testing model as the rest of Terracedb.
+
+The compatibility target is semantic, not storage-format-level. The goal is to preserve the behavior that matters to an in-process agent sandbox: a POSIX-like virtual filesystem, a small JSON key-value store, tool-run history, point-in-time views, and cheap copy-on-write sandboxes. SQL compatibility, a single-file transport unit, and byte-for-byte reuse of the SQLite schema are explicitly out of scope.
+
+## Goals and Non-Goals
+
+`terracedb-vfs` should preserve the following externally visible properties:
+
+- a POSIX-like virtual filesystem with inode/dentry semantics, root inode `1`, hard links, symlinks, per-inode metadata, and chunked file content,
+- immediate read-after-write for current filesystem state inside the same process,
+- append-only semantic activity records for filesystem mutations, KV mutations, and tool-run lifecycle events,
+- point-in-time snapshots for reproducible reads and durable clone/export flows for long-lived reproduction,
+- copy-on-write overlays for per-agent or per-session sandboxes, and
+- portability across Terracedb storage modes instead of a SQLite-specific sync story.
+
+Version 1 is intentionally narrower than the full space of mountable/networked virtual filesystem systems:
+
+- no FUSE, NFS, MCP, HTTP, CLI, or daemon/service boundary,
+- no host-filesystem mount surface or kernel-facing inode/handle contract,
+- no promise to emulate every open-file-handle nuance needed by OS mount adapters,
+- no SQL compatibility or SQLite WAL/file-format compatibility,
+- no assumption that portability means `cp agent.db`.
+
+The public surface is therefore path-oriented and embedded-library-first. Internally the implementation still uses inode/dentry tables, but callers do not need a separate mount-oriented API to use the library inside a Rust process.
+
+## Load-Bearing Decisions
+
+These decisions most constrain the design:
+
+- **One Terracedb DB may host many virtual filesystem volumes.** Every reserved table is keyed by `volume_id` first. Deployments that want one agent per DB can still do that by using exactly one volume.
+- **Current-state tables are authoritative for reads.** `stat`, `readdir`, `readFile`, KV lookups, and current tool-run status read directly from current-state rows, not from asynchronously maintained projections.
+- **Every logical mutation is one OCC unit.** Namespace changes, inode updates, chunk rewrites, whiteout/origin updates, KV changes, tool-run status changes, and activity-row insertion commit together.
+- **Activity is append-only and volume-ordered.** Each volume owns a monotonic `activity_id` allocator so scans over `vfs_activity` reproduce a stable semantic order.
+- **Snapshots are short-lived; clones are explicit.** Request-scoped snapshots use MVCC. Long-lived reproduction uses clone/export data, not unbounded snapshot pinning.
+- **Overlay bases are explicit read-only virtual filesystem cuts.** Version 1 overlays sit on top of another read-only virtual filesystem snapshot or clone, not an arbitrary host filesystem adapter.
+- **`fsync` remains meaningful.** Visible state may lead durable state in deferred modes; `fsync` and volume `flush()` are explicit durability fences over Terracedb `flush()`.
+
+## Public Surface
+
+The library exposes one embedded API surface:
+
+```typescript
+interface AgentFsConfig {
+  volumeId: string
+  chunkSize?: number          // immutable after volume creation
+  createIfMissing?: boolean
+}
+
+interface AgentFsStore {
+  openVolume(config: AgentFsConfig): Promise<AgentFsVolume>
+  cloneVolume(source: { volumeId: string, durable?: boolean }, target: AgentFsConfig): Promise<AgentFsVolume>
+  createOverlay(base: AgentFsSnapshot, target: AgentFsConfig): Promise<AgentFsOverlay>
+}
+
+interface AgentFsVolume {
+  fs: AgentFileSystem
+  kv: AgentKvStore
+  tools: AgentToolRuns
+
+  snapshot(opts?: { durable?: boolean }): Promise<AgentFsSnapshot>
+  activitySince(cursor: LogCursor, opts?: { durable?: boolean }): Promise<AsyncIterator<ActivityEntry>>
+  subscribeActivity(opts?: { durable?: boolean }): Receiver<SequenceNumber>
+
+  flush(): Promise<void>
+}
+
+interface AgentFsOverlay extends AgentFsVolume {
+  base: AgentFsSnapshot
+}
+
+interface AgentFsSnapshot {
+  sequence: SequenceNumber
+  fs: ReadOnlyAgentFileSystem
+  kv: ReadOnlyAgentKvStore
+  tools: ReadOnlyAgentToolRuns
+}
+
+interface AgentFileSystem {
+  stat(path: string): Promise<Stats | null>
+  lstat(path: string): Promise<Stats | null>
+  readFile(path: string): Promise<bytes | null>
+  pread(path: string, offset: u64, len: u64): Promise<bytes | null>
+  writeFile(path: string, data: bytes, opts?: CreateOptions): Promise<void>
+  pwrite(path: string, offset: u64, data: bytes): Promise<void>
+  truncate(path: string, size: u64): Promise<void>
+  mkdir(path: string, opts?: MkdirOptions): Promise<void>
+  readdir(path: string): Promise<DirEntry[]>
+  readdirPlus(path: string): Promise<DirEntryPlus[]>
+  rename(from: string, to: string): Promise<void>
+  link(from: string, to: string): Promise<void>
+  symlink(target: string, linkpath: string): Promise<void>
+  readlink(path: string): Promise<string>
+  unlink(path: string): Promise<void>
+  rmdir(path: string): Promise<void>
+  fsync(path?: string): Promise<void>
+}
+
+interface AgentKvStore {
+  get<T>(key: string): Promise<T | null>
+  set<T>(key: string, value: T): Promise<void>
+  delete(key: string): Promise<void>
+  listKeys(): Promise<string[]>
+}
+
+interface AgentToolRuns {
+  start(name: string, params?: Json): Promise<ToolRunId>
+  success(id: ToolRunId, result?: Json): Promise<void>
+  error(id: ToolRunId, error: string): Promise<void>
+  recordCompleted(input: CompletedToolRun): Promise<ToolRunId>
+  get(id: ToolRunId): Promise<ToolRun | null>
+  recent(limit?: number): Promise<ToolRun[]>
+}
+```
+
+This surface is intentionally enough to embed a virtual filesystem in-process and hand a constrained capability to an agent runtime. It does not try to be a kernel-facing mount API.
+
+## Volume Model and Reserved Tables
+
+Version 1 should use row tables only. Filesystem operations are dominated by point lookups and prefix scans over small keys, while file content is naturally represented as fixed-size blob chunks.
+
+All reserved keys begin with `volume_id`, which lets one DB host many isolated agent volumes without engine changes.
+
+### Current-State Tables
+
+| Table | Key shape | Purpose |
+|---|---|---|
+| `vfs_volume` | `(volume_id)` | Volume metadata: immutable `chunk_size`, format version, creation time, root inode, optional overlay base descriptor |
+| `vfs_allocator` | `(volume_id, kind)` | Persisted high-water marks for `ino`, `activity_id`, and `tool_run_id` block leasing |
+| `vfs_inode` | `(volume_id, ino)` | Current inode metadata: `mode`, `nlink`, `uid`, `gid`, `size`, timestamps, nanoseconds, `rdev` |
+| `vfs_dentry` | `(volume_id, parent_ino, name)` | Directory entry mapping from parent/name to child inode |
+| `vfs_chunk` | `(volume_id, ino, chunk_index)` | Current file bytes in fixed-size chunks |
+| `vfs_symlink` | `(volume_id, ino)` | Symlink target text |
+| `vfs_kv` | `(volume_id, key)` | Current JSON-serialized KV entries |
+| `vfs_tool_run` | `(volume_id, tool_run_id)` | Current tool-run row (`pending`, `success`, `error`, timestamps, params/result/error) |
+| `vfs_whiteout` | `(volume_id, path)` | Overlay whiteouts keyed by normalized path |
+| `vfs_origin` | `(volume_id, delta_ino)` | Copy-up provenance: which base volume/snapshot/inode a delta inode originated from |
+
+Notes:
+
+- `scanPrefix((volume_id, parent_ino))` over `vfs_dentry` is the primitive behind `readdir`.
+- `scan((volume_id, ino, first_chunk), (volume_id, ino, last_chunk + 1))` over `vfs_chunk` is the primitive behind `pread`.
+- root inode is always `1` inside a volume,
+- empty files have an inode row and no chunk rows.
+
+### Append-Only and Derived Tables
+
+| Table | Key shape | Purpose |
+|---|---|---|
+| `vfs_activity` | `(volume_id, activity_id)` | Append-only semantic audit stream for filesystem, KV, and tool mutations |
+| `vfs_tool_stats` | projection-owned | Optional derived per-tool counters and durations |
+| `vfs_volume_usage` | projection-owned | Optional derived file/dir/chunk counts and logical byte usage |
+
+`vfs_activity` is the authoritative history source for timelines and analytics. Projection tables are disposable read models rebuilt from it. Current-state tables such as `vfs_inode` and `vfs_chunk` must not be treated as historical truth after MVCC GC.
+
+## Filesystem Semantics
+
+### Snapshot-Consistent Reads
+
+Every multi-step read operation runs against one Terracedb snapshot:
+
+- `stat(path)` resolves the path and loads the inode in one cut,
+- `readdirPlus(path)` resolves the directory and reads child dentries/inodes in one cut,
+- `readFile(path)` resolves the inode and scans chunk rows in one cut.
+
+This avoids mixed-version results when concurrent writers modify the same directory or file.
+
+### Namespace and Metadata Mutations
+
+Every logical filesystem operation is one OCC transaction:
+
+1. take a snapshot,
+2. resolve the affected path(s) and parent directories in that snapshot,
+3. add the relevant read dependencies,
+4. stage all current-state row changes plus one semantic `vfs_activity` row,
+5. commit once.
+
+This same pattern applies to `mkdir`, `writeFile`, `rename`, `unlink`, `rmdir`, `link`, `symlink`, `truncate`, and `pwrite`. Current state and audit history therefore become visible together.
+
+### Chunked File I/O and Durability
+
+File content lives in `vfs_chunk` as fixed-size chunks. `chunk_size` is immutable per volume and chosen at volume creation time.
+
+Design notes:
+
+- small random writes rewrite only the touched chunk rows plus the inode row,
+- `truncate` that shrinks a file deletes chunks above the new EOF and trims the final partial chunk in the same commit,
+- writes past EOF create logical holes that read back as zeroes without requiring eager gap materialization,
+- chunk size is a volume policy, not an engine global.
+
+Ordinary mutations follow the DB's configured visibility rules. `fsync(path?)` and `volume.flush()` are explicit durability fences over Terracedb `flush()` and durable-sequence tracking.
+
+## Key-Value and Tool Services
+
+The embedded library keeps the same three high-level surfaces that make a virtual filesystem useful to agent runtimes: filesystem state, KV state, and tool-run history.
+
+### Key-Value State
+
+`vfs_kv` is a simple current-state table:
+
+- `set(key, value)` writes or overwrites the current JSON value and appends `kv_set` activity,
+- `delete(key)` removes the current row and appends `kv_delete` activity,
+- `listKeys()` is a prefix scan over `(volume_id, *)`.
+
+### Tool-Run Tracking
+
+The tool surface supports both common patterns:
+
+1. a two-step lifecycle where `start()` creates a pending run and `success()` or `error()` finalizes it,
+2. a one-shot `recordCompleted()` path for callers that already have the terminal record.
+
+`vfs_tool_run` stores current state. `vfs_activity` stores the immutable audit trail (`tool_started`, `tool_succeeded`, `tool_failed`) that later projections and debugging tools consume.
+
+## Snapshots, Clones, and Overlays
+
+### Point-in-Time Views
+
+`AgentFsSnapshot` is the lightweight "show me the exact state at a cut" mechanism. It is appropriate for request-scoped inspection, debugger-style reads, consistent multi-step operations, and one-shot exports.
+
+Because engine snapshots pin MVCC GC, callers should treat `AgentFsSnapshot` like any other short-lived database snapshot.
+
+### Durable Cloning and Export
+
+Long-lived reproduction is done by copying data, not by pinning snapshots indefinitely.
+
+Two deployment styles are expected:
+
+1. **one volume per DB**: use DB-level backup, restore, clone, or checkpoint flows,
+2. **many volumes per DB**: export or clone the reserved `vfs_*` keyspace for one `volume_id`.
+
+This replaces the SQLite-era "copy the database file" story with a Terracedb-native equivalent.
+
+### Embedded Copy-on-Write Overlays
+
+Overlay mode is modeled as a writable delta volume in front of a read-only virtual filesystem snapshot.
+
+Lookup order is:
+
+1. if the path exists in the delta volume, return the delta entry,
+2. else if the path is whiteouted in `vfs_whiteout`, return not found,
+3. else if the path exists in the base snapshot, return the base entry,
+4. else return not found.
+
+Directory listing merges delta dentries with base dentries and excludes whiteouted names.
+
+On first mutation of a base-resident file or directory, the overlay performs copy-up into the delta volume. `vfs_origin` records which base entry was copied so later mutations and debugging can reason about provenance. Because version 1 is embedded-only and path-oriented, this provenance exists for correctness and observability, not to promise stable kernel-facing inode numbers.
+
+## Queryability and Watchers
+
+Terracedb-backed virtual filesystem support preserves queryability, but the surface is explicit:
+
+- current state is inspected through direct library reads and reserved-table scans,
+- history and recent activity come from `vfs_activity`,
+- analytics such as per-tool stats or volume usage are projections over `vfs_activity`.
+
+The activity tail should expose both visible and durable variants:
+
+- visible for low-latency local follow modes,
+- durable for authoritative export, audit, or workflow triggers.
+
+Because `vfs_activity` is an ordinary Terracedb table, the projection and workflow machinery from Parts 3 and 4 can be reused above the filesystem without coupling filesystem correctness to those async consumers.
+
+## Storage Modes and Deterministic Testing
+
+The embedded virtual filesystem layer does not need its own replication or sync protocol. It inherits the enclosing DB's storage mode:
+
+- in tiered mode, current-state rows and activity rows behave like any other Terracedb tables, with cold SSTables offloaded automatically,
+- in s3-primary or deferred-durability configurations, visible state may lead durable state until flush boundaries.
+
+This library should inherit the same deterministic testing bar as the rest of the stack. The simulation target is the real filesystem/KV/tool/overlay code. The shadow model needs to cover directories, inode link counts, file bytes, whiteouts, origin mappings, KV state, tool-run lifecycle state, and activity-prefix correctness across crash and restart.
