@@ -112,4 +112,6 @@ include!("table.rs");
 include!("snapshot.rs");
 include!("util.rs");
 #[cfg(test)]
+mod property_tests;
+#[cfg(test)]
 mod tests;

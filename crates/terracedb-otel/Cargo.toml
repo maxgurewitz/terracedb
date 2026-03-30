@@ -21,3 +21,4 @@ tracing-subscriber = { version = "0.3.19", features = ["registry", "std"] }
 [dev-dependencies]
 async-trait = "0.1.89"
 futures = "0.3.31"
+insta = { workspace = true }

@@ -5,8 +5,8 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-echo "Running cargo test..."
-cargo test
+echo "Running cargo test --workspace..."
+cargo test --workspace
 
 echo "Running cargo fmt --check..."
 cargo fmt --all -- --check

@@ -840,6 +840,7 @@ mod tests {
 
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::{
@@ -973,6 +974,61 @@ mod tests {
             "tenant-a/db-01/cold/table-000009/0000/00000000000000000044-00000000000000000088/SST-000123.sst"
         );
         assert_eq!(layout.cold_prefix(), "tenant-a/db-01/cold");
+    }
+
+    proptest! {
+        #[test]
+        fn object_key_layout_trims_boundary_slashes_without_creating_double_separators(
+            segments in prop::collection::vec("[a-z0-9-]{1,8}", 0..4),
+            manifest_generation in any::<u64>(),
+            segment_id in any::<u64>(),
+            table_id in 1_u32..1000,
+            shard in any::<u16>(),
+            min_sequence in any::<u64>(),
+            span in 0_u64..1024,
+            local_id in "[A-Z0-9-]{1,16}",
+        ) {
+            let logical_prefix = segments.join("/");
+            let normalized = ObjectKeyLayout::new(&S3Location {
+                bucket: "bucket".to_string(),
+                prefix: logical_prefix.clone(),
+            });
+            let slashed = ObjectKeyLayout::new(&S3Location {
+                bucket: "bucket".to_string(),
+                prefix: format!("/{logical_prefix}/"),
+            });
+            let max_sequence = min_sequence.saturating_add(span);
+
+            let normalized_keys = [
+                normalized.backup_manifest(ManifestId::new(manifest_generation)),
+                normalized.backup_commit_log_segment(SegmentId::new(segment_id)),
+                normalized.backup_sstable(TableId::new(table_id), shard as u32, &local_id),
+                normalized.cold_sstable(
+                    TableId::new(table_id),
+                    shard as u32,
+                    SequenceNumber::new(min_sequence),
+                    SequenceNumber::new(max_sequence),
+                    &local_id,
+                ),
+            ];
+            let slashed_keys = [
+                slashed.backup_manifest(ManifestId::new(manifest_generation)),
+                slashed.backup_commit_log_segment(SegmentId::new(segment_id)),
+                slashed.backup_sstable(TableId::new(table_id), shard as u32, &local_id),
+                slashed.cold_sstable(
+                    TableId::new(table_id),
+                    shard as u32,
+                    SequenceNumber::new(min_sequence),
+                    SequenceNumber::new(max_sequence),
+                    &local_id,
+                ),
+            ];
+
+            prop_assert_eq!(normalized_keys.as_slice(), slashed_keys.as_slice());
+            for key in &normalized_keys {
+                prop_assert!(!key.contains("//"));
+            }
+        }
     }
 
     #[tokio::test]

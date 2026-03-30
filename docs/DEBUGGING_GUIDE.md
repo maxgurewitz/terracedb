@@ -238,6 +238,42 @@ Terracedb's main simulation path usually goes through its own
 `SimulatedFileSystem`, so in this repo custom Terracedb-specific trigger types
 will often be more useful than the built-in Turmoil ones.
 
+## Property, Matrix, And Snapshot Tests
+
+Terracedb now uses three complementary test tools alongside the larger
+deterministic simulation suites:
+
+- Use `proptest` for low-level semantic invariants where broad input coverage
+  and shrinking matter more than a single hand-written example. Current uses
+  include MVCC ordering, commit-log frame round-trips, watermark monotonicity,
+  and object-layout normalization.
+- Use `rstest` for explicit mode matrices where the behavior should stay the
+  same across a small set of storage, durability, format, or placement modes.
+  Keep the case list readable instead of open-ended.
+- Use `insta` only for stable, structured outputs that humans review well in a
+  diff, such as normalized telemetry/span or metric shapes. Do not use snapshot
+  assertions as a substitute for durable byte-format fixtures.
+
+That split matters: durable-format compatibility and byte-for-byte storage
+contracts still belong to the T23a-style golden fixtures and direct format
+assertions. `insta` in this repo is for semantic and observability shapes, not
+for on-disk or object-store compatibility promises.
+
+### Reproducing Shrunk Property Failures
+
+When a property test fails, the usual loop is:
+
+1. Re-run the exact test with `cargo test <test-name> -- --nocapture`.
+2. Let `proptest` shrink the case; the minimized failing input is the thing to
+   debug, not the original large sample.
+3. If `proptest` writes a regression case under `proptest-regressions/`, keep
+   that file around while you fix the bug and rerun the same test to replay it.
+
+The important habit is to preserve the smallest failing case you have. A good
+shrunk repro is usually easier to reason about than a simulation trace with a
+large randomized workload, and it often tells you exactly which invariant you
+actually broke.
+
 ## Choosing The Tool
 
 Use the lightest-weight tool that can actually answer the question:
