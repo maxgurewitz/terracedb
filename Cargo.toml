@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/terracedb-bricks",
     "crates/terracedb-simulation",
     "crates/terracedb-vfs",
     "crates/turmoil-determinism",
