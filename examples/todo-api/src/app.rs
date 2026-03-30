@@ -20,9 +20,9 @@ use terracedb::{
     TransactionCommitError, Value,
 };
 use terracedb_projections::{
-    MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionError,
-    ProjectionHandle, ProjectionHandlerError, ProjectionRuntime, ProjectionTransaction,
-    RecomputeStrategy,
+    ProjectionContext, ProjectionError, ProjectionHandle, ProjectionHandler,
+    ProjectionHandlerError, ProjectionRuntime, ProjectionTransaction, RecomputeStrategy,
+    SingleSourceProjection,
 };
 use terracedb_relays::{OutboxRelay, OutboxRelayError, OutboxRelayHandler, RelayEntry};
 use terracedb_workflows::{
@@ -191,10 +191,10 @@ impl TodoApp {
 
         let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
         let projection_handle = projection_runtime
-            .start_multi_source(
-                MultiSourceProjection::new(
+            .start_single_source(
+                SingleSourceProjection::new(
                     RECENT_PROJECTION_NAME,
-                    [tables.todos.clone()],
+                    tables.todos.clone(),
                     RecentTodosProjection {
                         todos: tables.todos.clone(),
                         recent_todos: tables.recent_todos.clone(),
@@ -609,8 +609,8 @@ struct RecentTodosProjection {
 }
 
 #[async_trait]
-impl MultiSourceProjectionHandler for RecentTodosProjection {
-    async fn apply(
+impl ProjectionHandler for RecentTodosProjection {
+    async fn apply_with_context(
         &self,
         _run: &terracedb_projections::ProjectionSequenceRun,
         ctx: &ProjectionContext,

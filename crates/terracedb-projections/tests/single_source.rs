@@ -12,8 +12,9 @@ use terracedb::{
     test_support::{bytes as test_bytes, row_table_config, test_dependencies, tiered_test_config},
 };
 use terracedb_projections::{
-    PROJECTION_CURSOR_TABLE_NAME, ProjectionError, ProjectionHandler, ProjectionHandlerError,
-    ProjectionRuntime, ProjectionSequenceRun, ProjectionTransaction, SingleSourceProjection,
+    PROJECTION_CURSOR_TABLE_NAME, ProjectionContext, ProjectionError, ProjectionHandler,
+    ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun, ProjectionTransaction,
+    SingleSourceProjection,
 };
 
 struct SequenceRecorder {
@@ -63,6 +64,50 @@ impl ProjectionHandler for MirrorProjection {
                 None => tx.delete(&self.output, entry.key.clone()),
             }
         }
+        Ok(())
+    }
+}
+
+struct FrontierSnapshotProjection {
+    source: Table,
+    output: Table,
+}
+
+#[async_trait]
+impl ProjectionHandler for FrontierSnapshotProjection {
+    async fn apply_with_context(
+        &self,
+        run: &ProjectionSequenceRun,
+        ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        let shared = ctx
+            .read(&self.source, b"shared".to_vec())
+            .await?
+            .map(|value| match value {
+                Value::Bytes(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                Value::Record(_) => Err(std::io::Error::other(
+                    "frontier snapshot projection only expects byte values",
+                )),
+            })
+            .transpose()
+            .map_err(ProjectionHandlerError::new)?
+            .unwrap_or_else(|| "-".to_string());
+        let scanned_keys = collect_rows(
+            ctx.scan(&self.source, Vec::new(), vec![0xff], ScanOptions::default())
+                .await?,
+        )
+        .await
+        .into_iter()
+        .map(|(key, _value)| String::from_utf8_lossy(&key).into_owned())
+        .collect::<Vec<_>>()
+        .join(",");
+
+        tx.put(
+            &self.output,
+            format!("snapshot:{}", run.sequence().get()).into_bytes(),
+            Value::bytes(format!("{shared}|{scanned_keys}")),
+        );
         Ok(())
     }
 }
@@ -215,6 +260,66 @@ async fn projection_catches_up_startup_backlog_without_new_notification() {
             .await
             .expect("read mirrored row"),
         Some(test_bytes("queued"))
+    );
+
+    handle.shutdown().await.expect("stop projection");
+}
+
+#[tokio::test]
+async fn single_source_projection_can_scan_and_read_through_projection_context() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config("/projection-single-source-context"),
+        test_dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("source"))
+        .await
+        .expect("create source table");
+    let output = db
+        .create_table(row_table_config("output"))
+        .await
+        .expect("create output table");
+
+    let runtime = ProjectionRuntime::open(db.clone())
+        .await
+        .expect("open projection runtime");
+    let mut handle = runtime
+        .start_single_source(
+            SingleSourceProjection::new(
+                "frontier-snapshot",
+                source.clone(),
+                FrontierSnapshotProjection {
+                    source: source.clone(),
+                    output: output.clone(),
+                },
+            )
+            .with_outputs([output.clone()]),
+        )
+        .await
+        .expect("start projection");
+
+    let mut batch = db.write_batch();
+    batch.put(&source, b"alpha".to_vec(), test_bytes("a"));
+    batch.put(&source, b"shared".to_vec(), test_bytes("current"));
+    batch.put(&source, b"zeta".to_vec(), test_bytes("z"));
+    let sequence = db
+        .commit(batch, CommitOptions::default())
+        .await
+        .expect("commit source rows");
+    db.flush().await.expect("flush source rows");
+
+    wait_for_watermark(&mut handle, sequence).await;
+
+    assert_eq!(
+        output
+            .read(format!("snapshot:{}", sequence.get()).into_bytes())
+            .await
+            .expect("read frontier snapshot"),
+        Some(Value::bytes("current|alpha,shared,zeta"))
     );
 
     handle.shutdown().await.expect("stop projection");
@@ -502,7 +607,8 @@ async fn projection_runtime_surfaces_typed_change_feed_storage_errors() {
         .await
         .expect_err("projection should fail on the injected change-feed error");
     match error {
-        ProjectionError::Storage(storage) => {
+        ProjectionError::Storage(storage)
+        | ProjectionError::ChangeFeed(ChangeFeedError::Storage(storage)) => {
             assert_eq!(storage.kind(), StorageErrorKind::Timeout);
         }
         other => panic!("expected typed projection change-feed failure, got {other:?}"),

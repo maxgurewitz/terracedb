@@ -338,11 +338,28 @@ impl ProjectionContextError {
 
 #[async_trait]
 pub trait ProjectionHandler: Send + Sync {
+    /// Compatibility hook for simple projections that only transform the current
+    /// batch. New code should prefer `apply_with_context`.
     async fn apply(
         &self,
+        _run: &ProjectionSequenceRun,
+        _tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        Err(ProjectionHandlerError::new(std::io::Error::other(
+            "projection handler must implement apply or apply_with_context",
+        )))
+    }
+
+    /// Canonical handler entry point for both single-source and multi-source
+    /// projections.
+    async fn apply_with_context(
+        &self,
         run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
-    ) -> Result<(), ProjectionHandlerError>;
+    ) -> Result<(), ProjectionHandlerError> {
+        self.apply(run, tx).await
+    }
 }
 
 #[async_trait]
@@ -353,6 +370,21 @@ pub trait MultiSourceProjectionHandler: Send + Sync {
         ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError>;
+}
+
+#[async_trait]
+impl<T> ProjectionHandler for T
+where
+    T: MultiSourceProjectionHandler + Send + Sync,
+{
+    async fn apply_with_context(
+        &self,
+        run: &ProjectionSequenceRun,
+        ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        MultiSourceProjectionHandler::apply(self, run, ctx, tx).await
+    }
 }
 
 pub struct SingleSourceProjection<H> {
@@ -685,7 +717,7 @@ impl ProjectionRuntime {
             dependencies: projection.dependencies,
             recompute: projection.recompute,
             mode: ProjectionMode::SingleSource,
-            handler: ProjectionHandlerKind::Single(Arc::new(projection.handler)),
+            handler: Arc::new(projection.handler),
         })
         .await
     }
@@ -695,7 +727,7 @@ impl ProjectionRuntime {
         projection: MultiSourceProjection<H>,
     ) -> Result<ProjectionHandle, ProjectionError>
     where
-        H: MultiSourceProjectionHandler + 'static,
+        H: ProjectionHandler + 'static,
     {
         self.start_projection(ProjectionSpec {
             name: projection.name,
@@ -704,7 +736,7 @@ impl ProjectionRuntime {
             dependencies: projection.dependencies,
             recompute: projection.recompute,
             mode: ProjectionMode::MultiSource,
-            handler: ProjectionHandlerKind::Multi(Arc::new(projection.handler)),
+            handler: Arc::new(projection.handler),
         })
         .await
     }
@@ -1198,26 +1230,7 @@ struct ProjectionSpec {
     dependencies: Vec<String>,
     recompute: RecomputeStrategy,
     mode: ProjectionMode,
-    handler: ProjectionHandlerKind,
-}
-
-enum ProjectionHandlerKind {
-    Single(Arc<dyn ProjectionHandler>),
-    Multi(Arc<dyn MultiSourceProjectionHandler>),
-}
-
-impl ProjectionHandlerKind {
-    async fn apply(
-        &self,
-        run: &ProjectionSequenceRun,
-        ctx: &ProjectionContext,
-        tx: &mut ProjectionTransaction,
-    ) -> Result<(), ProjectionHandlerError> {
-        match self {
-            Self::Single(handler) => handler.apply(run, tx).await,
-            Self::Multi(handler) => handler.apply(run, ctx, tx).await,
-        }
-    }
+    handler: Arc<dyn ProjectionHandler>,
 }
 
 struct ProjectionTaskRuntime {
@@ -1226,7 +1239,7 @@ struct ProjectionTaskRuntime {
     outputs: Vec<Table>,
     recompute: RecomputeStrategy,
     mode: ProjectionMode,
-    handler: ProjectionHandlerKind,
+    handler: Arc<dyn ProjectionHandler>,
     db: Db,
     cursor_table: Table,
     running: Arc<Mutex<BTreeSet<String>>>,
@@ -1507,7 +1520,11 @@ async fn drain_next_ready_run(
         );
 
         let mut tx = ProjectionTransaction::new(run.last_cursor());
-        if let Err(source) = runtime.handler.apply(&run, &context, &mut tx).await {
+        if let Err(source) = runtime
+            .handler
+            .apply_with_context(&run, &context, &mut tx)
+            .await
+        {
             if source.snapshot_too_old().is_some() {
                 if runtime.recompute == RecomputeStrategy::FailClosed {
                     return Err(ProjectionError::UnsupportedRecomputation {
@@ -1672,7 +1689,7 @@ async fn rebuild_from_current_state(
                 let mut tx = ProjectionTransaction::new(run.last_cursor());
                 runtime
                     .handler
-                    .apply(&run, &context, &mut tx)
+                    .apply_with_context(&run, &context, &mut tx)
                     .await
                     .map_err(|source| ProjectionError::Handler {
                         name: runtime.name.clone(),
