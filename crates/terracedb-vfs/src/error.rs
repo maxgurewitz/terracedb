@@ -32,6 +32,8 @@ pub enum AgentFsError {
     NotFile { path: String },
     #[error("path is not a symlink: {path}")]
     NotSymlink { path: String },
+    #[error("too many symlink expansions while resolving path: {path}")]
+    SymlinkLoop { path: String },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
     #[error("cannot remove or replace the volume root")]
