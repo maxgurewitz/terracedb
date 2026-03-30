@@ -1244,48 +1244,13 @@ impl Db {
         upper_bound: SequenceNumber,
         opts: ScanOptions,
     ) -> Result<ChangeStream, ChangeFeedError> {
-<<<<<<< HEAD
         let span = tracing::debug_span!("terracedb.db.change_feed.scan");
         apply_db_span_attributes(
             &span,
             &self.telemetry_db_name(),
             &self.telemetry_db_instance(),
             self.telemetry_storage_mode(),
-=======
-        let Some(table_id) = self.resolve_table_id(table) else {
-            return Err(Self::missing_table_error(table.name()).into());
-        };
-        if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
-            return Ok(Box::pin(stream::empty()));
-        }
-        let table_watermark = self.table_change_feed_watermark(table_id);
-
-        let table_handle = Table {
-            db: self.clone(),
-            name: Arc::from(table.name()),
-            id: Some(table_id),
-        };
-        let sources = {
-            let runtime = self.inner.commit_runtime.lock().await;
-            let floor = self.change_feed_floor_from_state(
-                table_id,
-                upper_bound,
-                runtime.oldest_sequence_for_table(table_id),
-                runtime.oldest_segment_id(),
-                table_watermark,
-            );
-            if let Some(oldest_available) = floor
-                && cursor.sequence() < oldest_available
-            {
-                return Err(ChangeFeedError::SnapshotTooOld(SnapshotTooOld {
-                    requested: cursor.sequence(),
-                    oldest_available,
-                }));
-            }
-
-            runtime.change_feed_scan_plan(table_id, cursor.sequence())
-        };
-
+        );
         apply_table_span_attribute(&span, table.name());
         crate::set_span_attribute(
             &span,
