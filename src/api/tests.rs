@@ -1,4 +1,3 @@
-
 use std::sync::atomic::Ordering;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -6829,6 +6828,34 @@ async fn group_commit_sync_failure_flush_and_reopen_do_not_resurrect_failed_writ
         None
     );
     assert_no_visible_or_durable_changes(&reopened, &reopened_events).await;
+
+    let committed = reopened_events
+        .write(b"user:retry".to_vec(), bytes("retry"))
+        .await
+        .expect("write after failed group commit");
+    assert_eq!(committed, SequenceNumber::new(1));
+    assert_eq!(
+        visible_changes(&reopened, &reopened_events).await,
+        vec![collected_change(
+            1,
+            0,
+            ChangeKind::Put,
+            b"user:retry",
+            Some(bytes("retry")),
+            "events",
+        )]
+    );
+    assert_eq!(
+        durable_changes(&reopened, &reopened_events).await,
+        vec![collected_change(
+            1,
+            0,
+            ChangeKind::Put,
+            b"user:retry",
+            Some(bytes("retry")),
+            "events",
+        )]
+    );
 }
 
 #[tokio::test]
@@ -6883,6 +6910,7 @@ async fn group_commit_sync_failure_keeps_failed_write_out_of_change_feeds_and_wa
         .write(b"user:ok".to_vec(), bytes("ok"))
         .await
         .expect("write later successful value");
+    assert_eq!(committed, SequenceNumber::new(1));
     let expected = vec![collected_change(
         committed.get(),
         0,
@@ -6942,6 +6970,360 @@ async fn group_commit_sync_failure_keeps_failed_write_out_of_change_feeds_and_wa
     );
     assert_eq!(visible_changes(&reopened, &reopened_events).await, expected);
     assert_eq!(durable_changes(&reopened, &reopened_events).await, expected);
+}
+
+#[tokio::test]
+async fn group_commit_sync_failure_discards_later_provisional_batches_in_same_tail() {
+    let root = "/group-commit-overlapping-failure";
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+    let db = Db::open(tiered_config(root), dependencies.clone())
+        .await
+        .expect("open db");
+    let events = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    file_system.inject_failure(FileSystemFailure::timeout(
+        FileSystemOperation::Sync,
+        commit_log_segment_path(root, 1),
+    ));
+
+    let mut batch_one_blocker = db.block_next_commit_phase(CommitPhase::AfterBatchSeal);
+    let first_events = events.clone();
+    let first =
+        tokio::spawn(async move { first_events.write(b"user:1".to_vec(), bytes("v1")).await });
+    assert_eq!(batch_one_blocker.sequence().await, SequenceNumber::new(1));
+
+    let second_events = events.clone();
+    let second =
+        tokio::spawn(async move { second_events.write(b"user:2".to_vec(), bytes("v2")).await });
+
+    while db.inner.next_sequence.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    batch_one_blocker.release();
+
+    assert_group_commit_sync_failure(
+        first
+            .await
+            .expect("join first")
+            .expect_err("first write should fail"),
+    );
+    assert_group_commit_sync_failure(
+        second
+            .await
+            .expect("join second")
+            .expect_err("second write should fail"),
+    );
+
+    assert_eq!(db.current_sequence(), SequenceNumber::default());
+    assert_eq!(db.current_durable_sequence(), SequenceNumber::default());
+    assert_eq!(
+        events.read(b"user:1".to_vec()).await.expect("read user:1"),
+        None
+    );
+    assert_eq!(
+        events.read(b"user:2".to_vec()).await.expect("read user:2"),
+        None
+    );
+    assert_no_visible_or_durable_changes(&db, &events).await;
+
+    db.flush()
+        .await
+        .expect("flush should not resurrect overlapping failed writes");
+    assert_eq!(
+        events
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read user:1 after flush"),
+        None
+    );
+    assert_eq!(
+        events
+            .read(b"user:2".to_vec())
+            .await
+            .expect("read user:2 after flush"),
+        None
+    );
+
+    file_system.crash();
+
+    let reopened = Db::open(tiered_config(root), dependencies)
+        .await
+        .expect("reopen db");
+    let reopened_events = reopened.table("events");
+    assert_eq!(reopened.current_sequence(), SequenceNumber::default());
+    assert_eq!(
+        reopened.current_durable_sequence(),
+        SequenceNumber::default()
+    );
+    assert_eq!(
+        reopened_events
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read user:1 after reopen"),
+        None
+    );
+    assert_eq!(
+        reopened_events
+            .read(b"user:2".to_vec())
+            .await
+            .expect("read user:2 after reopen"),
+        None
+    );
+    assert_no_visible_or_durable_changes(&reopened, &reopened_events).await;
+
+    let committed = reopened_events
+        .write(b"user:3".to_vec(), bytes("v3"))
+        .await
+        .expect("write after overlapping failure");
+    assert_eq!(committed, SequenceNumber::new(1));
+    assert_eq!(
+        visible_changes(&reopened, &reopened_events).await,
+        vec![collected_change(
+            1,
+            0,
+            ChangeKind::Put,
+            b"user:3",
+            Some(bytes("v3")),
+            "events",
+        )]
+    );
+}
+
+#[tokio::test]
+async fn group_commit_sync_failure_cascades_across_multiple_sealed_batches() {
+    let root = "/group-commit-chained-overlapping-failure";
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config(root),
+        dependencies(file_system.clone(), object_store),
+    )
+    .await
+    .expect("open db");
+    let events = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    file_system.inject_failure(FileSystemFailure::timeout(
+        FileSystemOperation::Sync,
+        commit_log_segment_path(root, 1),
+    ));
+
+    let mut batch_one_blocker = db.block_next_commit_phase(CommitPhase::AfterBatchSeal);
+    let first_events = events.clone();
+    let first =
+        tokio::spawn(async move { first_events.write(b"user:1".to_vec(), bytes("v1")).await });
+    assert_eq!(batch_one_blocker.sequence().await, SequenceNumber::new(1));
+
+    let mut batch_two_blocker = db.block_next_commit_phase(CommitPhase::AfterBatchSeal);
+    let second_events = events.clone();
+    let second =
+        tokio::spawn(async move { second_events.write(b"user:2".to_vec(), bytes("v2")).await });
+    assert_eq!(batch_two_blocker.sequence().await, SequenceNumber::new(2));
+
+    let third_events = events.clone();
+    let third =
+        tokio::spawn(async move { third_events.write(b"user:3".to_vec(), bytes("v3")).await });
+
+    while db.inner.next_sequence.load(Ordering::SeqCst) < 3 {
+        tokio::task::yield_now().await;
+    }
+
+    batch_one_blocker.release();
+    assert_group_commit_sync_failure(
+        first
+            .await
+            .expect("join first")
+            .expect_err("first write should fail"),
+    );
+
+    batch_two_blocker.release();
+    assert_group_commit_sync_failure(
+        second
+            .await
+            .expect("join second")
+            .expect_err("second write should fail"),
+    );
+    assert_group_commit_sync_failure(
+        third
+            .await
+            .expect("join third")
+            .expect_err("third write should fail"),
+    );
+
+    assert_eq!(db.current_sequence(), SequenceNumber::default());
+    assert_eq!(db.current_durable_sequence(), SequenceNumber::default());
+    assert_eq!(
+        events.read(b"user:1".to_vec()).await.expect("read user:1"),
+        None
+    );
+    assert_eq!(
+        events.read(b"user:2".to_vec()).await.expect("read user:2"),
+        None
+    );
+    assert_eq!(
+        events.read(b"user:3".to_vec()).await.expect("read user:3"),
+        None
+    );
+
+    let committed = events
+        .write(b"user:4".to_vec(), bytes("v4"))
+        .await
+        .expect("write after chained failure");
+    assert_eq!(committed, SequenceNumber::new(1));
+    assert_eq!(db.current_sequence(), committed);
+    assert_eq!(db.current_durable_sequence(), committed);
+}
+
+#[test]
+fn simulated_group_commit_sync_failure_discards_provisional_tail_across_restart() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x6a71_1001).run_with(|context| async move {
+        let root = "/terracedb/sim/group-commit-sync-failure";
+        let config = tiered_config(root);
+        let db = context.open_db(config.clone()).await?;
+        let events = db.create_table(row_table_config("events")).await?;
+
+        context
+            .file_system()
+            .inject_failure(FileSystemFailure::timeout(
+                FileSystemOperation::Sync,
+                commit_log_segment_path(root, 1),
+            ));
+
+        let error = events
+            .write(b"user:failed".to_vec(), bytes("failed"))
+            .await
+            .expect_err("group-commit sync should fail");
+        assert_group_commit_sync_failure(error);
+        assert_eq!(db.current_sequence(), SequenceNumber::default());
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::default());
+        assert_eq!(events.read(b"user:failed".to_vec()).await?, None);
+        assert_no_visible_or_durable_changes(&db, &events).await;
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_events = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), SequenceNumber::default());
+        assert_eq!(
+            reopened.current_durable_sequence(),
+            SequenceNumber::default()
+        );
+        assert_eq!(reopened_events.read(b"user:failed".to_vec()).await?, None);
+
+        assert!(
+            context.trace().iter().any(|event| matches!(
+                event,
+                TraceEvent::Crash {
+                    cut_point: CutPoint::AfterStep
+                }
+            )),
+            "simulation trace should record the crash cut point",
+        );
+        assert!(
+            context
+                .trace()
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Restart)),
+            "simulation trace should record the restart",
+        );
+
+        let committed = reopened_events
+            .write(b"user:ok".to_vec(), bytes("ok"))
+            .await?;
+        assert_eq!(committed, SequenceNumber::new(1));
+
+        Ok(())
+    })
+}
+
+#[test]
+fn simulated_group_commit_sync_failure_discards_follow_on_batches_across_restart() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x6a71_1002).run_with(|context| async move {
+        let root = "/terracedb/sim/group-commit-overlap-failure";
+        let config = tiered_config(root);
+        let db = context.open_db(config.clone()).await?;
+        let events = db.create_table(row_table_config("events")).await?;
+
+        context
+            .file_system()
+            .inject_failure(FileSystemFailure::timeout(
+                FileSystemOperation::Sync,
+                commit_log_segment_path(root, 1),
+            ));
+
+        let mut batch_one_blocker = db.block_next_commit_phase(CommitPhase::AfterBatchSeal);
+        let first_events = events.clone();
+        let first =
+            tokio::spawn(async move { first_events.write(b"user:1".to_vec(), bytes("v1")).await });
+        assert_eq!(batch_one_blocker.sequence().await, SequenceNumber::new(1));
+
+        let second_events = events.clone();
+        let second =
+            tokio::spawn(async move { second_events.write(b"user:2".to_vec(), bytes("v2")).await });
+
+        while db.inner.next_sequence.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        batch_one_blocker.release();
+
+        assert_group_commit_sync_failure(
+            first
+                .await
+                .expect("join first")
+                .expect_err("first write should fail"),
+        );
+        assert_group_commit_sync_failure(
+            second
+                .await
+                .expect("join second")
+                .expect_err("second write should fail"),
+        );
+        assert_eq!(db.current_sequence(), SequenceNumber::default());
+        assert_eq!(db.current_durable_sequence(), SequenceNumber::default());
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_events = reopened.table("events");
+        assert_eq!(reopened.current_sequence(), SequenceNumber::default());
+        assert_eq!(
+            reopened.current_durable_sequence(),
+            SequenceNumber::default()
+        );
+        assert_eq!(reopened_events.read(b"user:1".to_vec()).await?, None);
+        assert_eq!(reopened_events.read(b"user:2".to_vec()).await?, None);
+
+        assert!(
+            context.trace().iter().any(|event| matches!(
+                event,
+                TraceEvent::Crash {
+                    cut_point: CutPoint::AfterStep
+                }
+            )),
+            "simulation trace should record the crash cut point",
+        );
+        assert!(
+            context
+                .trace()
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Restart)),
+            "simulation trace should record the restart",
+        );
+
+        let committed = reopened_events
+            .write(b"user:3".to_vec(), bytes("v3"))
+            .await?;
+        assert_eq!(committed, SequenceNumber::new(1));
+
+        Ok(())
+    })
 }
 
 #[tokio::test]

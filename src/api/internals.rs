@@ -548,6 +548,7 @@ struct CommitConflictKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitPhase {
     BeforeDurabilitySync,
+    AfterBatchSeal,
     AfterDurabilitySync,
     BeforeMemtableInsert,
     AfterMemtableInsert,
@@ -1023,7 +1024,10 @@ impl CommitRuntime {
     ) -> Result<(), StorageError> {
         match &mut self.backend {
             CommitLogBackend::Local(manager) => {
-                manager.prune_sealed_before(sequence_exclusive).await?;
+                let protected_segments = BTreeSet::new();
+                manager
+                    .prune_sealed_before(sequence_exclusive, &protected_segments)
+                    .await?;
                 Ok(())
             }
             CommitLogBackend::Memory(_) => Ok(()),
@@ -1194,11 +1198,14 @@ struct CommitCoordinator {
     keys: BTreeMap<CommitConflictKey, BTreeSet<SequenceNumber>>,
     sequences: BTreeMap<SequenceNumber, SequenceCommitState>,
     current_batch: Option<Arc<GroupCommitBatch>>,
+    pending_failed_tail: Option<PendingFailedTail>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct SequenceCommitState {
     touched_tables: BTreeSet<String>,
+    conflict_keys: Vec<CommitConflictKey>,
+    group_batch: Option<Arc<GroupCommitBatch>>,
     memtable_inserted: bool,
     durable_confirmed: bool,
     visible_published: bool,
@@ -1206,7 +1213,16 @@ struct SequenceCommitState {
     aborted: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PendingFailedTail {
+    start_sequence: SequenceNumber,
+    error: StorageError,
+}
+
+#[derive(Debug)]
 struct GroupCommitBatch {
+    first_sequence: SequenceNumber,
+    predecessor: Option<Arc<GroupCommitBatch>>,
     state: Mutex<GroupCommitBatchState>,
     notify: Notify,
 }
@@ -1219,11 +1235,17 @@ struct GroupCommitBatchState {
 }
 
 impl GroupCommitBatch {
-    fn new() -> Self {
+    fn new(first_sequence: SequenceNumber, predecessor: Option<Arc<GroupCommitBatch>>) -> Self {
         Self {
+            first_sequence,
+            predecessor,
             state: Mutex::new(GroupCommitBatchState::default()),
             notify: Notify::new(),
         }
+    }
+
+    fn first_sequence(&self) -> SequenceNumber {
+        self.first_sequence
     }
 
     fn is_open(&self) -> bool {
@@ -1241,11 +1263,33 @@ impl GroupCommitBatch {
     fn staged_records(&self) -> Vec<CommitRecord> {
         mutex_lock(&self.state).records.clone()
     }
+
+    fn predecessor(&self) -> Option<Arc<GroupCommitBatch>> {
+        self.predecessor.clone()
+    }
+
+    fn finish(&self, result: Result<(), StorageError>) {
+        let mut state = mutex_lock(&self.state);
+        if state.result.is_none() {
+            state.result = Some(result);
+            drop(state);
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn await_result(&self) -> Result<(), StorageError> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(result) = self.result() {
+                return result;
+            }
+            notified.await;
+        }
+    }
 }
 
 struct CommitParticipant {
     sequence: SequenceNumber,
     operations: Vec<ResolvedBatchOperation>,
-    conflict_keys: Vec<CommitConflictKey>,
     group_batch: Option<Arc<GroupCommitBatch>>,
 }

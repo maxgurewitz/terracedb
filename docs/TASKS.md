@@ -684,20 +684,20 @@ Implement retention and garbage collection for the unified commit log, including
 
 **Description**
 
-Repair the failed-group-commit correctness hole by ensuring an assigned sequence does not enter the recoverable unified commit log until the batch's durability outcome is known. This task owns the exact semantics for failed assigned sequences so recovery, visible scans, durable scans, and watermark publication all remain consistent after fsync failure, later `flush()`, reopen, and backup/restore paths.
+Repair the failed-group-commit correctness hole by making pre-fsync assigned sequences part of an internal provisional tail rather than public committed history. This task owns the exact semantics for failed assigned sequences so recovery, visible scans, durable scans, watermark publication, and later sequence assignment all observe only the committed prefix after fsync failure, later `flush()`, reopen, and backup/restore paths.
 
 **Implementation steps**
 
-1. Introduce batch-local staging for assigned commit records so group-commit waiters can reserve sequence numbers without appending failed work to the recoverable log.
-2. Move the local tiered group-commit durable-log append so it occurs only as part of the successful batch durability path rather than inside the pre-durability commit critical section.
-3. Define and document failed assigned-sequence semantics for visible and durable watermarks, including whether failed sequences may be skipped as no-op positions in the prefix model.
-4. Ensure recovery replays only the durable committed prefix and never resurrects a write that previously returned a durability error.
-5. Ensure `scanSince`, `scanDurableSince`, subscription watermarks, and any tiered backup/restore tail sync paths stay consistent with the new staging behavior.
+1. Define the provisional-tail model explicitly: sequences reserved before durability are internal reservations, not public history, and `currentSequence()`, `currentDurableSequence()`, recovery, backup, replication, `scanSince`, and `scanDurableSince` observe only the committed prefix.
+2. Add commit-log rollback support so the engine can discard the unresolved provisional tail from the first failed reserved sequence onward, including any local active-tail bytes and sealed segments created by that unresolved range.
+3. On group-commit fsync failure, discard all unresolved reserved sequences from the failure point onward, fail those commits, and rewind sequence allocation so discarded reservations never become public sequence holes.
+4. Ensure recovery replays only the committed prefix and never resurrects a write that previously returned a durability error.
+5. Ensure `scanSince`, `scanDurableSince`, subscription watermarks, and any tiered backup/restore tail sync paths stay consistent with the provisional-tail discard behavior.
 
 **Verification**
 
 - Tests where group-commit fsync fails and the write returns an error, then a later `flush()` or reopen must not surface that write.
-- Tests proving visible and durable watermarks advance consistently across failed assigned sequences without reordering later successful commits.
+- Tests proving visible and durable watermarks stay at the committed prefix after failure and later successful commits reuse the discarded sequence range without public holes.
 - Recovery tests proving a crash before successful batch durability loses only the staged non-durable work, while a crash after successful durability preserves it.
 - Change-feed tests proving failed assigned sequences do not appear in `scanSince` or `scanDurableSince`, including after reopen.
 - Backup/restore tests proving remote tail synchronization and disaster recovery never reintroduce a failed write.
