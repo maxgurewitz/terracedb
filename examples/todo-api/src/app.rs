@@ -26,9 +26,10 @@ use terracedb_projections::{
 };
 use terracedb_relays::{OutboxRelay, OutboxRelayError, OutboxRelayHandler, RelayEntry};
 use terracedb_workflows::{
-    DEFAULT_TIMER_POLL_INTERVAL, WorkflowContext, WorkflowDefinition, WorkflowError,
-    WorkflowHandle, WorkflowHandler, WorkflowHandlerError, WorkflowOutput, WorkflowRuntime,
-    WorkflowStateMutation, WorkflowTables, WorkflowTelemetrySnapshot, WorkflowTimerCommand,
+    DEFAULT_TIMER_POLL_INTERVAL, RecurringSchedule, RecurringTickOutput,
+    RecurringWorkflowDefinition, RecurringWorkflowHandle, RecurringWorkflowHandler,
+    RecurringWorkflowRuntime, WorkflowContext, WorkflowError, WorkflowHandlerError, WorkflowTables,
+    WorkflowTelemetrySnapshot,
 };
 
 use crate::model::{
@@ -40,7 +41,6 @@ pub const TODOS_TABLE_NAME: &str = "todos";
 pub const RECENT_TODOS_TABLE_NAME: &str = "recent_todos";
 pub const PLANNER_WORKFLOW_NAME: &str = "weekly-planner";
 pub const PLANNER_INSTANCE_ID: &str = "weekly-planner";
-pub const PLANNER_BOOTSTRAP_CALLBACK_ID: &str = "bootstrap";
 pub const TODO_SERVER_PORT: u16 = 9601;
 
 const FULL_SCAN_START: &[u8] = b"";
@@ -50,7 +50,6 @@ const RECENT_PROJECTION_NAME: &str = "recent-todos";
 const WEEKLY_PLANNER_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PLANNER_DISPATCH_BATCH_LIMIT: usize = 16;
 const PLANNER_DISPATCH_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const PLANNER_TIMER_ID: &[u8] = b"weekly-planner:next-week";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TodoAppOptions {
@@ -166,8 +165,8 @@ pub struct TodoApp {
     state: TodoAppState,
     _projection_runtime: ProjectionRuntime,
     projection_handle: ProjectionHandle,
-    _workflow_runtime: WorkflowRuntime<WeeklyPlannerWorkflow>,
-    workflow_handle: WorkflowHandle,
+    _workflow_runtime: RecurringWorkflowRuntime<WeeklyPlannerWorkflow>,
+    workflow_handle: RecurringWorkflowHandle,
     dispatcher_shutdown: watch::Sender<bool>,
     dispatcher_task: JoinHandle<Result<(), TodoAppError>>,
 }
@@ -205,32 +204,35 @@ impl TodoApp {
             )
             .await?;
 
-        let workflow_runtime = WorkflowRuntime::open(
+        let planner_schedule = options.planner_schedule;
+        let workflow_runtime = RecurringWorkflowRuntime::open(
             db.clone(),
             clock.clone(),
-            WorkflowDefinition::new(
+            RecurringWorkflowDefinition::new(
                 PLANNER_WORKFLOW_NAME,
-                std::iter::empty::<Table>(),
+                PLANNER_INSTANCE_ID,
+                RecurringSchedule::custom(
+                    move |now| {
+                        Some(Timestamp::new(
+                            planner_schedule.next_week_start_ms(now.get()),
+                        ))
+                    },
+                    move |_state, fire_at| {
+                        Some(Timestamp::new(
+                            fire_at.get().saturating_add(planner_schedule.week_millis()),
+                        ))
+                    },
+                ),
                 WeeklyPlannerWorkflow {
-                    schedule: options.planner_schedule,
+                    schedule: planner_schedule,
                 },
             )
             .with_timer_poll_interval(
                 WEEKLY_PLANNER_TIMER_POLL_INTERVAL.min(DEFAULT_TIMER_POLL_INTERVAL),
-            )
-            .with_durable_progress(true),
+            ),
         )
         .await?;
         let workflow_handle = workflow_runtime.start().await?;
-
-        workflow_runtime
-            .admit_callback(
-                PLANNER_INSTANCE_ID,
-                PLANNER_BOOTSTRAP_CALLBACK_ID,
-                encode_u64(clock.now().get()),
-            )
-            .await?;
-        clock.sleep(WEEKLY_PLANNER_TIMER_POLL_INTERVAL).await;
 
         let (dispatcher_shutdown, dispatcher_rx) = watch::channel(false);
         let planner_outbox_table = workflow_runtime.tables().outbox_table().clone();
@@ -290,15 +292,13 @@ impl TodoApp {
     }
 
     pub async fn planner_state(&self) -> Result<Option<PlannerState>, TodoAppError> {
-        let Some(value) = self
-            .workflow_tables()
-            .state_table()
-            .read(PLANNER_INSTANCE_ID.as_bytes().to_vec())
+        Ok(self
+            ._workflow_runtime
+            .next_fire_at()
             .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(decode_json_value(&value, "planner state")?))
+            .map(|next_fire_at| PlannerState {
+                next_fire_at_ms: next_fire_at.get(),
+            }))
     }
 
     pub async fn shutdown(self) -> Result<(), TodoAppError> {
@@ -552,21 +552,6 @@ where
     }
 }
 
-fn encode_u64(value: u64) -> Vec<u8> {
-    value.to_be_bytes().to_vec()
-}
-
-fn decode_u64(bytes: &[u8], context: &str) -> Result<u64, std::io::Error> {
-    if bytes.len() != 8 {
-        return Err(std::io::Error::other(format!(
-            "{context} must encode exactly 8 bytes"
-        )));
-    }
-    let mut raw = [0_u8; 8];
-    raw.copy_from_slice(bytes);
-    Ok(u64::from_be_bytes(raw))
-}
-
 fn normalize_required(value: &str, field: &str) -> Result<String, TodoApiError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -680,94 +665,36 @@ impl OutboxRelayHandler for PlannerRelayHandler {
 }
 
 #[async_trait]
-impl WorkflowHandler for WeeklyPlannerWorkflow {
-    async fn route_event(
-        &self,
-        _entry: &terracedb::ChangeEntry,
-    ) -> Result<String, WorkflowHandlerError> {
-        Err(WorkflowHandlerError::new(std::io::Error::other(
-            "weekly planner workflow only accepts callbacks and timers",
-        )))
-    }
-
-    async fn handle(
+impl RecurringWorkflowHandler for WeeklyPlannerWorkflow {
+    async fn tick(
         &self,
         _instance_id: &str,
-        state: Option<Value>,
-        trigger: &terracedb_workflows::WorkflowTrigger,
+        _state: &terracedb_workflows::RecurringWorkflowState,
+        fire_at: Timestamp,
         _ctx: &WorkflowContext,
-    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
-        let existing_state = state
-            .as_ref()
-            .map(|value| decode_json_value::<PlannerState>(value, "planner state"))
-            .transpose()
-            .map_err(WorkflowHandlerError::new)?;
-
-        match trigger {
-            terracedb_workflows::WorkflowTrigger::Callback {
-                callback_id,
-                response,
-            } if callback_id == PLANNER_BOOTSTRAP_CALLBACK_ID => {
-                if existing_state.is_some() {
-                    return Ok(WorkflowOutput::default());
-                }
-
-                let now_ms = decode_u64(response, "bootstrap callback clock")
-                    .map_err(WorkflowHandlerError::new)?;
-                let next_fire_at_ms = self.schedule.next_week_start_ms(now_ms);
-                Ok(WorkflowOutput {
-                    state: WorkflowStateMutation::Put(
-                        encode_json_value(&PlannerState { next_fire_at_ms })
-                            .map_err(WorkflowHandlerError::new)?,
-                    ),
-                    outbox_entries: Vec::new(),
-                    timers: vec![WorkflowTimerCommand::Schedule {
-                        timer_id: PLANNER_TIMER_ID.to_vec(),
-                        fire_at: Timestamp::new(next_fire_at_ms),
-                        payload: Vec::new(),
-                    }],
-                })
-            }
-            terracedb_workflows::WorkflowTrigger::Timer { fire_at, .. } => {
-                let week_start_ms = fire_at.get();
-                let next_fire_at_ms = week_start_ms.saturating_add(self.schedule.week_millis());
-                let mut outbox_entries = Vec::with_capacity(self.schedule.days_per_week as usize);
-                for day_offset in 0..self.schedule.days_per_week {
-                    let scheduled_for_day =
-                        week_start_ms + day_offset.saturating_mul(self.schedule.day_millis);
-                    let command = PlannerCommand {
-                        todo_id: self.schedule.placeholder_todo_id(scheduled_for_day),
-                        title: format!("Plan day {}", self.schedule.day_index(scheduled_for_day)),
-                        scheduled_for_day,
-                        created_at_ms: week_start_ms,
-                    };
-                    outbox_entries.push(terracedb::OutboxEntry {
-                        outbox_id: format!("planner:{scheduled_for_day}").into_bytes(),
-                        idempotency_key: format!("planner:{scheduled_for_day}"),
-                        payload: serde_json::to_vec(&command).map_err(WorkflowHandlerError::new)?,
-                    });
-                }
-
-                Ok(WorkflowOutput {
-                    state: WorkflowStateMutation::Put(
-                        encode_json_value(&PlannerState { next_fire_at_ms })
-                            .map_err(WorkflowHandlerError::new)?,
-                    ),
-                    outbox_entries,
-                    timers: vec![WorkflowTimerCommand::Schedule {
-                        timer_id: PLANNER_TIMER_ID.to_vec(),
-                        fire_at: Timestamp::new(next_fire_at_ms),
-                        payload: Vec::new(),
-                    }],
-                })
-            }
-            terracedb_workflows::WorkflowTrigger::Callback { .. } => Err(
-                WorkflowHandlerError::new(std::io::Error::other("unknown weekly planner callback")),
-            ),
-            terracedb_workflows::WorkflowTrigger::Event(_) => Err(WorkflowHandlerError::new(
-                std::io::Error::other("weekly planner workflow does not consume source events"),
-            )),
+    ) -> Result<RecurringTickOutput, WorkflowHandlerError> {
+        let week_start_ms = fire_at.get();
+        let mut outbox_entries = Vec::with_capacity(self.schedule.days_per_week as usize);
+        for day_offset in 0..self.schedule.days_per_week {
+            let scheduled_for_day =
+                week_start_ms + day_offset.saturating_mul(self.schedule.day_millis);
+            let command = PlannerCommand {
+                todo_id: self.schedule.placeholder_todo_id(scheduled_for_day),
+                title: format!("Plan day {}", self.schedule.day_index(scheduled_for_day)),
+                scheduled_for_day,
+                created_at_ms: week_start_ms,
+            };
+            outbox_entries.push(terracedb::OutboxEntry {
+                outbox_id: format!("planner:{scheduled_for_day}").into_bytes(),
+                idempotency_key: format!("planner:{scheduled_for_day}"),
+                payload: serde_json::to_vec(&command).map_err(WorkflowHandlerError::new)?,
+            });
         }
+
+        Ok(RecurringTickOutput {
+            outbox_entries,
+            timers: Vec::new(),
+        })
     }
 }
 
