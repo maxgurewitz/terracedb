@@ -6,7 +6,7 @@ It is intentionally simple, but it exercises the full Terracedb stack:
 
 - `terracedb` stores the durable application state
 - `terracedb-projections` maintains a read model of recently changed TODOs
-- `terracedb-workflows` drives a weekly background task that creates placeholder TODOs
+- `terracedb-workflows` drives a weekly recurring background task that creates placeholder TODOs
 - `terracedb-simulation` tests the system end to end from client to server to embedded database
 
 The goal is to provide a first example that is easy to understand without giving up the parts that make Terracedb interesting.
@@ -35,7 +35,6 @@ The main durable application records are:
 
 - `todos`
 - `recent_todos`
-- `planner_dispatch_cursors`
 
 The `todos` table stores one durable record per TODO item.
 
@@ -52,9 +51,7 @@ Each TODO record includes:
 
 The `recent_todos` table stores the projection-backed recent view that powers the recent endpoint.
 
-The `planner_dispatch_cursors` table stores the durable cursor for the internal planner command consumer.
-
-Workflow runtime state, timers, inbox entries, and outbox entries use the workflow library's internal tables.
+Workflow runtime state, recurring schedule state, timers, inbox entries, and outbox entries use the workflow library's internal tables.
 
 Every durable state transition in the app flows through Terracedb.
 
@@ -85,6 +82,8 @@ Important invariant:
 
 The app includes a weekly planner workflow that fires at the configured start of each week and creates placeholder TODOs for the upcoming week.
 
+It uses the recurring helper from `terracedb-workflows`, so the application code only defines what happens on each weekly tick. The helper owns bootstrap admission, stable timer identity, next-fire calculation, and durable recurring state.
+
 The workflow:
 
 - wake up on a weekly schedule
@@ -92,7 +91,7 @@ The workflow:
 - emit one durable planner command per day for the upcoming week
 - avoid duplicate placeholder creation if the workflow is retried or replayed
 
-Those commands are consumed by an internal durable dispatcher in the application process. The dispatcher writes placeholder TODO records into the `todos` table and persists its outbox cursor in `planner_dispatch_cursors`.
+Those commands are consumed by an internal durable relay in the application process. The relay writes placeholder TODO records into the `todos` table and deletes delivered outbox rows in the same transaction.
 
 The placeholder TODO identifiers are deterministic, so retries and replay remain idempotent.
 

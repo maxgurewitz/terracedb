@@ -238,6 +238,20 @@ pub enum WorkflowTimerCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkflowProgressMode {
+    #[default]
+    Auto,
+    Buffered,
+    Durable,
+}
+
+impl WorkflowProgressMode {
+    fn uses_durable_commits(self) -> bool {
+        !matches!(self, Self::Buffered)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowOutput {
     pub state: WorkflowStateMutation,
@@ -438,7 +452,7 @@ pub struct WorkflowDefinition<H> {
     timer_poll_interval: Duration,
     source_batch_limit: usize,
     timer_batch_limit: usize,
-    durable_progress: bool,
+    progress_mode: WorkflowProgressMode,
 }
 
 impl<H> WorkflowDefinition<H> {
@@ -456,7 +470,7 @@ impl<H> WorkflowDefinition<H> {
             timer_poll_interval: DEFAULT_TIMER_POLL_INTERVAL,
             source_batch_limit: DEFAULT_SOURCE_BATCH_LIMIT,
             timer_batch_limit: DEFAULT_TIMER_BATCH_LIMIT,
-            durable_progress: false,
+            progress_mode: WorkflowProgressMode::Auto,
         }
     }
 
@@ -485,8 +499,17 @@ impl<H> WorkflowDefinition<H> {
         self
     }
 
+    pub fn with_progress_mode(mut self, progress_mode: WorkflowProgressMode) -> Self {
+        self.progress_mode = progress_mode;
+        self
+    }
+
     pub fn with_durable_progress(mut self, durable_progress: bool) -> Self {
-        self.durable_progress = durable_progress;
+        self.progress_mode = if durable_progress {
+            WorkflowProgressMode::Durable
+        } else {
+            WorkflowProgressMode::Buffered
+        };
         self
     }
 }
@@ -533,7 +556,7 @@ struct WorkflowRuntimeInner<H> {
     timer_poll_interval: Duration,
     source_batch_limit: usize,
     timer_batch_limit: usize,
-    durable_progress: bool,
+    progress_mode: WorkflowProgressMode,
     running: Mutex<bool>,
     in_flight_instances: Mutex<BTreeSet<String>>,
     ready_notify: Notify,
@@ -575,7 +598,7 @@ where
                     timer_poll_interval: definition.timer_poll_interval,
                     source_batch_limit: definition.source_batch_limit,
                     timer_batch_limit: definition.timer_batch_limit,
-                    durable_progress: definition.durable_progress,
+                    progress_mode: definition.progress_mode,
                     running: Mutex::new(false),
                     in_flight_instances: Mutex::new(BTreeSet::new()),
                     ready_notify: Notify::new(),
@@ -791,11 +814,394 @@ impl WorkflowHandle {
     }
 }
 
+const RECURRING_BOOTSTRAP_CALLBACK_ID: &str = "__terracedb.recurring.bootstrap";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurringWorkflowState {
+    pub bootstrapped_at: Timestamp,
+    pub last_tick_at: Option<Timestamp>,
+    pub next_fire_at: Option<Timestamp>,
+    pub tick_count: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecurringTickOutput {
+    pub outbox_entries: Vec<OutboxEntry>,
+    pub timers: Vec<WorkflowTimerCommand>,
+}
+
+#[async_trait]
+pub trait RecurringWorkflowHandler: Send + Sync {
+    async fn tick(
+        &self,
+        instance_id: &str,
+        state: &RecurringWorkflowState,
+        fire_at: Timestamp,
+        ctx: &WorkflowContext,
+    ) -> Result<RecurringTickOutput, WorkflowHandlerError>;
+}
+
+type InitialRecurringFireFn = dyn Fn(Timestamp) -> Option<Timestamp> + Send + Sync;
+type NextRecurringFireFn =
+    dyn Fn(&RecurringWorkflowState, Timestamp) -> Option<Timestamp> + Send + Sync;
+
+#[derive(Clone)]
+pub struct RecurringSchedule {
+    initial_fire_at: Arc<InitialRecurringFireFn>,
+    next_fire_at: Arc<NextRecurringFireFn>,
+}
+
+impl RecurringSchedule {
+    pub fn fixed_interval(interval: u64) -> Self {
+        Self::custom(
+            move |now| Some(Timestamp::new(now.get().saturating_add(interval))),
+            move |_state, fire_at| Some(Timestamp::new(fire_at.get().saturating_add(interval))),
+        )
+    }
+
+    pub fn custom<F, G>(initial_fire_at: F, next_fire_at: G) -> Self
+    where
+        F: Fn(Timestamp) -> Option<Timestamp> + Send + Sync + 'static,
+        G: Fn(&RecurringWorkflowState, Timestamp) -> Option<Timestamp> + Send + Sync + 'static,
+    {
+        Self {
+            initial_fire_at: Arc::new(initial_fire_at),
+            next_fire_at: Arc::new(next_fire_at),
+        }
+    }
+
+    fn initial_fire_at(&self, now: Timestamp) -> Option<Timestamp> {
+        (self.initial_fire_at)(now)
+    }
+
+    fn next_fire_at(
+        &self,
+        state: &RecurringWorkflowState,
+        fire_at: Timestamp,
+    ) -> Option<Timestamp> {
+        (self.next_fire_at)(state, fire_at)
+    }
+}
+
+pub struct RecurringWorkflowDefinition<H> {
+    name: String,
+    instance_id: String,
+    schedule: RecurringSchedule,
+    handler: H,
+    scheduler: Option<Arc<dyn WorkflowScheduler>>,
+    table_names: WorkflowTableNames,
+    timer_poll_interval: Duration,
+    timer_batch_limit: usize,
+    progress_mode: WorkflowProgressMode,
+}
+
+impl<H> RecurringWorkflowDefinition<H> {
+    pub fn new(
+        name: impl Into<String>,
+        instance_id: impl Into<String>,
+        schedule: RecurringSchedule,
+        handler: H,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            table_names: WorkflowTableNames::for_workflow(&name),
+            name,
+            instance_id: instance_id.into(),
+            schedule,
+            handler,
+            scheduler: None,
+            timer_poll_interval: DEFAULT_TIMER_POLL_INTERVAL,
+            timer_batch_limit: DEFAULT_TIMER_BATCH_LIMIT,
+            progress_mode: WorkflowProgressMode::Auto,
+        }
+    }
+
+    pub fn with_scheduler(mut self, scheduler: Arc<dyn WorkflowScheduler>) -> Self {
+        self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_table_names(mut self, table_names: WorkflowTableNames) -> Self {
+        self.table_names = table_names;
+        self
+    }
+
+    pub fn with_timer_poll_interval(mut self, interval: Duration) -> Self {
+        self.timer_poll_interval = interval;
+        self
+    }
+
+    pub fn with_timer_batch_limit(mut self, batch_limit: usize) -> Self {
+        self.timer_batch_limit = batch_limit.max(1);
+        self
+    }
+
+    pub fn with_progress_mode(mut self, progress_mode: WorkflowProgressMode) -> Self {
+        self.progress_mode = progress_mode;
+        self
+    }
+}
+
+pub struct RecurringWorkflowRuntime<H> {
+    runtime: WorkflowRuntime<RecurringWorkflowAdapter<H>>,
+    instance_id: String,
+    clock: Arc<dyn Clock>,
+}
+
+impl<H> Clone for RecurringWorkflowRuntime<H> {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            instance_id: self.instance_id.clone(),
+            clock: self.clock.clone(),
+        }
+    }
+}
+
+impl<H> RecurringWorkflowRuntime<H>
+where
+    H: RecurringWorkflowHandler + 'static,
+{
+    pub async fn open(
+        db: Db,
+        clock: Arc<dyn Clock>,
+        definition: RecurringWorkflowDefinition<H>,
+    ) -> Result<Self, WorkflowError> {
+        if definition.instance_id.trim().is_empty() {
+            return Err(WorkflowError::EmptyInstanceId);
+        }
+
+        let runtime = WorkflowRuntime::open(
+            db,
+            clock.clone(),
+            WorkflowDefinition::new(
+                definition.name,
+                std::iter::empty::<Table>(),
+                RecurringWorkflowAdapter {
+                    instance_id: definition.instance_id.clone(),
+                    schedule: definition.schedule,
+                    handler: definition.handler,
+                },
+            )
+            .with_scheduler(
+                definition
+                    .scheduler
+                    .unwrap_or_else(|| Arc::new(RoundRobinWorkflowScheduler::default())),
+            )
+            .with_table_names(definition.table_names)
+            .with_timer_poll_interval(definition.timer_poll_interval)
+            .with_timer_batch_limit(definition.timer_batch_limit)
+            .with_progress_mode(definition.progress_mode),
+        )
+        .await?;
+
+        Ok(Self {
+            runtime,
+            instance_id: definition.instance_id,
+            clock,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        self.runtime.name()
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn tables(&self) -> &WorkflowTables {
+        self.runtime.tables()
+    }
+
+    pub async fn telemetry_snapshot(&self) -> Result<WorkflowTelemetrySnapshot, WorkflowError> {
+        self.runtime.telemetry_snapshot().await
+    }
+
+    pub async fn load_state(&self) -> Result<Option<RecurringWorkflowState>, WorkflowError> {
+        decode_recurring_state(self.runtime.load_state(&self.instance_id).await?.as_ref())
+    }
+
+    pub async fn next_fire_at(&self) -> Result<Option<Timestamp>, WorkflowError> {
+        Ok(self
+            .load_state()
+            .await?
+            .and_then(|state| state.next_fire_at))
+    }
+
+    pub async fn ensure_bootstrapped(&self) -> Result<Option<SequenceNumber>, WorkflowError> {
+        if self.load_state().await?.is_some() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            self.runtime
+                .admit_callback(
+                    self.instance_id.clone(),
+                    RECURRING_BOOTSTRAP_CALLBACK_ID,
+                    encode_u64_bytes(self.clock.now().get()),
+                )
+                .await?,
+        ))
+    }
+
+    pub async fn start(&self) -> Result<RecurringWorkflowHandle, WorkflowError> {
+        self.ensure_bootstrapped().await?;
+        Ok(RecurringWorkflowHandle {
+            inner: self.runtime.start().await?,
+        })
+    }
+}
+
+pub struct RecurringWorkflowHandle {
+    inner: WorkflowHandle,
+}
+
+impl RecurringWorkflowHandle {
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    pub async fn abort(self) -> Result<(), WorkflowError> {
+        self.inner.abort().await
+    }
+
+    pub async fn shutdown(self) -> Result<(), WorkflowError> {
+        self.inner.shutdown().await
+    }
+}
+
+struct RecurringWorkflowAdapter<H> {
+    instance_id: String,
+    schedule: RecurringSchedule,
+    handler: H,
+}
+
+#[async_trait]
+impl<H> WorkflowHandler for RecurringWorkflowAdapter<H>
+where
+    H: RecurringWorkflowHandler + 'static,
+{
+    async fn route_event(&self, _entry: &ChangeEntry) -> Result<String, WorkflowHandlerError> {
+        Err(WorkflowHandlerError::new(std::io::Error::other(
+            "recurring workflows only accept helper-managed callbacks and timers",
+        )))
+    }
+
+    async fn handle(
+        &self,
+        instance_id: &str,
+        state: Option<Value>,
+        trigger: &WorkflowTrigger,
+        ctx: &WorkflowContext,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        if instance_id != self.instance_id {
+            return Err(WorkflowHandlerError::new(std::io::Error::other(format!(
+                "recurring workflow {} is bound to instance {}",
+                ctx.workflow_name(),
+                self.instance_id,
+            ))));
+        }
+
+        let recurring_state =
+            decode_recurring_state(state.as_ref()).map_err(WorkflowHandlerError::new)?;
+        match trigger {
+            WorkflowTrigger::Callback {
+                callback_id,
+                response,
+            } if callback_id == RECURRING_BOOTSTRAP_CALLBACK_ID => {
+                self.handle_bootstrap(recurring_state, response)
+            }
+            WorkflowTrigger::Timer {
+                timer_id, fire_at, ..
+            } => {
+                self.handle_timer(instance_id, recurring_state, timer_id, *fire_at, ctx)
+                    .await
+            }
+            WorkflowTrigger::Callback { .. } => Err(WorkflowHandlerError::new(
+                std::io::Error::other("unknown recurring workflow callback"),
+            )),
+            WorkflowTrigger::Event(_) => Err(WorkflowHandlerError::new(std::io::Error::other(
+                "recurring workflows do not consume source events",
+            ))),
+        }
+    }
+}
+
+impl<H> RecurringWorkflowAdapter<H>
+where
+    H: RecurringWorkflowHandler + 'static,
+{
+    fn handle_bootstrap(
+        &self,
+        state: Option<RecurringWorkflowState>,
+        response: &[u8],
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        if state.is_some() {
+            return Ok(WorkflowOutput::default());
+        }
+
+        let bootstrapped_at = Timestamp::new(
+            decode_u64_bytes(response, "recurring workflow bootstrap clock")
+                .map_err(WorkflowHandlerError::new)?,
+        );
+        let next_fire_at = self.schedule.initial_fire_at(bootstrapped_at);
+        let state = RecurringWorkflowState {
+            bootstrapped_at,
+            last_tick_at: None,
+            next_fire_at,
+            tick_count: 0,
+        };
+
+        Ok(WorkflowOutput {
+            state: WorkflowStateMutation::Put(encode_recurring_state(&state)?),
+            outbox_entries: Vec::new(),
+            timers: recurring_timer_schedule(&self.instance_id, next_fire_at),
+        })
+    }
+
+    async fn handle_timer(
+        &self,
+        instance_id: &str,
+        state: Option<RecurringWorkflowState>,
+        timer_id: &[u8],
+        fire_at: Timestamp,
+        ctx: &WorkflowContext,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        let Some(state) = state else {
+            return Ok(WorkflowOutput::default());
+        };
+        if timer_id != recurring_timer_id(instance_id) {
+            return Ok(WorkflowOutput::default());
+        }
+        if state.next_fire_at != Some(fire_at) {
+            return Ok(WorkflowOutput::default());
+        }
+
+        let tick_output = self.handler.tick(instance_id, &state, fire_at, ctx).await?;
+        let next_fire_at = self.schedule.next_fire_at(&state, fire_at);
+        let next_state = RecurringWorkflowState {
+            bootstrapped_at: state.bootstrapped_at,
+            last_tick_at: Some(fire_at),
+            next_fire_at,
+            tick_count: state.tick_count.saturating_add(1),
+        };
+        let mut timers = tick_output.timers;
+        timers.extend(recurring_timer_schedule(instance_id, next_fire_at));
+
+        Ok(WorkflowOutput {
+            state: WorkflowStateMutation::Put(encode_recurring_state(&next_state)?),
+            outbox_entries: tick_output.outbox_entries,
+            timers,
+        })
+    }
+}
+
 async fn commit_runtime_transaction<H>(
     runtime: &WorkflowRuntimeInner<H>,
     tx: Transaction,
 ) -> Result<SequenceNumber, TransactionCommitError> {
-    if runtime.durable_progress {
+    if runtime.progress_mode.uses_durable_commits() {
         tx.commit().await
     } else {
         tx.commit_no_flush().await
@@ -1558,6 +1964,22 @@ fn decode_trigger_order(value: Option<&Value>) -> Result<u64, WorkflowError> {
     Ok(u64::from_be_bytes(sequence))
 }
 
+fn encode_u64_bytes(value: u64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+fn decode_u64_bytes(bytes: &[u8], context: &str) -> Result<u64, std::io::Error> {
+    if bytes.len() != 8 {
+        return Err(std::io::Error::other(format!(
+            "{context} must encode exactly 8 bytes"
+        )));
+    }
+
+    let mut raw = [0_u8; 8];
+    raw.copy_from_slice(bytes);
+    Ok(u64::from_be_bytes(raw))
+}
+
 fn encode_payload<T>(value: &T, context: &str) -> Result<Vec<u8>, WorkflowError>
 where
     T: Serialize,
@@ -1631,6 +2053,40 @@ fn expect_bytes_value<'a>(value: &'a Value, context: &str) -> Result<&'a [u8], W
             Err(StorageError::corruption(format!("{context} expected a byte value")).into())
         }
     }
+}
+
+fn encode_recurring_state(state: &RecurringWorkflowState) -> Result<Value, WorkflowHandlerError> {
+    Ok(Value::bytes(
+        encode_payload(state, "recurring workflow state").map_err(WorkflowHandlerError::new)?,
+    ))
+}
+
+fn decode_recurring_state(
+    value: Option<&Value>,
+) -> Result<Option<RecurringWorkflowState>, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = expect_bytes_value(value, "recurring workflow state")?;
+    Ok(Some(decode_payload(bytes, "recurring workflow state")?))
+}
+
+fn recurring_timer_id(instance_id: &str) -> Key {
+    format!("__terracedb.recurring.timer:{instance_id}").into_bytes()
+}
+
+fn recurring_timer_schedule(
+    instance_id: &str,
+    next_fire_at: Option<Timestamp>,
+) -> Vec<WorkflowTimerCommand> {
+    next_fire_at
+        .into_iter()
+        .map(|fire_at| WorkflowTimerCommand::Schedule {
+            timer_id: recurring_timer_id(instance_id),
+            fire_at,
+            payload: Vec::new(),
+        })
+        .collect()
 }
 
 async fn count_rows_at_sequence(

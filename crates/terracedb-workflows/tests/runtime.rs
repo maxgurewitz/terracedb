@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use terracedb::{
     ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
     StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
-    Value,
+    Timestamp, Value,
     test_support::{
         row_table_config, test_dependencies, test_dependencies_with_clock,
         tiered_test_config_with_durability,
@@ -18,13 +18,15 @@ use terracedb_simulation::{
     CutPoint, SeededSimulationRunner, SimulationStackBuilder, TerracedbSimulationHarness,
 };
 use terracedb_workflows::{
-    DEFAULT_TIMER_POLL_INTERVAL, WorkflowContext, WorkflowDefinition, WorkflowError,
-    WorkflowHandle, WorkflowHandler, WorkflowHandlerError, WorkflowOutput, WorkflowRuntime,
-    WorkflowStateMutation, WorkflowTimerCommand,
+    DEFAULT_TIMER_POLL_INTERVAL, RecurringSchedule, RecurringTickOutput,
+    RecurringWorkflowDefinition, RecurringWorkflowHandle, RecurringWorkflowHandler,
+    RecurringWorkflowRuntime, RecurringWorkflowState, WorkflowContext, WorkflowDefinition,
+    WorkflowError, WorkflowHandle, WorkflowHandler, WorkflowHandlerError, WorkflowOutput,
+    WorkflowProgressMode, WorkflowRuntime, WorkflowStateMutation, WorkflowTimerCommand,
 };
 
-const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(300);
-const WORKFLOW_TIMER_SIMULATION_DURATION: Duration = Duration::from_millis(600);
+const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(600);
+const WORKFLOW_TIMER_SIMULATION_DURATION: Duration = Duration::from_millis(1_200);
 const SIMULATION_MIN_MESSAGE_LATENCY: Duration = Duration::from_millis(1);
 const SIMULATION_MAX_MESSAGE_LATENCY: Duration = Duration::from_millis(1);
 
@@ -205,6 +207,29 @@ impl WorkflowHandler for TimerHandler {
     }
 }
 
+struct RecurringTimerHandler;
+
+#[async_trait]
+impl RecurringWorkflowHandler for RecurringTimerHandler {
+    async fn tick(
+        &self,
+        instance_id: &str,
+        state: &RecurringWorkflowState,
+        fire_at: Timestamp,
+        _ctx: &WorkflowContext,
+    ) -> Result<RecurringTickOutput, WorkflowHandlerError> {
+        let tick = state.tick_count + 1;
+        Ok(RecurringTickOutput {
+            outbox_entries: vec![OutboxEntry {
+                outbox_id: format!("{instance_id}:{tick}").into_bytes(),
+                idempotency_key: format!("{instance_id}:{tick}"),
+                payload: fire_at.get().to_be_bytes().to_vec(),
+            }],
+            timers: Vec::new(),
+        })
+    }
+}
+
 #[tokio::test]
 async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
     let file_system = Arc::new(StubFileSystem::default());
@@ -258,7 +283,8 @@ async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
         .await
         .expect_err("workflow runtime should fail on change-feed scan");
     match error {
-        WorkflowError::Storage(storage) => {
+        WorkflowError::Storage(storage)
+        | WorkflowError::ChangeFeed(ChangeFeedError::Storage(storage)) => {
             assert_eq!(storage.kind(), StorageErrorKind::Timeout);
         }
         other => panic!("expected typed workflow change-feed failure, got {other:?}"),
@@ -301,7 +327,8 @@ fn backlog_stack_builder(
                 let runtime = WorkflowRuntime::open(
                     db.clone(),
                     context.clock(),
-                    WorkflowDefinition::new("orders", [source.clone()], RecordingHandler { stats }),
+                    WorkflowDefinition::new("orders", [source.clone()], RecordingHandler { stats })
+                        .with_progress_mode(WorkflowProgressMode::Buffered),
                 )
                 .await?;
 
@@ -348,23 +375,78 @@ fn callback_stack_builder() -> SimulationStackBuilder<WorkflowStack<CallbackRepl
 }
 
 fn timer_stack_builder(
-    durable_progress: bool,
+    progress_mode: Option<WorkflowProgressMode>,
 ) -> SimulationStackBuilder<WorkflowStack<TimerHandler>> {
     SimulationStackBuilder::new(
         move |context, db| async move {
-            let runtime = WorkflowRuntime::open(
-                db,
-                context.clock(),
+            let mut definition =
                 WorkflowDefinition::new("timers", std::iter::empty::<Table>(), TimerHandler)
-                    .with_timer_poll_interval(Duration::from_millis(1))
-                    .with_durable_progress(durable_progress),
-            )
-            .await?;
+                    .with_timer_poll_interval(Duration::from_millis(1));
+            if let Some(progress_mode) = progress_mode {
+                definition = definition.with_progress_mode(progress_mode);
+            }
+            let runtime = WorkflowRuntime::open(db, context.clock(), definition).await?;
 
             Ok(WorkflowStack {
                 runtime,
                 handle: None,
                 source: None,
+            })
+        },
+        |stack| async move {
+            stack.shutdown().await?;
+            Ok(())
+        },
+    )
+}
+
+struct RecurringWorkflowStack<H> {
+    runtime: RecurringWorkflowRuntime<H>,
+    handle: Option<RecurringWorkflowHandle>,
+}
+
+impl<H> RecurringWorkflowStack<H>
+where
+    H: RecurringWorkflowHandler + 'static,
+{
+    async fn start(&mut self) -> Result<(), WorkflowError> {
+        if self.handle.is_none() {
+            self.handle = Some(self.runtime.start().await?);
+        }
+        Ok(())
+    }
+
+    async fn shutdown(self) -> Result<(), WorkflowError> {
+        if let Some(handle) = self.handle {
+            handle.abort().await?;
+        }
+        Ok(())
+    }
+}
+
+fn recurring_stack_builder() -> SimulationStackBuilder<RecurringWorkflowStack<RecurringTimerHandler>>
+{
+    SimulationStackBuilder::new(
+        |context, db| async move {
+            let runtime = RecurringWorkflowRuntime::open(
+                db,
+                context.clock(),
+                RecurringWorkflowDefinition::new(
+                    "recurring",
+                    "job-1",
+                    RecurringSchedule::custom(
+                        |now| Some(Timestamp::new(now.get().saturating_add(10))),
+                        |_state, fire_at| Some(Timestamp::new(fire_at.get().saturating_add(10))),
+                    ),
+                    RecurringTimerHandler,
+                )
+                .with_timer_poll_interval(Duration::from_millis(1)),
+            )
+            .await?;
+
+            Ok(RecurringWorkflowStack {
+                runtime,
+                handle: None,
             })
         },
         |stack| async move {
@@ -467,6 +549,57 @@ where
                         .read(inbox_key)
                         .await?
                         .is_some())
+                })
+            },
+        )
+        .await
+}
+
+async fn wait_for_recurring_state<H, P>(
+    runtime: &RecurringWorkflowRuntime<H>,
+    predicate: P,
+) -> Result<RecurringWorkflowState, WorkflowError>
+where
+    H: RecurringWorkflowHandler + 'static,
+    P: Fn(&RecurringWorkflowState) -> bool,
+{
+    for _ in 0..100 {
+        if let Some(state) = runtime.load_state().await? {
+            if predicate(&state) {
+                return Ok(state);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    Err(WorkflowError::Handler {
+        name: runtime.name().to_string(),
+        source: WorkflowHandlerError::new(std::io::Error::other(
+            "timed out waiting for recurring state",
+        )),
+    })
+}
+
+async fn wait_for_simulation_recurring_tick_count<H>(
+    harness: &TerracedbSimulationHarness<RecurringWorkflowStack<H>>,
+    expected: u64,
+) -> Result<(), terracedb_simulation::SimulationHarnessError>
+where
+    H: RecurringWorkflowHandler + 'static,
+{
+    let state_table = harness.stack().runtime.tables().state_table().clone();
+    harness
+        .wait_for_visible(
+            format!("recurring tick count -> {expected}"),
+            [&state_table],
+            move |_db, stack| {
+                Box::pin(async move {
+                    Ok(stack
+                        .runtime
+                        .load_state()
+                        .await?
+                        .map(|state| state.tick_count == expected)
+                        .unwrap_or(false))
                 })
             },
         )
@@ -652,7 +785,7 @@ fn timer_loop_waits_for_durable_timer_rows_before_firing() -> turmoil::Result {
                     "/workflow-timer-fence",
                     TieredDurabilityMode::Deferred,
                 ),
-                timer_stack_builder(false),
+                timer_stack_builder(Some(WorkflowProgressMode::Buffered)),
             )
             .await?;
             harness.stack_mut().start().await?;
@@ -699,7 +832,7 @@ fn timer_loop_waits_for_durable_timer_rows_before_firing() -> turmoil::Result {
 }
 
 #[test]
-fn workflow_durable_progress_allows_timer_chains_without_manual_flush() -> turmoil::Result {
+fn workflow_auto_progress_allows_timer_chains_without_manual_flush() -> turmoil::Result {
     SeededSimulationRunner::new(0x4104)
         .with_simulation_duration(WORKFLOW_TIMER_SIMULATION_DURATION)
         .with_message_latency(
@@ -713,7 +846,7 @@ fn workflow_durable_progress_allows_timer_chains_without_manual_flush() -> turmo
                     "/workflow-durable-progress",
                     TieredDurabilityMode::Deferred,
                 ),
-                timer_stack_builder(true),
+                timer_stack_builder(None),
             )
             .await?;
             harness.stack_mut().start().await?;
@@ -731,6 +864,157 @@ fn workflow_durable_progress_allows_timer_chains_without_manual_flush() -> turmo
                 .sleep(Duration::from_millis(10))
                 .await;
             wait_for_workflow_state(&harness, "order-9", "fired").await?;
+
+            harness.shutdown().await?;
+            Ok(())
+        })
+}
+
+#[tokio::test]
+async fn recurring_workflow_skips_duplicate_bootstrap_callbacks_and_updates_state() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(3)));
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/recurring-bootstrap-dedupe",
+            TieredDurabilityMode::Deferred,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = RecurringWorkflowRuntime::open(
+        db,
+        clock.clone(),
+        RecurringWorkflowDefinition::new(
+            "planner",
+            "planner-1",
+            RecurringSchedule::fixed_interval(10),
+            RecurringTimerHandler,
+        )
+        .with_timer_poll_interval(Duration::from_millis(1)),
+    )
+    .await
+    .expect("open recurring workflow runtime");
+
+    assert!(
+        runtime
+            .ensure_bootstrapped()
+            .await
+            .expect("admit first bootstrap")
+            .is_some()
+    );
+    assert!(
+        runtime
+            .ensure_bootstrapped()
+            .await
+            .expect("admit duplicate bootstrap")
+            .is_some()
+    );
+
+    let handle = runtime
+        .start()
+        .await
+        .expect("start recurring workflow runtime");
+    let bootstrapped = wait_for_recurring_state(&runtime, |state| state.next_fire_at.is_some())
+        .await
+        .expect("wait for recurring bootstrap state");
+    assert_eq!(bootstrapped.bootstrapped_at, Timestamp::new(3));
+    assert_eq!(bootstrapped.last_tick_at, None);
+    assert_eq!(bootstrapped.next_fire_at, Some(Timestamp::new(13)));
+    assert_eq!(bootstrapped.tick_count, 0);
+
+    clock.set(Timestamp::new(15));
+    let fired = wait_for_recurring_state(&runtime, |state| state.tick_count == 1)
+        .await
+        .expect("wait for recurring timer tick");
+    assert_eq!(fired.last_tick_at, Some(Timestamp::new(13)));
+    assert_eq!(fired.next_fire_at, Some(Timestamp::new(23)));
+    assert_eq!(fired.tick_count, 1);
+
+    assert!(
+        runtime
+            .tables()
+            .outbox_table()
+            .read(b"planner-1:1".to_vec())
+            .await
+            .expect("read first recurring outbox entry")
+            .is_some()
+    );
+    assert!(
+        runtime
+            .tables()
+            .outbox_table()
+            .read(b"planner-1:2".to_vec())
+            .await
+            .expect("read duplicate recurring outbox entry")
+            .is_none()
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown recurring workflow runtime");
+}
+
+#[test]
+fn recurring_workflow_recovers_after_restart_with_custom_schedule() -> turmoil::Result {
+    SeededSimulationRunner::new(0x4105)
+        .with_simulation_duration(WORKFLOW_TIMER_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/recurring-restart",
+                    TieredDurabilityMode::Deferred,
+                ),
+                recurring_stack_builder(),
+            )
+            .await?;
+            harness.stack_mut().start().await?;
+
+            wait_for_simulation_recurring_tick_count(&harness, 0).await?;
+            harness
+                .context()
+                .clock()
+                .sleep(Duration::from_millis(10))
+                .await;
+            wait_for_simulation_recurring_tick_count(&harness, 1).await?;
+
+            harness.restart(CutPoint::AfterStep).await?;
+            harness.stack_mut().start().await?;
+            harness
+                .context()
+                .clock()
+                .sleep(Duration::from_millis(10))
+                .await;
+            wait_for_simulation_recurring_tick_count(&harness, 2).await?;
+
+            let runtime = &harness.stack().runtime;
+            harness.require(
+                runtime
+                    .tables()
+                    .outbox_table()
+                    .read(b"job-1:1".to_vec())
+                    .await?
+                    .is_some(),
+                "first recurring outbox entry should survive restart",
+            )?;
+            harness.require(
+                runtime
+                    .tables()
+                    .outbox_table()
+                    .read(b"job-1:2".to_vec())
+                    .await?
+                    .is_some(),
+                "second recurring outbox entry should be emitted after restart",
+            )?;
 
             harness.shutdown().await?;
             Ok(())
