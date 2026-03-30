@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     hash::{Hash, Hasher},
+    ops::Bound,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -1085,6 +1086,13 @@ struct VisibleValueResolution {
     collapse: Option<MergeCollapse>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RowScanResult {
+    rows: Vec<(Key, Value)>,
+    collapses: Vec<(Key, MergeCollapse)>,
+    visited_key_groups: usize,
+}
+
 #[derive(Clone, Debug)]
 struct ResolvedReadSetEntry {
     table_id: TableId,
@@ -1988,29 +1996,6 @@ impl ResidentRowSstable {
         self.columnar.is_some()
     }
 
-    fn collect_matching_keys(&self, matcher: &KeyMatcher<'_>, keys: &mut BTreeSet<Key>) {
-        let start = match matcher {
-            KeyMatcher::Range { start, .. } | KeyMatcher::Prefix(start) => self.lower_bound(start),
-        };
-        let mut last_key: Option<&[u8]> = None;
-
-        for row in &self.rows[start..] {
-            if !matcher.matches(&row.key) {
-                if matcher.is_past_end(&row.key) {
-                    break;
-                }
-                continue;
-            }
-
-            if last_key == Some(row.key.as_slice()) {
-                continue;
-            }
-
-            keys.insert(row.key.clone());
-            last_key = Some(row.key.as_slice());
-        }
-    }
-
     fn collect_visible_rows(
         &self,
         key: &[u8],
@@ -2357,21 +2342,6 @@ impl ResidentRowSstable {
 }
 
 impl SstableState {
-    fn collect_matching_keys(
-        &self,
-        table_id: TableId,
-        matcher: &KeyMatcher<'_>,
-        keys: &mut BTreeSet<Key>,
-    ) {
-        for sstable in &self.live {
-            if sstable.meta.table_id != table_id {
-                continue;
-            }
-
-            sstable.collect_matching_keys(matcher, keys);
-        }
-    }
-
     fn collect_visible_rows(
         &self,
         table_id: TableId,
@@ -2604,6 +2574,19 @@ enum KeyMatcher<'a> {
 }
 
 impl KeyMatcher<'_> {
+    fn start_bound(&self) -> &[u8] {
+        match self {
+            Self::Range { start, .. } | Self::Prefix(start) => start,
+        }
+    }
+
+    fn exclusive_upper_bound(&self) -> Option<Key> {
+        match self {
+            Self::Range { end, .. } => Some(end.to_vec()),
+            Self::Prefix(prefix) => prefix_exclusive_upper_bound(prefix),
+        }
+    }
+
     fn matches(&self, key: &[u8]) -> bool {
         match self {
             Self::Range { start, end } => key >= *start && key < *end,
@@ -2616,6 +2599,241 @@ impl KeyMatcher<'_> {
             Self::Range { end, .. } => key >= *end,
             Self::Prefix(prefix) => key > *prefix,
         }
+    }
+}
+
+fn prefix_exclusive_upper_bound(prefix: &[u8]) -> Option<Key> {
+    let mut upper = prefix.to_vec();
+    for index in (0..upper.len()).rev() {
+        if upper[index] == u8::MAX {
+            continue;
+        }
+
+        upper[index] = upper[index].saturating_add(1);
+        upper.truncate(index + 1);
+        return Some(upper);
+    }
+
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanDirection {
+    Forward,
+    Reverse,
+}
+
+struct TableMemtableCursor<'a> {
+    range: std::collections::btree_map::Range<'a, Vec<u8>, MemtableEntry>,
+    current: Option<&'a MemtableEntry>,
+    direction: ScanDirection,
+}
+
+impl<'a> TableMemtableCursor<'a> {
+    fn new(table: &'a TableMemtable, matcher: &KeyMatcher<'_>, direction: ScanDirection) -> Self {
+        let upper = matcher.exclusive_upper_bound();
+        let bounds = (
+            Bound::Included(matcher.start_bound()),
+            match upper.as_ref() {
+                Some(upper) => Bound::Excluded(upper.as_slice()),
+                None => Bound::Unbounded,
+            },
+        );
+        let mut range = table.entries.range::<[u8], _>(bounds);
+        let current = match direction {
+            ScanDirection::Forward => range.next().map(|(_, entry)| entry),
+            ScanDirection::Reverse => range.next_back().map(|(_, entry)| entry),
+        };
+
+        Self {
+            range,
+            current,
+            direction,
+        }
+    }
+
+    fn current_key(&self) -> Option<&[u8]> {
+        self.current.map(|entry| entry.user_key.as_slice())
+    }
+
+    fn take_key_rows(&mut self, key: &[u8], sequence: SequenceNumber, rows: &mut Vec<SstableRow>) {
+        while self.current_key() == Some(key) {
+            let entry = self
+                .current
+                .take()
+                .expect("current memtable entry should exist");
+            if entry.sequence <= sequence {
+                rows.push(SstableRow {
+                    key: entry.user_key.clone(),
+                    sequence: entry.sequence,
+                    kind: entry.kind,
+                    value: entry.value.clone(),
+                });
+            }
+            self.advance();
+        }
+    }
+
+    fn advance(&mut self) {
+        self.current = match self.direction {
+            ScanDirection::Forward => self.range.next().map(|(_, entry)| entry),
+            ScanDirection::Reverse => self.range.next_back().map(|(_, entry)| entry),
+        };
+    }
+}
+
+struct ResidentRowSstableCursor<'a> {
+    rows: &'a [SstableRow],
+    start_index: usize,
+    end_index: usize,
+    current_index: Option<usize>,
+    direction: ScanDirection,
+}
+
+impl<'a> ResidentRowSstableCursor<'a> {
+    fn new(
+        sstable: &'a ResidentRowSstable,
+        matcher: &KeyMatcher<'_>,
+        direction: ScanDirection,
+    ) -> Self {
+        let start_index = sstable.lower_bound(matcher.start_bound());
+        let end_index = matcher
+            .exclusive_upper_bound()
+            .as_ref()
+            .map(|upper| sstable.lower_bound(upper))
+            .unwrap_or_else(|| sstable.rows.len());
+        let current_index = if start_index < end_index {
+            match direction {
+                ScanDirection::Forward => Some(start_index),
+                ScanDirection::Reverse => Some(end_index - 1),
+            }
+        } else {
+            None
+        };
+
+        Self {
+            rows: &sstable.rows,
+            start_index,
+            end_index,
+            current_index,
+            direction,
+        }
+    }
+
+    fn current(&self) -> Option<&'a SstableRow> {
+        self.current_index.map(|index| &self.rows[index])
+    }
+
+    fn current_key(&self) -> Option<&[u8]> {
+        self.current().map(|row| row.key.as_slice())
+    }
+
+    fn take_key_rows(&mut self, key: &[u8], sequence: SequenceNumber, rows: &mut Vec<SstableRow>) {
+        while self.current_key() == Some(key) {
+            let row = self.current().expect("current SSTable row should exist");
+            if row.sequence <= sequence {
+                rows.push(row.clone());
+            }
+            self.advance();
+        }
+    }
+
+    fn advance(&mut self) {
+        let Some(index) = self.current_index else {
+            return;
+        };
+
+        self.current_index = match self.direction {
+            ScanDirection::Forward => {
+                let next = index.saturating_add(1);
+                (next < self.end_index).then_some(next)
+            }
+            ScanDirection::Reverse => index
+                .checked_sub(1)
+                .filter(|next| *next >= self.start_index),
+        };
+    }
+}
+
+enum RowScanSourceCursor<'a> {
+    Memtable(TableMemtableCursor<'a>),
+    Sstable(ResidentRowSstableCursor<'a>),
+}
+
+impl<'a> RowScanSourceCursor<'a> {
+    fn current_key(&self) -> Option<&[u8]> {
+        match self {
+            Self::Memtable(cursor) => cursor.current_key(),
+            Self::Sstable(cursor) => cursor.current_key(),
+        }
+    }
+
+    fn take_key_rows(&mut self, key: &[u8], sequence: SequenceNumber, rows: &mut Vec<SstableRow>) {
+        match self {
+            Self::Memtable(cursor) => cursor.take_key_rows(key, sequence, rows),
+            Self::Sstable(cursor) => cursor.take_key_rows(key, sequence, rows),
+        }
+    }
+}
+
+struct MergedRowRangeIterator<'a> {
+    sources: Vec<RowScanSourceCursor<'a>>,
+    direction: ScanDirection,
+}
+
+impl<'a> MergedRowRangeIterator<'a> {
+    fn new(
+        memtables: &'a MemtableState,
+        sstables: &'a SstableState,
+        table_id: TableId,
+        matcher: &KeyMatcher<'_>,
+        direction: ScanDirection,
+    ) -> Self {
+        let mut sources = Vec::new();
+
+        if let Some(table) = memtables.mutable.tables.get(&table_id) {
+            sources.push(RowScanSourceCursor::Memtable(TableMemtableCursor::new(
+                table, matcher, direction,
+            )));
+        }
+        for immutable in &memtables.immutables {
+            if let Some(table) = immutable.memtable.tables.get(&table_id) {
+                sources.push(RowScanSourceCursor::Memtable(TableMemtableCursor::new(
+                    table, matcher, direction,
+                )));
+            }
+        }
+        for sstable in &sstables.live {
+            if sstable.meta.table_id != table_id || sstable.is_columnar() {
+                continue;
+            }
+            sources.push(RowScanSourceCursor::Sstable(ResidentRowSstableCursor::new(
+                sstable, matcher, direction,
+            )));
+        }
+
+        Self { sources, direction }
+    }
+
+    fn next_key_rows(&mut self, sequence: SequenceNumber) -> Option<(Key, Vec<SstableRow>)> {
+        let target_key = self
+            .sources
+            .iter()
+            .filter_map(RowScanSourceCursor::current_key)
+            .reduce(|left, right| match self.direction {
+                ScanDirection::Forward => left.min(right),
+                ScanDirection::Reverse => left.max(right),
+            })?
+            .to_vec();
+        let mut rows = Vec::new();
+
+        for source in &mut self.sources {
+            if source.current_key() == Some(target_key.as_slice()) {
+                source.take_key_rows(&target_key, sequence, &mut rows);
+            }
+        }
+
+        Some((target_key, rows))
     }
 }
 
@@ -8222,6 +8440,15 @@ impl Db {
         let mut rows = Vec::new();
         memtables.collect_visible_rows(table_id, key, sequence, &mut rows);
         sstables.collect_visible_rows(table_id, key, sequence, &mut rows);
+        Self::resolve_visible_value_from_rows(table, key, &rows)
+    }
+
+    fn resolve_visible_value_from_rows(
+        table: &StoredTable,
+        key: &[u8],
+        rows: &[SstableRow],
+    ) -> Result<VisibleValueResolution, StorageError> {
+        let mut rows = rows.iter().collect::<Vec<_>>();
         rows.sort_by(|left, right| {
             right.sequence.cmp(&left.sequence).then_with(|| {
                 Self::visible_row_priority(left.kind).cmp(&Self::visible_row_priority(right.kind))
@@ -8298,6 +8525,50 @@ impl Db {
         );
     }
 
+    fn scan_visible_row_with_state(
+        tables: &BTreeMap<String, StoredTable>,
+        memtables: &MemtableState,
+        sstables: &SstableState,
+        table_id: TableId,
+        sequence: SequenceNumber,
+        matcher: KeyMatcher<'_>,
+        opts: &ScanOptions,
+    ) -> Result<RowScanResult, StorageError> {
+        let table = Self::stored_table_by_id(tables, table_id).ok_or_else(|| {
+            StorageError::not_found(format!("table id {} is not registered", table_id.get()))
+        })?;
+        let limit = opts.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(RowScanResult::default());
+        }
+
+        let direction = if opts.reverse {
+            ScanDirection::Reverse
+        } else {
+            ScanDirection::Forward
+        };
+        let mut iterator =
+            MergedRowRangeIterator::new(memtables, sstables, table_id, &matcher, direction);
+        let mut result = RowScanResult::default();
+
+        while result.rows.len() < limit {
+            let Some((key, rows)) = iterator.next_key_rows(sequence) else {
+                break;
+            };
+            result.visited_key_groups = result.visited_key_groups.saturating_add(1);
+
+            let resolution = Self::resolve_visible_value_from_rows(table, &key, &rows)?;
+            if let Some(collapse) = resolution.collapse {
+                result.collapses.push((key.clone(), collapse));
+            }
+            if let Some(value) = resolution.value {
+                result.rows.push((key, value));
+            }
+        }
+
+        Ok(result)
+    }
+
     fn read_visible_value_row(
         &self,
         table_id: TableId,
@@ -8327,35 +8598,20 @@ impl Db {
         matcher: KeyMatcher<'_>,
         opts: &ScanOptions,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
-        let limit = opts.limit.unwrap_or(usize::MAX);
-        if limit == 0 {
-            return Ok(Vec::new());
+        let result = {
+            let tables = self.tables_read();
+            let memtables = self.memtables_read();
+            let sstables = self.sstables_read();
+            Self::scan_visible_row_with_state(
+                &tables, &memtables, &sstables, table_id, sequence, matcher, opts,
+            )?
+        };
+
+        for (key, collapse) in result.collapses {
+            self.force_collapse_merge_chain(table_id, &key, collapse);
         }
 
-        let mut keys = BTreeSet::new();
-        self.memtables_read()
-            .collect_matching_keys(table_id, &matcher, &mut keys);
-        self.sstables_read()
-            .collect_matching_keys(table_id, &matcher, &mut keys);
-
-        let mut ordered_keys = keys.into_iter().collect::<Vec<_>>();
-        if opts.reverse {
-            ordered_keys.reverse();
-        }
-
-        let mut rows = Vec::new();
-        for key in ordered_keys {
-            let Some(value) = self.read_visible_value_row(table_id, &key, sequence)? else {
-                continue;
-            };
-
-            rows.push((key, value));
-            if rows.len() >= limit {
-                break;
-            }
-        }
-
-        Ok(rows)
+        Ok(result.rows)
     }
 
     fn resolve_scan_projection(
@@ -9506,7 +9762,7 @@ mod tests {
 
     use super::{
         COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, CommitPhase, CompactionJobKind,
-        CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
+        CompactionPhase, Db, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
         LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR,
         LOCAL_SSTABLE_SHARD_DIR, ManifestId, OffloadPhase, PendingWorkSpec,
         PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key,
@@ -11814,6 +12070,150 @@ mod tests {
                 (b"banana".to_vec(), Value::bytes("ripe")),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn row_scan_limit_short_circuits_after_requested_key_groups() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/row-scan-limit-short-circuit"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("red"))
+            .await
+            .expect("write apple");
+        db.flush().await.expect("flush apple");
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        let rotated = db.memtables_write().rotate_mutable();
+        assert!(
+            rotated.is_some(),
+            "banana should rotate into an immutable memtable"
+        );
+        table
+            .write(b"carrot".to_vec(), Value::bytes("orange"))
+            .await
+            .expect("write carrot");
+        table
+            .write(b"date".to_vec(), Value::bytes("brown"))
+            .await
+            .expect("write date");
+
+        let table_id = table.id().expect("table id");
+        let scan = {
+            let tables = db.tables_read();
+            let memtables = db.memtables_read();
+            let sstables = db.sstables_read();
+            Db::scan_visible_row_with_state(
+                &tables,
+                &memtables,
+                &sstables,
+                table_id,
+                db.current_sequence(),
+                KeyMatcher::Range {
+                    start: b"a",
+                    end: b"z",
+                },
+                &ScanOptions {
+                    reverse: false,
+                    limit: Some(2),
+                    columns: None,
+                },
+            )
+            .expect("scan visible rows with state")
+        };
+
+        assert_eq!(
+            scan.rows,
+            vec![
+                (b"apple".to_vec(), Value::bytes("red")),
+                (b"banana".to_vec(), Value::bytes("yellow")),
+            ]
+        );
+        assert_eq!(scan.visited_key_groups, 2);
+    }
+
+    #[tokio::test]
+    async fn reverse_row_scan_limit_short_circuits_after_requested_key_groups() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/reverse-row-scan-limit-short-circuit"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create table");
+
+        table
+            .write(b"apple".to_vec(), Value::bytes("red"))
+            .await
+            .expect("write apple");
+        db.flush().await.expect("flush apple");
+        table
+            .write(b"banana".to_vec(), Value::bytes("yellow"))
+            .await
+            .expect("write banana");
+        let rotated = db.memtables_write().rotate_mutable();
+        assert!(
+            rotated.is_some(),
+            "banana should rotate into an immutable memtable"
+        );
+        table
+            .write(b"carrot".to_vec(), Value::bytes("orange"))
+            .await
+            .expect("write carrot");
+        table
+            .write(b"date".to_vec(), Value::bytes("brown"))
+            .await
+            .expect("write date");
+
+        let table_id = table.id().expect("table id");
+        let scan = {
+            let tables = db.tables_read();
+            let memtables = db.memtables_read();
+            let sstables = db.sstables_read();
+            Db::scan_visible_row_with_state(
+                &tables,
+                &memtables,
+                &sstables,
+                table_id,
+                db.current_sequence(),
+                KeyMatcher::Range {
+                    start: b"a",
+                    end: b"z",
+                },
+                &ScanOptions {
+                    reverse: true,
+                    limit: Some(2),
+                    columns: None,
+                },
+            )
+            .expect("reverse scan visible rows with state")
+        };
+
+        assert_eq!(
+            scan.rows,
+            vec![
+                (b"date".to_vec(), Value::bytes("brown")),
+                (b"carrot".to_vec(), Value::bytes("orange")),
+            ]
+        );
+        assert_eq!(scan.visited_key_groups, 2);
     }
 
     #[tokio::test]
@@ -16624,6 +17024,66 @@ mod tests {
             .memtables_read()
             .read_at(table_id, b"doc", latest)
             .expect("forced collapse should install a shadow row");
+        assert_eq!(collapsed.kind, ChangeKind::Put);
+        assert_eq!(collapsed.value, Some(bytes("seed|A|B|C")));
+    }
+
+    #[tokio::test]
+    async fn long_merge_chains_force_a_collapsed_shadow_value_on_scan() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_config("/merge-collapse-scan"),
+            dependencies(file_system, object_store),
+        )
+        .await
+        .expect("open db");
+        let table = db
+            .create_table(merge_row_table_config("events", Some(2)))
+            .await
+            .expect("create merge table");
+
+        table
+            .write(b"doc".to_vec(), bytes("seed"))
+            .await
+            .expect("write base value");
+        table
+            .merge(b"doc".to_vec(), bytes("A"))
+            .await
+            .expect("write operand A");
+        table
+            .merge(b"doc".to_vec(), bytes("B"))
+            .await
+            .expect("write operand B");
+        let latest = table
+            .merge(b"doc".to_vec(), bytes("C"))
+            .await
+            .expect("write operand C");
+        db.flush().await.expect("flush unresolved operands");
+
+        let table_id = table.id().expect("table id");
+        assert!(
+            db.memtables_read()
+                .read_at(table_id, b"doc", latest)
+                .is_none(),
+            "no collapsed shadow row should exist before the scan"
+        );
+
+        assert_eq!(
+            collect_rows(
+                table
+                    .scan(b"doc".to_vec(), b"doe".to_vec(), ScanOptions::default())
+                    .await
+                    .expect("scan long merge chain"),
+            )
+            .await,
+            vec![(b"doc".to_vec(), bytes("seed|A|B|C"))]
+        );
+
+        let collapsed = db
+            .memtables_read()
+            .read_at(table_id, b"doc", latest)
+            .expect("scan should install a collapse shadow row");
         assert_eq!(collapsed.kind, ChangeKind::Put);
         assert_eq!(collapsed.value, Some(bytes("seed|A|B|C")));
     }
