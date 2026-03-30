@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use terracedb::IdEncodingError;
 
-use crate::AgentFsError;
+use crate::VfsError;
 
 macro_rules! encoded_id_newtype {
     ($name:ident, $inner:ty) => {
@@ -131,15 +131,15 @@ impl AllocatorKind {
         [self as u8]
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         match bytes {
             [1] => Ok(Self::Inode),
             [2] => Ok(Self::Activity),
             [3] => Ok(Self::ToolRun),
-            [other] => Err(AgentFsError::InvalidKey {
+            [other] => Err(VfsError::InvalidKey {
                 reason: format!("unknown allocator kind tag {other}"),
             }),
-            _ => Err(AgentFsError::InvalidKey {
+            _ => Err(VfsError::InvalidKey {
                 reason: format!(
                     "allocator kind expects {} byte, got {}",
                     Self::ENCODED_LEN,
@@ -160,7 +160,7 @@ impl VolumeKey {
         self.volume_id.encode().to_vec()
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         Ok(Self {
             volume_id: VolumeId::decode(bytes)?,
         })
@@ -185,9 +185,9 @@ impl AllocatorKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() != VolumeId::ENCODED_LEN + AllocatorKind::ENCODED_LEN {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "allocator key expects {} bytes, got {}",
                     VolumeId::ENCODED_LEN + AllocatorKind::ENCODED_LEN,
@@ -217,9 +217,9 @@ impl InodeKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() != VolumeId::ENCODED_LEN + InodeId::ENCODED_LEN {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "inode key expects {} bytes, got {}",
                     VolumeId::ENCODED_LEN + InodeId::ENCODED_LEN,
@@ -252,10 +252,10 @@ impl DentryKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         let fixed = VolumeId::ENCODED_LEN + InodeId::ENCODED_LEN;
         if bytes.len() < fixed {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "dentry key expects at least {fixed} bytes, got {}",
                     bytes.len()
@@ -294,10 +294,10 @@ impl ChunkKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         let fixed = VolumeId::ENCODED_LEN + InodeId::ENCODED_LEN + 8;
         if bytes.len() != fixed {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!("chunk key expects {fixed} bytes, got {}", bytes.len()),
             });
         }
@@ -337,7 +337,7 @@ impl SymlinkKey {
         .encode()
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         let key = InodeKey::decode(bytes)?;
         Ok(Self {
             volume_id: key.volume_id,
@@ -360,9 +360,9 @@ impl KvKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() < VolumeId::ENCODED_LEN {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "kv key expects at least {} bytes, got {}",
                     VolumeId::ENCODED_LEN,
@@ -396,9 +396,9 @@ impl ToolRunKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() != VolumeId::ENCODED_LEN + ToolRunId::ENCODED_LEN {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "tool run key expects {} bytes, got {}",
                     VolumeId::ENCODED_LEN + ToolRunId::ENCODED_LEN,
@@ -428,9 +428,9 @@ impl ActivityKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() != VolumeId::ENCODED_LEN + ActivityId::ENCODED_LEN {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "activity key expects {} bytes, got {}",
                     VolumeId::ENCODED_LEN + ActivityId::ENCODED_LEN,
@@ -464,9 +464,9 @@ impl WhiteoutKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() < VolumeId::ENCODED_LEN {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "whiteout key expects at least {} bytes, got {}",
                     VolumeId::ENCODED_LEN,
@@ -496,9 +496,9 @@ impl OriginKey {
         bytes
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, AgentFsError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() != VolumeId::ENCODED_LEN + InodeId::ENCODED_LEN {
-            return Err(AgentFsError::InvalidKey {
+            return Err(VfsError::InvalidKey {
                 reason: format!(
                     "origin key expects {} bytes, got {}",
                     VolumeId::ENCODED_LEN + InodeId::ENCODED_LEN,

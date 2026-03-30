@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use terracedb::Timestamp;
 
-use crate::{AgentFsError, JsonValue, ToolRunId};
+use crate::{JsonValue, ToolRunId, VfsError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,16 +38,15 @@ pub enum CompletedToolRunOutcome {
 }
 
 #[async_trait]
-pub trait ReadOnlyAgentToolRuns: Send + Sync {
-    async fn get(&self, id: ToolRunId) -> Result<Option<ToolRun>, AgentFsError>;
-    async fn recent(&self, limit: Option<usize>) -> Result<Vec<ToolRun>, AgentFsError>;
+pub trait ReadOnlyToolRunStore: Send + Sync {
+    async fn get(&self, id: ToolRunId) -> Result<Option<ToolRun>, VfsError>;
+    async fn recent(&self, limit: Option<usize>) -> Result<Vec<ToolRun>, VfsError>;
 }
 
 #[async_trait]
-pub trait AgentToolRuns: ReadOnlyAgentToolRuns {
-    async fn start(&self, name: &str, params: Option<JsonValue>)
-    -> Result<ToolRunId, AgentFsError>;
-    async fn success(&self, id: ToolRunId, result: Option<JsonValue>) -> Result<(), AgentFsError>;
-    async fn error(&self, id: ToolRunId, message: String) -> Result<(), AgentFsError>;
-    async fn record_completed(&self, input: CompletedToolRun) -> Result<ToolRunId, AgentFsError>;
+pub trait ToolRunStore: ReadOnlyToolRunStore {
+    async fn start(&self, name: &str, params: Option<JsonValue>) -> Result<ToolRunId, VfsError>;
+    async fn success(&self, id: ToolRunId, result: Option<JsonValue>) -> Result<(), VfsError>;
+    async fn error(&self, id: ToolRunId, message: String) -> Result<(), VfsError>;
+    async fn record_completed(&self, input: CompletedToolRun) -> Result<ToolRunId, VfsError>;
 }

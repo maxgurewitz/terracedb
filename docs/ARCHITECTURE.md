@@ -3347,9 +3347,9 @@ Timers are identified by explicit keys (e.g., `payment-timeout:{orderId}`), stor
 
 # Part 5: Embedded Virtual Filesystem Library
 
-This part describes a separate library, tentatively `terracedb-vfs`, that provides an embedded virtual filesystem on top of Terracedb rather than SQLite. The intended use is narrow: embed a virtual filesystem inside the Rust process, expose it to an AI agent or agent runtime, and persist its state with the same durability, queryability, and deterministic-testing model as the rest of Terracedb.
+This part describes a separate library, tentatively `terracedb-vfs`, that provides an embedded virtual filesystem on top of Terracedb rather than SQLite. The intended use is narrow: embed a virtual filesystem inside the Rust process, expose it to an embedded program or runtime, and persist its state with the same durability, queryability, and deterministic-testing model as the rest of Terracedb.
 
-The compatibility target is semantic, not storage-format-level. The goal is to preserve the behavior that matters to an in-process agent sandbox: a POSIX-like virtual filesystem, a small JSON key-value store, tool-run history, point-in-time views, and cheap copy-on-write sandboxes. SQL compatibility, a single-file transport unit, and byte-for-byte reuse of the SQLite schema are explicitly out of scope.
+The compatibility target is semantic, not storage-format-level. The goal is to preserve the behavior that matters to an in-process embedded sandbox: a POSIX-like virtual filesystem, a small JSON key-value store, tool-run history, point-in-time views, and cheap copy-on-write sandboxes. SQL compatibility, a single-file transport unit, and byte-for-byte reuse of the SQLite schema are explicitly out of scope.
 
 ## Goals and Non-Goals
 
@@ -3359,7 +3359,7 @@ The compatibility target is semantic, not storage-format-level. The goal is to p
 - immediate read-after-write for current filesystem state inside the same process,
 - append-only semantic activity records for filesystem mutations, KV mutations, and tool-run lifecycle events,
 - point-in-time snapshots for reproducible reads and durable clone/export flows for long-lived reproduction,
-- copy-on-write overlays for per-agent or per-session sandboxes, and
+- copy-on-write overlays for per-session sandboxes, and
 - portability across Terracedb storage modes instead of a SQLite-specific sync story.
 
 Version 1 is intentionally narrower than the full space of mountable/networked virtual filesystem systems:
@@ -3368,7 +3368,7 @@ Version 1 is intentionally narrower than the full space of mountable/networked v
 - no host-filesystem mount surface or kernel-facing inode/handle contract,
 - no promise to emulate every open-file-handle nuance needed by OS mount adapters,
 - no SQL compatibility or SQLite WAL/file-format compatibility,
-- no assumption that portability means `cp agent.db`.
+- no assumption that portability means `cp volume.db`.
 
 The public surface is therefore path-oriented and embedded-library-first. Internally the implementation still uses inode/dentry tables, but callers do not need a separate mount-oriented API to use the library inside a Rust process.
 
@@ -3376,7 +3376,7 @@ The public surface is therefore path-oriented and embedded-library-first. Intern
 
 These decisions most constrain the design:
 
-- **One Terracedb DB may host many virtual filesystem volumes.** Every reserved table is keyed by `volume_id` first. Deployments that want one agent per DB can still do that by using exactly one volume.
+- **One Terracedb DB may host many virtual filesystem volumes.** Every reserved table is keyed by `volume_id` first. Deployments that want one volume per DB can still do that by using exactly one volume.
 - **Current-state tables are authoritative for reads.** `stat`, `readdir`, `readFile`, KV lookups, and current tool-run status read directly from current-state rows, not from asynchronously maintained projections.
 - **Every logical mutation is one OCC unit.** Namespace changes, inode updates, chunk rewrites, whiteout/origin updates, KV changes, tool-run status changes, and activity-row insertion commit together.
 - **Activity is append-only and volume-ordered.** Each volume owns a monotonic `activity_id` allocator so scans over `vfs_activity` reproduce a stable semantic order.
@@ -3389,42 +3389,42 @@ These decisions most constrain the design:
 The library exposes one embedded API surface:
 
 ```typescript
-interface AgentFsConfig {
+interface VolumeConfig {
   volumeId: string
   chunkSize?: number          // immutable after volume creation
   createIfMissing?: boolean
 }
 
-interface AgentFsStore {
-  openVolume(config: AgentFsConfig): Promise<AgentFsVolume>
-  cloneVolume(source: { volumeId: string, durable?: boolean }, target: AgentFsConfig): Promise<AgentFsVolume>
-  createOverlay(base: AgentFsSnapshot, target: AgentFsConfig): Promise<AgentFsOverlay>
+interface VolumeStore {
+  openVolume(config: VolumeConfig): Promise<Volume>
+  cloneVolume(source: { volumeId: string, durable?: boolean }, target: VolumeConfig): Promise<Volume>
+  createOverlay(base: VolumeSnapshot, target: VolumeConfig): Promise<OverlayVolume>
 }
 
-interface AgentFsVolume {
-  fs: AgentFileSystem
-  kv: AgentKvStore
-  tools: AgentToolRuns
+interface Volume {
+  fs: VfsFileSystem
+  kv: VfsKvStore
+  tools: ToolRunStore
 
-  snapshot(opts?: { durable?: boolean }): Promise<AgentFsSnapshot>
+  snapshot(opts?: { durable?: boolean }): Promise<VolumeSnapshot>
   activitySince(cursor: LogCursor, opts?: { durable?: boolean }): Promise<AsyncIterator<ActivityEntry>>
   subscribeActivity(opts?: { durable?: boolean }): Receiver<SequenceNumber>
 
   flush(): Promise<void>
 }
 
-interface AgentFsOverlay extends AgentFsVolume {
-  base: AgentFsSnapshot
+interface OverlayVolume extends Volume {
+  base: VolumeSnapshot
 }
 
-interface AgentFsSnapshot {
+interface VolumeSnapshot {
   sequence: SequenceNumber
-  fs: ReadOnlyAgentFileSystem
-  kv: ReadOnlyAgentKvStore
-  tools: ReadOnlyAgentToolRuns
+  fs: ReadOnlyVfsFileSystem
+  kv: ReadOnlyVfsKvStore
+  tools: ReadOnlyToolRunStore
 }
 
-interface AgentFileSystem {
+interface VfsFileSystem {
   stat(path: string): Promise<Stats | null>
   lstat(path: string): Promise<Stats | null>
   readFile(path: string): Promise<bytes | null>
@@ -3444,14 +3444,14 @@ interface AgentFileSystem {
   fsync(path?: string): Promise<void>
 }
 
-interface AgentKvStore {
+interface VfsKvStore {
   get<T>(key: string): Promise<T | null>
   set<T>(key: string, value: T): Promise<void>
   delete(key: string): Promise<void>
   listKeys(): Promise<string[]>
 }
 
-interface AgentToolRuns {
+interface ToolRunStore {
   start(name: string, params?: Json): Promise<ToolRunId>
   success(id: ToolRunId, result?: Json): Promise<void>
   error(id: ToolRunId, error: string): Promise<void>
@@ -3461,13 +3461,13 @@ interface AgentToolRuns {
 }
 ```
 
-This surface is intentionally enough to embed a virtual filesystem in-process and hand a constrained capability to an agent runtime. It does not try to be a kernel-facing mount API.
+This surface is intentionally enough to embed a virtual filesystem in-process and hand a constrained capability to an embedded runtime. It does not try to be a kernel-facing mount API.
 
 ## Volume Model and Reserved Tables
 
 Version 1 should use row tables only. Filesystem operations are dominated by point lookups and prefix scans over small keys, while file content is naturally represented as fixed-size blob chunks.
 
-All reserved keys begin with `volume_id`, which lets one DB host many isolated agent volumes without engine changes.
+All reserved keys begin with `volume_id`, which lets one DB host many isolated volumes without engine changes.
 
 ### Current-State Tables
 
@@ -3540,7 +3540,7 @@ Ordinary mutations follow the DB's configured visibility rules. `fsync(path?)` a
 
 ## Key-Value and Tool Services
 
-The embedded library keeps the same three high-level surfaces that make a virtual filesystem useful to agent runtimes: filesystem state, KV state, and tool-run history.
+The embedded library keeps the same three high-level surfaces that make a virtual filesystem useful to embedded runtimes: filesystem state, KV state, and tool-run history.
 
 ### Key-Value State
 
@@ -3563,9 +3563,9 @@ The tool surface supports both common patterns:
 
 ### Point-in-Time Views
 
-`AgentFsSnapshot` is the lightweight "show me the exact state at a cut" mechanism. It is appropriate for request-scoped inspection, debugger-style reads, consistent multi-step operations, and one-shot exports.
+`VolumeSnapshot` is the lightweight "show me the exact state at a cut" mechanism. It is appropriate for request-scoped inspection, debugger-style reads, consistent multi-step operations, and one-shot exports.
 
-Because engine snapshots pin MVCC GC, callers should treat `AgentFsSnapshot` like any other short-lived database snapshot.
+Because engine snapshots pin MVCC GC, callers should treat `VolumeSnapshot` like any other short-lived database snapshot.
 
 ### Durable Cloning and Export
 

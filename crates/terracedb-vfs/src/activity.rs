@@ -6,10 +6,10 @@ use tokio::sync::watch;
 
 use terracedb::{LogCursor, SequenceNumber, SubscriptionClosed, Timestamp};
 
-use crate::{ActivityId, AgentFsError, JsonValue, ToolRunId, VolumeId};
+use crate::{ActivityId, JsonValue, ToolRunId, VfsError, VolumeId};
 
 pub type ActivityStream =
-    Pin<Box<dyn Stream<Item = Result<ActivityEntry, AgentFsError>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<ActivityEntry, VfsError>> + Send + 'static>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActivityOptions {

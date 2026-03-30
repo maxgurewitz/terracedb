@@ -4,12 +4,12 @@ use serde_json::json;
 
 use terracedb::{StubClock, StubRng, Timestamp};
 use terracedb_vfs::{
-    AgentFsConfig, AgentFsStore, CompletedToolRun, CompletedToolRunOutcome, CreateOptions,
-    InMemoryAgentFsStore, MkdirOptions, SnapshotOptions, ToolRunStatus, VolumeId,
+    CompletedToolRun, CompletedToolRunOutcome, CreateOptions, InMemoryVfsStore, MkdirOptions,
+    SnapshotOptions, ToolRunStatus, VolumeConfig, VolumeId, VolumeStore,
 };
 
-fn test_store(seed: u64, now: u64) -> InMemoryAgentFsStore {
-    InMemoryAgentFsStore::new(
+fn test_store(seed: u64, now: u64) -> InMemoryVfsStore {
+    InMemoryVfsStore::new(
         Arc::new(StubClock::new(Timestamp::new(now))),
         Arc::new(StubRng::seeded(seed)),
     )
@@ -29,7 +29,7 @@ async fn overlays_merge_base_entries_support_whiteouts_and_reopen_correctly() {
     let store = test_store(17, 10);
     let base = store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(0x4100))
+            VolumeConfig::new(VolumeId::new(0x4100))
                 .with_chunk_size(8)
                 .with_create_if_missing(true),
         )
@@ -69,7 +69,7 @@ async fn overlays_merge_base_entries_support_whiteouts_and_reopen_correctly() {
     let overlay = store
         .create_overlay(
             base_snapshot.clone(),
-            AgentFsConfig::new(overlay_id)
+            VolumeConfig::new(overlay_id)
                 .with_chunk_size(8)
                 .with_create_if_missing(true),
         )
@@ -193,7 +193,7 @@ async fn overlays_merge_base_entries_support_whiteouts_and_reopen_correctly() {
     );
 
     let reopened = store
-        .open_volume(AgentFsConfig::new(overlay_id).with_chunk_size(8))
+        .open_volume(VolumeConfig::new(overlay_id).with_chunk_size(8))
         .await
         .expect("reopen overlay through store");
     assert!(reopened.info().overlay_base.is_some());
@@ -236,7 +236,7 @@ async fn overlays_merge_base_entries_support_whiteouts_and_reopen_correctly() {
     let imported = imported_store
         .import_volume(
             exported_overlay,
-            AgentFsConfig::new(VolumeId::new(0x4102))
+            VolumeConfig::new(VolumeId::new(0x4102))
                 .with_chunk_size(8)
                 .with_create_if_missing(true),
         )
@@ -279,7 +279,7 @@ async fn export_import_round_trips_visible_state_and_durable_exports_skip_unflus
     let source_store = test_store(23, 100);
     let source = source_store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(0x4200))
+            VolumeConfig::new(VolumeId::new(0x4200))
                 .with_chunk_size(4)
                 .with_create_if_missing(true),
         )
@@ -333,7 +333,7 @@ async fn export_import_round_trips_visible_state_and_durable_exports_skip_unflus
     let visible_import = visible_store
         .import_volume(
             visible_export,
-            AgentFsConfig::new(VolumeId::new(0x4201))
+            VolumeConfig::new(VolumeId::new(0x4201))
                 .with_chunk_size(8)
                 .with_create_if_missing(true),
         )
@@ -388,7 +388,7 @@ async fn export_import_round_trips_visible_state_and_durable_exports_skip_unflus
     let durable_import = durable_store
         .import_volume(
             durable_export,
-            AgentFsConfig::new(VolumeId::new(0x4202))
+            VolumeConfig::new(VolumeId::new(0x4202))
                 .with_chunk_size(4)
                 .with_create_if_missing(true),
         )
@@ -430,7 +430,7 @@ async fn export_import_round_trips_visible_state_and_durable_exports_skip_unflus
     let flushed_import = flushed_store
         .import_volume(
             flushed_export,
-            AgentFsConfig::new(VolumeId::new(0x4203))
+            VolumeConfig::new(VolumeId::new(0x4203))
                 .with_chunk_size(8)
                 .with_create_if_missing(true),
         )

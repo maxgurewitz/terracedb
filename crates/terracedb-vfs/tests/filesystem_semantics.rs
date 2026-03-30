@@ -2,22 +2,22 @@ use std::sync::Arc;
 
 use terracedb::{StubClock, StubRng, Timestamp};
 use terracedb_vfs::{
-    AgentFsConfig, AgentFsError, AgentFsStore, CreateOptions, FileKind, InMemoryAgentFsStore,
-    MkdirOptions, SnapshotOptions, VolumeId,
+    CreateOptions, FileKind, InMemoryVfsStore, MkdirOptions, SnapshotOptions, VfsError,
+    VolumeConfig, VolumeId, VolumeStore,
 };
 
-fn test_store(clock: Arc<StubClock>) -> InMemoryAgentFsStore {
-    InMemoryAgentFsStore::new(clock, Arc::new(StubRng::seeded(7)))
+fn test_store(clock: Arc<StubClock>) -> InMemoryVfsStore {
+    InMemoryVfsStore::new(clock, Arc::new(StubRng::seeded(7)))
 }
 
 async fn open_volume(
-    store: &InMemoryAgentFsStore,
+    store: &InMemoryVfsStore,
     volume_id: u128,
     chunk_size: u32,
-) -> Arc<dyn terracedb_vfs::AgentFsVolume> {
+) -> Arc<dyn terracedb_vfs::Volume> {
     store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(volume_id))
+            VolumeConfig::new(VolumeId::new(volume_id))
                 .with_chunk_size(chunk_size)
                 .with_create_if_missing(true),
         )
@@ -277,7 +277,7 @@ async fn rename_readdir_and_directory_link_counts_are_maintained() {
 
     assert!(matches!(
         fs.rmdir("/workspace").await,
-        Err(AgentFsError::DirectoryNotEmpty { .. })
+        Err(VfsError::DirectoryNotEmpty { .. })
     ));
 
     fs.rename("/workspace/src", "/src")

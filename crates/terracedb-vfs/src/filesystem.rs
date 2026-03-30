@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use terracedb::Timestamp;
 
-use crate::{AgentFsError, InodeId};
+use crate::{InodeId, VfsError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,36 +74,31 @@ impl Default for MkdirOptions {
 }
 
 #[async_trait]
-pub trait ReadOnlyAgentFileSystem: Send + Sync {
-    async fn stat(&self, path: &str) -> Result<Option<Stats>, AgentFsError>;
-    async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError>;
-    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError>;
-    async fn pread(
-        &self,
-        path: &str,
-        offset: u64,
-        len: u64,
-    ) -> Result<Option<Vec<u8>>, AgentFsError>;
-    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError>;
-    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError>;
-    async fn readlink(&self, path: &str) -> Result<String, AgentFsError>;
+pub trait ReadOnlyVfsFileSystem: Send + Sync {
+    async fn stat(&self, path: &str) -> Result<Option<Stats>, VfsError>;
+    async fn lstat(&self, path: &str) -> Result<Option<Stats>, VfsError>;
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, VfsError>;
+    async fn pread(&self, path: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, VfsError>;
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError>;
+    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, VfsError>;
+    async fn readlink(&self, path: &str) -> Result<String, VfsError>;
 }
 
 #[async_trait]
-pub trait AgentFileSystem: ReadOnlyAgentFileSystem {
+pub trait VfsFileSystem: ReadOnlyVfsFileSystem {
     async fn write_file(
         &self,
         path: &str,
         data: Vec<u8>,
         opts: CreateOptions,
-    ) -> Result<(), AgentFsError>;
-    async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), AgentFsError>;
-    async fn truncate(&self, path: &str, size: u64) -> Result<(), AgentFsError>;
-    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<(), AgentFsError>;
-    async fn rename(&self, from: &str, to: &str) -> Result<(), AgentFsError>;
-    async fn link(&self, from: &str, to: &str) -> Result<(), AgentFsError>;
-    async fn symlink(&self, target: &str, linkpath: &str) -> Result<(), AgentFsError>;
-    async fn unlink(&self, path: &str) -> Result<(), AgentFsError>;
-    async fn rmdir(&self, path: &str) -> Result<(), AgentFsError>;
-    async fn fsync(&self, path: Option<&str>) -> Result<(), AgentFsError>;
+    ) -> Result<(), VfsError>;
+    async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), VfsError>;
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), VfsError>;
+    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<(), VfsError>;
+    async fn rename(&self, from: &str, to: &str) -> Result<(), VfsError>;
+    async fn link(&self, from: &str, to: &str) -> Result<(), VfsError>;
+    async fn symlink(&self, target: &str, linkpath: &str) -> Result<(), VfsError>;
+    async fn unlink(&self, path: &str) -> Result<(), VfsError>;
+    async fn rmdir(&self, path: &str) -> Result<(), VfsError>;
+    async fn fsync(&self, path: Option<&str>) -> Result<(), VfsError>;
 }
