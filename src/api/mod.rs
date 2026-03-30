@@ -17,8 +17,6 @@ use futures::{Stream, stream};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-#[cfg(test)]
-use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tracing::Instrument;
 

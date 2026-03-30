@@ -1,4 +1,11 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 
@@ -82,6 +89,7 @@ pub struct DbDependencies {
     pub object_store: Arc<dyn ObjectStore>,
     pub clock: Arc<dyn Clock>,
     pub rng: Arc<dyn Rng>,
+    pub(crate) failpoint_key: u64,
 }
 
 impl DbDependencies {
@@ -91,11 +99,16 @@ impl DbDependencies {
         clock: Arc<dyn Clock>,
         rng: Arc<dyn Rng>,
     ) -> Self {
+        static NEXT_FAILPOINT_KEY: OnceLock<AtomicU64> = OnceLock::new();
+        let failpoint_key = NEXT_FAILPOINT_KEY
+            .get_or_init(|| AtomicU64::new(1))
+            .fetch_add(1, Ordering::Relaxed);
         Self {
             file_system,
             object_store,
             clock,
             rng,
+            failpoint_key,
         }
     }
 }

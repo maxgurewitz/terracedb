@@ -1,10 +1,26 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    CompactionStrategy, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig, StubClock,
-    StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Value,
+    CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
+    StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat,
+    TieredDurabilityMode, TieredStorageConfig, Value,
 };
+
+pub use crate::failpoints::{
+    FailpointAction, FailpointHandle, FailpointHit, FailpointMode, FailpointOutcome,
+    FailpointRegistry, names as failpoint_names,
+};
+
+/// Attaches a shared failpoint registry to a dependency set so DB opens, async
+/// tests, and simulation helpers can arm the same named cut points.
+pub fn attach_failpoint_registry(dependencies: &DbDependencies, registry: Arc<FailpointRegistry>) {
+    dependencies.__attach_failpoint_registry(registry);
+}
+
+/// Returns the registry currently attached to a DB's dependency graph.
+pub fn db_failpoint_registry(db: &Db) -> Arc<FailpointRegistry> {
+    db.__failpoint_registry()
+}
 
 pub fn tiered_test_config(path: &str) -> DbConfig {
     tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit)

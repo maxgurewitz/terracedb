@@ -1,10 +1,11 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, Db, DbConfig, DbDependencies, DurableOutboxConsumer,
-    DurableTimerSet, OutboxEntry, ScheduledTimer, SequenceNumber, StubClock, StubFileSystem,
-    StubObjectStore, StubRng, Table, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Timestamp, Transaction, TransactionalOutbox, Value,
+    Clock, CommitError, CommitOptions, CompactionStrategy, Db, DbConfig, DbDependencies,
+    DurableOutboxConsumer, DurableTimerSet, OutboxEntry, ScheduledTimer, SequenceNumber,
+    StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, StubRng, Table,
+    TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction,
+    TransactionCommitError, TransactionalOutbox, Value,
 };
 use terracedb::{S3Location, SsdConfig, StorageConfig};
 use terracedb_simulation::{CutPoint, SeededSimulationRunner};
@@ -360,6 +361,117 @@ async fn outbox_replays_after_delivery_before_cursor_persistence() {
             .poll(Some(10))
             .await
             .expect("poll after cursor persistence")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn outbox_cursor_failpoint_preserves_consumer_position_until_retry() {
+    let env = TestEnv::new(
+        "/terracedb/t29/outbox-cursor-failpoint",
+        TieredDurabilityMode::GroupCommit,
+    );
+    let db = env.open().await;
+    let outbox_table = db
+        .create_table(row_table_config("outbox"))
+        .await
+        .expect("create outbox table");
+    let cursor_table = db
+        .create_table(row_table_config("outbox_cursors"))
+        .await
+        .expect("create outbox cursor table");
+    let outbox = TransactionalOutbox::new(outbox_table.clone());
+
+    let mut batch = db.write_batch();
+    outbox
+        .stage_entry(
+            &mut batch,
+            OutboxEntry {
+                outbox_id: b"order:2:confirmation".to_vec(),
+                idempotency_key: "order:2:confirmation".to_string(),
+                payload: b"send-confirmation".to_vec(),
+            },
+        )
+        .expect("stage outbox entry");
+    db.commit(batch, CommitOptions::default())
+        .await
+        .expect("commit outbox entry");
+
+    let consumer_id = b"mailer".to_vec();
+    let mut consumer = DurableOutboxConsumer::open(
+        &db,
+        outbox_table.clone(),
+        cursor_table.clone(),
+        consumer_id.clone(),
+    )
+    .await
+    .expect("open outbox consumer");
+    let first_pass = consumer.poll(Some(10)).await.expect("poll outbox");
+    let cursor = first_pass.last_cursor().expect("outbox cursor");
+
+    db.__failpoint_registry().arm_error(
+        "outbox.cursor_persist.before_commit",
+        StorageError::io("simulated outbox cursor failpoint"),
+        terracedb::FailpointMode::Once,
+    );
+
+    let error = consumer
+        .persist_through(cursor)
+        .await
+        .expect_err("failpoint should fail cursor persistence");
+    match error {
+        TransactionCommitError::Commit(CommitError::Storage(storage)) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Io);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("simulated outbox cursor failpoint"),
+                "expected injected outbox failpoint context, got {storage}"
+            );
+        }
+        other => panic!("expected commit storage error from outbox failpoint, got {other:?}"),
+    }
+
+    let replay_consumer = DurableOutboxConsumer::open(
+        &db,
+        outbox_table.clone(),
+        cursor_table.clone(),
+        consumer_id.clone(),
+    )
+    .await
+    .expect("reopen outbox consumer");
+    let replay = replay_consumer
+        .poll(Some(10))
+        .await
+        .expect("poll replayed outbox");
+    assert_eq!(replay.entries.len(), 1);
+    assert_eq!(
+        replay.entries[0].entry.idempotency_key,
+        "order:2:confirmation"
+    );
+
+    let mut retry_consumer =
+        DurableOutboxConsumer::open(&db, outbox_table, cursor_table, consumer_id)
+            .await
+            .expect("open retry consumer");
+    retry_consumer
+        .persist_through(cursor)
+        .await
+        .expect("persist cursor after one-shot failpoint");
+
+    let settled = DurableOutboxConsumer::open(
+        &db,
+        db.table("outbox"),
+        db.table("outbox_cursors"),
+        b"mailer".to_vec(),
+    )
+    .await
+    .expect("open settled consumer");
+    assert!(
+        settled
+            .poll(Some(10))
+            .await
+            .expect("poll settled outbox")
             .is_empty()
     );
 }

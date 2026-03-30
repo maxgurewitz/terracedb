@@ -1110,9 +1110,8 @@ impl Db {
                 updated_inputs.insert(updated.meta.local_id.clone(), updated);
             }
 
-            #[cfg(test)]
             self.maybe_pause_offload_phase(OffloadPhase::UploadComplete)
-                .await;
+                .await?;
 
             let current_state = self.sstables_read().clone();
             let mut replaced = 0_usize;
@@ -1161,9 +1160,8 @@ impl Db {
                 )
                 .await;
 
-            #[cfg(test)]
             self.maybe_pause_offload_phase(OffloadPhase::ManifestSwitched)
-                .await;
+                .await?;
 
             for input in &inputs {
                 self.inner
@@ -1173,9 +1171,8 @@ impl Db {
                     .await?;
             }
 
-            #[cfg(test)]
             self.maybe_pause_offload_phase(OffloadPhase::LocalCleanupFinished)
-                .await;
+                .await?;
 
             Ok(())
         }
@@ -1271,10 +1268,9 @@ impl Db {
                     )
                     .await?;
 
-                #[cfg(test)]
                 if !outputs.is_empty() {
                     self.maybe_pause_compaction_phase(CompactionPhase::OutputWritten)
-                        .await;
+                        .await?;
                 }
 
                 outputs
@@ -1319,9 +1315,8 @@ impl Db {
             filtered.removed_keys,
         );
 
-        #[cfg(test)]
         self.maybe_pause_compaction_phase(CompactionPhase::ManifestSwitched)
-            .await;
+            .await?;
 
         for input in &inputs {
             self.inner
@@ -1331,9 +1326,8 @@ impl Db {
                 .await?;
         }
 
-        #[cfg(test)]
         self.maybe_pause_compaction_phase(CompactionPhase::InputCleanupFinished)
-            .await;
+            .await?;
 
             Ok(())
         }

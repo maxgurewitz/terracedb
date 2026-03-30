@@ -1457,6 +1457,13 @@ impl Db {
             .sync_dir(&manifest_dir)
             .await?;
 
+        let _ = self
+            .__run_failpoint(
+                crate::failpoints::names::DB_MANIFEST_BEFORE_CURRENT_POINTER,
+                BTreeMap::from([("generation".to_string(), generation.get().to_string())]),
+            )
+            .await?;
+
         let current_path = Self::local_current_path(root);
         let current_temp_path = format!("{current_path}{LOCAL_CATALOG_TEMP_SUFFIX}");
         let current_payload = format!("{}\n", Self::manifest_filename(generation)).into_bytes();
@@ -1519,6 +1526,12 @@ impl Db {
             .dependencies
             .object_store
             .put(&manifest_key, &payload)
+            .await?;
+        let _ = self
+            .__run_failpoint(
+                crate::failpoints::names::DB_REMOTE_MANIFEST_BEFORE_LATEST_POINTER,
+                BTreeMap::from([("generation".to_string(), generation.get().to_string())]),
+            )
             .await?;
         self.inner
             .dependencies
@@ -1701,6 +1714,12 @@ impl Db {
         )?;
         let manifest_key = layout.backup_manifest(generation);
         self.write_remote_backup_object(&layout, &manifest_key, &payload, true)
+            .await?;
+        let _ = self
+            .__run_failpoint(
+                crate::failpoints::names::DB_BACKUP_MANIFEST_BEFORE_LATEST_POINTER,
+                BTreeMap::from([("generation".to_string(), generation.get().to_string())]),
+            )
             .await?;
         self.inner
             .dependencies

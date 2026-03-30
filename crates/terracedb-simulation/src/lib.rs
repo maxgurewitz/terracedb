@@ -22,7 +22,7 @@ use terracedb::{
     ObjectStore, ObjectStoreOperation, OpenError, OpenOptions, ReadError, Rng, S3Location,
     ScanOptions, SequenceNumber, SimulatedFileSystem, SsdConfig, StorageConfig, StorageError,
     StorageErrorKind, Table, TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig,
-    Timestamp, TtlCompactionFilter, Value, WriteError,
+    Timestamp, TtlCompactionFilter, Value, WriteError, test_support::FailpointRegistry,
 };
 
 const OBJECT_STORE_HOST: &str = "object-store";
@@ -323,6 +323,7 @@ pub struct SimulationContext {
     object_store: Arc<NetworkObjectStore>,
     clock: Arc<TurmoilClock>,
     rng: Arc<DeterministicRng>,
+    failpoints: Arc<FailpointRegistry>,
 }
 
 impl SimulationContext {
@@ -340,6 +341,7 @@ impl SimulationContext {
             object_store,
             clock,
             rng,
+            failpoints: Arc::new(FailpointRegistry::default()),
         }
     }
 
@@ -348,12 +350,14 @@ impl SimulationContext {
     }
 
     pub fn dependencies(&self) -> DbDependencies {
-        DbDependencies::new(
+        let dependencies = DbDependencies::new(
             self.file_system.clone(),
             self.object_store.clone(),
             self.clock.clone(),
             self.rng.clone(),
-        )
+        );
+        dependencies.__attach_failpoint_registry(self.failpoints.clone());
+        dependencies
     }
 
     pub fn file_system(&self) -> Arc<SimulatedFileSystem> {
@@ -370,6 +374,11 @@ impl SimulationContext {
 
     pub fn rng(&self) -> Arc<DeterministicRng> {
         self.rng.clone()
+    }
+
+    /// Returns the shared failpoint registry for this seeded simulation run.
+    pub fn failpoints(&self) -> Arc<FailpointRegistry> {
+        self.failpoints.clone()
     }
 
     pub fn record(&self, event: TraceEvent) {

@@ -53,12 +53,6 @@ struct DbInner {
     visible_watchers: Arc<WatermarkRegistry>,
     durable_watchers: Arc<WatermarkRegistry>,
     work_deferrals: Mutex<BTreeMap<String, u32>>,
-    #[cfg(test)]
-    commit_phase_blocks: Mutex<Vec<CommitPhaseBlock>>,
-    #[cfg(test)]
-    compaction_phase_blocks: Mutex<Vec<CompactionPhaseBlock>>,
-    #[cfg(test)]
-    offload_phase_blocks: Mutex<Vec<OffloadPhaseBlock>>,
 }
 
 #[derive(Clone)]
@@ -558,12 +552,40 @@ enum CommitPhase {
     AfterDurablePublish,
 }
 
+impl CommitPhase {
+    fn failpoint_name(self) -> &'static str {
+        match self {
+            Self::BeforeDurabilitySync => crate::failpoints::names::DB_COMMIT_BEFORE_DURABILITY_SYNC,
+            Self::AfterBatchSeal => crate::failpoints::names::DB_COMMIT_AFTER_BATCH_SEAL,
+            Self::AfterDurabilitySync => crate::failpoints::names::DB_COMMIT_AFTER_DURABILITY_SYNC,
+            Self::BeforeMemtableInsert => crate::failpoints::names::DB_COMMIT_BEFORE_MEMTABLE_INSERT,
+            Self::AfterMemtableInsert => crate::failpoints::names::DB_COMMIT_AFTER_MEMTABLE_INSERT,
+            Self::AfterVisibilityPublish => {
+                crate::failpoints::names::DB_COMMIT_AFTER_VISIBILITY_PUBLISH
+            }
+            Self::AfterDurablePublish => crate::failpoints::names::DB_COMMIT_AFTER_DURABLE_PUBLISH,
+        }
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompactionPhase {
     OutputWritten,
     ManifestSwitched,
     InputCleanupFinished,
+}
+
+impl CompactionPhase {
+    fn failpoint_name(self) -> &'static str {
+        match self {
+            Self::OutputWritten => crate::failpoints::names::DB_COMPACTION_OUTPUT_WRITTEN,
+            Self::ManifestSwitched => crate::failpoints::names::DB_COMPACTION_MANIFEST_SWITCHED,
+            Self::InputCleanupFinished => {
+                crate::failpoints::names::DB_COMPACTION_INPUT_CLEANUP_FINISHED
+            }
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -574,77 +596,61 @@ enum OffloadPhase {
     LocalCleanupFinished,
 }
 
-#[cfg(test)]
-struct CommitPhaseBlock {
-    phase: CommitPhase,
-    sequence_tx: Option<oneshot::Sender<SequenceNumber>>,
-    release_rx: Option<oneshot::Receiver<()>>,
+impl OffloadPhase {
+    fn failpoint_name(self) -> &'static str {
+        match self {
+            Self::UploadComplete => crate::failpoints::names::DB_OFFLOAD_UPLOAD_COMPLETE,
+            Self::ManifestSwitched => crate::failpoints::names::DB_OFFLOAD_MANIFEST_SWITCHED,
+            Self::LocalCleanupFinished => {
+                crate::failpoints::names::DB_OFFLOAD_LOCAL_CLEANUP_FINISHED
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 struct CommitPhaseBlocker {
-    sequence_rx: Option<oneshot::Receiver<SequenceNumber>>,
-    release_tx: Option<oneshot::Sender<()>>,
-}
-
-#[cfg(test)]
-struct CompactionPhaseBlock {
-    phase: CompactionPhase,
-    reached_tx: Option<oneshot::Sender<()>>,
-    release_rx: Option<oneshot::Receiver<()>>,
-}
-
-#[cfg(test)]
-struct OffloadPhaseBlock {
-    phase: OffloadPhase,
-    reached_tx: Option<oneshot::Sender<()>>,
-    release_rx: Option<oneshot::Receiver<()>>,
+    handle: crate::failpoints::FailpointHandle,
 }
 
 #[cfg(test)]
 struct CompactionPhaseBlocker {
-    reached_rx: Option<oneshot::Receiver<()>>,
-    release_tx: Option<oneshot::Sender<()>>,
+    handle: crate::failpoints::FailpointHandle,
 }
 
 #[cfg(test)]
 #[allow(dead_code)]
 struct OffloadPhaseBlocker {
-    reached_rx: Option<oneshot::Receiver<()>>,
-    release_tx: Option<oneshot::Sender<()>>,
+    handle: crate::failpoints::FailpointHandle,
 }
 
 #[cfg(test)]
 impl CommitPhaseBlocker {
     async fn sequence(&mut self) -> SequenceNumber {
-        self.sequence_rx
-            .take()
-            .expect("commit phase blocker sequence receiver should be available")
-            .await
-            .expect("commit phase blocker should observe a sequence")
+        let hit = self.handle.next_hit().await;
+        let value = hit
+            .metadata
+            .get("sequence")
+            .expect("commit phase failpoint should report a sequence");
+        let value = value
+            .parse::<u64>()
+            .expect("commit phase failpoint sequence should parse");
+        SequenceNumber::new(value)
     }
 
     fn release(&mut self) {
-        if let Some(release_tx) = self.release_tx.take() {
-            let _ = release_tx.send(());
-        }
+        self.handle.release();
     }
 }
 
 #[cfg(test)]
 impl CompactionPhaseBlocker {
     async fn wait_until_reached(&mut self) {
-        self.reached_rx
-            .take()
-            .expect("compaction phase blocker should have a receiver")
-            .await
-            .expect("compaction phase blocker should observe the phase");
+        self.handle.wait_until_hit().await;
     }
 
     fn release(&mut self) {
-        if let Some(release_tx) = self.release_tx.take() {
-            let _ = release_tx.send(());
-        }
+        self.handle.release();
     }
 }
 
@@ -652,17 +658,11 @@ impl CompactionPhaseBlocker {
 #[allow(dead_code)]
 impl OffloadPhaseBlocker {
     async fn wait_until_reached(&mut self) {
-        self.reached_rx
-            .take()
-            .expect("offload phase blocker should have a receiver")
-            .await
-            .expect("offload phase blocker should observe the phase");
+        self.handle.wait_until_hit().await;
     }
 
     fn release(&mut self) {
-        if let Some(release_tx) = self.release_tx.take() {
-            let _ = release_tx.send(());
-        }
+        self.handle.release();
     }
 }
 
