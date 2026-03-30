@@ -10,14 +10,14 @@ use terracedb::{
     LogCursor, ScanOptions, SequenceNumber, StorageError, StorageErrorKind, StubFileSystem,
     StubObjectStore, Table, TieredDurabilityMode, Value,
     test_support::{
-        FailpointMode, bytes as test_bytes, db_failpoint_registry, failpoint_names,
-        row_table_config, test_dependencies, tiered_test_config,
+        FailpointMode, bytes as test_bytes, db_failpoint_registry, row_table_config,
+        test_dependencies, tiered_test_config,
     },
 };
 use terracedb_projections::{
     PROJECTION_CURSOR_TABLE_NAME, ProjectionContext, ProjectionError, ProjectionHandler,
     ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun, ProjectionTransaction,
-    SingleSourceProjection,
+    SingleSourceProjection, failpoints::names as projection_failpoint_names,
 };
 
 struct SequenceRecorder {
@@ -305,7 +305,7 @@ async fn projection_failpoint_before_commit_preserves_cursor_until_retry() {
         .expect("start projection");
 
     db_failpoint_registry(&db).arm_error(
-        failpoint_names::PROJECTION_APPLY_BEFORE_COMMIT,
+        projection_failpoint_names::PROJECTION_APPLY_BEFORE_COMMIT,
         StorageError::io("simulated projection failpoint"),
         FailpointMode::Once,
     );

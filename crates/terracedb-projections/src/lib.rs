@@ -20,17 +20,14 @@ use terracedb::{
     Table, TableConfig, TableFormat, Value, WriteBatch, set_span_attribute, telemetry_attrs,
 };
 
+pub mod failpoints;
+
 pub const PROJECTION_CURSOR_TABLE_NAME: &str = "_projection_cursors";
 const PROJECTION_CURSOR_FORMAT_VERSION: u8 = 1;
 const PROJECTION_CURSOR_STATE_FORMAT_VERSION: u8 = 2;
 const PROJECTION_CURSOR_KEY_SEPARATOR: u8 = 0;
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
-const FAILPOINT_PROJECTION_APPLY_BEFORE_COMMIT: &str = "projection.apply.before_commit";
-const FAILPOINT_PROJECTION_REBUILD_APPLY_BEFORE_COMMIT: &str =
-    "projection.rebuild.apply.before_commit";
-const FAILPOINT_PROJECTION_REBUILD_RESET_BEFORE_COMMIT: &str =
-    "projection.rebuild.reset.before_commit";
 
 fn collect_operation_contexts(entries: &[ChangeEntry]) -> Vec<OperationContext> {
     let mut seen = BTreeSet::new();
@@ -1789,7 +1786,7 @@ async fn drain_next_ready_run(
         let _ = runtime
             .db
             .__run_failpoint(
-                FAILPOINT_PROJECTION_APPLY_BEFORE_COMMIT,
+                crate::failpoints::names::PROJECTION_APPLY_BEFORE_COMMIT,
                 BTreeMap::from([
                     ("projection".to_string(), runtime.name.clone()),
                     (
@@ -1864,7 +1861,7 @@ async fn rebuild_from_current_state(
             let _ = runtime
                 .db
                 .__run_failpoint(
-                    FAILPOINT_PROJECTION_REBUILD_RESET_BEFORE_COMMIT,
+                    crate::failpoints::names::PROJECTION_REBUILD_RESET_BEFORE_COMMIT,
                     BTreeMap::from([("projection".to_string(), runtime.name.clone())]),
                 )
                 .await?;
@@ -1909,7 +1906,7 @@ async fn rebuild_from_current_state(
                 let _ = runtime
                     .db
                     .__run_failpoint(
-                        FAILPOINT_PROJECTION_REBUILD_APPLY_BEFORE_COMMIT,
+                        crate::failpoints::names::PROJECTION_REBUILD_APPLY_BEFORE_COMMIT,
                         BTreeMap::from([
                             ("projection".to_string(), runtime.name.clone()),
                             (
@@ -1971,7 +1968,7 @@ async fn rebuild_from_current_state(
                 let _ = runtime
                     .db
                     .__run_failpoint(
-                        FAILPOINT_PROJECTION_REBUILD_APPLY_BEFORE_COMMIT,
+                        crate::failpoints::names::PROJECTION_REBUILD_APPLY_BEFORE_COMMIT,
                         BTreeMap::from([
                             ("projection".to_string(), runtime.name.clone()),
                             (

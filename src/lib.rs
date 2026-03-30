@@ -6,7 +6,7 @@ pub mod composition;
 pub mod config;
 pub mod engine;
 pub mod error;
-mod failpoints;
+pub mod failpoints;
 pub mod ids;
 pub mod io;
 mod metadata_flatbuffers;

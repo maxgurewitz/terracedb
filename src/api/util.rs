@@ -1,4 +1,6 @@
-fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32>) {
+use super::*;
+
+pub(super) fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32>) {
     let priority = match work.work_type {
         PendingWorkType::Flush => 0,
         PendingWorkType::Compaction => 1,
@@ -8,11 +10,11 @@ fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32>) {
     (priority, work.table.as_str(), work.level)
 }
 
-fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
 }
 
-async fn read_all_file(
+pub(super) async fn read_all_file(
     dependencies: &DbDependencies,
     handle: &crate::FileHandle,
 ) -> Result<Vec<u8>, StorageError> {
@@ -38,11 +40,14 @@ async fn read_all_file(
     Ok(bytes)
 }
 
-async fn read_path(dependencies: &DbDependencies, path: &str) -> Result<Vec<u8>, StorageError> {
+pub(super) async fn read_path(
+    dependencies: &DbDependencies,
+    path: &str,
+) -> Result<Vec<u8>, StorageError> {
     read_source(dependencies, &StorageSource::local_file(path)).await
 }
 
-async fn read_source(
+pub(super) async fn read_source(
     dependencies: &DbDependencies,
     source: &StorageSource,
 ) -> Result<Vec<u8>, StorageError> {
@@ -52,7 +57,7 @@ async fn read_source(
         .map_err(|error| error.into_storage_error())
 }
 
-async fn read_optional_path(
+pub(super) async fn read_optional_path(
     dependencies: &DbDependencies,
     path: &str,
 ) -> Result<Option<Vec<u8>>, StorageError> {
@@ -76,7 +81,7 @@ async fn read_optional_path(
     }
 }
 
-async fn read_optional_remote_object(
+pub(super) async fn read_optional_remote_object(
     dependencies: &DbDependencies,
     key: &str,
 ) -> Result<Option<Vec<u8>>, StorageError> {
@@ -87,7 +92,7 @@ async fn read_optional_remote_object(
     }
 }
 
-async fn write_local_file_atomic(
+pub(super) async fn write_local_file_atomic(
     dependencies: &DbDependencies,
     path: &str,
     bytes: &[u8],
@@ -120,7 +125,7 @@ async fn write_local_file_atomic(
     Ok(())
 }
 
-async fn delete_local_file_if_exists(
+pub(super) async fn delete_local_file_if_exists(
     dependencies: &DbDependencies,
     path: &str,
 ) -> Result<(), StorageError> {
@@ -141,7 +146,7 @@ async fn delete_local_file_if_exists(
     }
 }
 
-fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
+pub(super) fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     fn hash_with_seed(key: &[u8], seed: u64) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
         for &byte in key {

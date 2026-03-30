@@ -1,3 +1,5 @@
+use super::*;
+
 use crate::{
     adapters::{LocalDirObjectStore, SystemClock, SystemRng, TokioFileSystem},
     config::SsdConfig,
@@ -112,7 +114,6 @@ impl DbComponents {
         self.scheduler = Some(scheduler);
         self
     }
-
 }
 
 impl From<DbDependencies> for DbComponents {
@@ -350,7 +351,10 @@ impl fmt::Debug for DbBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DbBuilder")
             .field("settings", &self.settings)
-            .field("file_system", &self.file_system.as_ref().map(|_| "<dyn FileSystem>"))
+            .field(
+                "file_system",
+                &self.file_system.as_ref().map(|_| "<dyn FileSystem>"),
+            )
             .field(
                 "object_store",
                 &self.object_store.as_ref().map(|_| "<dyn ObjectStore>"),

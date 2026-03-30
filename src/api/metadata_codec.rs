@@ -1,7 +1,8 @@
-type FbMetadataEntryVector<'fbb> =
-    flatbuffers::WIPOffset<
-        flatbuffers::Vector<'fbb, flatbuffers::ForwardsUOffset<metadata_fb::MetadataEntry<'fbb>>>,
-    >;
+use super::*;
+
+type FbMetadataEntryVector<'fbb> = flatbuffers::WIPOffset<
+    flatbuffers::Vector<'fbb, flatbuffers::ForwardsUOffset<metadata_fb::MetadataEntry<'fbb>>>,
+>;
 
 const FB_TABLE_FORMAT_ROW: u8 = 1;
 const FB_TABLE_FORMAT_COLUMNAR: u8 = 2;
@@ -24,14 +25,14 @@ const FB_FIELD_VALUE_BYTES: u8 = 5;
 const FB_FIELD_VALUE_BOOL: u8 = 6;
 
 impl Db {
-    fn encode_table_format_flatbuffer(format: TableFormat) -> u8 {
+    pub(super) fn encode_table_format_flatbuffer(format: TableFormat) -> u8 {
         match format {
             TableFormat::Row => FB_TABLE_FORMAT_ROW,
             TableFormat::Columnar => FB_TABLE_FORMAT_COLUMNAR,
         }
     }
 
-    fn decode_table_format_flatbuffer(tag: u8) -> Result<TableFormat, StorageError> {
+    pub(super) fn decode_table_format_flatbuffer(tag: u8) -> Result<TableFormat, StorageError> {
         match tag {
             FB_TABLE_FORMAT_ROW => Ok(TableFormat::Row),
             FB_TABLE_FORMAT_COLUMNAR => Ok(TableFormat::Columnar),
@@ -41,7 +42,7 @@ impl Db {
         }
     }
 
-    fn encode_compaction_strategy_flatbuffer(strategy: CompactionStrategy) -> u8 {
+    pub(super) fn encode_compaction_strategy_flatbuffer(strategy: CompactionStrategy) -> u8 {
         match strategy {
             CompactionStrategy::Leveled => FB_COMPACTION_STRATEGY_LEVELED,
             CompactionStrategy::Tiered => FB_COMPACTION_STRATEGY_TIERED,
@@ -49,7 +50,7 @@ impl Db {
         }
     }
 
-    fn decode_compaction_strategy_flatbuffer(
+    pub(super) fn decode_compaction_strategy_flatbuffer(
         tag: u8,
     ) -> Result<CompactionStrategy, StorageError> {
         match tag {
@@ -62,7 +63,7 @@ impl Db {
         }
     }
 
-    fn encode_field_type_flatbuffer(field_type: FieldType) -> u8 {
+    pub(super) fn encode_field_type_flatbuffer(field_type: FieldType) -> u8 {
         match field_type {
             FieldType::Int64 => FB_FIELD_TYPE_INT64,
             FieldType::Float64 => FB_FIELD_TYPE_FLOAT64,
@@ -72,7 +73,7 @@ impl Db {
         }
     }
 
-    fn decode_field_type_flatbuffer(tag: u8) -> Result<FieldType, StorageError> {
+    pub(super) fn decode_field_type_flatbuffer(tag: u8) -> Result<FieldType, StorageError> {
         match tag {
             FB_FIELD_TYPE_INT64 => Ok(FieldType::Int64),
             FB_FIELD_TYPE_FLOAT64 => Ok(FieldType::Float64),
@@ -85,20 +86,14 @@ impl Db {
         }
     }
 
-    fn encode_field_value_flatbuffer<'fbb>(
+    pub(super) fn encode_field_value_flatbuffer<'fbb>(
         fbb: &mut flatbuffers::FlatBufferBuilder<'fbb>,
         value: &FieldValue,
     ) -> Result<flatbuffers::WIPOffset<metadata_fb::FieldValue<'fbb>>, StorageError> {
         let offset = match value {
-            FieldValue::Null => metadata_fb::create_field_value(
-                fbb,
-                FB_FIELD_VALUE_NULL,
-                0,
-                0.0,
-                None,
-                None,
-                false,
-            ),
+            FieldValue::Null => {
+                metadata_fb::create_field_value(fbb, FB_FIELD_VALUE_NULL, 0, 0.0, None, None, false)
+            }
             FieldValue::Int64(value) => metadata_fb::create_field_value(
                 fbb,
                 FB_FIELD_VALUE_INT64,
@@ -154,7 +149,7 @@ impl Db {
         Ok(offset)
     }
 
-    fn decode_field_value_flatbuffer(
+    pub(super) fn decode_field_value_flatbuffer(
         value: metadata_fb::FieldValue<'_>,
     ) -> Result<FieldValue, StorageError> {
         match value.kind() {
@@ -165,9 +160,7 @@ impl Db {
                 value
                     .string_value()
                     .ok_or_else(|| {
-                        StorageError::corruption(
-                            "flatbuffer field value is missing string payload",
-                        )
+                        StorageError::corruption("flatbuffer field value is missing string payload")
                     })?
                     .to_string(),
             )),
@@ -175,9 +168,7 @@ impl Db {
                 value
                     .bytes_value()
                     .ok_or_else(|| {
-                        StorageError::corruption(
-                            "flatbuffer field value is missing bytes payload",
-                        )
+                        StorageError::corruption("flatbuffer field value is missing bytes payload")
                     })?
                     .bytes()
                     .to_vec(),
@@ -189,7 +180,7 @@ impl Db {
         }
     }
 
-    fn encode_schema_flatbuffer<'fbb>(
+    pub(super) fn encode_schema_flatbuffer<'fbb>(
         fbb: &mut flatbuffers::FlatBufferBuilder<'fbb>,
         schema: &SchemaDefinition,
     ) -> Result<flatbuffers::WIPOffset<metadata_fb::SchemaDefinition<'fbb>>, StorageError> {
@@ -217,7 +208,7 @@ impl Db {
         ))
     }
 
-    fn decode_schema_flatbuffer(
+    pub(super) fn decode_schema_flatbuffer(
         schema: metadata_fb::SchemaDefinition<'_>,
     ) -> Result<SchemaDefinition, StorageError> {
         let schema_fields = schema.fields();
@@ -240,7 +231,7 @@ impl Db {
         })
     }
 
-    fn encode_metadata_entries_flatbuffer<'fbb>(
+    pub(super) fn encode_metadata_entries_flatbuffer<'fbb>(
         fbb: &mut flatbuffers::FlatBufferBuilder<'fbb>,
         metadata: &TableMetadata,
     ) -> Result<FbMetadataEntryVector<'fbb>, StorageError> {
@@ -262,8 +253,11 @@ impl Db {
         Ok(fbb.create_vector(&entries))
     }
 
-    fn decode_metadata_entries_flatbuffer(
-        entries: flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<metadata_fb::MetadataEntry<'_>>>,
+    pub(super) fn decode_metadata_entries_flatbuffer(
+        entries: flatbuffers::Vector<
+            '_,
+            flatbuffers::ForwardsUOffset<metadata_fb::MetadataEntry<'_>>,
+        >,
     ) -> Result<TableMetadata, StorageError> {
         let mut metadata = BTreeMap::new();
         for entry in entries {
@@ -278,7 +272,7 @@ impl Db {
         Ok(metadata)
     }
 
-    fn encode_catalog_entry_flatbuffer<'fbb>(
+    pub(super) fn encode_catalog_entry_flatbuffer<'fbb>(
         fbb: &mut flatbuffers::FlatBufferBuilder<'fbb>,
         entry: &PersistedCatalogEntry,
     ) -> Result<flatbuffers::WIPOffset<metadata_fb::CatalogEntry<'fbb>>, StorageError> {
@@ -307,10 +301,7 @@ impl Db {
                     .config
                     .bloom_filter_bits_per_key
                     .unwrap_or_default(),
-                has_history_retention_sequences: entry
-                    .config
-                    .history_retention_sequences
-                    .is_some(),
+                has_history_retention_sequences: entry.config.history_retention_sequences.is_some(),
                 history_retention_sequences: entry
                     .config
                     .history_retention_sequences
@@ -322,10 +313,14 @@ impl Db {
                 metadata_entries,
             },
         );
-        Ok(metadata_fb::create_catalog_entry(fbb, entry.id.get(), config))
+        Ok(metadata_fb::create_catalog_entry(
+            fbb,
+            entry.id.get(),
+            config,
+        ))
     }
 
-    fn decode_catalog_entry_flatbuffer(
+    pub(super) fn decode_catalog_entry_flatbuffer(
         entry: metadata_fb::CatalogEntry<'_>,
     ) -> Result<PersistedCatalogEntry, StorageError> {
         let config = entry.config();
@@ -350,20 +345,26 @@ impl Db {
                     Some(schema) => Some(Self::decode_schema_flatbuffer(schema)?),
                     None => None,
                 },
-                metadata: Self::decode_metadata_entries_flatbuffer(config.metadata_entries().ok_or_else(
-                    || StorageError::corruption("catalog entry is missing metadata entries"),
-                )?)?,
+                metadata: Self::decode_metadata_entries_flatbuffer(
+                    config.metadata_entries().ok_or_else(|| {
+                        StorageError::corruption("catalog entry is missing metadata entries")
+                    })?,
+                )?,
             },
         })
     }
 
-    fn encode_manifest_sstable_flatbuffer<'fbb>(
+    pub(super) fn encode_manifest_sstable_flatbuffer<'fbb>(
         fbb: &mut flatbuffers::FlatBufferBuilder<'fbb>,
         sstable: &PersistedManifestSstable,
     ) -> flatbuffers::WIPOffset<metadata_fb::ManifestSstable<'fbb>> {
         let local_id = fbb.create_string(&sstable.local_id);
-        let file_path = (!sstable.file_path.is_empty()).then(|| fbb.create_string(&sstable.file_path));
-        let remote_key = sstable.remote_key.as_ref().map(|key| fbb.create_string(key));
+        let file_path =
+            (!sstable.file_path.is_empty()).then(|| fbb.create_string(&sstable.file_path));
+        let remote_key = sstable
+            .remote_key
+            .as_ref()
+            .map(|key| fbb.create_string(key));
         let min_key = fbb.create_vector(&sstable.min_key);
         let max_key = fbb.create_vector(&sstable.max_key);
         metadata_fb::create_manifest_sstable(
@@ -387,7 +388,7 @@ impl Db {
         )
     }
 
-    fn decode_manifest_sstable_flatbuffer(
+    pub(super) fn decode_manifest_sstable_flatbuffer(
         sstable: metadata_fb::ManifestSstable<'_>,
     ) -> PersistedManifestSstable {
         PersistedManifestSstable {
@@ -403,11 +404,15 @@ impl Db {
             max_key: sstable.max_key().bytes().to_vec(),
             min_sequence: SequenceNumber::new(sstable.min_sequence()),
             max_sequence: SequenceNumber::new(sstable.max_sequence()),
-            schema_version: sstable.has_schema_version().then_some(sstable.schema_version()),
+            schema_version: sstable
+                .has_schema_version()
+                .then_some(sstable.schema_version()),
         }
     }
 
-    fn encode_catalog(tables: &BTreeMap<String, StoredTable>) -> Result<Vec<u8>, StorageError> {
+    pub(super) fn encode_catalog(
+        tables: &BTreeMap<String, StoredTable>,
+    ) -> Result<Vec<u8>, StorageError> {
         let persisted = PersistedCatalog::from_tables(tables);
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
         let mut entries = Vec::with_capacity(persisted.tables.len());
@@ -420,7 +425,7 @@ impl Db {
         Ok(fbb.finished_data().to_vec())
     }
 
-    fn decode_catalog(bytes: &[u8]) -> Result<PersistedCatalog, StorageError> {
+    pub(super) fn decode_catalog(bytes: &[u8]) -> Result<PersistedCatalog, StorageError> {
         let catalog = metadata_fb::root_with_identifier::<metadata_fb::Catalog<'_>>(
             bytes,
             metadata_fb::CATALOG_IDENTIFIER,
@@ -445,7 +450,7 @@ impl Db {
         })
     }
 
-    fn encode_manifest_payload_from_sstables(
+    pub(super) fn encode_manifest_payload_from_sstables(
         generation: ManifestId,
         last_flushed_sequence: SequenceNumber,
         sstables: &[PersistedManifestSstable],
@@ -458,10 +463,13 @@ impl Db {
         };
         let body_bytes = Self::encode_manifest_body_flatbuffer(&body)?;
         let checksum = checksum32(&body_bytes);
-        Self::encode_manifest_file_flatbuffer(&PersistedManifestFile { body, checksum }, &body_bytes)
+        Self::encode_manifest_file_flatbuffer(
+            &PersistedManifestFile { body, checksum },
+            &body_bytes,
+        )
     }
 
-    fn encode_manifest_body_flatbuffer(
+    pub(super) fn encode_manifest_body_flatbuffer(
         body: &PersistedManifestBody,
     ) -> Result<Vec<u8>, StorageError> {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
@@ -481,7 +489,7 @@ impl Db {
         Ok(fbb.finished_data().to_vec())
     }
 
-    fn encode_manifest_file_flatbuffer(
+    pub(super) fn encode_manifest_file_flatbuffer(
         file: &PersistedManifestFile,
         body_bytes: &[u8],
     ) -> Result<Vec<u8>, StorageError> {
@@ -492,7 +500,9 @@ impl Db {
         Ok(fbb.finished_data().to_vec())
     }
 
-    fn decode_manifest_file_flatbuffer(bytes: &[u8]) -> Result<PersistedManifestFile, StorageError> {
+    pub(super) fn decode_manifest_file_flatbuffer(
+        bytes: &[u8],
+    ) -> Result<PersistedManifestFile, StorageError> {
         let file = metadata_fb::root_with_identifier::<metadata_fb::ManifestFile<'_>>(
             bytes,
             metadata_fb::MANIFEST_FILE_IDENTIFIER,
@@ -506,7 +516,9 @@ impl Db {
             metadata_fb::MANIFEST_BODY_IDENTIFIER,
             "manifest body",
         )
-        .map_err(|error| StorageError::corruption(format!("decode manifest body failed: {error}")))?;
+        .map_err(|error| {
+            StorageError::corruption(format!("decode manifest body failed: {error}"))
+        })?;
 
         let mut sstables = Vec::with_capacity(body.sstables().len());
         for sstable in body.sstables() {
@@ -523,7 +535,7 @@ impl Db {
         })
     }
 
-    fn encode_remote_manifest_payload(
+    pub(super) fn encode_remote_manifest_payload(
         generation: ManifestId,
         last_flushed_sequence: SequenceNumber,
         sstables: &[PersistedManifestSstable],
@@ -544,7 +556,7 @@ impl Db {
         )
     }
 
-    fn encode_remote_manifest_body_flatbuffer(
+    pub(super) fn encode_remote_manifest_body_flatbuffer(
         body: &PersistedRemoteManifestBody,
     ) -> Result<Vec<u8>, StorageError> {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
@@ -577,19 +589,18 @@ impl Db {
         Ok(fbb.finished_data().to_vec())
     }
 
-    fn encode_remote_manifest_file_flatbuffer(
+    pub(super) fn encode_remote_manifest_file_flatbuffer(
         file: &PersistedRemoteManifestFile,
         body_bytes: &[u8],
     ) -> Result<Vec<u8>, StorageError> {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
         let body_bytes = fbb.create_vector(body_bytes);
-        let root =
-            metadata_fb::create_remote_manifest_file(&mut fbb, body_bytes, file.checksum);
+        let root = metadata_fb::create_remote_manifest_file(&mut fbb, body_bytes, file.checksum);
         fbb.finish(root, Some(metadata_fb::REMOTE_MANIFEST_FILE_IDENTIFIER));
         Ok(fbb.finished_data().to_vec())
     }
 
-    fn decode_remote_manifest_file_flatbuffer(
+    pub(super) fn decode_remote_manifest_file_flatbuffer(
         bytes: &[u8],
     ) -> Result<PersistedRemoteManifestFile, StorageError> {
         let file = metadata_fb::root_with_identifier::<metadata_fb::RemoteManifestFile<'_>>(
@@ -618,11 +629,12 @@ impl Db {
 
         let mut commit_log_segments = Vec::with_capacity(body.commit_log_segments().len());
         for segment in body.commit_log_segments() {
-            let footer = SegmentFooter::decode(segment.footer_bytes().bytes()).map_err(|error| {
-                StorageError::corruption(format!(
-                    "decode remote manifest commit-log footer failed: {error}"
-                ))
-            })?;
+            let footer =
+                SegmentFooter::decode(segment.footer_bytes().bytes()).map_err(|error| {
+                    StorageError::corruption(format!(
+                        "decode remote manifest commit-log footer failed: {error}"
+                    ))
+                })?;
             commit_log_segments.push(DurableRemoteCommitLogSegment {
                 object_key: segment.object_key().to_string(),
                 footer,
@@ -641,7 +653,7 @@ impl Db {
         })
     }
 
-    fn encode_backup_object_birth_payload(
+    pub(super) fn encode_backup_object_birth_payload(
         record: &BackupObjectBirthRecord,
     ) -> Result<Vec<u8>, StorageError> {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
@@ -656,7 +668,7 @@ impl Db {
         Ok(fbb.finished_data().to_vec())
     }
 
-    fn decode_backup_object_birth_payload(
+    pub(super) fn decode_backup_object_birth_payload(
         bytes: &[u8],
     ) -> Result<BackupObjectBirthRecord, StorageError> {
         let record = metadata_fb::root_with_identifier::<metadata_fb::BackupGcBirthRecord<'_>>(
