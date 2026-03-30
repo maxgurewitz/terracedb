@@ -1397,8 +1397,10 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
+ "terracedb-simulation",
  "thiserror",
  "tokio",
+ "turmoil",
 ]
 
 [[package]]
