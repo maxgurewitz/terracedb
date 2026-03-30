@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -111,6 +111,13 @@ pub trait AgentFsStore: Send + Sync {
         base: Arc<dyn AgentFsSnapshot>,
         target: AgentFsConfig,
     ) -> Result<Arc<dyn AgentFsOverlay>, AgentFsError>;
+    async fn export_volume(&self, source: CloneVolumeSource)
+    -> Result<AgentFsExport, AgentFsError>;
+    async fn import_volume(
+        &self,
+        export: AgentFsExport,
+        target: AgentFsConfig,
+    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError>;
 }
 
 #[async_trait]
@@ -147,6 +154,25 @@ pub trait AgentFsSnapshot: Send + Sync + Any {
 }
 
 #[derive(Clone)]
+pub struct AgentFsExport {
+    snapshot: SnapshotState,
+}
+
+impl AgentFsExport {
+    pub fn volume_id(&self) -> crate::VolumeId {
+        self.snapshot.info.volume_id
+    }
+
+    pub fn sequence(&self) -> SequenceNumber {
+        self.snapshot.sequence
+    }
+
+    pub fn durable(&self) -> bool {
+        self.snapshot.durable
+    }
+}
+
+#[derive(Clone)]
 pub struct InMemoryAgentFsStore {
     inner: Arc<InMemoryStoreInner>,
 }
@@ -155,7 +181,7 @@ struct InMemoryStoreInner {
     clock: Arc<dyn Clock>,
     _rng: Arc<dyn Rng>,
     allocator_block_size: u64,
-    volumes: Mutex<BTreeMap<crate::VolumeId, Arc<InMemoryVolumeInner>>>,
+    volumes: Mutex<BTreeMap<crate::VolumeId, StoredVolume>>,
 }
 
 impl InMemoryAgentFsStore {
@@ -172,6 +198,62 @@ impl InMemoryAgentFsStore {
 
     pub fn with_dependencies(dependencies: DbDependencies) -> Self {
         Self::new(dependencies.clock, dependencies.rng)
+    }
+}
+
+#[derive(Clone)]
+enum StoredVolume {
+    Regular(Arc<InMemoryVolumeInner>),
+    Overlay(Arc<InMemoryOverlayEntry>),
+}
+
+impl StoredVolume {
+    fn info(&self) -> AgentFsVolumeInfo {
+        match self {
+            Self::Regular(volume) => volume.info(),
+            Self::Overlay(overlay) => overlay.info(),
+        }
+    }
+
+    fn open_handle(&self) -> Arc<dyn AgentFsVolume> {
+        match self {
+            Self::Regular(volume) => Arc::new(InMemoryAgentFsVolume {
+                inner: volume.clone(),
+            }),
+            Self::Overlay(overlay) => Arc::new(InMemoryAgentFsOverlay {
+                entry: overlay.clone(),
+            }),
+        }
+    }
+
+    fn snapshot_state(&self, durable: bool) -> SnapshotState {
+        match self {
+            Self::Regular(volume) => volume.snapshot_state(durable),
+            Self::Overlay(overlay) => overlay.snapshot_state(durable),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct InMemoryOverlayEntry {
+    delta: Arc<InMemoryVolumeInner>,
+    base: Arc<SnapshotState>,
+}
+
+impl InMemoryOverlayEntry {
+    fn info(&self) -> AgentFsVolumeInfo {
+        self.delta.info()
+    }
+
+    fn snapshot_state(&self, durable: bool) -> SnapshotState {
+        let delta = self.delta.snapshot_state(durable);
+        build_overlay_snapshot(&delta, self.base.as_ref())
+    }
+
+    fn base_snapshot(&self) -> Arc<dyn AgentFsSnapshot> {
+        Arc::new(InMemoryAgentFsSnapshot {
+            state: self.base.clone(),
+        })
     }
 }
 
@@ -198,9 +280,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
                 });
             }
 
-            return Ok(Arc::new(InMemoryAgentFsVolume {
-                inner: existing.clone(),
-            }));
+            return Ok(existing.open_handle());
         }
 
         if !config.create_if_missing {
@@ -222,7 +302,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
             self.inner.clock.clone(),
             self.inner.allocator_block_size,
         ));
-        volumes.insert(config.volume_id, volume.clone());
+        volumes.insert(config.volume_id, StoredVolume::Regular(volume.clone()));
         Ok(Arc::new(InMemoryAgentFsVolume { inner: volume }))
     }
 
@@ -284,7 +364,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
             json!(source.volume_id.to_string()),
         );
         volume.append_activity(ActivityKind::VolumeCloned, None, None, metadata);
-        volumes.insert(target.volume_id, volume.clone());
+        volumes.insert(target.volume_id, StoredVolume::Regular(volume.clone()));
         Ok(Arc::new(InMemoryAgentFsVolume { inner: volume }))
     }
 
@@ -327,12 +407,11 @@ impl AgentFsStore for InMemoryAgentFsStore {
             });
         }
 
-        let volume = Arc::new(InMemoryVolumeInner::from_snapshot(
+        let volume = Arc::new(InMemoryVolumeInner::new_overlay(
             target_info,
             self.inner.clock.clone(),
             &base_snapshot.state,
             self.inner.allocator_block_size,
-            true,
         ));
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -344,12 +423,88 @@ impl AgentFsStore for InMemoryAgentFsStore {
             json!(base_snapshot.state.sequence.get()),
         );
         volume.append_activity(ActivityKind::OverlayCreated, None, None, metadata);
-        volumes.insert(target.volume_id, volume.clone());
+        let overlay = Arc::new(InMemoryOverlayEntry {
+            delta: volume,
+            base: base_snapshot.state.clone(),
+        });
+        volumes.insert(target.volume_id, StoredVolume::Overlay(overlay.clone()));
 
-        Ok(Arc::new(InMemoryAgentFsOverlay {
-            volume: Arc::new(InMemoryAgentFsVolume { inner: volume }),
-            base,
-        }))
+        Ok(Arc::new(InMemoryAgentFsOverlay { entry: overlay }))
+    }
+
+    async fn export_volume(
+        &self,
+        source: CloneVolumeSource,
+    ) -> Result<AgentFsExport, AgentFsError> {
+        let volume = {
+            let volumes = self
+                .inner
+                .volumes
+                .lock()
+                .expect("in-memory volume registry lock poisoned");
+            volumes
+                .get(&source.volume_id)
+                .cloned()
+                .ok_or(AgentFsError::VolumeNotFound {
+                    volume_id: source.volume_id,
+                })?
+        };
+
+        Ok(AgentFsExport {
+            snapshot: volume.snapshot_state(source.durable),
+        })
+    }
+
+    async fn import_volume(
+        &self,
+        export: AgentFsExport,
+        target: AgentFsConfig,
+    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError> {
+        let chunk_size = target.chunk_size.unwrap_or(export.snapshot.info.chunk_size);
+        if chunk_size == 0 {
+            return Err(AgentFsError::InvalidChunkSize);
+        }
+
+        let target_info = AgentFsVolumeInfo {
+            volume_id: target.volume_id,
+            chunk_size,
+            format_version: VFS_FORMAT_VERSION,
+            root_inode: ROOT_INODE_ID,
+            created_at: self.inner.clock.now(),
+            overlay_base: None,
+        };
+
+        let mut volumes = self
+            .inner
+            .volumes
+            .lock()
+            .expect("in-memory volume registry lock poisoned");
+        if volumes.contains_key(&target.volume_id) {
+            return Err(AgentFsError::VolumeAlreadyExists {
+                volume_id: target.volume_id,
+            });
+        }
+
+        let volume = Arc::new(InMemoryVolumeInner::from_snapshot(
+            target_info,
+            self.inner.clock.clone(),
+            &export.snapshot,
+            self.inner.allocator_block_size,
+            true,
+        ));
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "source_volume_id".to_string(),
+            json!(export.snapshot.info.volume_id.to_string()),
+        );
+        metadata.insert(
+            "source_sequence".to_string(),
+            json!(export.snapshot.sequence.get()),
+        );
+        metadata.insert("source_durable".to_string(), json!(export.snapshot.durable));
+        volume.append_activity(ActivityKind::VolumeCloned, None, None, metadata);
+        volumes.insert(target.volume_id, StoredVolume::Regular(volume.clone()));
+        Ok(Arc::new(InMemoryAgentFsVolume { inner: volume }))
     }
 }
 
@@ -432,33 +587,40 @@ impl AgentFsVolume for InMemoryAgentFsVolume {
 }
 
 struct InMemoryAgentFsOverlay {
-    volume: Arc<InMemoryAgentFsVolume>,
-    base: Arc<dyn AgentFsSnapshot>,
+    entry: Arc<InMemoryOverlayEntry>,
 }
 
 #[async_trait]
 impl AgentFsVolume for InMemoryAgentFsOverlay {
     fn info(&self) -> AgentFsVolumeInfo {
-        self.volume.info()
+        self.entry.info()
     }
 
     fn fs(&self) -> Arc<dyn AgentFileSystem> {
-        self.volume.fs()
+        Arc::new(InMemoryOverlayFileSystem {
+            overlay: self.entry.clone(),
+        })
     }
 
     fn kv(&self) -> Arc<dyn AgentKvStore> {
-        self.volume.kv()
+        Arc::new(InMemoryAgentKv {
+            volume: self.entry.delta.clone(),
+        })
     }
 
     fn tools(&self) -> Arc<dyn AgentToolRuns> {
-        self.volume.tools()
+        Arc::new(InMemoryAgentTools {
+            volume: self.entry.delta.clone(),
+        })
     }
 
     async fn snapshot(
         &self,
         opts: SnapshotOptions,
     ) -> Result<Arc<dyn AgentFsSnapshot>, AgentFsError> {
-        self.volume.snapshot(opts).await
+        Ok(Arc::new(InMemoryAgentFsSnapshot {
+            state: Arc::new(self.entry.snapshot_state(opts.durable)),
+        }))
     }
 
     async fn activity_since(
@@ -466,21 +628,32 @@ impl AgentFsVolume for InMemoryAgentFsOverlay {
         cursor: LogCursor,
         opts: ActivityOptions,
     ) -> Result<ActivityStream, AgentFsError> {
-        self.volume.activity_since(cursor, opts).await
+        InMemoryAgentFsVolume {
+            inner: self.entry.delta.clone(),
+        }
+        .activity_since(cursor, opts)
+        .await
     }
 
     fn subscribe_activity(&self, opts: ActivityOptions) -> ActivityReceiver {
-        self.volume.subscribe_activity(opts)
+        InMemoryAgentFsVolume {
+            inner: self.entry.delta.clone(),
+        }
+        .subscribe_activity(opts)
     }
 
     async fn flush(&self) -> Result<(), AgentFsError> {
-        self.volume.flush().await
+        InMemoryAgentFsVolume {
+            inner: self.entry.delta.clone(),
+        }
+        .flush()
+        .await
     }
 }
 
 impl AgentFsOverlay for InMemoryAgentFsOverlay {
     fn base(&self) -> Arc<dyn AgentFsSnapshot> {
-        self.base.clone()
+        self.entry.base_snapshot()
     }
 }
 
@@ -526,6 +699,10 @@ impl AgentFsSnapshot for InMemoryAgentFsSnapshot {
 
 struct InMemoryAgentFileSystem {
     volume: Arc<InMemoryVolumeInner>,
+}
+
+struct InMemoryOverlayFileSystem {
+    overlay: Arc<InMemoryOverlayEntry>,
 }
 
 struct InMemorySnapshotFileSystem {
@@ -656,6 +833,43 @@ impl ReadOnlyAgentFileSystem for InMemorySnapshotFileSystem {
 }
 
 #[async_trait]
+impl ReadOnlyAgentFileSystem for InMemoryOverlayFileSystem {
+    async fn stat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+        lookup_snapshot_stats(&self.overlay.snapshot_state(false), path, true)
+    }
+
+    async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+        lookup_snapshot_stats(&self.overlay.snapshot_state(false), path, false)
+    }
+
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
+        read_snapshot_file_bytes(&self.overlay.snapshot_state(false), path)
+    }
+
+    async fn pread(
+        &self,
+        path: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, AgentFsError> {
+        pread_snapshot_file_bytes(&self.overlay.snapshot_state(false), path, offset, len)
+    }
+
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
+        read_snapshot_dir_entries(&self.overlay.snapshot_state(false), path)
+    }
+
+    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+        read_snapshot_dir_entries_plus(&self.overlay.snapshot_state(false), path)
+    }
+
+    async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
+        let snapshot = self.overlay.snapshot_state(false);
+        read_link_target(&snapshot.paths, &snapshot.inodes, path)
+    }
+}
+
+#[async_trait]
 impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn write_file(
         &self,
@@ -664,74 +878,12 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         opts: CreateOptions,
     ) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
+        let opts = opts.clone();
         self.volume.mutate(|state, now| {
-            if path == "/" {
-                return Err(AgentFsError::RootInvariant);
-            }
-            ensure_parent_directory(state, &path, opts.create_parents, now)?;
-            let exact_exists = state.paths.contains_key(&path);
-            match resolve_existing_path(state, &path, true)? {
-                Some((resolved_path, inode_id)) => {
-                    let inode =
-                        state
-                            .inodes
-                            .get_mut(&inode_id)
-                            .ok_or_else(|| AgentFsError::NotFound {
-                                path: resolved_path.clone(),
-                            })?;
-                    let InodeData::File(content) = &mut inode.data else {
-                        return match inode.stats.kind {
-                            FileKind::Directory => Err(AgentFsError::IsDirectory {
-                                path: resolved_path,
-                            }),
-                            _ => Err(AgentFsError::NotFile {
-                                path: resolved_path,
-                            }),
-                        };
-                    };
-                    if !opts.overwrite {
-                        return Err(AgentFsError::AlreadyExists {
-                            path: resolved_path,
-                        });
-                    }
-                    *content = file_content_from_bytes(&data, state.info.chunk_size);
-                    inode.stats.size = data.len() as u64;
-                    inode.stats.modified_at = now;
-                    inode.stats.changed_at = now;
-                    inode.stats.accessed_at = now;
-                }
-                None if exact_exists => {
-                    return Err(AgentFsError::NotFound { path: path.clone() });
-                }
-                None => {
-                    let resolved_path = resolve_target_path(state, &path)?;
-                    if state.paths.contains_key(&resolved_path) {
-                        return Err(AgentFsError::AlreadyExists {
-                            path: resolved_path,
-                        });
-                    }
-
-                    let inode_id = allocate_inode(state);
-                    let stats =
-                        inode_stats(inode_id, FileKind::File, opts.mode, now, data.len() as u64);
-                    state.paths.insert(resolved_path.clone(), inode_id);
-                    state.inodes.insert(
-                        inode_id,
-                        InodeRecord {
-                            stats,
-                            data: InodeData::File(file_content_from_bytes(
-                                &data,
-                                state.info.chunk_size,
-                            )),
-                        },
-                    );
-                    touch_parent_directory(state, &resolved_path, now)?;
-                }
-            }
-
+            mutate_write_file_state(state, &path, &data, &opts, now)?;
             Ok(Some((
                 (),
-                activity_spec(ActivityKind::FileWritten, Some(path), None, None),
+                activity_spec(ActivityKind::FileWritten, Some(path.clone()), None, None),
             )))
         })
     }
@@ -739,40 +891,10 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
-            let (resolved_path, inode_id) = resolve_existing_path(state, &path, true)?
-                .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let inode = state
-                .inodes
-                .get_mut(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: resolved_path.clone(),
-                })?;
-            let InodeData::File(content) = &mut inode.data else {
-                return match inode.stats.kind {
-                    FileKind::Directory => Err(AgentFsError::IsDirectory {
-                        path: resolved_path.clone(),
-                    }),
-                    _ => Err(AgentFsError::NotFile {
-                        path: resolved_path.clone(),
-                    }),
-                };
-            };
-
-            let new_size = write_file_content_at(
-                content,
-                inode.stats.size,
-                state.info.chunk_size,
-                offset,
-                &data,
-            );
-            inode.stats.size = new_size;
-            inode.stats.modified_at = now;
-            inode.stats.changed_at = now;
-            inode.stats.accessed_at = now;
-
+            mutate_pwrite_state(state, &path, offset, &data, now)?;
             Ok(Some((
                 (),
-                activity_spec(ActivityKind::FilePatched, Some(path), None, None),
+                activity_spec(ActivityKind::FilePatched, Some(path.clone()), None, None),
             )))
         })
     }
@@ -780,34 +902,10 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn truncate(&self, path: &str, size: u64) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
-            let (resolved_path, inode_id) = resolve_existing_path(state, &path, true)?
-                .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let inode = state
-                .inodes
-                .get_mut(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: resolved_path.clone(),
-                })?;
-            let InodeData::File(content) = &mut inode.data else {
-                return match inode.stats.kind {
-                    FileKind::Directory => Err(AgentFsError::IsDirectory {
-                        path: resolved_path.clone(),
-                    }),
-                    _ => Err(AgentFsError::NotFile {
-                        path: resolved_path.clone(),
-                    }),
-                };
-            };
-
-            truncate_file_content(content, state.info.chunk_size, size);
-            inode.stats.size = size;
-            inode.stats.modified_at = now;
-            inode.stats.changed_at = now;
-            inode.stats.accessed_at = now;
-
+            mutate_truncate_state(state, &path, size, now)?;
             Ok(Some((
                 (),
-                activity_spec(ActivityKind::FileTruncated, Some(path), None, None),
+                activity_spec(ActivityKind::FileTruncated, Some(path.clone()), None, None),
             )))
         })
     }
@@ -822,40 +920,21 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
             };
         }
 
+        let opts = opts.clone();
         self.volume.mutate(|state, now| {
-            if let Some((resolved_path, inode_id)) = resolve_existing_path(state, &path, false)? {
-                let inode = state
-                    .inodes
-                    .get(&inode_id)
-                    .ok_or_else(|| AgentFsError::NotFound {
-                        path: resolved_path.clone(),
-                    })?;
-                if inode.stats.kind == FileKind::Directory && opts.recursive {
-                    return Ok(None);
-                }
-                return Err(AgentFsError::AlreadyExists {
-                    path: resolved_path,
-                });
+            if mutate_mkdir_state(state, &path, &opts, now)? {
+                Ok(Some((
+                    (),
+                    activity_spec(
+                        ActivityKind::DirectoryCreated,
+                        Some(path.clone()),
+                        None,
+                        None,
+                    ),
+                )))
+            } else {
+                Ok(None)
             }
-
-            ensure_parent_directory(state, &path, opts.recursive, now)?;
-            let resolved_path = resolve_target_path(state, &path)?;
-            let inode_id = allocate_inode(state);
-            let stats = inode_stats(inode_id, FileKind::Directory, opts.mode, now, 0);
-            state.paths.insert(resolved_path.clone(), inode_id);
-            state.inodes.insert(
-                inode_id,
-                InodeRecord {
-                    stats,
-                    data: InodeData::Directory,
-                },
-            );
-            increment_directory_nlink(state, &resolved_path, now)?;
-
-            Ok(Some((
-                (),
-                activity_spec(ActivityKind::DirectoryCreated, Some(path), None, None),
-            )))
         })
     }
 
@@ -863,102 +942,19 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         self.volume.mutate(|state, now| {
-            if from == "/" || to == "/" {
-                return Err(AgentFsError::RootInvariant);
-            }
-            if from == to {
+            if !mutate_rename_state(state, &from, &to, now)? {
                 return Ok(None);
             }
-            let (resolved_from, from_inode_id) = resolve_existing_path(state, &from, false)?
-                .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
-            let resolved_to = resolve_target_path(state, &to)?;
-            if resolved_from == resolved_to {
-                return Ok(None);
-            }
-            if is_descendant_path(&resolved_from, &resolved_to) {
-                return Err(AgentFsError::InvalidPath {
-                    path: resolved_to.clone(),
-                });
-            }
-
-            let from_kind = state
-                .inodes
-                .get(&from_inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: resolved_from.clone(),
-                })?
-                .stats
-                .kind;
-            let from_parent = parent_path(&resolved_from).ok_or(AgentFsError::RootInvariant)?;
-            let to_parent = parent_path(&resolved_to).ok_or(AgentFsError::RootInvariant)?;
-
-            if let Some(target_inode_id) = state.paths.get(&resolved_to).copied() {
-                let target_kind = state
-                    .inodes
-                    .get(&target_inode_id)
-                    .ok_or_else(|| AgentFsError::NotFound {
-                        path: resolved_to.clone(),
-                    })?
-                    .stats
-                    .kind;
-                match (from_kind, target_kind) {
-                    (FileKind::Directory, FileKind::Directory) => {
-                        if state.paths.keys().any(|candidate| {
-                            candidate != &resolved_to && is_descendant_path(&resolved_to, candidate)
-                        }) {
-                            return Err(AgentFsError::DirectoryNotEmpty {
-                                path: resolved_to.clone(),
-                            });
-                        }
-                        state.paths.remove(&resolved_to);
-                        state.inodes.remove(&target_inode_id);
-                        decrement_directory_nlink(state, &resolved_to, now)?;
-                    }
-                    (FileKind::Directory, _) => {
-                        return Err(AgentFsError::NotDirectory {
-                            path: resolved_to.clone(),
-                        });
-                    }
-                    (_, FileKind::Directory) => {
-                        return Err(AgentFsError::IsDirectory {
-                            path: resolved_to.clone(),
-                        });
-                    }
-                    (_, _) => {
-                        remove_non_directory_path(state, &resolved_to, now)?;
-                    }
-                }
-            }
-
-            let renames = state
-                .paths
-                .iter()
-                .filter_map(|(path, inode)| {
-                    rebase_path(path, &resolved_from, &resolved_to)
-                        .map(|new_path| (path.clone(), new_path, *inode))
-                })
-                .collect::<Vec<_>>();
-
-            for (old_path, _, _) in &renames {
-                state.paths.remove(old_path);
-            }
-            for (_, new_path, inode) in renames {
-                state.paths.insert(new_path, inode);
-            }
-            touch_directory_path_at(state, &from_parent, now)?;
-            touch_directory_path_at(state, &to_parent, now)?;
-            if from_kind == FileKind::Directory && from_parent != to_parent {
-                adjust_directory_parent_links(state, &from_parent, &to_parent)?;
-            }
-            if let Some(inode) = state.inodes.get_mut(&from_inode_id) {
-                inode.stats.changed_at = now;
-            }
-
             let mut metadata = BTreeMap::new();
             metadata.insert("to".to_string(), json!(to.clone()));
             Ok(Some((
                 (),
-                activity_spec(ActivityKind::PathRenamed, Some(from), None, Some(metadata)),
+                activity_spec(
+                    ActivityKind::PathRenamed,
+                    Some(from.clone()),
+                    None,
+                    Some(metadata),
+                ),
             )))
         })
     }
@@ -967,45 +963,14 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         self.volume.mutate(|state, now| {
-            if to == "/" {
-                return Err(AgentFsError::RootInvariant);
-            }
-            let (resolved_from, inode_id) = resolve_existing_path(state, &from, false)?
-                .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
-            let resolved_to = resolve_target_path(state, &to)?;
-            if state.paths.contains_key(&resolved_to) {
-                return Err(AgentFsError::AlreadyExists { path: resolved_to });
-            }
-            let kind = state
-                .inodes
-                .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: resolved_from.clone(),
-                })?
-                .stats
-                .kind;
-            if kind == FileKind::Directory {
-                return Err(AgentFsError::UnsupportedOperation {
-                    operation: "hard-link directories",
-                });
-            }
-            let inode = state
-                .inodes
-                .get_mut(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: resolved_from.clone(),
-                })?;
-            inode.stats.nlink = inode.stats.nlink.saturating_add(1);
-            inode.stats.changed_at = now;
-            state.paths.insert(resolved_to.clone(), inode_id);
-            touch_parent_directory(state, &resolved_to, now)?;
+            mutate_link_state(state, &from, &to, now)?;
             let mut metadata = BTreeMap::new();
-            metadata.insert("from".to_string(), json!(from));
+            metadata.insert("from".to_string(), json!(from.clone()));
             Ok(Some((
                 (),
                 activity_spec(
                     ActivityKind::HardLinkCreated,
-                    Some(to),
+                    Some(to.clone()),
                     None,
                     Some(metadata),
                 ),
@@ -1017,30 +982,15 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         let linkpath = normalize_path(linkpath)?;
         let target = target.to_string();
         self.volume.mutate(|state, now| {
-            if linkpath == "/" {
-                return Err(AgentFsError::RootInvariant);
-            }
-            let resolved_linkpath = resolve_target_path(state, &linkpath)?;
-            if state.paths.contains_key(&resolved_linkpath) {
-                return Err(AgentFsError::AlreadyExists {
-                    path: resolved_linkpath,
-                });
-            }
-            let inode_id = allocate_inode(state);
-            let stats = inode_stats(inode_id, FileKind::Symlink, 0o777, now, target.len() as u64);
-            state.paths.insert(resolved_linkpath.clone(), inode_id);
-            state.inodes.insert(
-                inode_id,
-                InodeRecord {
-                    stats,
-                    data: InodeData::Symlink(target),
-                },
-            );
-            touch_parent_directory(state, &resolved_linkpath, now)?;
-
+            mutate_symlink_state(state, &target, &linkpath, now)?;
             Ok(Some((
                 (),
-                activity_spec(ActivityKind::SymlinkCreated, Some(linkpath), None, None),
+                activity_spec(
+                    ActivityKind::SymlinkCreated,
+                    Some(linkpath.clone()),
+                    None,
+                    None,
+                ),
             )))
         })
     }
@@ -1048,16 +998,10 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn unlink(&self, path: &str) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
-            if path == "/" {
-                return Err(AgentFsError::RootInvariant);
-            }
-            let (resolved_path, _) = resolve_existing_path(state, &path, false)?
-                .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            remove_non_directory_path(state, &resolved_path, now)?;
-            touch_parent_directory(state, &resolved_path, now)?;
+            mutate_unlink_state(state, &path, now)?;
             Ok(Some((
                 (),
-                activity_spec(ActivityKind::PathDeleted, Some(path), None, None),
+                activity_spec(ActivityKind::PathDeleted, Some(path.clone()), None, None),
             )))
         })
     }
@@ -1065,37 +1009,15 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn rmdir(&self, path: &str) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
-            if path == "/" {
-                return Err(AgentFsError::RootInvariant);
-            }
-            let (resolved_path, inode_id) = resolve_existing_path(state, &path, false)?
-                .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let inode = state
-                .inodes
-                .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: resolved_path.clone(),
-                })?;
-            if inode.stats.kind != FileKind::Directory {
-                return Err(AgentFsError::NotDirectory {
-                    path: resolved_path.clone(),
-                });
-            }
-            if state.paths.keys().any(|candidate| {
-                candidate != &resolved_path && is_descendant_path(&resolved_path, candidate)
-            }) {
-                return Err(AgentFsError::DirectoryNotEmpty {
-                    path: resolved_path.clone(),
-                });
-            }
-            state.paths.remove(&resolved_path);
-            state.inodes.remove(&inode_id);
-            decrement_directory_nlink(state, &resolved_path, now)?;
-            touch_parent_directory(state, &resolved_path, now)?;
-
+            mutate_rmdir_state(state, &path, now)?;
             Ok(Some((
                 (),
-                activity_spec(ActivityKind::DirectoryRemoved, Some(path), None, None),
+                activity_spec(
+                    ActivityKind::DirectoryRemoved,
+                    Some(path.clone()),
+                    None,
+                    None,
+                ),
             )))
         })
     }
@@ -1114,6 +1036,450 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         }
 
         self.volume.promote_durable_cut();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AgentFileSystem for InMemoryOverlayFileSystem {
+    async fn write_file(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        opts: CreateOptions,
+    ) -> Result<(), AgentFsError> {
+        let path = normalize_path(path)?;
+        let opts = opts.clone();
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let resolved_path = if let Some((resolved_path, _)) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
+            {
+                ensure_overlay_existing_path(
+                    state,
+                    base.as_ref(),
+                    &merged,
+                    &resolved_path,
+                    false,
+                    now,
+                )?;
+                resolved_path
+            } else {
+                let resolved_path =
+                    resolve_target_path_in_maps(&merged.paths, &merged.inodes, &path)?;
+                materialize_overlay_parent_chain(
+                    state,
+                    base.as_ref(),
+                    &merged,
+                    &resolved_path,
+                    opts.create_parents,
+                    now,
+                )?;
+                resolved_path
+            };
+
+            let delta_opts = CreateOptions {
+                create_parents: false,
+                ..opts.clone()
+            };
+            mutate_write_file_state(state, &resolved_path, &data, &delta_opts, now)?;
+            Ok(Some((
+                (),
+                activity_spec(ActivityKind::FileWritten, Some(path.clone()), None, None),
+            )))
+        })
+    }
+
+    async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), AgentFsError> {
+        let path = normalize_path(path)?;
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let (resolved_path, _) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
+                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+            ensure_overlay_existing_path(
+                state,
+                base.as_ref(),
+                &merged,
+                &resolved_path,
+                false,
+                now,
+            )?;
+            mutate_pwrite_state(state, &resolved_path, offset, &data, now)?;
+            Ok(Some((
+                (),
+                activity_spec(ActivityKind::FilePatched, Some(path.clone()), None, None),
+            )))
+        })
+    }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), AgentFsError> {
+        let path = normalize_path(path)?;
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let (resolved_path, _) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
+                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+            ensure_overlay_existing_path(
+                state,
+                base.as_ref(),
+                &merged,
+                &resolved_path,
+                false,
+                now,
+            )?;
+            mutate_truncate_state(state, &resolved_path, size, now)?;
+            Ok(Some((
+                (),
+                activity_spec(ActivityKind::FileTruncated, Some(path.clone()), None, None),
+            )))
+        })
+    }
+
+    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<(), AgentFsError> {
+        let path = normalize_path(path)?;
+        if path == "/" {
+            return if opts.recursive {
+                Ok(())
+            } else {
+                Err(AgentFsError::AlreadyExists { path })
+            };
+        }
+
+        let opts = opts.clone();
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            if let Some((resolved_path, inode_id)) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
+            {
+                let inode = merged
+                    .inodes
+                    .get(&inode_id)
+                    .ok_or_else(|| AgentFsError::NotFound {
+                        path: resolved_path.clone(),
+                    })?;
+                if inode.stats.kind == FileKind::Directory && opts.recursive {
+                    return Ok(None);
+                }
+                return Err(AgentFsError::AlreadyExists {
+                    path: resolved_path,
+                });
+            }
+
+            let resolved_path = resolve_target_path_in_maps(&merged.paths, &merged.inodes, &path)?;
+            materialize_overlay_parent_chain(
+                state,
+                base.as_ref(),
+                &merged,
+                &resolved_path,
+                opts.recursive,
+                now,
+            )?;
+            let delta_opts = MkdirOptions {
+                recursive: false,
+                ..opts.clone()
+            };
+            mutate_mkdir_state(state, &resolved_path, &delta_opts, now)?;
+            Ok(Some((
+                (),
+                activity_spec(
+                    ActivityKind::DirectoryCreated,
+                    Some(path.clone()),
+                    None,
+                    None,
+                ),
+            )))
+        })
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
+        let from = normalize_path(from)?;
+        let to = normalize_path(to)?;
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            if from == "/" || to == "/" {
+                return Err(AgentFsError::RootInvariant);
+            }
+            if from == to {
+                return Ok(None);
+            }
+
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let (resolved_from, from_inode_id) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &from, false)?
+                    .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
+            let resolved_to = resolve_target_path_in_maps(&merged.paths, &merged.inodes, &to)?;
+            if resolved_from == resolved_to {
+                return Ok(None);
+            }
+
+            let from_kind = merged
+                .inodes
+                .get(&from_inode_id)
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_from.clone(),
+                })?
+                .stats
+                .kind;
+
+            let source_was_delta = state.paths.contains_key(&resolved_from);
+            if !source_was_delta {
+                if from_kind == FileKind::Directory {
+                    copy_up_overlay_directory_subtree(
+                        state,
+                        base.as_ref(),
+                        &merged,
+                        &resolved_from,
+                        now,
+                    )?;
+                } else {
+                    ensure_overlay_existing_path(
+                        state,
+                        base.as_ref(),
+                        &merged,
+                        &resolved_from,
+                        false,
+                        now,
+                    )?;
+                }
+            }
+
+            let target_existing = resolve_existing_in_maps_with_mode(
+                &merged.paths,
+                &merged.inodes,
+                &resolved_to,
+                false,
+            )?;
+            let mut target_was_base = false;
+            if let Some((target_path, target_inode_id)) = target_existing {
+                target_was_base = !state.paths.contains_key(&target_path);
+                let target_kind = merged
+                    .inodes
+                    .get(&target_inode_id)
+                    .ok_or_else(|| AgentFsError::NotFound {
+                        path: target_path.clone(),
+                    })?
+                    .stats
+                    .kind;
+                if from_kind == FileKind::Directory
+                    && target_kind == FileKind::Directory
+                    && merged.paths.keys().any(|candidate| {
+                        candidate != &target_path && is_descendant_path(&target_path, candidate)
+                    })
+                {
+                    return Err(AgentFsError::DirectoryNotEmpty { path: target_path });
+                }
+                if target_was_base {
+                    if target_kind == FileKind::Directory {
+                        ensure_overlay_existing_path(
+                            state,
+                            base.as_ref(),
+                            &merged,
+                            &target_path,
+                            false,
+                            now,
+                        )?;
+                    } else {
+                        ensure_overlay_existing_path(
+                            state,
+                            base.as_ref(),
+                            &merged,
+                            &target_path,
+                            false,
+                            now,
+                        )?;
+                    }
+                }
+            } else {
+                materialize_overlay_parent_chain(
+                    state,
+                    base.as_ref(),
+                    &merged,
+                    &resolved_to,
+                    false,
+                    now,
+                )?;
+            }
+
+            if !mutate_rename_state(state, &resolved_from, &resolved_to, now)? {
+                return Ok(None);
+            }
+            if !source_was_delta {
+                state.whiteouts.insert(resolved_from.clone());
+            }
+            if target_was_base {
+                state.whiteouts.insert(resolved_to.clone());
+            }
+
+            let mut metadata = BTreeMap::new();
+            metadata.insert("to".to_string(), json!(to.clone()));
+            Ok(Some((
+                (),
+                activity_spec(
+                    ActivityKind::PathRenamed,
+                    Some(from.clone()),
+                    None,
+                    Some(metadata),
+                ),
+            )))
+        })
+    }
+
+    async fn link(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
+        let from = normalize_path(from)?;
+        let to = normalize_path(to)?;
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let (resolved_from, _) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &from, false)?
+                    .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
+            ensure_overlay_existing_path(
+                state,
+                base.as_ref(),
+                &merged,
+                &resolved_from,
+                false,
+                now,
+            )?;
+            let resolved_to = resolve_target_path_in_maps(&merged.paths, &merged.inodes, &to)?;
+            materialize_overlay_parent_chain(
+                state,
+                base.as_ref(),
+                &merged,
+                &resolved_to,
+                false,
+                now,
+            )?;
+            mutate_link_state(state, &resolved_from, &resolved_to, now)?;
+            let mut metadata = BTreeMap::new();
+            metadata.insert("from".to_string(), json!(from.clone()));
+            Ok(Some((
+                (),
+                activity_spec(
+                    ActivityKind::HardLinkCreated,
+                    Some(to.clone()),
+                    None,
+                    Some(metadata),
+                ),
+            )))
+        })
+    }
+
+    async fn symlink(&self, target: &str, linkpath: &str) -> Result<(), AgentFsError> {
+        let linkpath = normalize_path(linkpath)?;
+        let target = target.to_string();
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let resolved_linkpath =
+                resolve_target_path_in_maps(&merged.paths, &merged.inodes, &linkpath)?;
+            materialize_overlay_parent_chain(
+                state,
+                base.as_ref(),
+                &merged,
+                &resolved_linkpath,
+                false,
+                now,
+            )?;
+            mutate_symlink_state(state, &target, &resolved_linkpath, now)?;
+            Ok(Some((
+                (),
+                activity_spec(
+                    ActivityKind::SymlinkCreated,
+                    Some(linkpath.clone()),
+                    None,
+                    None,
+                ),
+            )))
+        })
+    }
+
+    async fn unlink(&self, path: &str) -> Result<(), AgentFsError> {
+        let path = normalize_path(path)?;
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let (resolved_path, _) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
+                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+            let source_was_delta = state.paths.contains_key(&resolved_path);
+            if !source_was_delta {
+                ensure_overlay_existing_path(
+                    state,
+                    base.as_ref(),
+                    &merged,
+                    &resolved_path,
+                    false,
+                    now,
+                )?;
+            }
+            mutate_unlink_state(state, &resolved_path, now)?;
+            if !source_was_delta {
+                state.whiteouts.insert(resolved_path);
+            }
+            Ok(Some((
+                (),
+                activity_spec(ActivityKind::PathDeleted, Some(path.clone()), None, None),
+            )))
+        })
+    }
+
+    async fn rmdir(&self, path: &str) -> Result<(), AgentFsError> {
+        let path = normalize_path(path)?;
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let (resolved_path, _) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
+                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+            let source_was_delta = state.paths.contains_key(&resolved_path);
+            if !source_was_delta {
+                ensure_overlay_existing_path(
+                    state,
+                    base.as_ref(),
+                    &merged,
+                    &resolved_path,
+                    false,
+                    now,
+                )?;
+            }
+            mutate_rmdir_state(state, &resolved_path, now)?;
+            if !source_was_delta {
+                state.whiteouts.insert(resolved_path);
+            }
+            Ok(Some((
+                (),
+                activity_spec(
+                    ActivityKind::DirectoryRemoved,
+                    Some(path.clone()),
+                    None,
+                    None,
+                ),
+            )))
+        })
+    }
+
+    async fn fsync(&self, path: Option<&str>) -> Result<(), AgentFsError> {
+        if let Some(path) = path {
+            let path = normalize_path(path)?;
+            if resolve_existing_in_maps_with_mode(
+                &self.overlay.snapshot_state(false).paths,
+                &self.overlay.snapshot_state(false).inodes,
+                &path,
+                true,
+            )?
+            .is_none()
+            {
+                return Err(AgentFsError::NotFound { path });
+            }
+        }
+
+        self.overlay.delta.promote_durable_cut();
         Ok(())
     }
 }
@@ -1385,6 +1751,23 @@ impl InMemoryVolumeInner {
         }
     }
 
+    fn new_overlay(
+        info: AgentFsVolumeInfo,
+        clock: Arc<dyn Clock>,
+        base: &SnapshotState,
+        allocator_block_size: u64,
+    ) -> Self {
+        let state = VolumeState::new_overlay(info, base, allocator_block_size);
+        let (activity_watch, _receiver) = watch::channel(state.sequence);
+        let (durable_activity_watch, _receiver) = watch::channel(state.durable.sequence);
+        Self {
+            clock,
+            state: Mutex::new(state),
+            activity_watch,
+            durable_activity_watch,
+        }
+    }
+
     fn info(&self) -> AgentFsVolumeInfo {
         self.state
             .lock()
@@ -1474,6 +1857,8 @@ struct SnapshotState {
     inodes: BTreeMap<InodeId, InodeRecord>,
     kv: BTreeMap<String, JsonValue>,
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
+    whiteouts: BTreeSet<String>,
+    origins: BTreeMap<InodeId, OriginRecord>,
 }
 
 #[derive(Clone, Default)]
@@ -1483,6 +1868,8 @@ struct DurableViewState {
     inodes: BTreeMap<InodeId, InodeRecord>,
     kv: BTreeMap<String, JsonValue>,
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
+    whiteouts: BTreeSet<String>,
+    origins: BTreeMap<InodeId, OriginRecord>,
     activity_len: usize,
 }
 
@@ -1496,8 +1883,18 @@ impl DurableViewState {
             inodes: self.inodes.clone(),
             kv: self.kv.clone(),
             tool_runs: self.tool_runs.clone(),
+            whiteouts: self.whiteouts.clone(),
+            origins: self.origins.clone(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OriginRecord {
+    base_volume_id: crate::VolumeId,
+    base_sequence: SequenceNumber,
+    base_durable: bool,
+    base_inode: InodeId,
 }
 
 struct VolumeState {
@@ -1508,6 +1905,8 @@ struct VolumeState {
     inodes: BTreeMap<InodeId, InodeRecord>,
     kv: BTreeMap<String, JsonValue>,
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
+    whiteouts: BTreeSet<String>,
+    origins: BTreeMap<InodeId, OriginRecord>,
     activities: Vec<ActivityEntry>,
     durable: DurableViewState,
 }
@@ -1534,6 +1933,8 @@ impl VolumeState {
             inodes: inodes.clone(),
             kv: BTreeMap::new(),
             tool_runs: BTreeMap::new(),
+            whiteouts: BTreeSet::new(),
+            origins: BTreeMap::new(),
             activity_len: 0,
         };
 
@@ -1545,6 +1946,8 @@ impl VolumeState {
             inodes,
             kv: BTreeMap::new(),
             tool_runs: BTreeMap::new(),
+            whiteouts: BTreeSet::new(),
+            origins: BTreeMap::new(),
             activities: Vec::new(),
             durable,
         }
@@ -1556,6 +1959,11 @@ impl VolumeState {
         allocator_block_size: u64,
         initialize_durable: bool,
     ) -> Self {
+        let inodes = clone_inodes_for_chunk_size(
+            &snapshot.inodes,
+            snapshot.info.chunk_size,
+            info.chunk_size,
+        );
         let next_inode = snapshot
             .inodes
             .keys()
@@ -1574,9 +1982,11 @@ impl VolumeState {
             DurableViewState {
                 sequence: SequenceNumber::new(0),
                 paths: snapshot.paths.clone(),
-                inodes: snapshot.inodes.clone(),
+                inodes: inodes.clone(),
                 kv: snapshot.kv.clone(),
                 tool_runs: snapshot.tool_runs.clone(),
+                whiteouts: BTreeSet::new(),
+                origins: BTreeMap::new(),
                 activity_len: 0,
             }
         } else {
@@ -1588,9 +1998,75 @@ impl VolumeState {
             sequence: SequenceNumber::new(0),
             allocators: allocator_map(next_inode, 1, next_tool_run_id, allocator_block_size),
             paths: snapshot.paths.clone(),
-            inodes: snapshot.inodes.clone(),
+            inodes,
             kv: snapshot.kv.clone(),
             tool_runs: snapshot.tool_runs.clone(),
+            whiteouts: BTreeSet::new(),
+            origins: BTreeMap::new(),
+            activities: Vec::new(),
+            durable,
+        }
+    }
+
+    fn new_overlay(
+        info: AgentFsVolumeInfo,
+        base: &SnapshotState,
+        allocator_block_size: u64,
+    ) -> Self {
+        let root = base
+            .inodes
+            .get(&ROOT_INODE_ID)
+            .cloned()
+            .unwrap_or_else(|| InodeRecord {
+                stats: inode_stats(
+                    ROOT_INODE_ID,
+                    FileKind::Directory,
+                    0o755,
+                    info.created_at,
+                    0,
+                ),
+                data: InodeData::Directory,
+            });
+        let mut paths = BTreeMap::new();
+        paths.insert("/".to_string(), ROOT_INODE_ID);
+        let mut inodes = BTreeMap::new();
+        inodes.insert(ROOT_INODE_ID, root);
+        let durable = DurableViewState {
+            sequence: SequenceNumber::new(0),
+            paths: paths.clone(),
+            inodes: inodes.clone(),
+            kv: base.kv.clone(),
+            tool_runs: base.tool_runs.clone(),
+            whiteouts: BTreeSet::new(),
+            origins: BTreeMap::new(),
+            activity_len: 0,
+        };
+
+        let next_inode = base
+            .inodes
+            .keys()
+            .map(|inode| inode.get())
+            .max()
+            .unwrap_or(ROOT_INODE_ID.get())
+            + 1;
+        let next_tool_run_id = base
+            .tool_runs
+            .keys()
+            .map(|tool_run_id| tool_run_id.get())
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        Self {
+            info,
+            sequence: SequenceNumber::new(0),
+            allocators: allocator_map(next_inode, 1, next_tool_run_id, allocator_block_size),
+            paths,
+            inodes,
+            kv: base.kv.clone(),
+            tool_runs: base.tool_runs.clone(),
+            whiteouts: BTreeSet::new(),
+            origins: BTreeMap::new(),
             activities: Vec::new(),
             durable,
         }
@@ -1605,6 +2081,8 @@ impl VolumeState {
             inodes: self.inodes.clone(),
             kv: self.kv.clone(),
             tool_runs: self.tool_runs.clone(),
+            whiteouts: self.whiteouts.clone(),
+            origins: self.origins.clone(),
         }
     }
 
@@ -1614,6 +2092,8 @@ impl VolumeState {
         self.durable.inodes = self.inodes.clone();
         self.durable.kv = self.kv.clone();
         self.durable.tool_runs = self.tool_runs.clone();
+        self.durable.whiteouts = self.whiteouts.clone();
+        self.durable.origins = self.origins.clone();
         self.durable.activity_len = self.activities.len();
     }
 
@@ -1778,6 +2258,797 @@ fn configured_chunk_size(chunk_size: Option<u32>) -> Result<u32, AgentFsError> {
         return Err(AgentFsError::InvalidChunkSize);
     }
     Ok(chunk_size)
+}
+
+fn clone_inodes_for_chunk_size(
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    source_chunk_size: u32,
+    target_chunk_size: u32,
+) -> BTreeMap<InodeId, InodeRecord> {
+    inodes
+        .iter()
+        .map(|(inode_id, record)| {
+            (
+                *inode_id,
+                clone_inode_for_chunk_size(record, source_chunk_size, target_chunk_size, *inode_id),
+            )
+        })
+        .collect()
+}
+
+fn clone_inode_for_chunk_size(
+    record: &InodeRecord,
+    source_chunk_size: u32,
+    target_chunk_size: u32,
+    inode_id: InodeId,
+) -> InodeRecord {
+    let mut cloned = record.clone();
+    cloned.stats.inode = inode_id;
+    if let InodeData::File(content) = &record.data {
+        let bytes = file_content_to_bytes(content, record.stats.size, source_chunk_size);
+        cloned.data = InodeData::File(file_content_from_bytes(&bytes, target_chunk_size));
+    }
+    cloned
+}
+
+fn mutate_write_file_state(
+    state: &mut VolumeState,
+    path: &str,
+    data: &[u8],
+    opts: &CreateOptions,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    if path == "/" {
+        return Err(AgentFsError::RootInvariant);
+    }
+    ensure_parent_directory(state, path, opts.create_parents, now)?;
+    let exact_exists = state.paths.contains_key(path);
+    match resolve_existing_path(state, path, true)? {
+        Some((resolved_path, inode_id)) => {
+            let inode = state
+                .inodes
+                .get_mut(&inode_id)
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_path.clone(),
+                })?;
+            let InodeData::File(content) = &mut inode.data else {
+                return match inode.stats.kind {
+                    FileKind::Directory => Err(AgentFsError::IsDirectory {
+                        path: resolved_path,
+                    }),
+                    _ => Err(AgentFsError::NotFile {
+                        path: resolved_path,
+                    }),
+                };
+            };
+            if !opts.overwrite {
+                return Err(AgentFsError::AlreadyExists {
+                    path: resolved_path,
+                });
+            }
+            *content = file_content_from_bytes(data, state.info.chunk_size);
+            inode.stats.size = data.len() as u64;
+            inode.stats.modified_at = now;
+            inode.stats.changed_at = now;
+            inode.stats.accessed_at = now;
+        }
+        None if exact_exists => {
+            return Err(AgentFsError::NotFound {
+                path: path.to_string(),
+            });
+        }
+        None => {
+            let resolved_path = resolve_target_path(state, path)?;
+            if state.paths.contains_key(&resolved_path) {
+                return Err(AgentFsError::AlreadyExists {
+                    path: resolved_path,
+                });
+            }
+
+            let inode_id = allocate_inode(state);
+            let stats = inode_stats(inode_id, FileKind::File, opts.mode, now, data.len() as u64);
+            state.paths.insert(resolved_path.clone(), inode_id);
+            state.inodes.insert(
+                inode_id,
+                InodeRecord {
+                    stats,
+                    data: InodeData::File(file_content_from_bytes(data, state.info.chunk_size)),
+                },
+            );
+            touch_parent_directory(state, &resolved_path, now)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn mutate_pwrite_state(
+    state: &mut VolumeState,
+    path: &str,
+    offset: u64,
+    data: &[u8],
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let (resolved_path, inode_id) =
+        resolve_existing_path(state, path, true)?.ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    let inode = state
+        .inodes
+        .get_mut(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_path.clone(),
+        })?;
+    let InodeData::File(content) = &mut inode.data else {
+        return match inode.stats.kind {
+            FileKind::Directory => Err(AgentFsError::IsDirectory {
+                path: resolved_path.clone(),
+            }),
+            _ => Err(AgentFsError::NotFile {
+                path: resolved_path.clone(),
+            }),
+        };
+    };
+
+    let new_size = write_file_content_at(
+        content,
+        inode.stats.size,
+        state.info.chunk_size,
+        offset,
+        data,
+    );
+    inode.stats.size = new_size;
+    inode.stats.modified_at = now;
+    inode.stats.changed_at = now;
+    inode.stats.accessed_at = now;
+    Ok(())
+}
+
+fn mutate_truncate_state(
+    state: &mut VolumeState,
+    path: &str,
+    size: u64,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let (resolved_path, inode_id) =
+        resolve_existing_path(state, path, true)?.ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    let inode = state
+        .inodes
+        .get_mut(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_path.clone(),
+        })?;
+    let InodeData::File(content) = &mut inode.data else {
+        return match inode.stats.kind {
+            FileKind::Directory => Err(AgentFsError::IsDirectory {
+                path: resolved_path.clone(),
+            }),
+            _ => Err(AgentFsError::NotFile {
+                path: resolved_path.clone(),
+            }),
+        };
+    };
+
+    truncate_file_content(content, state.info.chunk_size, size);
+    inode.stats.size = size;
+    inode.stats.modified_at = now;
+    inode.stats.changed_at = now;
+    inode.stats.accessed_at = now;
+    Ok(())
+}
+
+fn mutate_mkdir_state(
+    state: &mut VolumeState,
+    path: &str,
+    opts: &MkdirOptions,
+    now: Timestamp,
+) -> Result<bool, AgentFsError> {
+    if let Some((resolved_path, inode_id)) = resolve_existing_path(state, path, false)? {
+        let inode = state
+            .inodes
+            .get(&inode_id)
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: resolved_path.clone(),
+            })?;
+        if inode.stats.kind == FileKind::Directory && opts.recursive {
+            return Ok(false);
+        }
+        return Err(AgentFsError::AlreadyExists {
+            path: resolved_path,
+        });
+    }
+
+    ensure_parent_directory(state, path, opts.recursive, now)?;
+    let resolved_path = resolve_target_path(state, path)?;
+    let inode_id = allocate_inode(state);
+    let stats = inode_stats(inode_id, FileKind::Directory, opts.mode, now, 0);
+    state.paths.insert(resolved_path.clone(), inode_id);
+    state.inodes.insert(
+        inode_id,
+        InodeRecord {
+            stats,
+            data: InodeData::Directory,
+        },
+    );
+    increment_directory_nlink(state, &resolved_path, now)?;
+    Ok(true)
+}
+
+fn mutate_rename_state(
+    state: &mut VolumeState,
+    from: &str,
+    to: &str,
+    now: Timestamp,
+) -> Result<bool, AgentFsError> {
+    if from == "/" || to == "/" {
+        return Err(AgentFsError::RootInvariant);
+    }
+    if from == to {
+        return Ok(false);
+    }
+    let (resolved_from, from_inode_id) =
+        resolve_existing_path(state, from, false)?.ok_or_else(|| AgentFsError::NotFound {
+            path: from.to_string(),
+        })?;
+    let resolved_to = resolve_target_path(state, to)?;
+    if resolved_from == resolved_to {
+        return Ok(false);
+    }
+    if is_descendant_path(&resolved_from, &resolved_to) {
+        return Err(AgentFsError::InvalidPath {
+            path: resolved_to.clone(),
+        });
+    }
+
+    let from_kind = state
+        .inodes
+        .get(&from_inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_from.clone(),
+        })?
+        .stats
+        .kind;
+    let from_parent = parent_path(&resolved_from).ok_or(AgentFsError::RootInvariant)?;
+    let to_parent = parent_path(&resolved_to).ok_or(AgentFsError::RootInvariant)?;
+
+    if let Some(target_inode_id) = state.paths.get(&resolved_to).copied() {
+        let target_kind = state
+            .inodes
+            .get(&target_inode_id)
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: resolved_to.clone(),
+            })?
+            .stats
+            .kind;
+        match (from_kind, target_kind) {
+            (FileKind::Directory, FileKind::Directory) => {
+                if state.paths.keys().any(|candidate| {
+                    candidate != &resolved_to && is_descendant_path(&resolved_to, candidate)
+                }) {
+                    return Err(AgentFsError::DirectoryNotEmpty {
+                        path: resolved_to.clone(),
+                    });
+                }
+                state.paths.remove(&resolved_to);
+                state.inodes.remove(&target_inode_id);
+                decrement_directory_nlink(state, &resolved_to, now)?;
+            }
+            (FileKind::Directory, _) => {
+                return Err(AgentFsError::NotDirectory {
+                    path: resolved_to.clone(),
+                });
+            }
+            (_, FileKind::Directory) => {
+                return Err(AgentFsError::IsDirectory {
+                    path: resolved_to.clone(),
+                });
+            }
+            (_, _) => {
+                remove_non_directory_path(state, &resolved_to, now)?;
+            }
+        }
+    }
+
+    let renames = state
+        .paths
+        .iter()
+        .filter_map(|(path, inode)| {
+            rebase_path(path, &resolved_from, &resolved_to)
+                .map(|new_path| (path.clone(), new_path, *inode))
+        })
+        .collect::<Vec<_>>();
+
+    for (old_path, _, _) in &renames {
+        state.paths.remove(old_path);
+    }
+    for (_, new_path, inode) in renames {
+        state.paths.insert(new_path, inode);
+    }
+    touch_directory_path_at(state, &from_parent, now)?;
+    touch_directory_path_at(state, &to_parent, now)?;
+    if from_kind == FileKind::Directory && from_parent != to_parent {
+        adjust_directory_parent_links(state, &from_parent, &to_parent)?;
+    }
+    if let Some(inode) = state.inodes.get_mut(&from_inode_id) {
+        inode.stats.changed_at = now;
+    }
+    Ok(true)
+}
+
+fn mutate_link_state(
+    state: &mut VolumeState,
+    from: &str,
+    to: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    if to == "/" {
+        return Err(AgentFsError::RootInvariant);
+    }
+    let (resolved_from, inode_id) =
+        resolve_existing_path(state, from, false)?.ok_or_else(|| AgentFsError::NotFound {
+            path: from.to_string(),
+        })?;
+    let resolved_to = resolve_target_path(state, to)?;
+    if state.paths.contains_key(&resolved_to) {
+        return Err(AgentFsError::AlreadyExists { path: resolved_to });
+    }
+    let kind = state
+        .inodes
+        .get(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_from.clone(),
+        })?
+        .stats
+        .kind;
+    if kind == FileKind::Directory {
+        return Err(AgentFsError::UnsupportedOperation {
+            operation: "hard-link directories",
+        });
+    }
+    let inode = state
+        .inodes
+        .get_mut(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_from.clone(),
+        })?;
+    inode.stats.nlink = inode.stats.nlink.saturating_add(1);
+    inode.stats.changed_at = now;
+    state.paths.insert(resolved_to.clone(), inode_id);
+    touch_parent_directory(state, &resolved_to, now)?;
+    Ok(())
+}
+
+fn mutate_symlink_state(
+    state: &mut VolumeState,
+    target: &str,
+    linkpath: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    if linkpath == "/" {
+        return Err(AgentFsError::RootInvariant);
+    }
+    let resolved_linkpath = resolve_target_path(state, linkpath)?;
+    if state.paths.contains_key(&resolved_linkpath) {
+        return Err(AgentFsError::AlreadyExists {
+            path: resolved_linkpath,
+        });
+    }
+    let inode_id = allocate_inode(state);
+    let stats = inode_stats(inode_id, FileKind::Symlink, 0o777, now, target.len() as u64);
+    state.paths.insert(resolved_linkpath.clone(), inode_id);
+    state.inodes.insert(
+        inode_id,
+        InodeRecord {
+            stats,
+            data: InodeData::Symlink(target.to_string()),
+        },
+    );
+    touch_parent_directory(state, &resolved_linkpath, now)?;
+    Ok(())
+}
+
+fn mutate_unlink_state(
+    state: &mut VolumeState,
+    path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    if path == "/" {
+        return Err(AgentFsError::RootInvariant);
+    }
+    let (resolved_path, _) =
+        resolve_existing_path(state, path, false)?.ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    remove_non_directory_path(state, &resolved_path, now)?;
+    touch_parent_directory(state, &resolved_path, now)?;
+    Ok(())
+}
+
+fn mutate_rmdir_state(
+    state: &mut VolumeState,
+    path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    if path == "/" {
+        return Err(AgentFsError::RootInvariant);
+    }
+    let (resolved_path, inode_id) =
+        resolve_existing_path(state, path, false)?.ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    let inode = state
+        .inodes
+        .get(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_path.clone(),
+        })?;
+    if inode.stats.kind != FileKind::Directory {
+        return Err(AgentFsError::NotDirectory {
+            path: resolved_path.clone(),
+        });
+    }
+    if state.paths.keys().any(|candidate| {
+        candidate != &resolved_path && is_descendant_path(&resolved_path, candidate)
+    }) {
+        return Err(AgentFsError::DirectoryNotEmpty {
+            path: resolved_path.clone(),
+        });
+    }
+    state.paths.remove(&resolved_path);
+    state.inodes.remove(&inode_id);
+    decrement_directory_nlink(state, &resolved_path, now)?;
+    touch_parent_directory(state, &resolved_path, now)?;
+    Ok(())
+}
+
+fn build_overlay_snapshot(delta: &SnapshotState, base: &SnapshotState) -> SnapshotState {
+    let mut paths = BTreeMap::new();
+    let mut inodes = BTreeMap::new();
+
+    for (path, inode_id) in &base.paths {
+        if delta.paths.contains_key(path) || overlay_path_whiteouted(&delta.whiteouts, path) {
+            continue;
+        }
+        paths.insert(path.clone(), *inode_id);
+        if let Some(inode) = base.inodes.get(inode_id) {
+            inodes.insert(*inode_id, inode.clone());
+        }
+    }
+
+    for (path, inode_id) in &delta.paths {
+        paths.insert(path.clone(), *inode_id);
+    }
+    inodes.extend(delta.inodes.clone());
+
+    SnapshotState {
+        info: delta.info.clone(),
+        sequence: delta.sequence,
+        durable: delta.durable,
+        paths,
+        inodes,
+        kv: delta.kv.clone(),
+        tool_runs: delta.tool_runs.clone(),
+        whiteouts: delta.whiteouts.clone(),
+        origins: delta.origins.clone(),
+    }
+}
+
+fn overlay_visible_snapshot(state: &VolumeState, base: &SnapshotState) -> SnapshotState {
+    build_overlay_snapshot(&state.visible_snapshot(), base)
+}
+
+fn overlay_path_whiteouted(whiteouts: &BTreeSet<String>, path: &str) -> bool {
+    whiteouts
+        .iter()
+        .any(|whiteout| path == whiteout || is_descendant_path(whiteout, path))
+}
+
+fn overlay_origin_record(state: &VolumeState, base_inode: InodeId) -> Option<OriginRecord> {
+    state.info.overlay_base.as_ref().map(|base| OriginRecord {
+        base_volume_id: base.volume_id,
+        base_sequence: base.sequence,
+        base_durable: base.durable,
+        base_inode,
+    })
+}
+
+fn visible_directory_nlink(merged: &SnapshotState, path: &str) -> Result<u32, AgentFsError> {
+    let mut nlink = 2_u32;
+    for entry in read_snapshot_dir_entries(merged, path)? {
+        if entry.kind == FileKind::Directory {
+            nlink = nlink.saturating_add(1);
+        }
+    }
+    Ok(nlink)
+}
+
+fn count_inode_paths(paths: &BTreeMap<String, InodeId>, inode_id: InodeId) -> u32 {
+    paths
+        .values()
+        .filter(|candidate| **candidate == inode_id)
+        .count() as u32
+}
+
+fn materialize_overlay_parent_chain(
+    state: &mut VolumeState,
+    base: &SnapshotState,
+    merged: &SnapshotState,
+    path: &str,
+    create_missing: bool,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let Some(parent) = parent_path(path) else {
+        return Err(AgentFsError::RootInvariant);
+    };
+    if parent == "/" {
+        return Ok(());
+    }
+
+    let mut current = String::new();
+    for segment in parent.trim_start_matches('/').split('/') {
+        current.push('/');
+        current.push_str(segment);
+        if let Some(inode_id) = state.paths.get(&current).copied() {
+            let inode = state
+                .inodes
+                .get(&inode_id)
+                .ok_or_else(|| AgentFsError::NotDirectory {
+                    path: current.clone(),
+                })?;
+            if inode.stats.kind != FileKind::Directory {
+                return Err(AgentFsError::NotDirectory {
+                    path: current.clone(),
+                });
+            }
+            continue;
+        }
+
+        if let Some((resolved_path, inode_id)) =
+            resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &current, true)?
+        {
+            let inode = merged
+                .inodes
+                .get(&inode_id)
+                .ok_or_else(|| AgentFsError::NotDirectory {
+                    path: resolved_path.clone(),
+                })?;
+            if inode.stats.kind != FileKind::Directory {
+                return Err(AgentFsError::NotDirectory {
+                    path: resolved_path,
+                });
+            }
+            copy_up_overlay_directory_exact(state, base, merged, &resolved_path, now)?;
+            continue;
+        }
+
+        if !create_missing {
+            return Err(AgentFsError::NotFound { path: current });
+        }
+
+        let inode_id = allocate_inode(state);
+        let stats = inode_stats(inode_id, FileKind::Directory, 0o755, now, 0);
+        state.paths.insert(current.clone(), inode_id);
+        state.inodes.insert(
+            inode_id,
+            InodeRecord {
+                stats,
+                data: InodeData::Directory,
+            },
+        );
+        increment_directory_nlink(state, &current, now)?;
+    }
+
+    Ok(())
+}
+
+fn copy_up_overlay_directory_exact(
+    state: &mut VolumeState,
+    base: &SnapshotState,
+    merged: &SnapshotState,
+    path: &str,
+    _now: Timestamp,
+) -> Result<InodeId, AgentFsError> {
+    if let Some(inode_id) = state.paths.get(path).copied() {
+        return Ok(inode_id);
+    }
+
+    let (resolved_path, base_inode_id) =
+        resolve_existing_in_maps_with_mode(&base.paths, &base.inodes, path, false)?.ok_or_else(
+            || AgentFsError::NotFound {
+                path: path.to_string(),
+            },
+        )?;
+    let base_record =
+        base.inodes
+            .get(&base_inode_id)
+            .ok_or_else(|| AgentFsError::NotDirectory {
+                path: resolved_path.clone(),
+            })?;
+    if base_record.stats.kind != FileKind::Directory {
+        return Err(AgentFsError::NotDirectory {
+            path: resolved_path,
+        });
+    }
+
+    let inode_id = if path == "/" {
+        ROOT_INODE_ID
+    } else {
+        allocate_inode(state)
+    };
+    let mut record = clone_inode_for_chunk_size(
+        base_record,
+        base.info.chunk_size,
+        state.info.chunk_size,
+        inode_id,
+    );
+    record.stats.nlink = visible_directory_nlink(merged, path)?;
+    state.paths.insert(path.to_string(), inode_id);
+    state.inodes.insert(inode_id, record);
+    if inode_id != ROOT_INODE_ID {
+        if let Some(origin) = overlay_origin_record(state, base_inode_id) {
+            state.origins.insert(inode_id, origin);
+        }
+    }
+    Ok(inode_id)
+}
+
+fn copy_up_overlay_inode_aliases(
+    state: &mut VolumeState,
+    base: &SnapshotState,
+    merged: &SnapshotState,
+    path: &str,
+    now: Timestamp,
+) -> Result<InodeId, AgentFsError> {
+    let (resolved_path, base_inode_id) =
+        resolve_existing_in_maps_with_mode(&base.paths, &base.inodes, path, false)?.ok_or_else(
+            || AgentFsError::NotFound {
+                path: path.to_string(),
+            },
+        )?;
+    let base_record = base
+        .inodes
+        .get(&base_inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_path.clone(),
+        })?;
+    if base_record.stats.kind == FileKind::Directory {
+        return Err(AgentFsError::UnsupportedOperation {
+            operation: "copy-up directory aliases",
+        });
+    }
+
+    let existing_delta_inode = state.origins.iter().find_map(|(delta_inode, origin)| {
+        (origin.base_volume_id == base.info.volume_id
+            && origin.base_sequence == base.sequence
+            && origin.base_durable == base.durable
+            && origin.base_inode == base_inode_id)
+            .then_some(*delta_inode)
+    });
+
+    let delta_inode = if let Some(delta_inode) = existing_delta_inode {
+        delta_inode
+    } else {
+        let delta_inode = allocate_inode(state);
+        let record = clone_inode_for_chunk_size(
+            base_record,
+            base.info.chunk_size,
+            state.info.chunk_size,
+            delta_inode,
+        );
+        state.inodes.insert(delta_inode, record);
+        if let Some(origin) = overlay_origin_record(state, base_inode_id) {
+            state.origins.insert(delta_inode, origin);
+        }
+        delta_inode
+    };
+
+    let aliases = merged
+        .paths
+        .iter()
+        .filter_map(|(alias_path, inode_id)| {
+            (*inode_id == base_inode_id && !state.paths.contains_key(alias_path))
+                .then_some(alias_path.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for alias in aliases {
+        materialize_overlay_parent_chain(state, base, merged, &alias, false, now)?;
+        state.paths.insert(alias, delta_inode);
+    }
+
+    if let Some(inode) = state.inodes.get_mut(&delta_inode) {
+        inode.stats.nlink = count_inode_paths(&state.paths, delta_inode).max(1);
+    }
+    Ok(delta_inode)
+}
+
+fn copy_up_overlay_directory_subtree(
+    state: &mut VolumeState,
+    base: &SnapshotState,
+    merged: &SnapshotState,
+    path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let mut paths = merged
+        .paths
+        .keys()
+        .filter(|candidate| **candidate == path || is_descendant_path(path, candidate))
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|candidate| (path_segments(candidate).len(), candidate.clone()));
+
+    for candidate in paths {
+        if state.paths.contains_key(&candidate) {
+            continue;
+        }
+        let inode_id =
+            merged
+                .paths
+                .get(&candidate)
+                .copied()
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: candidate.clone(),
+                })?;
+        let inode = merged
+            .inodes
+            .get(&inode_id)
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: candidate.clone(),
+            })?;
+        match inode.stats.kind {
+            FileKind::Directory => {
+                materialize_overlay_parent_chain(state, base, merged, &candidate, false, now)?;
+                copy_up_overlay_directory_exact(state, base, merged, &candidate, now)?;
+            }
+            _ => {
+                copy_up_overlay_inode_aliases(state, base, merged, &candidate, now)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_overlay_existing_path(
+    state: &mut VolumeState,
+    base: &SnapshotState,
+    merged: &SnapshotState,
+    path: &str,
+    recursive_dir: bool,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    if state.paths.contains_key(path) {
+        return Ok(());
+    }
+    let inode_id = merged
+        .paths
+        .get(path)
+        .copied()
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    let inode = merged
+        .inodes
+        .get(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    match inode.stats.kind {
+        FileKind::Directory => {
+            materialize_overlay_parent_chain(state, base, merged, path, false, now)?;
+            if recursive_dir {
+                copy_up_overlay_directory_subtree(state, base, merged, path, now)?;
+            } else {
+                copy_up_overlay_directory_exact(state, base, merged, path, now)?;
+            }
+        }
+        _ => {
+            copy_up_overlay_inode_aliases(state, base, merged, path, now)?;
+        }
+    }
+    Ok(())
 }
 
 fn inode_stats(inode: InodeId, kind: FileKind, mode: u32, now: Timestamp, size: u64) -> Stats {
@@ -1949,17 +3220,26 @@ fn create_missing_directories(
 }
 
 fn resolve_target_path(state: &VolumeState, path: &str) -> Result<String, AgentFsError> {
+    resolve_target_path_in_maps(&state.paths, &state.inodes, path)
+}
+
+fn resolve_target_path_in_maps(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    path: &str,
+) -> Result<String, AgentFsError> {
     let path = normalize_path(path)?;
     let Some(parent) = parent_path(&path) else {
         return Err(AgentFsError::RootInvariant);
     };
     let name = basename(&path).ok_or(AgentFsError::RootInvariant)?;
     let (resolved_parent, parent_inode) =
-        resolve_existing_path(state, &parent, true)?.ok_or_else(|| AgentFsError::NotFound {
-            path: parent.clone(),
+        resolve_existing_in_maps_with_mode(paths, inodes, &parent, true)?.ok_or_else(|| {
+            AgentFsError::NotFound {
+                path: parent.clone(),
+            }
         })?;
-    let inode = state
-        .inodes
+    let inode = inodes
         .get(&parent_inode)
         .ok_or_else(|| AgentFsError::NotDirectory {
             path: resolved_parent.clone(),
