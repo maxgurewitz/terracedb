@@ -6,7 +6,7 @@ An embedded database library (not a server) built on LSM tree fundamentals. The 
 
 All I/O, time, and randomness are abstracted behind traits, enabling deterministic simulation testing in the style of FoundationDB. The engine is verified via large-scale randomized scenario generation with fault injection and invariant checking, reproducible from a seed.
 
-Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, and embedded virtual filesystems — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), and an embedded virtual filesystem library (Part 5).
+Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, embedded virtual filesystems, and out-of-line blob storage — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), embedded virtual filesystem library (Part 5), and the `terracedb-bricks` blob/large-object library (Part 6).
 
 ### Load-Bearing Decisions
 
@@ -20,6 +20,7 @@ These are the architectural choices that most constrain the rest of the design:
 - **Projections are deterministic state updaters with read access.** They declare output writes; they do not cause side effects or commit their own batches.
 - **Workflows are stateful orchestrators with side effects.** They use the outbox pattern for at-least-once external delivery and durable timers for scheduling.
 - **Embedded virtual filesystems are libraries, not engine modes.** Their current-state filesystem/KV/tool rows live in ordinary tables; timelines and watchers are layered on top of append-only activity rows and change capture.
+- **Blob and large-object storage are libraries, not engine value variants.** Large bytes live out-of-line in a blob store; Terracedb stores metadata, references, and derived indexes.
 - **Virtual filesystem compatibility is semantic, not SQLite-format compatibility.** The goal is to provide an in-process virtual filesystem/KV/tool model on Terracedb, not SQL, a single-file transport format, or SQLite WAL behavior.
 - **Event sourcing is recommended** for data that drives history-dependent projections. Mutable-record projections cannot be safely recomputed from SSTables after `SnapshotTooOld`.
 - **Tokio is the sole runtime.** io_uring is an optional backend optimization behind the `FileSystem` trait, not a semantic requirement.
@@ -1880,7 +1881,7 @@ Building blocks used by the projection library, the workflow library, the embedd
 
 These patterns fall into two categories based on data locality: **colocated** patterns update source and derived data in the same `WriteBatch` (fast, immediate consistency), while **cross-entity** patterns propagate changes asynchronously via `subscribe` + `scanSince` (flexible, eventually consistent with notification-driven read-after-write). Where relevant, each pattern notes which category it falls into.
 
-**Note on pseudocode:** examples in Parts 2–5 use `await` on DB operations to reflect the async API, but omit `Result` unwrapping for brevity. All engine operations return `Promise<Result<...>>` types; the `Result` unwrapping is implicit. Sequence numbers used as watermarks are **visibility** markers unless the library explicitly consumes the durable stream (`scanDurableSince` / `subscribeDurable`). Authoritative consumers in Parts 3, 4, and the durable surfaces described in Part 5 use the durable stream; best-effort maintenance may use the visible stream.
+**Note on pseudocode:** examples in Parts 2–6 use `await` on DB operations to reflect the async API, but omit `Result` unwrapping for brevity. All engine operations return `Promise<Result<...>>` types; the `Result` unwrapping is implicit. Sequence numbers used as watermarks are **visibility** markers unless the library explicitly consumes the durable stream (`scanDurableSince` / `subscribeDurable`). Authoritative consumers in Parts 3, 4, and the durable surfaces described in Parts 5 and 6 use the durable stream; best-effort maintenance may use the visible stream.
 
 ---
 
@@ -3615,3 +3616,177 @@ The embedded virtual filesystem layer does not need its own replication or sync 
 - in s3-primary or deferred-durability configurations, visible state may lead durable state until flush boundaries.
 
 This library should inherit the same deterministic testing bar as the rest of the stack. The simulation target is the real filesystem/KV/tool/overlay code. The shadow model needs to cover directories, inode link counts, file bytes, whiteouts, origin mappings, KV state, tool-run lifecycle state, and activity-prefix correctness across crash and restart.
+
+---
+
+# Part 6: Bricks Library
+
+This part describes a separate library, tentatively `terracedb-bricks`, that stores large binary objects out-of-line in an application-provided blob store while keeping only metadata, references, and derived search indexes inside Terracedb. The intended use is to make large files queryable and composable without turning them into engine-level inline values or forcing every large write through the commit log, memtable, and SSTable paths.
+
+## Goals and Non-Goals
+
+`terracedb-bricks` should preserve the following externally visible properties:
+
+- direct-to-blob-store ingestion with no required local-disk spill and no requirement that the DB inline the full object bytes,
+- Terracedb-resident metadata rows for queryability: object IDs, digests, byte length, content type, tags, timestamps, and application metadata,
+- range reads and whole-object reads from the backing blob store,
+- durable activity rows and durable indexing hooks so metadata search and downstream workflows can tail blob lifecycle events,
+- optional derived text/chunk/index tables for search, preview, and enrichment, and
+- deterministic testing of publish, delete, indexing, and garbage-collection behavior through injected DB and blob-store traits.
+
+Version 1 is intentionally narrower than the full space of content-addressable stores and search systems:
+
+- no engine-level `Value::Blob` or special blob-aware MVCC type,
+- no promise that arbitrary application rows and external blob bytes are one physical atomic unit; correctness comes from explicit publish ordering,
+- no requirement that the DB's own tiered-storage, backup, or cold-storage manifests double as the blob catalog,
+- no core full-text or vector-search engine; search is metadata plus library-managed derived indexes, and
+- no hidden dependence on one specific object-store SDK or one provider's multipart protocol.
+
+## Load-Bearing Decisions
+
+These decisions most constrain the design:
+
+- **Blob bytes are always out-of-line.** Terracedb stores metadata, references, and search indexes, not the primary blob payload.
+- **Publish order is upload first, metadata second.** If the process crashes after upload but before metadata publish, the result is an orphan object that GC may later reclaim. The reverse ordering is not allowed because it would expose unreadable blobs.
+- **Search is derived-data-first.** Queryability comes from ordinary Terracedb tables containing metadata, extracted text, previews, embeddings, or application-defined indexes rather than from scanning opaque object bytes during reads.
+- **The blob store is a library boundary.** The preferred backend supports streaming upload and range reads. A compatibility adapter may wrap the engine's current whole-buffer `ObjectStore` trait for tests or small objects, but the library contract itself should not force whole-object buffering.
+- **Blob GC is separate from engine remote-storage GC.** The library may reuse the same physical bucket/account as Terracedb's backup or cold-storage paths, but only with a disjoint prefix and an independent reachability/retention policy.
+
+## Public Surface
+
+The library exposes an embedded API surface oriented around metadata, object I/O, and indexing hooks:
+
+```typescript
+interface BlobLibraryConfig {
+  namespace: string
+  createIfMissing?: boolean
+}
+
+interface BlobStore {
+  put(key: string, data: AsyncByteStream, opts?: BlobPutOptions): Promise<BlobObjectInfo>
+  get(key: string, opts?: { range?: ByteRange }): Promise<AsyncByteStream>
+  stat(key: string): Promise<BlobObjectInfo | null>
+  delete(key: string): Promise<void>
+}
+
+interface BlobCollection {
+  put(input: BlobWrite): Promise<BlobHandle>
+  stat(id: BlobId): Promise<BlobMetadata | null>
+  get(id: BlobId, opts?: { range?: ByteRange }): Promise<BlobReadResult>
+  delete(id: BlobId): Promise<void>
+  search(query: BlobQuery): Promise<AsyncIterator<BlobSearchRow>>
+  activitySince(cursor: LogCursor, opts?: { durable?: boolean }): Promise<AsyncIterator<BlobActivity>>
+  subscribeActivity(opts?: { durable?: boolean }): Receiver<SequenceNumber>
+}
+
+interface BlobWrite {
+  alias?: string
+  data: AsyncByteStream | bytes
+  contentType?: string
+  tags?: Record<string, string>
+  metadata?: Record<string, Json>
+}
+
+interface BlobHandle {
+  id: BlobId
+  objectKey: string
+  digest: string
+  sizeBytes: u64
+}
+```
+
+`BlobStore` is intentionally a separate library-edge abstraction rather than a hidden alias for the engine's object-store trait. The important difference is that blob ingestion should be able to stream large inputs directly to the backing store. A small-object/test adapter can still be built on top of the engine's injected `ObjectStore`, but the architecture should not hard-code whole-buffer semantics into the blob library itself.
+
+## Reserved Tables and Object Layout
+
+Version 1 should keep object bytes out of Terracedb tables entirely. Terracedb rows hold only current metadata, aliases, lifecycle events, and derived indexes.
+
+### Current-State Tables
+
+| Table | Key shape | Purpose |
+|---|---|---|
+| `blob_catalog` | `(namespace, blob_id)` | Current metadata row: `object_key`, digest, byte length, content type, tags, application metadata, timestamps, optional indexing status |
+| `blob_alias` | `(namespace, alias)` | Optional stable lookup/upsert alias that resolves to the current `blob_id` |
+| `blob_object_gc` | `(namespace, object_key)` | Optional GC helper row containing first-seen time, digest, size, and other reachability/cleanup metadata if the implementation wants DB-assisted GC bookkeeping |
+
+### Append-Only and Derived Tables
+
+| Table | Key shape | Purpose |
+|---|---|---|
+| `blob_activity` | `(namespace, activity_id)` | Append-only semantic audit stream for `blob_published`, `blob_deleted`, alias updates, and indexing milestones |
+| `blob_text_chunk` | projection-owned | Optional extracted-text or preview chunks keyed for snippet retrieval and rebuild |
+| `blob_term_index` | projection-owned | Optional normalized term/tag/prefix index for metadata or extracted-text search |
+| `blob_embedding_index` | application-owned | Optional vector/semantic index metadata if the application wants semantic retrieval layered on top |
+
+Object keys should live under a blob-library-owned prefix such as `blobs/<namespace>/...`, not under Terracedb's `backup/` or `cold/` prefixes. Content-addressed naming is recommended because it simplifies deduplication and orphan cleanup, but random IDs are still a valid implementation if deduplication is deferred.
+
+## Ingestion, Publish, and Read Semantics
+
+Blob publish is a two-system protocol: the object store receives bytes, and Terracedb receives metadata. Because those two systems cannot be made one physical commit without turning the engine into a blob transport, the library must define explicit ordering.
+
+The publish path is:
+
+1. stream the bytes to the blob store while computing digest and byte length,
+2. once upload succeeds, commit `blob_catalog`, `blob_alias`, and `blob_activity` rows in one Terracedb batch,
+3. let durable indexers react to `blob_activity` or `blob_catalog` changes to build search tables.
+
+This ordering gives the right failure mode:
+
+- if upload succeeds but metadata publish fails or the process crashes, the object is merely orphaned and can be reclaimed later,
+- if metadata publish succeeds, the referenced object is already present,
+- the library never makes a blob visible before the object exists.
+
+Reads are metadata-first:
+
+1. resolve `blob_id` or alias through Terracedb,
+2. capture the referenced `object_key` and metadata at a snapshot-consistent cut,
+3. fetch the bytes or requested range from the blob store.
+
+The library should fail closed if the metadata row exists but the object is missing or corrupt. That is a library/storage inconsistency, not a case for silently returning empty content.
+
+## Search and Indexing
+
+The reason to use a blob library on top of Terracedb is not just to store large bytes elsewhere; it is to make those objects queryable without forcing the DB to inline them.
+
+Search therefore operates on ordinary Terracedb rows:
+
+- metadata search over content type, tags, aliases, digest, size, timestamps, and application-defined fields,
+- extracted-text search over `blob_text_chunk` and `blob_term_index`,
+- preview/search-result rendering from derived snippet rows, and
+- optional semantic retrieval from application-managed embedding metadata.
+
+The blob library should not claim that arbitrary raw-byte search is a core read-path feature. Instead, the indexing story should reuse the projection/workflow machinery from earlier parts:
+
+- authoritative indexers consume the **durable** blob activity stream,
+- index output and cursor advancement commit atomically using the projection runtime,
+- rebuild after `SnapshotTooOld` or extractor changes comes from the current catalog plus blob-store reads, not from treating old SSTables as the blob payload store.
+
+This means large-file search is mostly an indexing problem, not a database-value-type problem.
+
+## Delete, Retention, and Garbage Collection
+
+Delete is also two-phase:
+
+1. remove or supersede the visible metadata/alias rows in Terracedb and append a delete activity row,
+2. reclaim the external object later, once it is safe.
+
+Immediate object deletion is unsafe for two reasons:
+
+- another live metadata row may still reference the same object, especially if deduplication or alias replacement is enabled,
+- retained MVCC history or long-lived snapshot cuts may still be able to observe an older metadata version that references the object until the normal history horizon moves past it.
+
+Blob GC should therefore respect both **current reachability** and **history retention**. An implementation may use `blob_object_gc`, object-store prefix scans, or provider-side metadata to assist the sweep, but the rule is the same: do not remove an object until no visible metadata row, retained historical metadata version, or documented grace window can still legally reference it.
+
+As with backup/offload GC, stale object-store listings and successful uploads with lost responses must be treated as normal failure modes. The design should prefer harmless orphan objects over premature deletion.
+
+## Storage Modes and Deterministic Testing
+
+The enclosing DB's storage mode still matters, but only for metadata and derived indexes:
+
+- in tiered mode, blob metadata tables behave like ordinary Terracedb tables and may themselves move through hot/cold storage over time,
+- in deferred-durability or s3-primary mode, metadata visibility may lead metadata durability until flush boundaries,
+- authoritative indexers and workflows above blob events should therefore use the durable stream.
+
+Blob bytes themselves inherit the durability semantics of the chosen `BlobStore`, not of Terracedb's commit log. That separation is intentional.
+
+This library should inherit the same deterministic testing bar as the rest of the stack. The simulation target is the real publish/read/delete/index/GC code. The shadow model needs to cover current metadata rows, alias resolution, object bytes, durable activity order, derived index state, orphan-object harmlessness, and safe cleanup across crash and restart.

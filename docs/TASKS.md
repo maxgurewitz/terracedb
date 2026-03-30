@@ -23,6 +23,7 @@ Included in this plan:
 - composition primitives built on top of the engine,
 - projection and workflow libraries,
 - an embedded virtual filesystem library, and
+- a `terracedb-bricks` blob / large-object library for out-of-line bytes plus metadata search, and
 - deterministic simulation coverage for the full stack.
 
 Explicitly excluded from the main execution plan:
@@ -55,6 +56,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 6** builds composition helpers, projections, workflows, and application-facing simulation harnesses.
 - **Phase 7** expands deterministic simulation to the full stack.
 - **Phase 8** adds an embedded virtual filesystem library on top of Terracedb.
+- **Phase 9** adds the `terracedb-bricks` blob / large-object library on top of Terracedb.
 
 ## Parallel tracks
 
@@ -68,6 +70,7 @@ Once Phase 0 is complete, the work naturally splits into eight mostly independen
 - **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T31 depends on T30, T32 depends on T18/T19/T28/T29, and T32a depends on T03a/T31/T32
 - **Track G — full-stack hardening:** T33 after T32a
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
+- **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
 
 ---
 
@@ -1594,6 +1597,159 @@ Bring the virtual filesystem crate up to the same correctness bar as the rest of
 
 ---
 
+## Phase 9 — `terracedb-bricks` blob and large-object library
+
+**Parallelization:** T41 first. After that, T42 and T43 can begin in parallel against the frozen crate boundary from T41. T44 depends on T43, T30, and T31. T45 depends on T42 and T43. T46 depends on T33, T44, and T45.
+
+### T41. Freeze the `terracedb-bricks` crate boundary, publish semantics, and reserved tables
+
+**Depends on:** T01
+
+**Description**
+
+Define the `terracedb-bricks` public surface and the storage/indexing contracts before implementation work branches. This task freezes the semantic target: large bytes stay out-of-line in a blob store, while Terracedb stores metadata, references, lifecycle activity, and derived search indexes. The point is to keep blob support a library concern rather than turning it into an engine-level `Value::Blob` feature.
+
+**Implementation steps**
+
+1. Define the Rust equivalents of the architecture's blob-library contracts: `BlobCollection`, `BlobId`, `BlobWrite`, `BlobHandle`, `BlobMetadata`, query/search types, and activity types.
+2. Freeze the reserved table/key contracts for current metadata, aliases, lifecycle activity, and projection-owned derived index tables.
+3. Define the blob-store abstraction as a separate library-edge trait with streaming upload and range-read support, plus a compatibility adapter path for the engine's smaller whole-buffer object-store implementations.
+4. Define the upload-before-publish, delete-before-GC, durable-indexing, and fail-closed missing-object semantics explicitly.
+5. Add stub/fake implementations so downstream tasks can compile against the crate boundary before the real blob logic exists.
+
+**Verification**
+
+- Compile-only API tests that instantiate configs, fake blob stores, and the public blob-library surface.
+- Unit tests that round-trip blob IDs, aliases, and table-key encodings.
+- Contract tests proving the frozen object-prefix and reserved-table names are stable and disjoint from Terracedb's backup/cold-storage prefixes.
+
+---
+
+### T42. Implement blob-store trait, adapters, and out-of-line I/O substrate
+
+**Depends on:** T22, T23, T41
+
+**Description**
+
+Implement the library edge for large-object bytes themselves: the `BlobStore` trait, test fakes, compatibility adapters over existing object-store implementations, and the low-level upload/read/delete helpers that the higher-level catalog task will call. This task should own the byte-transport side of `terracedb-bricks` so the metadata/catalog task can proceed in parallel against the frozen trait boundary.
+
+**Implementation steps**
+
+1. Create the blob-store crate/module surface and implement the production `BlobStore` trait, test fakes, and compatibility adapters over the engine's existing object-store implementations where reasonable.
+2. Implement low-level streaming upload helpers, range-read helpers, stat/delete helpers, and typed error mapping for object-store failures.
+3. Implement upload-time digest and size accounting, plus stable object-key policies such as content-addressed naming or another frozen naming scheme.
+4. Ensure `terracedb-bricks` object prefixes and failure semantics stay separate from the engine's own tiered/backup/offload object layout even when they reuse the same physical backend.
+5. Add cut points and retry/recovery hooks for stale list results, upload success with lost response, timeout/partition failures, and interrupted reads.
+
+**Verification**
+
+- Trait contract tests for fake and real adapters covering put/get/stat/delete and range-read behavior.
+- Tests proving large objects can be fetched incrementally without forcing the DB to inline them.
+- Fault-injection tests for timeout, lost-response, and interrupted-read behavior at the blob-store edge.
+- Prefix/layout tests proving bricks objects never collide with the engine's backup/cold-storage namespaces.
+
+---
+
+### T43. Implement metadata catalog, publication, aliases, reads, deletes, and lifecycle activity
+
+**Depends on:** T41
+
+**Description**
+
+Implement the Terracedb-resident current-state side of `terracedb-bricks`: metadata rows, alias/upsert semantics, durable lifecycle activity, publish ordering, and metadata-first reads/deletes. This task should proceed against the frozen `BlobStore` trait plus test fakes from T41 rather than waiting for the production adapters in T42.
+
+**Implementation steps**
+
+1. Create the reserved tables and key encodings for `blob_catalog`, `blob_alias`, `blob_activity`, and any current-state GC helper rows.
+2. Implement the metadata side of `put`, `stat`, `get`, `delete`, and alias-resolution helpers on top of ordinary Terracedb tables and the frozen `BlobStore` trait.
+3. Implement upload-before-publish ordering so current metadata and lifecycle activity become visible only after the backing object exists.
+4. Implement metadata-first reads and fail-closed behavior for missing or corrupt referenced objects.
+5. Ensure delete and alias-replacement flows update current metadata and append lifecycle activity in one Terracedb batch, while deferring physical object reclamation to the GC task.
+
+**Verification**
+
+- Read/write/delete tests for both ID-based and alias-based access using fake blob-store implementations.
+- Tests showing current metadata rows and corresponding activity rows never become visible independently.
+- Crash tests at “upload complete but metadata not yet published”, “metadata published but client not yet acknowledged”, and “delete metadata visible before object GC”.
+- Restart tests proving bricks metadata reopens cleanly and orphan uploads remain harmless.
+
+---
+
+### T44. Implement durable indexing, extraction, and search helpers for bricks
+
+**Depends on:** T30, T31, T43
+
+**Description**
+
+Build the queryability story above the bricks catalog. Search should come from metadata rows and derived index tables maintained with the projection runtime, not from pretending raw object bytes are a first-class scan surface inside the engine.
+
+**Implementation steps**
+
+1. Implement durable metadata indexes for at least alias/name, content type, tags, size ranges, and timestamps using ordinary Terracedb tables.
+2. Implement an optional extraction pipeline that can fetch blob bytes or ranges and write derived rows such as text chunks, previews/snippets, normalized term indexes, or other application-facing searchable summaries.
+3. Expose query helpers for metadata search and opt-in extracted-text search, keeping all index state in ordinary Terracedb tables rather than in a special engine subsystem.
+4. Use the durable projection machinery so index output and cursor advancement remain atomic, and rebuild indexes from the current catalog plus blob-store reads after `SnapshotTooOld`, extractor changes, or catalog replay.
+5. Make unsupported extractor/search cases fail closed or remain explicitly opt-in rather than silently returning partial results.
+
+**Verification**
+
+- Metadata-search tests proving filters and ordering behave deterministically across restart and replay.
+- Cursor/output atomicity tests for blob indexers using the projection runtime.
+- Rebuild tests showing the same blob catalog plus blob-store contents produce the same derived index state.
+- Crash tests during extraction/index writes, including replay after partial indexing progress.
+
+---
+
+### T45. Implement object GC and retention safety for bricks
+
+**Depends on:** T42, T43
+
+**Description**
+
+Implement safe external-object cleanup for `terracedb-bricks`. This task owns the exact semantics for orphan uploads, alias replacement, dedup/shared-object cases, and retained-history safety, but it should remain independent of the richer indexing/search task so GC work can proceed in parallel with indexing.
+
+**Implementation steps**
+
+1. Implement garbage collection that determines object reachability from blob metadata plus retained-history rules and deletes only objects that are provably unreferenced and past the grace horizon.
+2. Handle alias replacement, delete/recreate flows, and optional deduplicated/shared-object cases without deleting still-referenced objects.
+3. Implement orphan-object handling and sweep logic for uploads that completed before metadata publication.
+4. Add fault handling for stale LIST results, upload success with lost response, interrupted GC, and delete retries.
+5. Ensure GC bookkeeping stays consistent with the frozen reserved-table contracts and object-key prefixes from earlier tasks.
+
+**Verification**
+
+- Tests proving orphan uploaded objects are harmless before metadata publication and are eventually reclaimed safely.
+- Retention tests proving GC does not delete objects that may still be referenced by live metadata or retained historical versions.
+- Alias-replacement and dedup/shared-object tests proving still-live objects are never deleted prematurely.
+- Fault-injection tests for stale LIST, lost-response, and interrupted-sweep behavior.
+
+---
+
+### T46. Build deterministic crash, fault, and randomized suites for `terracedb-bricks`
+
+**Depends on:** T33, T44, T45
+
+**Description**
+
+Bring the bricks library up to the same correctness bar as the rest of Terracedb by extending the deterministic simulation framework to the real publish/read/delete/index/GC implementation.
+
+**Implementation steps**
+
+1. Extend the deterministic simulation/shadow-model machinery to cover blob metadata rows, alias resolution, object bytes, derived index state, and safe cleanup behavior.
+2. Add crash cut points around upload-before-publish, metadata publication, delete-before-GC, extraction/index writes, and object reclamation.
+3. Add randomized workloads covering publishes, alias replacements, range reads, metadata searches, extraction/index runs, deletes, orphan cleanup, and GC.
+4. Add randomized fault schedules covering object-store timeouts/partitions, stale LIST behavior, successful uploads with lost responses, interrupted reads, and interrupted GC.
+5. Ensure every failing seed captures the workload, object-store fault schedule, trace, and enough blob metadata to replay the failure exactly.
+
+**Verification**
+
+- Same-seed replay tests proving blob publish/index/GC traces and outcomes are reproducible.
+- Large-seed simulation campaigns where metadata state, object state, and derived search state are checked after each step or recovery point.
+- Recovered-state prefix tests proving visible/durable metadata rules remain intact across crash and restart.
+- End-to-end tests where publish, search, delete, and GC continue to behave correctly across crash/restart and object-store faults.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
@@ -1666,6 +1822,16 @@ At this point the system should additionally support:
 - KV state and tool-run audit history,
 - durable clone/export flows instead of SQLite-file copies, and
 - deterministic simulation coverage for the virtual filesystem crate itself.
+
+### Milestone H — `terracedb-bricks` blob and large-object library
+Complete: T41–T46
+
+At this point the system should additionally support:
+- an out-of-line `terracedb-bricks` blob / large-object library on top of Terracedb,
+- current-state metadata and lifecycle activity rows for large objects,
+- durable metadata and extracted-text search indexes maintained with projections,
+- safe orphan-object handling and external-object GC, and
+- deterministic simulation coverage for blob publish/read/delete/index/GC behavior.
 
 ---
 
