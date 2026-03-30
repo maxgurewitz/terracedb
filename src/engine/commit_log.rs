@@ -315,6 +315,7 @@ pub(crate) struct LocalSegmentScanPlan {
     pub fs: Arc<dyn FileSystem>,
     pub segment_id: SegmentId,
     pub path: String,
+    pub read_len: Option<u64>,
     pub min_sequence: Option<SequenceNumber>,
     pub max_sequence: Option<SequenceNumber>,
 }
@@ -691,12 +692,14 @@ impl SegmentManager {
     pub async fn prune_sealed_before(
         &mut self,
         sequence_exclusive: SequenceNumber,
+        protected_segments: &BTreeSet<SegmentId>,
     ) -> Result<Vec<SegmentFooter>, StorageError> {
         let deleted = self
             .catalog
             .footers()
             .iter()
             .filter(|footer| footer.max_sequence < sequence_exclusive)
+            .filter(|footer| !protected_segments.contains(&footer.segment_id))
             .cloned()
             .collect::<Vec<_>>();
         if deleted.is_empty() {
@@ -864,6 +867,7 @@ impl SegmentManager {
                 } else {
                     self.active.path.clone()
                 },
+                read_len: (!descriptor.sealed).then_some(self.active.len),
                 min_sequence: descriptor.min_sequence,
                 max_sequence: descriptor.max_sequence,
             })
