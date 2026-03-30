@@ -6,80 +6,22 @@ use std::{
 
 use async_trait::async_trait;
 use terracedb::{
-    Db, DbConfig, DbDependencies, LogCursor, OutboxEntry, S3Location, SsdConfig, StorageConfig,
-    StubClock, StubFileSystem, StubObjectStore, TieredDurabilityMode, TieredStorageConfig, Value,
-    test_support::{row_table_config, test_dependencies_with_clock},
+    Clock, LogCursor, OutboxEntry, Table, TieredDurabilityMode, Value,
+    test_support::{row_table_config, tiered_test_config_with_durability},
+};
+use terracedb_simulation::{
+    CutPoint, SeededSimulationRunner, SimulationStackBuilder, TerracedbSimulationHarness,
 };
 use terracedb_workflows::{
-    DEFAULT_TIMER_POLL_INTERVAL, WorkflowContext, WorkflowDefinition, WorkflowHandler,
-    WorkflowHandlerError, WorkflowOutput, WorkflowRuntime, WorkflowStateMutation,
-    WorkflowTimerCommand,
+    DEFAULT_TIMER_POLL_INTERVAL, WorkflowContext, WorkflowDefinition, WorkflowError,
+    WorkflowHandle, WorkflowHandler, WorkflowHandlerError, WorkflowOutput, WorkflowRuntime,
+    WorkflowStateMutation, WorkflowTimerCommand,
 };
 
-fn tiered_config(path: &str, durability: TieredDurabilityMode) -> DbConfig {
-    DbConfig {
-        storage: StorageConfig::Tiered(TieredStorageConfig {
-            ssd: SsdConfig {
-                path: path.to_string(),
-            },
-            s3: S3Location {
-                bucket: "terracedb-test".to_string(),
-                prefix: "workflows".to_string(),
-            },
-            max_local_bytes: 1024 * 1024,
-            durability,
-        }),
-        scheduler: None,
-    }
-}
-
-#[derive(Clone)]
-struct TestEnv {
-    config: DbConfig,
-    dependencies: DbDependencies,
-    file_system: Arc<StubFileSystem>,
-    clock: Arc<StubClock>,
-}
-
-impl TestEnv {
-    fn new(path: &str, durability: TieredDurabilityMode) -> Self {
-        let file_system = Arc::new(StubFileSystem::default());
-        let object_store = Arc::new(StubObjectStore::default());
-        let clock = Arc::new(StubClock::default());
-        let dependencies =
-            test_dependencies_with_clock(file_system.clone(), object_store, clock.clone());
-
-        Self {
-            config: tiered_config(path, durability),
-            dependencies,
-            file_system,
-            clock,
-        }
-    }
-
-    async fn open(&self) -> Db {
-        Db::open(self.config.clone(), self.dependencies.clone())
-            .await
-            .expect("open db")
-    }
-}
-
-async fn wait_until<F, Fut>(mut predicate: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    tokio::time::timeout(Duration::from_secs(1), async move {
-        loop {
-            if predicate().await {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("condition should become true");
-}
+const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(300);
+const WORKFLOW_TIMER_SIMULATION_DURATION: Duration = Duration::from_millis(600);
+const SIMULATION_MIN_MESSAGE_LATENCY: Duration = Duration::from_millis(1);
+const SIMULATION_MAX_MESSAGE_LATENCY: Duration = Duration::from_millis(1);
 
 fn decode_count(value: Option<Value>) -> usize {
     match value {
@@ -258,243 +200,432 @@ impl WorkflowHandler for TimerHandler {
     }
 }
 
-#[tokio::test]
-async fn workflow_replays_startup_backlog_round_robin_and_outbox_order() {
-    let env = TestEnv::new(
-        "/workflow-backlog-round-robin",
-        TieredDurabilityMode::GroupCommit,
-    );
-    let db = env.open().await;
-    let source = db
-        .create_table(row_table_config("workflow_source"))
-        .await
-        .expect("create source table");
+struct WorkflowStack<H> {
+    runtime: WorkflowRuntime<H>,
+    handle: Option<WorkflowHandle>,
+    source: Option<Table>,
+}
 
-    let mut batch = db.write_batch();
-    batch.put(&source, b"alpha:1".to_vec(), Value::bytes("a1"));
-    batch.put(&source, b"alpha:2".to_vec(), Value::bytes("a2"));
-    batch.put(&source, b"beta:1".to_vec(), Value::bytes("b1"));
-    let sequence = db
-        .commit(batch, Default::default())
-        .await
-        .expect("commit backlog");
+impl<H> WorkflowStack<H>
+where
+    H: WorkflowHandler + 'static,
+{
+    async fn start(&mut self) -> Result<(), WorkflowError> {
+        if self.handle.is_none() {
+            self.handle = Some(self.runtime.start().await?);
+        }
+        Ok(())
+    }
 
-    let stats = ExecutionStats::default();
-    let runtime = WorkflowRuntime::open(
-        db.clone(),
-        env.clock.clone(),
-        WorkflowDefinition::new(
-            "orders",
-            [source.clone()],
-            RecordingHandler {
-                stats: stats.clone(),
+    async fn shutdown(self) -> Result<(), WorkflowError> {
+        if let Some(handle) = self.handle {
+            handle.abort().await?;
+        }
+        Ok(())
+    }
+}
+
+fn backlog_stack_builder(
+    stats: ExecutionStats,
+) -> SimulationStackBuilder<WorkflowStack<RecordingHandler>> {
+    SimulationStackBuilder::new(
+        move |context, db| {
+            let stats = stats.clone();
+            async move {
+                let source = db.create_table(row_table_config("workflow_source")).await?;
+                let runtime = WorkflowRuntime::open(
+                    db.clone(),
+                    context.clock(),
+                    WorkflowDefinition::new("orders", [source.clone()], RecordingHandler { stats }),
+                )
+                .await?;
+
+                Ok(WorkflowStack {
+                    runtime,
+                    handle: None,
+                    source: Some(source),
+                })
+            }
+        },
+        |stack| async move {
+            stack.shutdown().await?;
+            Ok(())
+        },
+    )
+}
+
+fn callback_stack_builder() -> SimulationStackBuilder<WorkflowStack<CallbackReplayHandler>> {
+    SimulationStackBuilder::new(
+        |context, db| async move {
+            let runtime = WorkflowRuntime::open(
+                db,
+                context.clock(),
+                WorkflowDefinition::new(
+                    "callbacks",
+                    std::iter::empty::<Table>(),
+                    CallbackReplayHandler,
+                )
+                .with_timer_poll_interval(DEFAULT_TIMER_POLL_INTERVAL),
+            )
+            .await?;
+
+            Ok(WorkflowStack {
+                runtime,
+                handle: None,
+                source: None,
+            })
+        },
+        |stack| async move {
+            stack.shutdown().await?;
+            Ok(())
+        },
+    )
+}
+
+fn timer_stack_builder() -> SimulationStackBuilder<WorkflowStack<TimerHandler>> {
+    SimulationStackBuilder::new(
+        |context, db| async move {
+            let runtime = WorkflowRuntime::open(
+                db,
+                context.clock(),
+                WorkflowDefinition::new("timers", std::iter::empty::<Table>(), TimerHandler)
+                    .with_timer_poll_interval(Duration::from_millis(1)),
+            )
+            .await?;
+
+            Ok(WorkflowStack {
+                runtime,
+                handle: None,
+                source: None,
+            })
+        },
+        |stack| async move {
+            stack.shutdown().await?;
+            Ok(())
+        },
+    )
+}
+
+async fn checkpoint_workflow<H>(
+    harness: &mut TerracedbSimulationHarness<WorkflowStack<H>>,
+    label: impl Into<String>,
+    instance_ids: Vec<&str>,
+) -> Result<(), terracedb_simulation::SimulationHarnessError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let instance_ids = instance_ids
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    harness
+        .checkpoint_with(label, move |_db, stack| {
+            Box::pin(async move {
+                let mut metadata = BTreeMap::from([
+                    (
+                        "workflow.name".to_string(),
+                        stack.runtime.name().to_string(),
+                    ),
+                    (
+                        "workflow.running".to_string(),
+                        stack.handle.is_some().to_string(),
+                    ),
+                ]);
+                if let Some(source) = &stack.source {
+                    metadata.insert(
+                        "workflow.source_cursor".to_string(),
+                        format!("{:?}", stack.runtime.load_source_cursor(source).await?),
+                    );
+                }
+                for instance_id in &instance_ids {
+                    metadata.insert(
+                        format!("workflow.state.{instance_id}"),
+                        format!("{:?}", stack.runtime.load_state(instance_id).await?),
+                    );
+                }
+                Ok(metadata)
+            })
+        })
+        .await
+}
+
+async fn wait_for_workflow_state<H>(
+    harness: &TerracedbSimulationHarness<WorkflowStack<H>>,
+    instance_id: &str,
+    expected: &str,
+) -> Result<(), terracedb_simulation::SimulationHarnessError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let state_table = harness.stack().runtime.tables().state_table().clone();
+    let inbox_table = harness.stack().runtime.tables().inbox_table().clone();
+    let instance_id = instance_id.to_string();
+    let expected = Value::bytes(expected);
+    harness
+        .wait_for_change(
+            format!("workflow state {instance_id} -> {:?}", expected),
+            [&state_table],
+            [&inbox_table],
+            move |_db, stack| {
+                let instance_id = instance_id.clone();
+                let expected = expected.clone();
+                Box::pin(async move {
+                    Ok(stack.runtime.load_state(&instance_id).await? == Some(expected))
+                })
             },
-        ),
-    )
-    .await
-    .expect("open workflow runtime");
-    let handle = runtime.start().await.expect("start workflow runtime");
-
-    wait_until(|| {
-        let order = stats.order.clone();
-        async move { order.lock().expect("order lock poisoned").len() == 3 }
-    })
-    .await;
-    wait_until(|| {
-        let runtime = &runtime;
-        async move {
-            runtime.load_state("alpha").await.expect("load alpha state") == Some(Value::bytes("2"))
-                && runtime.load_state("beta").await.expect("load beta state")
-                    == Some(Value::bytes("1"))
-        }
-    })
-    .await;
-
-    assert_eq!(
-        stats.order.lock().expect("order lock poisoned").as_slice(),
-        &["alpha".to_string(), "beta".to_string(), "alpha".to_string()]
-    );
-    assert_eq!(
-        runtime.load_state("alpha").await.expect("load alpha state"),
-        Some(Value::bytes("2"))
-    );
-    assert_eq!(
-        runtime.load_state("beta").await.expect("load beta state"),
-        Some(Value::bytes("1"))
-    );
-    assert_eq!(
-        runtime
-            .load_source_cursor(&source)
-            .await
-            .expect("load source cursor"),
-        LogCursor::new(sequence, 2)
-    );
-
-    let max_active = stats.max_active.lock().expect("max-active lock poisoned");
-    assert_eq!(max_active.get("alpha"), Some(&1));
-    assert_eq!(max_active.get("beta"), Some(&1));
-
-    assert!(
-        runtime
-            .tables()
-            .outbox_table()
-            .read(b"alpha:1".to_vec())
-            .await
-            .expect("read alpha outbox 1")
-            .is_some()
-    );
-    assert!(
-        runtime
-            .tables()
-            .outbox_table()
-            .read(b"alpha:2".to_vec())
-            .await
-            .expect("read alpha outbox 2")
-            .is_some()
-    );
-    assert!(
-        runtime
-            .tables()
-            .outbox_table()
-            .read(b"beta:1".to_vec())
-            .await
-            .expect("read beta outbox")
-            .is_some()
-    );
-
-    handle.shutdown().await.expect("stop workflow runtime");
+        )
+        .await
 }
 
-#[tokio::test]
-async fn callback_admission_is_durable_before_return_and_replays_after_restart() {
-    let env = TestEnv::new("/workflow-callback-replay", TieredDurabilityMode::Deferred);
-    let db = env.open().await;
-
-    let runtime = WorkflowRuntime::open(
-        db.clone(),
-        env.clock.clone(),
-        WorkflowDefinition::new("callbacks", std::iter::empty(), CallbackReplayHandler)
-            .with_timer_poll_interval(DEFAULT_TIMER_POLL_INTERVAL),
-    )
-    .await
-    .expect("open workflow runtime");
-
-    let durable_sequence = runtime
-        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+async fn wait_for_visible_inbox_row<H>(
+    harness: &TerracedbSimulationHarness<WorkflowStack<H>>,
+    inbox_key: Vec<u8>,
+) -> Result<(), terracedb_simulation::SimulationHarnessError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let inbox_table = harness.stack().runtime.tables().inbox_table().clone();
+    harness
+        .wait_for_visible(
+            "workflow visible inbox row",
+            [&inbox_table],
+            move |_db, stack| {
+                let inbox_key = inbox_key.clone();
+                Box::pin(async move {
+                    Ok(stack
+                        .runtime
+                        .tables()
+                        .inbox_table()
+                        .read(inbox_key)
+                        .await?
+                        .is_some())
+                })
+            },
+        )
         .await
-        .expect("admit callback");
-    assert_eq!(db.current_durable_sequence(), durable_sequence);
-
-    env.file_system.crash();
-
-    let reopened = env.open().await;
-    let reopened_runtime = WorkflowRuntime::open(
-        reopened.clone(),
-        env.clock.clone(),
-        WorkflowDefinition::new("callbacks", std::iter::empty(), CallbackReplayHandler),
-    )
-    .await
-    .expect("reopen workflow runtime");
-    let handle = reopened_runtime
-        .start()
-        .await
-        .expect("start replay runtime");
-
-    wait_until(|| {
-        let reopened_runtime = &reopened_runtime;
-        async move {
-            reopened_runtime
-                .load_state("order-1")
-                .await
-                .expect("load replayed state")
-                == Some(Value::bytes("processed:cb-1"))
-        }
-    })
-    .await;
-
-    reopened.flush().await.expect("flush replayed outbox");
-    assert!(
-        reopened_runtime
-            .tables()
-            .outbox_table()
-            .read(b"order-1:cb-1".to_vec())
-            .await
-            .expect("read replayed outbox")
-            .is_some()
-    );
-
-    handle.shutdown().await.expect("stop replay runtime");
 }
 
-#[tokio::test]
-async fn timer_loop_waits_for_durable_timer_rows_before_firing() {
-    let env = TestEnv::new("/workflow-timer-fence", TieredDurabilityMode::Deferred);
-    let db = env.open().await;
-    let runtime = WorkflowRuntime::open(
-        db.clone(),
-        env.clock.clone(),
-        WorkflowDefinition::new("timers", std::iter::empty(), TimerHandler)
-            .with_timer_poll_interval(Duration::from_millis(1)),
-    )
-    .await
-    .expect("open timer runtime");
-    let handle = runtime.start().await.expect("start timer runtime");
+#[test]
+fn workflow_replays_startup_backlog_round_robin_and_outbox_order() -> turmoil::Result {
+    SeededSimulationRunner::new(0x4101)
+        .with_simulation_duration(WORKFLOW_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let stats = ExecutionStats::default();
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/workflow-backlog-round-robin",
+                    TieredDurabilityMode::GroupCommit,
+                ),
+                backlog_stack_builder(stats.clone()),
+            )
+            .await?;
+            let source = harness
+                .stack()
+                .source
+                .clone()
+                .expect("backlog workflow source should exist");
 
-    runtime
-        .admit_callback("order-7", "start", b"begin".to_vec())
-        .await
-        .expect("admit scheduling callback");
+            let mut batch = harness.db().write_batch();
+            batch.put(&source, b"alpha:1".to_vec(), Value::bytes("a1"));
+            batch.put(&source, b"alpha:2".to_vec(), Value::bytes("a2"));
+            batch.put(&source, b"beta:1".to_vec(), Value::bytes("b1"));
+            let sequence = harness.db().commit(batch, Default::default()).await?;
 
-    wait_until(|| {
-        let runtime = &runtime;
-        async move {
-            runtime
-                .load_state("order-7")
-                .await
-                .expect("load scheduled state")
-                == Some(Value::bytes("scheduled"))
-        }
-    })
-    .await;
+            harness.stack_mut().start().await?;
+            checkpoint_workflow(&mut harness, "workflow-started", vec!["alpha", "beta"]).await?;
+            wait_for_workflow_state(&harness, "alpha", "2").await?;
+            wait_for_workflow_state(&harness, "beta", "1").await?;
 
-    env.clock.advance(Duration::from_millis(10));
-    tokio::task::yield_now().await;
-    assert_eq!(
-        runtime
-            .load_state("order-7")
-            .await
-            .expect("load state before durable timer flush"),
-        Some(Value::bytes("scheduled"))
-    );
+            checkpoint_workflow(
+                &mut harness,
+                "workflow-backlog-drained",
+                vec!["alpha", "beta"],
+            )
+            .await?;
 
-    db.flush().await.expect("flush scheduled timer");
-    env.clock.advance(Duration::from_millis(1));
-    wait_until(|| {
-        let runtime = &runtime;
-        async move {
-            runtime
-                .tables()
-                .inbox_table()
-                .read(b"order-7\0\0\0\0\0\0\0\0\x02".to_vec())
-                .await
-                .expect("read admitted timer inbox row")
-                .is_some()
-        }
-    })
-    .await;
+            let order = stats.order.lock().expect("order lock poisoned").clone();
+            harness.require_eq(
+                "workflow execution order",
+                &order,
+                &vec!["alpha".to_string(), "beta".to_string(), "alpha".to_string()],
+            )?;
+            let runtime = &harness.stack().runtime;
+            harness.require_eq(
+                "alpha workflow state",
+                &runtime.load_state("alpha").await?,
+                &Some(Value::bytes("2")),
+            )?;
+            harness.require_eq(
+                "beta workflow state",
+                &runtime.load_state("beta").await?,
+                &Some(Value::bytes("1")),
+            )?;
+            harness.require_eq(
+                "workflow source cursor",
+                &runtime.load_source_cursor(&source).await?,
+                &LogCursor::new(sequence, 2),
+            )?;
 
-    db.flush().await.expect("flush admitted timer trigger");
-    wait_until(|| {
-        let runtime = &runtime;
-        async move {
-            runtime
-                .load_state("order-7")
-                .await
-                .expect("load fired state")
-                == Some(Value::bytes("fired"))
-        }
-    })
-    .await;
+            let max_active = stats.max_active.lock().expect("max-active lock poisoned");
+            harness.require_eq(
+                "alpha max concurrency",
+                &max_active.get("alpha").copied(),
+                &Some(1),
+            )?;
+            harness.require_eq(
+                "beta max concurrency",
+                &max_active.get("beta").copied(),
+                &Some(1),
+            )?;
 
-    handle.shutdown().await.expect("stop timer runtime");
+            harness.require(
+                runtime
+                    .tables()
+                    .outbox_table()
+                    .read(b"alpha:1".to_vec())
+                    .await?
+                    .is_some(),
+                "alpha first outbox entry should be present",
+            )?;
+            harness.require(
+                runtime
+                    .tables()
+                    .outbox_table()
+                    .read(b"alpha:2".to_vec())
+                    .await?
+                    .is_some(),
+                "alpha second outbox entry should be present",
+            )?;
+            harness.require(
+                runtime
+                    .tables()
+                    .outbox_table()
+                    .read(b"beta:1".to_vec())
+                    .await?
+                    .is_some(),
+                "beta outbox entry should be present",
+            )?;
+
+            harness.shutdown().await?;
+            Ok(())
+        })
+}
+
+#[test]
+fn callback_admission_is_durable_before_return_and_replays_after_restart() -> turmoil::Result {
+    SeededSimulationRunner::new(0x4102)
+        .with_simulation_duration(WORKFLOW_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/workflow-callback-replay",
+                    TieredDurabilityMode::Deferred,
+                ),
+                callback_stack_builder(),
+            )
+            .await?;
+
+            let durable_sequence = harness
+                .stack()
+                .runtime
+                .admit_callback("order-1", "cb-1", b"approved".to_vec())
+                .await?;
+            checkpoint_workflow(&mut harness, "callback-admitted", vec!["order-1"]).await?;
+            harness.require_eq(
+                "durable callback admission sequence",
+                &harness.db().current_durable_sequence(),
+                &durable_sequence,
+            )?;
+
+            harness.restart(CutPoint::AfterStep).await?;
+            harness.stack_mut().start().await?;
+            wait_for_workflow_state(&harness, "order-1", "processed:cb-1").await?;
+
+            checkpoint_workflow(&mut harness, "callback-replayed", vec!["order-1"]).await?;
+            harness.db().flush().await?;
+            let runtime = &harness.stack().runtime;
+            harness.require(
+                runtime
+                    .tables()
+                    .outbox_table()
+                    .read(b"order-1:cb-1".to_vec())
+                    .await?
+                    .is_some(),
+                "replayed outbox entry should be present after restart",
+            )?;
+
+            harness.shutdown().await?;
+            Ok(())
+        })
+}
+
+#[test]
+fn timer_loop_waits_for_durable_timer_rows_before_firing() -> turmoil::Result {
+    SeededSimulationRunner::new(0x4103)
+        .with_simulation_duration(WORKFLOW_TIMER_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/workflow-timer-fence",
+                    TieredDurabilityMode::Deferred,
+                ),
+                timer_stack_builder(),
+            )
+            .await?;
+            harness.stack_mut().start().await?;
+
+            harness
+                .stack()
+                .runtime
+                .admit_callback("order-7", "start", b"begin".to_vec())
+                .await?;
+            checkpoint_workflow(&mut harness, "timer-scheduled", vec!["order-7"]).await?;
+            wait_for_workflow_state(&harness, "order-7", "scheduled").await?;
+
+            harness
+                .context()
+                .clock()
+                .sleep(Duration::from_millis(10))
+                .await;
+            harness.require_eq(
+                "timer state before durable flush",
+                &harness.stack().runtime.load_state("order-7").await?,
+                &Some(Value::bytes("scheduled")),
+            )?;
+
+            harness.db().flush().await?;
+            harness
+                .context()
+                .clock()
+                .sleep(Duration::from_millis(1))
+                .await;
+            wait_for_visible_inbox_row(&harness, b"order-7\0\0\0\0\0\0\0\0\x02".to_vec()).await?;
+
+            harness.db().flush().await?;
+            wait_for_workflow_state(&harness, "order-7", "fired").await?;
+            checkpoint_workflow(&mut harness, "timer-fired", vec!["order-7"]).await?;
+            harness.require_eq(
+                "timer final state",
+                &harness.stack().runtime.load_state("order-7").await?,
+                &Some(Value::bytes("fired")),
+            )?;
+
+            harness.shutdown().await?;
+            Ok(())
+        })
 }

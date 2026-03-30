@@ -7,18 +7,21 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, CutPoint, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
-    DbConfig, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
-    DbSimulationScenarioConfig, DbWorkloadOperation, FieldDefinition, FieldId, FieldType,
-    FieldValue, FileSystem, FileSystemFailure, FileSystemOperation, LogCursor, ManifestId,
-    ObjectKeyLayout, ObjectStore, ObjectStoreFaultSpec, ObjectStoreOperation, OpenError,
-    OperationResult, PendingWork, PendingWorkType, PointMutation, RemoteCache, RemoteRecoveryHint,
-    S3Location, S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision,
-    ScheduledFault, ScheduledFaultKind, Scheduler, SchemaDefinition, SeededSimulationRunner,
-    SequenceNumber, ShadowOracle, SimulationMergeOperatorId, SimulationScenarioConfig,
-    SimulationTableSpec, SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubDbProcess,
+    Clock, CommitOptions, CompactionStrategy, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
+    FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
+    FileSystemOperation, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore, ObjectStoreOperation,
+    OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint, S3Location,
+    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+    SchemaDefinition, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind, StorageSource,
     TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, TraceEvent, Transaction, UnifiedStorage, Value,
+    TieredStorageConfig, Transaction, UnifiedStorage, Value,
+};
+use terracedb_simulation::{
+    CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
+    DbSimulationScenarioConfig, DbWorkloadOperation, ObjectStoreFaultSpec, OperationResult,
+    PointMutation, ScheduledFault, ScheduledFaultKind, SeededSimulationRunner, ShadowOracle,
+    SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec, StubDbProcess,
+    TraceEvent,
 };
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {

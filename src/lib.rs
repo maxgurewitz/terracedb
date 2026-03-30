@@ -1,3 +1,5 @@
+extern crate self as terracedb;
+
 pub mod adapters;
 pub mod api;
 pub mod composition;
@@ -8,7 +10,9 @@ pub mod ids;
 pub mod io;
 pub mod remote;
 pub mod scheduler;
-pub mod simulation;
+#[cfg(test)]
+#[allow(dead_code)]
+mod simulation;
 pub mod stubs;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -55,15 +59,6 @@ pub use scheduler::{
     DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, NoopScheduler,
     PendingWork, PendingWorkType, RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
     TableStats, ThrottleDecision,
-};
-pub use simulation::{
-    CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbOracleError, DbRecoveryMatch,
-    DbShadowOracle, DbSimulationOutcome, DbSimulationScenarioConfig, DbWorkloadOperation,
-    GeneratedScenario, NetworkObjectStore, ObjectStoreFaultSpec, OperationResult, OracleError,
-    PointMutation, RecoveryMatch, ScheduledFault, ScheduledFaultKind, SeededSimulationRunner,
-    ShadowOracle, SimulationCompactionFilterId, SimulationContext, SimulationMergeOperatorId,
-    SimulationOutcome, SimulationScenarioConfig, SimulationTableSpec, StubDbProcess, TraceEvent,
-    TurmoilClock,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 #[cfg(any(test, feature = "test-support"))]

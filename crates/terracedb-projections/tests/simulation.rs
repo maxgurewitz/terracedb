@@ -3,15 +3,22 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    CommitOptions, DeterministicRng, KvStream, Rng, ScanOptions, SeededSimulationRunner,
-    SequenceNumber, Table, Value,
+    CommitOptions, DeterministicRng, KvStream, Rng, ScanOptions, SequenceNumber, Table, Value,
     test_support::{row_table_config, tiered_test_config},
 };
 use terracedb_projections::{
     MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionHandler,
-    ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun, ProjectionTransaction,
-    SingleSourceProjection,
+    ProjectionHandle, ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun,
+    ProjectionTransaction, SingleSourceProjection,
 };
+use terracedb_simulation::{
+    SeededSimulationRunner, SimulationCheckpoint, SimulationStackBuilder,
+    TerracedbSimulationHarness, TraceEvent,
+};
+
+const PROJECTION_SIMULATION_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
+const SIMULATION_MIN_MESSAGE_LATENCY: std::time::Duration = std::time::Duration::from_millis(1);
+const SIMULATION_MAX_MESSAGE_LATENCY: std::time::Duration = std::time::Duration::from_millis(1);
 
 struct MirrorProjection {
     output: Table,
@@ -32,6 +39,13 @@ impl ProjectionHandler for MirrorProjection {
         }
         Ok(())
     }
+}
+
+struct ProjectionStack {
+    source: Table,
+    output: Table,
+    _runtime: ProjectionRuntime,
+    handle: ProjectionHandle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +116,13 @@ struct MultiSourceStep {
     right: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionSimulationCapture {
+    snapshots: Vec<ProjectionSnapshot>,
+    trace: Vec<TraceEvent>,
+    checkpoints: Vec<SimulationCheckpoint>,
+}
+
 async fn collect_rows(stream: KvStream) -> Vec<(Vec<u8>, Vec<u8>)> {
     stream
         .map(|(key, value)| match value {
@@ -156,67 +177,123 @@ fn planned_multi_source_batches(seed: u64) -> Vec<MultiSourceStep> {
     batches
 }
 
-fn run_projection_simulation(seed: u64) -> turmoil::Result<Vec<ProjectionSnapshot>> {
-    SeededSimulationRunner::new(seed).run_with(move |context| async move {
-        let db = context
-            .open_db(tiered_test_config(&format!("/projection-sim-{seed}")))
-            .await?;
-        let source = db
-            .create_table(row_table_config("source"))
-            .await
-            .expect("create source table");
-        let output = db
-            .create_table(row_table_config("output"))
-            .await
-            .expect("create output table");
-        let runtime = ProjectionRuntime::open(db.clone())
-            .await
-            .expect("open projection runtime");
-        let mut handle = runtime
-            .start_single_source(
-                SingleSourceProjection::new(
-                    "mirror",
-                    source.clone(),
-                    MirrorProjection {
-                        output: output.clone(),
-                    },
+fn projection_stack_builder() -> SimulationStackBuilder<ProjectionStack> {
+    SimulationStackBuilder::new(
+        |_context, db| async move {
+            let source = db.create_table(row_table_config("source")).await?;
+            let output = db.create_table(row_table_config("output")).await?;
+            let runtime = ProjectionRuntime::open(db.clone()).await?;
+            let handle = runtime
+                .start_single_source(
+                    SingleSourceProjection::new(
+                        "mirror",
+                        source.clone(),
+                        MirrorProjection {
+                            output: output.clone(),
+                        },
+                    )
+                    .with_outputs([output.clone()]),
                 )
-                .with_outputs([output.clone()]),
+                .await?;
+
+            Ok(ProjectionStack {
+                source,
+                output,
+                _runtime: runtime,
+                handle,
+            })
+        },
+        |stack| async move {
+            stack.handle.shutdown().await?;
+            Ok(())
+        },
+    )
+}
+
+fn run_projection_simulation(seed: u64) -> turmoil::Result<ProjectionSimulationCapture> {
+    SeededSimulationRunner::new(seed)
+        .with_simulation_duration(PROJECTION_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(move |context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config(&format!("/projection-sim-{seed}")),
+                projection_stack_builder(),
             )
-            .await
-            .expect("start projection");
+            .await?;
 
-        let mut snapshots = Vec::new();
-        for writes in planned_batches(seed) {
-            let mut batch = db.write_batch();
-            for (key, value) in writes {
-                batch.put(&source, key, Value::bytes(value));
-            }
+            harness
+                .checkpoint_with("projection-open", |_db, stack| {
+                    Box::pin(async move {
+                        Ok(BTreeMap::from([(
+                            "projection.watermark".to_string(),
+                            stack.handle.current_watermark().get().to_string(),
+                        )]))
+                    })
+                })
+                .await?;
 
-            let sequence = db
-                .commit(batch, CommitOptions::default())
-                .await
-                .expect("commit simulated source batch");
-            handle
-                .wait_for_watermark(sequence)
-                .await
-                .expect("projection should reach simulated watermark");
+            let mut snapshots = Vec::new();
+            for (step, writes) in planned_batches(seed).into_iter().enumerate() {
+                let source = harness.stack().source.clone();
+                let output = harness.stack().output.clone();
 
-            snapshots.push(ProjectionSnapshot {
-                watermark: handle.current_watermark(),
-                rows: collect_rows(
+                let mut batch = harness.db().write_batch();
+                for (key, value) in writes {
+                    batch.put(&source, key, Value::bytes(value));
+                }
+
+                let sequence = harness
+                    .db()
+                    .commit(batch, CommitOptions::default())
+                    .await
+                    .expect("commit simulated source batch");
+                harness
+                    .stack_mut()
+                    .handle
+                    .wait_for_watermark(sequence)
+                    .await
+                    .expect("projection should reach simulated watermark");
+
+                let rows = collect_rows(
                     output
                         .scan(Vec::new(), vec![0xff], ScanOptions::default())
                         .await
                         .expect("scan projected output"),
                 )
-                .await,
-            });
-        }
+                .await;
+                let watermark = harness.stack().handle.current_watermark();
+                snapshots.push(ProjectionSnapshot {
+                    watermark,
+                    rows: rows.clone(),
+                });
 
-        handle.shutdown().await.expect("stop projection");
-        Ok(snapshots)
-    })
+                harness
+                    .checkpoint_with(format!("projection-batch-{step}"), move |_db, stack| {
+                        Box::pin(async move {
+                            Ok(BTreeMap::from([
+                                (
+                                    "projection.watermark".to_string(),
+                                    stack.handle.current_watermark().get().to_string(),
+                                ),
+                                ("projection.output_rows".to_string(), rows.len().to_string()),
+                            ]))
+                        })
+                    })
+                    .await?;
+            }
+
+            let capture = ProjectionSimulationCapture {
+                snapshots,
+                trace: harness.trace(),
+                checkpoints: harness.checkpoints().to_vec(),
+            };
+            harness.shutdown().await?;
+            Ok(capture)
+        })
 }
 
 fn run_multi_source_projection_simulation(

@@ -1,13 +1,13 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, CutPoint, Db, DbConfig, DbDependencies,
-    DurableOutboxConsumer, DurableTimerSet, OutboxEntry, ScheduledTimer, SeededSimulationRunner,
-    SequenceNumber, StubClock, StubFileSystem, StubObjectStore, StubRng, Table, TableConfig,
-    TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction,
-    TransactionalOutbox, Value,
+    Clock, CommitOptions, CompactionStrategy, Db, DbConfig, DbDependencies, DurableOutboxConsumer,
+    DurableTimerSet, OutboxEntry, ScheduledTimer, SequenceNumber, StubClock, StubFileSystem,
+    StubObjectStore, StubRng, Table, TableConfig, TableFormat, TieredDurabilityMode,
+    TieredStorageConfig, Timestamp, Transaction, TransactionalOutbox, Value,
 };
 use terracedb::{S3Location, SsdConfig, StorageConfig};
+use terracedb_simulation::{CutPoint, SeededSimulationRunner};
 
 fn row_table_config(name: &str) -> TableConfig {
     TableConfig {
