@@ -637,6 +637,15 @@ fn decode_outbox_message(change: crate::ChangeEntry) -> Result<OutboxMessage, St
     })
 }
 
+pub fn decode_outbox_entry(outbox_id: Key, value: &Value) -> Result<OutboxEntry, StorageError> {
+    let (idempotency_key, payload) = decode_outbox_value(value)?;
+    Ok(OutboxEntry {
+        outbox_id,
+        idempotency_key,
+        payload,
+    })
+}
+
 fn expect_bytes_value<'a>(value: &'a Value, context: &str) -> Result<&'a [u8], StorageError> {
     match value {
         Value::Bytes(bytes) => Ok(bytes),

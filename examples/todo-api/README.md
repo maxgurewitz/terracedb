@@ -29,14 +29,17 @@ Those placeholder TODOs give the user a lightweight weekly planning scaffold, su
 
 ## Core data model
 
-The example should keep the data model small and explicit.
+The app keeps the data model small and explicit.
 
-Suggested main records:
+The main durable application records are:
 
 - `todos`
-- `weekly_plans`
+- `recent_todos`
+- `planner_dispatch_cursors`
 
-Each TODO record can include fields like:
+The `todos` table stores one durable record per TODO item.
+
+Each TODO record includes:
 
 - `todo_id`
 - `title`
@@ -47,20 +50,28 @@ Each TODO record can include fields like:
 - `created_at`
 - `updated_at`
 
-The exact schema can stay flexible in the first implementation. The important part is that every durable state transition flows through Terracedb.
+The `recent_todos` table stores the projection-backed recent view that powers the recent endpoint.
+
+The `planner_dispatch_cursors` table stores the durable cursor for the internal planner command consumer.
+
+Workflow runtime state, timers, inbox entries, and outbox entries use the workflow library's internal tables.
+
+Every durable state transition in the app flows through Terracedb.
 
 ## Projection: recent TODOs
 
 The app maintains a projection of the 10 most recently created or modified TODOs.
 
-This projection should:
+This projection:
 
 - subscribe to changes from the source TODO table
 - order entries by last mutation time or sequence
-- keep only the newest 10 items
+- materialize the newest 10 items into fixed slots in the projection table
 - serve as the fast read model for a `recent TODOs` API endpoint
 
-This is intentionally small, but it demonstrates the core projection pattern:
+This projection intentionally recomputes the recent-10 view from the source table at the projection frontier and rewrites the 10 projection slots deterministically. That keeps the example simple and makes replay behavior easy to reason about.
+
+It demonstrates the core projection pattern:
 
 - write durable source state first
 - derive a query-friendly read model asynchronously
@@ -72,14 +83,18 @@ Important invariant:
 
 ## Workflow: weekly placeholder creation
 
-The app also includes a workflow that runs at the configured start of each week and creates placeholder TODOs for the upcoming week.
+The app includes a weekly planner workflow that fires at the configured start of each week and creates placeholder TODOs for the upcoming week.
 
-The workflow should:
+The workflow:
 
 - wake up on a weekly schedule
 - determine the seven upcoming calendar days for the next week window
-- create one placeholder TODO for each day that does not already have one
-- avoid duplicates if the workflow is retried or replayed
+- emit one durable planner command per day for the upcoming week
+- avoid duplicate placeholder creation if the workflow is retried or replayed
+
+Those commands are consumed by an internal durable dispatcher in the application process. The dispatcher writes placeholder TODO records into the `todos` table and persists its outbox cursor in `planner_dispatch_cursors`.
+
+The placeholder TODO identifiers are deterministic, so retries and replay remain idempotent.
 
 Example behavior:
 
@@ -95,9 +110,9 @@ This makes the workflow example useful without making it too complex:
 
 ## Basic API shape
 
-The API can stay intentionally small.
+The API is intentionally small.
 
-Suggested endpoints:
+The app exposes these endpoints:
 
 - `POST /todos`
 - `GET /todos`
@@ -179,12 +194,12 @@ It should make a good foundation for later examples that are more ambitious, suc
 
 ## Initial implementation direction
 
-When code is added later, this example should aim for:
+The implementation of this example consists of:
 
 - a small API surface
 - one source table for TODOs
 - one projection for recent changes
-- one weekly workflow
+- one weekly workflow plus one internal planner dispatcher
 - end-to-end simulation tests for the normal API behavior
 - end-to-end simulation tests for retry and crash behavior
 - an end-to-end time-travel simulation test for weekly placeholder creation

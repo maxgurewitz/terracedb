@@ -2,6 +2,8 @@
 members = [
     ".",
     "crates/terracedb-bricks",
+    "examples/todo-api",
+    "crates/terracedb-relays",
     "crates/terracedb-simulation",
     "crates/terracedb-vfs",
     "crates/turmoil-determinism",

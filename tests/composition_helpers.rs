@@ -530,3 +530,94 @@ fn outbox_simulation_restarts_and_catches_up_without_cursor_persistence() -> tur
         Ok(())
     })
 }
+
+#[test]
+fn outbox_simulation_replays_weekly_placeholder_batches_in_order() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2931).run_with(|context| async move {
+        let config = simulation_config(
+            "/terracedb/sim/t29-outbox-placeholder-batch",
+            TieredDurabilityMode::Deferred,
+        );
+        let db = context.open_db(config.clone()).await?;
+        let outbox_table = db.create_table(row_table_config("outbox")).await?;
+        let cursor_table = db.create_table(row_table_config("outbox_cursors")).await?;
+        let outbox = TransactionalOutbox::new(outbox_table.clone());
+        let mut wake = outbox.subscribe_durable(&db);
+
+        let mut batch = db.write_batch();
+        for day in 0..7 {
+            outbox.stage_entry(
+                &mut batch,
+                OutboxEntry {
+                    outbox_id: format!("week:0001:day:{day}").into_bytes(),
+                    idempotency_key: format!("planner:week:1:day:{day}"),
+                    payload: format!("placeholder:week:1:day:{day}").into_bytes(),
+                },
+            )?;
+        }
+        let committed = db.commit(batch, CommitOptions::default()).await?;
+
+        db.flush().await?;
+        assert_eq!(wake.changed().await.expect("durable wake"), committed);
+
+        let consumer_id = b"planner-dispatch".to_vec();
+        let consumer = DurableOutboxConsumer::open(
+            &db,
+            outbox_table.clone(),
+            cursor_table.clone(),
+            consumer_id.clone(),
+        )
+        .await?;
+        let initial = consumer.poll(Some(16)).await?;
+        assert_eq!(initial.entries.len(), 7);
+        assert_eq!(
+            initial
+                .entries
+                .iter()
+                .map(|message| String::from_utf8_lossy(&message.entry.payload).into_owned())
+                .collect::<Vec<_>>(),
+            (0..7)
+                .map(|day| format!("placeholder:week:1:day:{day}"))
+                .collect::<Vec<_>>()
+        );
+
+        let reopened = context
+            .restart_db(config.clone(), CutPoint::AfterStep)
+            .await?;
+        let mut replay_consumer = DurableOutboxConsumer::open(
+            &reopened,
+            reopened.table("outbox"),
+            reopened.table("outbox_cursors"),
+            consumer_id,
+        )
+        .await?;
+        let replay = replay_consumer.poll(Some(16)).await?;
+        assert_eq!(replay.entries.len(), 7);
+        assert_eq!(
+            replay
+                .entries
+                .iter()
+                .map(|message| message.entry.idempotency_key.clone())
+                .collect::<Vec<_>>(),
+            (0..7)
+                .map(|day| format!("planner:week:1:day:{day}"))
+                .collect::<Vec<_>>()
+        );
+
+        replay_consumer
+            .persist_through(replay.last_cursor().expect("replay cursor"))
+            .await?;
+
+        let reopened_again = context.restart_db(config, CutPoint::AfterStep).await?;
+        let settled = DurableOutboxConsumer::open(
+            &reopened_again,
+            reopened_again.table("outbox"),
+            reopened_again.table("outbox_cursors"),
+            b"planner-dispatch".to_vec(),
+        )
+        .await?;
+        assert!(settled.poll(Some(16)).await?.is_empty());
+
+        Ok(())
+    })
+}

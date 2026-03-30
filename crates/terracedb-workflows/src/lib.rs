@@ -438,6 +438,7 @@ pub struct WorkflowDefinition<H> {
     timer_poll_interval: Duration,
     source_batch_limit: usize,
     timer_batch_limit: usize,
+    durable_progress: bool,
 }
 
 impl<H> WorkflowDefinition<H> {
@@ -455,6 +456,7 @@ impl<H> WorkflowDefinition<H> {
             timer_poll_interval: DEFAULT_TIMER_POLL_INTERVAL,
             source_batch_limit: DEFAULT_SOURCE_BATCH_LIMIT,
             timer_batch_limit: DEFAULT_TIMER_BATCH_LIMIT,
+            durable_progress: false,
         }
     }
 
@@ -480,6 +482,11 @@ impl<H> WorkflowDefinition<H> {
 
     pub fn with_timer_batch_limit(mut self, batch_limit: usize) -> Self {
         self.timer_batch_limit = batch_limit.max(1);
+        self
+    }
+
+    pub fn with_durable_progress(mut self, durable_progress: bool) -> Self {
+        self.durable_progress = durable_progress;
         self
     }
 }
@@ -526,6 +533,7 @@ struct WorkflowRuntimeInner<H> {
     timer_poll_interval: Duration,
     source_batch_limit: usize,
     timer_batch_limit: usize,
+    durable_progress: bool,
     running: Mutex<bool>,
     in_flight_instances: Mutex<BTreeSet<String>>,
     ready_notify: Notify,
@@ -567,6 +575,7 @@ where
                     timer_poll_interval: definition.timer_poll_interval,
                     source_batch_limit: definition.source_batch_limit,
                     timer_batch_limit: definition.timer_batch_limit,
+                    durable_progress: definition.durable_progress,
                     running: Mutex::new(false),
                     in_flight_instances: Mutex::new(BTreeSet::new()),
                     ready_notify: Notify::new(),
@@ -782,6 +791,17 @@ impl WorkflowHandle {
     }
 }
 
+async fn commit_runtime_transaction<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    tx: Transaction,
+) -> Result<SequenceNumber, TransactionCommitError> {
+    if runtime.durable_progress {
+        tx.commit().await
+    } else {
+        tx.commit_no_flush().await
+    }
+}
+
 async fn run_workflow_runtime<H>(
     runtime: Arc<WorkflowRuntimeInner<H>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -968,7 +988,7 @@ where
                 new_cursor,
             );
 
-            match tx.commit_no_flush().await {
+            match commit_runtime_transaction(runtime, tx).await {
                 Ok(_) => {
                     *cursor = new_cursor;
                     set_span_attribute(
@@ -1390,7 +1410,7 @@ where
             }
         }
 
-        tx.commit_no_flush().await?;
+        commit_runtime_transaction(runtime, tx).await?;
         Ok(())
     }
     .instrument(span.clone())

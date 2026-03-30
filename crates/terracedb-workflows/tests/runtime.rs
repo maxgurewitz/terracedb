@@ -6,9 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use terracedb::{
-    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
-    StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table, TieredDurabilityMode,
-    Value,
+    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor,
+    OutboxEntry, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table,
+    TieredDurabilityMode, Value,
     test_support::{
         row_table_config, test_dependencies, test_dependencies_with_clock,
         tiered_test_config_with_durability,
@@ -347,14 +347,17 @@ fn callback_stack_builder() -> SimulationStackBuilder<WorkflowStack<CallbackRepl
     )
 }
 
-fn timer_stack_builder() -> SimulationStackBuilder<WorkflowStack<TimerHandler>> {
+fn timer_stack_builder(
+    durable_progress: bool,
+) -> SimulationStackBuilder<WorkflowStack<TimerHandler>> {
     SimulationStackBuilder::new(
-        |context, db| async move {
+        move |context, db| async move {
             let runtime = WorkflowRuntime::open(
                 db,
                 context.clock(),
                 WorkflowDefinition::new("timers", std::iter::empty::<Table>(), TimerHandler)
-                    .with_timer_poll_interval(Duration::from_millis(1)),
+                    .with_timer_poll_interval(Duration::from_millis(1))
+                    .with_durable_progress(durable_progress),
             )
             .await?;
 
@@ -649,7 +652,7 @@ fn timer_loop_waits_for_durable_timer_rows_before_firing() -> turmoil::Result {
                     "/workflow-timer-fence",
                     TieredDurabilityMode::Deferred,
                 ),
-                timer_stack_builder(),
+                timer_stack_builder(false),
             )
             .await?;
             harness.stack_mut().start().await?;
@@ -689,6 +692,45 @@ fn timer_loop_waits_for_durable_timer_rows_before_firing() -> turmoil::Result {
                 &harness.stack().runtime.load_state("order-7").await?,
                 &Some(Value::bytes("fired")),
             )?;
+
+            harness.shutdown().await?;
+            Ok(())
+        })
+}
+
+#[test]
+fn workflow_durable_progress_allows_timer_chains_without_manual_flush() -> turmoil::Result {
+    SeededSimulationRunner::new(0x4104)
+        .with_simulation_duration(WORKFLOW_TIMER_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/workflow-durable-progress",
+                    TieredDurabilityMode::Deferred,
+                ),
+                timer_stack_builder(true),
+            )
+            .await?;
+            harness.stack_mut().start().await?;
+
+            harness
+                .stack()
+                .runtime
+                .admit_callback("order-9", "start", b"begin".to_vec())
+                .await?;
+            wait_for_workflow_state(&harness, "order-9", "scheduled").await?;
+
+            harness
+                .context()
+                .clock()
+                .sleep(Duration::from_millis(10))
+                .await;
+            wait_for_workflow_state(&harness, "order-9", "fired").await?;
 
             harness.shutdown().await?;
             Ok(())
@@ -748,7 +790,8 @@ async fn workflow_runtime_surfaces_change_feed_scan_failures_without_panicking()
         .expect("workflow shutdown should return promptly")
         .expect_err("workflow runtime should surface the underlying change-feed error")
     {
-        WorkflowError::ChangeFeed(ChangeFeedError::Storage(error)) => {
+        WorkflowError::ChangeFeed(ChangeFeedError::Storage(error))
+        | WorkflowError::Storage(error) => {
             assert_eq!(error.kind(), StorageErrorKind::Timeout);
         }
         other => panic!("unexpected workflow error: {other}"),

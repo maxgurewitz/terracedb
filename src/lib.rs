@@ -33,6 +33,7 @@ pub use api::{
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
     OutboxBatch, OutboxEntry, OutboxMessage, ScheduledTimer, TransactionalOutbox,
+    decode_outbox_entry,
 };
 pub use config::{
     CompactionDecision, CompactionDecisionContext, CompactionFilter, CompactionFilterRef,
