@@ -21,12 +21,14 @@ Included in this plan:
 - tiered and s3-primary storage modes,
 - scheduler integration,
 - composition primitives built on top of the engine,
-- projection and workflow libraries, and
+- projection and workflow libraries,
+- an embedded virtual filesystem library, and
 - deterministic simulation coverage for the full stack.
 
 Explicitly excluded from the main execution plan:
 
 - physical sharding,
+- mount/protocol adapters that expose the embedded virtual filesystem as a real host filesystem or network service,
 - zero-downtime upgrade handoff,
 - deployment choreography/platform rollout details,
 - time estimates or staffing concerns.
@@ -52,10 +54,11 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 5** adds columnar tables.
 - **Phase 6** builds composition helpers, projections, workflows, and application-facing simulation harnesses.
 - **Phase 7** expands deterministic simulation to the full stack.
+- **Phase 8** adds an embedded virtual filesystem library on top of Terracedb.
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into seven mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into eight mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -64,6 +67,7 @@ Once Phase 0 is complete, the work naturally splits into seven mostly independen
 - **Track E — columnar:** T24 → T25 → T26 → T27
 - **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T31 depends on T30, T32 depends on T18/T19/T28/T29, and T32a depends on T03a/T31/T32
 - **Track G — full-stack hardening:** T33 after T32a
+- **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
 
 ---
 
@@ -1182,7 +1186,7 @@ Build the application-facing Terracedb harnesses on top of the shared simulation
 
 ## Phase 7 — Full-stack deterministic hardening
 
-**Parallelization:** This final phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist.
+**Parallelization:** This hardening phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist.
 
 ### T33. Full-stack randomized scenario generation and invariant suites
 
@@ -1190,7 +1194,7 @@ Build the application-facing Terracedb harnesses on top of the shared simulation
 
 **Description**
 
-Compose the deterministic testing machinery built in earlier tasks into the full-system correctness matrix: mixed workloads, mixed fault workloads, large-seed campaigns, and cross-layer invariants spanning engine, projections, and workflows. This task is the capstone integration bar for the architecture as a whole, not the first place subsystem-specific oracles, fault hooks, or workload generators should appear.
+Compose the deterministic testing machinery built in earlier tasks into the full-system correctness matrix for the core DB / projection / workflow stack: mixed workloads, mixed fault workloads, large-seed campaigns, and cross-layer invariants spanning engine, projections, and workflows. This task is the capstone integration bar for that stack, not the first place subsystem-specific oracles, fault hooks, or workload generators should appear.
 
 **Interpretation note**
 
@@ -1200,7 +1204,7 @@ Implement this task in the strongest sense, following the FoundationDB testing p
 - Production code paths should contain the fault hooks and cut points that simulation drives; adapter-only fault injection is not sufficient.
 - Randomized runs should be composed from domain workloads plus fault workloads, with invariants checked throughout, rather than from generic raw-I/O fuzzing alone.
 - A failing seed must reproduce the workload shape, injected faults, scheduling decisions, and trace, not merely the final state.
-- The goal of T33 is to make this randomized deterministic simulation matrix the primary correctness bar for the system, not an optional supplement to unit tests.
+- The goal of T33 is to make this randomized deterministic simulation matrix the primary correctness bar for the core DB / projection / workflow stack, not an optional supplement to unit tests.
 
 **Implementation steps**
 
@@ -1259,6 +1263,260 @@ Operationalize the deterministic simulation bar by running larger seeded campaig
 - A failing CI seed produces an artifact bundle with the seed and replay metadata needed for local reproduction.
 - Replay tooling or documented commands can rerun a captured failing seed locally and reproduce the same failure.
 - Campaign tiers demonstrate that larger seed counts can be added operationally without replacing the fast must-pass smoke coverage.
+
+---
+
+## Phase 8 — Embedded virtual filesystem library
+
+**Parallelization:** T34 first. T35 depends on T34. T36 depends on T35. T37 depends on T35, T36, T30, and T31. T38 depends on T35, T36, T37, T22, and T23. T39 depends on T36, T37, and T38. T40 depends on T33, T37, T38, and T39.
+
+### T34. Freeze the embedded virtual filesystem crate boundary, semantics, and reserved tables
+
+**Depends on:** T01, T28
+
+**Description**
+
+Define the embedded virtual filesystem public surface and the reserved table/key contracts before implementation work branches. This task freezes the semantic target: provide a useful filesystem/KV/tool/overlay model on Terracedb for in-process agent runtimes, not SQL compatibility or mount-oriented adapter behavior.
+
+**Implementation steps**
+
+1. Add a new workspace member (for example `crates/terracedb-vfs`) and define its crate/module boundaries:
+   - volume lifecycle,
+   - path-based filesystem API,
+   - KV API,
+   - tool-run API,
+   - snapshot / clone / overlay API,
+   - activity API, and
+   - shared error types.
+2. Freeze the reserved table families and key encodings:
+   - `vfs_volume`,
+   - `vfs_allocator`,
+   - `vfs_inode`,
+   - `vfs_dentry`,
+   - `vfs_chunk`,
+   - `vfs_symlink`,
+   - `vfs_kv`,
+   - `vfs_tool_run`,
+   - `vfs_activity`,
+   - `vfs_whiteout`,
+   - `vfs_origin`.
+3. Freeze stable encodings for `volume_id`, inode IDs, activity IDs, and tool-run IDs, including the volume-first key-prefix ordering used for scans.
+4. Decide and document the compatibility boundary explicitly:
+   - preserve POSIX-like virtual filesystem semantics, snapshots, overlays, KV/tool APIs, and auditability,
+   - do not promise SQL compatibility, mount/service adapters, or single-file transport.
+5. Add compile-only stubs and a fake in-memory volume implementation so downstream tasks can build against the new crate boundary immediately.
+
+**Verification**
+
+- Compile-only tests that instantiate the public volume/filesystem/KV/tool/overlay APIs.
+- Unit tests that round-trip the reserved key encodings and confirm scan order for dentries, chunks, and activity rows.
+- A smoke test that opens a fake volume under deterministic injected dependencies without touching real I/O.
+
+---
+
+### T35. Implement volume lifecycle, root metadata, allocators, and shared read helpers
+
+**Depends on:** T34, T04, T05, T10, T28
+
+**Description**
+
+Implement the common substrate that every virtual filesystem operation uses: volume creation/open, immutable volume config, root inode initialization, monotonic ID allocation, and snapshot-consistent helper routines for resolving paths and scanning chunk/dentry ranges.
+
+**Implementation steps**
+
+1. Implement `create/open volume` with immutable config such as `chunk_size`, format version, and optional overlay-base descriptor.
+2. Initialize and persist root inode `1`, default metadata, and any reserved per-volume rows needed on first open.
+3. Implement block-leased monotonic allocators for:
+   - inode IDs,
+   - activity IDs, and
+   - tool-run IDs.
+4. Implement shared helpers for:
+   - path normalization,
+   - parent lookup,
+   - snapshot-bound path resolution,
+   - dentry prefix scans,
+   - chunk range scans, and
+   - common virtual filesystem error mapping.
+5. Implement the shared durability-cut helper logic the higher-level API will use later for `snapshot({ durable: true })`, `fsync`, and export/clone boundaries.
+
+**Verification**
+
+- Reopen tests proving volume metadata, root inode, and config survive restart unchanged.
+- Allocator tests proving monotonicity across restart, retry, and concurrent lease refresh.
+- Snapshot-consistency tests showing path resolution and inode/chunk reads do not mix versions under concurrent writers.
+- Simulation tests with conflict retries and injected crashes during allocator lease refresh.
+
+---
+
+### T36. Implement core filesystem state and POSIX-like operations
+
+**Depends on:** T35, T28
+
+**Description**
+
+Implement the current-state filesystem itself on top of Terracedb tables: namespace operations, inode metadata, chunked file I/O, links, symlinks, and `fsync` semantics. This task is the heart of the embedded virtual filesystem crate.
+
+**Implementation steps**
+
+1. Implement inode/dentry/chunk/symlink read and write paths using one OCC unit per logical filesystem operation.
+2. Implement the core file and directory API:
+   - `mkdir`,
+   - `writeFile`,
+   - `readFile`,
+   - `pread`,
+   - `pwrite`,
+   - `truncate`,
+   - `readdir`,
+   - `readdirPlus`.
+3. Implement metadata and namespace mutation APIs:
+   - `stat`,
+   - `lstat`,
+   - supported ownership/permission/time updates,
+   - `link`,
+   - `symlink`,
+   - `readlink`,
+   - `unlink`,
+   - `rmdir`,
+   - `rename`.
+4. Implement correct synchronous maintenance of:
+   - `nlink`,
+   - file size,
+   - nanosecond timestamps,
+   - `rdev` when special files are exposed,
+   - chunk creation/rewrite/removal for truncate and partial writes.
+5. Define `fsync` and volume flush semantics as durability fences over Terracedb flush behavior.
+
+**Verification**
+
+- POSIX-like unit and integration tests for create/read/write/delete/rename/readdir.
+- Hard-link and symlink tests, including correct `nlink` behavior and `readlink` semantics.
+- `pread` / `pwrite` / `truncate` tests across chunk boundaries.
+- Crash tests proving multi-row namespace/data mutations recover atomically.
+
+---
+
+### T37. Implement KV state, tool-run tracking, append-only activity, and timeline helpers
+
+**Depends on:** T35, T36, T30, T31
+
+**Description**
+
+Implement the non-filesystem virtual filesystem surfaces and the auditability model. Every mutating filesystem, KV, and tool action should append one semantic activity row in the same commit as the current-state change.
+
+**Implementation steps**
+
+1. Implement `vfs_kv` current-state operations with JSON serialization/deserialization and `set` / `delete` semantics.
+2. Implement `vfs_tool_run` current-state operations supporting both:
+   - a two-step `start` → `success|error` lifecycle, and
+   - a one-shot “record completed run” path.
+3. Instrument every mutating filesystem, KV, and tool operation so it appends one `vfs_activity` row in the same batch as the current-state change.
+4. Implement timeline/query helpers over `vfs_activity`, plus lightweight derived projections for at least:
+   - recent activity,
+   - per-tool counters and latency stats, and
+   - volume usage/accounting.
+5. Expose visible and durable activity-tail helpers using `scanSince` / `scanDurableSince` and `subscribe` / `subscribeDurable`.
+
+**Verification**
+
+- Tests showing current-state rows and corresponding activity rows never become visible independently.
+- Timeline/projection rebuild tests proving recent activity, stats, and usage recompute correctly from append-only history.
+- Tool-run lifecycle tests covering pending, success, error, and one-shot completed paths.
+- Crash tests around pending → completed transitions and filesystem mutation + activity atomicity.
+
+---
+
+### T38. Implement snapshots, clone/export flows, and copy-on-write overlays
+
+**Depends on:** T35, T36, T37, T22, T23
+
+**Description**
+
+Implement the Terracedb-native reproduction story for embedded agent volumes: short-lived read-only snapshots, logical clone/export flows, and writable overlay volumes backed by read-only virtual filesystem bases. This replaces the SQLite-era “copy the database file” portability story with a Terracedb-native equivalent.
+
+**Implementation steps**
+
+1. Implement `AgentFsSnapshot` as a read-only volume view bound to a visible or durable cut.
+2. Implement logical export/import or clone helpers for moving a single `volume_id` into a fresh DB or restoring it elsewhere.
+3. Implement overlay metadata plus the `vfs_whiteout` and `vfs_origin` tables, with bases restricted to read-only virtual filesystem snapshots/clones rather than host filesystem adapters.
+4. Implement overlay lookup semantics, merged directory listing, whiteout handling, and copy-up on first mutation of base-resident entries.
+5. Ensure long-lived reproduction and overlay bases use exported data or retained base metadata rather than GC-pinning engine snapshots indefinitely.
+
+**Verification**
+
+- Snapshot stability tests under concurrent writes.
+- Whiteout and copy-up tests, including recreate-after-delete behavior and merged `readdir` semantics.
+- Export/import round-trip tests proving the restored volume matches the source cut exactly.
+- Tests showing durable-cut exports never include visible-but-not-yet-durable state.
+
+---
+
+### T39. Expose the embedded Rust API and agent-runtime integration examples
+
+**Depends on:** T36, T37, T38
+
+**Description**
+
+Expose the virtual filesystem crate the way applications actually use it: as an embedded Rust library for in-process agent sandboxes. The goal is a stable SDK and examples for agent runtimes, not a second wave of mount, CLI, or service implementations.
+
+**Implementation steps**
+
+1. Finalize the Rust SDK surface for path-based filesystem operations, KV, tool runs, snapshots, overlays, activity tailing, and flush.
+2. Add convenience helpers and examples for common AI-agent runtime patterns:
+   - open a base volume,
+   - create a writable overlay for one run/session,
+   - expose a bounded capability surface to the agent,
+   - inspect recent file/tool activity.
+3. Add end-to-end examples that run an agent or agent-like harness against the same embedded volume API used by production code.
+4. Ensure no example or helper bypasses the crate and writes reserved tables directly.
+5. Document the explicit version-1 non-goals:
+   - no FUSE/NFS/MCP/HTTP/service boundary,
+   - no host filesystem mount surface,
+   - no mount-oriented inode/handle API.
+
+**Verification**
+
+- Integration tests through the SDK for filesystem, KV, tool-run, snapshot, and overlay operations.
+- Example tests showing an agent-style harness can use a base volume plus writable overlay without touching internal tables.
+- Restart tests showing existing volumes and overlays reopen without repair or migration tricks.
+- API tests proving the agent-facing surface stays path-based and mount-independent.
+
+---
+
+### T40. Build deterministic compatibility, crash, and randomized fault suites for the virtual filesystem crate
+
+**Depends on:** T33, T37, T38, T39
+
+**Description**
+
+Bring the virtual filesystem crate up to the same correctness bar as the rest of Terracedb by extending the deterministic simulation framework to the real embedded filesystem/KV/tool/overlay implementation.
+
+**Implementation steps**
+
+1. Build a shadow model for:
+   - current filesystem state,
+   - KV state,
+   - tool-run lifecycle state,
+   - overlay whiteouts/origin mappings, and
+   - append-only activity prefix rules.
+2. Add randomized workloads covering:
+   - namespace operations,
+   - file I/O and truncation,
+   - hard links and symlinks,
+   - tool-run start/success/error,
+   - KV updates,
+   - overlay copy-up and whiteouts,
+   - snapshot/export/import flows,
+   - `fsync` / flush behavior.
+3. Add crash cut points around create, rename, unlink, truncate, copy-up, tool-run completion, export, and durability-boundary operations.
+4. Port or mirror a representative subset of relevant virtual-filesystem behavior/spec examples against the Terracedb implementation.
+5. Ensure every failing seed captures the workload, trace, injected faults, and enough volume metadata to replay the failure exactly.
+
+**Verification**
+
+- Large-seed simulation campaigns where both current state and activity-prefix invariants are checked after each step or recovery point.
+- Same-seed replay tests proving identical traces and results.
+- Compatibility-corpus tests passing against the virtual filesystem crate.
+- Recovered-state prefix tests across standalone volumes and overlay volumes.
 
 ---
 
@@ -1325,6 +1583,16 @@ Complete: T33
 
 At this point the system should have the deterministic simulation coverage needed to validate the entire stack under randomized failures.
 
+### Milestone G — Embedded virtual filesystem library
+Complete: T34–T40
+
+At this point the system should additionally support:
+- an embedded virtual filesystem crate on top of Terracedb,
+- point-in-time snapshots and copy-on-write overlays for agent sandboxes,
+- KV state and tool-run audit history,
+- durable clone/export flows instead of SQLite-file copies, and
+- deterministic simulation coverage for the virtual filesystem crate itself.
+
 ---
 
 ## Deferred items from the architecture
@@ -1332,6 +1600,7 @@ At this point the system should have the deterministic simulation coverage neede
 The following architecture sections are intentionally **not** decomposed into implementation tasks here because they are either explicitly future work or outside the requested scope:
 
 - physical per-table sharding,
+- mount/protocol adapters for exposing the embedded virtual filesystem outside the process,
 - zero-downtime upgrade handoff library,
 - platform-specific deployment recipes and rollout automation.
 

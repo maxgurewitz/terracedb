@@ -4,7 +4,7 @@
 
 Instead of shipping a monolithic database server with every higher-level feature baked in, terracedb focuses on a small set of durable, reusable building blocks: tables, snapshots, sequence numbers, atomic write batches, conflict-checked commits, version-aware reads, and change-capture streams.
 
-The goal is to make it easy to assemble specialized embedded databases in-process — from simple key-value state stores to richer systems with derived views, async pipelines, and durable orchestration — while keeping the core understandable, testable, and deterministic.
+The goal is to make it easy to assemble specialized embedded databases in-process — from simple key-value state stores to richer systems with derived views, async pipelines, durable orchestration, and embedded agent sandboxes — while keeping the core understandable, testable, and deterministic.
 
 ## Design goals
 
@@ -35,6 +35,12 @@ It tails change streams, reads from frontier-pinned snapshots, and writes materi
 The workflow library builds **durable stateful orchestration** on top of the same primitives.
 
 It supports long-lived workflow instances, durable trigger admission, timers, retries, and external side effects via an outbox pattern. Where projections maintain derived state, workflows coordinate business processes that must survive crashes and resume from durable state.
+
+## Embedded virtual filesystem library
+
+The architecture also includes a planned **embedded virtual filesystem library** on top of Terracedb.
+
+Its scope is intentionally narrow: provide an in-process virtual filesystem, small KV state, tool-run history, point-in-time snapshots, and copy-on-write overlays for AI-agent runtimes. Exposing that filesystem as a real host mount or network service is explicitly out of scope.
 
 ## Philosophy
 
