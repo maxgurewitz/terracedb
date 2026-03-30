@@ -368,6 +368,31 @@ Implement the complete row-table read path across mutable memtable, immutable me
 
 ---
 
+### T10a. Merged row-range iterator and large-scan efficiency
+
+**Depends on:** T10
+
+**Description**
+
+Replace the current “collect all candidate keys, then resolve each key with point lookups” row-scan strategy with a proper merged iterator over memtables and SSTables. This task owns large-range-scan efficiency for row tables so scans do not repeatedly reacquire lookup state or materialize the full keyset before yielding results.
+
+**Implementation steps**
+
+1. Introduce a merged row iterator that can walk mutable memtable, immutable memtables, and SSTables in key order.
+2. Resolve visibility, tombstones, and per-key version collapse during iteration rather than via N follow-up point lookups.
+3. Preserve existing semantics for `scan`, `scanAt`, `scanPrefix`, reverse scans, and limits.
+4. Ensure the iterator can short-circuit early for limits and narrow ranges without collecting the entire keyset first.
+5. Reuse the iterator substrate where possible so future read-path optimizations do not fork scan semantics.
+
+**Verification**
+
+- Oracle tests proving the merged iterator returns exactly the same logical rows as the existing semantics across random put/delete/versioned workloads.
+- Tests showing limits and reverse scans stop without enumerating the full matching keyspace.
+- Historical-scan tests proving `scanAt` still observes the correct version horizon while newer versions exist.
+- Read/flush/compaction interleaving tests proving scan results remain snapshot-consistent while range iteration is in flight.
+
+---
+
 ### T11. Compaction framework and leveled compaction
 
 **Depends on:** T10
@@ -549,6 +574,56 @@ Implement change capture on top of the unified commit log: gap-free iteration, p
 
 ---
 
+### T17a. Incremental streaming change-feed iteration
+
+**Depends on:** T17
+
+**Description**
+
+Make the change-feed surface truly incremental instead of materializing a full `Vec<ChangeEntry>` before returning. This task owns memory-bounded, low-latency iteration for `scanSince` and `scanDurableSince`, including future remote/cold commit-log reads that should naturally pipeline.
+
+**Implementation steps**
+
+1. Replace full-result materialization with a stream/iterator pipeline that yields `ChangeEntry` values incrementally.
+2. Preserve strict `(sequence, op_index)` ordering, cursor semantics, and visible-vs-durable upper bounds while yielding incrementally.
+3. Bound in-memory buffering to the current page/window rather than the entire scan result.
+4. Ensure limit handling can terminate the stream promptly without decoding unnecessary tail records.
+5. Structure the scan path so future remote/cold commit-log segment reads can pipeline decode and yield work naturally.
+
+**Verification**
+
+- Tests proving change-feed results remain identical to the pre-streaming semantics across multi-entry batches and resume positions.
+- Tests showing small limits terminate without reading or buffering the entire available result set.
+- Fault-injection tests proving mid-stream scan failures surface as typed errors without losing already-yielded ordering guarantees.
+- Remote/cold-path tests proving large scans can make progress incrementally rather than waiting for full materialization.
+
+---
+
+### T17b. Low-contention commit-log scan path for change feeds
+
+**Depends on:** T17
+
+**Description**
+
+Remove the global `commit_runtime` async mutex as a long-lived scan bottleneck by separating cheap metadata snapshots from long-running I/O. This task owns the concurrency properties of continuous change-feed consumers so scans do not unnecessarily serialize commits, flushes, and other commit-log operations.
+
+**Implementation steps**
+
+1. Refactor the scan path to snapshot the metadata needed for a scan without holding the global commit-log runtime lock across I/O.
+2. Split mutable commit-log control-plane state from read-mostly scan metadata where needed so scans can proceed concurrently with foreground operations.
+3. Ensure commits, flushes, sealing, and retention can continue safely while scans are reading an earlier stable view.
+4. Preserve correctness for visible/durable upper bounds, `SnapshotTooOld`, and table-segment lookup under concurrent maintenance.
+5. Add internal contention hooks/metrics so scan-path serialization regressions are visible in tests and profiling.
+
+**Verification**
+
+- Concurrency tests where a blocked or slow change-feed scan does not prevent independent commits from completing.
+- Tests where flush/seal/retention progress concurrently with a scan without violating ordering or visibility bounds.
+- Regression tests proving `SnapshotTooOld` and table-floor calculations remain correct under concurrent log maintenance.
+- Simulation or harness tests that repeatedly interleave scans with commits and maintenance without deadlock or starvation.
+
+---
+
 ### T18. `subscribe` and `subscribeDurable` coalescing notifications
 
 **Depends on:** T07
@@ -596,6 +671,136 @@ Implement retention and garbage collection for the unified commit log, including
 - Tests where a segment remains physically present for table A while table B already receives logical `SnapshotTooOld`.
 - Recovery tests proving recovery-only mode deletes segments as soon as they are unnecessary.
 - Simulation tests with lagging consumers, retention windows, and concurrent recovery pressure.
+
+---
+
+### T19a. Failed assigned-sequence durability semantics and recoverable-log staging
+
+**Depends on:** T07, T17, T18, T19
+
+**Description**
+
+Repair the failed-group-commit correctness hole by ensuring an assigned sequence does not enter the recoverable unified commit log until the batch's durability outcome is known. This task owns the exact semantics for failed assigned sequences so recovery, visible scans, durable scans, and watermark publication all remain consistent after fsync failure, later `flush()`, reopen, and backup/restore paths.
+
+**Implementation steps**
+
+1. Introduce batch-local staging for assigned commit records so group-commit waiters can reserve sequence numbers without appending failed work to the recoverable log.
+2. Move the local tiered group-commit durable-log append so it occurs only as part of the successful batch durability path rather than inside the pre-durability commit critical section.
+3. Define and document failed assigned-sequence semantics for visible and durable watermarks, including whether failed sequences may be skipped as no-op positions in the prefix model.
+4. Ensure recovery replays only the durable committed prefix and never resurrects a write that previously returned a durability error.
+5. Ensure `scanSince`, `scanDurableSince`, subscription watermarks, and any tiered backup/restore tail sync paths stay consistent with the new staging behavior.
+
+**Verification**
+
+- Tests where group-commit fsync fails and the write returns an error, then a later `flush()` or reopen must not surface that write.
+- Tests proving visible and durable watermarks advance consistently across failed assigned sequences without reordering later successful commits.
+- Recovery tests proving a crash before successful batch durability loses only the staged non-durable work, while a crash after successful durability preserves it.
+- Change-feed tests proving failed assigned sequences do not appear in `scanSince` or `scanDurableSince`, including after reopen.
+- Backup/restore tests proving remote tail synchronization and disaster recovery never reintroduce a failed write.
+
+---
+
+### T19b. Change-feed typed error surface and panic-free scan failure handling
+
+**Depends on:** T17, T18, T19
+
+**Description**
+
+Replace the current `SnapshotTooOld`-only change-feed error surface with a dedicated `ChangeFeedError` that can express both retention-horizon failures and ordinary storage/runtime scan failures. This task owns the public API churn needed to make `scanSince` and `scanDurableSince` panic-free and fully typed across the core engine, projections, workflows, and simulation helpers.
+
+**Implementation steps**
+
+1. Define a `ChangeFeedError` enum that includes at least `SnapshotTooOld` and `StorageError`, plus any conversion helpers needed by callers.
+2. Change `scanSince` and `scanDurableSince` to return `Result<ChangeStream, ChangeFeedError>` instead of `Result<ChangeStream, SnapshotTooOld>`.
+3. Remove panic-based handling from change-feed scans and propagate storage/runtime failures as typed errors instead.
+4. Update projection, workflow, and simulation crates to consume the new change-feed error surface without collapsing distinct failure modes.
+5. Update architecture docs, task references, and tests so the change-feed contract explicitly distinguishes retention failure from ordinary scan I/O/corruption failure.
+
+**Verification**
+
+- Tests where commit-log scan I/O fails and `scanSince` / `scanDurableSince` return typed errors rather than panicking.
+- Tests where `SnapshotTooOld` is still surfaced distinctly and is not collapsed into a generic storage error.
+- Projection-runtime tests proving durable source scans propagate change-feed failures through the runtime without process abort.
+- Workflow-runtime tests proving source admission and durable outbox/timer consumers handle change-feed scan failures as typed runtime errors.
+- Simulation tests covering local corruption, remote-read failure, and retention-horizon failure across change-feed consumers.
+
+---
+
+### T19c. Group-commit fsync failure regression suite
+
+**Depends on:** T19a
+
+**Description**
+
+Add a must-pass regression suite for the failed-group-commit durability path so the engine continuously proves that a write which returned an error can never leak back in through reads, change feeds, watermarks, `flush()`, or recovery.
+
+**Implementation steps**
+
+1. Add explicit fault injection for commit-log `sync` failure during the group-commit durability path.
+2. Capture same-process aftermath checks for reads, visible scans, durable scans, and watermark/subscription state.
+3. Add follow-up operations after the failure, including later successful commits and explicit `flush()`, to prove the failed write is not resurrected.
+4. Add reopen/recovery assertions proving the failed write is not replayed after crash or restart.
+5. Keep this suite isolated and easy to understand so future refactors can use it as the canonical regression harness for failed assigned sequences.
+
+**Verification**
+
+- Tests where `commit()` returns an error on fsync failure and the failed write is absent from point reads.
+- Tests where the failed write is absent from both `scanSince` and `scanDurableSince`.
+- Tests proving subscriptions and visible/durable watermarks still progress for later successful commits.
+- Tests proving later `flush()` does not make the failed write visible or durable.
+- Reopen/recovery tests proving the failed write is never replayed.
+
+---
+
+### T19d. Change-feed structured error regression suite
+
+**Depends on:** T19b
+
+**Description**
+
+Add focused regression coverage for the new typed change-feed error surface so scan failures are verified as structured returns rather than process aborts.
+
+**Implementation steps**
+
+1. Add tests for local commit-log read failures during `scanSince` and `scanDurableSince`.
+2. Add tests for remote/object-store failures such as timeout and missing/corrupt segment reads where applicable.
+3. Add corruption tests for malformed segment bytes and invalid commit-log frames encountered during scanning.
+4. Verify downstream consumers such as projections and workflows propagate the typed failure rather than panicking.
+5. Ensure `SnapshotTooOld` remains distinguishable from ordinary storage/runtime scan failure in all helper APIs.
+
+**Verification**
+
+- Tests where local scan I/O returns `ChangeFeedError::Storage(...)` rather than panicking.
+- Tests where remote/object-store timeout or read failure is surfaced distinctly as a typed scan error.
+- Tests where corrupted segment bytes produce a structured error return instead of process abort.
+- Projection and workflow tests proving durable consumers surface the typed change-feed error through their runtime errors.
+- Regression tests proving `SnapshotTooOld` is still surfaced as its own variant and is not collapsed into a generic storage failure.
+
+---
+
+### T19e. Watermark and failed-sequence property tests
+
+**Depends on:** T18, T19, T19a
+
+**Description**
+
+Add property-style and randomized invariant tests around visibility/durability watermark behavior once failed assigned-sequence semantics are repaired. This task owns the “holes and prefixes” correctness bar so later refactors cannot quietly reintroduce skipped-prefix or aborted-sequence bugs.
+
+**Implementation steps**
+
+1. Build randomized schedules that interleave successful commits, failed assigned sequences, watermark publication, and later successful commits.
+2. Assert monotonicity and prefix invariants for visible and durable watermarks under all such schedules.
+3. Assert that no visible or durable change-feed result ever yields a failed/aborted sequence.
+4. Assert that later successful sequences still become publishable after earlier failures according to the chosen failed-sequence semantics.
+5. Reuse these invariants across unit tests and simulation/harness workloads so they guard both direct coordinator logic and end-to-end behavior.
+
+**Verification**
+
+- Property tests proving visible and durable watermarks are monotonic.
+- Property tests proving the durable watermark never exceeds the visible watermark.
+- Property tests proving no visible or durable feed yields a failed/aborted sequence.
+- Randomized schedule tests proving later successful sequences still publish correctly after earlier failures.
+- Reopen/recovery variants proving the same invariants hold across crash boundaries.
 
 ---
 
@@ -1029,6 +1234,31 @@ Implement this task in the strongest sense, following the FoundationDB testing p
 - Reproducibility tests proving the same seed yields the same trace and the same final state.
 - Prefix-consistency tests proving recovered state is always some valid durable/visible prefix according to the configured mode.
 - End-to-end tests where projections and workflows continue to behave correctly across crash/restart, `SnapshotTooOld`, recomputation, timer replay, and outbox retries.
+
+---
+
+### T33a. CI seeded campaigns and failure-artifact capture
+
+**Depends on:** T33
+
+**Description**
+
+Operationalize the deterministic simulation bar by running larger seeded campaigns in CI and preserving failing seeds as first-class artifacts. This task owns the project-level workflow that turns the simulation machinery from “available” into “continuously enforced.”
+
+**Implementation steps**
+
+1. Add CI jobs for deterministic seeded campaigns at a scale meaningfully above the basic local smoke suite.
+2. Split seed execution into tiers as needed, such as per-PR must-pass coverage and larger scheduled/nightly campaigns.
+3. Capture failing seeds, traces, injected-fault schedules, and enough runtime metadata to replay failures locally.
+4. Provide an easy local replay entrypoint/documented command so a CI-found seed can be reproduced directly by developers.
+5. Make campaign configuration explicit and reviewable so seed counts, workloads, and fault mixes can evolve intentionally over time.
+
+**Verification**
+
+- CI runs deterministic seeded campaigns automatically rather than relying only on ad hoc local execution.
+- A failing CI seed produces an artifact bundle with the seed and replay metadata needed for local reproduction.
+- Replay tooling or documented commands can rerun a captured failing seed locally and reproduce the same failure.
+- Campaign tiers demonstrate that larger seed counts can be added operationally without replacing the fast must-pass smoke coverage.
 
 ---
 
