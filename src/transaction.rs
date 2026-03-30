@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::{
-    CommitError, CommitOptions, Db, FlushError, Key, ReadError, ReadSet, SequenceNumber, Snapshot,
-    Table, Value, WriteBatch,
+    CommitError, CommitOptions, Db, FlushError, Key, OperationContext, ReadError, ReadSet,
+    SequenceNumber, Snapshot, Table, Value, WriteBatch,
 };
 
 /// User-space optimistic transaction helper built on top of the engine's
@@ -141,7 +141,12 @@ impl Transaction {
         } = self;
 
         let sequence = db
-            .commit(batch, CommitOptions::default().with_read_set(read_set))
+            .commit(
+                batch,
+                CommitOptions::default()
+                    .with_read_set(read_set)
+                    .with_operation_context(OperationContext::current()),
+            )
             .await?;
 
         if opts.flush

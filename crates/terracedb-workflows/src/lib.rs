@@ -14,14 +14,17 @@ use tokio::{
     sync::{Notify, watch},
     task::JoinHandle,
 };
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use terracedb::{
     ChangeEntry, ChangeFeedError, ChangeKind, Clock, CommitError, CreateTableError, Db,
-    DurableCursorStore, DurableTimerSet, Key, LogCursor, OutboxEntry, ReadError, ScanOptions,
-    ScheduledTimer, SnapshotTooOld, StorageError, Table, TableConfig, TableFormat, Timestamp,
-    Transaction, TransactionCommitError, TransactionalOutbox, Value,
+    DurableCursorStore, DurableTimerSet, Key, LogCursor, OperationContext, OutboxEntry, ReadError,
+    ScanOptions, ScheduledTimer, SnapshotTooOld, StorageError, Table, TableConfig, TableFormat,
+    Timestamp, Transaction, TransactionCommitError, TransactionalOutbox, Value,
 };
-use terracedb::{CompactionStrategy, SequenceNumber};
+use terracedb::{
+    CompactionStrategy, SequenceNumber, SpanRelation, set_span_attribute, telemetry_attrs,
+};
 
 pub const DEFAULT_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const DEFAULT_SOURCE_BATCH_LIMIT: usize = 128;
@@ -31,6 +34,87 @@ const WORKFLOW_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_TRIGGER_ORDER_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_TABLE_PREFIX: &str = "_workflow_";
 const INBOX_KEY_SEPARATOR: u8 = 0;
+const FULL_SCAN_START: &[u8] = b"";
+const FULL_SCAN_END: &[u8] = &[0xff];
+
+fn workflow_trigger_kind(trigger: &WorkflowTrigger) -> &'static str {
+    match trigger {
+        WorkflowTrigger::Event(_) => "event",
+        WorkflowTrigger::Timer { .. } => "timer",
+        WorkflowTrigger::Callback { .. } => "callback",
+    }
+}
+
+fn apply_workflow_span_attributes(
+    span: &tracing::Span,
+    db: &Db,
+    workflow_name: &str,
+    instance_id: Option<&str>,
+) {
+    set_span_attribute(span, telemetry_attrs::DB_NAME, db.telemetry_db_name());
+    set_span_attribute(
+        span,
+        telemetry_attrs::DB_INSTANCE,
+        db.telemetry_db_instance(),
+    );
+    set_span_attribute(
+        span,
+        telemetry_attrs::STORAGE_MODE,
+        db.telemetry_storage_mode(),
+    );
+    set_span_attribute(
+        span,
+        telemetry_attrs::WORKFLOW_NAME,
+        workflow_name.to_string(),
+    );
+    if let Some(instance_id) = instance_id {
+        set_span_attribute(
+            span,
+            telemetry_attrs::WORKFLOW_INSTANCE_ID,
+            instance_id.to_string(),
+        );
+    }
+}
+
+fn attach_operation_context(
+    span: &tracing::Span,
+    operation_context: Option<&OperationContext>,
+) -> bool {
+    operation_context
+        .filter(|context| !context.is_empty())
+        .map(|context| context.attach_to_span(span, SpanRelation::Parent))
+        .unwrap_or(false)
+}
+
+fn attach_operation_contexts(span: &tracing::Span, contexts: &[OperationContext]) {
+    if let Some(parent) = contexts.first() {
+        parent.attach_to_span(span, SpanRelation::Parent);
+        for context in contexts.iter().skip(1) {
+            context.attach_to_span(span, SpanRelation::Link);
+        }
+    }
+}
+
+fn collect_operation_contexts(entries: &[ChangeEntry]) -> Vec<OperationContext> {
+    let mut seen = BTreeSet::new();
+    let mut contexts = Vec::new();
+    for entry in entries {
+        let Some(context) = entry.operation_context.clone() else {
+            continue;
+        };
+        if context.is_empty() {
+            continue;
+        }
+        let key = (
+            context.traceparent().map(str::to_string),
+            context.tracestate().map(str::to_string),
+        );
+        if seen.insert(key) {
+            contexts.push(context);
+        }
+    }
+    contexts
+}
 
 #[derive(Debug)]
 pub struct WorkflowHandlerError {
@@ -404,6 +488,32 @@ pub struct WorkflowRuntime<H> {
     inner: Arc<WorkflowRuntimeInner<H>>,
 }
 
+impl<H> Clone for WorkflowRuntime<H> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowSourceTelemetrySnapshot {
+    pub source_table: String,
+    pub durable_sequence: SequenceNumber,
+    pub cursor_sequence: SequenceNumber,
+    pub lag: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowTelemetrySnapshot {
+    pub workflow_name: String,
+    pub inbox_depth: usize,
+    pub timer_depth: usize,
+    pub outbox_depth: usize,
+    pub in_flight_instances: usize,
+    pub source_lags: Vec<WorkflowSourceTelemetrySnapshot>,
+}
+
 struct WorkflowRuntimeInner<H> {
     name: String,
     db: Db,
@@ -430,33 +540,41 @@ where
         clock: Arc<dyn Clock>,
         definition: WorkflowDefinition<H>,
     ) -> Result<Self, WorkflowError> {
-        if definition.name.trim().is_empty() {
-            return Err(WorkflowError::EmptyName);
+        let workflow_name = definition.name.clone();
+        let span = tracing::info_span!("terracedb.workflow.runtime.open");
+        apply_workflow_span_attributes(&span, &db, &workflow_name, None);
+
+        async move {
+            if definition.name.trim().is_empty() {
+                return Err(WorkflowError::EmptyName);
+            }
+
+            let tables = ensure_workflow_tables(&db, &definition.table_names).await?;
+            let scheduler = definition
+                .scheduler
+                .unwrap_or_else(|| Arc::new(RoundRobinWorkflowScheduler::default()));
+
+            Ok(Self {
+                inner: Arc::new(WorkflowRuntimeInner {
+                    name: definition.name,
+                    db,
+                    clock,
+                    sources: definition.sources,
+                    handler: Arc::new(definition.handler),
+                    scheduler,
+                    source_cursors: DurableCursorStore::new(tables.source_cursors.clone()),
+                    tables,
+                    timer_poll_interval: definition.timer_poll_interval,
+                    source_batch_limit: definition.source_batch_limit,
+                    timer_batch_limit: definition.timer_batch_limit,
+                    running: Mutex::new(false),
+                    in_flight_instances: Mutex::new(BTreeSet::new()),
+                    ready_notify: Notify::new(),
+                }),
+            })
         }
-
-        let tables = ensure_workflow_tables(&db, &definition.table_names).await?;
-        let scheduler = definition
-            .scheduler
-            .unwrap_or_else(|| Arc::new(RoundRobinWorkflowScheduler::default()));
-
-        Ok(Self {
-            inner: Arc::new(WorkflowRuntimeInner {
-                name: definition.name,
-                db,
-                clock,
-                sources: definition.sources,
-                handler: Arc::new(definition.handler),
-                scheduler,
-                source_cursors: DurableCursorStore::new(tables.source_cursors.clone()),
-                tables,
-                timer_poll_interval: definition.timer_poll_interval,
-                source_batch_limit: definition.source_batch_limit,
-                timer_batch_limit: definition.timer_batch_limit,
-                running: Mutex::new(false),
-                in_flight_instances: Mutex::new(BTreeSet::new()),
-                ready_notify: Notify::new(),
-            }),
-        })
+        .instrument(span.clone())
+        .await
     }
 
     pub fn name(&self) -> &str {
@@ -490,29 +608,72 @@ where
         callback_id: impl Into<String>,
         response: Vec<u8>,
     ) -> Result<SequenceNumber, WorkflowError> {
+        self.admit_callback_with_context(
+            instance_id,
+            callback_id,
+            response,
+            Some(OperationContext::current()).filter(|context| !context.is_empty()),
+        )
+        .await
+    }
+
+    pub async fn admit_callback_with_context(
+        &self,
+        instance_id: impl Into<String>,
+        callback_id: impl Into<String>,
+        response: Vec<u8>,
+        operation_context: Option<OperationContext>,
+    ) -> Result<SequenceNumber, WorkflowError> {
         let instance_id = instance_id.into();
         if instance_id.is_empty() {
             return Err(WorkflowError::EmptyInstanceId);
         }
+        let callback_id = callback_id.into();
 
         let trigger = WorkflowTrigger::Callback {
-            callback_id: callback_id.into(),
+            callback_id: callback_id.clone(),
             response,
         };
+        let span = tracing::info_span!("terracedb.workflow.callback.admit");
+        apply_workflow_span_attributes(&span, &self.inner.db, &self.inner.name, Some(&instance_id));
+        set_span_attribute(
+            &span,
+            telemetry_attrs::WORKFLOW_TRIGGER_KIND,
+            workflow_trigger_kind(&trigger),
+        );
+        set_span_attribute(&span, telemetry_attrs::CALLBACK_ID, callback_id);
+        attach_operation_context(&span, operation_context.as_ref());
+        let span_for_attrs = span.clone();
 
-        loop {
-            let mut tx = Transaction::begin(&self.inner.db).await;
-            stage_trigger_admission(&self.inner, &mut tx, &instance_id, &trigger).await?;
-            match tx.commit().await {
-                Ok(sequence) => {
-                    self.inner.scheduler.mark_ready(instance_id.clone());
-                    self.inner.ready_notify.notify_one();
-                    return Ok(sequence);
+        async move {
+            loop {
+                let mut tx = Transaction::begin(&self.inner.db).await;
+                let trigger_seq = stage_trigger_admission(
+                    &self.inner,
+                    &mut tx,
+                    &instance_id,
+                    &trigger,
+                    operation_context.clone(),
+                )
+                .await?;
+                match tx.commit().await {
+                    Ok(sequence) => {
+                        set_span_attribute(
+                            &span_for_attrs,
+                            telemetry_attrs::WORKFLOW_TRIGGER_SEQ,
+                            trigger_seq,
+                        );
+                        self.inner.scheduler.mark_ready(instance_id.clone());
+                        self.inner.ready_notify.notify_one();
+                        return Ok(sequence);
+                    }
+                    Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
+                    Err(error) => return Err(error.into()),
                 }
-                Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
-                Err(error) => return Err(error.into()),
             }
         }
+        .instrument(span.clone())
+        .await
     }
 
     pub async fn start(&self) -> Result<WorkflowHandle, WorkflowError> {
@@ -528,25 +689,68 @@ where
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let runtime = self.inner.clone();
-        let task = tokio::spawn(async move {
-            let result = AssertUnwindSafe(run_workflow_runtime(runtime.clone(), shutdown_rx))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|payload| {
-                    Err(WorkflowError::Panic {
-                        name: runtime.name.clone(),
-                        reason: panic_payload_to_string(payload),
-                    })
-                });
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        let task = tokio::spawn(
+            async move {
+                let result = AssertUnwindSafe(run_workflow_runtime(runtime.clone(), shutdown_rx))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|payload| {
+                        Err(WorkflowError::Panic {
+                            name: runtime.name.clone(),
+                            reason: panic_payload_to_string(payload),
+                        })
+                    });
 
-            *runtime.running.lock().expect("running lock poisoned") = false;
-            result
-        });
+                *runtime.running.lock().expect("running lock poisoned") = false;
+                result
+            }
+            .with_subscriber(dispatch),
+        );
 
         Ok(WorkflowHandle {
             name: self.inner.name.clone(),
             shutdown: shutdown_tx,
             task,
+        })
+    }
+
+    pub async fn telemetry_snapshot(&self) -> Result<WorkflowTelemetrySnapshot, WorkflowError> {
+        let durable_sequence = self.inner.db.current_durable_sequence();
+        let inbox_depth =
+            count_rows_at_sequence(self.inner.tables.inbox_table(), durable_sequence).await?;
+        let timer_depth =
+            count_rows_at_sequence(self.inner.tables.timer_schedule_table(), durable_sequence)
+                .await?;
+        let outbox_depth =
+            count_rows_at_sequence(self.inner.tables.outbox_table(), durable_sequence).await?;
+        let in_flight_instances = self
+            .inner
+            .in_flight_instances
+            .lock()
+            .expect("in-flight lock poisoned")
+            .len();
+        let mut source_lags = Vec::with_capacity(self.inner.sources.len());
+        for source in &self.inner.sources {
+            let durable_source_sequence = self.inner.db.subscribe_durable(source).current();
+            let cursor = self.load_source_cursor(source).await?;
+            source_lags.push(WorkflowSourceTelemetrySnapshot {
+                source_table: source.name().to_string(),
+                durable_sequence: durable_source_sequence,
+                cursor_sequence: cursor.sequence(),
+                lag: durable_source_sequence
+                    .get()
+                    .saturating_sub(cursor.sequence().get()),
+            });
+        }
+
+        Ok(WorkflowTelemetrySnapshot {
+            workflow_name: self.inner.name.clone(),
+            inbox_depth,
+            timer_depth,
+            outbox_depth,
+            in_flight_instances,
+            source_lags,
         })
     }
 }
@@ -585,34 +789,46 @@ async fn run_workflow_runtime<H>(
 where
     H: WorkflowHandler + 'static,
 {
-    let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(run_inbox_executor(runtime.clone(), shutdown_rx.clone()));
-    tasks.spawn(run_timer_loop(runtime.clone(), shutdown_rx.clone()));
-    for source in runtime.sources.clone() {
-        tasks.spawn(run_source_admission_loop(
-            runtime.clone(),
-            source,
-            shutdown_rx.clone(),
-        ));
-    }
+    let span = tracing::info_span!("terracedb.workflow.runtime");
+    apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, None);
 
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(error);
-            }
-            Err(error) => {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(error.into());
+    async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        tasks.spawn(
+            run_inbox_executor(runtime.clone(), shutdown_rx.clone())
+                .with_subscriber(dispatch.clone()),
+        );
+        tasks.spawn(
+            run_timer_loop(runtime.clone(), shutdown_rx.clone()).with_subscriber(dispatch.clone()),
+        );
+        for source in runtime.sources.clone() {
+            tasks.spawn(
+                run_source_admission_loop(runtime.clone(), source, shutdown_rx.clone())
+                    .with_subscriber(dispatch.clone()),
+            );
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(error);
+                }
+                Err(error) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(error.into());
+                }
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
+    .instrument(span.clone())
+    .await
 }
 
 async fn run_source_admission_loop<H>(
@@ -693,56 +909,81 @@ where
     if page.is_empty() {
         return Ok(false);
     }
+    let operation_contexts = collect_operation_contexts(&page);
+    let span = tracing::info_span!("terracedb.workflow.source_batch");
+    apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, None);
+    set_span_attribute(
+        &span,
+        telemetry_attrs::SOURCE_TABLE,
+        source.name().to_string(),
+    );
+    set_span_attribute(
+        &span,
+        "terracedb.workflow.batch.entry_count",
+        page.len() as u64,
+    );
+    attach_operation_contexts(&span, &operation_contexts);
+    let span_for_attrs = span.clone();
 
-    loop {
-        let mut tx = Transaction::begin(&runtime.db).await;
-        let mut ready_seen = BTreeSet::new();
-        let mut newly_ready = Vec::new();
-        let mut new_cursor = *cursor;
+    async move {
+        loop {
+            let mut tx = Transaction::begin(&runtime.db).await;
+            let mut ready_seen = BTreeSet::new();
+            let mut newly_ready = Vec::new();
+            let mut new_cursor = *cursor;
 
-        for entry in &page {
-            let instance_id = runtime.handler.route_event(entry).await.map_err(|source| {
-                WorkflowError::Handler {
-                    name: runtime.name.clone(),
-                    source,
+            for entry in &page {
+                let instance_id = runtime.handler.route_event(entry).await.map_err(|source| {
+                    WorkflowError::Handler {
+                        name: runtime.name.clone(),
+                        source,
+                    }
+                })?;
+                if instance_id.is_empty() {
+                    return Err(WorkflowError::EmptyInstanceId);
                 }
-            })?;
-            if instance_id.is_empty() {
-                return Err(WorkflowError::EmptyInstanceId);
+
+                stage_trigger_admission(
+                    runtime,
+                    &mut tx,
+                    &instance_id,
+                    &WorkflowTrigger::Event(entry.clone()),
+                    entry.operation_context.clone(),
+                )
+                .await?;
+                if ready_seen.insert(instance_id.clone()) {
+                    newly_ready.push(instance_id);
+                }
+                new_cursor = entry.cursor;
             }
 
-            stage_trigger_admission(
-                runtime,
+            runtime.source_cursors.stage_persist_in_transaction(
                 &mut tx,
-                &instance_id,
-                &WorkflowTrigger::Event(entry.clone()),
-            )
-            .await?;
-            if ready_seen.insert(instance_id.clone()) {
-                newly_ready.push(instance_id);
-            }
-            new_cursor = entry.cursor;
-        }
+                source_cursor_key(source),
+                new_cursor,
+            );
 
-        runtime.source_cursors.stage_persist_in_transaction(
-            &mut tx,
-            source_cursor_key(source),
-            new_cursor,
-        );
-
-        match tx.commit_no_flush().await {
-            Ok(_) => {
-                *cursor = new_cursor;
-                for instance_id in newly_ready {
-                    runtime.scheduler.mark_ready(instance_id);
+            match tx.commit_no_flush().await {
+                Ok(_) => {
+                    *cursor = new_cursor;
+                    set_span_attribute(
+                        &span_for_attrs,
+                        telemetry_attrs::LOG_CURSOR,
+                        format!("{}:{}", new_cursor.sequence().get(), new_cursor.op_index()),
+                    );
+                    for instance_id in newly_ready {
+                        runtime.scheduler.mark_ready(instance_id);
+                    }
+                    runtime.ready_notify.notify_one();
+                    return Ok(true);
                 }
-                runtime.ready_notify.notify_one();
-                return Ok(true);
+                Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
+                Err(error) => return Err(error.into()),
             }
-            Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
-            Err(error) => return Err(error.into()),
         }
     }
+    .instrument(span.clone())
+    .await
 }
 
 async fn run_timer_loop<H>(
@@ -799,48 +1040,72 @@ where
     if due.is_empty() {
         return Ok(false);
     }
+    let contexts = due
+        .timers
+        .iter()
+        .filter_map(|timer| {
+            decode_payload::<StoredWorkflowTimer>(&timer.payload, "workflow timer payload")
+                .ok()
+                .and_then(|stored| stored.operation_context)
+        })
+        .collect::<Vec<_>>();
+    let span = tracing::info_span!("terracedb.workflow.timer.fire_batch");
+    apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, None);
+    set_span_attribute(
+        &span,
+        "terracedb.workflow.timer.count",
+        due.timers.len() as u64,
+    );
+    attach_operation_contexts(&span, &contexts);
 
-    loop {
-        let mut tx = Transaction::begin(&runtime.db).await;
-        let mut ready_seen = BTreeSet::new();
-        let mut newly_ready = Vec::new();
+    async move {
+        loop {
+            let mut tx = Transaction::begin(&runtime.db).await;
+            let mut ready_seen = BTreeSet::new();
+            let mut newly_ready = Vec::new();
 
-        for timer in &due.timers {
-            let stored_timer =
-                decode_payload::<StoredWorkflowTimer>(&timer.payload, "workflow timer payload")?;
-            stage_trigger_admission(
-                runtime,
-                &mut tx,
-                &stored_timer.workflow_instance,
-                &WorkflowTrigger::Timer {
-                    timer_id: timer.timer_id.clone(),
-                    fire_at: timer.fire_at,
-                    payload: stored_timer.payload.clone(),
-                },
-            )
-            .await?;
-            runtime.tables.timers.stage_delete_at_in_transaction(
-                &mut tx,
-                timer.timer_id.clone(),
-                timer.fire_at,
-            );
-            if ready_seen.insert(stored_timer.workflow_instance.clone()) {
-                newly_ready.push(stored_timer.workflow_instance);
-            }
-        }
-
-        match tx.commit().await {
-            Ok(_) => {
-                for instance_id in newly_ready {
-                    runtime.scheduler.mark_ready(instance_id);
+            for timer in &due.timers {
+                let stored_timer = decode_payload::<StoredWorkflowTimer>(
+                    &timer.payload,
+                    "workflow timer payload",
+                )?;
+                stage_trigger_admission(
+                    runtime,
+                    &mut tx,
+                    &stored_timer.workflow_instance,
+                    &WorkflowTrigger::Timer {
+                        timer_id: timer.timer_id.clone(),
+                        fire_at: timer.fire_at,
+                        payload: stored_timer.payload.clone(),
+                    },
+                    stored_timer.operation_context.clone(),
+                )
+                .await?;
+                runtime.tables.timers.stage_delete_at_in_transaction(
+                    &mut tx,
+                    timer.timer_id.clone(),
+                    timer.fire_at,
+                );
+                if ready_seen.insert(stored_timer.workflow_instance.clone()) {
+                    newly_ready.push(stored_timer.workflow_instance);
                 }
-                runtime.ready_notify.notify_one();
-                return Ok(true);
             }
-            Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
-            Err(error) => return Err(error.into()),
+
+            match tx.commit().await {
+                Ok(_) => {
+                    for instance_id in newly_ready {
+                        runtime.scheduler.mark_ready(instance_id);
+                    }
+                    runtime.ready_notify.notify_one();
+                    return Ok(true);
+                }
+                Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
     }
+    .instrument(span.clone())
+    .await
 }
 
 async fn run_inbox_executor<H>(
@@ -994,7 +1259,15 @@ where
         return Ok(false);
     };
 
-    process_workflow_trigger(runtime, instance_id, admitted.trigger, inbox_key).await?;
+    process_workflow_trigger(
+        runtime,
+        instance_id,
+        admitted.trigger,
+        admitted.trigger_seq,
+        admitted.operation_context,
+        inbox_key,
+    )
+    .await?;
     Ok(rows.len() > 1)
 }
 
@@ -1002,80 +1275,121 @@ async fn process_workflow_trigger<H>(
     runtime: &WorkflowRuntimeInner<H>,
     instance_id: &str,
     trigger: WorkflowTrigger,
+    trigger_seq: u64,
+    operation_context: Option<OperationContext>,
     inbox_key: Key,
 ) -> Result<(), WorkflowError>
 where
     H: WorkflowHandler + 'static,
 {
-    let mut tx = Transaction::begin(&runtime.db).await;
-    let current_state = tx
-        .read(runtime.tables.state_table(), instance_key(instance_id))
-        .await?;
-    let ctx = WorkflowContext::new(&runtime.name, instance_id, &trigger, current_state.as_ref())?;
-    let output = runtime
-        .handler
-        .handle(instance_id, current_state, &trigger, &ctx)
-        .await
-        .map_err(|source| WorkflowError::Handler {
-            name: runtime.name.clone(),
-            source,
-        })?;
-
-    tx.delete(runtime.tables.inbox_table(), inbox_key);
-
-    match output.state {
-        WorkflowStateMutation::Unchanged => {}
-        WorkflowStateMutation::Put(value) => {
-            tx.write(
-                runtime.tables.state_table(),
-                instance_key(instance_id),
-                value,
+    let span = tracing::info_span!("terracedb.workflow.step");
+    apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, Some(instance_id));
+    set_span_attribute(
+        &span,
+        telemetry_attrs::WORKFLOW_TRIGGER_KIND,
+        workflow_trigger_kind(&trigger),
+    );
+    set_span_attribute(&span, telemetry_attrs::WORKFLOW_TRIGGER_SEQ, trigger_seq);
+    match &trigger {
+        WorkflowTrigger::Event(entry) => {
+            set_span_attribute(
+                &span,
+                telemetry_attrs::SOURCE_TABLE,
+                entry.table.name().to_string(),
             );
+            set_span_attribute(&span, telemetry_attrs::SEQUENCE, entry.sequence.get());
         }
-        WorkflowStateMutation::Delete => {
-            tx.delete(runtime.tables.state_table(), instance_key(instance_id));
+        WorkflowTrigger::Timer {
+            timer_id, fire_at, ..
+        } => {
+            set_span_attribute(
+                &span,
+                telemetry_attrs::TIMER_ID,
+                String::from_utf8_lossy(timer_id).into_owned(),
+            );
+            set_span_attribute(&span, "terracedb.timer.fire_at", fire_at.get());
+        }
+        WorkflowTrigger::Callback { callback_id, .. } => {
+            set_span_attribute(&span, telemetry_attrs::CALLBACK_ID, callback_id.clone());
         }
     }
+    attach_operation_context(&span, operation_context.as_ref());
 
-    for entry in output.outbox_entries {
-        runtime
-            .tables
-            .outbox
-            .stage_entry_in_transaction(&mut tx, entry)?;
-    }
+    async move {
+        let mut tx = Transaction::begin(&runtime.db).await;
+        let current_state = tx
+            .read(runtime.tables.state_table(), instance_key(instance_id))
+            .await?;
+        let ctx =
+            WorkflowContext::new(&runtime.name, instance_id, &trigger, current_state.as_ref())?;
+        let output = runtime
+            .handler
+            .handle(instance_id, current_state, &trigger, &ctx)
+            .await
+            .map_err(|source| WorkflowError::Handler {
+                name: runtime.name.clone(),
+                source,
+            })?;
 
-    for timer in output.timers {
-        match timer {
-            WorkflowTimerCommand::Schedule {
-                timer_id,
-                fire_at,
-                payload,
-            } => runtime.tables.timers.stage_schedule_in_transaction(
-                &mut tx,
-                ScheduledTimer {
-                    timer_id,
-                    fire_at,
-                    payload: encode_payload(
-                        &StoredWorkflowTimer {
-                            workflow_instance: instance_id.to_string(),
-                            payload,
-                        },
-                        "workflow timer payload",
-                    )?,
-                },
-            )?,
-            WorkflowTimerCommand::Cancel { timer_id } => {
-                runtime
-                    .tables
-                    .timers
-                    .cancel_in_transaction(&mut tx, timer_id)
-                    .await?;
+        tx.delete(runtime.tables.inbox_table(), inbox_key);
+
+        match output.state {
+            WorkflowStateMutation::Unchanged => {}
+            WorkflowStateMutation::Put(value) => {
+                tx.write(
+                    runtime.tables.state_table(),
+                    instance_key(instance_id),
+                    value,
+                );
+            }
+            WorkflowStateMutation::Delete => {
+                tx.delete(runtime.tables.state_table(), instance_key(instance_id));
             }
         }
-    }
 
-    tx.commit_no_flush().await?;
-    Ok(())
+        for entry in output.outbox_entries {
+            runtime
+                .tables
+                .outbox
+                .stage_entry_in_transaction(&mut tx, entry)?;
+        }
+
+        for timer in output.timers {
+            match timer {
+                WorkflowTimerCommand::Schedule {
+                    timer_id,
+                    fire_at,
+                    payload,
+                } => runtime.tables.timers.stage_schedule_in_transaction(
+                    &mut tx,
+                    ScheduledTimer {
+                        timer_id,
+                        fire_at,
+                        payload: encode_payload(
+                            &StoredWorkflowTimer {
+                                workflow_instance: instance_id.to_string(),
+                                payload,
+                                operation_context: operation_context.clone(),
+                            },
+                            "workflow timer payload",
+                        )?,
+                    },
+                )?,
+                WorkflowTimerCommand::Cancel { timer_id } => {
+                    runtime
+                        .tables
+                        .timers
+                        .cancel_in_transaction(&mut tx, timer_id)
+                        .await?;
+                }
+            }
+        }
+
+        tx.commit_no_flush().await?;
+        Ok(())
+    }
+    .instrument(span.clone())
+    .await
 }
 
 async fn stage_trigger_admission<H>(
@@ -1083,6 +1397,7 @@ async fn stage_trigger_admission<H>(
     tx: &mut Transaction,
     instance_id: &str,
     trigger: &WorkflowTrigger,
+    operation_context: Option<OperationContext>,
 ) -> Result<u64, WorkflowError>
 where
     H: WorkflowHandler + 'static,
@@ -1112,6 +1427,7 @@ where
                 workflow_instance: instance_id.to_string(),
                 trigger_seq: trigger_sequence,
                 trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
+                operation_context,
             },
             "workflow inbox trigger",
         )?),
@@ -1246,7 +1562,9 @@ fn decode_admitted_trigger(
     let stored = decode_payload::<StoredAdmittedWorkflowTrigger>(bytes, "workflow inbox trigger")?;
     Ok(AdmittedWorkflowTrigger {
         workflow_instance: stored.workflow_instance,
+        trigger_seq: stored.trigger_seq,
         trigger: stored.trigger.into_runtime_trigger(db),
+        operation_context: stored.operation_context,
     })
 }
 
@@ -1285,10 +1603,31 @@ fn expect_bytes_value<'a>(value: &'a Value, context: &str) -> Result<&'a [u8], W
     }
 }
 
+async fn count_rows_at_sequence(
+    table: &Table,
+    sequence: SequenceNumber,
+) -> Result<usize, WorkflowError> {
+    let mut rows = table
+        .scan_at(
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    let mut count = 0_usize;
+    while rows.next().await.is_some() {
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[derive(Clone, Debug)]
 struct AdmittedWorkflowTrigger {
     workflow_instance: String,
+    trigger_seq: u64,
     trigger: WorkflowTrigger,
+    operation_context: Option<OperationContext>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1296,12 +1635,14 @@ struct StoredAdmittedWorkflowTrigger {
     workflow_instance: String,
     trigger_seq: u64,
     trigger: StoredWorkflowTrigger,
+    operation_context: Option<OperationContext>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredWorkflowTimer {
     workflow_instance: String,
     payload: Vec<u8>,
+    operation_context: Option<OperationContext>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1378,6 +1719,7 @@ struct StoredChangeEntry {
     cursor: LogCursor,
     sequence: SequenceNumber,
     kind: ChangeKind,
+    operation_context: Option<OperationContext>,
 }
 
 impl StoredChangeEntry {
@@ -1389,6 +1731,7 @@ impl StoredChangeEntry {
             cursor: entry.cursor,
             sequence: entry.sequence,
             kind: entry.kind,
+            operation_context: entry.operation_context.clone(),
         }
     }
 
@@ -1400,6 +1743,7 @@ impl StoredChangeEntry {
             sequence: self.sequence,
             kind: self.kind,
             table: db.table(self.source_table),
+            operation_context: self.operation_context,
         }
     }
 }

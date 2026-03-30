@@ -1184,6 +1184,55 @@ Build the application-facing Terracedb harnesses on top of the shared simulation
 
 ---
 
+### T32b. OpenTelemetry export integration and cross-runtime correlation
+
+**Depends on:** T03a, T16, T31, T32
+
+**Description**
+
+Implement Terracedb’s first observability integration as an **export-only** OpenTelemetry path: traces, logs, and metrics are emitted to external OTLP collectors / providers, but Terracedb does not yet act as an in-process telemetry storage backend. This task covers instrumentation of the core DB, projection runtime, and workflow runtime; OTLP bootstrap and shutdown; process-level resource metadata; and correlation with application spans when the embedding application is also using OpenTelemetry.
+
+The design goal is to make observability a **library edge concern**, not a storage-engine concern. Instrumentation should live in the production code paths of `terracedb`, `terracedb-projections`, and `terracedb-workflows`, while exporter/provider setup lives in a small dedicated integration crate or module. The same codebase must support three modes: disabled, deterministic test exporter, and real OTLP export. Correlation must work in the common case where an application already has an active OpenTelemetry/tracing context and Terracedb operations should appear as child spans or linked work within that trace.
+
+**Implementation steps**
+
+1. Add a dedicated observability integration surface (for example `terracedb-otel`) that owns:
+
+   * OpenTelemetry resource construction (`service.name`, version, environment, process/runtime attributes),
+   * OTLP exporter/provider bootstrap,
+   * propagation setup,
+   * test/in-memory exporters,
+   * explicit shutdown / flush handles.
+2. Instrument the DB, projection, and workflow production paths with `tracing` spans/events rather than hard-coding OTLP calls throughout engine logic. Cover at least:
+
+   * DB open/close,
+   * commit / flush / recovery,
+   * change-feed catch-up and subscription wake processing,
+   * compaction / object-store operations,
+   * projection batch processing and watermark advancement,
+   * workflow trigger admission, step execution, timer firing, callback admission, and outbox delivery.
+3. Define Terracedb-specific span/log/metric attribute names and keep them stable. Include identifiers such as DB name/instance, table, projection/workflow name, sequence / durable-sequence where appropriate, storage mode, and tenant/application labels when available. Do **not** make unbounded user keys or row payloads part of default telemetry.
+4. Implement correlation with an embedding application’s existing tracing/OTel context:
+
+   * if a Terracedb API call is invoked under an existing application span, the Terracedb span should become a child span,
+   * if asynchronous background work is causally triggered by an earlier span but executes later (projection catch-up, workflow continuation, outbox delivery), preserve correlation via explicit parent propagation or span links rather than ambient thread-local assumptions,
+   * expose helper APIs for callers to attach operation-scoped context explicitly when needed.
+5. Add a metric reporter layer that exports stable engine/runtime metrics without embedding exporter state into core types. Favor poll/snapshot-based collection for internal state (for example scheduler backlog, compaction debt, projection lag, workflow inbox depth, durable-vs-visible lag) so the engine remains decoupled from the metric backend.
+6. Provide configuration for disabled mode, test-exporter mode, and real OTLP mode. Real OTLP mode should support endpoint, protocol, headers/auth, export interval/batch knobs, and a clean shutdown path that flushes pending telemetry before process exit.
+7. Keep deterministic simulation intact by ensuring simulation tests do not depend on real background OTLP worker threads or real sockets. The deterministic harness should be able to install a test exporter and assert on completed spans/logs/metrics as ordinary test data.
+
+**Verification**
+
+Write a focused integration test matrix around **correlation**, **stability of emitted telemetry**, and **deterministic testability**, not just “did the exporter send something.”
+
+Start with direct DB-call correlation tests. Create an application-level root span, invoke Terracedb operations (`commit`, `flush`, `scanSince`, transaction helper calls where available), export to an in-memory/test exporter, and assert that the emitted Terracedb spans share the same trace ID as the application span and have the expected parent/child relationship. Add a negative control where Terracedb is called with no ambient context and verify that it still emits valid standalone spans rather than panicking or silently dropping instrumentation. Add tests that nested operations do not create nonsensical span trees (for example every internal helper becoming a top-level root span), and that the stable Terracedb attributes are present while row values, large payloads, and unbounded key material are absent by default.
+
+Then add async/runtime-correlation tests for projections and workflows. Drive a source event under an application span, let it flow through the projection runtime and workflow runtime, and verify that later asynchronous work is still correlated correctly: either it remains in the same trace with an explicit propagated parent, or it is connected by span links where strict parent/child timing no longer makes sense. Include crash/restart cases in deterministic simulation: emit work, crash after durable admission but before the runtime finishes processing, restart, and assert that the replayed projection/workflow spans are still well-formed and carry enough stable identifiers (projection/workflow name, source table, sequence, trigger ID) to correlate them with the original causal chain. The key property is that replay/recovery may create new execution spans, but it must not lose causal linkage or invent nondeterministic IDs outside the configured tracing/export system.
+
+Add metric and log verification with the same rigor. For metrics, use the test exporter to assert that snapshots include expected gauges/counters/histograms for scheduler backlog, compaction debt, projection lag, workflow queue/inbox depth, and durable-vs-visible watermarks, and that repeated collection updates the same logical instruments rather than generating an ever-growing set of metric names or attribute cardinalities. For logs, emit representative warnings/errors from object-store failure, retry, and recovery paths and assert that they carry the current trace/span context when invoked inside an active span. Finally, add deterministic-simulation tests that run with the test exporter enabled across repeated same-seed runs and verify that emitted span/log/metric shapes are reproducible enough for seed-based debugging: same causal operations should produce the same sequence of Terracedb telemetry records modulo exporter timestamps and other explicitly documented nondeterministic fields.
+
+---
+
 ## Phase 7 — Full-stack deterministic hardening
 
 **Parallelization:** This hardening phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist.

@@ -3,94 +3,107 @@ impl Db {
         mut config: DbConfig,
         dependencies: DbDependencies,
     ) -> Result<Self, OpenError> {
-        Self::validate_storage_config(&config.storage)?;
-        let scheduler = config
-            .scheduler
-            .clone()
-            .unwrap_or_else(|| Arc::new(RoundRobinScheduler::default()));
-        config.scheduler = Some(scheduler.clone());
-        if let StorageConfig::Tiered(tiered) = &config.storage {
-            Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
-        }
-        let catalog_location = Self::catalog_location(&config.storage);
-        let (tables, next_table_id) = Self::load_tables(&dependencies, &catalog_location).await?;
-        let loaded_manifest = Self::load_local_manifest(&config.storage, &dependencies).await?;
-        let mut commit_runtime = Self::open_commit_runtime(&config.storage, &dependencies).await?;
-        if let CommitLogBackend::Memory(log) = &mut commit_runtime.backend {
-            log.durable_commit_log_segments = loaded_manifest.durable_commit_log_segments.clone();
-            log.next_segment_id = loaded_manifest
-                .durable_commit_log_segments
+        let db_name = db_name_from_storage(&config.storage);
+        let db_instance = db_instance_from_storage(&config.storage);
+        let storage_mode = storage_mode_name(&config.storage);
+        let span = tracing::info_span!("terracedb.db.open");
+        apply_db_span_attributes(&span, &db_name, &db_instance, storage_mode);
+
+        async move {
+            Self::validate_storage_config(&config.storage)?;
+            let scheduler = config
+                .scheduler
+                .clone()
+                .unwrap_or_else(|| Arc::new(RoundRobinScheduler::default()));
+            config.scheduler = Some(scheduler.clone());
+            if let StorageConfig::Tiered(tiered) = &config.storage {
+                Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
+            }
+            let catalog_location = Self::catalog_location(&config.storage);
+            let (tables, next_table_id) =
+                Self::load_tables(&dependencies, &catalog_location).await?;
+            let loaded_manifest = Self::load_local_manifest(&config.storage, &dependencies).await?;
+            let mut commit_runtime =
+                Self::open_commit_runtime(&config.storage, &dependencies).await?;
+            if let CommitLogBackend::Memory(log) = &mut commit_runtime.backend {
+                log.durable_commit_log_segments =
+                    loaded_manifest.durable_commit_log_segments.clone();
+                log.next_segment_id = loaded_manifest
+                    .durable_commit_log_segments
+                    .iter()
+                    .map(|segment| segment.footer.segment_id.get())
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .max(1);
+            }
+            let recovered_commit_log = commit_runtime
+                .recover_after(loaded_manifest.last_flushed_sequence)
+                .await?;
+            let recovered_sequence = recovered_commit_log
+                .max_sequence
+                .max(loaded_manifest.last_flushed_sequence);
+            let next_sstable_id = loaded_manifest
+                .live_sstables
                 .iter()
-                .map(|segment| segment.footer.segment_id.get())
+                .filter_map(|sstable| Self::parse_sstable_local_id(&sstable.meta.local_id))
                 .max()
                 .unwrap_or(0)
                 .saturating_add(1)
                 .max(1);
+            let memtables = recovered_commit_log.memtables;
+            let sstables = SstableState {
+                manifest_generation: loaded_manifest.generation,
+                last_flushed_sequence: loaded_manifest.last_flushed_sequence,
+                live: loaded_manifest.live_sstables,
+            };
+            let initial_table_watermarks =
+                Self::initial_table_watermarks(&tables, &memtables, &sstables);
+
+            let db = Self {
+                inner: Arc::new(DbInner {
+                    config,
+                    scheduler,
+                    dependencies,
+                    catalog_location,
+                    catalog_write_lock: AsyncMutex::new(()),
+                    commit_lock: AsyncMutex::new(()),
+                    maintenance_lock: AsyncMutex::new(()),
+                    backup_lock: AsyncMutex::new(()),
+                    commit_runtime: AsyncMutex::new(commit_runtime),
+                    commit_coordinator: Mutex::new(CommitCoordinator::default()),
+                    next_table_id: AtomicU32::new(next_table_id),
+                    next_sequence: AtomicU64::new(recovered_sequence.get()),
+                    current_sequence: AtomicU64::new(recovered_sequence.get()),
+                    current_durable_sequence: AtomicU64::new(recovered_sequence.get()),
+                    tables: RwLock::new(tables),
+                    memtables: RwLock::new(memtables),
+                    sstables: RwLock::new(sstables),
+                    next_sstable_id: AtomicU64::new(next_sstable_id),
+                    snapshot_tracker: Mutex::new(SnapshotTracker::default()),
+                    next_snapshot_id: AtomicU64::new(0),
+                    compaction_filter_stats: Mutex::new(BTreeMap::new()),
+                    visible_watchers: Arc::new(WatermarkRegistry::new(
+                        initial_table_watermarks.clone(),
+                    )),
+                    durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
+                    work_deferrals: Mutex::new(BTreeMap::new()),
+                    #[cfg(test)]
+                    commit_phase_blocks: Mutex::new(Vec::new()),
+                    #[cfg(test)]
+                    compaction_phase_blocks: Mutex::new(Vec::new()),
+                    #[cfg(test)]
+                    offload_phase_blocks: Mutex::new(Vec::new()),
+                }),
+            };
+            db.prune_commit_log(true)
+                .await
+                .map_err(OpenError::Storage)?;
+
+            Ok(db)
         }
-        let recovered_commit_log = commit_runtime
-            .recover_after(loaded_manifest.last_flushed_sequence)
-            .await?;
-        let recovered_sequence = recovered_commit_log
-            .max_sequence
-            .max(loaded_manifest.last_flushed_sequence);
-        let next_sstable_id = loaded_manifest
-            .live_sstables
-            .iter()
-            .filter_map(|sstable| Self::parse_sstable_local_id(&sstable.meta.local_id))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(1);
-        let memtables = recovered_commit_log.memtables;
-        let sstables = SstableState {
-            manifest_generation: loaded_manifest.generation,
-            last_flushed_sequence: loaded_manifest.last_flushed_sequence,
-            live: loaded_manifest.live_sstables,
-        };
-        let initial_table_watermarks =
-            Self::initial_table_watermarks(&tables, &memtables, &sstables);
-
-        let db = Self {
-            inner: Arc::new(DbInner {
-                config,
-                scheduler,
-                dependencies,
-                catalog_location,
-                catalog_write_lock: AsyncMutex::new(()),
-                commit_lock: AsyncMutex::new(()),
-                maintenance_lock: AsyncMutex::new(()),
-                backup_lock: AsyncMutex::new(()),
-                commit_runtime: AsyncMutex::new(commit_runtime),
-                commit_coordinator: Mutex::new(CommitCoordinator::default()),
-                next_table_id: AtomicU32::new(next_table_id),
-                next_sequence: AtomicU64::new(recovered_sequence.get()),
-                current_sequence: AtomicU64::new(recovered_sequence.get()),
-                current_durable_sequence: AtomicU64::new(recovered_sequence.get()),
-                tables: RwLock::new(tables),
-                memtables: RwLock::new(memtables),
-                sstables: RwLock::new(sstables),
-                next_sstable_id: AtomicU64::new(next_sstable_id),
-                snapshot_tracker: Mutex::new(SnapshotTracker::default()),
-                next_snapshot_id: AtomicU64::new(0),
-                compaction_filter_stats: Mutex::new(BTreeMap::new()),
-                visible_watchers: Arc::new(WatermarkRegistry::new(
-                    initial_table_watermarks.clone(),
-                )),
-                durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
-                work_deferrals: Mutex::new(BTreeMap::new()),
-                #[cfg(test)]
-                commit_phase_blocks: Mutex::new(Vec::new()),
-                #[cfg(test)]
-                compaction_phase_blocks: Mutex::new(Vec::new()),
-                #[cfg(test)]
-                offload_phase_blocks: Mutex::new(Vec::new()),
-            }),
-        };
-        db.prune_commit_log(true)
-            .await
-            .map_err(OpenError::Storage)?;
-
-        Ok(db)
+        .instrument(span.clone())
+        .await
     }
 
     fn validate_storage_config(storage: &StorageConfig) -> Result<(), OpenError> {

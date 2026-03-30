@@ -973,161 +973,214 @@ impl Db {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn run_next_compaction(&self) -> Result<bool, StorageError> {
-        let Some(local_root) = self.local_storage_root().map(str::to_string) else {
-            return Ok(false);
-        };
-        let _maintenance_guard = self.inner.maintenance_lock.lock().await;
-        let Some(job) = self.pending_compaction_jobs().into_iter().next() else {
-            return Ok(false);
-        };
+        let span = tracing::info_span!("terracedb.db.compaction.run_next");
+        apply_db_span_attributes(
+            &span,
+            &self.telemetry_db_name(),
+            &self.telemetry_db_instance(),
+            self.telemetry_storage_mode(),
+        );
+        crate::set_span_attribute(
+            &span,
+            crate::telemetry_attrs::WORK_KIND,
+            opentelemetry::Value::String("compaction".into()),
+        );
+        let span_for_attrs = span.clone();
 
-        self.execute_compaction_job(&local_root, job).await?;
-        Ok(true)
+        async move {
+            let Some(local_root) = self.local_storage_root().map(str::to_string) else {
+                return Ok(false);
+            };
+            let _maintenance_guard = self.inner.maintenance_lock.lock().await;
+            let Some(job) = self.pending_compaction_jobs().into_iter().next() else {
+                return Ok(false);
+            };
+            apply_table_span_attribute(&span_for_attrs, &job.table_name);
+            crate::set_span_attribute(
+                &span_for_attrs,
+                "terracedb.compaction.target_level",
+                job.target_level,
+            );
+            crate::set_span_attribute(
+                &span_for_attrs,
+                "terracedb.compaction.input_count",
+                job.input_local_ids.len() as u64,
+            );
+
+            self.execute_compaction_job(&local_root, job).await?;
+            Ok(true)
+        }
+        .instrument(span.clone())
+        .await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     async fn execute_offload_job(&self, job: OffloadJob) -> Result<(), StorageError> {
-        let StorageConfig::Tiered(config) = &self.inner.config.storage else {
-            return Err(StorageError::unsupported(
-                "cold offload is only supported in tiered mode",
-            ));
-        };
+        let span = tracing::info_span!("terracedb.db.offload.execute");
+        apply_db_span_attributes(
+            &span,
+            &self.telemetry_db_name(),
+            &self.telemetry_db_instance(),
+            self.telemetry_storage_mode(),
+        );
+        crate::set_span_attribute(
+            &span,
+            crate::telemetry_attrs::WORK_KIND,
+            opentelemetry::Value::String("offload".into()),
+        );
+        apply_table_span_attribute(&span, &job.table_name);
+        crate::set_span_attribute(
+            &span,
+            "terracedb.offload.input_count",
+            job.input_local_ids.len() as u64,
+        );
 
-        let tables = self.tables_read().clone();
-        let table = Self::stored_table_by_id(&tables, job.table_id)
-            .cloned()
-            .ok_or_else(|| {
-                StorageError::corruption(format!(
-                    "offload references unknown table id {}",
-                    job.table_id.get()
-                ))
-            })?;
-        if table.config.format != TableFormat::Row {
-            return Err(StorageError::unsupported(
-                "cold offload only supports row tables",
-            ));
-        }
+        async move {
+            let StorageConfig::Tiered(config) = &self.inner.config.storage else {
+                return Err(StorageError::unsupported(
+                    "cold offload is only supported in tiered mode",
+                ));
+            };
 
-        let live = self.sstables_read().live.clone();
-        let by_local_id = live
-            .into_iter()
-            .map(|sstable| (sstable.meta.local_id.clone(), sstable))
-            .collect::<BTreeMap<_, _>>();
-        let mut inputs = Vec::with_capacity(job.input_local_ids.len());
-        for local_id in &job.input_local_ids {
-            let input = by_local_id.get(local_id).cloned().ok_or_else(|| {
-                StorageError::corruption(format!(
-                    "offload job {} resolved no SSTable for {}",
-                    job.id, local_id
-                ))
-            })?;
-            if input.meta.table_id != job.table_id {
-                return Err(StorageError::corruption(format!(
-                    "offload job {} references SSTable {} from another table",
-                    job.id, local_id
-                )));
+            let tables = self.tables_read().clone();
+            let table = Self::stored_table_by_id(&tables, job.table_id)
+                .cloned()
+                .ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "offload references unknown table id {}",
+                        job.table_id.get()
+                    ))
+                })?;
+            if table.config.format != TableFormat::Row {
+                return Err(StorageError::unsupported(
+                    "cold offload only supports row tables",
+                ));
             }
-            if input.meta.file_path.is_empty() {
-                return Err(StorageError::corruption(format!(
-                    "offload job {} references non-local SSTable {}",
-                    job.id, local_id
-                )));
-            }
-            inputs.push(input);
-        }
 
-        let layout = ObjectKeyLayout::new(&config.s3);
-        let storage = UnifiedStorage::from_dependencies(&self.inner.dependencies);
-        let mut updated_inputs = BTreeMap::new();
-        for input in &inputs {
-            let remote_key = layout.cold_sstable(
-                input.meta.table_id,
-                0,
-                input.meta.min_sequence,
-                input.meta.max_sequence,
-                &input.meta.local_id,
-            );
-            let bytes = read_path(&self.inner.dependencies, &input.meta.file_path).await?;
-            storage
-                .put_object(&remote_key, &bytes)
-                .await
-                .map_err(|error| error.into_storage_error())?;
-            Self::note_backup_object_birth(&self.inner.dependencies, &layout, &remote_key).await;
-
-            let mut updated = input.clone();
-            updated.meta.file_path.clear();
-            updated.meta.remote_key = Some(remote_key);
-            updated_inputs.insert(updated.meta.local_id.clone(), updated);
-        }
-
-        #[cfg(test)]
-        self.maybe_pause_offload_phase(OffloadPhase::UploadComplete)
-            .await;
-
-        let current_state = self.sstables_read().clone();
-        let mut replaced = 0_usize;
-        let mut new_live = current_state
-            .live
-            .into_iter()
-            .map(|sstable| {
-                if let Some(updated) = updated_inputs.get(&sstable.meta.local_id) {
-                    replaced += 1;
-                    updated.clone()
-                } else {
-                    sstable
+            let live = self.sstables_read().live.clone();
+            let by_local_id = live
+                .into_iter()
+                .map(|sstable| (sstable.meta.local_id.clone(), sstable))
+                .collect::<BTreeMap<_, _>>();
+            let mut inputs = Vec::with_capacity(job.input_local_ids.len());
+            for local_id in &job.input_local_ids {
+                let input = by_local_id.get(local_id).cloned().ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "offload job {} resolved no SSTable for {}",
+                        job.id, local_id
+                    ))
+                })?;
+                if input.meta.table_id != job.table_id {
+                    return Err(StorageError::corruption(format!(
+                        "offload job {} references SSTable {} from another table",
+                        job.id, local_id
+                    )));
                 }
-            })
-            .collect::<Vec<_>>();
-        if replaced != job.input_local_ids.len() {
-            return Err(StorageError::corruption(format!(
-                "offload job {} replaced {} of {} SSTables",
-                job.id,
-                replaced,
-                job.input_local_ids.len()
-            )));
-        }
-        Self::sort_live_sstables(&mut new_live);
+                if input.meta.file_path.is_empty() {
+                    return Err(StorageError::corruption(format!(
+                        "offload job {} references non-local SSTable {}",
+                        job.id, local_id
+                    )));
+                }
+                inputs.push(input);
+            }
 
-        let next_generation =
-            ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
-        self.install_manifest(
-            next_generation,
-            current_state.last_flushed_sequence,
-            &new_live,
-        )
-        .await?;
+            let layout = ObjectKeyLayout::new(&config.s3);
+            let storage = UnifiedStorage::from_dependencies(&self.inner.dependencies);
+            let mut updated_inputs = BTreeMap::new();
+            for input in &inputs {
+                let remote_key = layout.cold_sstable(
+                    input.meta.table_id,
+                    0,
+                    input.meta.min_sequence,
+                    input.meta.max_sequence,
+                    &input.meta.local_id,
+                );
+                let bytes = read_path(&self.inner.dependencies, &input.meta.file_path).await?;
+                storage
+                    .put_object(&remote_key, &bytes)
+                    .await
+                    .map_err(|error| error.into_storage_error())?;
+                Self::note_backup_object_birth(&self.inner.dependencies, &layout, &remote_key)
+                    .await;
 
-        {
-            let mut sstables = self.sstables_write();
-            sstables.manifest_generation = next_generation;
-            sstables.live = new_live;
-        }
-        let state = self.sstables_read().clone();
-        let _ = self
-            .sync_tiered_backup_manifest(
-                state.manifest_generation,
-                state.last_flushed_sequence,
-                &state.live,
+                let mut updated = input.clone();
+                updated.meta.file_path.clear();
+                updated.meta.remote_key = Some(remote_key);
+                updated_inputs.insert(updated.meta.local_id.clone(), updated);
+            }
+
+            #[cfg(test)]
+            self.maybe_pause_offload_phase(OffloadPhase::UploadComplete)
+                .await;
+
+            let current_state = self.sstables_read().clone();
+            let mut replaced = 0_usize;
+            let mut new_live = current_state
+                .live
+                .into_iter()
+                .map(|sstable| {
+                    if let Some(updated) = updated_inputs.get(&sstable.meta.local_id) {
+                        replaced += 1;
+                        updated.clone()
+                    } else {
+                        sstable
+                    }
+                })
+                .collect::<Vec<_>>();
+            if replaced != job.input_local_ids.len() {
+                return Err(StorageError::corruption(format!(
+                    "offload job {} replaced {} of {} SSTables",
+                    job.id,
+                    replaced,
+                    job.input_local_ids.len()
+                )));
+            }
+            Self::sort_live_sstables(&mut new_live);
+
+            let next_generation =
+                ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
+            self.install_manifest(
+                next_generation,
+                current_state.last_flushed_sequence,
+                &new_live,
             )
-            .await;
+            .await?;
 
-        #[cfg(test)]
-        self.maybe_pause_offload_phase(OffloadPhase::ManifestSwitched)
-            .await;
+            {
+                let mut sstables = self.sstables_write();
+                sstables.manifest_generation = next_generation;
+                sstables.live = new_live;
+            }
+            let state = self.sstables_read().clone();
+            let _ = self
+                .sync_tiered_backup_manifest(
+                    state.manifest_generation,
+                    state.last_flushed_sequence,
+                    &state.live,
+                )
+                .await;
 
-        for input in &inputs {
-            self.inner
-                .dependencies
-                .file_system
-                .delete(&input.meta.file_path)
-                .await?;
+            #[cfg(test)]
+            self.maybe_pause_offload_phase(OffloadPhase::ManifestSwitched)
+                .await;
+
+            for input in &inputs {
+                self.inner
+                    .dependencies
+                    .file_system
+                    .delete(&input.meta.file_path)
+                    .await?;
+            }
+
+            #[cfg(test)]
+            self.maybe_pause_offload_phase(OffloadPhase::LocalCleanupFinished)
+                .await;
+
+            Ok(())
         }
-
-        #[cfg(test)]
-        self.maybe_pause_offload_phase(OffloadPhase::LocalCleanupFinished)
-            .await;
-
-        Ok(())
+        .instrument(span.clone())
+        .await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1136,53 +1189,74 @@ impl Db {
         local_root: &str,
         job: CompactionJob,
     ) -> Result<(), StorageError> {
-        let tables = self.tables_read().clone();
-        let memtables = self.memtables_read().clone();
-        let sstables = self.sstables_read().clone();
-        let table = Self::stored_table_by_id(&tables, job.table_id)
-            .cloned()
-            .ok_or_else(|| {
-                StorageError::corruption(format!(
-                    "compaction references unknown table id {}",
-                    job.table_id.get()
-                ))
-            })?;
-        let live = sstables.live.clone();
-        let input_local_ids = job.input_local_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let inputs = live
-            .iter()
-            .filter(|sstable| input_local_ids.contains(&sstable.meta.local_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if inputs.len() != job.input_local_ids.len() {
-            return Err(StorageError::corruption(format!(
-                "compaction job {} resolved {} of {} inputs",
-                job.id,
-                inputs.len(),
-                job.input_local_ids.len()
-            )));
-        }
+        let span = tracing::info_span!("terracedb.db.compaction.execute");
+        apply_db_span_attributes(
+            &span,
+            &self.telemetry_db_name(),
+            &self.telemetry_db_instance(),
+            self.telemetry_storage_mode(),
+        );
+        crate::set_span_attribute(
+            &span,
+            crate::telemetry_attrs::WORK_KIND,
+            opentelemetry::Value::String("compaction".into()),
+        );
+        apply_table_span_attribute(&span, &job.table_name);
+        crate::set_span_attribute(&span, "terracedb.compaction.target_level", job.target_level);
+        crate::set_span_attribute(
+            &span,
+            "terracedb.compaction.input_count",
+            job.input_local_ids.len() as u64,
+        );
 
-        let filtered = match job.kind {
-            CompactionJobKind::Rewrite => {
-                let mut merged_rows = self.load_compaction_input_rows(&table, &inputs).await?;
-                merged_rows.sort_by_key(|row| {
-                    encode_mvcc_key(&row.row.key, CommitId::new(row.row.sequence))
-                });
-                merged_rows = self
-                    .rewrite_compaction_rows(&tables, &memtables, &sstables, &table, merged_rows)
-                    .await?;
-                merged_rows = Self::retain_rows_within_horizon(
-                    merged_rows,
-                    self.history_gc_horizon(job.table_id),
-                );
-                self.apply_compaction_filter(&table, merged_rows)
+        async move {
+            let tables = self.tables_read().clone();
+            let memtables = self.memtables_read().clone();
+            let sstables = self.sstables_read().clone();
+            let table = Self::stored_table_by_id(&tables, job.table_id)
+                .cloned()
+                .ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "compaction references unknown table id {}",
+                        job.table_id.get()
+                    ))
+                })?;
+            let live = sstables.live.clone();
+            let input_local_ids = job.input_local_ids.iter().cloned().collect::<BTreeSet<_>>();
+            let inputs = live
+                .iter()
+                .filter(|sstable| input_local_ids.contains(&sstable.meta.local_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if inputs.len() != job.input_local_ids.len() {
+                return Err(StorageError::corruption(format!(
+                    "compaction job {} resolved {} of {} inputs",
+                    job.id,
+                    inputs.len(),
+                    job.input_local_ids.len()
+                )));
             }
-            CompactionJobKind::DeleteOnly => FilteredCompactionRows::default(),
-        };
 
-        let outputs = match job.kind {
-            CompactionJobKind::Rewrite => {
+            let filtered = match job.kind {
+                CompactionJobKind::Rewrite => {
+                    let mut merged_rows = self.load_compaction_input_rows(&table, &inputs).await?;
+                    merged_rows.sort_by_key(|row| {
+                        encode_mvcc_key(&row.row.key, CommitId::new(row.row.sequence))
+                    });
+                    merged_rows = self
+                        .rewrite_compaction_rows(&tables, &memtables, &sstables, &table, merged_rows)
+                        .await?;
+                    merged_rows = Self::retain_rows_within_horizon(
+                        merged_rows,
+                        self.history_gc_horizon(job.table_id),
+                    );
+                    self.apply_compaction_filter(&table, merged_rows)
+                }
+                CompactionJobKind::DeleteOnly => FilteredCompactionRows::default(),
+            };
+
+            let outputs = match job.kind {
+                CompactionJobKind::Rewrite => {
                 let outputs = self
                     .write_compaction_outputs(
                         local_root,
@@ -1205,8 +1279,8 @@ impl Db {
 
                 outputs
             }
-            CompactionJobKind::DeleteOnly => Vec::new(),
-        };
+                CompactionJobKind::DeleteOnly => Vec::new(),
+            };
 
         let current_state = self.sstables_read().clone();
         let mut new_live = current_state
@@ -1261,6 +1335,9 @@ impl Db {
         self.maybe_pause_compaction_phase(CompactionPhase::InputCleanupFinished)
             .await;
 
-        Ok(())
+            Ok(())
+        }
+        .instrument(span.clone())
+        .await
     }
 }

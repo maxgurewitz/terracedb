@@ -14,13 +14,14 @@ use crate::{
     error::{ChangeFeedError, CommitError, FlushError, StorageError},
     ids::{CommitId, FieldId, LogCursor, SegmentId, SequenceNumber, TableId},
     io::{FileHandle, FileSystem, OpenOptions},
+    telemetry::OperationContext,
 };
 
 const RECORD_MAGIC: [u8; 4] = *b"TDBR";
 const FOOTER_MAGIC: [u8; 8] = *b"TDBFTR1\0";
 const RECORD_HEADER_LEN: usize = 12;
 const FOOTER_TRAILER_LEN: usize = 16;
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const DEFAULT_SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_RECORDS_PER_BLOCK: u64 = 64;
 const FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -95,7 +96,7 @@ impl CommitRecord {
     fn decode_payload(bytes: &[u8]) -> Result<Self, StorageError> {
         let mut cursor = ByteCursor::new(bytes);
         let version = cursor.read_u8()?;
-        if version != FORMAT_VERSION {
+        if !matches!(version, 1 | FORMAT_VERSION) {
             return Err(StorageError::corruption(format!(
                 "unsupported commit record format version {version}"
             )));
@@ -108,7 +109,7 @@ impl CommitRecord {
 
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            entries.push(CommitEntry::decode(&mut cursor)?);
+            entries.push(CommitEntry::decode(&mut cursor, version >= 2)?);
         }
 
         if cursor.remaining() != 0 {
@@ -128,6 +129,7 @@ pub struct CommitEntry {
     pub kind: ChangeKind,
     pub key: Vec<u8>,
     pub value: Option<Value>,
+    pub operation_context: Option<OperationContext>,
 }
 
 impl CommitEntry {
@@ -153,10 +155,22 @@ impl CommitEntry {
             None => push_u32(bytes, u32::MAX),
         }
 
+        match &self.operation_context {
+            Some(context) if !context.is_empty() => {
+                push_u8(bytes, 1);
+                encode_optional_text(bytes, context.traceparent())?;
+                encode_optional_text(bytes, context.tracestate())?;
+            }
+            _ => push_u8(bytes, 0),
+        }
+
         Ok(())
     }
 
-    fn decode(cursor: &mut ByteCursor<'_>) -> Result<Self, StorageError> {
+    fn decode(
+        cursor: &mut ByteCursor<'_>,
+        with_operation_context: bool,
+    ) -> Result<Self, StorageError> {
         let op_index = cursor.read_u16()?;
         let table_id = TableId::new(cursor.read_u32()?);
         let kind = decode_change_kind(cursor.read_u8()?)?;
@@ -168,6 +182,22 @@ impl CommitEntry {
             let value_bytes = cursor.read_exact(value_len as usize)?;
             Some(decode_value(value_bytes)?)
         };
+        let operation_context = if with_operation_context {
+            match cursor.read_u8()? {
+                0 => None,
+                1 => Some(OperationContext {
+                    traceparent: decode_optional_text(cursor)?,
+                    tracestate: decode_optional_text(cursor)?,
+                }),
+                flag => {
+                    return Err(StorageError::corruption(format!(
+                        "unsupported commit entry operation-context flag {flag}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             op_index,
@@ -175,7 +205,36 @@ impl CommitEntry {
             kind,
             key: key.to_vec(),
             value,
+            operation_context,
         })
+    }
+}
+
+fn encode_optional_text(bytes: &mut Vec<u8>, value: Option<&str>) -> Result<(), StorageError> {
+    match value {
+        Some(value) => {
+            push_u8(bytes, 1);
+            push_len(bytes, value.len())?;
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        None => push_u8(bytes, 0),
+    }
+
+    Ok(())
+}
+
+fn decode_optional_text(cursor: &mut ByteCursor<'_>) -> Result<Option<String>, StorageError> {
+    match cursor.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let bytes = cursor.read_len_prefixed_bytes()?;
+            let text = String::from_utf8(bytes.to_vec())
+                .map_err(|_| StorageError::corruption("commit entry text field is not utf-8"))?;
+            Ok(Some(text))
+        }
+        flag => Err(StorageError::corruption(format!(
+            "unsupported commit entry text presence flag {flag}"
+        ))),
     }
 }
 
@@ -1957,6 +2016,7 @@ mod tests {
                     kind: ChangeKind::Put,
                     key: format!("user:{sequence}").into_bytes(),
                     value: Some(Value::Record(record_value)),
+                    operation_context: None,
                 },
                 CommitEntry {
                     op_index: 1,
@@ -1964,6 +2024,7 @@ mod tests {
                     kind: ChangeKind::Delete,
                     key: format!("audit:{sequence}").into_bytes(),
                     value: None,
+                    operation_context: None,
                 },
                 CommitEntry {
                     op_index: 2,
@@ -1971,6 +2032,7 @@ mod tests {
                     kind: ChangeKind::Merge,
                     key: format!("merge:{sequence}").into_bytes(),
                     value: Some(Value::Bytes(vec![sequence as u8, sequence as u8 + 1])),
+                    operation_context: None,
                 },
             ],
         }

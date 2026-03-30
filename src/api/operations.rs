@@ -14,6 +14,7 @@ pub struct ChangeEntry {
     pub sequence: SequenceNumber,
     pub kind: ChangeKind,
     pub table: Table,
+    pub operation_context: Option<OperationContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,11 +106,22 @@ impl ReadSet {
 #[derive(Clone, Debug, Default)]
 pub struct CommitOptions {
     pub read_set: Option<ReadSet>,
+    pub operation_context: Option<OperationContext>,
 }
 
 impl CommitOptions {
     pub fn with_read_set(mut self, read_set: ReadSet) -> Self {
         self.read_set = Some(read_set);
+        self
+    }
+
+    pub fn with_operation_context(mut self, operation_context: OperationContext) -> Self {
+        self.operation_context = Some(operation_context);
+        self
+    }
+
+    pub fn with_current_context(mut self) -> Self {
+        self.operation_context = Some(OperationContext::current());
         self
     }
 }

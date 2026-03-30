@@ -949,6 +949,7 @@ fn change_entries_for_record(
                 sequence,
                 kind: entry.kind,
                 table: table.clone(),
+                operation_context: entry.operation_context,
             })
         })
         .collect()
