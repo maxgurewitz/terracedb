@@ -7,7 +7,7 @@ It is intentionally simple, but it exercises the full Terracedb stack:
 - `terracedb` stores the durable application state
 - `terracedb-projections` maintains a read model of recently changed TODOs
 - `terracedb-workflows` drives a weekly recurring background task that creates placeholder TODOs
-- `terracedb-simulation` tests the system end to end from client to server to embedded database
+- `terracedb-http` and `terracedb-simulation` test the system end to end from client to server to embedded database
 
 The goal is to provide a first example that is easy to understand without giving up the parts that make Terracedb interesting.
 
