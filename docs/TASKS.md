@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This file turns the architecture into a dependency-aware implementation plan optimized for one developer working with AI agents. Each task is intended to be small enough to hand to an agent once its dependencies are complete, and stable enough that multiple tasks can proceed in parallel without constant interface churn.
+This file turns the architecture into a dependency-aware implementation plan optimized for one developer working with AI assistance. Each task is intended to be small enough to hand to a helper once its dependencies are complete, and stable enough that multiple tasks can proceed in parallel without constant interface churn.
 
 The emphasis here is on:
 
@@ -1353,7 +1353,7 @@ Operationalize the deterministic simulation bar by running larger seeded campaig
 
 **Description**
 
-Define the embedded virtual filesystem public surface and the reserved table/key contracts before implementation work branches. This task freezes the semantic target: provide a useful filesystem/KV/tool/overlay model on Terracedb for in-process agent runtimes, not SQL compatibility or mount-oriented adapter behavior.
+Define the embedded virtual filesystem public surface and the reserved table/key contracts before implementation work branches. This task freezes the semantic target: provide a useful filesystem/KV/tool/overlay model on Terracedb for in-process embedded runtimes, not SQL compatibility or mount-oriented adapter behavior.
 
 **Implementation steps**
 
@@ -1508,11 +1508,11 @@ Implement the non-filesystem virtual filesystem surfaces and the auditability mo
 
 **Description**
 
-Implement the Terracedb-native reproduction story for embedded agent volumes: short-lived read-only snapshots, logical clone/export flows, and writable overlay volumes backed by read-only virtual filesystem bases. This replaces the SQLite-era “copy the database file” portability story with a Terracedb-native equivalent.
+Implement the Terracedb-native reproduction story for embedded volumes: short-lived read-only snapshots, logical clone/export flows, and writable overlay volumes backed by read-only virtual filesystem bases. This replaces the SQLite-era “copy the database file” portability story with a Terracedb-native equivalent.
 
 **Implementation steps**
 
-1. Implement `AgentFsSnapshot` as a read-only volume view bound to a visible or durable cut.
+1. Implement `VolumeSnapshot` as a read-only volume view bound to a visible or durable cut.
 2. Implement logical export/import or clone helpers for moving a single `volume_id` into a fresh DB or restoring it elsewhere.
 3. Implement overlay metadata plus the `vfs_whiteout` and `vfs_origin` tables, with bases restricted to read-only virtual filesystem snapshots/clones rather than host filesystem adapters.
 4. Implement overlay lookup semantics, merged directory listing, whiteout handling, and copy-up on first mutation of base-resident entries.
@@ -1527,23 +1527,23 @@ Implement the Terracedb-native reproduction story for embedded agent volumes: sh
 
 ---
 
-### T39. Expose the embedded Rust API and agent-runtime integration examples
+### T39. Expose the embedded Rust API and embedded-runtime integration examples
 
 **Depends on:** T36, T37, T38
 
 **Description**
 
-Expose the virtual filesystem crate the way applications actually use it: as an embedded Rust library for in-process agent sandboxes. The goal is a stable SDK and examples for agent runtimes, not a second wave of mount, CLI, or service implementations.
+Expose the virtual filesystem crate the way applications actually use it: as an embedded Rust library for in-process embedded sandboxes. The goal is a stable SDK and examples for embedded runtimes, not a second wave of mount, CLI, or service implementations.
 
 **Implementation steps**
 
 1. Finalize the Rust SDK surface for path-based filesystem operations, KV, tool runs, snapshots, overlays, activity tailing, and flush.
-2. Add convenience helpers and examples for common AI-agent runtime patterns:
+2. Add convenience helpers and examples for common embedded runtime patterns:
    - open a base volume,
    - create a writable overlay for one run/session,
-   - expose a bounded capability surface to the agent,
+   - expose a bounded capability surface to the caller or runtime,
    - inspect recent file/tool activity.
-3. Add end-to-end examples that run an agent or agent-like harness against the same embedded volume API used by production code.
+3. Add end-to-end examples that run an embedded or session-scoped harness against the same embedded volume API used by production code.
 4. Ensure no example or helper bypasses the crate and writes reserved tables directly.
 5. Document the explicit version-1 non-goals:
    - no FUSE/NFS/MCP/HTTP/service boundary,
@@ -1553,9 +1553,9 @@ Expose the virtual filesystem crate the way applications actually use it: as an 
 **Verification**
 
 - Integration tests through the SDK for filesystem, KV, tool-run, snapshot, and overlay operations.
-- Example tests showing an agent-style harness can use a base volume plus writable overlay without touching internal tables.
+- Example tests showing an embedded harness can use a base volume plus writable overlay without touching internal tables.
 - Restart tests showing existing volumes and overlays reopen without repair or migration tricks.
-- API tests proving the agent-facing surface stays path-based and mount-independent.
+- API tests proving the caller-facing surface stays path-based and mount-independent.
 
 ---
 
@@ -1818,7 +1818,7 @@ Complete: T34–T40
 
 At this point the system should additionally support:
 - an embedded virtual filesystem crate on top of Terracedb,
-- point-in-time snapshots and copy-on-write overlays for agent sandboxes,
+- point-in-time snapshots and copy-on-write overlays for embedded sandboxes,
 - KV state and tool-run audit history,
 - durable clone/export flows instead of SQLite-file copies, and
 - deterministic simulation coverage for the virtual filesystem crate itself.

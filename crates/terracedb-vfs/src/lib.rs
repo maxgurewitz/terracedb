@@ -1,8 +1,11 @@
+#![doc = include_str!("../README.md")]
+
 pub mod activity;
 pub mod error;
 pub mod filesystem;
 pub mod ids;
 pub mod kv;
+pub mod sdk;
 pub mod store;
 pub mod tables;
 pub mod tool_runs;
@@ -10,21 +13,22 @@ pub mod tool_runs;
 pub use activity::{
     ActivityEntry, ActivityKind, ActivityOptions, ActivityReceiver, ActivityStream,
 };
-pub use error::AgentFsError;
+pub use error::VfsError;
 pub use filesystem::{
-    AgentFileSystem, CreateOptions, DirEntry, DirEntryPlus, FileKind, MkdirOptions,
-    ReadOnlyAgentFileSystem, Stats,
+    CreateOptions, DirEntry, DirEntryPlus, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, Stats,
+    VfsFileSystem,
 };
 pub use ids::{
     ActivityId, ActivityKey, AllocatorKey, AllocatorKind, ChunkKey, DentryKey, InodeId, InodeKey,
     KvKey, OriginKey, SymlinkKey, ToolRunId, ToolRunKey, VolumeId, VolumeKey, WhiteoutKey,
 };
-pub use kv::{AgentKvStore, ReadOnlyAgentKvStore};
+pub use kv::{ReadOnlyVfsKvStore, VfsKvStore};
+pub use sdk::{VfsStoreExt, VfsVolumeExt};
 pub use serde_json::Value as JsonValue;
 pub use store::{
-    AgentFsConfig, AgentFsExport, AgentFsOverlay, AgentFsSnapshot, AgentFsStore, AgentFsVolume,
-    AgentFsVolumeInfo, CloneVolumeSource, DEFAULT_CHUNK_SIZE, InMemoryAgentFsStore,
-    OverlayBaseDescriptor, ROOT_INODE_ID, SnapshotOptions, VFS_FORMAT_VERSION,
+    CloneVolumeSource, DEFAULT_CHUNK_SIZE, InMemoryVfsStore, OverlayBaseDescriptor, OverlayVolume,
+    ROOT_INODE_ID, SnapshotOptions, VFS_FORMAT_VERSION, Volume, VolumeConfig, VolumeExport,
+    VolumeInfo, VolumeSnapshot, VolumeStore,
 };
 pub use tables::{
     RESERVED_TABLES, ReservedTableDescriptor, VFS_ACTIVITY_TABLE_NAME, VFS_ALLOCATOR_TABLE_NAME,
@@ -33,6 +37,6 @@ pub use tables::{
     VFS_WHITEOUT_TABLE_NAME, reserved_table, reserved_table_configs, reserved_table_descriptors,
 };
 pub use tool_runs::{
-    AgentToolRuns, CompletedToolRun, CompletedToolRunOutcome, ReadOnlyAgentToolRuns, ToolRun,
-    ToolRunStatus,
+    CompletedToolRun, CompletedToolRunOutcome, ReadOnlyToolRunStore, ToolRun, ToolRunStatus,
+    ToolRunStore,
 };

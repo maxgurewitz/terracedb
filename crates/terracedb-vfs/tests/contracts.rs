@@ -5,9 +5,8 @@ use serde_json::json;
 
 use terracedb::{DbDependencies, LogCursor, StubClock, StubFileSystem, StubObjectStore, StubRng};
 use terracedb_vfs::{
-    ActivityKey, ActivityKind, ActivityOptions, AgentFsConfig, AgentFsStore, ChunkKey,
-    CloneVolumeSource, CreateOptions, DentryKey, InMemoryAgentFsStore, InodeId, SnapshotOptions,
-    VolumeId,
+    ActivityKey, ActivityKind, ActivityOptions, ChunkKey, CloneVolumeSource, CreateOptions,
+    DentryKey, InMemoryVfsStore, InodeId, SnapshotOptions, VolumeConfig, VolumeId, VolumeStore,
 };
 
 #[tokio::test]
@@ -18,11 +17,11 @@ async fn public_vfs_surface_compiles_and_is_instantiable() {
         Arc::new(StubClock::default()),
         Arc::new(StubRng::seeded(42)),
     );
-    let store = InMemoryAgentFsStore::with_dependencies(dependencies);
+    let store = InMemoryVfsStore::with_dependencies(dependencies);
 
     let volume = store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(1))
+            VolumeConfig::new(VolumeId::new(1))
                 .with_chunk_size(8192)
                 .with_create_if_missing(true),
         )
@@ -88,7 +87,7 @@ async fn public_vfs_surface_compiles_and_is_instantiable() {
     let cloned = store
         .clone_volume(
             CloneVolumeSource::new(volume.info().volume_id),
-            AgentFsConfig::new(VolumeId::new(2))
+            VolumeConfig::new(VolumeId::new(2))
                 .with_create_if_missing(true)
                 .with_chunk_size(8192),
         )
@@ -106,7 +105,7 @@ async fn public_vfs_surface_compiles_and_is_instantiable() {
     let overlay = store
         .create_overlay(
             snapshot,
-            AgentFsConfig::new(VolumeId::new(3))
+            VolumeConfig::new(VolumeId::new(3))
                 .with_create_if_missing(true)
                 .with_chunk_size(8192),
         )

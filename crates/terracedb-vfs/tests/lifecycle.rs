@@ -4,19 +4,18 @@ use futures::{TryStreamExt, future::join_all};
 
 use terracedb::{DbDependencies, LogCursor, StubClock, StubFileSystem, StubObjectStore, StubRng};
 use terracedb_vfs::{
-    ActivityOptions, AgentFsConfig, AgentFsError, AgentFsStore, CompletedToolRun,
-    CompletedToolRunOutcome, CreateOptions, FileKind, InMemoryAgentFsStore, MkdirOptions,
-    SnapshotOptions, VolumeId,
+    ActivityOptions, CompletedToolRun, CompletedToolRunOutcome, CreateOptions, FileKind,
+    InMemoryVfsStore, MkdirOptions, SnapshotOptions, VfsError, VolumeConfig, VolumeId, VolumeStore,
 };
 
-fn test_store() -> InMemoryAgentFsStore {
+fn test_store() -> InMemoryVfsStore {
     let dependencies = DbDependencies::new(
         Arc::new(StubFileSystem::default()),
         Arc::new(StubObjectStore::default()),
         Arc::new(StubClock::default()),
         Arc::new(StubRng::seeded(0x5151)),
     );
-    InMemoryAgentFsStore::with_dependencies(dependencies)
+    InMemoryVfsStore::with_dependencies(dependencies)
 }
 
 fn sorted_names(entries: Vec<terracedb_vfs::DirEntry>) -> Vec<String> {
@@ -31,7 +30,7 @@ fn sorted_names(entries: Vec<terracedb_vfs::DirEntry>) -> Vec<String> {
 #[tokio::test]
 async fn reopen_preserves_volume_metadata_root_and_config() {
     let store = test_store();
-    let config = AgentFsConfig::new(VolumeId::new(0x35))
+    let config = VolumeConfig::new(VolumeId::new(0x35))
         .with_chunk_size(8192)
         .with_create_if_missing(true);
 
@@ -62,7 +61,7 @@ async fn reopen_preserves_volume_metadata_root_and_config() {
 
     let reopened = store
         .open_volume(
-            AgentFsConfig::new(config.volume_id)
+            VolumeConfig::new(config.volume_id)
                 .with_chunk_size(8192)
                 .with_create_if_missing(false),
         )
@@ -80,7 +79,7 @@ async fn reopen_preserves_volume_metadata_root_and_config() {
 
     let mismatch = store
         .open_volume(
-            AgentFsConfig::new(config.volume_id)
+            VolumeConfig::new(config.volume_id)
                 .with_chunk_size(4096)
                 .with_create_if_missing(false),
         )
@@ -89,7 +88,7 @@ async fn reopen_preserves_volume_metadata_root_and_config() {
         .expect("mismatched chunk size should fail");
     assert!(matches!(
         mismatch,
-        AgentFsError::VolumeConfigMismatch {
+        VfsError::VolumeConfigMismatch {
             requested_chunk_size: 4096,
             ..
         }
@@ -101,7 +100,7 @@ async fn allocators_remain_monotonic_across_reopen_and_concurrent_refresh() {
     let store = test_store();
     let volume = store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(0x36))
+            VolumeConfig::new(VolumeId::new(0x36))
                 .with_chunk_size(4096)
                 .with_create_if_missing(true),
         )
@@ -184,7 +183,7 @@ async fn allocators_remain_monotonic_across_reopen_and_concurrent_refresh() {
 
     let reopened = store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(0x36))
+            VolumeConfig::new(VolumeId::new(0x36))
                 .with_chunk_size(4096)
                 .with_create_if_missing(false),
         )
@@ -242,7 +241,7 @@ async fn durable_snapshot_and_activity_fence_visible_state_until_fsync() {
     let store = test_store();
     let volume = store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(0x37))
+            VolumeConfig::new(VolumeId::new(0x37))
                 .with_chunk_size(4096)
                 .with_create_if_missing(true),
         )
@@ -342,7 +341,7 @@ async fn snapshot_path_resolution_and_chunk_reads_do_not_mix_versions() {
     let store = test_store();
     let volume = store
         .open_volume(
-            AgentFsConfig::new(VolumeId::new(0x38))
+            VolumeConfig::new(VolumeId::new(0x38))
                 .with_chunk_size(4)
                 .with_create_if_missing(true),
         )

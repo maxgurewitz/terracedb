@@ -14,9 +14,9 @@ use terracedb::{Clock, DbDependencies, LogCursor, Rng, SequenceNumber, Timestamp
 
 use crate::{
     ActivityEntry, ActivityId, ActivityKind, ActivityOptions, ActivityReceiver, ActivityStream,
-    AgentFileSystem, AgentFsError, AgentKvStore, AgentToolRuns, AllocatorKind, CreateOptions,
-    DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue, MkdirOptions, ReadOnlyAgentFileSystem,
-    ReadOnlyAgentKvStore, ReadOnlyAgentToolRuns, Stats, ToolRun, ToolRunId, ToolRunStatus,
+    AllocatorKind, CreateOptions, DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue,
+    MkdirOptions, ReadOnlyToolRunStore, ReadOnlyVfsFileSystem, ReadOnlyVfsKvStore, Stats, ToolRun,
+    ToolRunId, ToolRunStatus, ToolRunStore, VfsError, VfsFileSystem, VfsKvStore,
 };
 
 pub const VFS_FORMAT_VERSION: u8 = 1;
@@ -27,13 +27,13 @@ const DEFAULT_ALLOCATOR_BLOCK_SIZE: u64 = 32;
 const MAX_SYMLINK_DEPTH: usize = 40;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentFsConfig {
+pub struct VolumeConfig {
     pub volume_id: crate::VolumeId,
     pub chunk_size: Option<u32>,
     pub create_if_missing: bool,
 }
 
-impl AgentFsConfig {
+impl VolumeConfig {
     pub fn new(volume_id: crate::VolumeId) -> Self {
         Self {
             volume_id,
@@ -86,7 +86,7 @@ pub struct OverlayBaseDescriptor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentFsVolumeInfo {
+pub struct VolumeInfo {
     pub volume_id: crate::VolumeId,
     pub chunk_size: u32,
     pub format_version: u8,
@@ -96,69 +96,62 @@ pub struct AgentFsVolumeInfo {
 }
 
 #[async_trait]
-pub trait AgentFsStore: Send + Sync {
-    async fn open_volume(
-        &self,
-        config: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError>;
+pub trait VolumeStore: Send + Sync {
+    async fn open_volume(&self, config: VolumeConfig) -> Result<Arc<dyn Volume>, VfsError>;
     async fn clone_volume(
         &self,
         source: CloneVolumeSource,
-        target: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError>;
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError>;
     async fn create_overlay(
         &self,
-        base: Arc<dyn AgentFsSnapshot>,
-        target: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsOverlay>, AgentFsError>;
-    async fn export_volume(&self, source: CloneVolumeSource)
-    -> Result<AgentFsExport, AgentFsError>;
+        base: Arc<dyn VolumeSnapshot>,
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn OverlayVolume>, VfsError>;
+    async fn export_volume(&self, source: CloneVolumeSource) -> Result<VolumeExport, VfsError>;
     async fn import_volume(
         &self,
-        export: AgentFsExport,
-        target: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError>;
+        export: VolumeExport,
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError>;
 }
 
 #[async_trait]
-pub trait AgentFsVolume: Send + Sync {
-    fn info(&self) -> AgentFsVolumeInfo;
-    fn fs(&self) -> Arc<dyn AgentFileSystem>;
-    fn kv(&self) -> Arc<dyn AgentKvStore>;
-    fn tools(&self) -> Arc<dyn AgentToolRuns>;
-    async fn snapshot(
-        &self,
-        opts: SnapshotOptions,
-    ) -> Result<Arc<dyn AgentFsSnapshot>, AgentFsError>;
+pub trait Volume: Send + Sync {
+    fn info(&self) -> VolumeInfo;
+    fn fs(&self) -> Arc<dyn VfsFileSystem>;
+    fn kv(&self) -> Arc<dyn VfsKvStore>;
+    fn tools(&self) -> Arc<dyn ToolRunStore>;
+    async fn snapshot(&self, opts: SnapshotOptions) -> Result<Arc<dyn VolumeSnapshot>, VfsError>;
     async fn activity_since(
         &self,
         cursor: LogCursor,
         opts: ActivityOptions,
-    ) -> Result<ActivityStream, AgentFsError>;
+    ) -> Result<ActivityStream, VfsError>;
     fn subscribe_activity(&self, opts: ActivityOptions) -> ActivityReceiver;
-    async fn flush(&self) -> Result<(), AgentFsError>;
+    async fn flush(&self) -> Result<(), VfsError>;
 }
 
-pub trait AgentFsOverlay: AgentFsVolume {
-    fn base(&self) -> Arc<dyn AgentFsSnapshot>;
+pub trait OverlayVolume: Volume {
+    fn base(&self) -> Arc<dyn VolumeSnapshot>;
 }
 
-pub trait AgentFsSnapshot: Send + Sync + Any {
+pub trait VolumeSnapshot: Send + Sync + Any {
     fn volume_id(&self) -> crate::VolumeId;
     fn sequence(&self) -> SequenceNumber;
     fn durable(&self) -> bool;
-    fn info(&self) -> AgentFsVolumeInfo;
-    fn fs(&self) -> Arc<dyn ReadOnlyAgentFileSystem>;
-    fn kv(&self) -> Arc<dyn ReadOnlyAgentKvStore>;
-    fn tools(&self) -> Arc<dyn ReadOnlyAgentToolRuns>;
+    fn info(&self) -> VolumeInfo;
+    fn fs(&self) -> Arc<dyn ReadOnlyVfsFileSystem>;
+    fn kv(&self) -> Arc<dyn ReadOnlyVfsKvStore>;
+    fn tools(&self) -> Arc<dyn ReadOnlyToolRunStore>;
 }
 
 #[derive(Clone)]
-pub struct AgentFsExport {
+pub struct VolumeExport {
     snapshot: SnapshotState,
 }
 
-impl AgentFsExport {
+impl VolumeExport {
     pub fn volume_id(&self) -> crate::VolumeId {
         self.snapshot.info.volume_id
     }
@@ -173,7 +166,7 @@ impl AgentFsExport {
 }
 
 #[derive(Clone)]
-pub struct InMemoryAgentFsStore {
+pub struct InMemoryVfsStore {
     inner: Arc<InMemoryStoreInner>,
 }
 
@@ -184,7 +177,7 @@ struct InMemoryStoreInner {
     volumes: Mutex<BTreeMap<crate::VolumeId, StoredVolume>>,
 }
 
-impl InMemoryAgentFsStore {
+impl InMemoryVfsStore {
     pub fn new(clock: Arc<dyn Clock>, rng: Arc<dyn Rng>) -> Self {
         Self {
             inner: Arc::new(InMemoryStoreInner {
@@ -208,19 +201,19 @@ enum StoredVolume {
 }
 
 impl StoredVolume {
-    fn info(&self) -> AgentFsVolumeInfo {
+    fn info(&self) -> VolumeInfo {
         match self {
             Self::Regular(volume) => volume.info(),
             Self::Overlay(overlay) => overlay.info(),
         }
     }
 
-    fn open_handle(&self) -> Arc<dyn AgentFsVolume> {
+    fn open_handle(&self) -> Arc<dyn Volume> {
         match self {
-            Self::Regular(volume) => Arc::new(InMemoryAgentFsVolume {
+            Self::Regular(volume) => Arc::new(InMemoryVolume {
                 inner: volume.clone(),
             }),
-            Self::Overlay(overlay) => Arc::new(InMemoryAgentFsOverlay {
+            Self::Overlay(overlay) => Arc::new(InMemoryOverlayVolume {
                 entry: overlay.clone(),
             }),
         }
@@ -241,7 +234,7 @@ struct InMemoryOverlayEntry {
 }
 
 impl InMemoryOverlayEntry {
-    fn info(&self) -> AgentFsVolumeInfo {
+    fn info(&self) -> VolumeInfo {
         self.delta.info()
     }
 
@@ -250,19 +243,16 @@ impl InMemoryOverlayEntry {
         build_overlay_snapshot(&delta, self.base.as_ref())
     }
 
-    fn base_snapshot(&self) -> Arc<dyn AgentFsSnapshot> {
-        Arc::new(InMemoryAgentFsSnapshot {
+    fn base_snapshot(&self) -> Arc<dyn VolumeSnapshot> {
+        Arc::new(InMemoryVolumeSnapshot {
             state: self.base.clone(),
         })
     }
 }
 
 #[async_trait]
-impl AgentFsStore for InMemoryAgentFsStore {
-    async fn open_volume(
-        &self,
-        config: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError> {
+impl VolumeStore for InMemoryVfsStore {
+    async fn open_volume(&self, config: VolumeConfig) -> Result<Arc<dyn Volume>, VfsError> {
         let chunk_size = configured_chunk_size(config.chunk_size)?;
         let mut volumes = self
             .inner
@@ -273,7 +263,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
         if let Some(existing) = volumes.get(&config.volume_id) {
             let info = existing.info();
             if info.chunk_size != chunk_size {
-                return Err(AgentFsError::VolumeConfigMismatch {
+                return Err(VfsError::VolumeConfigMismatch {
                     volume_id: config.volume_id,
                     existing_chunk_size: info.chunk_size,
                     requested_chunk_size: chunk_size,
@@ -284,12 +274,12 @@ impl AgentFsStore for InMemoryAgentFsStore {
         }
 
         if !config.create_if_missing {
-            return Err(AgentFsError::VolumeNotFound {
+            return Err(VfsError::VolumeNotFound {
                 volume_id: config.volume_id,
             });
         }
 
-        let info = AgentFsVolumeInfo {
+        let info = VolumeInfo {
             volume_id: config.volume_id,
             chunk_size,
             format_version: VFS_FORMAT_VERSION,
@@ -303,14 +293,14 @@ impl AgentFsStore for InMemoryAgentFsStore {
             self.inner.allocator_block_size,
         ));
         volumes.insert(config.volume_id, StoredVolume::Regular(volume.clone()));
-        Ok(Arc::new(InMemoryAgentFsVolume { inner: volume }))
+        Ok(Arc::new(InMemoryVolume { inner: volume }))
     }
 
     async fn clone_volume(
         &self,
         source: CloneVolumeSource,
-        target: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError> {
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError> {
         let source_volume = {
             let volumes = self
                 .inner
@@ -320,7 +310,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
             volumes
                 .get(&source.volume_id)
                 .cloned()
-                .ok_or(AgentFsError::VolumeNotFound {
+                .ok_or(VfsError::VolumeNotFound {
                     volume_id: source.volume_id,
                 })?
         };
@@ -328,10 +318,10 @@ impl AgentFsStore for InMemoryAgentFsStore {
         let snapshot = source_volume.snapshot_state(source.durable);
         let chunk_size = target.chunk_size.unwrap_or(snapshot.info.chunk_size);
         if chunk_size == 0 {
-            return Err(AgentFsError::InvalidChunkSize);
+            return Err(VfsError::InvalidChunkSize);
         }
 
-        let target_info = AgentFsVolumeInfo {
+        let target_info = VolumeInfo {
             volume_id: target.volume_id,
             chunk_size,
             format_version: VFS_FORMAT_VERSION,
@@ -346,7 +336,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
             .lock()
             .expect("in-memory volume registry lock poisoned");
         if volumes.contains_key(&target.volume_id) {
-            return Err(AgentFsError::VolumeAlreadyExists {
+            return Err(VfsError::VolumeAlreadyExists {
                 volume_id: target.volume_id,
             });
         }
@@ -365,25 +355,25 @@ impl AgentFsStore for InMemoryAgentFsStore {
         );
         volume.append_activity(ActivityKind::VolumeCloned, None, None, metadata);
         volumes.insert(target.volume_id, StoredVolume::Regular(volume.clone()));
-        Ok(Arc::new(InMemoryAgentFsVolume { inner: volume }))
+        Ok(Arc::new(InMemoryVolume { inner: volume }))
     }
 
     async fn create_overlay(
         &self,
-        base: Arc<dyn AgentFsSnapshot>,
-        target: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsOverlay>, AgentFsError> {
+        base: Arc<dyn VolumeSnapshot>,
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn OverlayVolume>, VfsError> {
         let base_snapshot = (base.as_ref() as &dyn Any)
-            .downcast_ref::<InMemoryAgentFsSnapshot>()
-            .ok_or(AgentFsError::IncompatibleSnapshotImplementation)?;
+            .downcast_ref::<InMemoryVolumeSnapshot>()
+            .ok_or(VfsError::IncompatibleSnapshotImplementation)?;
         let chunk_size = target
             .chunk_size
             .unwrap_or(base_snapshot.state.info.chunk_size);
         if chunk_size == 0 {
-            return Err(AgentFsError::InvalidChunkSize);
+            return Err(VfsError::InvalidChunkSize);
         }
 
-        let target_info = AgentFsVolumeInfo {
+        let target_info = VolumeInfo {
             volume_id: target.volume_id,
             chunk_size,
             format_version: VFS_FORMAT_VERSION,
@@ -402,7 +392,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
             .lock()
             .expect("in-memory volume registry lock poisoned");
         if volumes.contains_key(&target.volume_id) {
-            return Err(AgentFsError::VolumeAlreadyExists {
+            return Err(VfsError::VolumeAlreadyExists {
                 volume_id: target.volume_id,
             });
         }
@@ -429,13 +419,10 @@ impl AgentFsStore for InMemoryAgentFsStore {
         });
         volumes.insert(target.volume_id, StoredVolume::Overlay(overlay.clone()));
 
-        Ok(Arc::new(InMemoryAgentFsOverlay { entry: overlay }))
+        Ok(Arc::new(InMemoryOverlayVolume { entry: overlay }))
     }
 
-    async fn export_volume(
-        &self,
-        source: CloneVolumeSource,
-    ) -> Result<AgentFsExport, AgentFsError> {
+    async fn export_volume(&self, source: CloneVolumeSource) -> Result<VolumeExport, VfsError> {
         let volume = {
             let volumes = self
                 .inner
@@ -445,27 +432,27 @@ impl AgentFsStore for InMemoryAgentFsStore {
             volumes
                 .get(&source.volume_id)
                 .cloned()
-                .ok_or(AgentFsError::VolumeNotFound {
+                .ok_or(VfsError::VolumeNotFound {
                     volume_id: source.volume_id,
                 })?
         };
 
-        Ok(AgentFsExport {
+        Ok(VolumeExport {
             snapshot: volume.snapshot_state(source.durable),
         })
     }
 
     async fn import_volume(
         &self,
-        export: AgentFsExport,
-        target: AgentFsConfig,
-    ) -> Result<Arc<dyn AgentFsVolume>, AgentFsError> {
+        export: VolumeExport,
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError> {
         let chunk_size = target.chunk_size.unwrap_or(export.snapshot.info.chunk_size);
         if chunk_size == 0 {
-            return Err(AgentFsError::InvalidChunkSize);
+            return Err(VfsError::InvalidChunkSize);
         }
 
-        let target_info = AgentFsVolumeInfo {
+        let target_info = VolumeInfo {
             volume_id: target.volume_id,
             chunk_size,
             format_version: VFS_FORMAT_VERSION,
@@ -480,7 +467,7 @@ impl AgentFsStore for InMemoryAgentFsStore {
             .lock()
             .expect("in-memory volume registry lock poisoned");
         if volumes.contains_key(&target.volume_id) {
-            return Err(AgentFsError::VolumeAlreadyExists {
+            return Err(VfsError::VolumeAlreadyExists {
                 volume_id: target.volume_id,
             });
         }
@@ -504,44 +491,41 @@ impl AgentFsStore for InMemoryAgentFsStore {
         metadata.insert("source_durable".to_string(), json!(export.snapshot.durable));
         volume.append_activity(ActivityKind::VolumeCloned, None, None, metadata);
         volumes.insert(target.volume_id, StoredVolume::Regular(volume.clone()));
-        Ok(Arc::new(InMemoryAgentFsVolume { inner: volume }))
+        Ok(Arc::new(InMemoryVolume { inner: volume }))
     }
 }
 
 #[derive(Clone)]
-struct InMemoryAgentFsVolume {
+struct InMemoryVolume {
     inner: Arc<InMemoryVolumeInner>,
 }
 
 #[async_trait]
-impl AgentFsVolume for InMemoryAgentFsVolume {
-    fn info(&self) -> AgentFsVolumeInfo {
+impl Volume for InMemoryVolume {
+    fn info(&self) -> VolumeInfo {
         self.inner.info()
     }
 
-    fn fs(&self) -> Arc<dyn AgentFileSystem> {
-        Arc::new(InMemoryAgentFileSystem {
+    fn fs(&self) -> Arc<dyn VfsFileSystem> {
+        Arc::new(InMemoryVfsFileSystem {
             volume: self.inner.clone(),
         })
     }
 
-    fn kv(&self) -> Arc<dyn AgentKvStore> {
-        Arc::new(InMemoryAgentKv {
+    fn kv(&self) -> Arc<dyn VfsKvStore> {
+        Arc::new(InMemoryVfsKv {
             volume: self.inner.clone(),
         })
     }
 
-    fn tools(&self) -> Arc<dyn AgentToolRuns> {
-        Arc::new(InMemoryAgentTools {
+    fn tools(&self) -> Arc<dyn ToolRunStore> {
+        Arc::new(InMemoryToolRunStore {
             volume: self.inner.clone(),
         })
     }
 
-    async fn snapshot(
-        &self,
-        opts: SnapshotOptions,
-    ) -> Result<Arc<dyn AgentFsSnapshot>, AgentFsError> {
-        Ok(Arc::new(InMemoryAgentFsSnapshot {
+    async fn snapshot(&self, opts: SnapshotOptions) -> Result<Arc<dyn VolumeSnapshot>, VfsError> {
+        Ok(Arc::new(InMemoryVolumeSnapshot {
             state: Arc::new(self.inner.snapshot_state(opts.durable)),
         }))
     }
@@ -550,7 +534,7 @@ impl AgentFsVolume for InMemoryAgentFsVolume {
         &self,
         cursor: LogCursor,
         opts: ActivityOptions,
-    ) -> Result<ActivityStream, AgentFsError> {
+    ) -> Result<ActivityStream, VfsError> {
         let entries = {
             let state = self.inner.state.lock().expect("volume state lock poisoned");
             let activity_slice = if opts.durable {
@@ -580,45 +564,42 @@ impl AgentFsVolume for InMemoryAgentFsVolume {
         }
     }
 
-    async fn flush(&self) -> Result<(), AgentFsError> {
+    async fn flush(&self) -> Result<(), VfsError> {
         self.inner.promote_durable_cut();
         Ok(())
     }
 }
 
-struct InMemoryAgentFsOverlay {
+struct InMemoryOverlayVolume {
     entry: Arc<InMemoryOverlayEntry>,
 }
 
 #[async_trait]
-impl AgentFsVolume for InMemoryAgentFsOverlay {
-    fn info(&self) -> AgentFsVolumeInfo {
+impl Volume for InMemoryOverlayVolume {
+    fn info(&self) -> VolumeInfo {
         self.entry.info()
     }
 
-    fn fs(&self) -> Arc<dyn AgentFileSystem> {
+    fn fs(&self) -> Arc<dyn VfsFileSystem> {
         Arc::new(InMemoryOverlayFileSystem {
             overlay: self.entry.clone(),
         })
     }
 
-    fn kv(&self) -> Arc<dyn AgentKvStore> {
-        Arc::new(InMemoryAgentKv {
+    fn kv(&self) -> Arc<dyn VfsKvStore> {
+        Arc::new(InMemoryVfsKv {
             volume: self.entry.delta.clone(),
         })
     }
 
-    fn tools(&self) -> Arc<dyn AgentToolRuns> {
-        Arc::new(InMemoryAgentTools {
+    fn tools(&self) -> Arc<dyn ToolRunStore> {
+        Arc::new(InMemoryToolRunStore {
             volume: self.entry.delta.clone(),
         })
     }
 
-    async fn snapshot(
-        &self,
-        opts: SnapshotOptions,
-    ) -> Result<Arc<dyn AgentFsSnapshot>, AgentFsError> {
-        Ok(Arc::new(InMemoryAgentFsSnapshot {
+    async fn snapshot(&self, opts: SnapshotOptions) -> Result<Arc<dyn VolumeSnapshot>, VfsError> {
+        Ok(Arc::new(InMemoryVolumeSnapshot {
             state: Arc::new(self.entry.snapshot_state(opts.durable)),
         }))
     }
@@ -627,8 +608,8 @@ impl AgentFsVolume for InMemoryAgentFsOverlay {
         &self,
         cursor: LogCursor,
         opts: ActivityOptions,
-    ) -> Result<ActivityStream, AgentFsError> {
-        InMemoryAgentFsVolume {
+    ) -> Result<ActivityStream, VfsError> {
+        InMemoryVolume {
             inner: self.entry.delta.clone(),
         }
         .activity_since(cursor, opts)
@@ -636,14 +617,14 @@ impl AgentFsVolume for InMemoryAgentFsOverlay {
     }
 
     fn subscribe_activity(&self, opts: ActivityOptions) -> ActivityReceiver {
-        InMemoryAgentFsVolume {
+        InMemoryVolume {
             inner: self.entry.delta.clone(),
         }
         .subscribe_activity(opts)
     }
 
-    async fn flush(&self) -> Result<(), AgentFsError> {
-        InMemoryAgentFsVolume {
+    async fn flush(&self) -> Result<(), VfsError> {
+        InMemoryVolume {
             inner: self.entry.delta.clone(),
         }
         .flush()
@@ -651,17 +632,17 @@ impl AgentFsVolume for InMemoryAgentFsOverlay {
     }
 }
 
-impl AgentFsOverlay for InMemoryAgentFsOverlay {
-    fn base(&self) -> Arc<dyn AgentFsSnapshot> {
+impl OverlayVolume for InMemoryOverlayVolume {
+    fn base(&self) -> Arc<dyn VolumeSnapshot> {
         self.entry.base_snapshot()
     }
 }
 
-struct InMemoryAgentFsSnapshot {
+struct InMemoryVolumeSnapshot {
     state: Arc<SnapshotState>,
 }
 
-impl AgentFsSnapshot for InMemoryAgentFsSnapshot {
+impl VolumeSnapshot for InMemoryVolumeSnapshot {
     fn volume_id(&self) -> crate::VolumeId {
         self.state.info.volume_id
     }
@@ -674,30 +655,30 @@ impl AgentFsSnapshot for InMemoryAgentFsSnapshot {
         self.state.durable
     }
 
-    fn info(&self) -> AgentFsVolumeInfo {
+    fn info(&self) -> VolumeInfo {
         self.state.info.clone()
     }
 
-    fn fs(&self) -> Arc<dyn ReadOnlyAgentFileSystem> {
+    fn fs(&self) -> Arc<dyn ReadOnlyVfsFileSystem> {
         Arc::new(InMemorySnapshotFileSystem {
             state: self.state.clone(),
         })
     }
 
-    fn kv(&self) -> Arc<dyn ReadOnlyAgentKvStore> {
+    fn kv(&self) -> Arc<dyn ReadOnlyVfsKvStore> {
         Arc::new(InMemorySnapshotKv {
             state: self.state.clone(),
         })
     }
 
-    fn tools(&self) -> Arc<dyn ReadOnlyAgentToolRuns> {
+    fn tools(&self) -> Arc<dyn ReadOnlyToolRunStore> {
         Arc::new(InMemorySnapshotTools {
             state: self.state.clone(),
         })
     }
 }
 
-struct InMemoryAgentFileSystem {
+struct InMemoryVfsFileSystem {
     volume: Arc<InMemoryVolumeInner>,
 }
 
@@ -709,7 +690,7 @@ struct InMemorySnapshotFileSystem {
     state: Arc<SnapshotState>,
 }
 
-struct InMemoryAgentKv {
+struct InMemoryVfsKv {
     volume: Arc<InMemoryVolumeInner>,
 }
 
@@ -717,7 +698,7 @@ struct InMemorySnapshotKv {
     state: Arc<SnapshotState>,
 }
 
-struct InMemoryAgentTools {
+struct InMemoryToolRunStore {
     volume: Arc<InMemoryVolumeInner>,
 }
 
@@ -726,8 +707,8 @@ struct InMemorySnapshotTools {
 }
 
 #[async_trait]
-impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
-    async fn stat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+impl ReadOnlyVfsFileSystem for InMemoryVfsFileSystem {
+    async fn stat(&self, path: &str) -> Result<Option<Stats>, VfsError> {
         let state = self
             .volume
             .state
@@ -736,7 +717,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
         lookup_stats(&state, path, true)
     }
 
-    async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+    async fn lstat(&self, path: &str) -> Result<Option<Stats>, VfsError> {
         let state = self
             .volume
             .state
@@ -745,7 +726,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
         lookup_stats(&state, path, false)
     }
 
-    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, VfsError> {
         let state = self
             .volume
             .state
@@ -754,12 +735,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
         read_file_bytes(&state, path)
     }
 
-    async fn pread(
-        &self,
-        path: &str,
-        offset: u64,
-        len: u64,
-    ) -> Result<Option<Vec<u8>>, AgentFsError> {
+    async fn pread(&self, path: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, VfsError> {
         let state = self
             .volume
             .state
@@ -768,7 +744,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
         pread_file_bytes(&state, path, offset, len)
     }
 
-    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
         let state = self
             .volume
             .state
@@ -777,7 +753,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
         read_dir_entries(&state, path)
     }
 
-    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, VfsError> {
         let state = self
             .volume
             .state
@@ -786,7 +762,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
         read_dir_entries_plus(&state, path)
     }
 
-    async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
+    async fn readlink(&self, path: &str) -> Result<String, VfsError> {
         let state = self
             .volume
             .state
@@ -797,86 +773,76 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
 }
 
 #[async_trait]
-impl ReadOnlyAgentFileSystem for InMemorySnapshotFileSystem {
-    async fn stat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+impl ReadOnlyVfsFileSystem for InMemorySnapshotFileSystem {
+    async fn stat(&self, path: &str) -> Result<Option<Stats>, VfsError> {
         lookup_snapshot_stats(self.state.as_ref(), path, true)
     }
 
-    async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+    async fn lstat(&self, path: &str) -> Result<Option<Stats>, VfsError> {
         lookup_snapshot_stats(self.state.as_ref(), path, false)
     }
 
-    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, VfsError> {
         read_snapshot_file_bytes(self.state.as_ref(), path)
     }
 
-    async fn pread(
-        &self,
-        path: &str,
-        offset: u64,
-        len: u64,
-    ) -> Result<Option<Vec<u8>>, AgentFsError> {
+    async fn pread(&self, path: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, VfsError> {
         pread_snapshot_file_bytes(self.state.as_ref(), path, offset, len)
     }
 
-    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
         read_snapshot_dir_entries(self.state.as_ref(), path)
     }
 
-    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, VfsError> {
         read_snapshot_dir_entries_plus(self.state.as_ref(), path)
     }
 
-    async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
+    async fn readlink(&self, path: &str) -> Result<String, VfsError> {
         read_link_target(&self.state.paths, &self.state.inodes, path)
     }
 }
 
 #[async_trait]
-impl ReadOnlyAgentFileSystem for InMemoryOverlayFileSystem {
-    async fn stat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+impl ReadOnlyVfsFileSystem for InMemoryOverlayFileSystem {
+    async fn stat(&self, path: &str) -> Result<Option<Stats>, VfsError> {
         lookup_snapshot_stats(&self.overlay.snapshot_state(false), path, true)
     }
 
-    async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
+    async fn lstat(&self, path: &str) -> Result<Option<Stats>, VfsError> {
         lookup_snapshot_stats(&self.overlay.snapshot_state(false), path, false)
     }
 
-    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, VfsError> {
         read_snapshot_file_bytes(&self.overlay.snapshot_state(false), path)
     }
 
-    async fn pread(
-        &self,
-        path: &str,
-        offset: u64,
-        len: u64,
-    ) -> Result<Option<Vec<u8>>, AgentFsError> {
+    async fn pread(&self, path: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, VfsError> {
         pread_snapshot_file_bytes(&self.overlay.snapshot_state(false), path, offset, len)
     }
 
-    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
         read_snapshot_dir_entries(&self.overlay.snapshot_state(false), path)
     }
 
-    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+    async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, VfsError> {
         read_snapshot_dir_entries_plus(&self.overlay.snapshot_state(false), path)
     }
 
-    async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
+    async fn readlink(&self, path: &str) -> Result<String, VfsError> {
         let snapshot = self.overlay.snapshot_state(false);
         read_link_target(&snapshot.paths, &snapshot.inodes, path)
     }
 }
 
 #[async_trait]
-impl AgentFileSystem for InMemoryAgentFileSystem {
+impl VfsFileSystem for InMemoryVfsFileSystem {
     async fn write_file(
         &self,
         path: &str,
         data: Vec<u8>,
         opts: CreateOptions,
-    ) -> Result<(), AgentFsError> {
+    ) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let opts = opts.clone();
         self.volume.mutate(|state, now| {
@@ -888,7 +854,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), AgentFsError> {
+    async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
             mutate_pwrite_state(state, &path, offset, &data, now)?;
@@ -899,7 +865,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn truncate(&self, path: &str, size: u64) -> Result<(), AgentFsError> {
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
             mutate_truncate_state(state, &path, size, now)?;
@@ -910,13 +876,13 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<(), AgentFsError> {
+    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         if path == "/" {
             return if opts.recursive {
                 Ok(())
             } else {
-                Err(AgentFsError::AlreadyExists { path })
+                Err(VfsError::AlreadyExists { path })
             };
         }
 
@@ -938,7 +904,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn rename(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
+    async fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         self.volume.mutate(|state, now| {
@@ -959,7 +925,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn link(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
+    async fn link(&self, from: &str, to: &str) -> Result<(), VfsError> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         self.volume.mutate(|state, now| {
@@ -978,7 +944,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn symlink(&self, target: &str, linkpath: &str) -> Result<(), AgentFsError> {
+    async fn symlink(&self, target: &str, linkpath: &str) -> Result<(), VfsError> {
         let linkpath = normalize_path(linkpath)?;
         let target = target.to_string();
         self.volume.mutate(|state, now| {
@@ -995,7 +961,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn unlink(&self, path: &str) -> Result<(), AgentFsError> {
+    async fn unlink(&self, path: &str) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
             mutate_unlink_state(state, &path, now)?;
@@ -1006,7 +972,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn rmdir(&self, path: &str) -> Result<(), AgentFsError> {
+    async fn rmdir(&self, path: &str) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
             mutate_rmdir_state(state, &path, now)?;
@@ -1022,7 +988,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         })
     }
 
-    async fn fsync(&self, path: Option<&str>) -> Result<(), AgentFsError> {
+    async fn fsync(&self, path: Option<&str>) -> Result<(), VfsError> {
         if let Some(path) = path {
             let path = normalize_path(path)?;
             let state = self
@@ -1031,7 +997,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                 .lock()
                 .expect("volume state lock poisoned");
             if resolve_existing_path(&state, &path, true)?.is_none() {
-                return Err(AgentFsError::NotFound { path });
+                return Err(VfsError::NotFound { path });
             }
         }
 
@@ -1041,13 +1007,13 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
 }
 
 #[async_trait]
-impl AgentFileSystem for InMemoryOverlayFileSystem {
+impl VfsFileSystem for InMemoryOverlayFileSystem {
     async fn write_file(
         &self,
         path: &str,
         data: Vec<u8>,
         opts: CreateOptions,
-    ) -> Result<(), AgentFsError> {
+    ) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let opts = opts.clone();
         let base = self.overlay.base.clone();
@@ -1091,14 +1057,14 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), AgentFsError> {
+    async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
             let merged = overlay_visible_snapshot(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
-                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+                    .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
             ensure_overlay_existing_path(
                 state,
                 base.as_ref(),
@@ -1115,14 +1081,14 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn truncate(&self, path: &str, size: u64) -> Result<(), AgentFsError> {
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
             let merged = overlay_visible_snapshot(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
-                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+                    .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
             ensure_overlay_existing_path(
                 state,
                 base.as_ref(),
@@ -1139,13 +1105,13 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<(), AgentFsError> {
+    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         if path == "/" {
             return if opts.recursive {
                 Ok(())
             } else {
-                Err(AgentFsError::AlreadyExists { path })
+                Err(VfsError::AlreadyExists { path })
             };
         }
 
@@ -1159,13 +1125,13 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
                 let inode = merged
                     .inodes
                     .get(&inode_id)
-                    .ok_or_else(|| AgentFsError::NotFound {
+                    .ok_or_else(|| VfsError::NotFound {
                         path: resolved_path.clone(),
                     })?;
                 if inode.stats.kind == FileKind::Directory && opts.recursive {
                     return Ok(None);
                 }
-                return Err(AgentFsError::AlreadyExists {
+                return Err(VfsError::AlreadyExists {
                     path: resolved_path,
                 });
             }
@@ -1196,13 +1162,13 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn rename(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
+    async fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
             if from == "/" || to == "/" {
-                return Err(AgentFsError::RootInvariant);
+                return Err(VfsError::RootInvariant);
             }
             if from == to {
                 return Ok(None);
@@ -1211,7 +1177,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
             let merged = overlay_visible_snapshot(state, base.as_ref());
             let (resolved_from, from_inode_id) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &from, false)?
-                    .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
+                    .ok_or_else(|| VfsError::NotFound { path: from.clone() })?;
             let resolved_to = resolve_target_path_in_maps(&merged.paths, &merged.inodes, &to)?;
             if resolved_from == resolved_to {
                 return Ok(None);
@@ -1220,7 +1186,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
             let from_kind = merged
                 .inodes
                 .get(&from_inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
+                .ok_or_else(|| VfsError::NotFound {
                     path: resolved_from.clone(),
                 })?
                 .stats
@@ -1260,7 +1226,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
                 let target_kind = merged
                     .inodes
                     .get(&target_inode_id)
-                    .ok_or_else(|| AgentFsError::NotFound {
+                    .ok_or_else(|| VfsError::NotFound {
                         path: target_path.clone(),
                     })?
                     .stats
@@ -1271,7 +1237,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
                         candidate != &target_path && is_descendant_path(&target_path, candidate)
                     })
                 {
-                    return Err(AgentFsError::DirectoryNotEmpty { path: target_path });
+                    return Err(VfsError::DirectoryNotEmpty { path: target_path });
                 }
                 if target_was_base {
                     if target_kind == FileKind::Directory {
@@ -1329,7 +1295,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn link(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
+    async fn link(&self, from: &str, to: &str) -> Result<(), VfsError> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         let base = self.overlay.base.clone();
@@ -1337,7 +1303,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
             let merged = overlay_visible_snapshot(state, base.as_ref());
             let (resolved_from, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &from, false)?
-                    .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
+                    .ok_or_else(|| VfsError::NotFound { path: from.clone() })?;
             ensure_overlay_existing_path(
                 state,
                 base.as_ref(),
@@ -1370,7 +1336,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn symlink(&self, target: &str, linkpath: &str) -> Result<(), AgentFsError> {
+    async fn symlink(&self, target: &str, linkpath: &str) -> Result<(), VfsError> {
         let linkpath = normalize_path(linkpath)?;
         let target = target.to_string();
         let base = self.overlay.base.clone();
@@ -1399,14 +1365,14 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn unlink(&self, path: &str) -> Result<(), AgentFsError> {
+    async fn unlink(&self, path: &str) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
             let merged = overlay_visible_snapshot(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
-                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+                    .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
             let source_was_delta = state.paths.contains_key(&resolved_path);
             if !source_was_delta {
                 ensure_overlay_existing_path(
@@ -1429,14 +1395,14 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn rmdir(&self, path: &str) -> Result<(), AgentFsError> {
+    async fn rmdir(&self, path: &str) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
             let merged = overlay_visible_snapshot(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
-                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+                    .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
             let source_was_delta = state.paths.contains_key(&resolved_path);
             if !source_was_delta {
                 ensure_overlay_existing_path(
@@ -1464,7 +1430,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
         })
     }
 
-    async fn fsync(&self, path: Option<&str>) -> Result<(), AgentFsError> {
+    async fn fsync(&self, path: Option<&str>) -> Result<(), VfsError> {
         if let Some(path) = path {
             let path = normalize_path(path)?;
             if resolve_existing_in_maps_with_mode(
@@ -1475,7 +1441,7 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
             )?
             .is_none()
             {
-                return Err(AgentFsError::NotFound { path });
+                return Err(VfsError::NotFound { path });
             }
         }
 
@@ -1485,8 +1451,8 @@ impl AgentFileSystem for InMemoryOverlayFileSystem {
 }
 
 #[async_trait]
-impl ReadOnlyAgentKvStore for InMemoryAgentKv {
-    async fn get_json(&self, key: &str) -> Result<Option<JsonValue>, AgentFsError> {
+impl ReadOnlyVfsKvStore for InMemoryVfsKv {
+    async fn get_json(&self, key: &str) -> Result<Option<JsonValue>, VfsError> {
         let state = self
             .volume
             .state
@@ -1495,7 +1461,7 @@ impl ReadOnlyAgentKvStore for InMemoryAgentKv {
         Ok(state.kv.get(key).cloned())
     }
 
-    async fn list_keys(&self) -> Result<Vec<String>, AgentFsError> {
+    async fn list_keys(&self) -> Result<Vec<String>, VfsError> {
         let state = self
             .volume
             .state
@@ -1506,19 +1472,19 @@ impl ReadOnlyAgentKvStore for InMemoryAgentKv {
 }
 
 #[async_trait]
-impl ReadOnlyAgentKvStore for InMemorySnapshotKv {
-    async fn get_json(&self, key: &str) -> Result<Option<JsonValue>, AgentFsError> {
+impl ReadOnlyVfsKvStore for InMemorySnapshotKv {
+    async fn get_json(&self, key: &str) -> Result<Option<JsonValue>, VfsError> {
         Ok(self.state.kv.get(key).cloned())
     }
 
-    async fn list_keys(&self) -> Result<Vec<String>, AgentFsError> {
+    async fn list_keys(&self) -> Result<Vec<String>, VfsError> {
         Ok(self.state.kv.keys().cloned().collect())
     }
 }
 
 #[async_trait]
-impl AgentKvStore for InMemoryAgentKv {
-    async fn set_json(&self, key: &str, value: JsonValue) -> Result<(), AgentFsError> {
+impl VfsKvStore for InMemoryVfsKv {
+    async fn set_json(&self, key: &str, value: JsonValue) -> Result<(), VfsError> {
         let key = key.to_string();
         self.volume.mutate(|state, _now| {
             state.kv.insert(key.clone(), value);
@@ -1529,7 +1495,7 @@ impl AgentKvStore for InMemoryAgentKv {
         })
     }
 
-    async fn delete(&self, key: &str) -> Result<(), AgentFsError> {
+    async fn delete(&self, key: &str) -> Result<(), VfsError> {
         let key = key.to_string();
         self.volume.mutate(|state, _now| {
             state.kv.remove(&key);
@@ -1542,8 +1508,8 @@ impl AgentKvStore for InMemoryAgentKv {
 }
 
 #[async_trait]
-impl ReadOnlyAgentToolRuns for InMemoryAgentTools {
-    async fn get(&self, id: ToolRunId) -> Result<Option<ToolRun>, AgentFsError> {
+impl ReadOnlyToolRunStore for InMemoryToolRunStore {
+    async fn get(&self, id: ToolRunId) -> Result<Option<ToolRun>, VfsError> {
         let state = self
             .volume
             .state
@@ -1552,7 +1518,7 @@ impl ReadOnlyAgentToolRuns for InMemoryAgentTools {
         Ok(state.tool_runs.get(&id).cloned())
     }
 
-    async fn recent(&self, limit: Option<usize>) -> Result<Vec<ToolRun>, AgentFsError> {
+    async fn recent(&self, limit: Option<usize>) -> Result<Vec<ToolRun>, VfsError> {
         let state = self
             .volume
             .state
@@ -1563,23 +1529,19 @@ impl ReadOnlyAgentToolRuns for InMemoryAgentTools {
 }
 
 #[async_trait]
-impl ReadOnlyAgentToolRuns for InMemorySnapshotTools {
-    async fn get(&self, id: ToolRunId) -> Result<Option<ToolRun>, AgentFsError> {
+impl ReadOnlyToolRunStore for InMemorySnapshotTools {
+    async fn get(&self, id: ToolRunId) -> Result<Option<ToolRun>, VfsError> {
         Ok(self.state.tool_runs.get(&id).cloned())
     }
 
-    async fn recent(&self, limit: Option<usize>) -> Result<Vec<ToolRun>, AgentFsError> {
+    async fn recent(&self, limit: Option<usize>) -> Result<Vec<ToolRun>, VfsError> {
         Ok(recent_tool_runs(&self.state.tool_runs, limit))
     }
 }
 
 #[async_trait]
-impl AgentToolRuns for InMemoryAgentTools {
-    async fn start(
-        &self,
-        name: &str,
-        params: Option<JsonValue>,
-    ) -> Result<ToolRunId, AgentFsError> {
+impl ToolRunStore for InMemoryToolRunStore {
+    async fn start(&self, name: &str, params: Option<JsonValue>) -> Result<ToolRunId, VfsError> {
         let name = name.to_string();
         self.volume.mutate(|state, now| {
             let tool_run_id = allocate_tool_run_id(state);
@@ -1606,14 +1568,14 @@ impl AgentToolRuns for InMemoryAgentTools {
         })
     }
 
-    async fn success(&self, id: ToolRunId, result: Option<JsonValue>) -> Result<(), AgentFsError> {
+    async fn success(&self, id: ToolRunId, result: Option<JsonValue>) -> Result<(), VfsError> {
         self.volume.mutate(|state, now| {
             let run = state
                 .tool_runs
                 .get_mut(&id)
-                .ok_or(AgentFsError::ToolRunNotFound { tool_run_id: id })?;
+                .ok_or(VfsError::ToolRunNotFound { tool_run_id: id })?;
             if run.status != ToolRunStatus::Pending {
-                return Err(AgentFsError::ToolRunAlreadyCompleted { tool_run_id: id });
+                return Err(VfsError::ToolRunAlreadyCompleted { tool_run_id: id });
             }
             run.status = ToolRunStatus::Success;
             run.result = result;
@@ -1632,14 +1594,14 @@ impl AgentToolRuns for InMemoryAgentTools {
         })
     }
 
-    async fn error(&self, id: ToolRunId, message: String) -> Result<(), AgentFsError> {
+    async fn error(&self, id: ToolRunId, message: String) -> Result<(), VfsError> {
         self.volume.mutate(|state, now| {
             let run = state
                 .tool_runs
                 .get_mut(&id)
-                .ok_or(AgentFsError::ToolRunNotFound { tool_run_id: id })?;
+                .ok_or(VfsError::ToolRunNotFound { tool_run_id: id })?;
             if run.status != ToolRunStatus::Pending {
-                return Err(AgentFsError::ToolRunAlreadyCompleted { tool_run_id: id });
+                return Err(VfsError::ToolRunAlreadyCompleted { tool_run_id: id });
             }
             run.status = ToolRunStatus::Error;
             run.error = Some(message.clone());
@@ -1662,7 +1624,7 @@ impl AgentToolRuns for InMemoryAgentTools {
     async fn record_completed(
         &self,
         input: crate::CompletedToolRun,
-    ) -> Result<ToolRunId, AgentFsError> {
+    ) -> Result<ToolRunId, VfsError> {
         self.volume.mutate(|state, now| {
             let tool_run_id = allocate_tool_run_id(state);
             let (status, result, error, activity_kind) = match input.outcome.clone() {
@@ -1716,11 +1678,7 @@ struct InMemoryVolumeInner {
 }
 
 impl InMemoryVolumeInner {
-    fn new_empty(
-        info: AgentFsVolumeInfo,
-        clock: Arc<dyn Clock>,
-        allocator_block_size: u64,
-    ) -> Self {
+    fn new_empty(info: VolumeInfo, clock: Arc<dyn Clock>, allocator_block_size: u64) -> Self {
         let state = VolumeState::new(info, allocator_block_size);
         let (activity_watch, _receiver) = watch::channel(state.sequence);
         let (durable_activity_watch, _receiver) = watch::channel(state.durable.sequence);
@@ -1733,7 +1691,7 @@ impl InMemoryVolumeInner {
     }
 
     fn from_snapshot(
-        info: AgentFsVolumeInfo,
+        info: VolumeInfo,
         clock: Arc<dyn Clock>,
         snapshot: &SnapshotState,
         allocator_block_size: u64,
@@ -1752,7 +1710,7 @@ impl InMemoryVolumeInner {
     }
 
     fn new_overlay(
-        info: AgentFsVolumeInfo,
+        info: VolumeInfo,
         clock: Arc<dyn Clock>,
         base: &SnapshotState,
         allocator_block_size: u64,
@@ -1768,7 +1726,7 @@ impl InMemoryVolumeInner {
         }
     }
 
-    fn info(&self) -> AgentFsVolumeInfo {
+    fn info(&self) -> VolumeInfo {
         self.state
             .lock()
             .expect("volume state lock poisoned")
@@ -1808,9 +1766,9 @@ impl InMemoryVolumeInner {
         self.durable_activity_watch.send_replace(durable_sequence);
     }
 
-    fn mutate<T, F>(&self, f: F) -> Result<T, AgentFsError>
+    fn mutate<T, F>(&self, f: F) -> Result<T, VfsError>
     where
-        F: FnOnce(&mut VolumeState, Timestamp) -> Result<Option<(T, ActivitySpec)>, AgentFsError>,
+        F: FnOnce(&mut VolumeState, Timestamp) -> Result<Option<(T, ActivitySpec)>, VfsError>,
         T: Default,
     {
         let now = self.clock.now();
@@ -1850,7 +1808,7 @@ impl InMemoryVolumeInner {
 
 #[derive(Clone)]
 struct SnapshotState {
-    info: AgentFsVolumeInfo,
+    info: VolumeInfo,
     sequence: SequenceNumber,
     durable: bool,
     paths: BTreeMap<String, InodeId>,
@@ -1874,7 +1832,7 @@ struct DurableViewState {
 }
 
 impl DurableViewState {
-    fn snapshot(&self, info: AgentFsVolumeInfo) -> SnapshotState {
+    fn snapshot(&self, info: VolumeInfo) -> SnapshotState {
         SnapshotState {
             info,
             sequence: self.sequence,
@@ -1898,7 +1856,7 @@ struct OriginRecord {
 }
 
 struct VolumeState {
-    info: AgentFsVolumeInfo,
+    info: VolumeInfo,
     sequence: SequenceNumber,
     allocators: BTreeMap<AllocatorKind, BlockLeaseAllocator>,
     paths: BTreeMap<String, InodeId>,
@@ -1912,7 +1870,7 @@ struct VolumeState {
 }
 
 impl VolumeState {
-    fn new(info: AgentFsVolumeInfo, allocator_block_size: u64) -> Self {
+    fn new(info: VolumeInfo, allocator_block_size: u64) -> Self {
         let root = InodeRecord {
             stats: inode_stats(
                 ROOT_INODE_ID,
@@ -1954,7 +1912,7 @@ impl VolumeState {
     }
 
     fn from_snapshot(
-        info: AgentFsVolumeInfo,
+        info: VolumeInfo,
         snapshot: &SnapshotState,
         allocator_block_size: u64,
         initialize_durable: bool,
@@ -2008,11 +1966,7 @@ impl VolumeState {
         }
     }
 
-    fn new_overlay(
-        info: AgentFsVolumeInfo,
-        base: &SnapshotState,
-        allocator_block_size: u64,
-    ) -> Self {
+    fn new_overlay(info: VolumeInfo, base: &SnapshotState, allocator_block_size: u64) -> Self {
         let root = base
             .inodes
             .get(&ROOT_INODE_ID)
@@ -2252,10 +2206,10 @@ fn tool_metadata(tool_run_id: ToolRunId) -> BTreeMap<String, JsonValue> {
     metadata
 }
 
-fn configured_chunk_size(chunk_size: Option<u32>) -> Result<u32, AgentFsError> {
+fn configured_chunk_size(chunk_size: Option<u32>) -> Result<u32, VfsError> {
     let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
     if chunk_size == 0 {
-        return Err(AgentFsError::InvalidChunkSize);
+        return Err(VfsError::InvalidChunkSize);
     }
     Ok(chunk_size)
 }
@@ -2297,9 +2251,9 @@ fn mutate_write_file_state(
     data: &[u8],
     opts: &CreateOptions,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     if path == "/" {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     }
     ensure_parent_directory(state, path, opts.create_parents, now)?;
     let exact_exists = state.paths.contains_key(path);
@@ -2308,21 +2262,21 @@ fn mutate_write_file_state(
             let inode = state
                 .inodes
                 .get_mut(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
+                .ok_or_else(|| VfsError::NotFound {
                     path: resolved_path.clone(),
                 })?;
             let InodeData::File(content) = &mut inode.data else {
                 return match inode.stats.kind {
-                    FileKind::Directory => Err(AgentFsError::IsDirectory {
+                    FileKind::Directory => Err(VfsError::IsDirectory {
                         path: resolved_path,
                     }),
-                    _ => Err(AgentFsError::NotFile {
+                    _ => Err(VfsError::NotFile {
                         path: resolved_path,
                     }),
                 };
             };
             if !opts.overwrite {
-                return Err(AgentFsError::AlreadyExists {
+                return Err(VfsError::AlreadyExists {
                     path: resolved_path,
                 });
             }
@@ -2333,14 +2287,14 @@ fn mutate_write_file_state(
             inode.stats.accessed_at = now;
         }
         None if exact_exists => {
-            return Err(AgentFsError::NotFound {
+            return Err(VfsError::NotFound {
                 path: path.to_string(),
             });
         }
         None => {
             let resolved_path = resolve_target_path(state, path)?;
             if state.paths.contains_key(&resolved_path) {
-                return Err(AgentFsError::AlreadyExists {
+                return Err(VfsError::AlreadyExists {
                     path: resolved_path,
                 });
             }
@@ -2368,23 +2322,23 @@ fn mutate_pwrite_state(
     offset: u64,
     data: &[u8],
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let (resolved_path, inode_id) =
-        resolve_existing_path(state, path, true)?.ok_or_else(|| AgentFsError::NotFound {
+        resolve_existing_path(state, path, true)?.ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
     let inode = state
         .inodes
         .get_mut(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: resolved_path.clone(),
         })?;
     let InodeData::File(content) = &mut inode.data else {
         return match inode.stats.kind {
-            FileKind::Directory => Err(AgentFsError::IsDirectory {
+            FileKind::Directory => Err(VfsError::IsDirectory {
                 path: resolved_path.clone(),
             }),
-            _ => Err(AgentFsError::NotFile {
+            _ => Err(VfsError::NotFile {
                 path: resolved_path.clone(),
             }),
         };
@@ -2409,23 +2363,23 @@ fn mutate_truncate_state(
     path: &str,
     size: u64,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let (resolved_path, inode_id) =
-        resolve_existing_path(state, path, true)?.ok_or_else(|| AgentFsError::NotFound {
+        resolve_existing_path(state, path, true)?.ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
     let inode = state
         .inodes
         .get_mut(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: resolved_path.clone(),
         })?;
     let InodeData::File(content) = &mut inode.data else {
         return match inode.stats.kind {
-            FileKind::Directory => Err(AgentFsError::IsDirectory {
+            FileKind::Directory => Err(VfsError::IsDirectory {
                 path: resolved_path.clone(),
             }),
-            _ => Err(AgentFsError::NotFile {
+            _ => Err(VfsError::NotFile {
                 path: resolved_path.clone(),
             }),
         };
@@ -2444,18 +2398,18 @@ fn mutate_mkdir_state(
     path: &str,
     opts: &MkdirOptions,
     now: Timestamp,
-) -> Result<bool, AgentFsError> {
+) -> Result<bool, VfsError> {
     if let Some((resolved_path, inode_id)) = resolve_existing_path(state, path, false)? {
         let inode = state
             .inodes
             .get(&inode_id)
-            .ok_or_else(|| AgentFsError::NotFound {
+            .ok_or_else(|| VfsError::NotFound {
                 path: resolved_path.clone(),
             })?;
         if inode.stats.kind == FileKind::Directory && opts.recursive {
             return Ok(false);
         }
-        return Err(AgentFsError::AlreadyExists {
+        return Err(VfsError::AlreadyExists {
             path: resolved_path,
         });
     }
@@ -2481,15 +2435,15 @@ fn mutate_rename_state(
     from: &str,
     to: &str,
     now: Timestamp,
-) -> Result<bool, AgentFsError> {
+) -> Result<bool, VfsError> {
     if from == "/" || to == "/" {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     }
     if from == to {
         return Ok(false);
     }
     let (resolved_from, from_inode_id) =
-        resolve_existing_path(state, from, false)?.ok_or_else(|| AgentFsError::NotFound {
+        resolve_existing_path(state, from, false)?.ok_or_else(|| VfsError::NotFound {
             path: from.to_string(),
         })?;
     let resolved_to = resolve_target_path(state, to)?;
@@ -2497,7 +2451,7 @@ fn mutate_rename_state(
         return Ok(false);
     }
     if is_descendant_path(&resolved_from, &resolved_to) {
-        return Err(AgentFsError::InvalidPath {
+        return Err(VfsError::InvalidPath {
             path: resolved_to.clone(),
         });
     }
@@ -2505,19 +2459,19 @@ fn mutate_rename_state(
     let from_kind = state
         .inodes
         .get(&from_inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: resolved_from.clone(),
         })?
         .stats
         .kind;
-    let from_parent = parent_path(&resolved_from).ok_or(AgentFsError::RootInvariant)?;
-    let to_parent = parent_path(&resolved_to).ok_or(AgentFsError::RootInvariant)?;
+    let from_parent = parent_path(&resolved_from).ok_or(VfsError::RootInvariant)?;
+    let to_parent = parent_path(&resolved_to).ok_or(VfsError::RootInvariant)?;
 
     if let Some(target_inode_id) = state.paths.get(&resolved_to).copied() {
         let target_kind = state
             .inodes
             .get(&target_inode_id)
-            .ok_or_else(|| AgentFsError::NotFound {
+            .ok_or_else(|| VfsError::NotFound {
                 path: resolved_to.clone(),
             })?
             .stats
@@ -2527,7 +2481,7 @@ fn mutate_rename_state(
                 if state.paths.keys().any(|candidate| {
                     candidate != &resolved_to && is_descendant_path(&resolved_to, candidate)
                 }) {
-                    return Err(AgentFsError::DirectoryNotEmpty {
+                    return Err(VfsError::DirectoryNotEmpty {
                         path: resolved_to.clone(),
                     });
                 }
@@ -2536,12 +2490,12 @@ fn mutate_rename_state(
                 decrement_directory_nlink(state, &resolved_to, now)?;
             }
             (FileKind::Directory, _) => {
-                return Err(AgentFsError::NotDirectory {
+                return Err(VfsError::NotDirectory {
                     path: resolved_to.clone(),
                 });
             }
             (_, FileKind::Directory) => {
-                return Err(AgentFsError::IsDirectory {
+                return Err(VfsError::IsDirectory {
                     path: resolved_to.clone(),
                 });
             }
@@ -2582,35 +2536,35 @@ fn mutate_link_state(
     from: &str,
     to: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     if to == "/" {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     }
     let (resolved_from, inode_id) =
-        resolve_existing_path(state, from, false)?.ok_or_else(|| AgentFsError::NotFound {
+        resolve_existing_path(state, from, false)?.ok_or_else(|| VfsError::NotFound {
             path: from.to_string(),
         })?;
     let resolved_to = resolve_target_path(state, to)?;
     if state.paths.contains_key(&resolved_to) {
-        return Err(AgentFsError::AlreadyExists { path: resolved_to });
+        return Err(VfsError::AlreadyExists { path: resolved_to });
     }
     let kind = state
         .inodes
         .get(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: resolved_from.clone(),
         })?
         .stats
         .kind;
     if kind == FileKind::Directory {
-        return Err(AgentFsError::UnsupportedOperation {
+        return Err(VfsError::UnsupportedOperation {
             operation: "hard-link directories",
         });
     }
     let inode = state
         .inodes
         .get_mut(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: resolved_from.clone(),
         })?;
     inode.stats.nlink = inode.stats.nlink.saturating_add(1);
@@ -2625,13 +2579,13 @@ fn mutate_symlink_state(
     target: &str,
     linkpath: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     if linkpath == "/" {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     }
     let resolved_linkpath = resolve_target_path(state, linkpath)?;
     if state.paths.contains_key(&resolved_linkpath) {
-        return Err(AgentFsError::AlreadyExists {
+        return Err(VfsError::AlreadyExists {
             path: resolved_linkpath,
         });
     }
@@ -2653,12 +2607,12 @@ fn mutate_unlink_state(
     state: &mut VolumeState,
     path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     if path == "/" {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     }
     let (resolved_path, _) =
-        resolve_existing_path(state, path, false)?.ok_or_else(|| AgentFsError::NotFound {
+        resolve_existing_path(state, path, false)?.ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
     remove_non_directory_path(state, &resolved_path, now)?;
@@ -2666,33 +2620,29 @@ fn mutate_unlink_state(
     Ok(())
 }
 
-fn mutate_rmdir_state(
-    state: &mut VolumeState,
-    path: &str,
-    now: Timestamp,
-) -> Result<(), AgentFsError> {
+fn mutate_rmdir_state(state: &mut VolumeState, path: &str, now: Timestamp) -> Result<(), VfsError> {
     if path == "/" {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     }
     let (resolved_path, inode_id) =
-        resolve_existing_path(state, path, false)?.ok_or_else(|| AgentFsError::NotFound {
+        resolve_existing_path(state, path, false)?.ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
     let inode = state
         .inodes
         .get(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: resolved_path.clone(),
         })?;
     if inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory {
+        return Err(VfsError::NotDirectory {
             path: resolved_path.clone(),
         });
     }
     if state.paths.keys().any(|candidate| {
         candidate != &resolved_path && is_descendant_path(&resolved_path, candidate)
     }) {
-        return Err(AgentFsError::DirectoryNotEmpty {
+        return Err(VfsError::DirectoryNotEmpty {
             path: resolved_path.clone(),
         });
     }
@@ -2754,7 +2704,7 @@ fn overlay_origin_record(state: &VolumeState, base_inode: InodeId) -> Option<Ori
     })
 }
 
-fn visible_directory_nlink(merged: &SnapshotState, path: &str) -> Result<u32, AgentFsError> {
+fn visible_directory_nlink(merged: &SnapshotState, path: &str) -> Result<u32, VfsError> {
     let mut nlink = 2_u32;
     for entry in read_snapshot_dir_entries(merged, path)? {
         if entry.kind == FileKind::Directory {
@@ -2778,9 +2728,9 @@ fn materialize_overlay_parent_chain(
     path: &str,
     create_missing: bool,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let Some(parent) = parent_path(path) else {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     };
     if parent == "/" {
         return Ok(());
@@ -2794,11 +2744,11 @@ fn materialize_overlay_parent_chain(
             let inode = state
                 .inodes
                 .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotDirectory {
+                .ok_or_else(|| VfsError::NotDirectory {
                     path: current.clone(),
                 })?;
             if inode.stats.kind != FileKind::Directory {
-                return Err(AgentFsError::NotDirectory {
+                return Err(VfsError::NotDirectory {
                     path: current.clone(),
                 });
             }
@@ -2811,11 +2761,11 @@ fn materialize_overlay_parent_chain(
             let inode = merged
                 .inodes
                 .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotDirectory {
+                .ok_or_else(|| VfsError::NotDirectory {
                     path: resolved_path.clone(),
                 })?;
             if inode.stats.kind != FileKind::Directory {
-                return Err(AgentFsError::NotDirectory {
+                return Err(VfsError::NotDirectory {
                     path: resolved_path,
                 });
             }
@@ -2824,7 +2774,7 @@ fn materialize_overlay_parent_chain(
         }
 
         if !create_missing {
-            return Err(AgentFsError::NotFound { path: current });
+            return Err(VfsError::NotFound { path: current });
         }
 
         let inode_id = allocate_inode(state);
@@ -2849,25 +2799,25 @@ fn copy_up_overlay_directory_exact(
     merged: &SnapshotState,
     path: &str,
     _now: Timestamp,
-) -> Result<InodeId, AgentFsError> {
+) -> Result<InodeId, VfsError> {
     if let Some(inode_id) = state.paths.get(path).copied() {
         return Ok(inode_id);
     }
 
     let (resolved_path, base_inode_id) =
         resolve_existing_in_maps_with_mode(&base.paths, &base.inodes, path, false)?.ok_or_else(
-            || AgentFsError::NotFound {
+            || VfsError::NotFound {
                 path: path.to_string(),
             },
         )?;
-    let base_record =
-        base.inodes
-            .get(&base_inode_id)
-            .ok_or_else(|| AgentFsError::NotDirectory {
-                path: resolved_path.clone(),
-            })?;
+    let base_record = base
+        .inodes
+        .get(&base_inode_id)
+        .ok_or_else(|| VfsError::NotDirectory {
+            path: resolved_path.clone(),
+        })?;
     if base_record.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory {
+        return Err(VfsError::NotDirectory {
             path: resolved_path,
         });
     }
@@ -2900,21 +2850,21 @@ fn copy_up_overlay_inode_aliases(
     merged: &SnapshotState,
     path: &str,
     now: Timestamp,
-) -> Result<InodeId, AgentFsError> {
+) -> Result<InodeId, VfsError> {
     let (resolved_path, base_inode_id) =
         resolve_existing_in_maps_with_mode(&base.paths, &base.inodes, path, false)?.ok_or_else(
-            || AgentFsError::NotFound {
+            || VfsError::NotFound {
                 path: path.to_string(),
             },
         )?;
     let base_record = base
         .inodes
         .get(&base_inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: resolved_path.clone(),
         })?;
     if base_record.stats.kind == FileKind::Directory {
-        return Err(AgentFsError::UnsupportedOperation {
+        return Err(VfsError::UnsupportedOperation {
             operation: "copy-up directory aliases",
         });
     }
@@ -2970,7 +2920,7 @@ fn copy_up_overlay_directory_subtree(
     merged: &SnapshotState,
     path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let mut paths = merged
         .paths
         .keys()
@@ -2983,18 +2933,17 @@ fn copy_up_overlay_directory_subtree(
         if state.paths.contains_key(&candidate) {
             continue;
         }
-        let inode_id =
-            merged
-                .paths
-                .get(&candidate)
-                .copied()
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: candidate.clone(),
-                })?;
+        let inode_id = merged
+            .paths
+            .get(&candidate)
+            .copied()
+            .ok_or_else(|| VfsError::NotFound {
+                path: candidate.clone(),
+            })?;
         let inode = merged
             .inodes
             .get(&inode_id)
-            .ok_or_else(|| AgentFsError::NotFound {
+            .ok_or_else(|| VfsError::NotFound {
                 path: candidate.clone(),
             })?;
         match inode.stats.kind {
@@ -3018,7 +2967,7 @@ fn ensure_overlay_existing_path(
     path: &str,
     recursive_dir: bool,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     if state.paths.contains_key(path) {
         return Ok(());
     }
@@ -3026,13 +2975,13 @@ fn ensure_overlay_existing_path(
         .paths
         .get(path)
         .copied()
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
     let inode = merged
         .inodes
         .get(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
     match inode.stats.kind {
@@ -3068,9 +3017,9 @@ fn inode_stats(inode: InodeId, kind: FileKind, mode: u32, now: Timestamp, size: 
     }
 }
 
-fn normalize_path(path: &str) -> Result<String, AgentFsError> {
+fn normalize_path(path: &str) -> Result<String, VfsError> {
     if !path.starts_with('/') {
-        return Err(AgentFsError::InvalidPath {
+        return Err(VfsError::InvalidPath {
             path: path.to_string(),
         });
     }
@@ -3084,7 +3033,7 @@ fn normalize_path(path: &str) -> Result<String, AgentFsError> {
             continue;
         }
         if part == "." || part == ".." {
-            return Err(AgentFsError::InvalidPath {
+            return Err(VfsError::InvalidPath {
                 path: path.to_string(),
             });
         }
@@ -3098,9 +3047,9 @@ fn normalize_path(path: &str) -> Result<String, AgentFsError> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-fn normalize_internal_path(path: &str) -> Result<String, AgentFsError> {
+fn normalize_internal_path(path: &str) -> Result<String, VfsError> {
     if !path.starts_with('/') {
-        return Err(AgentFsError::InvalidPath {
+        return Err(VfsError::InvalidPath {
             path: path.to_string(),
         });
     }
@@ -3164,9 +3113,9 @@ fn ensure_parent_directory(
     path: &str,
     create_parents: bool,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let Some(parent) = parent_path(path) else {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     };
 
     if create_parents {
@@ -3179,7 +3128,7 @@ fn create_missing_directories(
     state: &mut VolumeState,
     path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     if path == "/" {
         return Ok(());
     }
@@ -3192,11 +3141,11 @@ fn create_missing_directories(
             let inode = state
                 .inodes
                 .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotDirectory {
+                .ok_or_else(|| VfsError::NotDirectory {
                     path: current.clone(),
                 })?;
             if inode.stats.kind != FileKind::Directory {
-                return Err(AgentFsError::NotDirectory {
+                return Err(VfsError::NotDirectory {
                     path: current.clone(),
                 });
             }
@@ -3219,7 +3168,7 @@ fn create_missing_directories(
     Ok(())
 }
 
-fn resolve_target_path(state: &VolumeState, path: &str) -> Result<String, AgentFsError> {
+fn resolve_target_path(state: &VolumeState, path: &str) -> Result<String, VfsError> {
     resolve_target_path_in_maps(&state.paths, &state.inodes, path)
 }
 
@@ -3227,25 +3176,25 @@ fn resolve_target_path_in_maps(
     paths: &BTreeMap<String, InodeId>,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
-) -> Result<String, AgentFsError> {
+) -> Result<String, VfsError> {
     let path = normalize_path(path)?;
     let Some(parent) = parent_path(&path) else {
-        return Err(AgentFsError::RootInvariant);
+        return Err(VfsError::RootInvariant);
     };
-    let name = basename(&path).ok_or(AgentFsError::RootInvariant)?;
+    let name = basename(&path).ok_or(VfsError::RootInvariant)?;
     let (resolved_parent, parent_inode) =
         resolve_existing_in_maps_with_mode(paths, inodes, &parent, true)?.ok_or_else(|| {
-            AgentFsError::NotFound {
+            VfsError::NotFound {
                 path: parent.clone(),
             }
         })?;
     let inode = inodes
         .get(&parent_inode)
-        .ok_or_else(|| AgentFsError::NotDirectory {
+        .ok_or_else(|| VfsError::NotDirectory {
             path: resolved_parent.clone(),
         })?;
     if inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory {
+        return Err(VfsError::NotDirectory {
             path: resolved_parent,
         });
     }
@@ -3256,7 +3205,7 @@ fn resolve_existing_path(
     state: &VolumeState,
     path: &str,
     follow_final_symlink: bool,
-) -> Result<Option<(String, InodeId)>, AgentFsError> {
+) -> Result<Option<(String, InodeId)>, VfsError> {
     resolve_existing_in_maps_with_mode(&state.paths, &state.inodes, path, follow_final_symlink)
 }
 
@@ -3265,7 +3214,7 @@ fn resolve_existing_in_maps_with_mode(
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
     follow_final_symlink: bool,
-) -> Result<Option<(String, InodeId)>, AgentFsError> {
+) -> Result<Option<(String, InodeId)>, VfsError> {
     let original = normalize_path(path)?;
     let mut current = original.clone();
     for _ in 0..MAX_SYMLINK_DEPTH {
@@ -3282,11 +3231,9 @@ fn resolve_existing_in_maps_with_mode(
             let Some(inode_id) = paths.get(&candidate).copied() else {
                 return Ok(None);
             };
-            let inode = inodes
-                .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound {
-                    path: candidate.clone(),
-                })?;
+            let inode = inodes.get(&inode_id).ok_or_else(|| VfsError::NotFound {
+                path: candidate.clone(),
+            })?;
             let is_final = index + 1 == segments.len();
             if let InodeData::Symlink(target) = &inode.data
                 && (!is_final || follow_final_symlink)
@@ -3302,21 +3249,21 @@ fn resolve_existing_in_maps_with_mode(
             let inode_id = paths
                 .get(&prefix)
                 .copied()
-                .ok_or_else(|| AgentFsError::NotFound {
+                .ok_or_else(|| VfsError::NotFound {
                     path: prefix.clone(),
                 })?;
             return Ok(Some((prefix, inode_id)));
         }
     }
 
-    Err(AgentFsError::SymlinkLoop { path: original })
+    Err(VfsError::SymlinkLoop { path: original })
 }
 
 fn resolve_symlink_target(
     symlink_path: &str,
     target: &str,
     remainder: &[&str],
-) -> Result<String, AgentFsError> {
+) -> Result<String, VfsError> {
     let parent = parent_path(symlink_path).unwrap_or_else(|| "/".to_string());
     let mut combined = if target.starts_with('/') {
         target.to_string()
@@ -3338,7 +3285,7 @@ fn lookup_stats(
     state: &VolumeState,
     path: &str,
     follow_final_symlink: bool,
-) -> Result<Option<Stats>, AgentFsError> {
+) -> Result<Option<Stats>, VfsError> {
     lookup_stats_in_maps(&state.paths, &state.inodes, path, follow_final_symlink)
 }
 
@@ -3346,7 +3293,7 @@ fn lookup_snapshot_stats(
     state: &SnapshotState,
     path: &str,
     follow_final_symlink: bool,
-) -> Result<Option<Stats>, AgentFsError> {
+) -> Result<Option<Stats>, VfsError> {
     lookup_stats_in_maps(&state.paths, &state.inodes, path, follow_final_symlink)
 }
 
@@ -3355,26 +3302,26 @@ fn lookup_stats_in_maps(
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
     follow_final_symlink: bool,
-) -> Result<Option<Stats>, AgentFsError> {
+) -> Result<Option<Stats>, VfsError> {
     let Some((resolved_path, inode_id)) =
         resolve_existing_in_maps_with_mode(paths, inodes, path, follow_final_symlink)?
     else {
         return Ok(None);
     };
-    let inode = inodes.get(&inode_id).ok_or(AgentFsError::NotFound {
+    let inode = inodes.get(&inode_id).ok_or(VfsError::NotFound {
         path: resolved_path,
     })?;
     Ok(Some(inode.stats.clone()))
 }
 
-fn read_file_bytes(state: &VolumeState, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
+fn read_file_bytes(state: &VolumeState, path: &str) -> Result<Option<Vec<u8>>, VfsError> {
     read_file_bytes_in_maps(&state.paths, &state.inodes, state.info.chunk_size, path)
 }
 
 fn read_snapshot_file_bytes(
     state: &SnapshotState,
     path: &str,
-) -> Result<Option<Vec<u8>>, AgentFsError> {
+) -> Result<Option<Vec<u8>>, VfsError> {
     read_file_bytes_in_maps(&state.paths, &state.inodes, state.info.chunk_size, path)
 }
 
@@ -3383,27 +3330,25 @@ fn read_file_bytes_in_maps(
     inodes: &BTreeMap<InodeId, InodeRecord>,
     chunk_size: u32,
     path: &str,
-) -> Result<Option<Vec<u8>>, AgentFsError> {
+) -> Result<Option<Vec<u8>>, VfsError> {
     let Some((resolved_path, inode_id)) =
         resolve_existing_in_maps_with_mode(paths, inodes, path, true)?
     else {
         return Ok(None);
     };
-    let inode = inodes
-        .get(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
-            path: resolved_path.clone(),
-        })?;
+    let inode = inodes.get(&inode_id).ok_or_else(|| VfsError::NotFound {
+        path: resolved_path.clone(),
+    })?;
     match &inode.data {
         InodeData::File(content) => Ok(Some(file_content_to_bytes(
             content,
             inode.stats.size,
             chunk_size,
         ))),
-        InodeData::Directory => Err(AgentFsError::IsDirectory {
+        InodeData::Directory => Err(VfsError::IsDirectory {
             path: resolved_path,
         }),
-        InodeData::Symlink(_) => Err(AgentFsError::NotFile {
+        InodeData::Symlink(_) => Err(VfsError::NotFile {
             path: resolved_path,
         }),
     }
@@ -3414,7 +3359,7 @@ fn pread_file_bytes(
     path: &str,
     offset: u64,
     len: u64,
-) -> Result<Option<Vec<u8>>, AgentFsError> {
+) -> Result<Option<Vec<u8>>, VfsError> {
     pread_file_bytes_in_maps(
         &state.paths,
         &state.inodes,
@@ -3430,7 +3375,7 @@ fn pread_snapshot_file_bytes(
     path: &str,
     offset: u64,
     len: u64,
-) -> Result<Option<Vec<u8>>, AgentFsError> {
+) -> Result<Option<Vec<u8>>, VfsError> {
     pread_file_bytes_in_maps(
         &state.paths,
         &state.inodes,
@@ -3448,17 +3393,15 @@ fn pread_file_bytes_in_maps(
     path: &str,
     offset: u64,
     len: u64,
-) -> Result<Option<Vec<u8>>, AgentFsError> {
+) -> Result<Option<Vec<u8>>, VfsError> {
     let Some((resolved_path, inode_id)) =
         resolve_existing_in_maps_with_mode(paths, inodes, path, true)?
     else {
         return Ok(None);
     };
-    let inode = inodes
-        .get(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
-            path: resolved_path.clone(),
-        })?;
+    let inode = inodes.get(&inode_id).ok_or_else(|| VfsError::NotFound {
+        path: resolved_path.clone(),
+    })?;
     match &inode.data {
         InodeData::File(content) => Ok(Some(read_file_content_range(
             content,
@@ -3467,23 +3410,20 @@ fn pread_file_bytes_in_maps(
             offset,
             len,
         ))),
-        InodeData::Directory => Err(AgentFsError::IsDirectory {
+        InodeData::Directory => Err(VfsError::IsDirectory {
             path: resolved_path,
         }),
-        InodeData::Symlink(_) => Err(AgentFsError::NotFile {
+        InodeData::Symlink(_) => Err(VfsError::NotFile {
             path: resolved_path,
         }),
     }
 }
 
-fn read_dir_entries(state: &VolumeState, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
+fn read_dir_entries(state: &VolumeState, path: &str) -> Result<Vec<DirEntry>, VfsError> {
     read_dir_entries_in_maps(&state.paths, &state.inodes, path)
 }
 
-fn read_snapshot_dir_entries(
-    state: &SnapshotState,
-    path: &str,
-) -> Result<Vec<DirEntry>, AgentFsError> {
+fn read_snapshot_dir_entries(state: &SnapshotState, path: &str) -> Result<Vec<DirEntry>, VfsError> {
     read_dir_entries_in_maps(&state.paths, &state.inodes, path)
 }
 
@@ -3491,19 +3431,19 @@ fn read_dir_entries_in_maps(
     paths: &BTreeMap<String, InodeId>,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
-) -> Result<Vec<DirEntry>, AgentFsError> {
+) -> Result<Vec<DirEntry>, VfsError> {
     let normalized = normalize_path(path)?;
     let (resolved_path, inode_id) = resolve_existing_in_maps_with_mode(paths, inodes, path, true)?
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: normalized.clone(),
         })?;
     let inode = inodes
         .get(&inode_id)
-        .ok_or_else(|| AgentFsError::NotDirectory {
+        .ok_or_else(|| VfsError::NotDirectory {
             path: resolved_path.clone(),
         })?;
     if inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory {
+        return Err(VfsError::NotDirectory {
             path: resolved_path,
         });
     }
@@ -3511,7 +3451,7 @@ fn read_dir_entries_in_maps(
     let mut entries = Vec::new();
     for (candidate, inode_id) in paths {
         if let Some(name) = direct_child_name(&resolved_path, candidate) {
-            let inode = inodes.get(inode_id).ok_or_else(|| AgentFsError::NotFound {
+            let inode = inodes.get(inode_id).ok_or_else(|| VfsError::NotFound {
                 path: candidate.clone(),
             })?;
             entries.push(DirEntry {
@@ -3524,17 +3464,14 @@ fn read_dir_entries_in_maps(
     Ok(entries)
 }
 
-fn read_dir_entries_plus(
-    state: &VolumeState,
-    path: &str,
-) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+fn read_dir_entries_plus(state: &VolumeState, path: &str) -> Result<Vec<DirEntryPlus>, VfsError> {
     read_dir_entries_plus_in_maps(&state.paths, &state.inodes, path)
 }
 
 fn read_snapshot_dir_entries_plus(
     state: &SnapshotState,
     path: &str,
-) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+) -> Result<Vec<DirEntryPlus>, VfsError> {
     read_dir_entries_plus_in_maps(&state.paths, &state.inodes, path)
 }
 
@@ -3542,13 +3479,13 @@ fn read_dir_entries_plus_in_maps(
     paths: &BTreeMap<String, InodeId>,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
-) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+) -> Result<Vec<DirEntryPlus>, VfsError> {
     read_dir_entries_in_maps(paths, inodes, path)?
         .into_iter()
         .map(|entry| {
             let stats = inodes
                 .get(&entry.inode)
-                .ok_or_else(|| AgentFsError::NotFound {
+                .ok_or_else(|| VfsError::NotFound {
                     path: format!("{path}/{}", entry.name),
                 })?
                 .stats
@@ -3562,20 +3499,18 @@ fn read_link_target(
     paths: &BTreeMap<String, InodeId>,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
-) -> Result<String, AgentFsError> {
+) -> Result<String, VfsError> {
     let normalized = normalize_path(path)?;
     let (resolved_path, inode_id) = resolve_existing_in_maps_with_mode(paths, inodes, path, false)?
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: normalized.clone(),
         })?;
-    let inode = inodes
-        .get(&inode_id)
-        .ok_or_else(|| AgentFsError::NotFound {
-            path: resolved_path.clone(),
-        })?;
+    let inode = inodes.get(&inode_id).ok_or_else(|| VfsError::NotFound {
+        path: resolved_path.clone(),
+    })?;
     match &inode.data {
         InodeData::Symlink(target) => Ok(target.clone()),
-        _ => Err(AgentFsError::NotSymlink {
+        _ => Err(VfsError::NotSymlink {
             path: resolved_path,
         }),
     }
@@ -3585,22 +3520,22 @@ fn touch_directory_path_at(
     state: &mut VolumeState,
     path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let inode_id = state
         .paths
         .get(path)
         .copied()
-        .ok_or_else(|| AgentFsError::NotFound {
+        .ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
     let inode = state
         .inodes
         .get_mut(&inode_id)
-        .ok_or_else(|| AgentFsError::NotDirectory {
+        .ok_or_else(|| VfsError::NotDirectory {
             path: path.to_string(),
         })?;
     if inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory {
+        return Err(VfsError::NotDirectory {
             path: path.to_string(),
         });
     }
@@ -3613,7 +3548,7 @@ fn touch_parent_directory(
     state: &mut VolumeState,
     child_path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let Some(parent) = parent_path(child_path) else {
         return Ok(());
     };
@@ -3624,27 +3559,26 @@ fn increment_directory_nlink(
     state: &mut VolumeState,
     child_path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let Some(parent) = parent_path(child_path) else {
         return Ok(());
     };
-    let parent_inode_id =
-        state
-            .paths
-            .get(&parent)
-            .copied()
-            .ok_or_else(|| AgentFsError::NotFound {
-                path: parent.clone(),
-            })?;
+    let parent_inode_id = state
+        .paths
+        .get(&parent)
+        .copied()
+        .ok_or_else(|| VfsError::NotFound {
+            path: parent.clone(),
+        })?;
     let parent_inode =
         state
             .inodes
             .get_mut(&parent_inode_id)
-            .ok_or_else(|| AgentFsError::NotDirectory {
+            .ok_or_else(|| VfsError::NotDirectory {
                 path: parent.clone(),
             })?;
     if parent_inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory { path: parent });
+        return Err(VfsError::NotDirectory { path: parent });
     }
     parent_inode.stats.nlink = parent_inode.stats.nlink.saturating_add(1);
     parent_inode.stats.modified_at = now;
@@ -3656,27 +3590,26 @@ fn decrement_directory_nlink(
     state: &mut VolumeState,
     child_path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     let Some(parent) = parent_path(child_path) else {
         return Ok(());
     };
-    let parent_inode_id =
-        state
-            .paths
-            .get(&parent)
-            .copied()
-            .ok_or_else(|| AgentFsError::NotFound {
-                path: parent.clone(),
-            })?;
+    let parent_inode_id = state
+        .paths
+        .get(&parent)
+        .copied()
+        .ok_or_else(|| VfsError::NotFound {
+            path: parent.clone(),
+        })?;
     let parent_inode =
         state
             .inodes
             .get_mut(&parent_inode_id)
-            .ok_or_else(|| AgentFsError::NotDirectory {
+            .ok_or_else(|| VfsError::NotDirectory {
                 path: parent.clone(),
             })?;
     if parent_inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory { path: parent });
+        return Err(VfsError::NotDirectory { path: parent });
     }
     parent_inode.stats.nlink = parent_inode.stats.nlink.saturating_sub(1);
     parent_inode.stats.modified_at = now;
@@ -3688,7 +3621,7 @@ fn adjust_directory_parent_links(
     state: &mut VolumeState,
     old_parent: &str,
     new_parent: &str,
-) -> Result<(), AgentFsError> {
+) -> Result<(), VfsError> {
     if old_parent == new_parent {
         return Ok(());
     }
@@ -3697,7 +3630,7 @@ fn adjust_directory_parent_links(
             .paths
             .get(old_parent)
             .copied()
-            .ok_or_else(|| AgentFsError::NotFound {
+            .ok_or_else(|| VfsError::NotFound {
                 path: old_parent.to_string(),
             })?;
     let new_parent_inode =
@@ -3705,13 +3638,13 @@ fn adjust_directory_parent_links(
             .paths
             .get(new_parent)
             .copied()
-            .ok_or_else(|| AgentFsError::NotFound {
+            .ok_or_else(|| VfsError::NotFound {
                 path: new_parent.to_string(),
             })?;
     state
         .inodes
         .get_mut(&old_parent_inode)
-        .ok_or_else(|| AgentFsError::NotDirectory {
+        .ok_or_else(|| VfsError::NotDirectory {
             path: old_parent.to_string(),
         })?
         .stats
@@ -3725,7 +3658,7 @@ fn adjust_directory_parent_links(
     state
         .inodes
         .get_mut(&new_parent_inode)
-        .ok_or_else(|| AgentFsError::NotDirectory {
+        .ok_or_else(|| VfsError::NotDirectory {
             path: new_parent.to_string(),
         })?
         .stats
@@ -3743,22 +3676,19 @@ fn remove_non_directory_path(
     state: &mut VolumeState,
     path: &str,
     now: Timestamp,
-) -> Result<(), AgentFsError> {
-    let inode_id = state
-        .paths
-        .remove(path)
-        .ok_or_else(|| AgentFsError::NotFound {
-            path: path.to_string(),
-        })?;
+) -> Result<(), VfsError> {
+    let inode_id = state.paths.remove(path).ok_or_else(|| VfsError::NotFound {
+        path: path.to_string(),
+    })?;
     let remove_inode = {
         let inode = state
             .inodes
             .get_mut(&inode_id)
-            .ok_or_else(|| AgentFsError::NotFound {
+            .ok_or_else(|| VfsError::NotFound {
                 path: path.to_string(),
             })?;
         if inode.stats.kind == FileKind::Directory {
-            return Err(AgentFsError::IsDirectory {
+            return Err(VfsError::IsDirectory {
                 path: path.to_string(),
             });
         }

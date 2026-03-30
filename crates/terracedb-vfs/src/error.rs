@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::{ToolRunId, VolumeId};
 
 #[derive(Debug, Error)]
-pub enum AgentFsError {
+pub enum VfsError {
     #[error("volume {volume_id} not found")]
     VolumeNotFound { volume_id: VolumeId },
     #[error("volume {volume_id} already exists")]

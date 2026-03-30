@@ -4,8 +4,8 @@ use futures::{TryStreamExt, future::join_all};
 use terracedb::{Clock, LogCursor};
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{
-    ActivityOptions, AgentFsConfig, AgentFsStore, CompletedToolRun, CompletedToolRunOutcome,
-    CreateOptions, InMemoryAgentFsStore, MkdirOptions, SnapshotOptions, VolumeId,
+    ActivityOptions, CompletedToolRun, CompletedToolRunOutcome, CreateOptions, InMemoryVfsStore,
+    MkdirOptions, SnapshotOptions, VolumeConfig, VolumeId, VolumeStore,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,10 +53,10 @@ fn run_vfs_simulation(seed: u64) -> turmoil::Result<VfsSimulationCapture> {
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(50))
         .run_with(move |context| async move {
-            let store = InMemoryAgentFsStore::new(context.clock(), context.rng());
+            let store = InMemoryVfsStore::new(context.clock(), context.rng());
             let volume = store
                 .open_volume(
-                    AgentFsConfig::new(VolumeId::new(0x3900 + seed as u128))
+                    VolumeConfig::new(VolumeId::new(0x3900 + seed as u128))
                         .with_chunk_size(4)
                         .with_create_if_missing(true),
                 )
