@@ -6681,6 +6681,15 @@ impl Db {
 
     pub async fn snapshot(&self) -> Snapshot {
         let sequence = self.current_sequence();
+        self.register_snapshot(sequence)
+    }
+
+    pub async fn durable_snapshot(&self) -> Snapshot {
+        let sequence = self.current_durable_sequence();
+        self.register_snapshot(sequence)
+    }
+
+    fn register_snapshot(&self, sequence: SequenceNumber) -> Snapshot {
         let registration_id = self.inner.next_snapshot_id.fetch_add(1, Ordering::SeqCst) + 1;
         mutex_lock(&self.inner.snapshot_tracker).register(registration_id, sequence);
 
