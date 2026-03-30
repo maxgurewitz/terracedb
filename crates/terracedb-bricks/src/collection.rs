@@ -168,7 +168,8 @@ pub struct BlobHandle {
     pub size_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlobIndexState {
     #[default]
     Pending,
@@ -452,10 +453,8 @@ impl BlobCollection for InMemoryBlobCollection {
 
             if let Some(alias) = alias.as_ref()
                 && let Some(previous_blob_id) = state.aliases.insert(alias.clone(), blob_id)
-                && let Some(previous) = state.blobs.get_mut(&previous_blob_id)
             {
-                previous.alias = None;
-                previous.updated_at = timestamp;
+                state.blobs.remove(&previous_blob_id);
             }
 
             let metadata = BlobMetadata {

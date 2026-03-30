@@ -111,10 +111,14 @@ pub enum BlobError {
     AliasNotFound { alias: BlobAlias },
     #[error("published metadata references a missing object: {object_key}")]
     MissingObject { object_key: String },
+    #[error(transparent)]
+    SnapshotTooOld(#[from] terracedb::SnapshotTooOld),
     #[error("unsupported blob-library operation: {operation}")]
     UnsupportedOperation { operation: &'static str },
     #[error(transparent)]
     Contract(#[from] BlobContractError),
+    #[error(transparent)]
+    Storage(#[from] terracedb::StorageError),
     #[error(transparent)]
     Store(#[from] BlobStoreError),
 }

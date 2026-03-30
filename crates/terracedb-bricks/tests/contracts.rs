@@ -3,7 +3,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 
-use terracedb::{LogCursor, ObjectKeyLayout, S3Location, StubObjectStore};
+use terracedb::{
+    Db, DbConfig, DbDependencies, LogCursor, ObjectKeyLayout, S3Location, StorageConfig, StubClock,
+    StubFileSystem, StubObjectStore, StubRng, TieredDurabilityMode, TieredStorageConfig,
+};
 use terracedb_bricks::{
     BLOB_ACTIVITY_TABLE_NAME, BLOB_ALIAS_TABLE_NAME, BLOB_CATALOG_TABLE_NAME,
     BLOB_COLLECTION_SEMANTICS, BLOB_OBJECT_GC_TABLE_NAME, BLOB_TERM_INDEX_TABLE_NAME,
@@ -12,8 +15,8 @@ use terracedb_bricks::{
     BlobIndexDurability, BlobLocator, BlobMissingObjectSemantics, BlobObjectLayout,
     BlobObjectReclamation, BlobPublishOrdering, BlobQuery, BlobReadOptions, BlobSemantics,
     BlobStore, BlobStoreByteStream, BlobStoreObjectStoreAdapter, BlobWrite, BlobWriteData,
-    FrozenTableOwner, InMemoryBlobCollection, InMemoryBlobStore, frozen_table_configs,
-    frozen_table_descriptors,
+    FrozenTableOwner, InMemoryBlobCollection, InMemoryBlobStore, TerracedbBlobCollection,
+    frozen_table_configs, frozen_table_descriptors,
 };
 
 fn stream_bytes(bytes: &'static [u8]) -> BlobStoreByteStream {
@@ -175,6 +178,35 @@ async fn public_bricks_surface_compiles_and_is_instantiable() {
         .expect("delete blob metadata");
     let next = receiver.changed().await.expect("activity receiver changed");
     assert!(next > activities.last().expect("activity").sequence);
+
+    let db = Db::open(
+        DbConfig {
+            storage: StorageConfig::Tiered(TieredStorageConfig {
+                ssd: terracedb::SsdConfig {
+                    path: "/tmp/terracedb-bricks-contracts".to_string(),
+                },
+                s3: S3Location {
+                    bucket: "terracedb-bricks-test".to_string(),
+                    prefix: "contracts".to_string(),
+                },
+                max_local_bytes: 1024 * 1024,
+                durability: TieredDurabilityMode::GroupCommit,
+            }),
+            scheduler: None,
+        },
+        DbDependencies::new(
+            Arc::new(StubFileSystem::default()),
+            Arc::new(StubObjectStore::default()),
+            Arc::new(StubClock::default()),
+            Arc::new(StubRng::seeded(88)),
+        ),
+    )
+    .await
+    .expect("open db for terracedb-backed collection");
+    let durable_collection = TerracedbBlobCollection::open(db, config, memory_store)
+        .await
+        .expect("open terracedb-backed blob collection");
+    assert_blob_collection_surface(&durable_collection, BLOB_COLLECTION_SEMANTICS);
 }
 
 #[test]
