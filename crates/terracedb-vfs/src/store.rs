@@ -15,14 +15,17 @@ use terracedb::{Clock, DbDependencies, LogCursor, Rng, SequenceNumber, Timestamp
 use crate::{
     ActivityEntry, ActivityId, ActivityKind, ActivityOptions, ActivityReceiver, ActivityStream,
     AgentFileSystem, AgentFsError, AgentKvStore, AgentToolRuns, AllocatorKind, CreateOptions,
-    DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue, MkdirOptions, ReadOnlyAgentFileSystem,
-    ReadOnlyAgentKvStore, ReadOnlyAgentToolRuns, Stats, ToolRun, ToolRunId, ToolRunStatus,
+    DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue, MkdirOptions,
+    ReadOnlyAgentFileSystem, ReadOnlyAgentKvStore, ReadOnlyAgentToolRuns, Stats, ToolRun,
+    ToolRunId, ToolRunStatus,
 };
 
 pub const VFS_FORMAT_VERSION: u8 = 1;
 pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024;
 pub const ROOT_INODE_ID: InodeId = InodeId::new(1);
 const DEFAULT_ALLOCATOR_BLOCK_SIZE: u64 = 32;
+
+const MAX_SYMLINK_DEPTH: usize = 40;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentFsConfig {
@@ -549,7 +552,12 @@ struct InMemorySnapshotTools {
 #[async_trait]
 impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
     async fn stat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
-        self.lstat(path).await
+        let state = self
+            .volume
+            .state
+            .lock()
+            .expect("volume state lock poisoned");
+        lookup_stats(&state, path, true)
     }
 
     async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
@@ -558,7 +566,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        lookup_stats(&state.read_view(), path)
+        lookup_stats(&state, path, false)
     }
 
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
@@ -567,7 +575,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_file_bytes(&state.read_view(), path)
+        read_file_bytes(&state, path)
     }
 
     async fn pread(
@@ -581,7 +589,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        pread_file_bytes(&state.read_view(), path, offset, len)
+        pread_file_bytes(&state, path, offset, len)
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
@@ -590,7 +598,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_dir_entries(&state.read_view(), path)
+        read_dir_entries(&state, path)
     }
 
     async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
@@ -599,7 +607,7 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_dir_entries_plus(&state.read_view(), path)
+        read_dir_entries_plus(&state, path)
     }
 
     async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
@@ -608,22 +616,22 @@ impl ReadOnlyAgentFileSystem for InMemoryAgentFileSystem {
             .state
             .lock()
             .expect("volume state lock poisoned");
-        read_link_target(&state.read_view(), path)
+        read_link_target(&state.paths, &state.inodes, path)
     }
 }
 
 #[async_trait]
 impl ReadOnlyAgentFileSystem for InMemorySnapshotFileSystem {
     async fn stat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
-        self.lstat(path).await
+        lookup_snapshot_stats(self.state.as_ref(), path, true)
     }
 
     async fn lstat(&self, path: &str) -> Result<Option<Stats>, AgentFsError> {
-        lookup_stats(&self.state.read_view(), path)
+        lookup_snapshot_stats(self.state.as_ref(), path, false)
     }
 
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
-        read_file_bytes(&self.state.read_view(), path)
+        read_snapshot_file_bytes(self.state.as_ref(), path)
     }
 
     async fn pread(
@@ -632,19 +640,19 @@ impl ReadOnlyAgentFileSystem for InMemorySnapshotFileSystem {
         offset: u64,
         len: u64,
     ) -> Result<Option<Vec<u8>>, AgentFsError> {
-        pread_file_bytes(&self.state.read_view(), path, offset, len)
+        pread_snapshot_file_bytes(self.state.as_ref(), path, offset, len)
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
-        read_dir_entries(&self.state.read_view(), path)
+        read_snapshot_dir_entries(self.state.as_ref(), path)
     }
 
     async fn readdir_plus(&self, path: &str) -> Result<Vec<DirEntryPlus>, AgentFsError> {
-        read_dir_entries_plus(&self.state.read_view(), path)
+        read_snapshot_dir_entries_plus(self.state.as_ref(), path)
     }
 
     async fn readlink(&self, path: &str) -> Result<String, AgentFsError> {
-        read_link_target(&self.state.read_view(), path)
+        read_link_target(&self.state.paths, &self.state.inodes, path)
     }
 }
 
@@ -662,48 +670,63 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                 return Err(AgentFsError::RootInvariant);
             }
             ensure_parent_directory(state, &path, opts.create_parents, now)?;
-            let chunk_size = state.info.chunk_size;
-
-            match state.paths.get(&path).copied() {
-                Some(inode_id) => {
-                    let inode = state
-                        .inodes
-                        .get_mut(&inode_id)
-                        .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-                    match &mut inode.data {
-                        InodeData::Directory => {
-                            return Err(AgentFsError::IsDirectory { path: path.clone() });
-                        }
-                        InodeData::Symlink(_) if !opts.overwrite => {
-                            return Err(AgentFsError::AlreadyExists { path: path.clone() });
-                        }
-                        InodeData::Symlink(_) => {
-                            return Err(AgentFsError::NotFile { path: path.clone() });
-                        }
-                        InodeData::File(chunks) => {
-                            if !opts.overwrite {
-                                return Err(AgentFsError::AlreadyExists { path: path.clone() });
-                            }
-                            chunks.overwrite_all(&data, chunk_size);
-                            inode.stats.size = data.len() as u64;
-                            inode.stats.modified_at = now;
-                            inode.stats.changed_at = now;
-                            inode.stats.accessed_at = now;
-                        }
+            let exact_exists = state.paths.contains_key(&path);
+            match resolve_existing_path(state, &path, true)? {
+                Some((resolved_path, inode_id)) => {
+                    let inode =
+                        state
+                            .inodes
+                            .get_mut(&inode_id)
+                            .ok_or_else(|| AgentFsError::NotFound {
+                                path: resolved_path.clone(),
+                            })?;
+                    let InodeData::File(content) = &mut inode.data else {
+                        return match inode.stats.kind {
+                            FileKind::Directory => Err(AgentFsError::IsDirectory {
+                                path: resolved_path,
+                            }),
+                            _ => Err(AgentFsError::NotFile {
+                                path: resolved_path,
+                            }),
+                        };
+                    };
+                    if !opts.overwrite {
+                        return Err(AgentFsError::AlreadyExists {
+                            path: resolved_path,
+                        });
                     }
+                    *content = file_content_from_bytes(&data, state.info.chunk_size);
+                    inode.stats.size = data.len() as u64;
+                    inode.stats.modified_at = now;
+                    inode.stats.changed_at = now;
+                    inode.stats.accessed_at = now;
+                }
+                None if exact_exists => {
+                    return Err(AgentFsError::NotFound { path: path.clone() });
                 }
                 None => {
+                    let resolved_path = resolve_target_path(state, &path)?;
+                    if state.paths.contains_key(&resolved_path) {
+                        return Err(AgentFsError::AlreadyExists {
+                            path: resolved_path,
+                        });
+                    }
+
                     let inode_id = allocate_inode(state);
                     let stats =
-                        file_stats(inode_id, FileKind::File, opts.mode, now, data.len() as u64);
-                    state.paths.insert(path.clone(), inode_id);
+                        inode_stats(inode_id, FileKind::File, opts.mode, now, data.len() as u64);
+                    state.paths.insert(resolved_path.clone(), inode_id);
                     state.inodes.insert(
                         inode_id,
                         InodeRecord {
                             stats,
-                            data: InodeData::File(FileChunks::from_bytes(&data, chunk_size)),
+                            data: InodeData::File(file_content_from_bytes(
+                                &data,
+                                state.info.chunk_size,
+                            )),
                         },
                     );
+                    touch_parent_directory(state, &resolved_path, now)?;
                 }
             }
 
@@ -717,23 +740,33 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn pwrite(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
-            let inode_id = *state
-                .paths
-                .get(&path)
+            let (resolved_path, inode_id) = resolve_existing_path(state, &path, true)?
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let chunk_size = state.info.chunk_size;
             let inode = state
                 .inodes
                 .get_mut(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let InodeData::File(chunks) = &mut inode.data else {
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_path.clone(),
+                })?;
+            let InodeData::File(content) = &mut inode.data else {
                 return match inode.stats.kind {
-                    FileKind::Directory => Err(AgentFsError::IsDirectory { path: path.clone() }),
-                    _ => Err(AgentFsError::NotFile { path: path.clone() }),
+                    FileKind::Directory => Err(AgentFsError::IsDirectory {
+                        path: resolved_path.clone(),
+                    }),
+                    _ => Err(AgentFsError::NotFile {
+                        path: resolved_path.clone(),
+                    }),
                 };
             };
 
-            inode.stats.size = chunks.write_at(offset, &data, inode.stats.size, chunk_size);
+            let new_size = write_file_content_at(
+                content,
+                inode.stats.size,
+                state.info.chunk_size,
+                offset,
+                &data,
+            );
+            inode.stats.size = new_size;
             inode.stats.modified_at = now;
             inode.stats.changed_at = now;
             inode.stats.accessed_at = now;
@@ -748,23 +781,26 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn truncate(&self, path: &str, size: u64) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
         self.volume.mutate(|state, now| {
-            let inode_id = *state
-                .paths
-                .get(&path)
+            let (resolved_path, inode_id) = resolve_existing_path(state, &path, true)?
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let chunk_size = state.info.chunk_size;
             let inode = state
                 .inodes
                 .get_mut(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let InodeData::File(chunks) = &mut inode.data else {
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_path.clone(),
+                })?;
+            let InodeData::File(content) = &mut inode.data else {
                 return match inode.stats.kind {
-                    FileKind::Directory => Err(AgentFsError::IsDirectory { path: path.clone() }),
-                    _ => Err(AgentFsError::NotFile { path: path.clone() }),
+                    FileKind::Directory => Err(AgentFsError::IsDirectory {
+                        path: resolved_path.clone(),
+                    }),
+                    _ => Err(AgentFsError::NotFile {
+                        path: resolved_path.clone(),
+                    }),
                 };
             };
 
-            chunks.truncate(size, inode.stats.size, chunk_size);
+            truncate_file_content(content, state.info.chunk_size, size);
             inode.stats.size = size;
             inode.stats.modified_at = now;
             inode.stats.changed_at = now;
@@ -788,21 +824,26 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
         }
 
         self.volume.mutate(|state, now| {
-            if let Some(inode_id) = state.paths.get(&path).copied() {
+            if let Some((resolved_path, inode_id)) = resolve_existing_path(state, &path, false)? {
                 let inode = state
                     .inodes
                     .get(&inode_id)
-                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+                    .ok_or_else(|| AgentFsError::NotFound {
+                        path: resolved_path.clone(),
+                    })?;
                 if inode.stats.kind == FileKind::Directory && opts.recursive {
                     return Ok(None);
                 }
-                return Err(AgentFsError::AlreadyExists { path: path.clone() });
+                return Err(AgentFsError::AlreadyExists {
+                    path: resolved_path,
+                });
             }
 
             ensure_parent_directory(state, &path, opts.recursive, now)?;
+            let resolved_path = resolve_target_path(state, &path)?;
             let inode_id = allocate_inode(state);
-            let stats = file_stats(inode_id, FileKind::Directory, opts.mode, now, 0);
-            state.paths.insert(path.clone(), inode_id);
+            let stats = inode_stats(inode_id, FileKind::Directory, opts.mode, now, 0);
+            state.paths.insert(resolved_path.clone(), inode_id);
             state.inodes.insert(
                 inode_id,
                 InodeRecord {
@@ -810,6 +851,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                     data: InodeData::Directory,
                 },
             );
+            increment_directory_nlink(state, &resolved_path, now)?;
 
             Ok(Some((
                 (),
@@ -821,26 +863,80 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn rename(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
-        self.volume.mutate(|state, _now| {
+        self.volume.mutate(|state, now| {
             if from == "/" || to == "/" {
                 return Err(AgentFsError::RootInvariant);
             }
-            if !state.paths.contains_key(&from) {
-                return Err(AgentFsError::NotFound { path: from.clone() });
+            if from == to {
+                return Ok(None);
             }
-            if state.paths.contains_key(&to) {
-                return Err(AgentFsError::AlreadyExists { path: to.clone() });
+            let (resolved_from, from_inode_id) = resolve_existing_path(state, &from, false)?
+                .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
+            let resolved_to = resolve_target_path(state, &to)?;
+            if resolved_from == resolved_to {
+                return Ok(None);
             }
-            if is_descendant_path(&from, &to) {
-                return Err(AgentFsError::InvalidPath { path: to.clone() });
+            if is_descendant_path(&resolved_from, &resolved_to) {
+                return Err(AgentFsError::InvalidPath {
+                    path: resolved_to.clone(),
+                });
             }
 
-            ensure_existing_parent_directory(state, &to)?;
+            let from_kind = state
+                .inodes
+                .get(&from_inode_id)
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_from.clone(),
+                })?
+                .stats
+                .kind;
+            let from_parent = parent_path(&resolved_from).ok_or(AgentFsError::RootInvariant)?;
+            let to_parent = parent_path(&resolved_to).ok_or(AgentFsError::RootInvariant)?;
+
+            if let Some(target_inode_id) = state.paths.get(&resolved_to).copied() {
+                let target_kind = state
+                    .inodes
+                    .get(&target_inode_id)
+                    .ok_or_else(|| AgentFsError::NotFound {
+                        path: resolved_to.clone(),
+                    })?
+                    .stats
+                    .kind;
+                match (from_kind, target_kind) {
+                    (FileKind::Directory, FileKind::Directory) => {
+                        if state.paths.keys().any(|candidate| {
+                            candidate != &resolved_to && is_descendant_path(&resolved_to, candidate)
+                        }) {
+                            return Err(AgentFsError::DirectoryNotEmpty {
+                                path: resolved_to.clone(),
+                            });
+                        }
+                        state.paths.remove(&resolved_to);
+                        state.inodes.remove(&target_inode_id);
+                        decrement_directory_nlink(state, &resolved_to, now)?;
+                    }
+                    (FileKind::Directory, _) => {
+                        return Err(AgentFsError::NotDirectory {
+                            path: resolved_to.clone(),
+                        });
+                    }
+                    (_, FileKind::Directory) => {
+                        return Err(AgentFsError::IsDirectory {
+                            path: resolved_to.clone(),
+                        });
+                    }
+                    (_, _) => {
+                        remove_non_directory_path(state, &resolved_to, now)?;
+                    }
+                }
+            }
+
             let renames = state
                 .paths
                 .iter()
                 .filter_map(|(path, inode)| {
-                    rebase_path(path, &from, &to).map(|new_path| (path.clone(), new_path, *inode))
+                    rebase_path(path, &resolved_from, &resolved_to)
+                        .map(|new_path| (path.clone(), new_path, *inode))
                 })
                 .collect::<Vec<_>>();
 
@@ -849,6 +945,14 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
             }
             for (_, new_path, inode) in renames {
                 state.paths.insert(new_path, inode);
+            }
+            touch_directory_path_at(state, &from_parent, now)?;
+            touch_directory_path_at(state, &to_parent, now)?;
+            if from_kind == FileKind::Directory && from_parent != to_parent {
+                adjust_directory_parent_links(state, &from_parent, &to_parent)?;
+            }
+            if let Some(inode) = state.inodes.get_mut(&from_inode_id) {
+                inode.stats.changed_at = now;
             }
 
             let mut metadata = BTreeMap::new();
@@ -863,22 +967,22 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
     async fn link(&self, from: &str, to: &str) -> Result<(), AgentFsError> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
-        self.volume.mutate(|state, _now| {
+        self.volume.mutate(|state, now| {
             if to == "/" {
                 return Err(AgentFsError::RootInvariant);
             }
-            let inode_id = *state
-                .paths
-                .get(&from)
+            let (resolved_from, inode_id) = resolve_existing_path(state, &from, false)?
                 .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
-            ensure_existing_parent_directory(state, &to)?;
-            if state.paths.contains_key(&to) {
-                return Err(AgentFsError::AlreadyExists { path: to.clone() });
+            let resolved_to = resolve_target_path(state, &to)?;
+            if state.paths.contains_key(&resolved_to) {
+                return Err(AgentFsError::AlreadyExists { path: resolved_to });
             }
             let kind = state
                 .inodes
                 .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_from.clone(),
+                })?
                 .stats
                 .kind;
             if kind == FileKind::Directory {
@@ -889,9 +993,13 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
             let inode = state
                 .inodes
                 .get_mut(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound { path: from.clone() })?;
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_from.clone(),
+                })?;
             inode.stats.nlink = inode.stats.nlink.saturating_add(1);
-            state.paths.insert(to.clone(), inode_id);
+            inode.stats.changed_at = now;
+            state.paths.insert(resolved_to.clone(), inode_id);
+            touch_parent_directory(state, &resolved_to, now)?;
             let mut metadata = BTreeMap::new();
             metadata.insert("from".to_string(), json!(from));
             Ok(Some((
@@ -913,15 +1021,15 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
             if linkpath == "/" {
                 return Err(AgentFsError::RootInvariant);
             }
-            if state.paths.contains_key(&linkpath) {
+            let resolved_linkpath = resolve_target_path(state, &linkpath)?;
+            if state.paths.contains_key(&resolved_linkpath) {
                 return Err(AgentFsError::AlreadyExists {
-                    path: linkpath.clone(),
+                    path: resolved_linkpath,
                 });
             }
-            ensure_existing_parent_directory(state, &linkpath)?;
             let inode_id = allocate_inode(state);
-            let stats = file_stats(inode_id, FileKind::Symlink, 0o777, now, target.len() as u64);
-            state.paths.insert(linkpath.clone(), inode_id);
+            let stats = inode_stats(inode_id, FileKind::Symlink, 0o777, now, target.len() as u64);
+            state.paths.insert(resolved_linkpath.clone(), inode_id);
             state.inodes.insert(
                 inode_id,
                 InodeRecord {
@@ -929,6 +1037,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                     data: InodeData::Symlink(target),
                 },
             );
+            touch_parent_directory(state, &resolved_linkpath, now)?;
 
             Ok(Some((
                 (),
@@ -939,28 +1048,14 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
 
     async fn unlink(&self, path: &str) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
-        self.volume.mutate(|state, _now| {
+        self.volume.mutate(|state, now| {
             if path == "/" {
                 return Err(AgentFsError::RootInvariant);
             }
-            let inode_id = state
-                .paths
-                .remove(&path)
+            let (resolved_path, _) = resolve_existing_path(state, &path, false)?
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-            let remove_inode = {
-                let inode = state
-                    .inodes
-                    .get_mut(&inode_id)
-                    .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-                if inode.stats.kind == FileKind::Directory {
-                    return Err(AgentFsError::IsDirectory { path: path.clone() });
-                }
-                inode.stats.nlink = inode.stats.nlink.saturating_sub(1);
-                inode.stats.nlink == 0
-            };
-            if remove_inode {
-                state.inodes.remove(&inode_id);
-            }
+            remove_non_directory_path(state, &resolved_path, now)?;
+            touch_parent_directory(state, &resolved_path, now)?;
             Ok(Some((
                 (),
                 activity_spec(ActivityKind::PathDeleted, Some(path), None, None),
@@ -970,30 +1065,34 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
 
     async fn rmdir(&self, path: &str) -> Result<(), AgentFsError> {
         let path = normalize_path(path)?;
-        self.volume.mutate(|state, _now| {
+        self.volume.mutate(|state, now| {
             if path == "/" {
                 return Err(AgentFsError::RootInvariant);
             }
-            let inode_id = *state
-                .paths
-                .get(&path)
+            let (resolved_path, inode_id) = resolve_existing_path(state, &path, false)?
                 .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
             let inode = state
                 .inodes
                 .get(&inode_id)
-                .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: resolved_path.clone(),
+                })?;
             if inode.stats.kind != FileKind::Directory {
-                return Err(AgentFsError::NotDirectory { path: path.clone() });
+                return Err(AgentFsError::NotDirectory {
+                    path: resolved_path.clone(),
+                });
             }
-            if state
-                .paths
-                .keys()
-                .any(|candidate| candidate != &path && is_descendant_path(&path, candidate))
-            {
-                return Err(AgentFsError::DirectoryNotEmpty { path: path.clone() });
+            if state.paths.keys().any(|candidate| {
+                candidate != &resolved_path && is_descendant_path(&resolved_path, candidate)
+            }) {
+                return Err(AgentFsError::DirectoryNotEmpty {
+                    path: resolved_path.clone(),
+                });
             }
-            state.paths.remove(&path);
+            state.paths.remove(&resolved_path);
             state.inodes.remove(&inode_id);
+            decrement_directory_nlink(state, &resolved_path, now)?;
+            touch_parent_directory(state, &resolved_path, now)?;
 
             Ok(Some((
                 (),
@@ -1010,12 +1109,11 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
                 .state
                 .lock()
                 .expect("volume state lock poisoned");
-            if !state.paths.contains_key(&path) {
+            if resolve_existing_path(&state, &path, true)?.is_none() {
                 return Err(AgentFsError::NotFound { path });
             }
         }
 
-        self.volume.promote_durable_cut();
         Ok(())
     }
 }
@@ -1378,9 +1476,27 @@ struct SnapshotState {
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
 }
 
-impl SnapshotState {
-    fn read_view(&self) -> VolumeReadView<'_> {
-        VolumeReadView::new(&self.info, &self.paths, &self.inodes)
+#[derive(Clone, Default)]
+struct DurableViewState {
+    sequence: SequenceNumber,
+    paths: BTreeMap<String, InodeId>,
+    inodes: BTreeMap<InodeId, InodeRecord>,
+    kv: BTreeMap<String, JsonValue>,
+    tool_runs: BTreeMap<ToolRunId, ToolRun>,
+    activity_len: usize,
+}
+
+impl DurableViewState {
+    fn snapshot(&self, info: AgentFsVolumeInfo) -> SnapshotState {
+        SnapshotState {
+            info,
+            sequence: self.sequence,
+            durable: true,
+            paths: self.paths.clone(),
+            inodes: self.inodes.clone(),
+            kv: self.kv.clone(),
+            tool_runs: self.tool_runs.clone(),
+        }
     }
 }
 
@@ -1399,7 +1515,7 @@ struct VolumeState {
 impl VolumeState {
     fn new(info: AgentFsVolumeInfo, allocator_block_size: u64) -> Self {
         let root = InodeRecord {
-            stats: file_stats(
+            stats: inode_stats(
                 ROOT_INODE_ID,
                 FileKind::Directory,
                 0o755,
@@ -1492,10 +1608,6 @@ impl VolumeState {
         }
     }
 
-    fn read_view(&self) -> VolumeReadView<'_> {
-        VolumeReadView::new(&self.info, &self.paths, &self.inodes)
-    }
-
     fn promote_durable_cut(&mut self) {
         self.durable.sequence = self.sequence;
         self.durable.paths = self.paths.clone();
@@ -1522,126 +1634,13 @@ struct InodeRecord {
 #[derive(Clone)]
 enum InodeData {
     Directory,
-    File(FileChunks),
+    File(FileContent),
     Symlink(String),
 }
 
 #[derive(Clone, Default)]
-struct DurableViewState {
-    sequence: SequenceNumber,
-    paths: BTreeMap<String, InodeId>,
-    inodes: BTreeMap<InodeId, InodeRecord>,
-    kv: BTreeMap<String, JsonValue>,
-    tool_runs: BTreeMap<ToolRunId, ToolRun>,
-    activity_len: usize,
-}
-
-impl DurableViewState {
-    fn snapshot(&self, info: AgentFsVolumeInfo) -> SnapshotState {
-        SnapshotState {
-            info,
-            sequence: self.sequence,
-            durable: true,
-            paths: self.paths.clone(),
-            inodes: self.inodes.clone(),
-            kv: self.kv.clone(),
-            tool_runs: self.tool_runs.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct FileChunks {
+struct FileContent {
     chunks: BTreeMap<u64, Vec<u8>>,
-}
-
-impl FileChunks {
-    fn from_bytes(bytes: &[u8], chunk_size: u32) -> Self {
-        let mut chunks = BTreeMap::new();
-        if bytes.is_empty() {
-            return Self { chunks };
-        }
-
-        let chunk_len = chunk_size as usize;
-        for (index, chunk) in bytes.chunks(chunk_len).enumerate() {
-            chunks.insert(index as u64, chunk.to_vec());
-        }
-        Self { chunks }
-    }
-
-    fn read_all(&self, size: u64, chunk_size: u32) -> Vec<u8> {
-        self.read_range(0, size, size, chunk_size)
-    }
-
-    fn read_range(&self, offset: u64, len: u64, size: u64, chunk_size: u32) -> Vec<u8> {
-        if len == 0 || offset >= size {
-            return Vec::new();
-        }
-
-        let end = size.min(offset.saturating_add(len));
-        let first_chunk = offset / chunk_size as u64;
-        let last_chunk = end.saturating_sub(1) / chunk_size as u64 + 1;
-        let mut bytes = vec![0; end.saturating_sub(offset) as usize];
-
-        for chunk in self.scan_range(first_chunk, last_chunk) {
-            let chunk_start = chunk.chunk_index * chunk_size as u64;
-            let chunk_end = chunk_start.saturating_add(chunk.bytes.len() as u64);
-            let read_start = offset.max(chunk_start);
-            let read_end = end.min(chunk_end);
-            if read_start >= read_end {
-                continue;
-            }
-
-            let source_start = (read_start - chunk_start) as usize;
-            let source_end = source_start + (read_end - read_start) as usize;
-            let target_start = (read_start - offset) as usize;
-            let target_end = target_start + (read_end - read_start) as usize;
-            bytes[target_start..target_end].copy_from_slice(&chunk.bytes[source_start..source_end]);
-        }
-
-        bytes
-    }
-
-    fn overwrite_all(&mut self, bytes: &[u8], chunk_size: u32) {
-        *self = Self::from_bytes(bytes, chunk_size);
-    }
-
-    fn write_at(&mut self, offset: u64, data: &[u8], size: u64, chunk_size: u32) -> u64 {
-        let mut bytes = self.read_all(size, chunk_size);
-        let offset = offset as usize;
-        if bytes.len() < offset {
-            bytes.resize(offset, 0);
-        }
-        let end = offset.saturating_add(data.len());
-        if bytes.len() < end {
-            bytes.resize(end, 0);
-        }
-        bytes[offset..end].copy_from_slice(data);
-        self.overwrite_all(&bytes, chunk_size);
-        bytes.len() as u64
-    }
-
-    fn truncate(&mut self, size: u64, current_size: u64, chunk_size: u32) {
-        let mut bytes = self.read_all(current_size, chunk_size);
-        bytes.resize(size as usize, 0);
-        self.overwrite_all(&bytes, chunk_size);
-    }
-
-    fn scan_range(&self, first_chunk: u64, last_chunk: u64) -> Vec<ChunkRecord> {
-        self.chunks
-            .range(first_chunk..last_chunk)
-            .map(|(chunk_index, bytes)| ChunkRecord {
-                chunk_index: *chunk_index,
-                bytes: bytes.clone(),
-            })
-            .collect()
-    }
-}
-
-#[derive(Clone)]
-struct ChunkRecord {
-    chunk_index: u64,
-    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -1677,16 +1676,6 @@ impl BlockLeaseAllocator {
         self.next_persisted = self.next_persisted.saturating_add(self.block_size);
         self.lease_next = start;
         self.lease_end = self.next_persisted;
-    }
-
-    #[allow(dead_code)]
-    fn persisted_next(&self) -> u64 {
-        self.next_persisted
-    }
-
-    #[allow(dead_code)]
-    fn recover_after_crash(&self) -> Self {
-        Self::new(self.next_persisted, self.block_size)
     }
 }
 
@@ -1791,12 +1780,12 @@ fn configured_chunk_size(chunk_size: Option<u32>) -> Result<u32, AgentFsError> {
     Ok(chunk_size)
 }
 
-fn file_stats(inode: InodeId, kind: FileKind, mode: u32, now: Timestamp, size: u64) -> Stats {
+fn inode_stats(inode: InodeId, kind: FileKind, mode: u32, now: Timestamp, size: u64) -> Stats {
     Stats {
         inode,
         kind,
         mode,
-        nlink: 1,
+        nlink: if kind == FileKind::Directory { 2 } else { 1 },
         uid: 0,
         gid: 0,
         size,
@@ -1838,6 +1827,31 @@ fn normalize_path(path: &str) -> Result<String, AgentFsError> {
     Ok(format!("/{}", parts.join("/")))
 }
 
+fn normalize_internal_path(path: &str) -> Result<String, AgentFsError> {
+    if !path.starts_with('/') {
+        return Err(AgentFsError::InvalidPath {
+            path: path.to_string(),
+        });
+    }
+
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+
+    if parts.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", parts.join("/")))
+    }
+}
+
 fn parent_path(path: &str) -> Option<String> {
     if path == "/" {
         return None;
@@ -1847,6 +1861,30 @@ fn parent_path(path: &str) -> Option<String> {
         Some("/".to_string())
     } else {
         Some(path[..index].to_string())
+    }
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    if path == "/" {
+        Vec::new()
+    } else {
+        path.trim_start_matches('/').split('/').collect()
+    }
+}
+
+fn basename(path: &str) -> Option<&str> {
+    if path == "/" {
+        None
+    } else {
+        path.rsplit('/').next()
+    }
+}
+
+fn join_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
     }
 }
 
@@ -1863,7 +1901,7 @@ fn ensure_parent_directory(
     if create_parents {
         create_missing_directories(state, &parent, now)?;
     }
-    ensure_existing_parent_directory(state, path)
+    resolve_target_path(state, path).map(|_| ())
 }
 
 fn create_missing_directories(
@@ -1895,7 +1933,7 @@ fn create_missing_directories(
         }
 
         let inode_id = allocate_inode(state);
-        let stats = file_stats(inode_id, FileKind::Directory, 0o755, now, 0);
+        let stats = inode_stats(inode_id, FileKind::Directory, 0o755, now, 0);
         state.paths.insert(current.clone(), inode_id);
         state.inodes.insert(
             inode_id,
@@ -1904,247 +1942,554 @@ fn create_missing_directories(
                 data: InodeData::Directory,
             },
         );
+        increment_directory_nlink(state, &current, now)?;
     }
 
     Ok(())
 }
 
-fn ensure_existing_parent_directory(state: &VolumeState, path: &str) -> Result<(), AgentFsError> {
-    let Some(parent) = parent_path(path) else {
+fn resolve_target_path(state: &VolumeState, path: &str) -> Result<String, AgentFsError> {
+    let path = normalize_path(path)?;
+    let Some(parent) = parent_path(&path) else {
         return Err(AgentFsError::RootInvariant);
     };
-    let inode_id = state
-        .paths
-        .get(&parent)
-        .ok_or_else(|| AgentFsError::NotFound {
+    let name = basename(&path).ok_or(AgentFsError::RootInvariant)?;
+    let (resolved_parent, parent_inode) =
+        resolve_existing_path(state, &parent, true)?.ok_or_else(|| AgentFsError::NotFound {
             path: parent.clone(),
         })?;
     let inode = state
         .inodes
-        .get(inode_id)
+        .get(&parent_inode)
         .ok_or_else(|| AgentFsError::NotDirectory {
-            path: parent.clone(),
+            path: resolved_parent.clone(),
         })?;
     if inode.stats.kind != FileKind::Directory {
-        return Err(AgentFsError::NotDirectory { path: parent });
+        return Err(AgentFsError::NotDirectory {
+            path: resolved_parent,
+        });
     }
-    Ok(())
+    Ok(join_path(&resolved_parent, name))
 }
 
-struct VolumeReadView<'a> {
-    info: &'a AgentFsVolumeInfo,
-    paths: &'a BTreeMap<String, InodeId>,
-    inodes: &'a BTreeMap<InodeId, InodeRecord>,
+fn resolve_existing_path(
+    state: &VolumeState,
+    path: &str,
+    follow_final_symlink: bool,
+) -> Result<Option<(String, InodeId)>, AgentFsError> {
+    resolve_existing_in_maps_with_mode(&state.paths, &state.inodes, path, follow_final_symlink)
 }
 
-impl<'a> VolumeReadView<'a> {
-    fn new(
-        info: &'a AgentFsVolumeInfo,
-        paths: &'a BTreeMap<String, InodeId>,
-        inodes: &'a BTreeMap<InodeId, InodeRecord>,
-    ) -> Self {
-        Self {
-            info,
-            paths,
-            inodes,
-        }
-    }
-
-    fn resolve_path(&self, path: &str) -> Result<Option<ResolvedPath<'a>>, AgentFsError> {
-        let path = normalize_path(path)?;
-        let Some(inode_id) = self.paths.get(&path).copied() else {
-            return Ok(None);
-        };
-        let inode = self
-            .inodes
-            .get(&inode_id)
-            .ok_or_else(|| AgentFsError::NotFound { path: path.clone() })?;
-        Ok(Some(ResolvedPath { path, inode }))
-    }
-
-    #[allow(dead_code)]
-    fn parent_lookup(&self, path: &str) -> Result<ResolvedPath<'a>, AgentFsError> {
-        let path = normalize_path(path)?;
-        let Some(parent) = parent_path(&path) else {
-            return Err(AgentFsError::RootInvariant);
-        };
-        let Some(resolved) = self.resolve_path(&parent)? else {
-            return Err(AgentFsError::NotFound { path: parent });
-        };
-        if resolved.inode.stats.kind != FileKind::Directory {
-            return Err(AgentFsError::NotDirectory {
-                path: resolved.path.clone(),
-            });
-        }
-        Ok(resolved)
-    }
-
-    fn dentry_scan(&self, path: &str) -> Result<Vec<ScannedDentry<'a>>, AgentFsError> {
-        let resolved = self
-            .resolve_path(path)?
-            .ok_or_else(|| AgentFsError::NotFound {
-                path: normalize_path(path).unwrap_or_else(|_| path.to_string()),
-            })?;
-        if resolved.inode.stats.kind != FileKind::Directory {
-            return Err(AgentFsError::NotDirectory {
-                path: resolved.path.clone(),
-            });
+fn resolve_existing_in_maps_with_mode(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    path: &str,
+    follow_final_symlink: bool,
+) -> Result<Option<(String, InodeId)>, AgentFsError> {
+    let original = normalize_path(path)?;
+    let mut current = original.clone();
+    for _ in 0..MAX_SYMLINK_DEPTH {
+        if current == "/" {
+            return Ok(paths.get(&current).copied().map(|inode| (current, inode)));
         }
 
-        let mut entries = Vec::new();
-        for (candidate, inode_id) in self.paths {
-            if let Some(name) = direct_child_name(&resolved.path, candidate) {
-                let inode = self
-                    .inodes
-                    .get(inode_id)
-                    .ok_or_else(|| AgentFsError::NotFound {
-                        path: candidate.clone(),
-                    })?;
-                entries.push(ScannedDentry {
-                    name,
-                    inode_id: *inode_id,
-                    inode,
-                });
+        let segments = path_segments(&current);
+        let mut prefix = "/".to_string();
+        let mut redirected = None;
+
+        for (index, segment) in segments.iter().enumerate() {
+            let candidate = join_path(&prefix, segment);
+            let Some(inode_id) = paths.get(&candidate).copied() else {
+                return Ok(None);
+            };
+            let inode = inodes
+                .get(&inode_id)
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: candidate.clone(),
+                })?;
+            let is_final = index + 1 == segments.len();
+            if let InodeData::Symlink(target) = &inode.data
+                && (!is_final || follow_final_symlink)
+            {
+                current = resolve_symlink_target(&candidate, target, &segments[index + 1..])?;
+                redirected = Some(());
+                break;
             }
+            prefix = candidate;
         }
-        Ok(entries)
-    }
 
-    fn chunk_range_scan(
-        &self,
-        resolved: &ResolvedPath<'a>,
-        offset: u64,
-        len: u64,
-    ) -> Result<Vec<ChunkRecord>, AgentFsError> {
-        match &resolved.inode.data {
-            InodeData::File(chunks) => {
-                if len == 0 || offset >= resolved.inode.stats.size {
-                    return Ok(Vec::new());
-                }
-                let chunk_size = self.info.chunk_size as u64;
-                let first_chunk = offset / chunk_size;
-                let end = resolved.inode.stats.size.min(offset.saturating_add(len));
-                let last_chunk = end.saturating_sub(1) / chunk_size + 1;
-                Ok(chunks.scan_range(first_chunk, last_chunk))
-            }
-            InodeData::Directory => Err(AgentFsError::IsDirectory {
-                path: resolved.path.clone(),
-            }),
-            InodeData::Symlink(_) => Err(AgentFsError::NotFile {
-                path: resolved.path.clone(),
-            }),
+        if redirected.is_none() {
+            let inode_id = paths
+                .get(&prefix)
+                .copied()
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: prefix.clone(),
+                })?;
+            return Ok(Some((prefix, inode_id)));
         }
     }
+
+    Err(AgentFsError::SymlinkLoop { path: original })
 }
 
-struct ResolvedPath<'a> {
-    path: String,
-    inode: &'a InodeRecord,
+fn resolve_symlink_target(
+    symlink_path: &str,
+    target: &str,
+    remainder: &[&str],
+) -> Result<String, AgentFsError> {
+    let parent = parent_path(symlink_path).unwrap_or_else(|| "/".to_string());
+    let mut combined = if target.starts_with('/') {
+        target.to_string()
+    } else if parent == "/" {
+        format!("/{target}")
+    } else {
+        format!("{parent}/{target}")
+    };
+    if !remainder.is_empty() {
+        if combined != "/" {
+            combined.push('/');
+        }
+        combined.push_str(&remainder.join("/"));
+    }
+    normalize_internal_path(&combined)
 }
 
-struct ScannedDentry<'a> {
-    name: String,
-    inode_id: InodeId,
-    inode: &'a InodeRecord,
+fn lookup_stats(
+    state: &VolumeState,
+    path: &str,
+    follow_final_symlink: bool,
+) -> Result<Option<Stats>, AgentFsError> {
+    lookup_stats_in_maps(&state.paths, &state.inodes, path, follow_final_symlink)
 }
 
-fn lookup_stats(view: &VolumeReadView<'_>, path: &str) -> Result<Option<Stats>, AgentFsError> {
-    Ok(view
-        .resolve_path(path)?
-        .map(|resolved| resolved.inode.stats.clone()))
+fn lookup_snapshot_stats(
+    state: &SnapshotState,
+    path: &str,
+    follow_final_symlink: bool,
+) -> Result<Option<Stats>, AgentFsError> {
+    lookup_stats_in_maps(&state.paths, &state.inodes, path, follow_final_symlink)
 }
 
-fn read_file_bytes(view: &VolumeReadView<'_>, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
-    let Some(resolved) = view.resolve_path(path)? else {
+fn lookup_stats_in_maps(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    path: &str,
+    follow_final_symlink: bool,
+) -> Result<Option<Stats>, AgentFsError> {
+    let Some((resolved_path, inode_id)) =
+        resolve_existing_in_maps_with_mode(paths, inodes, path, follow_final_symlink)?
+    else {
         return Ok(None);
     };
+    let inode = inodes.get(&inode_id).ok_or(AgentFsError::NotFound {
+        path: resolved_path,
+    })?;
+    Ok(Some(inode.stats.clone()))
+}
 
-    match &resolved.inode.data {
-        InodeData::File(chunks) => Ok(Some(
-            chunks.read_all(resolved.inode.stats.size, view.info.chunk_size),
-        )),
+fn read_file_bytes(state: &VolumeState, path: &str) -> Result<Option<Vec<u8>>, AgentFsError> {
+    read_file_bytes_in_maps(&state.paths, &state.inodes, state.info.chunk_size, path)
+}
+
+fn read_snapshot_file_bytes(
+    state: &SnapshotState,
+    path: &str,
+) -> Result<Option<Vec<u8>>, AgentFsError> {
+    read_file_bytes_in_maps(&state.paths, &state.inodes, state.info.chunk_size, path)
+}
+
+fn read_file_bytes_in_maps(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    chunk_size: u32,
+    path: &str,
+) -> Result<Option<Vec<u8>>, AgentFsError> {
+    let Some((resolved_path, inode_id)) =
+        resolve_existing_in_maps_with_mode(paths, inodes, path, true)?
+    else {
+        return Ok(None);
+    };
+    let inode = inodes
+        .get(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_path.clone(),
+        })?;
+    match &inode.data {
+        InodeData::File(content) => Ok(Some(file_content_to_bytes(
+            content,
+            inode.stats.size,
+            chunk_size,
+        ))),
         InodeData::Directory => Err(AgentFsError::IsDirectory {
-            path: resolved.path,
+            path: resolved_path,
         }),
         InodeData::Symlink(_) => Err(AgentFsError::NotFile {
-            path: resolved.path,
+            path: resolved_path,
         }),
     }
 }
 
 fn pread_file_bytes(
-    view: &VolumeReadView<'_>,
+    state: &VolumeState,
     path: &str,
     offset: u64,
     len: u64,
 ) -> Result<Option<Vec<u8>>, AgentFsError> {
-    let Some(resolved) = view.resolve_path(path)? else {
+    pread_file_bytes_in_maps(
+        &state.paths,
+        &state.inodes,
+        state.info.chunk_size,
+        path,
+        offset,
+        len,
+    )
+}
+
+fn pread_snapshot_file_bytes(
+    state: &SnapshotState,
+    path: &str,
+    offset: u64,
+    len: u64,
+) -> Result<Option<Vec<u8>>, AgentFsError> {
+    pread_file_bytes_in_maps(
+        &state.paths,
+        &state.inodes,
+        state.info.chunk_size,
+        path,
+        offset,
+        len,
+    )
+}
+
+fn pread_file_bytes_in_maps(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    chunk_size: u32,
+    path: &str,
+    offset: u64,
+    len: u64,
+) -> Result<Option<Vec<u8>>, AgentFsError> {
+    let Some((resolved_path, inode_id)) =
+        resolve_existing_in_maps_with_mode(paths, inodes, path, true)?
+    else {
         return Ok(None);
     };
-
-    match &resolved.inode.data {
-        InodeData::File(chunks) => {
-            let _scan = view.chunk_range_scan(&resolved, offset, len)?;
-            Ok(Some(chunks.read_range(
-                offset,
-                len,
-                resolved.inode.stats.size,
-                view.info.chunk_size,
-            )))
-        }
+    let inode = inodes
+        .get(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_path.clone(),
+        })?;
+    match &inode.data {
+        InodeData::File(content) => Ok(Some(read_file_content_range(
+            content,
+            inode.stats.size,
+            chunk_size,
+            offset,
+            len,
+        ))),
         InodeData::Directory => Err(AgentFsError::IsDirectory {
-            path: resolved.path,
+            path: resolved_path,
         }),
         InodeData::Symlink(_) => Err(AgentFsError::NotFile {
-            path: resolved.path,
+            path: resolved_path,
         }),
     }
 }
 
-fn read_dir_entries(view: &VolumeReadView<'_>, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
-    view.dentry_scan(path)?
-        .into_iter()
-        .map(|entry| {
-            Ok(DirEntry {
-                name: entry.name,
-                inode: entry.inode_id,
-                kind: entry.inode.stats.kind,
-            })
-        })
-        .collect()
+fn read_dir_entries(state: &VolumeState, path: &str) -> Result<Vec<DirEntry>, AgentFsError> {
+    read_dir_entries_in_maps(&state.paths, &state.inodes, path)
+}
+
+fn read_snapshot_dir_entries(
+    state: &SnapshotState,
+    path: &str,
+) -> Result<Vec<DirEntry>, AgentFsError> {
+    read_dir_entries_in_maps(&state.paths, &state.inodes, path)
+}
+
+fn read_dir_entries_in_maps(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    path: &str,
+) -> Result<Vec<DirEntry>, AgentFsError> {
+    let normalized = normalize_path(path)?;
+    let (resolved_path, inode_id) = resolve_existing_in_maps_with_mode(paths, inodes, path, true)?
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: normalized.clone(),
+        })?;
+    let inode = inodes
+        .get(&inode_id)
+        .ok_or_else(|| AgentFsError::NotDirectory {
+            path: resolved_path.clone(),
+        })?;
+    if inode.stats.kind != FileKind::Directory {
+        return Err(AgentFsError::NotDirectory {
+            path: resolved_path,
+        });
+    }
+
+    let mut entries = Vec::new();
+    for (candidate, inode_id) in paths {
+        if let Some(name) = direct_child_name(&resolved_path, candidate) {
+            let inode = inodes.get(inode_id).ok_or_else(|| AgentFsError::NotFound {
+                path: candidate.clone(),
+            })?;
+            entries.push(DirEntry {
+                name,
+                inode: *inode_id,
+                kind: inode.stats.kind,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 fn read_dir_entries_plus(
-    view: &VolumeReadView<'_>,
+    state: &VolumeState,
     path: &str,
 ) -> Result<Vec<DirEntryPlus>, AgentFsError> {
-    view.dentry_scan(path)?
+    read_dir_entries_plus_in_maps(&state.paths, &state.inodes, path)
+}
+
+fn read_snapshot_dir_entries_plus(
+    state: &SnapshotState,
+    path: &str,
+) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+    read_dir_entries_plus_in_maps(&state.paths, &state.inodes, path)
+}
+
+fn read_dir_entries_plus_in_maps(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    path: &str,
+) -> Result<Vec<DirEntryPlus>, AgentFsError> {
+    read_dir_entries_in_maps(paths, inodes, path)?
         .into_iter()
         .map(|entry| {
-            Ok(DirEntryPlus {
-                entry: DirEntry {
-                    name: entry.name,
-                    inode: entry.inode_id,
-                    kind: entry.inode.stats.kind,
-                },
-                stats: entry.inode.stats.clone(),
-            })
+            let stats = inodes
+                .get(&entry.inode)
+                .ok_or_else(|| AgentFsError::NotFound {
+                    path: format!("{path}/{}", entry.name),
+                })?
+                .stats
+                .clone();
+            Ok(DirEntryPlus { entry, stats })
         })
         .collect()
 }
 
-fn read_link_target(view: &VolumeReadView<'_>, path: &str) -> Result<String, AgentFsError> {
-    let resolved = view
-        .resolve_path(path)?
+fn read_link_target(
+    paths: &BTreeMap<String, InodeId>,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    path: &str,
+) -> Result<String, AgentFsError> {
+    let normalized = normalize_path(path)?;
+    let (resolved_path, inode_id) = resolve_existing_in_maps_with_mode(paths, inodes, path, false)?
         .ok_or_else(|| AgentFsError::NotFound {
-            path: normalize_path(path).unwrap_or_else(|_| path.to_string()),
+            path: normalized.clone(),
         })?;
-    match &resolved.inode.data {
+    let inode = inodes
+        .get(&inode_id)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: resolved_path.clone(),
+        })?;
+    match &inode.data {
         InodeData::Symlink(target) => Ok(target.clone()),
         _ => Err(AgentFsError::NotSymlink {
-            path: resolved.path,
+            path: resolved_path,
         }),
     }
+}
+
+fn touch_directory_path_at(
+    state: &mut VolumeState,
+    path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let inode_id = state
+        .paths
+        .get(path)
+        .copied()
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    let inode = state
+        .inodes
+        .get_mut(&inode_id)
+        .ok_or_else(|| AgentFsError::NotDirectory {
+            path: path.to_string(),
+        })?;
+    if inode.stats.kind != FileKind::Directory {
+        return Err(AgentFsError::NotDirectory {
+            path: path.to_string(),
+        });
+    }
+    inode.stats.modified_at = now;
+    inode.stats.changed_at = now;
+    Ok(())
+}
+
+fn touch_parent_directory(
+    state: &mut VolumeState,
+    child_path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let Some(parent) = parent_path(child_path) else {
+        return Ok(());
+    };
+    touch_directory_path_at(state, &parent, now)
+}
+
+fn increment_directory_nlink(
+    state: &mut VolumeState,
+    child_path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let Some(parent) = parent_path(child_path) else {
+        return Ok(());
+    };
+    let parent_inode_id =
+        state
+            .paths
+            .get(&parent)
+            .copied()
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: parent.clone(),
+            })?;
+    let parent_inode =
+        state
+            .inodes
+            .get_mut(&parent_inode_id)
+            .ok_or_else(|| AgentFsError::NotDirectory {
+                path: parent.clone(),
+            })?;
+    if parent_inode.stats.kind != FileKind::Directory {
+        return Err(AgentFsError::NotDirectory { path: parent });
+    }
+    parent_inode.stats.nlink = parent_inode.stats.nlink.saturating_add(1);
+    parent_inode.stats.modified_at = now;
+    parent_inode.stats.changed_at = now;
+    Ok(())
+}
+
+fn decrement_directory_nlink(
+    state: &mut VolumeState,
+    child_path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let Some(parent) = parent_path(child_path) else {
+        return Ok(());
+    };
+    let parent_inode_id =
+        state
+            .paths
+            .get(&parent)
+            .copied()
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: parent.clone(),
+            })?;
+    let parent_inode =
+        state
+            .inodes
+            .get_mut(&parent_inode_id)
+            .ok_or_else(|| AgentFsError::NotDirectory {
+                path: parent.clone(),
+            })?;
+    if parent_inode.stats.kind != FileKind::Directory {
+        return Err(AgentFsError::NotDirectory { path: parent });
+    }
+    parent_inode.stats.nlink = parent_inode.stats.nlink.saturating_sub(1);
+    parent_inode.stats.modified_at = now;
+    parent_inode.stats.changed_at = now;
+    Ok(())
+}
+
+fn adjust_directory_parent_links(
+    state: &mut VolumeState,
+    old_parent: &str,
+    new_parent: &str,
+) -> Result<(), AgentFsError> {
+    if old_parent == new_parent {
+        return Ok(());
+    }
+    let old_parent_inode =
+        state
+            .paths
+            .get(old_parent)
+            .copied()
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: old_parent.to_string(),
+            })?;
+    let new_parent_inode =
+        state
+            .paths
+            .get(new_parent)
+            .copied()
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: new_parent.to_string(),
+            })?;
+    state
+        .inodes
+        .get_mut(&old_parent_inode)
+        .ok_or_else(|| AgentFsError::NotDirectory {
+            path: old_parent.to_string(),
+        })?
+        .stats
+        .nlink = state
+        .inodes
+        .get(&old_parent_inode)
+        .expect("old parent exists")
+        .stats
+        .nlink
+        .saturating_sub(1);
+    state
+        .inodes
+        .get_mut(&new_parent_inode)
+        .ok_or_else(|| AgentFsError::NotDirectory {
+            path: new_parent.to_string(),
+        })?
+        .stats
+        .nlink = state
+        .inodes
+        .get(&new_parent_inode)
+        .expect("new parent exists")
+        .stats
+        .nlink
+        .saturating_add(1);
+    Ok(())
+}
+
+fn remove_non_directory_path(
+    state: &mut VolumeState,
+    path: &str,
+    now: Timestamp,
+) -> Result<(), AgentFsError> {
+    let inode_id = state
+        .paths
+        .remove(path)
+        .ok_or_else(|| AgentFsError::NotFound {
+            path: path.to_string(),
+        })?;
+    let remove_inode = {
+        let inode = state
+            .inodes
+            .get_mut(&inode_id)
+            .ok_or_else(|| AgentFsError::NotFound {
+                path: path.to_string(),
+            })?;
+        if inode.stats.kind == FileKind::Directory {
+            return Err(AgentFsError::IsDirectory {
+                path: path.to_string(),
+            });
+        }
+        inode.stats.nlink = inode.stats.nlink.saturating_sub(1);
+        inode.stats.changed_at = now;
+        inode.stats.nlink == 0
+    };
+    if remove_inode {
+        state.inodes.remove(&inode_id);
+    }
+    Ok(())
 }
 
 fn direct_child_name(parent: &str, child: &str) -> Option<String> {
@@ -2183,63 +2528,106 @@ fn rebase_path(path: &str, from: &str, to: &str) -> Option<String> {
     Some(format!("{to}/{suffix}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn file_content_from_bytes(bytes: &[u8], chunk_size: u32) -> FileContent {
+    let mut content = FileContent::default();
+    for (index, chunk) in bytes.chunks(chunk_size as usize).enumerate() {
+        content.chunks.insert(index as u64, chunk.to_vec());
+    }
+    content
+}
 
-    fn test_volume_info() -> AgentFsVolumeInfo {
-        AgentFsVolumeInfo {
-            volume_id: crate::VolumeId::new(1),
-            chunk_size: 4,
-            format_version: VFS_FORMAT_VERSION,
-            root_inode: ROOT_INODE_ID,
-            created_at: Timestamp::new(7),
-            overlay_base: None,
+fn file_content_to_bytes(content: &FileContent, size: u64, chunk_size: u32) -> Vec<u8> {
+    read_file_content_range(content, size, chunk_size, 0, size)
+}
+
+fn read_file_content_range(
+    content: &FileContent,
+    size: u64,
+    chunk_size: u32,
+    offset: u64,
+    len: u64,
+) -> Vec<u8> {
+    if len == 0 || offset >= size {
+        return Vec::new();
+    }
+
+    let chunk_size = u64::from(chunk_size);
+    let end = size.min(offset.saturating_add(len));
+    let mut out = vec![0; (end - offset) as usize];
+    let first_chunk = offset / chunk_size;
+    let last_chunk = (end - 1) / chunk_size;
+
+    for chunk_index in first_chunk..=last_chunk {
+        let Some(chunk) = content.chunks.get(&chunk_index) else {
+            continue;
+        };
+        let chunk_start = chunk_index * chunk_size;
+        let copy_start = offset.max(chunk_start);
+        let copy_end = end.min(chunk_start + chunk.len() as u64);
+        if copy_start >= copy_end {
+            continue;
         }
+
+        let src_start = (copy_start - chunk_start) as usize;
+        let bytes_to_copy = (copy_end - copy_start) as usize;
+        let dst_start = (copy_start - offset) as usize;
+        out[dst_start..dst_start + bytes_to_copy]
+            .copy_from_slice(&chunk[src_start..src_start + bytes_to_copy]);
     }
 
-    #[test]
-    fn block_allocator_recovers_monotonicity_after_crash_during_lease_refresh() {
-        let mut allocator = BlockLeaseAllocator::new(2, 4);
-        allocator.refresh_lease();
-        assert_eq!(allocator.persisted_next(), 6);
+    out
+}
 
-        let mut recovered = allocator.recover_after_crash();
-        assert_eq!(recovered.allocate(), 6);
+fn write_file_content_at(
+    content: &mut FileContent,
+    current_size: u64,
+    chunk_size: u32,
+    offset: u64,
+    data: &[u8],
+) -> u64 {
+    if data.is_empty() {
+        return current_size;
     }
 
-    #[test]
-    fn durable_cut_promotes_visible_state_without_mixing_versions() {
-        let mut state = VolumeState::new(test_volume_info(), 2);
-        let inode = allocate_inode(&mut state);
-        state.paths.insert("/notes.txt".to_string(), inode);
-        state.inodes.insert(
-            inode,
-            InodeRecord {
-                stats: file_stats(inode, FileKind::File, 0o644, Timestamp::new(9), 8),
-                data: InodeData::File(FileChunks::from_bytes(b"abcdefgh", 4)),
-            },
-        );
-        append_activity(
-            &mut state,
-            Timestamp::new(9),
-            ActivityKind::FileWritten,
-            Some("/notes.txt".to_string()),
-            None,
-            BTreeMap::new(),
-        );
+    let chunk_size_u64 = u64::from(chunk_size);
+    let new_size = current_size.max(offset.saturating_add(data.len() as u64));
+    let first_chunk = offset / chunk_size_u64;
+    let last_chunk = (offset + data.len() as u64 - 1) / chunk_size_u64;
 
-        let durable_before = state.durable.snapshot(state.info.clone());
-        assert_eq!(
-            read_file_bytes(&durable_before.read_view(), "/notes.txt").expect("read durable"),
-            None
-        );
+    for chunk_index in first_chunk..=last_chunk {
+        let chunk_start = chunk_index * chunk_size_u64;
+        let desired_len = (new_size - chunk_start).min(chunk_size_u64) as usize;
+        let mut chunk = vec![0; desired_len];
+        if let Some(existing) = content.chunks.get(&chunk_index) {
+            let preserved = existing.len().min(chunk.len());
+            chunk[..preserved].copy_from_slice(&existing[..preserved]);
+        }
 
-        state.promote_durable_cut();
-        let durable_after = state.durable.snapshot(state.info.clone());
-        assert_eq!(
-            read_file_bytes(&durable_after.read_view(), "/notes.txt").expect("read durable"),
-            Some(b"abcdefgh".to_vec())
-        );
+        let write_start = offset.max(chunk_start);
+        let write_end = (offset + data.len() as u64).min(chunk_start + chunk.len() as u64);
+        let src_start = (write_start - offset) as usize;
+        let bytes_to_copy = (write_end - write_start) as usize;
+        let dst_start = (write_start - chunk_start) as usize;
+        chunk[dst_start..dst_start + bytes_to_copy]
+            .copy_from_slice(&data[src_start..src_start + bytes_to_copy]);
+        content.chunks.insert(chunk_index, chunk);
+    }
+
+    new_size
+}
+
+fn truncate_file_content(content: &mut FileContent, chunk_size: u32, size: u64) {
+    if size == 0 {
+        content.chunks.clear();
+        return;
+    }
+
+    let chunk_size_u64 = u64::from(chunk_size);
+    let last_chunk = (size - 1) / chunk_size_u64;
+    content.chunks.retain(|index, _| *index <= last_chunk);
+
+    let final_len = ((size - 1) % chunk_size_u64 + 1) as usize;
+    if let Some(chunk) = content.chunks.get_mut(&last_chunk) {
+        chunk.truncate(final_len);
     }
 }
