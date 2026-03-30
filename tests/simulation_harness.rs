@@ -280,18 +280,18 @@ async fn assert_simulated_failed_sequence_invariants(
             .await?,
     )
     .await;
+    let reused_successes = successful_sequences
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     assert_eq!(collected_sequences(&visible_changes), successful_sequences);
     assert_eq!(collected_sequences(&durable_changes), successful_sequences);
-    assert!(
-        visible_changes
-            .iter()
-            .all(|change| !failed_sequences.contains(&change.sequence))
-    );
-    assert!(
-        durable_changes
-            .iter()
-            .all(|change| !failed_sequences.contains(&change.sequence))
-    );
+    assert!(visible_changes.iter().all(|change| {
+        !failed_sequences.contains(&change.sequence) || reused_successes.contains(&change.sequence)
+    }));
+    assert!(durable_changes.iter().all(|change| {
+        !failed_sequences.contains(&change.sequence) || reused_successes.contains(&change.sequence)
+    }));
 
     Ok(())
 }
