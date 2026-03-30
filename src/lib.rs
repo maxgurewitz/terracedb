@@ -26,9 +26,9 @@ pub use adapters::{
 };
 pub use api::{
     BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarRecord, CommitOptions, Db,
-    FieldDefinition, FieldType, FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet,
-    ReadSetEntry, ScanOptions, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
-    WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
+    DbBuilder, DbComponents, DbSettings, FieldDefinition, FieldType, FieldValue, Key, KeyPrefix,
+    KvStream, NamedColumnarRecord, ReadSet, ReadSetEntry, ScanOptions, SchemaDefinition, Snapshot,
+    Table, Value, WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
 };
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,

@@ -20,8 +20,8 @@ use crate::{
     ChangeFeedError, ChangeKind, Clock, CommitError, CommitId, CommitOptions, CompactionStrategy,
     DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
     FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
-    ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation, PendingWork,
-    PendingWorkType, ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
+    NoopScheduler, ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation,
+    PendingWork, PendingWorkType, ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
     ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SsdConfig,
     StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng, Table,
     TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
@@ -105,6 +105,91 @@ fn dependencies_with_clock(
         clock,
         Arc::new(StubRng::seeded(7)),
     )
+}
+
+#[tokio::test]
+async fn builder_component_overrides_flow_through_runtime() {
+    let file_system: Arc<dyn FileSystem> = Arc::new(crate::StubFileSystem::default());
+    let object_store: Arc<dyn ObjectStore> = Arc::new(StubObjectStore::default());
+    let clock: Arc<dyn Clock> = Arc::new(StubClock::default());
+    let rng: Arc<dyn Rng> = Arc::new(StubRng::seeded(17));
+    let scheduler: Arc<dyn Scheduler> = Arc::new(NoopScheduler);
+
+    let db = Db::builder()
+        .config(tiered_config("/builder-component-overrides"))
+        .file_system(file_system.clone())
+        .object_store(object_store.clone())
+        .clock(clock.clone())
+        .rng(rng.clone())
+        .scheduler(scheduler.clone())
+        .open()
+        .await
+        .expect("open db through builder");
+
+    assert!(Arc::ptr_eq(&db.dependencies().file_system, &file_system));
+    assert!(Arc::ptr_eq(&db.dependencies().object_store, &object_store));
+    assert!(Arc::ptr_eq(&db.dependencies().clock, &clock));
+    assert!(Arc::ptr_eq(&db.dependencies().rng, &rng));
+    assert!(Arc::ptr_eq(&db.inner.scheduler, &scheduler));
+}
+
+#[tokio::test]
+async fn builder_into_open_parts_matches_low_level_inputs() {
+    let config = tiered_config("/builder-open-parts");
+    let file_system: Arc<dyn FileSystem> = Arc::new(crate::StubFileSystem::default());
+    let object_store: Arc<dyn ObjectStore> = Arc::new(StubObjectStore::default());
+    let clock: Arc<dyn Clock> = Arc::new(StubClock::default());
+    let rng: Arc<dyn Rng> = Arc::new(StubRng::seeded(29));
+    let dependencies = DbDependencies::new(
+        file_system.clone(),
+        object_store.clone(),
+        clock.clone(),
+        rng.clone(),
+    );
+
+    let builder = Db::builder()
+        .config(config.clone())
+        .dependencies(dependencies.clone());
+    let (built_config, built_dependencies) = builder
+        .clone()
+        .into_open_parts()
+        .expect("builder should resolve open parts");
+
+    assert_eq!(built_config.storage, config.storage);
+    assert!(built_config.scheduler.is_none());
+    assert!(Arc::ptr_eq(
+        &built_dependencies.file_system,
+        &dependencies.file_system
+    ));
+    assert!(Arc::ptr_eq(
+        &built_dependencies.object_store,
+        &dependencies.object_store
+    ));
+    assert!(Arc::ptr_eq(&built_dependencies.clock, &dependencies.clock));
+    assert!(Arc::ptr_eq(&built_dependencies.rng, &dependencies.rng));
+
+    let built_db = builder.open().await.expect("open db through builder");
+    let low_level_db = Db::open(config, dependencies)
+        .await
+        .expect("open db through low-level api");
+
+    assert_eq!(
+        built_db.telemetry_db_name(),
+        low_level_db.telemetry_db_name()
+    );
+    assert_eq!(
+        built_db.telemetry_db_instance(),
+        low_level_db.telemetry_db_instance()
+    );
+    assert_eq!(
+        built_db.telemetry_storage_mode(),
+        low_level_db.telemetry_storage_mode()
+    );
+    assert_eq!(built_db.current_sequence(), low_level_db.current_sequence());
+    assert_eq!(
+        built_db.current_durable_sequence(),
+        low_level_db.current_durable_sequence()
+    );
 }
 
 #[derive(Clone)]
