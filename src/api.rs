@@ -537,6 +537,8 @@ const LEVELED_L0_COMPACTION_TRIGGER: usize = 2;
 const TIERED_LEVEL_RUN_COMPACTION_TRIGGER: usize = 3;
 const FIFO_MAX_LIVE_SSTABLES: usize = 2;
 const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
+const COLUMNAR_SSTABLE_FORMAT_VERSION: u32 = 1;
+const COLUMNAR_SSTABLE_MAGIC: &[u8; 8] = b"TDBCOL1\n";
 const MVCC_KEY_SEPARATOR: u8 = 0;
 const DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH: usize = 8;
 const MAX_SCHEDULER_DEFER_CYCLES: u32 = 3;
@@ -739,6 +741,78 @@ struct PersistedRowSstableBody {
 struct PersistedRowSstableFile {
     body: PersistedRowSstableBody,
     checksum: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ColumnEncoding {
+    Plain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ColumnCompression {
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ColumnarBlockLocation {
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedColumnarColumnFooter {
+    field_id: FieldId,
+    #[serde(rename = "type")]
+    field_type: FieldType,
+    encoding: ColumnEncoding,
+    compression: ColumnCompression,
+    block: ColumnarBlockLocation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedColumnarSstableFooter {
+    format_version: u32,
+    table_id: TableId,
+    level: u32,
+    local_id: String,
+    row_count: u64,
+    min_key: Key,
+    max_key: Key,
+    min_sequence: SequenceNumber,
+    max_sequence: SequenceNumber,
+    schema_version: u32,
+    data_checksum: u32,
+    key_index: ColumnarBlockLocation,
+    sequence_column: ColumnarBlockLocation,
+    tombstone_bitmap: ColumnarBlockLocation,
+    row_kind_column: ColumnarBlockLocation,
+    columns: Vec<PersistedColumnarColumnFooter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_key_bloom_filter: Option<UserKeyBloomFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedNullableColumn<T> {
+    present_bitmap: Vec<bool>,
+    values: Vec<T>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedFloat64Column {
+    present_bitmap: Vec<bool>,
+    values_bits: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum PersistedColumnBlock {
+    Int64(PersistedNullableColumn<i64>),
+    Float64(PersistedFloat64Column),
+    String(PersistedNullableColumn<String>),
+    Bytes(PersistedNullableColumn<Vec<u8>>),
+    Bool(PersistedNullableColumn<bool>),
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3257,7 +3331,19 @@ impl Db {
             )));
         }
 
-        let file: PersistedRowSstableFile = serde_json::from_slice(&bytes).map_err(|error| {
+        if meta.schema_version.is_some() {
+            Self::decode_resident_columnar_sstable(location, meta, &bytes)
+        } else {
+            Self::decode_resident_row_sstable(location, meta, &bytes)
+        }
+    }
+
+    fn decode_resident_row_sstable(
+        location: &str,
+        meta: &PersistedManifestSstable,
+        bytes: &[u8],
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let file: PersistedRowSstableFile = serde_json::from_slice(bytes).map_err(|error| {
             StorageError::corruption(format!("decode SSTable {location} failed: {error}"))
         })?;
         if file.body.format_version != ROW_SSTABLE_FORMAT_VERSION {
@@ -3321,6 +3407,386 @@ impl Db {
             rows: file.body.rows,
             user_key_bloom_filter: file.body.user_key_bloom_filter,
         })
+    }
+
+    fn decode_resident_columnar_sstable(
+        location: &str,
+        meta: &PersistedManifestSstable,
+        bytes: &[u8],
+    ) -> Result<ResidentRowSstable, StorageError> {
+        if checksum32(bytes) != meta.checksum {
+            return Err(StorageError::corruption(format!(
+                "SSTable checksum mismatch for {location}",
+            )));
+        }
+
+        let (footer, footer_start) = Self::columnar_footer_from_bytes(location, bytes)?;
+        if footer.format_version != COLUMNAR_SSTABLE_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported columnar SSTable version {}",
+                footer.format_version
+            )));
+        }
+
+        if footer.table_id != meta.table_id
+            || footer.level != meta.level
+            || footer.local_id != meta.local_id
+            || footer.min_key != meta.min_key
+            || footer.max_key != meta.max_key
+            || footer.min_sequence != meta.min_sequence
+            || footer.max_sequence != meta.max_sequence
+            || Some(footer.schema_version) != meta.schema_version
+        {
+            return Err(StorageError::corruption(format!(
+                "manifest metadata does not match SSTable {location}",
+            )));
+        }
+
+        let data_region = &bytes[COLUMNAR_SSTABLE_MAGIC.len()..footer_start];
+        if checksum32(data_region) != footer.data_checksum
+            || footer.data_checksum != meta.data_checksum
+        {
+            return Err(StorageError::corruption(format!(
+                "SSTable data checksum mismatch for {location}",
+            )));
+        }
+
+        let row_count = usize::try_from(footer.row_count).map_err(|_| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} row count exceeds platform limits"
+            ))
+        })?;
+        let key_index: Vec<Key> = serde_json::from_slice(Self::columnar_block_slice(
+            location,
+            bytes,
+            footer_start,
+            "key index",
+            &footer.key_index,
+        )?)
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar key index for {location} failed: {error}"
+            ))
+        })?;
+        let sequences: Vec<SequenceNumber> = serde_json::from_slice(Self::columnar_block_slice(
+            location,
+            bytes,
+            footer_start,
+            "sequence column",
+            &footer.sequence_column,
+        )?)
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar sequence column for {location} failed: {error}"
+            ))
+        })?;
+        let tombstones: Vec<bool> = serde_json::from_slice(Self::columnar_block_slice(
+            location,
+            bytes,
+            footer_start,
+            "tombstone bitmap",
+            &footer.tombstone_bitmap,
+        )?)
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar tombstone bitmap for {location} failed: {error}"
+            ))
+        })?;
+        let row_kinds: Vec<ChangeKind> = serde_json::from_slice(Self::columnar_block_slice(
+            location,
+            bytes,
+            footer_start,
+            "row-kind column",
+            &footer.row_kind_column,
+        )?)
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar row-kind column for {location} failed: {error}"
+            ))
+        })?;
+
+        if key_index.len() != row_count
+            || sequences.len() != row_count
+            || tombstones.len() != row_count
+            || row_kinds.len() != row_count
+        {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} contains inconsistent block lengths",
+            )));
+        }
+
+        let mut values_by_field = BTreeMap::<FieldId, Vec<FieldValue>>::new();
+        let mut seen_field_ids = BTreeSet::new();
+        for column in &footer.columns {
+            if !seen_field_ids.insert(column.field_id) {
+                return Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} contains duplicate field id {}",
+                    column.field_id.get()
+                )));
+            }
+            let block = Self::columnar_block_slice(
+                location,
+                bytes,
+                footer_start,
+                "column block",
+                &column.block,
+            )?;
+            values_by_field.insert(
+                column.field_id,
+                Self::decode_columnar_field_values(location, column, row_count, block)?,
+            );
+        }
+
+        let mut rows = Vec::with_capacity(row_count);
+        for row_index in 0..row_count {
+            let kind = row_kinds[row_index];
+            let tombstone = tombstones[row_index];
+            let value = if tombstone {
+                if kind != ChangeKind::Delete {
+                    return Err(StorageError::corruption(format!(
+                        "columnar SSTable {location} marks non-delete row {} as a tombstone",
+                        row_index
+                    )));
+                }
+                None
+            } else {
+                if kind == ChangeKind::Delete {
+                    return Err(StorageError::corruption(format!(
+                        "columnar SSTable {location} stores delete row {} without a tombstone",
+                        row_index
+                    )));
+                }
+
+                let mut record = ColumnarRecord::new();
+                for column in &footer.columns {
+                    let values = values_by_field.get(&column.field_id).ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "columnar SSTable {location} omitted field {} during decode",
+                            column.field_id.get()
+                        ))
+                    })?;
+                    record.insert(column.field_id, values[row_index].clone());
+                }
+                Some(Value::Record(record))
+            };
+
+            rows.push(SstableRow {
+                key: key_index[row_index].clone(),
+                sequence: sequences[row_index],
+                kind,
+                value,
+            });
+        }
+
+        let computed =
+            Self::summarize_sstable_rows(meta.table_id, meta.level, &meta.local_id, &rows)?;
+        if computed.min_key != meta.min_key
+            || computed.max_key != meta.max_key
+            || computed.min_sequence != meta.min_sequence
+            || computed.max_sequence != meta.max_sequence
+        {
+            return Err(StorageError::corruption(format!(
+                "SSTable row summary does not match metadata for {location}",
+            )));
+        }
+
+        Ok(ResidentRowSstable {
+            meta: meta.clone(),
+            rows,
+            user_key_bloom_filter: footer.user_key_bloom_filter,
+        })
+    }
+
+    fn columnar_footer_from_bytes(
+        location: &str,
+        bytes: &[u8],
+    ) -> Result<(PersistedColumnarSstableFooter, usize), StorageError> {
+        let min_len = COLUMNAR_SSTABLE_MAGIC.len() * 2 + std::mem::size_of::<u64>();
+        if bytes.len() < min_len {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} is too short",
+            )));
+        }
+        if !bytes.starts_with(COLUMNAR_SSTABLE_MAGIC) {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} is missing the header magic",
+            )));
+        }
+
+        let footer_magic_offset = bytes.len() - COLUMNAR_SSTABLE_MAGIC.len();
+        if &bytes[footer_magic_offset..] != COLUMNAR_SSTABLE_MAGIC {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} is missing the trailer magic",
+            )));
+        }
+
+        let footer_len_offset = footer_magic_offset - std::mem::size_of::<u64>();
+        let footer_len = u64::from_le_bytes(
+            bytes[footer_len_offset..footer_magic_offset]
+                .try_into()
+                .map_err(|_| {
+                    StorageError::corruption(format!(
+                        "columnar SSTable {location} footer length trailer is truncated",
+                    ))
+                })?,
+        ) as usize;
+        let footer_start = footer_len_offset.checked_sub(footer_len).ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} footer length points before the file start",
+            ))
+        })?;
+        let footer_bytes = &bytes[footer_start..footer_len_offset];
+        let footer = serde_json::from_slice(footer_bytes).map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar SSTable footer for {location} failed: {error}"
+            ))
+        })?;
+
+        Ok((footer, footer_start))
+    }
+
+    fn columnar_block_slice<'a>(
+        location: &str,
+        bytes: &'a [u8],
+        footer_start: usize,
+        block_name: &str,
+        block: &ColumnarBlockLocation,
+    ) -> Result<&'a [u8], StorageError> {
+        let offset = usize::try_from(block.offset).map_err(|_| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} {block_name} offset exceeds platform limits",
+            ))
+        })?;
+        let length = usize::try_from(block.length).map_err(|_| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} {block_name} length exceeds platform limits",
+            ))
+        })?;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {location} {block_name} range overflows",
+            ))
+        })?;
+        if offset < COLUMNAR_SSTABLE_MAGIC.len() || end > footer_start {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} {block_name} range is outside the data region",
+            )));
+        }
+
+        Ok(&bytes[offset..end])
+    }
+
+    fn decode_columnar_field_values(
+        location: &str,
+        column: &PersistedColumnarColumnFooter,
+        row_count: usize,
+        block: &[u8],
+    ) -> Result<Vec<FieldValue>, StorageError> {
+        let decoded: PersistedColumnBlock = serde_json::from_slice(block).map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar field {} for {location} failed: {error}",
+                column.field_id.get()
+            ))
+        })?;
+        match (column.field_type, decoded) {
+            (FieldType::Int64, PersistedColumnBlock::Int64(values)) => {
+                Self::decode_nullable_column_values(
+                    location,
+                    column,
+                    row_count,
+                    &values.present_bitmap,
+                    values.values.into_iter().map(FieldValue::Int64).collect(),
+                )
+            }
+            (FieldType::Float64, PersistedColumnBlock::Float64(values)) => {
+                Self::decode_nullable_column_values(
+                    location,
+                    column,
+                    row_count,
+                    &values.present_bitmap,
+                    values
+                        .values_bits
+                        .into_iter()
+                        .map(|bits| FieldValue::Float64(f64::from_bits(bits)))
+                        .collect(),
+                )
+            }
+            (FieldType::String, PersistedColumnBlock::String(values)) => {
+                Self::decode_nullable_column_values(
+                    location,
+                    column,
+                    row_count,
+                    &values.present_bitmap,
+                    values.values.into_iter().map(FieldValue::String).collect(),
+                )
+            }
+            (FieldType::Bytes, PersistedColumnBlock::Bytes(values)) => {
+                Self::decode_nullable_column_values(
+                    location,
+                    column,
+                    row_count,
+                    &values.present_bitmap,
+                    values.values.into_iter().map(FieldValue::Bytes).collect(),
+                )
+            }
+            (FieldType::Bool, PersistedColumnBlock::Bool(values)) => {
+                Self::decode_nullable_column_values(
+                    location,
+                    column,
+                    row_count,
+                    &values.present_bitmap,
+                    values.values.into_iter().map(FieldValue::Bool).collect(),
+                )
+            }
+            _ => Err(StorageError::corruption(format!(
+                "columnar SSTable {location} field {} type metadata does not match its block",
+                column.field_id.get()
+            ))),
+        }
+    }
+
+    fn decode_nullable_column_values(
+        location: &str,
+        column: &PersistedColumnarColumnFooter,
+        row_count: usize,
+        present_bitmap: &[bool],
+        values: Vec<FieldValue>,
+    ) -> Result<Vec<FieldValue>, StorageError> {
+        if present_bitmap.len() != row_count {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} field {} bitmap length mismatch",
+                column.field_id.get()
+            )));
+        }
+        if present_bitmap.iter().filter(|present| **present).count() != values.len() {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} field {} present bitmap does not match its value count",
+                column.field_id.get()
+            )));
+        }
+
+        let mut decoded = Vec::with_capacity(row_count);
+        let mut values = values.into_iter();
+        for present in present_bitmap {
+            decoded.push(if *present {
+                values.next().ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "columnar SSTable {location} field {} ran out of values during decode",
+                        column.field_id.get()
+                    ))
+                })?
+            } else {
+                FieldValue::Null
+            });
+        }
+        if values.next().is_some() {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} field {} contains extra decoded values",
+                column.field_id.get()
+            )));
+        }
+
+        Ok(decoded)
     }
 
     fn summarize_sstable_rows(
@@ -3391,12 +3857,6 @@ impl Db {
                     )))
                 })?;
 
-            if stored.config.format != TableFormat::Row {
-                return Err(FlushError::Unimplemented(
-                    "columnar flush path is implemented in T25",
-                ));
-            }
-
             let rows = table_memtable
                 .entries
                 .values()
@@ -3412,18 +3872,25 @@ impl Db {
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
             let path = Self::local_sstable_path(local_root, table_id, &local_id);
-            outputs.push(
-                self.write_row_sstable(
-                    &path,
-                    table_id,
-                    0,
-                    local_id,
-                    rows,
-                    stored.config.bloom_filter_bits_per_key,
-                )
-                .await
-                .map_err(FlushError::Storage)?,
-            );
+            let output = match stored.config.format {
+                TableFormat::Row => {
+                    self.write_row_sstable(
+                        &path,
+                        table_id,
+                        0,
+                        local_id,
+                        rows,
+                        stored.config.bloom_filter_bits_per_key,
+                    )
+                    .await
+                }
+                TableFormat::Columnar => {
+                    self.write_columnar_sstable(&path, 0, local_id, &stored, rows)
+                        .await
+                }
+            }
+            .map_err(FlushError::Storage)?;
+            outputs.push(output);
         }
 
         Ok(outputs)
@@ -3453,12 +3920,6 @@ impl Db {
                     )))
                 })?;
 
-            if stored.config.format != TableFormat::Row {
-                return Err(FlushError::Unimplemented(
-                    "columnar flush path is implemented in T25",
-                ));
-            }
-
             let rows = table_memtable
                 .entries
                 .values()
@@ -3474,18 +3935,25 @@ impl Db {
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
             let object_key = Self::remote_sstable_key(config, table_id, &local_id);
-            outputs.push(
-                self.write_row_sstable_remote(
-                    &object_key,
-                    table_id,
-                    0,
-                    local_id,
-                    rows,
-                    stored.config.bloom_filter_bits_per_key,
-                )
-                .await
-                .map_err(FlushError::Storage)?,
-            );
+            let output = match stored.config.format {
+                TableFormat::Row => {
+                    self.write_row_sstable_remote(
+                        &object_key,
+                        table_id,
+                        0,
+                        local_id,
+                        rows,
+                        stored.config.bloom_filter_bits_per_key,
+                    )
+                    .await
+                }
+                TableFormat::Columnar => {
+                    self.write_columnar_sstable_remote(&object_key, 0, local_id, &stored, rows)
+                        .await
+                }
+            }
+            .map_err(FlushError::Storage)?;
+            outputs.push(output);
         }
 
         Ok(outputs)
@@ -3541,6 +4009,321 @@ impl Db {
         ))
     }
 
+    fn encode_json_block<T: Serialize>(label: &str, value: &T) -> Result<Vec<u8>, StorageError> {
+        serde_json::to_vec(value)
+            .map_err(|error| StorageError::corruption(format!("encode {label} failed: {error}")))
+    }
+
+    fn append_columnar_block(bytes: &mut Vec<u8>, block_bytes: &[u8]) -> ColumnarBlockLocation {
+        let location = ColumnarBlockLocation {
+            offset: bytes.len() as u64,
+            length: block_bytes.len() as u64,
+        };
+        bytes.extend_from_slice(block_bytes);
+        location
+    }
+
+    fn columnar_row_is_tombstone(row: &SstableRow) -> Result<bool, StorageError> {
+        match row.kind {
+            ChangeKind::Delete => {
+                if row.value.is_some() {
+                    return Err(StorageError::corruption(
+                        "columnar delete row unexpectedly contains a value",
+                    ));
+                }
+                Ok(true)
+            }
+            ChangeKind::Put | ChangeKind::Merge => {
+                if row.value.is_none() {
+                    return Err(StorageError::corruption(
+                        "columnar non-delete row is missing a record value",
+                    ));
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn columnar_field_value_for_row(
+        field: &FieldDefinition,
+        row: &SstableRow,
+    ) -> Result<Option<FieldValue>, StorageError> {
+        if Self::columnar_row_is_tombstone(row)? {
+            return Ok(None);
+        }
+
+        let value = row.value.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar row for field {} is missing a value",
+                field.name
+            ))
+        })?;
+        let Value::Record(record) = value else {
+            return Err(StorageError::corruption(format!(
+                "columnar row for field {} is stored as bytes",
+                field.name
+            )));
+        };
+        let field_value = record.get(&field.id).ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar row is missing field {} ({})",
+                field.id.get(),
+                field.name
+            ))
+        })?;
+        validate_field_value_against_definition(field, field_value, "columnar row value")?;
+
+        if matches!(field_value, FieldValue::Null) {
+            Ok(None)
+        } else {
+            Ok(Some(field_value.clone()))
+        }
+    }
+
+    fn encode_columnar_field_block(
+        field: &FieldDefinition,
+        rows: &[SstableRow],
+    ) -> Result<Vec<u8>, StorageError> {
+        match field.field_type {
+            FieldType::Int64 => {
+                let mut present_bitmap = Vec::with_capacity(rows.len());
+                let mut values = Vec::new();
+                for row in rows {
+                    match Self::columnar_field_value_for_row(field, row)? {
+                        Some(FieldValue::Int64(value)) => {
+                            present_bitmap.push(true);
+                            values.push(value);
+                        }
+                        Some(other) => {
+                            return Err(StorageError::corruption(format!(
+                                "columnar row value for field {} had type {}, expected int64",
+                                field.name,
+                                field_value_type_name(&other)
+                            )));
+                        }
+                        None => present_bitmap.push(false),
+                    }
+                }
+                Self::encode_json_block(
+                    &format!("columnar field {} block", field.name),
+                    &PersistedColumnBlock::Int64(PersistedNullableColumn {
+                        present_bitmap,
+                        values,
+                    }),
+                )
+            }
+            FieldType::Float64 => {
+                let mut present_bitmap = Vec::with_capacity(rows.len());
+                let mut values_bits = Vec::new();
+                for row in rows {
+                    match Self::columnar_field_value_for_row(field, row)? {
+                        Some(FieldValue::Float64(value)) => {
+                            present_bitmap.push(true);
+                            values_bits.push(value.to_bits());
+                        }
+                        Some(other) => {
+                            return Err(StorageError::corruption(format!(
+                                "columnar row value for field {} had type {}, expected float64",
+                                field.name,
+                                field_value_type_name(&other)
+                            )));
+                        }
+                        None => present_bitmap.push(false),
+                    }
+                }
+                Self::encode_json_block(
+                    &format!("columnar field {} block", field.name),
+                    &PersistedColumnBlock::Float64(PersistedFloat64Column {
+                        present_bitmap,
+                        values_bits,
+                    }),
+                )
+            }
+            FieldType::String => {
+                let mut present_bitmap = Vec::with_capacity(rows.len());
+                let mut values = Vec::new();
+                for row in rows {
+                    match Self::columnar_field_value_for_row(field, row)? {
+                        Some(FieldValue::String(value)) => {
+                            present_bitmap.push(true);
+                            values.push(value);
+                        }
+                        Some(other) => {
+                            return Err(StorageError::corruption(format!(
+                                "columnar row value for field {} had type {}, expected string",
+                                field.name,
+                                field_value_type_name(&other)
+                            )));
+                        }
+                        None => present_bitmap.push(false),
+                    }
+                }
+                Self::encode_json_block(
+                    &format!("columnar field {} block", field.name),
+                    &PersistedColumnBlock::String(PersistedNullableColumn {
+                        present_bitmap,
+                        values,
+                    }),
+                )
+            }
+            FieldType::Bytes => {
+                let mut present_bitmap = Vec::with_capacity(rows.len());
+                let mut values = Vec::new();
+                for row in rows {
+                    match Self::columnar_field_value_for_row(field, row)? {
+                        Some(FieldValue::Bytes(value)) => {
+                            present_bitmap.push(true);
+                            values.push(value);
+                        }
+                        Some(other) => {
+                            return Err(StorageError::corruption(format!(
+                                "columnar row value for field {} had type {}, expected bytes",
+                                field.name,
+                                field_value_type_name(&other)
+                            )));
+                        }
+                        None => present_bitmap.push(false),
+                    }
+                }
+                Self::encode_json_block(
+                    &format!("columnar field {} block", field.name),
+                    &PersistedColumnBlock::Bytes(PersistedNullableColumn {
+                        present_bitmap,
+                        values,
+                    }),
+                )
+            }
+            FieldType::Bool => {
+                let mut present_bitmap = Vec::with_capacity(rows.len());
+                let mut values = Vec::new();
+                for row in rows {
+                    match Self::columnar_field_value_for_row(field, row)? {
+                        Some(FieldValue::Bool(value)) => {
+                            present_bitmap.push(true);
+                            values.push(value);
+                        }
+                        Some(other) => {
+                            return Err(StorageError::corruption(format!(
+                                "columnar row value for field {} had type {}, expected bool",
+                                field.name,
+                                field_value_type_name(&other)
+                            )));
+                        }
+                        None => present_bitmap.push(false),
+                    }
+                }
+                Self::encode_json_block(
+                    &format!("columnar field {} block", field.name),
+                    &PersistedColumnBlock::Bool(PersistedNullableColumn {
+                        present_bitmap,
+                        values,
+                    }),
+                )
+            }
+        }
+    }
+
+    fn encode_columnar_sstable(
+        table_id: TableId,
+        level: u32,
+        local_id: String,
+        schema: &SchemaDefinition,
+        rows: Vec<SstableRow>,
+        bloom_filter_bits_per_key: Option<u32>,
+    ) -> Result<(ResidentRowSstable, Vec<u8>), StorageError> {
+        schema.validate()?;
+
+        let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
+        meta.schema_version = Some(schema.version);
+        let user_key_bloom_filter = UserKeyBloomFilter::build(&rows, bloom_filter_bits_per_key);
+
+        let mut bytes = Vec::from(&COLUMNAR_SSTABLE_MAGIC[..]);
+        let key_index = Self::append_columnar_block(
+            &mut bytes,
+            &Self::encode_json_block(
+                "columnar key index",
+                &rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>(),
+            )?,
+        );
+        let sequence_column = Self::append_columnar_block(
+            &mut bytes,
+            &Self::encode_json_block(
+                "columnar sequence column",
+                &rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+            )?,
+        );
+
+        let mut tombstones = Vec::with_capacity(rows.len());
+        for row in &rows {
+            tombstones.push(Self::columnar_row_is_tombstone(row)?);
+        }
+        let tombstone_bitmap = Self::append_columnar_block(
+            &mut bytes,
+            &Self::encode_json_block("columnar tombstone bitmap", &tombstones)?,
+        );
+        let row_kind_column = Self::append_columnar_block(
+            &mut bytes,
+            &Self::encode_json_block(
+                "columnar row-kind column",
+                &rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            )?,
+        );
+
+        let mut columns = Vec::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            let block = Self::append_columnar_block(
+                &mut bytes,
+                &Self::encode_columnar_field_block(field, &rows)?,
+            );
+            columns.push(PersistedColumnarColumnFooter {
+                field_id: field.id,
+                field_type: field.field_type,
+                encoding: ColumnEncoding::Plain,
+                compression: ColumnCompression::None,
+                block,
+            });
+        }
+
+        let data_checksum = checksum32(&bytes[COLUMNAR_SSTABLE_MAGIC.len()..]);
+        let footer = PersistedColumnarSstableFooter {
+            format_version: COLUMNAR_SSTABLE_FORMAT_VERSION,
+            table_id,
+            level,
+            local_id: local_id.clone(),
+            row_count: rows.len() as u64,
+            min_key: meta.min_key.clone(),
+            max_key: meta.max_key.clone(),
+            min_sequence: meta.min_sequence,
+            max_sequence: meta.max_sequence,
+            schema_version: schema.version,
+            data_checksum,
+            key_index,
+            sequence_column,
+            tombstone_bitmap,
+            row_kind_column,
+            columns,
+            user_key_bloom_filter: user_key_bloom_filter.clone(),
+        };
+        let footer_bytes = Self::encode_json_block("columnar SSTable footer", &footer)?;
+        bytes.extend_from_slice(&footer_bytes);
+        bytes.extend_from_slice(&(footer_bytes.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(COLUMNAR_SSTABLE_MAGIC);
+
+        let checksum = checksum32(&bytes);
+        meta.length = bytes.len() as u64;
+        meta.checksum = checksum;
+        meta.data_checksum = data_checksum;
+
+        Ok((
+            ResidentRowSstable {
+                meta,
+                rows,
+                user_key_bloom_filter,
+            },
+            bytes,
+        ))
+    }
+
     async fn write_row_sstable(
         &self,
         path: &str,
@@ -3579,6 +4362,55 @@ impl Db {
         Ok(resident)
     }
 
+    async fn write_columnar_sstable(
+        &self,
+        path: &str,
+        level: u32,
+        local_id: String,
+        stored: &StoredTable,
+        rows: Vec<SstableRow>,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let schema = stored.config.schema.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar table {} is missing a schema",
+                stored.config.name
+            ))
+        })?;
+        let (mut resident, bytes) = Self::encode_columnar_sstable(
+            stored.id,
+            level,
+            local_id,
+            schema,
+            rows,
+            stored.config.bloom_filter_bits_per_key,
+        )?;
+
+        let handle = self
+            .inner
+            .dependencies
+            .file_system
+            .open(
+                path,
+                OpenOptions {
+                    create: true,
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .await?;
+        self.inner
+            .dependencies
+            .file_system
+            .write_at(&handle, 0, &bytes)
+            .await?;
+        self.inner.dependencies.file_system.sync(&handle).await?;
+
+        resident.meta.file_path = path.to_string();
+        Ok(resident)
+    }
+
     async fn write_row_sstable_remote(
         &self,
         object_key: &str,
@@ -3590,6 +4422,37 @@ impl Db {
     ) -> Result<ResidentRowSstable, StorageError> {
         let (mut resident, bytes) =
             Self::encode_row_sstable(table_id, level, local_id, rows, bloom_filter_bits_per_key)?;
+        self.inner
+            .dependencies
+            .object_store
+            .put(object_key, &bytes)
+            .await?;
+        resident.meta.remote_key = Some(object_key.to_string());
+        Ok(resident)
+    }
+
+    async fn write_columnar_sstable_remote(
+        &self,
+        object_key: &str,
+        level: u32,
+        local_id: String,
+        stored: &StoredTable,
+        rows: Vec<SstableRow>,
+    ) -> Result<ResidentRowSstable, StorageError> {
+        let schema = stored.config.schema.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar table {} is missing a schema",
+                stored.config.name
+            ))
+        })?;
+        let (mut resident, bytes) = Self::encode_columnar_sstable(
+            stored.id,
+            level,
+            local_id,
+            schema,
+            rows,
+            stored.config.bloom_filter_bits_per_key,
+        )?;
         self.inner
             .dependencies
             .object_store
@@ -7360,11 +8223,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CommitPhase, CompactionJobKind, CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH,
-        LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
-        LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, ManifestId, OffloadPhase,
-        PendingWorkSpec, PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate,
-        decode_mvcc_key, encode_mvcc_key, read_path,
+        COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, CommitPhase, CompactionJobKind,
+        CompactionPhase, Db, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
+        LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR,
+        LOCAL_SSTABLE_SHARD_DIR, ManifestId, OffloadPhase, PendingWorkSpec,
+        PersistedRowSstableFile, SchemaDefinition, StoredTable, WatermarkUpdate, decode_mvcc_key,
+        encode_mvcc_key, read_path,
     };
     use crate::{
         ChangeKind, CommitError, CommitId, CommitOptions, CompactionStrategy, DbConfig,
@@ -7844,6 +8708,60 @@ mod tests {
                 ("retention".to_string(), json!("30d")),
                 ("schedule_group".to_string(), json!("metrics")),
             ]),
+        }
+    }
+
+    fn columnar_all_types_table_config(name: &str) -> TableConfig {
+        TableConfig {
+            name: name.to_string(),
+            format: TableFormat::Columnar,
+            merge_operator: None,
+            max_merge_operand_chain_length: None,
+            compaction_filter: None,
+            bloom_filter_bits_per_key: Some(7),
+            history_retention_sequences: Some(16),
+            compaction_strategy: CompactionStrategy::Tiered,
+            schema: Some(SchemaDefinition {
+                version: 4,
+                fields: vec![
+                    FieldDefinition {
+                        id: FieldId::new(1),
+                        name: "metric".to_string(),
+                        field_type: FieldType::String,
+                        nullable: false,
+                        default: None,
+                    },
+                    FieldDefinition {
+                        id: FieldId::new(2),
+                        name: "count".to_string(),
+                        field_type: FieldType::Int64,
+                        nullable: false,
+                        default: Some(FieldValue::Int64(0)),
+                    },
+                    FieldDefinition {
+                        id: FieldId::new(3),
+                        name: "ratio".to_string(),
+                        field_type: FieldType::Float64,
+                        nullable: true,
+                        default: None,
+                    },
+                    FieldDefinition {
+                        id: FieldId::new(4),
+                        name: "payload".to_string(),
+                        field_type: FieldType::Bytes,
+                        nullable: true,
+                        default: None,
+                    },
+                    FieldDefinition {
+                        id: FieldId::new(5),
+                        name: "active".to_string(),
+                        field_type: FieldType::Bool,
+                        nullable: false,
+                        default: Some(FieldValue::Bool(false)),
+                    },
+                ],
+            }),
+            metadata: BTreeMap::from([("retention".to_string(), json!("16h"))]),
         }
     }
 
@@ -9533,6 +10451,520 @@ mod tests {
                 (b"apple".to_vec(), Value::bytes("new")),
                 (b"banana".to_vec(), Value::bytes("yellow")),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_persists_columnar_sstables_manifest_footer_and_reopenable_reads() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(
+            tiered_config("/columnar-flush-persist"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let config = columnar_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+        let table = db.create_table(config).await.expect("create table");
+
+        table
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("user_id", FieldValue::String("alice".to_string())),
+                        ("count", FieldValue::Int64(1)),
+                    ],
+                )
+                .expect("encode first record"),
+            )
+            .await
+            .expect("write first record");
+        table
+            .write(
+                b"user:2".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![("user_id", FieldValue::String("bob".to_string()))],
+                )
+                .expect("encode second record"),
+            )
+            .await
+            .expect("write second record");
+        let updated = Value::named_record(
+            &schema,
+            vec![
+                ("user_id", FieldValue::String("alice".to_string())),
+                ("count", FieldValue::Int64(2)),
+            ],
+        )
+        .expect("encode updated record");
+        let flushed = table
+            .write(b"user:1".to_vec(), updated.clone())
+            .await
+            .expect("write updated record");
+
+        db.flush().await.expect("flush to columnar SSTable");
+
+        let live = db
+            .sstables_read()
+            .live
+            .first()
+            .cloned()
+            .expect("live columnar sstable");
+        assert_eq!(live.meta.schema_version, Some(schema.version));
+        assert_eq!(live.rows.len(), 3);
+        let filter = live
+            .user_key_bloom_filter
+            .as_ref()
+            .expect("columnar resident bloom filter");
+        assert!(filter.may_contain(b"user:1"));
+        assert!(filter.may_contain(b"user:2"));
+
+        let file_bytes = read_path(&dependencies, &live.meta.file_path)
+            .await
+            .expect("read columnar sstable");
+        let (footer, footer_start) =
+            Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes)
+                .expect("decode columnar footer");
+        assert_eq!(footer.format_version, COLUMNAR_SSTABLE_FORMAT_VERSION);
+        assert_eq!(footer.schema_version, schema.version);
+        assert_eq!(footer.row_count, 3);
+        assert_eq!(footer.columns.len(), 2);
+        assert!(footer_start > COLUMNAR_SSTABLE_MAGIC.len());
+        assert_eq!(
+            footer
+                .user_key_bloom_filter
+                .expect("persisted columnar bloom filter")
+                .bits_per_key,
+            6
+        );
+
+        let loaded_manifest = Db::read_manifest_at_path(
+            &dependencies,
+            &Db::local_manifest_path("/columnar-flush-persist", ManifestId::new(1)),
+        )
+        .await
+        .expect("load manifest");
+        assert_eq!(loaded_manifest.last_flushed_sequence, flushed);
+        assert_eq!(loaded_manifest.live_sstables.len(), 1);
+        assert_eq!(
+            loaded_manifest.live_sstables[0].meta.schema_version,
+            Some(schema.version)
+        );
+
+        let expected_defaulted = Value::named_record(
+            &schema,
+            vec![("user_id", FieldValue::String("bob".to_string()))],
+        )
+        .expect("encode defaulted record");
+        assert_eq!(
+            table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read flushed updated row"),
+            Some(updated.clone())
+        );
+        assert_eq!(
+            table
+                .read(b"user:2".to_vec())
+                .await
+                .expect("read flushed defaulted row"),
+            Some(expected_defaulted.clone())
+        );
+
+        let reopened = Db::open(tiered_config("/columnar-flush-persist"), dependencies)
+            .await
+            .expect("reopen after columnar flush");
+        let reopened_table = reopened.table("metrics");
+        assert_eq!(reopened.current_sequence(), flushed);
+        assert_eq!(reopened.current_durable_sequence(), flushed);
+        assert_eq!(
+            reopened_table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read reopened updated row"),
+            Some(updated)
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"user:2".to_vec())
+                .await
+                .expect("read reopened defaulted row"),
+            Some(expected_defaulted)
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_sstables_round_trip_all_supported_field_types_and_tombstones() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store);
+
+        let db = Db::open(tiered_config("/columnar-all-types"), dependencies.clone())
+            .await
+            .expect("open db");
+        let config = columnar_all_types_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+        let table = db.create_table(config).await.expect("create table");
+
+        let full_record = Value::named_record(
+            &schema,
+            vec![
+                ("metric", FieldValue::String("cpu".to_string())),
+                ("count", FieldValue::Int64(7)),
+                ("ratio", FieldValue::Float64(1.25)),
+                ("payload", FieldValue::Bytes(vec![1, 2, 3, 4])),
+                ("active", FieldValue::Bool(true)),
+            ],
+        )
+        .expect("encode full record");
+        let defaulted_record = Value::named_record(
+            &schema,
+            vec![("metric", FieldValue::String("memory".to_string()))],
+        )
+        .expect("encode defaulted record");
+
+        table
+            .write(b"row:1".to_vec(), full_record.clone())
+            .await
+            .expect("write full record");
+        table
+            .write(b"row:2".to_vec(), defaulted_record.clone())
+            .await
+            .expect("write defaulted record");
+        table
+            .write(
+                b"row:3".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("metric", FieldValue::String("disk".to_string())),
+                        ("count", FieldValue::Int64(3)),
+                        ("active", FieldValue::Bool(true)),
+                    ],
+                )
+                .expect("encode tombstoned record"),
+            )
+            .await
+            .expect("write tombstoned record");
+        table
+            .delete(b"row:3".to_vec())
+            .await
+            .expect("delete tombstoned record");
+
+        db.flush().await.expect("flush all-types columnar sstable");
+
+        let live = db
+            .sstables_read()
+            .live
+            .first()
+            .cloned()
+            .expect("live all-types sstable");
+        let file_bytes = read_path(&dependencies, &live.meta.file_path)
+            .await
+            .expect("read all-types sstable");
+        let (footer, _) = Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes)
+            .expect("decode all-types footer");
+        assert_eq!(
+            footer
+                .columns
+                .iter()
+                .map(|column| column.field_type)
+                .collect::<Vec<_>>(),
+            vec![
+                FieldType::String,
+                FieldType::Int64,
+                FieldType::Float64,
+                FieldType::Bytes,
+                FieldType::Bool,
+            ]
+        );
+
+        let reopened = Db::open(tiered_config("/columnar-all-types"), dependencies)
+            .await
+            .expect("reopen all-types db");
+        let reopened_table = reopened.table("metrics");
+        assert_eq!(
+            reopened_table
+                .read(b"row:1".to_vec())
+                .await
+                .expect("read full record"),
+            Some(full_record)
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"row:2".to_vec())
+                .await
+                .expect("read defaulted record"),
+            Some(defaulted_record)
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"row:3".to_vec())
+                .await
+                .expect("read tombstoned record"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_sstable_flush_is_byte_for_byte_deterministic() {
+        let first_file_system = Arc::new(crate::StubFileSystem::default());
+        let first_object_store = Arc::new(StubObjectStore::default());
+        let first_dependencies = dependencies(first_file_system.clone(), first_object_store);
+        let second_file_system = Arc::new(crate::StubFileSystem::default());
+        let second_object_store = Arc::new(StubObjectStore::default());
+        let second_dependencies = dependencies(second_file_system.clone(), second_object_store);
+
+        let config = columnar_all_types_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+
+        let first_db = Db::open(
+            tiered_config("/columnar-deterministic-a"),
+            first_dependencies.clone(),
+        )
+        .await
+        .expect("open first db");
+        let first_table = first_db
+            .create_table(config.clone())
+            .await
+            .expect("create first table");
+        first_table
+            .write(
+                b"row:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("metric", FieldValue::String("cpu".to_string())),
+                        ("count", FieldValue::Int64(9)),
+                        ("ratio", FieldValue::Float64(2.5)),
+                        ("payload", FieldValue::Bytes(vec![9, 8, 7])),
+                        ("active", FieldValue::Bool(true)),
+                    ],
+                )
+                .expect("encode first deterministic record"),
+            )
+            .await
+            .expect("write first deterministic record");
+        first_table
+            .write(
+                b"row:2".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![("metric", FieldValue::String("memory".to_string()))],
+                )
+                .expect("encode second deterministic record"),
+            )
+            .await
+            .expect("write second deterministic record");
+        first_table
+            .delete(b"row:2".to_vec())
+            .await
+            .expect("delete second deterministic row");
+        first_db.flush().await.expect("flush first db");
+        let first_path = first_db.sstables_read().live[0].meta.file_path.clone();
+        let first_bytes = read_path(&first_dependencies, &first_path)
+            .await
+            .expect("read first deterministic sstable");
+
+        let second_db = Db::open(
+            tiered_config("/columnar-deterministic-b"),
+            second_dependencies.clone(),
+        )
+        .await
+        .expect("open second db");
+        let second_table = second_db
+            .create_table(config)
+            .await
+            .expect("create second table");
+        second_table
+            .write(
+                b"row:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("metric", FieldValue::String("cpu".to_string())),
+                        ("count", FieldValue::Int64(9)),
+                        ("ratio", FieldValue::Float64(2.5)),
+                        ("payload", FieldValue::Bytes(vec![9, 8, 7])),
+                        ("active", FieldValue::Bool(true)),
+                    ],
+                )
+                .expect("encode mirrored deterministic record"),
+            )
+            .await
+            .expect("write mirrored deterministic record");
+        second_table
+            .write(
+                b"row:2".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![("metric", FieldValue::String("memory".to_string()))],
+                )
+                .expect("encode mirrored deterministic defaulted record"),
+            )
+            .await
+            .expect("write mirrored deterministic defaulted record");
+        second_table
+            .delete(b"row:2".to_vec())
+            .await
+            .expect("delete mirrored deterministic row");
+        second_db.flush().await.expect("flush second db");
+        let second_path = second_db.sstables_read().live[0].meta.file_path.clone();
+        let second_bytes = read_path(&second_dependencies, &second_path)
+            .await
+            .expect("read second deterministic sstable");
+
+        assert_eq!(first_bytes, second_bytes);
+    }
+
+    #[tokio::test]
+    async fn columnar_manifest_sync_failure_preserves_prior_generation_on_reopen() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system.clone(), object_store);
+
+        let db = Db::open(
+            tiered_config("/columnar-manifest-sync-failure"),
+            dependencies.clone(),
+        )
+        .await
+        .expect("open db");
+        let config = columnar_table_config("metrics");
+        let schema = config.schema.clone().expect("columnar schema");
+        let table = db.create_table(config).await.expect("create table");
+
+        table
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("user_id", FieldValue::String("alice".to_string())),
+                        ("count", FieldValue::Int64(1)),
+                    ],
+                )
+                .expect("encode initial record"),
+            )
+            .await
+            .expect("write initial record");
+        db.flush().await.expect("flush initial record");
+
+        let updated = Value::named_record(
+            &schema,
+            vec![
+                ("user_id", FieldValue::String("alice".to_string())),
+                ("count", FieldValue::Int64(2)),
+            ],
+        )
+        .expect("encode updated record");
+        let second = table
+            .write(b"user:1".to_vec(), updated.clone())
+            .await
+            .expect("write updated record");
+        file_system.inject_failure(FileSystemFailure::timeout(
+            FileSystemOperation::SyncDir,
+            Db::local_manifest_dir("/columnar-manifest-sync-failure"),
+        ));
+        db.flush().await.expect_err("manifest sync failure");
+
+        file_system.crash();
+        let reopened = Db::open(
+            tiered_config("/columnar-manifest-sync-failure"),
+            dependencies,
+        )
+        .await
+        .expect("reopen after failed columnar manifest sync");
+        let reopened_table = reopened.table("metrics");
+        assert_eq!(reopened.current_sequence(), second);
+        assert_eq!(reopened.current_durable_sequence(), second);
+        assert_eq!(
+            reopened.sstables_read().manifest_generation,
+            ManifestId::new(1)
+        );
+        assert_eq!(
+            reopened_table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read recovered updated record"),
+            Some(updated)
+        );
+        assert!(
+            reopened
+                .table_stats(&reopened_table)
+                .await
+                .pending_flush_bytes
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_primary_columnar_flush_persists_remote_sstables_and_reopens() {
+        let file_system = Arc::new(crate::StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let dependencies = dependencies(file_system, object_store.clone());
+        let config = s3_primary_config("columnar-remote-flush");
+
+        let db = Db::open(config.clone(), dependencies.clone())
+            .await
+            .expect("open s3 db");
+        let table_config = columnar_table_config("metrics");
+        let schema = table_config.schema.clone().expect("columnar schema");
+        let table = db
+            .create_table(table_config)
+            .await
+            .expect("create columnar table");
+
+        let expected = Value::named_record(
+            &schema,
+            vec![
+                ("user_id", FieldValue::String("alice".to_string())),
+                ("count", FieldValue::Int64(4)),
+            ],
+        )
+        .expect("encode remote record");
+        let flushed = table
+            .write(b"user:1".to_vec(), expected.clone())
+            .await
+            .expect("write remote record");
+
+        db.flush().await.expect("flush remote columnar sstable");
+        assert_eq!(db.current_durable_sequence(), flushed);
+
+        let live = db
+            .sstables_read()
+            .live
+            .first()
+            .cloned()
+            .expect("live remote columnar sstable");
+        let remote_key = live.meta.remote_key.clone().expect("remote sstable key");
+        let file_bytes = object_store
+            .get(&remote_key)
+            .await
+            .expect("read remote sstable");
+        let (footer, _) =
+            Db::columnar_footer_from_bytes(&remote_key, &file_bytes).expect("decode remote footer");
+        assert_eq!(footer.schema_version, schema.version);
+        assert_eq!(footer.row_count, 1);
+        assert_eq!(live.meta.schema_version, Some(schema.version));
+
+        let reopened = Db::open(config, dependencies)
+            .await
+            .expect("reopen remote db");
+        let reopened_table = reopened.table("metrics");
+        assert_eq!(reopened.current_sequence(), flushed);
+        assert_eq!(reopened.current_durable_sequence(), flushed);
+        assert_eq!(
+            reopened_table
+                .read(b"user:1".to_vec())
+                .await
+                .expect("read reopened remote record"),
+            Some(expected)
         );
     }
 
