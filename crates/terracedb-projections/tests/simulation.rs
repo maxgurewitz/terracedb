@@ -118,8 +118,8 @@ struct RecentTodosProjection {
 }
 
 #[async_trait]
-impl MultiSourceProjectionHandler for RecentTodosProjection {
-    async fn apply(
+impl ProjectionHandler for RecentTodosProjection {
+    async fn apply_with_context(
         &self,
         _run: &ProjectionSequenceRun,
         ctx: &ProjectionContext,
@@ -563,10 +563,10 @@ fn recent_todos_projection_simulation_tracks_last_ten_created_or_modified_rows()
                 .await
                 .expect("open projection runtime");
             let mut handle = runtime
-                .start_multi_source(
-                    MultiSourceProjection::new(
+                .start_single_source(
+                    SingleSourceProjection::new(
                         "recent-todos",
-                        [todos.clone()],
+                        todos.clone(),
                         RecentTodosProjection {
                             todos: todos.clone(),
                             recent: recent.clone(),
