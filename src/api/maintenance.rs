@@ -715,7 +715,10 @@ impl Db {
                 ))
             })?;
             let metadata = sstable
-                .load_columnar_metadata(&self.inner.dependencies)
+                .load_columnar_metadata(
+                    &self.inner.columnar_read_context,
+                    ColumnarReadAccessPattern::Scan,
+                )
                 .await?;
             let location = sstable.meta.storage_descriptor();
             let mut row_kinds = Vec::with_capacity(metadata.key_index.len());
@@ -733,7 +736,12 @@ impl Db {
                 }
             }
             let values = sstable
-                .materialize_columnar_rows(&self.inner.dependencies, projection, &row_indexes)
+                .materialize_columnar_rows(
+                    &self.inner.columnar_read_context,
+                    projection,
+                    &row_indexes,
+                    ColumnarReadAccessPattern::Scan,
+                )
                 .await?;
 
             for (row_index, kind) in row_kinds.iter().copied().enumerate() {
@@ -804,6 +812,7 @@ impl Db {
                         columnar_projection
                             .as_ref()
                             .expect("columnar projection should exist"),
+                        ColumnarReadAccessPattern::Scan,
                     )
                     .await?
                 }

@@ -2155,6 +2155,131 @@ fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state
 }
 
 #[test]
+fn remote_columnar_cache_survives_simulated_restart_and_masks_warmed_range_faults()
+-> turmoil::Result {
+    SeededSimulationRunner::new(0x2626).run_with(|context| async move {
+        let config = simulation_s3_primary_config("sim/columnar-cache-restart");
+        let schema = SchemaDefinition {
+            version: 1,
+            fields: vec![
+                FieldDefinition {
+                    id: FieldId::new(1),
+                    name: "user_id".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(2),
+                    name: "count".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    default: Some(FieldValue::Int64(0)),
+                },
+                FieldDefinition {
+                    id: FieldId::new(3),
+                    name: "active".to_string(),
+                    field_type: FieldType::Bool,
+                    nullable: true,
+                    default: None,
+                },
+            ],
+        };
+        let expected = Value::record(BTreeMap::from([
+            (FieldId::new(1), FieldValue::String("alice".to_string())),
+            (FieldId::new(2), FieldValue::Int64(9)),
+            (FieldId::new(3), FieldValue::Null),
+        ]));
+
+        let db = context.open_db(config.clone()).await?;
+        let metrics = db
+            .create_table(TableConfig {
+                name: "metrics".to_string(),
+                format: TableFormat::Columnar,
+                merge_operator: None,
+                max_merge_operand_chain_length: None,
+                compaction_filter: None,
+                bloom_filter_bits_per_key: Some(8),
+                history_retention_sequences: Some(16),
+                compaction_strategy: CompactionStrategy::Tiered,
+                schema: Some(schema.clone()),
+                metadata: Default::default(),
+            })
+            .await
+            .expect("create columnar table");
+
+        metrics
+            .write(
+                b"user:1".to_vec(),
+                Value::named_record(
+                    &schema,
+                    [
+                        ("count", FieldValue::Int64(9)),
+                        ("user_id", FieldValue::String("alice".to_string())),
+                    ],
+                )
+                .expect("normalize columnar record"),
+            )
+            .await
+            .expect("write columnar record");
+        db.flush().await?;
+
+        let layout = ObjectKeyLayout::new(&S3Location {
+            bucket: "terracedb-sim".to_string(),
+            prefix: "sim/columnar-cache-restart".to_string(),
+        });
+        let mut remote_sstables = context
+            .object_store()
+            .list(&layout.backup_sstable_prefix())
+            .await?
+            .into_iter()
+            .filter(|key| key.ends_with(".sst"))
+            .collect::<Vec<_>>();
+        assert_eq!(remote_sstables.len(), 1);
+        let remote_key = remote_sstables.pop().expect("columnar SSTable object");
+
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::GetRange,
+                target_prefix: remote_key.clone(),
+            })
+            .await?;
+        let cold_restart = context
+            .restart_db(config.clone(), CutPoint::AfterStep)
+            .await
+            .expect_err("cold restart should surface the injected footer range timeout");
+        assert!(
+            matches!(cold_restart, OpenError::Storage(ref error) if error.kind() == StorageErrorKind::Timeout),
+            "expected a timeout during cold restart, got {cold_restart:?}"
+        );
+
+        let warmed = context.open_db(config.clone()).await?;
+        let warmed_metrics = warmed.table("metrics");
+        assert_eq!(
+            warmed_metrics.read(b"user:1".to_vec()).await?,
+            Some(expected.clone())
+        );
+
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::GetRange,
+                target_prefix: remote_key,
+            })
+            .await?;
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_metrics = reopened.table("metrics");
+        assert_eq!(
+            reopened_metrics.read(b"user:1".to_vec()).await?,
+            Some(expected)
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
 fn remote_cache_survives_simulated_restart_and_masks_warmed_network_faults() -> turmoil::Result {
     SeededSimulationRunner::new(0x2020).run_with(|context| async move {
         let key = "backup/sst/table-000001/0000/SST-000001.sst";

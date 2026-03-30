@@ -19,10 +19,17 @@ impl Db {
             if let StorageConfig::Tiered(tiered) = &config.storage {
                 Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
             }
+            let columnar_read_context = Arc::new(
+                Self::open_columnar_read_context(&config.storage, &dependencies)
+                    .await
+                    .map_err(OpenError::Storage)?,
+            );
             let catalog_location = Self::catalog_location(&config.storage);
             let (tables, next_table_id) =
                 Self::load_tables(&dependencies, &catalog_location).await?;
-            let loaded_manifest = Self::load_local_manifest(&config.storage, &dependencies).await?;
+            let loaded_manifest =
+                Self::load_local_manifest(&config.storage, &dependencies, &columnar_read_context)
+                    .await?;
             let mut commit_runtime =
                 Self::open_commit_runtime(&config.storage, &dependencies).await?;
             if let CommitLogBackend::Memory(log) = &mut commit_runtime.backend {
@@ -65,6 +72,7 @@ impl Db {
                     config,
                     scheduler,
                     dependencies,
+                    columnar_read_context,
                     catalog_location,
                     catalog_write_lock: AsyncMutex::new(()),
                     commit_lock: AsyncMutex::new(()),
@@ -581,15 +589,68 @@ impl Db {
         ObjectKeyLayout::new(location)
     }
 
+    fn storage_cache_namespace(location: &S3Location) -> String {
+        let mut encoded = String::new();
+        for byte in format!("{}/{}", location.bucket, location.prefix).bytes() {
+            encoded.push_str(&format!("{byte:02x}"));
+        }
+        encoded
+    }
+
+    fn s3_primary_remote_cache_root(config: &S3PrimaryStorageConfig) -> String {
+        std::env::temp_dir()
+            .join("terracedb-object-cache")
+            .join(Self::storage_cache_namespace(&config.s3))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    async fn open_columnar_read_context(
+        storage: &StorageConfig,
+        dependencies: &DbDependencies,
+    ) -> Result<ColumnarReadContext, StorageError> {
+        let remote_cache_root = match storage {
+            StorageConfig::Tiered(config) => {
+                Some(Self::join_fs_path(&config.ssd.path, LOCAL_REMOTE_CACHE_RELATIVE_DIR))
+            }
+            StorageConfig::S3Primary(config) => Some(Self::s3_primary_remote_cache_root(config)),
+        };
+        let remote_cache = match remote_cache_root {
+            Some(root) => Some(Arc::new(
+                RemoteCache::open(dependencies.file_system.clone(), root).await?,
+            )),
+            None => None,
+        };
+        Ok(ColumnarReadContext {
+            dependencies: dependencies.clone(),
+            remote_cache,
+            decoded_cache: DecodedColumnarCache::default(),
+            raw_byte_cache_enabled: AtomicBool::new(true),
+            decoded_cache_enabled: AtomicBool::new(true),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn ephemeral_columnar_read_context(dependencies: &DbDependencies) -> ColumnarReadContext {
+        ColumnarReadContext {
+            dependencies: dependencies.clone(),
+            remote_cache: None,
+            decoded_cache: DecodedColumnarCache::default(),
+            raw_byte_cache_enabled: AtomicBool::new(false),
+            decoded_cache_enabled: AtomicBool::new(true),
+        }
+    }
+
     async fn load_local_manifest(
         storage: &StorageConfig,
         dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
     ) -> Result<LoadedManifest, OpenError> {
         let StorageConfig::Tiered(config) = storage else {
             let StorageConfig::S3Primary(config) = storage else {
                 return Ok(LoadedManifest::default());
             };
-            return Self::load_remote_manifest(config, dependencies).await;
+            return Self::load_remote_manifest(config, dependencies, columnar_read_context).await;
         };
 
         let current_path = Self::local_current_path(&config.ssd.path);
@@ -634,7 +695,13 @@ impl Db {
         let mut saw_manifest = false;
         for path in candidates {
             saw_manifest = true;
-            match Self::read_manifest_at_path(dependencies, &path).await {
+            match Self::read_manifest_at_path_with_context(
+                dependencies,
+                columnar_read_context,
+                &path,
+            )
+            .await
+            {
                 Ok(manifest) => return Ok(manifest),
                 Err(error) => last_error = Some(error),
             }
@@ -683,21 +750,27 @@ impl Db {
     async fn load_remote_manifest(
         config: &S3PrimaryStorageConfig,
         dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
     ) -> Result<LoadedManifest, OpenError> {
-        Self::load_remote_manifest_from_layout(&Self::remote_object_layout(config), dependencies)
-            .await
+        Self::load_remote_manifest_from_layout(
+            &Self::remote_object_layout(config),
+            dependencies,
+            columnar_read_context,
+        )
+        .await
     }
 
     async fn load_remote_manifest_from_layout(
         layout: &ObjectKeyLayout,
         dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
     ) -> Result<LoadedManifest, OpenError> {
         let Some((key, file)) =
             Self::load_remote_manifest_file_from_layout(layout, dependencies).await?
         else {
             return Ok(LoadedManifest::default());
         };
-        Self::loaded_manifest_from_remote_file(dependencies, &key, file)
+        Self::loaded_manifest_from_remote_file(dependencies, columnar_read_context, &key, file)
             .await
             .map_err(OpenError::Storage)
     }
@@ -774,8 +847,18 @@ impl Db {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn read_manifest_at_path(
         dependencies: &DbDependencies,
+        path: &str,
+    ) -> Result<LoadedManifest, StorageError> {
+        let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
+        Self::read_manifest_at_path_with_context(dependencies, &columnar_read_context, path).await
+    }
+
+    async fn read_manifest_at_path_with_context(
+        dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
         path: &str,
     ) -> Result<LoadedManifest, StorageError> {
         let bytes = read_source(dependencies, &StorageSource::local_file(path)).await?;
@@ -803,7 +886,14 @@ impl Db {
         let mut max_sequence = SequenceNumber::new(0);
         for sstable in &file.body.sstables {
             max_sequence = max_sequence.max(sstable.max_sequence);
-            live_sstables.push(Self::load_resident_sstable(dependencies, sstable).await?);
+            live_sstables.push(
+                Self::load_resident_sstable_with_context(
+                    dependencies,
+                    columnar_read_context,
+                    sstable,
+                )
+                .await?,
+            );
         }
 
         if max_sequence > file.body.last_flushed_sequence {
@@ -851,6 +941,7 @@ impl Db {
 
     async fn loaded_manifest_from_remote_file(
         dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
         key: &str,
         file: PersistedRemoteManifestFile,
     ) -> Result<LoadedManifest, StorageError> {
@@ -858,7 +949,14 @@ impl Db {
         let mut max_sstable_sequence = SequenceNumber::new(0);
         for sstable in &file.body.sstables {
             max_sstable_sequence = max_sstable_sequence.max(sstable.max_sequence);
-            live_sstables.push(Self::load_resident_sstable(dependencies, sstable).await?);
+            live_sstables.push(
+                Self::load_resident_sstable_with_context(
+                    dependencies,
+                    columnar_read_context,
+                    sstable,
+                )
+                .await?,
+            );
         }
 
         let max_log_sequence = file

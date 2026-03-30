@@ -262,7 +262,8 @@ impl ResidentRowSstable {
 
     async fn load_columnar_metadata(
         &self,
-        dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
+        access: ColumnarReadAccessPattern,
     ) -> Result<LoadedColumnarMetadata, StorageError> {
         let columnar = self.columnar.as_ref().ok_or_else(|| {
             StorageError::corruption(format!(
@@ -271,101 +272,28 @@ impl ResidentRowSstable {
             ))
         })?;
         let location = self.meta.storage_descriptor();
-        let (footer, footer_start) = Db::columnar_footer_from_source(
-            dependencies,
-            &columnar.source,
-            self.meta.length,
-            location,
-        )
-        .await?;
-        Db::validate_loaded_columnar_footer(location, &self.meta, &footer)?;
+        let footer = columnar_read_context
+            .footer_from_source(&self.meta, &columnar.source, location, access)
+            .await?;
+        Db::validate_loaded_columnar_footer(location, &self.meta, footer.footer.as_ref())?;
 
-        let row_count = usize::try_from(footer.row_count).map_err(|_| {
+        let row_count = usize::try_from(footer.footer.row_count).map_err(|_| {
             StorageError::corruption(format!(
                 "columnar SSTable {location} row count exceeds platform limits"
             ))
         })?;
-        let key_index_range =
-            Db::columnar_block_range(location, footer_start, "key index", &footer.key_index)?;
-        let sequence_range = Db::columnar_block_range(
-            location,
-            footer_start,
-            "sequence column",
-            &footer.sequence_column,
-        )?;
-        let tombstone_range = Db::columnar_block_range(
-            location,
-            footer_start,
-            "tombstone bitmap",
-            &footer.tombstone_bitmap,
-        )?;
-        let row_kind_range = Db::columnar_block_range(
-            location,
-            footer_start,
-            "row-kind column",
-            &footer.row_kind_column,
-        )?;
-
-        let key_index: Vec<Key> = serde_json::from_slice(
-            &Db::read_exact_source_range(
-                dependencies,
-                &columnar.source,
-                key_index_range,
-                location,
-                "key index",
-            )
-            .await?,
-        )
-        .map_err(|error| {
-            StorageError::corruption(format!(
-                "decode columnar key index for {location} failed: {error}"
-            ))
-        })?;
-        let sequences: Vec<SequenceNumber> = serde_json::from_slice(
-            &Db::read_exact_source_range(
-                dependencies,
-                &columnar.source,
-                sequence_range,
-                location,
-                "sequence column",
-            )
-            .await?,
-        )
-        .map_err(|error| {
-            StorageError::corruption(format!(
-                "decode columnar sequence column for {location} failed: {error}"
-            ))
-        })?;
-        let tombstones: Vec<bool> = serde_json::from_slice(
-            &Db::read_exact_source_range(
-                dependencies,
-                &columnar.source,
-                tombstone_range,
-                location,
-                "tombstone bitmap",
-            )
-            .await?,
-        )
-        .map_err(|error| {
-            StorageError::corruption(format!(
-                "decode columnar tombstone bitmap for {location} failed: {error}"
-            ))
-        })?;
-        let row_kinds: Vec<ChangeKind> = serde_json::from_slice(
-            &Db::read_exact_source_range(
-                dependencies,
-                &columnar.source,
-                row_kind_range,
-                location,
-                "row-kind column",
-            )
-            .await?,
-        )
-        .map_err(|error| {
-            StorageError::corruption(format!(
-                "decode columnar row-kind column for {location} failed: {error}"
-            ))
-        })?;
+        let key_index = columnar_read_context
+            .key_index(&self.meta, &columnar.source, &footer, location, access)
+            .await?;
+        let sequences = columnar_read_context
+            .sequence_column(&self.meta, &columnar.source, &footer, location, access)
+            .await?;
+        let tombstones = columnar_read_context
+            .tombstone_bitmap(&self.meta, &columnar.source, &footer, location, access)
+            .await?;
+        let row_kinds = columnar_read_context
+            .row_kind_column(&self.meta, &columnar.source, &footer, location, access)
+            .await?;
 
         if key_index.len() != row_count
             || sequences.len() != row_count
@@ -378,8 +306,8 @@ impl ResidentRowSstable {
         }
 
         Ok(LoadedColumnarMetadata {
-            footer,
-            footer_start,
+            footer: footer.footer,
+            footer_start: footer.footer_start,
             key_index,
             sequences,
             tombstones,
@@ -389,7 +317,7 @@ impl ResidentRowSstable {
 
     async fn collect_visible_row_refs_for_key_columnar(
         &self,
-        dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
         key: &[u8],
         sequence: SequenceNumber,
     ) -> Result<Vec<ColumnarRowRef>, StorageError> {
@@ -405,7 +333,9 @@ impl ResidentRowSstable {
             return Ok(Vec::new());
         }
 
-        let metadata = self.load_columnar_metadata(dependencies).await?;
+        let metadata = self
+            .load_columnar_metadata(columnar_read_context, ColumnarReadAccessPattern::Point)
+            .await?;
         let start = metadata
             .key_index
             .partition_point(|candidate| candidate.as_slice() < key);
@@ -440,7 +370,7 @@ impl ResidentRowSstable {
 
     async fn collect_scan_row_refs_columnar(
         &self,
-        dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
         matcher: &KeyMatcher<'_>,
         sequence: SequenceNumber,
     ) -> Result<Vec<ColumnarRowRef>, StorageError> {
@@ -448,7 +378,9 @@ impl ResidentRowSstable {
             return Ok(Vec::new());
         }
 
-        let metadata = self.load_columnar_metadata(dependencies).await?;
+        let metadata = self
+            .load_columnar_metadata(columnar_read_context, ColumnarReadAccessPattern::Scan)
+            .await?;
         let start = match matcher {
             KeyMatcher::Range { start, .. } | KeyMatcher::Prefix(start) => metadata
                 .key_index
@@ -486,9 +418,10 @@ impl ResidentRowSstable {
 
     async fn materialize_columnar_rows(
         &self,
-        dependencies: &DbDependencies,
+        columnar_read_context: &ColumnarReadContext,
         projection: &ColumnProjection,
         row_indexes: &BTreeSet<usize>,
+        access: ColumnarReadAccessPattern,
     ) -> Result<BTreeMap<usize, Value>, StorageError> {
         if row_indexes.is_empty() {
             return Ok(BTreeMap::new());
@@ -500,7 +433,9 @@ impl ResidentRowSstable {
                 self.meta.storage_descriptor()
             ))
         })?;
-        let metadata = self.load_columnar_metadata(dependencies).await?;
+        let metadata = self
+            .load_columnar_metadata(columnar_read_context, access)
+            .await?;
         let location = self.meta.storage_descriptor();
         let row_count = metadata.key_index.len();
         let columns_by_field = metadata
@@ -509,7 +444,7 @@ impl ResidentRowSstable {
             .iter()
             .map(|column| (column.field_id, column))
             .collect::<BTreeMap<_, _>>();
-        let mut values_by_field = BTreeMap::<FieldId, Vec<FieldValue>>::new();
+        let mut values_by_field = BTreeMap::<FieldId, Arc<Vec<FieldValue>>>::new();
 
         for field in &projection.fields {
             if let Some(column) = columns_by_field.get(&field.id) {
@@ -519,23 +454,22 @@ impl ResidentRowSstable {
                         field.id.get()
                     )));
                 }
-                let range = Db::columnar_block_range(
-                    location,
-                    metadata.footer_start,
-                    "column block",
-                    &column.block,
-                )?;
-                let block = Db::read_exact_source_range(
-                    dependencies,
-                    &columnar.source,
-                    range,
-                    location,
-                    "column block",
-                )
-                .await?;
                 values_by_field.insert(
                     field.id,
-                    Db::decode_columnar_field_values(location, column, row_count, &block)?,
+                    columnar_read_context
+                        .column_block(
+                            &self.meta,
+                            &columnar.source,
+                            &CachedColumnarFooter {
+                                footer: metadata.footer.clone(),
+                                footer_start: metadata.footer_start,
+                            },
+                            column,
+                            row_count,
+                            location,
+                            access,
+                        )
+                        .await?,
                 );
             }
         }

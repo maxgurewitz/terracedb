@@ -36,7 +36,7 @@ use crate::{
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, OpenOptions},
-    remote::{ObjectKeyLayout, StorageSource, UnifiedStorage},
+    remote::{ObjectKeyLayout, RemoteCache, StorageSource, UnifiedStorage},
     scheduler::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
         ScheduleAction, Scheduler, TableStats,
