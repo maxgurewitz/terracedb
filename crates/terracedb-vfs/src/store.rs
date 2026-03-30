@@ -1114,6 +1114,7 @@ impl AgentFileSystem for InMemoryAgentFileSystem {
             }
         }
 
+        self.volume.promote_durable_cut();
         Ok(())
     }
 }
