@@ -1,0 +1,35 @@
+name: real-remote-chaos
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run smoke campaign
+        run: bash scripts/run_remote_chaos_suite.sh smoke
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-remote-chaos-smoke
+          path: .tmp/remote-chaos-artifacts
+
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run nightly campaign
+        run: bash scripts/run_remote_chaos_suite.sh nightly
+      - name: Upload nightly artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-remote-chaos-nightly
+          path: .tmp/remote-chaos-artifacts
