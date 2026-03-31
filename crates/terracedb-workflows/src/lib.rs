@@ -173,6 +173,8 @@ pub enum WorkflowError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
+    CheckpointStore(#[from] WorkflowCheckpointStoreError),
+    #[error(transparent)]
     TransactionCommit(#[from] TransactionCommitError),
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
@@ -212,6 +214,7 @@ impl WorkflowError {
             Self::CreateTable(_)
             | Self::Read(_)
             | Self::Storage(_)
+            | Self::CheckpointStore(_)
             | Self::TransactionCommit(_)
             | Self::Join(_)
             | Self::EmptyName
@@ -611,6 +614,20 @@ pub enum WorkflowSourceProgressOrigin {
     CheckpointRestore,
     ReplayFromHistory,
     FastForwardToCurrentDurable,
+}
+
+impl WorkflowSourceProgressOrigin {
+    pub fn attach_mode(self) -> Option<WorkflowSourceAttachMode> {
+        match self {
+            Self::DurableCursor => None,
+            Self::BeginningBootstrap
+            | Self::CheckpointRestore
+            | Self::ReplayFromHistory => Some(WorkflowSourceAttachMode::Historical),
+            Self::CurrentDurableBootstrap | Self::FastForwardToCurrentDurable => {
+                Some(WorkflowSourceAttachMode::LiveOnly)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1482,6 +1499,8 @@ pub struct WorkflowSourceTelemetrySnapshot {
     pub durable_sequence: SequenceNumber,
     pub cursor_sequence: SequenceNumber,
     pub lag: u64,
+    pub progress_origin: WorkflowSourceProgressOrigin,
+    pub attach_mode: Option<WorkflowSourceAttachMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1792,6 +1811,8 @@ where
                 lag: durable_source_sequence
                     .get()
                     .saturating_sub(progress.sequence().get()),
+                progress_origin: progress.origin(),
+                attach_mode: progress.origin().attach_mode(),
             });
         }
 
@@ -2273,6 +2294,290 @@ async fn commit_runtime_transaction<H>(
     }
 }
 
+fn workflow_historical_event_name(event: WorkflowHistoricalEvent) -> &'static str {
+    match event {
+        WorkflowHistoricalEvent::FirstAttach => "first-attach",
+        WorkflowHistoricalEvent::SnapshotTooOld => "snapshot-too-old",
+    }
+}
+
+fn workflow_historical_resolution_name(
+    resolution: WorkflowHistoricalSourceResolution,
+) -> &'static str {
+    match resolution {
+        WorkflowHistoricalSourceResolution::AttachFromBeginning => "attach-from-beginning",
+        WorkflowHistoricalSourceResolution::AttachFromCurrentDurable { .. } => {
+            "attach-from-current-durable"
+        }
+        WorkflowHistoricalSourceResolution::RestoreCheckpoint => "restore-checkpoint",
+        WorkflowHistoricalSourceResolution::ReplayFromHistory => "replay-from-history",
+        WorkflowHistoricalSourceResolution::FastForwardToCurrentDurable { .. } => {
+            "fast-forward-to-current-durable"
+        }
+        WorkflowHistoricalSourceResolution::FailClosedSnapshotTooOld => {
+            "fail-closed-snapshot-too-old"
+        }
+    }
+}
+
+async fn resolve_workflow_source_progress<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    source: &WorkflowSource,
+    event: WorkflowHistoricalEvent,
+    snapshot_too_old: Option<&SnapshotTooOld>,
+) -> Result<WorkflowSourceProgress, WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let current_durable_sequence = runtime.db.subscribe_durable(source.table()).current();
+    let checkpoint_progress = load_checkpoint_source_progress(runtime, source).await?;
+    let checkpoint_available = checkpoint_progress.is_some();
+    let resolution = match event {
+        WorkflowHistoricalEvent::FirstAttach => source.initial_resolution(
+            checkpoint_available,
+            current_durable_sequence,
+        ),
+        WorkflowHistoricalEvent::SnapshotTooOld => source.recovery_resolution(
+            checkpoint_available,
+            current_durable_sequence,
+        ),
+    };
+    let span = tracing::info_span!("terracedb.workflow.source_resolution");
+    apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, None);
+    set_span_attribute(
+        &span,
+        telemetry_attrs::SOURCE_TABLE,
+        source.table().name().to_string(),
+    );
+    set_span_attribute(
+        &span,
+        telemetry_attrs::DURABLE_SEQUENCE,
+        current_durable_sequence,
+    );
+    set_span_attribute(
+        &span,
+        "terracedb.workflow.source.event",
+        workflow_historical_event_name(event),
+    );
+    set_span_attribute(
+        &span,
+        "terracedb.workflow.source.resolution",
+        workflow_historical_resolution_name(resolution),
+    );
+    set_span_attribute(
+        &span,
+        "terracedb.workflow.source.checkpoint_available",
+        checkpoint_available,
+    );
+    set_span_attribute(
+        &span,
+        "terracedb.workflow.source.lossy",
+        resolution.is_lossy(),
+    );
+    if let Some(attach_mode) = resolution.attach_mode() {
+        set_span_attribute(
+            &span,
+            "terracedb.workflow.source.attach_mode",
+            match attach_mode {
+                WorkflowSourceAttachMode::Historical => "historical",
+                WorkflowSourceAttachMode::LiveOnly => "live-only",
+            },
+        );
+    }
+    if let Some(snapshot_too_old) = snapshot_too_old {
+        set_span_attribute(
+            &span,
+            "terracedb.workflow.snapshot_too_old.requested",
+            snapshot_too_old.requested,
+        );
+        set_span_attribute(
+            &span,
+            "terracedb.workflow.snapshot_too_old.oldest_available",
+            snapshot_too_old.oldest_available,
+        );
+    }
+
+    let span_for_attrs = span.clone();
+
+    async move {
+        if resolution.surfaces_snapshot_too_old() {
+            return Err(snapshot_too_old
+                .cloned()
+                .map(WorkflowError::SnapshotTooOld)
+                .unwrap_or_else(|| {
+                    WorkflowError::Storage(StorageError::unsupported(
+                        "workflow source fail-closed recovery requires a SnapshotTooOld cause",
+                    ))
+                }));
+        }
+
+        let progress = source_progress_for_resolution(source, resolution, checkpoint_progress)?;
+        persist_workflow_source_progress(runtime, source, progress).await?;
+        set_span_attribute(
+            &span_for_attrs,
+            telemetry_attrs::LOG_CURSOR,
+            format!(
+                "{}:{}",
+                progress.sequence().get(),
+                progress.as_log_cursor().op_index()
+            ),
+        );
+        Ok(progress)
+    }
+    .instrument(span.clone())
+    .await
+}
+
+fn source_progress_for_resolution(
+    source: &WorkflowSource,
+    resolution: WorkflowHistoricalSourceResolution,
+    checkpoint_progress: Option<WorkflowSourceProgress>,
+) -> Result<WorkflowSourceProgress, WorkflowError> {
+    match resolution {
+        WorkflowHistoricalSourceResolution::AttachFromBeginning => Ok(
+            WorkflowSourceProgress::from_cursor(LogCursor::beginning())
+                .with_origin(WorkflowSourceProgressOrigin::BeginningBootstrap),
+        ),
+        WorkflowHistoricalSourceResolution::AttachFromCurrentDurable { durable_sequence } => Ok(
+            WorkflowSourceProgress::from_durable_sequence(durable_sequence)
+                .with_origin(WorkflowSourceProgressOrigin::CurrentDurableBootstrap),
+        ),
+        WorkflowHistoricalSourceResolution::RestoreCheckpoint => checkpoint_progress
+            .map(|progress| progress.with_origin(WorkflowSourceProgressOrigin::CheckpointRestore))
+            .ok_or_else(|| {
+                StorageError::not_found(format!(
+                    "checkpoint restore requested for source {}, but no checkpoint frontier is available",
+                    source.table().name(),
+                ))
+                .into()
+            }),
+        WorkflowHistoricalSourceResolution::ReplayFromHistory => {
+            if source.config().capabilities.replay != WorkflowReplayableSourceKind::AppendOnlyOrdered
+            {
+                return Err(StorageError::unsupported(format!(
+                    "workflow source {} cannot replay from history unless it is configured as append-only ordered",
+                    source.table().name(),
+                ))
+                .into());
+            }
+            Ok(WorkflowSourceProgress::from_cursor(LogCursor::beginning())
+                .with_origin(WorkflowSourceProgressOrigin::ReplayFromHistory))
+        }
+        WorkflowHistoricalSourceResolution::FastForwardToCurrentDurable { durable_sequence } => Ok(
+            WorkflowSourceProgress::from_durable_sequence(durable_sequence)
+                .with_origin(WorkflowSourceProgressOrigin::FastForwardToCurrentDurable),
+        ),
+        WorkflowHistoricalSourceResolution::FailClosedSnapshotTooOld => Err(
+            StorageError::unsupported(
+                "workflow source fail-closed recovery must be handled before progress resolution",
+            )
+            .into(),
+        ),
+    }
+}
+
+async fn load_checkpoint_source_progress<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    source: &WorkflowSource,
+) -> Result<Option<WorkflowSourceProgress>, WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    if !source.config().capabilities.supports_checkpoint_restore() {
+        return Ok(None);
+    }
+    let Some(checkpoint_store) = runtime.checkpoint_store.as_ref() else {
+        return Ok(None);
+    };
+    let Some(manifest) = checkpoint_store.load_latest_manifest(&runtime.name).await? else {
+        return Ok(None);
+    };
+    Ok(manifest.source_frontier.get(source.table().name()).copied())
+}
+
+async fn persist_workflow_source_progress<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    source: &WorkflowSource,
+    progress: WorkflowSourceProgress,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    loop {
+        let mut tx = Transaction::begin(&runtime.db).await;
+        stage_workflow_source_progress_in_transaction(
+            &mut tx,
+            runtime.tables.source_progress_table(),
+            source.table(),
+            progress,
+        )?;
+        match tx.commit().await {
+            Ok(_) => return Ok(()),
+            Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn resume_local_durable_work<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
+        seed_ready_instances_from_durable_inbox(runtime).await?;
+        let _ = admit_due_timer_batch(runtime).await?;
+        drain_ready_instances(runtime, shutdown_rx).await?;
+
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
+        if !has_durable_inbox_entries(runtime).await? && !has_due_durable_timers(runtime).await? {
+            return Ok(());
+        }
+    }
+}
+
+async fn has_durable_inbox_entries<H>(runtime: &WorkflowRuntimeInner<H>) -> Result<bool, WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let durable_sequence = runtime.db.current_durable_sequence();
+    let mut rows = runtime
+        .tables
+        .inbox_table()
+        .scan_at(
+            Vec::new(),
+            vec![0xff],
+            durable_sequence,
+            ScanOptions {
+                limit: Some(1),
+                ..ScanOptions::default()
+            },
+        )
+        .await?;
+    Ok(rows.next().await.is_some())
+}
+
+async fn has_due_durable_timers<H>(runtime: &WorkflowRuntimeInner<H>) -> Result<bool, WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    Ok(!runtime
+        .tables
+        .timers
+        .scan_due_durable(&runtime.db, runtime.clock.now(), Some(1))
+        .await?
+        .is_empty())
+}
+
 async fn run_workflow_runtime<H>(
     runtime: Arc<WorkflowRuntimeInner<H>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -2284,6 +2589,10 @@ where
     apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, None);
 
     async move {
+        if !runtime.sources.is_empty() {
+            resume_local_durable_work(&runtime, &shutdown_rx).await?;
+        }
+
         let mut tasks = tokio::task::JoinSet::new();
         let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
         tasks.spawn(
@@ -2330,9 +2639,23 @@ async fn run_source_admission_loop<H>(
 where
     H: WorkflowHandler + 'static,
 {
-    let mut progress =
-        load_workflow_source_progress(runtime.tables.source_progress_table(), source.table())
-            .await?;
+    let mut progress = match read_workflow_source_progress(
+        runtime.tables.source_progress_table(),
+        source.table(),
+    )
+    .await?
+    {
+        Some(progress) => progress,
+        None => {
+            resolve_workflow_source_progress(
+                runtime.as_ref(),
+                &source,
+                WorkflowHistoricalEvent::FirstAttach,
+                None,
+            )
+            .await?
+        }
+    };
     let mut durable_wakes = runtime.db.subscribe_durable(source.table());
 
     loop {
@@ -2340,9 +2663,28 @@ where
             return Ok(());
         }
 
-        while admit_source_page(&runtime, &source, &mut progress).await? {
-            if *shutdown_rx.borrow() {
-                return Ok(());
+        loop {
+            match admit_source_page(&runtime, &source, &mut progress).await {
+                Ok(true) => {
+                    if *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                Ok(false) => break,
+                Err(error) if error.snapshot_too_old().is_some() => {
+                    let snapshot_too_old = error
+                        .snapshot_too_old()
+                        .cloned()
+                        .expect("SnapshotTooOld guard should guarantee an error payload");
+                    progress = resolve_workflow_source_progress(
+                        runtime.as_ref(),
+                        &source,
+                        WorkflowHistoricalEvent::SnapshotTooOld,
+                        Some(&snapshot_too_old),
+                    )
+                    .await?;
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -3517,10 +3859,21 @@ async fn load_workflow_source_progress(
     progress_table: &Table,
     source: &Table,
 ) -> Result<WorkflowSourceProgress, WorkflowError> {
+    Ok(read_workflow_source_progress(progress_table, source)
+        .await?
+        .unwrap_or_default())
+}
+
+async fn read_workflow_source_progress(
+    progress_table: &Table,
+    source: &Table,
+) -> Result<Option<WorkflowSourceProgress>, WorkflowError> {
     let Some(value) = progress_table.read(source_cursor_key(source)).await? else {
-        return Ok(WorkflowSourceProgress::default());
+        return Ok(None);
     };
-    decode_workflow_source_progress_value(&value).map_err(Into::into)
+    decode_workflow_source_progress_value(&value)
+        .map(Some)
+        .map_err(Into::into)
 }
 
 fn stage_workflow_source_progress_in_transaction(
