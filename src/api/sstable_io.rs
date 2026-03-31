@@ -53,7 +53,9 @@ impl ColumnarReadContext {
                 ColumnarReadArtifact::ColumnBlock => access == ColumnarReadAccessPattern::Point,
             };
         let populate_hot_data = match artifact {
-            ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata => true,
+            ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata => {
+                access != ColumnarReadAccessPattern::Recovery
+            }
             ColumnarReadArtifact::ColumnBlock => access == ColumnarReadAccessPattern::Point,
         };
 
@@ -64,7 +66,7 @@ impl ColumnarReadContext {
                 && self
                     .raw_byte_cache_population_enabled
                     .load(Ordering::Relaxed),
-            use_decoded_cache,
+            use_decoded_cache: use_decoded_cache && access != ColumnarReadAccessPattern::Recovery,
             populate_decoded_cache: use_decoded_cache && populate_hot_data,
         }
     }
@@ -73,11 +75,13 @@ impl ColumnarReadContext {
         access: ColumnarReadAccessPattern,
         artifact: ColumnarReadArtifact,
     ) -> bool {
-        access == ColumnarReadAccessPattern::Scan
-            && matches!(
-                artifact,
-                ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata
-            )
+        matches!(
+            access,
+            ColumnarReadAccessPattern::Scan | ColumnarReadAccessPattern::Recovery
+        ) && matches!(
+            artifact,
+            ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata
+        )
     }
 
     async fn read_exact_remote_range_via_raw_cache(
@@ -1171,7 +1175,7 @@ impl Db {
                 meta,
                 &source,
                 location,
-                ColumnarReadAccessPattern::Point,
+                ColumnarReadAccessPattern::Recovery,
                 false,
             )
             .await?;

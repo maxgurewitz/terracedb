@@ -801,20 +801,23 @@ impl Db {
         hybrid_read: &crate::HybridReadConfig,
         dependencies: &DbDependencies,
     ) -> Result<ColumnarReadContext, StorageError> {
-        let remote_cache_root = match storage {
-            StorageConfig::Tiered(config) => Some(Self::join_fs_path(
-                &config.ssd.path,
-                LOCAL_REMOTE_CACHE_RELATIVE_DIR,
+        let remote_cache_config = match storage {
+            StorageConfig::Tiered(config) => Some((
+                Self::join_fs_path(&config.ssd.path, LOCAL_REMOTE_CACHE_RELATIVE_DIR),
+                hybrid_read.raw_segment_cache_bytes,
             )),
-            StorageConfig::S3Primary(config) => Some(Self::s3_primary_remote_cache_root(config)),
+            StorageConfig::S3Primary(config) => Some((
+                Self::s3_primary_remote_cache_root(config),
+                hybrid_read.raw_segment_cache_bytes,
+            )),
         };
-        let remote_cache = match remote_cache_root {
-            Some(root) => Some(Arc::new(
+        let remote_cache = match remote_cache_config {
+            Some((root, max_bytes)) => Some(Arc::new(
                 RemoteCache::open_with_config(
                     dependencies.file_system.clone(),
                     root,
                     crate::remote::RemoteCacheConfig {
-                        max_bytes: hybrid_read.raw_segment_cache_bytes,
+                        max_bytes,
                         ..Default::default()
                     },
                 )
