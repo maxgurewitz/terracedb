@@ -2265,6 +2265,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-debezium"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-kafka",
+ "terracedb-projections",
+ "terracedb-simulation",
+ "terracedb-workflows",
+ "thiserror",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-example-retention-api"
 version = "0.1.0"
 dependencies = [
