@@ -125,7 +125,7 @@ mod util;
 mod watermark;
 
 pub use self::builder::*;
-pub use self::internals::ColumnarCacheUsageSnapshot;
+pub use self::internals::{ColumnarCacheUsageSnapshot, DomainColumnarCacheUsageSnapshot};
 pub use self::operations::*;
 pub use self::schema::*;
 pub use self::snapshot::Snapshot;

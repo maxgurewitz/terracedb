@@ -426,7 +426,7 @@ pub enum DurabilityClass {
     Custom(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ExecutionLane {
     UserForeground,
     UserBackground,

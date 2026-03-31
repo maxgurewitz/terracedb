@@ -61,6 +61,7 @@ pub(super) struct DbInner {
     pub(super) visible_watchers: Arc<WatermarkRegistry>,
     pub(super) durable_watchers: Arc<WatermarkRegistry>,
     pub(super) work_deferrals: Mutex<BTreeMap<String, u32>>,
+    pub(super) work_deferral_domains: Mutex<BTreeMap<String, crate::ExecutionDomainPath>>,
     pub(super) pending_work_budget_state: Mutex<PendingWorkBudgetState>,
     pub(super) scheduler_observability: SchedulerObservabilityStats,
     pub(super) compact_to_wide_stats: Mutex<BTreeMap<CompactToWideStatsKey, CompactToWideStats>>,
@@ -163,6 +164,7 @@ pub(super) struct ColumnarMaterialization {
 pub(super) enum ColumnarReadAccessPattern {
     Point,
     Scan,
+    Background,
     Recovery,
 }
 
@@ -197,8 +199,22 @@ pub(super) struct ColumnarCacheStatsSnapshot {
     pub(super) decoded_column_block_admissions: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnarCacheUsageSnapshot {
+    pub raw_byte_entries: usize,
+    pub raw_byte_bytes: u64,
+    pub raw_byte_budget_bytes: u64,
+    pub decoded_metadata_entries: usize,
+    pub decoded_metadata_entry_limit: usize,
+    pub decoded_metadata_bytes: u64,
+    pub decoded_column_entries: usize,
+    pub decoded_column_entry_limit: usize,
+    pub decoded_column_bytes: u64,
+    pub by_domain: BTreeMap<crate::ExecutionDomainPath, DomainColumnarCacheUsageSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DomainColumnarCacheUsageSnapshot {
     pub raw_byte_entries: usize,
     pub raw_byte_bytes: u64,
     pub raw_byte_budget_bytes: u64,
@@ -210,6 +226,13 @@ pub struct ColumnarCacheUsageSnapshot {
     pub decoded_column_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ColumnarCacheLaneBudget {
+    pub(super) raw_byte_budget_bytes: u64,
+    pub(super) decoded_metadata_entry_limit: usize,
+    pub(super) decoded_column_entry_limit: usize,
+}
+
 pub(super) struct ColumnarReadContext {
     pub(super) dependencies: DbDependencies,
     pub(super) remote_cache: Option<Arc<RemoteCache>>,
@@ -219,6 +242,8 @@ pub(super) struct ColumnarReadContext {
     pub(super) decoded_cache_enabled: AtomicBool,
     pub(super) raw_byte_cache_budget_bytes: u64,
     pub(super) raw_byte_cache_budget_state: Mutex<RawByteCacheBudgetState>,
+    pub(super) cache_domain_paths: BTreeMap<crate::ExecutionLane, crate::ExecutionDomainPath>,
+    pub(super) cache_lane_budgets: BTreeMap<crate::ExecutionLane, ColumnarCacheLaneBudget>,
     pub(super) skip_indexes_enabled: bool,
     pub(super) projection_sidecars_enabled: bool,
     #[allow(dead_code)]
@@ -236,6 +261,10 @@ pub(super) struct DecodedColumnarCache {
     pub(super) stats: ColumnarCacheStats,
     pub(super) metadata_entry_limit: usize,
     pub(super) column_entry_limit: usize,
+    pub(super) metadata_entry_limits: BTreeMap<crate::ExecutionLane, usize>,
+    pub(super) column_entry_limits: BTreeMap<crate::ExecutionLane, usize>,
+    pub(super) metadata_owners: RwLock<BTreeMap<ColumnarSstableIdentity, crate::ExecutionLane>>,
+    pub(super) column_owners: RwLock<BTreeMap<ColumnarColumnCacheKey, crate::ExecutionLane>>,
     pub(super) metadata_order: Mutex<VecDeque<ColumnarSstableIdentity>>,
     pub(super) column_order: Mutex<VecDeque<ColumnarColumnCacheKey>>,
 }
@@ -261,8 +290,13 @@ pub(super) struct SchedulerObservabilityStats {
     pub(super) forced_flushes: AtomicU64,
     pub(super) forced_l0_compactions: AtomicU64,
     pub(super) budget_blocked_executions: AtomicU64,
+    pub(super) budget_blocked_executions_by_domain:
+        Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
     pub(super) background_delay_events: AtomicU64,
     pub(super) background_delay_millis: AtomicU64,
+    pub(super) background_delay_events_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
+    pub(super) background_delay_millis_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
+    pub(super) throttled_writes_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -279,10 +313,24 @@ pub(super) struct CompactToWideStats {
 }
 
 #[derive(Default)]
+pub(super) struct PendingWorkBudgetUsage {
+    pub(super) in_flight_bytes: u64,
+    pub(super) in_flight_requests: u32,
+    pub(super) concurrency: u32,
+}
+
+#[derive(Default)]
+pub(super) struct DomainPendingWorkBudgetUsage {
+    pub(super) in_flight_bytes: u64,
+    pub(super) concurrency: u32,
+    pub(super) local_requests: u32,
+    pub(super) remote_requests: u32,
+}
+
+#[derive(Default)]
 pub(super) struct PendingWorkBudgetState {
-    pub(super) in_flight_bytes: BTreeMap<PendingWorkType, u64>,
-    pub(super) in_flight_requests: BTreeMap<PendingWorkType, u32>,
-    pub(super) concurrency: BTreeMap<PendingWorkType, u32>,
+    pub(super) by_work_type: BTreeMap<PendingWorkType, PendingWorkBudgetUsage>,
+    pub(super) by_domain: BTreeMap<crate::ExecutionDomainPath, DomainPendingWorkBudgetUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -296,6 +344,7 @@ pub(super) struct RawByteCacheBudgetState {
     pub(super) total_bytes: u64,
     pub(super) order: VecDeque<RawByteCacheBudgetKey>,
     pub(super) lengths: BTreeMap<RawByteCacheBudgetKey, u64>,
+    pub(super) owners: BTreeMap<RawByteCacheBudgetKey, crate::ExecutionLane>,
 }
 
 #[derive(Clone, Debug)]
@@ -371,7 +420,12 @@ impl PersistedManifestSstable {
 }
 
 impl DecodedColumnarCache {
-    pub(super) fn new(metadata_entry_limit: usize, column_entry_limit: usize) -> Self {
+    pub(super) fn new(
+        metadata_entry_limits: BTreeMap<crate::ExecutionLane, usize>,
+        column_entry_limits: BTreeMap<crate::ExecutionLane, usize>,
+    ) -> Self {
+        let metadata_entry_limit = metadata_entry_limits.values().copied().sum();
+        let column_entry_limit = column_entry_limits.values().copied().sum();
         Self {
             footers: RwLock::new(BTreeMap::new()),
             key_indexes: RwLock::new(BTreeMap::new()),
@@ -382,6 +436,10 @@ impl DecodedColumnarCache {
             stats: ColumnarCacheStats::default(),
             metadata_entry_limit,
             column_entry_limit,
+            metadata_entry_limits,
+            column_entry_limits,
+            metadata_owners: RwLock::new(BTreeMap::new()),
+            column_owners: RwLock::new(BTreeMap::new()),
             metadata_order: Mutex::new(VecDeque::new()),
             column_order: Mutex::new(VecDeque::new()),
         }
@@ -413,17 +471,50 @@ impl DecodedColumnarCache {
         }
     }
 
-    pub(super) fn usage_snapshot(&self, raw_byte_budget_bytes: u64) -> ColumnarCacheUsageSnapshot {
+    pub(super) fn usage_snapshot(
+        &self,
+        raw_byte_budget_bytes: u64,
+        cache_domain_paths: &BTreeMap<crate::ExecutionLane, crate::ExecutionDomainPath>,
+        cache_lane_budgets: &BTreeMap<crate::ExecutionLane, ColumnarCacheLaneBudget>,
+    ) -> ColumnarCacheUsageSnapshot {
+        let metadata_owners = self.metadata_owners.read().clone();
+        let column_owners = self.column_owners.read().clone();
+        let mut by_domain = BTreeMap::new();
+        for (&lane, domain) in cache_domain_paths {
+            let lane_budget = cache_lane_budgets.get(&lane).copied().unwrap_or_default();
+            by_domain.insert(
+                domain.clone(),
+                DomainColumnarCacheUsageSnapshot {
+                    raw_byte_budget_bytes: lane_budget.raw_byte_budget_bytes,
+                    decoded_metadata_entries: metadata_owners
+                        .values()
+                        .filter(|owner| **owner == lane)
+                        .count(),
+                    decoded_metadata_entry_limit: lane_budget.decoded_metadata_entry_limit,
+                    decoded_metadata_bytes: self
+                        .metadata_usage_bytes_for_lane(lane, &metadata_owners),
+                    decoded_column_entries: column_owners
+                        .values()
+                        .filter(|owner| **owner == lane)
+                        .count(),
+                    decoded_column_entry_limit: lane_budget.decoded_column_entry_limit,
+                    decoded_column_bytes: self.column_usage_bytes_for_lane(lane, &column_owners),
+                    ..Default::default()
+                },
+            );
+        }
+
         ColumnarCacheUsageSnapshot {
             raw_byte_entries: 0,
             raw_byte_bytes: 0,
             raw_byte_budget_bytes,
-            decoded_metadata_entries: self.metadata_order.lock().len(),
+            decoded_metadata_entries: metadata_owners.len(),
             decoded_metadata_entry_limit: self.metadata_entry_limit,
             decoded_metadata_bytes: self.metadata_usage_bytes(),
-            decoded_column_entries: self.column_order.lock().len(),
+            decoded_column_entries: column_owners.len(),
             decoded_column_entry_limit: self.column_entry_limit,
             decoded_column_bytes: self.column_usage_bytes(),
+            by_domain,
         }
     }
 
@@ -462,6 +553,8 @@ impl DecodedColumnarCache {
         self.tombstone_bitmaps.write().clear();
         self.row_kind_columns.write().clear();
         self.column_blocks.write().clear();
+        self.metadata_owners.write().clear();
+        self.column_owners.write().clear();
         self.metadata_order.lock().clear();
         self.column_order.lock().clear();
     }
@@ -487,9 +580,10 @@ impl DecodedColumnarCache {
         &self,
         identity: ColumnarSstableIdentity,
         footer: CachedColumnarFooter,
+        lane: crate::ExecutionLane,
     ) {
         self.footers.write().insert(identity.clone(), footer);
-        self.touch_metadata_identity(&identity);
+        self.touch_metadata_identity(&identity, lane);
         self.trim_metadata_to_limit();
         self.stats
             .decoded_footer_admissions
@@ -514,9 +608,10 @@ impl DecodedColumnarCache {
         &self,
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<Key>>,
+        lane: crate::ExecutionLane,
     ) {
         self.key_indexes.write().insert(identity.clone(), values);
-        self.touch_metadata_identity(&identity);
+        self.touch_metadata_identity(&identity, lane);
         self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
@@ -544,11 +639,12 @@ impl DecodedColumnarCache {
         &self,
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<SequenceNumber>>,
+        lane: crate::ExecutionLane,
     ) {
         self.sequence_columns
             .write()
             .insert(identity.clone(), values);
-        self.touch_metadata_identity(&identity);
+        self.touch_metadata_identity(&identity, lane);
         self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
@@ -576,11 +672,12 @@ impl DecodedColumnarCache {
         &self,
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<bool>>,
+        lane: crate::ExecutionLane,
     ) {
         self.tombstone_bitmaps
             .write()
             .insert(identity.clone(), values);
-        self.touch_metadata_identity(&identity);
+        self.touch_metadata_identity(&identity, lane);
         self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
@@ -608,11 +705,12 @@ impl DecodedColumnarCache {
         &self,
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<ChangeKind>>,
+        lane: crate::ExecutionLane,
     ) {
         self.row_kind_columns
             .write()
             .insert(identity.clone(), values);
-        self.touch_metadata_identity(&identity);
+        self.touch_metadata_identity(&identity, lane);
         self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
@@ -640,67 +738,108 @@ impl DecodedColumnarCache {
         &self,
         key: ColumnarColumnCacheKey,
         values: Arc<Vec<FieldValue>>,
+        lane: crate::ExecutionLane,
     ) {
         self.column_blocks.write().insert(key.clone(), values);
-        self.touch_column_key(&key);
+        self.touch_column_key(&key, lane);
         self.trim_column_blocks_to_limit();
         self.stats
             .decoded_column_block_admissions
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn touch_metadata_identity(&self, identity: &ColumnarSstableIdentity) {
+    fn touch_metadata_identity(
+        &self,
+        identity: &ColumnarSstableIdentity,
+        lane: crate::ExecutionLane,
+    ) {
         let mut order = self.metadata_order.lock();
         if let Some(position) = order.iter().position(|cached| cached == identity) {
             order.remove(position);
         }
         order.push_back(identity.clone());
+        self.metadata_owners.write().insert(identity.clone(), lane);
     }
 
     fn trim_metadata_to_limit(&self) {
-        loop {
-            let next = {
-                let mut order = self.metadata_order.lock();
-                if order.len() <= self.metadata_entry_limit {
-                    None
-                } else {
-                    order.pop_front()
-                }
-            };
-            let Some(identity) = next else {
-                break;
-            };
-            self.footers.write().remove(&identity);
-            self.key_indexes.write().remove(&identity);
-            self.sequence_columns.write().remove(&identity);
-            self.tombstone_bitmaps.write().remove(&identity);
-            self.row_kind_columns.write().remove(&identity);
+        for (&lane, &limit) in &self.metadata_entry_limits {
+            while self.metadata_entries_for_lane(lane) > limit {
+                let Some(identity) = self.pop_oldest_metadata_for_lane(lane) else {
+                    break;
+                };
+                self.remove_metadata_identity(&identity);
+            }
         }
     }
 
-    fn touch_column_key(&self, key: &ColumnarColumnCacheKey) {
+    fn touch_column_key(&self, key: &ColumnarColumnCacheKey, lane: crate::ExecutionLane) {
         let mut order = self.column_order.lock();
         if let Some(position) = order.iter().position(|cached| cached == key) {
             order.remove(position);
         }
         order.push_back(key.clone());
+        self.column_owners.write().insert(key.clone(), lane);
     }
 
     fn trim_column_blocks_to_limit(&self) {
-        loop {
-            let next = {
-                let mut order = self.column_order.lock();
-                if order.len() <= self.column_entry_limit {
-                    None
-                } else {
-                    order.pop_front()
-                }
-            };
-            let Some(key) = next else {
-                break;
-            };
-            self.column_blocks.write().remove(&key);
+        for (&lane, &limit) in &self.column_entry_limits {
+            while self.column_entries_for_lane(lane) > limit {
+                let Some(key) = self.pop_oldest_column_for_lane(lane) else {
+                    break;
+                };
+                self.column_blocks.write().remove(&key);
+                self.column_owners.write().remove(&key);
+            }
         }
+    }
+
+    fn metadata_entries_for_lane(&self, lane: crate::ExecutionLane) -> usize {
+        self.metadata_owners
+            .read()
+            .values()
+            .filter(|owner| **owner == lane)
+            .count()
+    }
+
+    fn column_entries_for_lane(&self, lane: crate::ExecutionLane) -> usize {
+        self.column_owners
+            .read()
+            .values()
+            .filter(|owner| **owner == lane)
+            .count()
+    }
+
+    fn pop_oldest_metadata_for_lane(
+        &self,
+        lane: crate::ExecutionLane,
+    ) -> Option<ColumnarSstableIdentity> {
+        let owners = self.metadata_owners.read();
+        let mut order = self.metadata_order.lock();
+        let position = order
+            .iter()
+            .position(|identity| owners.get(identity).copied() == Some(lane))?;
+        order.remove(position)
+    }
+
+    fn pop_oldest_column_for_lane(
+        &self,
+        lane: crate::ExecutionLane,
+    ) -> Option<ColumnarColumnCacheKey> {
+        let owners = self.column_owners.read();
+        let mut order = self.column_order.lock();
+        let position = order
+            .iter()
+            .position(|key| owners.get(key).copied() == Some(lane))?;
+        order.remove(position)
+    }
+
+    fn remove_metadata_identity(&self, identity: &ColumnarSstableIdentity) {
+        self.footers.write().remove(identity);
+        self.key_indexes.write().remove(identity);
+        self.sequence_columns.write().remove(identity);
+        self.tombstone_bitmaps.write().remove(identity);
+        self.row_kind_columns.write().remove(identity);
+        self.metadata_owners.write().remove(identity);
     }
 
     fn metadata_usage_bytes(&self) -> u64 {
@@ -741,11 +880,79 @@ impl DecodedColumnarCache {
             .saturating_add(row_kind_bytes)
     }
 
+    fn metadata_usage_bytes_for_lane(
+        &self,
+        lane: crate::ExecutionLane,
+        owners: &BTreeMap<ColumnarSstableIdentity, crate::ExecutionLane>,
+    ) -> u64 {
+        owners
+            .iter()
+            .filter(|(_, owner)| **owner == lane)
+            .map(|(identity, _)| self.metadata_usage_bytes_for_identity(identity))
+            .sum()
+    }
+
+    fn metadata_usage_bytes_for_identity(&self, identity: &ColumnarSstableIdentity) -> u64 {
+        let footer_bytes = self
+            .footers
+            .read()
+            .get(identity)
+            .map(estimate_cached_footer_bytes)
+            .unwrap_or_default();
+        let key_index_bytes = self
+            .key_indexes
+            .read()
+            .get(identity)
+            .map(|values| estimate_keys_bytes(values.as_ref().as_slice()))
+            .unwrap_or_default();
+        let sequence_bytes = self
+            .sequence_columns
+            .read()
+            .get(identity)
+            .map(|values| (values.len() as u64).saturating_mul(std::mem::size_of::<u64>() as u64))
+            .unwrap_or_default();
+        let tombstone_bytes = self
+            .tombstone_bitmaps
+            .read()
+            .get(identity)
+            .map(|values| values.len() as u64)
+            .unwrap_or_default();
+        let row_kind_bytes = self
+            .row_kind_columns
+            .read()
+            .get(identity)
+            .map(|values| values.len() as u64)
+            .unwrap_or_default();
+        footer_bytes
+            .saturating_add(key_index_bytes)
+            .saturating_add(sequence_bytes)
+            .saturating_add(tombstone_bytes)
+            .saturating_add(row_kind_bytes)
+    }
+
     fn column_usage_bytes(&self) -> u64 {
         self.column_blocks
             .read()
             .values()
             .map(|values| estimate_field_values_bytes(values.as_ref().as_slice()))
+            .sum()
+    }
+
+    fn column_usage_bytes_for_lane(
+        &self,
+        lane: crate::ExecutionLane,
+        owners: &BTreeMap<ColumnarColumnCacheKey, crate::ExecutionLane>,
+    ) -> u64 {
+        owners
+            .iter()
+            .filter(|(_, owner)| **owner == lane)
+            .map(|(key, _)| {
+                self.column_blocks
+                    .read()
+                    .get(key)
+                    .map(|values| estimate_field_values_bytes(values.as_ref().as_slice()))
+                    .unwrap_or_default()
+            })
             .sum()
     }
 }
@@ -754,8 +961,14 @@ impl Default for DecodedColumnarCache {
     fn default() -> Self {
         let config = crate::HybridReadConfig::default();
         Self::new(
-            config.decoded_metadata_cache_entries,
-            config.decoded_column_cache_entries,
+            BTreeMap::from([(
+                crate::ExecutionLane::UserForeground,
+                config.decoded_metadata_cache_entries,
+            )]),
+            BTreeMap::from([(
+                crate::ExecutionLane::UserForeground,
+                config.decoded_column_cache_entries,
+            )]),
         )
     }
 }
@@ -1130,6 +1343,7 @@ pub(super) enum PendingWorkSpec {
 #[derive(Clone, Debug)]
 pub(super) struct PendingWorkCandidate {
     pub(super) pending: PendingWork,
+    pub(super) tag: crate::WorkRuntimeTag,
     pub(super) spec: PendingWorkSpec,
 }
 

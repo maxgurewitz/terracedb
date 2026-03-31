@@ -133,6 +133,22 @@ fn dependencies_with_clock(
     )
 }
 
+fn execution_profile_with_prefix(prefix: &str) -> crate::DbExecutionProfile {
+    crate::DbExecutionProfile::default()
+        .with_foreground(crate::ExecutionLaneBinding::new(
+            crate::ExecutionDomainPath::new(["process", prefix, "foreground"]),
+            crate::DurabilityClass::UserData,
+        ))
+        .with_background(crate::ExecutionLaneBinding::new(
+            crate::ExecutionDomainPath::new(["process", prefix, "background"]),
+            crate::DurabilityClass::UserData,
+        ))
+        .with_control_plane(crate::ExecutionLaneBinding::new(
+            crate::ExecutionDomainPath::new(["process", prefix, "control"]),
+            crate::DurabilityClass::ControlPlane,
+        ))
+}
+
 #[tokio::test]
 async fn builder_component_overrides_flow_through_runtime() {
     let file_system: Arc<dyn FileSystem> = Arc::new(crate::StubFileSystem::default());
@@ -2155,6 +2171,58 @@ async fn forced_flush_ignores_scheduler_deferrals_when_memtable_budget_is_exhaus
         "forced flush should install SSTables"
     );
     assert!(!db.sstables_read().live.is_empty());
+}
+
+#[tokio::test]
+async fn domain_mutable_memory_budget_forces_flush_before_storage_ceiling() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let profile = execution_profile_with_prefix("domain-mutable");
+    let resource_manager: Arc<dyn crate::ResourceManager> =
+        Arc::new(crate::InMemoryResourceManager::default());
+    resource_manager.register_domain(crate::ExecutionDomainSpec {
+        path: profile.foreground.domain.clone(),
+        owner: crate::ExecutionDomainOwner::Database {
+            name: "domain-mutable".to_string(),
+        },
+        budget: crate::ExecutionDomainBudget {
+            memory: crate::DomainMemoryBudget {
+                mutable_bytes: Some(300),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        placement: crate::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+        metadata: BTreeMap::new(),
+    });
+
+    let dependencies = dependencies(file_system, object_store)
+        .with_resource_manager(resource_manager)
+        .with_execution_profile(profile);
+    let db = Db::open(
+        tiered_config_with_max_local_bytes("/domain-mutable-budget", 1024),
+        dependencies,
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    assert_eq!(db.memtable_budget_bytes(), Some(300));
+    assert!(!db.memtable_budget_exceeded_by(200));
+    assert!(db.memtable_budget_exceeded_by(301));
+
+    table
+        .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 200]))
+        .await
+        .expect("write first value");
+    assert!(db.sstables_read().live.is_empty());
+
+    table
+        .write(b"user:2".to_vec(), Value::Bytes(vec![b'y'; 200]))
+        .await
+        .expect("write second value");
 }
 
 #[test]
@@ -6068,6 +6136,149 @@ async fn columnar_cache_usage_snapshot_respects_configured_bounds() {
     assert_eq!(usage.decoded_column_entry_limit, 1);
     assert!(usage.decoded_metadata_entries <= 1);
     assert!(usage.decoded_column_entries <= 1);
+}
+
+#[tokio::test]
+async fn columnar_cache_usage_surfaces_domain_budget_partitions() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let profile = execution_profile_with_prefix("cache-usage");
+    let resource_manager: Arc<dyn crate::ResourceManager> =
+        Arc::new(crate::InMemoryResourceManager::default());
+    for (path, name, cache_bytes) in [
+        (profile.foreground.domain.clone(), "foreground", 256_u64),
+        (profile.background.domain.clone(), "background", 64_u64),
+        (profile.control_plane.domain.clone(), "control", 32_u64),
+    ] {
+        resource_manager.register_domain(crate::ExecutionDomainSpec {
+            path,
+            owner: crate::ExecutionDomainOwner::Database {
+                name: format!("cache-usage-{name}"),
+            },
+            budget: crate::ExecutionDomainBudget {
+                memory: crate::DomainMemoryBudget {
+                    cache_bytes: Some(cache_bytes),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            placement: crate::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+            metadata: BTreeMap::new(),
+        });
+    }
+
+    let mut config = s3_primary_config("domain-cache-usage");
+    config.hybrid_read.raw_segment_cache_bytes = 352;
+    config.hybrid_read.decoded_metadata_cache_entries = 7;
+    config.hybrid_read.decoded_column_cache_entries = 14;
+    let dependencies = dependencies(file_system, object_store)
+        .with_resource_manager(resource_manager)
+        .with_execution_profile(profile.clone());
+    let db = Db::open(config, dependencies).await.expect("open db");
+
+    let usage = db.columnar_cache_usage_snapshot();
+    assert_eq!(usage.raw_byte_budget_bytes, 352);
+    assert_eq!(
+        usage.by_domain[&profile.foreground.domain].raw_byte_budget_bytes,
+        256
+    );
+    assert_eq!(
+        usage.by_domain[&profile.background.domain].raw_byte_budget_bytes,
+        64
+    );
+    assert_eq!(
+        usage.by_domain[&profile.control_plane.domain].raw_byte_budget_bytes,
+        32
+    );
+    assert_eq!(
+        usage.by_domain[&profile.foreground.domain].decoded_metadata_entry_limit
+            + usage.by_domain[&profile.background.domain].decoded_metadata_entry_limit
+            + usage.by_domain[&profile.control_plane.domain].decoded_metadata_entry_limit,
+        7
+    );
+    assert_eq!(
+        usage.by_domain[&profile.foreground.domain].decoded_column_entry_limit
+            + usage.by_domain[&profile.background.domain].decoded_column_entry_limit
+            + usage.by_domain[&profile.control_plane.domain].decoded_column_entry_limit,
+        14
+    );
+}
+
+#[tokio::test]
+async fn columnar_background_compaction_uses_background_cache_partition() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let profile = execution_profile_with_prefix("cache-background");
+    let resource_manager: Arc<dyn crate::ResourceManager> =
+        Arc::new(crate::InMemoryResourceManager::default());
+    for (path, name, cache_bytes) in [
+        (profile.foreground.domain.clone(), "foreground", 192_u64),
+        (profile.background.domain.clone(), "background", 64_u64),
+        (profile.control_plane.domain.clone(), "control", 0_u64),
+    ] {
+        resource_manager.register_domain(crate::ExecutionDomainSpec {
+            path,
+            owner: crate::ExecutionDomainOwner::Database {
+                name: format!("cache-background-{name}"),
+            },
+            budget: crate::ExecutionDomainBudget {
+                memory: crate::DomainMemoryBudget {
+                    cache_bytes: Some(cache_bytes),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            placement: crate::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+            metadata: BTreeMap::new(),
+        });
+    }
+    let dependencies = dependencies(file_system, object_store)
+        .with_resource_manager(resource_manager)
+        .with_execution_profile(profile.clone());
+    let db = Db::open(
+        tiered_config("/columnar-background-cache-partition"),
+        dependencies,
+    )
+    .await
+    .expect("open db");
+    let config = columnar_table_config("metrics");
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    for (key, user_id, count) in [
+        (b"user:1".to_vec(), "alice", 1_i64),
+        (b"user:2".to_vec(), "bob", 2_i64),
+        (b"user:3".to_vec(), "carol", 3_i64),
+    ] {
+        table
+            .write(
+                key,
+                Value::named_record(
+                    &schema,
+                    [
+                        ("user_id", FieldValue::String(user_id.to_string())),
+                        ("count", FieldValue::Int64(count)),
+                    ],
+                )
+                .expect("encode row"),
+            )
+            .await
+            .expect("write row");
+        db.flush().await.expect("flush row");
+    }
+
+    db.clear_columnar_decoded_cache();
+    assert!(db.run_next_compaction().await.expect("run compaction"));
+
+    let usage = db.columnar_cache_usage_snapshot();
+    let foreground = usage.by_domain[&profile.foreground.domain];
+    let background = usage.by_domain[&profile.background.domain];
+    assert_eq!(foreground.decoded_metadata_entries, 0);
+    assert!(background.decoded_metadata_entries > 0);
+    assert!(
+        background.decoded_metadata_entries <= background.decoded_metadata_entry_limit,
+        "background maintenance reads should stay inside their own decoded-cache partition"
+    );
 }
 
 #[tokio::test]
