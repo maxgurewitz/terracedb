@@ -294,16 +294,43 @@ pub struct ColumnarV2Header {
     pub part_digest: CompactPartDigest,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarSequenceBounds {
+    pub min_sequence: SequenceNumber,
+    pub max_sequence: SequenceNumber,
+}
+
+impl ColumnarSequenceBounds {
+    pub fn contains(&self, sequence: SequenceNumber) -> bool {
+        self.min_sequence <= sequence && sequence <= self.max_sequence
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarV2GranuleRef {
+    pub granule_index: u32,
+    pub first_key: Key,
+    pub row_range: ByteRange,
+    pub page_range: ByteRange,
+    pub sequence_bounds: ColumnarSequenceBounds,
+    pub has_tombstones: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnarV2PageRef {
+    pub granule_index: u32,
     pub substream_ordinal: u32,
     pub page_ordinal: u32,
+    pub first_key: Key,
     pub range: ByteRange,
     pub row_range: ByteRange,
+    pub sequence_bounds: ColumnarSequenceBounds,
+    pub has_tombstones: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnarV2PageDirectory {
+    pub granules: Vec<ColumnarV2GranuleRef>,
     pub pages: Vec<ColumnarV2PageRef>,
 }
 
@@ -320,6 +347,236 @@ pub struct ColumnarV2Footer {
     pub synopsis: ColumnarSynopsisSidecar,
     pub optional_sidecars: Vec<ColumnarOptionalSidecar>,
     pub digests: Vec<CompactPartDigest>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridKeyRange {
+    pub start_inclusive: Option<Key>,
+    pub end_exclusive: Option<Key>,
+}
+
+impl HybridKeyRange {
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    pub fn contains(&self, key: &[u8]) -> bool {
+        if self
+            .start_inclusive
+            .as_deref()
+            .is_some_and(|start| key < start)
+        {
+            return false;
+        }
+        if self.end_exclusive.as_deref().is_some_and(|end| key >= end) {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ZoneMapPredicate {
+    AlwaysTrue,
+    FieldEquals {
+        field_id: FieldId,
+        value: FieldValue,
+    },
+    Int64AtLeast {
+        field_id: FieldId,
+        value: i64,
+    },
+    BoolEquals {
+        field_id: FieldId,
+        value: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarGranuleSelection {
+    pub granule: ColumnarV2GranuleRef,
+    pub pages: Vec<ColumnarV2PageRef>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarPruningStats {
+    pub inspected_granules: usize,
+    pub inspected_pages: usize,
+    pub skipped_by_key_range: usize,
+    pub skipped_by_zone_map: usize,
+    pub selected_row_upper_bound: u64,
+    pub overread_row_upper_bound: u64,
+    pub page_pruned_rows: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarPruningOutcome {
+    pub selected: Vec<ColumnarGranuleSelection>,
+    pub stats: ColumnarPruningStats,
+}
+
+pub trait HybridSynopsisPruner: Send + Sync {
+    fn prune(
+        &self,
+        page_directory: &ColumnarV2PageDirectory,
+        synopsis: &ColumnarSynopsisSidecar,
+        key_range: &HybridKeyRange,
+        predicate: &ZoneMapPredicate,
+    ) -> Result<ColumnarPruningOutcome, StorageError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BaseZoneMapPruner;
+
+impl HybridSynopsisPruner for BaseZoneMapPruner {
+    fn prune(
+        &self,
+        page_directory: &ColumnarV2PageDirectory,
+        synopsis: &ColumnarSynopsisSidecar,
+        key_range: &HybridKeyRange,
+        predicate: &ZoneMapPredicate,
+    ) -> Result<ColumnarPruningOutcome, StorageError> {
+        page_directory.prune_with_zone_maps(synopsis, key_range, predicate)
+    }
+}
+
+impl ZoneMapSynopsis {
+    pub fn may_match(&self, predicate: &ZoneMapPredicate) -> bool {
+        match predicate {
+            ZoneMapPredicate::AlwaysTrue => true,
+            ZoneMapPredicate::FieldEquals { field_id, value } => {
+                if &self.field_id != field_id {
+                    return true;
+                }
+                let Some(min) = self.min_value.as_ref() else {
+                    return false;
+                };
+                let Some(max) = self.max_value.as_ref() else {
+                    return false;
+                };
+                !field_value_lt(value, min) && !field_value_gt(value, max)
+            }
+            ZoneMapPredicate::Int64AtLeast { field_id, value } => {
+                if &self.field_id != field_id {
+                    return true;
+                }
+                match self.max_value.as_ref() {
+                    Some(FieldValue::Int64(max)) => max >= value,
+                    Some(_) => true,
+                    None => false,
+                }
+            }
+            ZoneMapPredicate::BoolEquals { field_id, value } => {
+                if &self.field_id != field_id {
+                    return true;
+                }
+                let Some(min) = self.min_value.as_ref() else {
+                    return false;
+                };
+                let Some(max) = self.max_value.as_ref() else {
+                    return false;
+                };
+                let expected = FieldValue::Bool(*value);
+                !field_value_lt(&expected, min) && !field_value_gt(&expected, max)
+            }
+        }
+    }
+}
+
+impl ColumnarSynopsisSidecar {
+    pub fn granule(&self, granule_index: u32) -> Option<&ColumnarGranuleSynopsis> {
+        self.granules
+            .iter()
+            .find(|granule| granule.granule_index == granule_index)
+    }
+}
+
+impl ColumnarV2PageDirectory {
+    pub fn pages_for_granule(&self, granule_index: u32) -> Vec<ColumnarV2PageRef> {
+        self.pages
+            .iter()
+            .filter(|page| page.granule_index == granule_index)
+            .cloned()
+            .collect()
+    }
+
+    pub fn prune_with_zone_maps(
+        &self,
+        synopsis: &ColumnarSynopsisSidecar,
+        key_range: &HybridKeyRange,
+        predicate: &ZoneMapPredicate,
+    ) -> Result<ColumnarPruningOutcome, StorageError> {
+        let mut selected = Vec::new();
+        let mut stats = ColumnarPruningStats::default();
+
+        for (granule_position, granule) in self.granules.iter().enumerate() {
+            stats.inspected_granules += 1;
+            let next_granule_first_key = self
+                .granules
+                .get(granule_position + 1)
+                .map(|next| next.first_key.as_slice());
+            if !key_window_overlaps(
+                granule.first_key.as_slice(),
+                next_granule_first_key,
+                key_range,
+            ) {
+                stats.skipped_by_key_range += 1;
+                continue;
+            }
+
+            let granule_synopsis = synopsis.granule(granule.granule_index).ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "synopsis sidecar is missing granule {}",
+                    granule.granule_index
+                ))
+            })?;
+            if !granule_synopsis
+                .zone_maps
+                .iter()
+                .all(|zone_map| zone_map.may_match(predicate))
+            {
+                stats.skipped_by_zone_map += 1;
+                continue;
+            }
+
+            let pages = self.pages_for_granule(granule.granule_index);
+            let mut selected_pages = Vec::new();
+            for (page_position, page) in pages.iter().enumerate() {
+                stats.inspected_pages += 1;
+                let next_page_first_key = pages
+                    .get(page_position + 1)
+                    .map(|next| next.first_key.as_slice())
+                    .or(next_granule_first_key);
+                if key_window_overlaps(page.first_key.as_slice(), next_page_first_key, key_range) {
+                    stats.selected_row_upper_bound = stats
+                        .selected_row_upper_bound
+                        .saturating_add(page.row_range.len());
+                    selected_pages.push(page.clone());
+                }
+            }
+            if selected_pages.is_empty() {
+                stats.skipped_by_key_range += 1;
+                continue;
+            }
+
+            let selected_rows = selected_pages
+                .iter()
+                .map(|page| page.row_range.len())
+                .sum::<u64>();
+            let granule_rows = granule.row_range.len();
+            stats.overread_row_upper_bound =
+                stats.overread_row_upper_bound.saturating_add(selected_rows);
+            stats.page_pruned_rows = stats
+                .page_pruned_rows
+                .saturating_add(granule_rows.saturating_sub(selected_rows));
+            selected.push(ColumnarGranuleSelection {
+                granule: granule.clone(),
+                pages: selected_pages,
+            });
+        }
+
+        Ok(ColumnarPruningOutcome { selected, stats })
+    }
 }
 
 #[async_trait]
@@ -354,6 +611,43 @@ pub struct HybridRowRef {
 pub enum RowProjection {
     FullRow,
     Fields(Vec<FieldId>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LateMaterializationPlan {
+    pub predicate_projection: RowProjection,
+    pub final_projection: RowProjection,
+    pub late_projection: RowProjection,
+}
+
+impl LateMaterializationPlan {
+    pub fn new(predicate_projection: RowProjection, final_projection: RowProjection) -> Self {
+        let late_projection = match (&predicate_projection, &final_projection) {
+            (RowProjection::FullRow, RowProjection::Fields(_)) => RowProjection::Fields(Vec::new()),
+            (_, RowProjection::FullRow) => RowProjection::FullRow,
+            (RowProjection::Fields(predicate_fields), RowProjection::Fields(final_fields)) => {
+                RowProjection::Fields(
+                    final_fields
+                        .iter()
+                        .copied()
+                        .filter(|field_id| !predicate_fields.contains(field_id))
+                        .collect(),
+                )
+            }
+        };
+        Self {
+            predicate_projection,
+            final_projection,
+            late_projection,
+        }
+    }
+
+    pub fn needs_late_materialization(&self) -> bool {
+        match &self.late_projection {
+            RowProjection::FullRow => true,
+            RowProjection::Fields(fields) => !fields.is_empty(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +686,17 @@ impl SelectionMask {
 
     pub fn is_selected(&self, position: usize) -> bool {
         self.selected.get(position).copied().unwrap_or(false)
+    }
+
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Result<Self, StorageError> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(StorageError::unsupported(
+                "selection mask slice must stay within bounds",
+            ));
+        }
+        Ok(Self {
+            selected: self.selected[range].to_vec(),
+        })
     }
 
     pub fn intersect(&self, other: &Self) -> Result<Self, StorageError> {
@@ -454,6 +759,35 @@ impl RowRefBatch {
             selection,
             survivors,
         })
+    }
+
+    pub fn apply_selection(&self, selection: &SelectionMask) -> Result<Self, StorageError> {
+        Self::new(
+            self.rows.clone(),
+            self.projection.clone(),
+            Some(self.selection.intersect(selection)?),
+        )
+    }
+
+    pub fn survivor_rows(&self) -> Vec<HybridRowRef> {
+        self.survivors
+            .row_positions
+            .iter()
+            .filter_map(|index| self.rows.get(*index).cloned())
+            .collect()
+    }
+
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Result<Self, StorageError> {
+        if range.start > range.end || range.end > self.rows.len() {
+            return Err(StorageError::unsupported(
+                "row-ref batch slice must stay within bounds",
+            ));
+        }
+        Self::new(
+            self.rows[range.clone()].to_vec(),
+            self.projection.clone(),
+            Some(self.selection.slice(range)?),
+        )
     }
 }
 
@@ -634,8 +968,23 @@ impl VecRowRefBatchIterator {
 
 #[async_trait]
 impl RowRefBatchIterator for VecRowRefBatchIterator {
-    async fn next_batch(&mut self, _max_rows: usize) -> Result<Option<RowRefBatch>, StorageError> {
-        Ok(self.batches.pop_front())
+    async fn next_batch(&mut self, max_rows: usize) -> Result<Option<RowRefBatch>, StorageError> {
+        if max_rows == 0 {
+            return Err(StorageError::unsupported(
+                "row-ref batch iterator max_rows must be greater than zero",
+            ));
+        }
+        let Some(batch) = self.batches.pop_front() else {
+            return Ok(None);
+        };
+        if batch.rows.len() <= max_rows {
+            return Ok(Some(batch));
+        }
+
+        let head = batch.slice(0..max_rows)?;
+        let tail = batch.slice(max_rows..batch.rows.len())?;
+        self.batches.push_front(tail);
+        Ok(Some(head))
     }
 }
 
@@ -744,6 +1093,48 @@ impl CompactToWidePromotionPolicy for ConservativeCompactToWidePolicy {
     }
 }
 
+fn key_window_overlaps(
+    first_key: &[u8],
+    next_first_key: Option<&[u8]>,
+    key_range: &HybridKeyRange,
+) -> bool {
+    if key_range
+        .end_exclusive
+        .as_deref()
+        .is_some_and(|end| first_key >= end)
+    {
+        return false;
+    }
+    if let Some(start) = key_range.start_inclusive.as_deref()
+        && next_first_key.is_some_and(|next| next <= start)
+    {
+        return false;
+    }
+    true
+}
+
+fn field_value_lt(left: &FieldValue, right: &FieldValue) -> bool {
+    match (left, right) {
+        (FieldValue::Int64(left), FieldValue::Int64(right)) => left < right,
+        (FieldValue::Float64(left), FieldValue::Float64(right)) => left < right,
+        (FieldValue::String(left), FieldValue::String(right)) => left < right,
+        (FieldValue::Bytes(left), FieldValue::Bytes(right)) => left < right,
+        (FieldValue::Bool(left), FieldValue::Bool(right)) => left < right,
+        _ => false,
+    }
+}
+
+fn field_value_gt(left: &FieldValue, right: &FieldValue) -> bool {
+    match (left, right) {
+        (FieldValue::Int64(left), FieldValue::Int64(right)) => left > right,
+        (FieldValue::Float64(left), FieldValue::Float64(right)) => left > right,
+        (FieldValue::String(left), FieldValue::String(right)) => left > right,
+        (FieldValue::Bytes(left), FieldValue::Bytes(right)) => left > right,
+        (FieldValue::Bool(left), FieldValue::Bool(right)) => left > right,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -834,6 +1225,35 @@ mod tests {
         }
     }
 
+    fn sample_page_directory() -> ColumnarV2PageDirectory {
+        ColumnarV2PageDirectory {
+            granules: vec![ColumnarV2GranuleRef {
+                granule_index: 0,
+                first_key: b"user:1".to_vec(),
+                row_range: ByteRange::new(0, 2),
+                page_range: ByteRange::new(0, 1),
+                sequence_bounds: ColumnarSequenceBounds {
+                    min_sequence: SequenceNumber::new(1),
+                    max_sequence: SequenceNumber::new(2),
+                },
+                has_tombstones: false,
+            }],
+            pages: vec![ColumnarV2PageRef {
+                granule_index: 0,
+                substream_ordinal: 0,
+                page_ordinal: 0,
+                first_key: b"user:1".to_vec(),
+                range: ByteRange::new(8, 32),
+                row_range: ByteRange::new(0, 2),
+                sequence_bounds: ColumnarSequenceBounds {
+                    min_sequence: SequenceNumber::new(1),
+                    max_sequence: SequenceNumber::new(2),
+                },
+                has_tombstones: false,
+            }],
+        }
+    }
+
     #[test]
     fn hybrid_read_config_requires_bounded_caches_and_base_zone_maps() {
         let mut config = HybridReadConfig::default();
@@ -881,14 +1301,7 @@ mod tests {
         let loader = StubColumnarFooterPageDirectoryLoader::new(
             sample_header(),
             sample_footer(),
-            ColumnarV2PageDirectory {
-                pages: vec![ColumnarV2PageRef {
-                    substream_ordinal: 0,
-                    page_ordinal: 0,
-                    range: ByteRange::new(8, 32),
-                    row_range: ByteRange::new(0, 2),
-                }],
-            },
+            sample_page_directory(),
         );
         let mut iterator = VecRowRefBatchIterator::new([RowRefBatch::new(
             vec![HybridRowRef {
@@ -982,5 +1395,176 @@ mod tests {
         let _ = runtime;
         let _ = Arc::new(StubClock::default());
         let _ = Arc::new(StubRng::seeded(9));
+    }
+
+    #[test]
+    fn page_directory_prunes_granules_with_key_ranges_and_zone_maps() {
+        let page_directory = ColumnarV2PageDirectory {
+            granules: vec![
+                ColumnarV2GranuleRef {
+                    granule_index: 0,
+                    first_key: b"user:1".to_vec(),
+                    row_range: ByteRange::new(0, 2),
+                    page_range: ByteRange::new(0, 1),
+                    sequence_bounds: ColumnarSequenceBounds {
+                        min_sequence: SequenceNumber::new(1),
+                        max_sequence: SequenceNumber::new(2),
+                    },
+                    has_tombstones: false,
+                },
+                ColumnarV2GranuleRef {
+                    granule_index: 1,
+                    first_key: b"user:3".to_vec(),
+                    row_range: ByteRange::new(2, 4),
+                    page_range: ByteRange::new(1, 2),
+                    sequence_bounds: ColumnarSequenceBounds {
+                        min_sequence: SequenceNumber::new(3),
+                        max_sequence: SequenceNumber::new(4),
+                    },
+                    has_tombstones: false,
+                },
+            ],
+            pages: vec![
+                ColumnarV2PageRef {
+                    granule_index: 0,
+                    substream_ordinal: 0,
+                    page_ordinal: 0,
+                    first_key: b"user:1".to_vec(),
+                    range: ByteRange::new(8, 32),
+                    row_range: ByteRange::new(0, 2),
+                    sequence_bounds: ColumnarSequenceBounds {
+                        min_sequence: SequenceNumber::new(1),
+                        max_sequence: SequenceNumber::new(2),
+                    },
+                    has_tombstones: false,
+                },
+                ColumnarV2PageRef {
+                    granule_index: 1,
+                    substream_ordinal: 0,
+                    page_ordinal: 1,
+                    first_key: b"user:3".to_vec(),
+                    range: ByteRange::new(32, 56),
+                    row_range: ByteRange::new(2, 4),
+                    sequence_bounds: ColumnarSequenceBounds {
+                        min_sequence: SequenceNumber::new(3),
+                        max_sequence: SequenceNumber::new(4),
+                    },
+                    has_tombstones: false,
+                },
+            ],
+        };
+        let synopsis = ColumnarSynopsisSidecar {
+            format_tag: ColumnarV2FormatTag::synopsis_sidecar(),
+            part_local_id: "SST-000777".to_string(),
+            granules: vec![
+                ColumnarGranuleSynopsis {
+                    granule_index: 0,
+                    row_range: ByteRange::new(0, 2),
+                    zone_maps: vec![ZoneMapSynopsis {
+                        field_id: FieldId::new(2),
+                        min_value: Some(FieldValue::Int64(1)),
+                        max_value: Some(FieldValue::Int64(5)),
+                        null_count: 0,
+                    }],
+                },
+                ColumnarGranuleSynopsis {
+                    granule_index: 1,
+                    row_range: ByteRange::new(2, 4),
+                    zone_maps: vec![ZoneMapSynopsis {
+                        field_id: FieldId::new(2),
+                        min_value: Some(FieldValue::Int64(8)),
+                        max_value: Some(FieldValue::Int64(12)),
+                        null_count: 0,
+                    }],
+                },
+            ],
+            checksum: 55,
+        };
+        let outcome = BaseZoneMapPruner
+            .prune(
+                &page_directory,
+                &synopsis,
+                &HybridKeyRange {
+                    start_inclusive: Some(b"user:2".to_vec()),
+                    end_exclusive: Some(b"user:9".to_vec()),
+                },
+                &ZoneMapPredicate::Int64AtLeast {
+                    field_id: FieldId::new(2),
+                    value: 7,
+                },
+            )
+            .expect("prune page directory");
+
+        assert_eq!(outcome.selected.len(), 1);
+        assert_eq!(outcome.selected[0].granule.granule_index, 1);
+        assert_eq!(outcome.selected[0].pages.len(), 1);
+        assert_eq!(outcome.stats.inspected_granules, 2);
+        assert_eq!(outcome.stats.skipped_by_zone_map, 1);
+        assert_eq!(outcome.stats.selected_row_upper_bound, 2);
+        assert_eq!(outcome.stats.page_pruned_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn row_ref_batches_split_apply_predicates_and_plan_late_materialization() {
+        let rows = vec![
+            HybridRowRef {
+                table_id: TableId::new(7),
+                local_id: "SST-000777".to_string(),
+                key: b"user:1".to_vec(),
+                sequence: SequenceNumber::new(1),
+                row_ordinal: 0,
+            },
+            HybridRowRef {
+                table_id: TableId::new(7),
+                local_id: "SST-000777".to_string(),
+                key: b"user:2".to_vec(),
+                sequence: SequenceNumber::new(2),
+                row_ordinal: 1,
+            },
+            HybridRowRef {
+                table_id: TableId::new(7),
+                local_id: "SST-000777".to_string(),
+                key: b"user:3".to_vec(),
+                sequence: SequenceNumber::new(3),
+                row_ordinal: 2,
+            },
+        ];
+        let batch = RowRefBatch::new(
+            rows,
+            RowProjection::Fields(vec![FieldId::new(1), FieldId::new(2), FieldId::new(3)]),
+            None,
+        )
+        .expect("batch");
+        let plan = LateMaterializationPlan::new(
+            RowProjection::Fields(vec![FieldId::new(2)]),
+            batch.projection.clone(),
+        );
+        let filtered = batch
+            .apply_selection(&SelectionMask::from_selected_positions(3, &[1, 2]))
+            .expect("apply predicate selection");
+        let mut iterator = VecRowRefBatchIterator::new([filtered.clone()]);
+
+        let head = iterator
+            .next_batch(2)
+            .await
+            .expect("first split")
+            .expect("head batch");
+        let tail = iterator
+            .next_batch(2)
+            .await
+            .expect("second split")
+            .expect("tail batch");
+
+        assert!(plan.needs_late_materialization());
+        assert_eq!(
+            plan.late_projection,
+            RowProjection::Fields(vec![FieldId::new(1), FieldId::new(3)])
+        );
+        assert_eq!(head.rows.len(), 2);
+        assert_eq!(head.survivor_rows().len(), 1);
+        assert_eq!(head.survivor_rows()[0].key, b"user:2".to_vec());
+        assert_eq!(tail.rows.len(), 1);
+        assert_eq!(tail.survivor_rows().len(), 1);
+        assert_eq!(tail.survivor_rows()[0].key, b"user:3".to_vec());
     }
 }
