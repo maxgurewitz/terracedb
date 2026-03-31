@@ -464,6 +464,14 @@ pub fn execution_lane_name(lane: ExecutionLane) -> &'static str {
     }
 }
 
+fn execution_lane_domain_segment(lane: ExecutionLane) -> &'static str {
+    match lane {
+        ExecutionLane::UserForeground => "foreground",
+        ExecutionLane::UserBackground => "background",
+        ExecutionLane::ControlPlane => "control",
+    }
+}
+
 pub fn durability_class_metadata_value(durability_class: &DurabilityClass) -> String {
     match durability_class {
         DurabilityClass::UserData => "user-data".to_string(),
@@ -800,6 +808,64 @@ pub struct ColocatedDatabasePlacement {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Canonical shard-ready namespace rules for one colocated database.
+///
+/// The current shard-ready profile still runs the database through one set of
+/// database-wide foreground/background/control domains. The nested
+/// `future_shard_namespace` is reserved so later physical shards can slot into
+/// the hierarchy without changing how the database-level placement tree is
+/// named.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardReadyPlacementLayout {
+    pub database: String,
+    pub database_root: ExecutionDomainPath,
+    pub future_shard_namespace: ExecutionDomainPath,
+}
+
+impl ShardReadyPlacementLayout {
+    pub fn new(database: impl Into<String>) -> Self {
+        let database = database.into();
+        let database_root = ExecutionDomainPath::new(["process", "shards", database.as_str()]);
+        let future_shard_namespace = database_root.child("shards");
+        Self {
+            database,
+            database_root,
+            future_shard_namespace,
+        }
+    }
+
+    pub fn database_lane_path(&self, lane: ExecutionLane) -> ExecutionDomainPath {
+        self.database_root
+            .child(execution_lane_domain_segment(lane))
+    }
+
+    pub fn future_shard_root(&self, shard: impl AsRef<str>) -> ExecutionDomainPath {
+        self.future_shard_namespace.child(shard.as_ref())
+    }
+
+    pub fn future_shard_lane_path(
+        &self,
+        shard: impl AsRef<str>,
+        lane: ExecutionLane,
+    ) -> ExecutionDomainPath {
+        self.future_shard_root(shard)
+            .child(execution_lane_domain_segment(lane))
+    }
+
+    pub fn database_owner(&self) -> ExecutionDomainOwner {
+        ExecutionDomainOwner::Database {
+            name: self.database.clone(),
+        }
+    }
+
+    pub fn shard_owner(&self, shard: impl Into<String>) -> ExecutionDomainOwner {
+        ExecutionDomainOwner::Shard {
+            database: self.database.clone(),
+            shard: shard.into(),
+        }
+    }
+}
+
 impl ColocatedDatabasePlacement {
     pub fn new(
         name: impl Into<String>,
@@ -850,20 +916,19 @@ impl ColocatedDatabasePlacement {
     }
 
     pub fn shard_ready(name: impl Into<String>) -> Self {
-        let name = name.into();
-        let root = ExecutionDomainPath::new(["process", "shards", name.as_str()]);
+        let layout = ShardReadyPlacementLayout::new(name.into());
         let mut placement = Self::new(
-            name,
+            layout.database.clone(),
             ExecutionLanePlacementConfig::shared(
-                root.child("foreground"),
+                layout.database_lane_path(ExecutionLane::UserForeground),
                 DurabilityClass::UserData,
             ),
             ExecutionLanePlacementConfig::shared(
-                root.child("background"),
+                layout.database_lane_path(ExecutionLane::UserBackground),
                 DurabilityClass::UserData,
             ),
             ExecutionLanePlacementConfig::reserved(
-                root.child("control"),
+                layout.database_lane_path(ExecutionLane::ControlPlane),
                 DurabilityClass::ControlPlane,
                 reserved_control_plane_budget(),
             ),
@@ -871,6 +936,14 @@ impl ColocatedDatabasePlacement {
         placement.metadata.insert(
             "terracedb.execution.layout".to_string(),
             "shard-ready".to_string(),
+        );
+        placement.metadata.insert(
+            "terracedb.execution.future_shard_namespace".to_string(),
+            layout.future_shard_namespace.as_string(),
+        );
+        placement.metadata.insert(
+            "terracedb.execution.physical_sharding".to_string(),
+            "not-enabled".to_string(),
         );
         placement
     }
@@ -2108,25 +2181,21 @@ impl ResourceManager for InMemoryResourceManager {
         let (snapshot, event) = {
             let mut domains = self.domains.lock();
             Self::ensure_record(&mut domains, &spec.path);
-            let event = if domains
-                .get(&spec.path)
-                .is_some_and(|record| record.explicit)
-            {
+            let path = spec.path.clone();
+            let event = if domains.get(&path).is_some_and(|record| record.explicit) {
                 ExecutionDomainLifecycleEvent::Updated
             } else {
                 ExecutionDomainLifecycleEvent::Registered
             };
             let entry = domains
-                .get_mut(&spec.path)
+                .get_mut(&path)
                 .expect("domain must exist after ensuring hierarchy");
-            entry.spec = if entry.explicit {
-                Self::merge_spec(entry.spec.clone(), spec)
-            } else {
-                spec
-            };
+            // `update_domain` is a true reconfiguration seam. It replaces the
+            // explicit contract while preserving the live counters attached to
+            // the domain path.
+            entry.spec = spec;
             entry.state = ExecutionDomainState::Active;
             entry.explicit = true;
-            let path = entry.spec.path.clone();
             let snapshot = self.domain_snapshot_locked(&domains, &path);
             (snapshot, event)
         };

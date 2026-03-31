@@ -1349,6 +1349,8 @@ This means a host can move a DB or subsystem between shared and reserved executi
 2. Open each DB with `Db::builder().colocated_database(&deployment, "...")`.
 3. Inspect runtime decisions through `deployment.report()` or `db.execution_placement_report()`.
 
+The `shard_ready` preset is deliberately conservative. Today it places the DB in database-wide lanes such as `process/shards/orders/foreground`, `process/shards/orders/background`, and `process/shards/orders/control`, while reserving the nested namespace `process/shards/orders/shards/<physical-shard>/...` for future shard-local lanes. This makes the placement tree shard-ready without claiming that per-table physical sharding, shard maps, or shard-local storage ownership already exist.
+
 ### Engine Responsibilities
 
 The engine:
@@ -1517,7 +1519,7 @@ Physical per-table sharding — where a table gets independent memtables, commit
 
 3. **WriteBatch shard grouping.** The commit path resolves each entry's target shard (always 0 today) and groups entries by `(table, shard)` before acquiring the mutex. When physical sharding is added, the commit path can validate that no batch spans multiple shards of the same sharded table — a one-line check on an already-computed grouping.
 
-4. **Execution-domain hierarchy already separates placement from correctness.** A future physical shard can slot into the existing domain tree as another workload unit (for example `db.orders.shard_3.foreground`) without redefining commit semantics or resource-isolation concepts. Domains provide the placement/budgeting foundation for shard-local foreground, background, and control-plane work, but they are not themselves physical sharding.
+4. **Execution-domain hierarchy already separates placement from correctness.** A future physical shard can slot into the existing shard-ready tree as another workload unit (for example `process/shards/orders/shards/0003/foreground`) without redefining commit semantics or resource-isolation concepts. Domains provide the placement/budgeting foundation for shard-local foreground, background, and control-plane work, but they are not themselves physical sharding and do not define logical shard ownership.
 
 When physical sharding is implemented, it will be opt-in per table via `TableConfig`. Unsharded tables continue to work exactly as today. Cross-shard `WriteBatch` operations on a sharded table will be rejected at commit time, enforcing the single-writer-per-entity discipline that is currently an application convention.
 
