@@ -6,7 +6,7 @@ An embedded database library (not a server) built on LSM tree fundamentals. The 
 
 All I/O, time, and randomness are abstracted behind traits, enabling deterministic simulation testing in the style of FoundationDB. The engine is verified via large-scale randomized scenario generation with fault injection and invariant checking, reproducible from a seed.
 
-Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, embedded virtual filesystems, and out-of-line blob storage — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), embedded virtual filesystem library (Part 5), and the `terracedb-bricks` blob/large-object library (Part 6).
+Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, external stream ingress from systems such as Kafka and Debezium, embedded virtual filesystems, and out-of-line blob storage — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), embedded virtual filesystem library (Part 5), and the `terracedb-bricks` blob/large-object library (Part 6).
 
 When multiple DB instances, future physical shards, or attached subsystems share one process, resource isolation is expressed through **execution domains**. An execution domain is a named placement and budgeting boundary for CPU, memory, local I/O, remote I/O, and background work. Domains affect where work runs and what it may consume, but they do not change correctness semantics such as commit ordering, visibility, durability, or recovery. A unit of work may carry both an execution domain and a **durability class**; domains control resource isolation, while durability classes control persistence-path semantics.
 
@@ -21,10 +21,13 @@ These are the architectural choices that most constrain the rest of the design:
 - **Colocated derived state is synchronous** (one `WriteBatch`). Cross-entity derived state is asynchronous via `scanSince` with notification-driven consistency (`subscribe` + `waitForWatermark`).
 - **Projections are deterministic state updaters with read access.** They declare output writes; they do not cause side effects or commit their own batches.
 - **Workflows are stateful orchestrators with side effects.** They use the outbox pattern for at-least-once external delivery and durable timers for scheduling.
+- **Historical workflow processing is configurable.** A workflow source may bootstrap from the beginning, from the current durable frontier, or from restored checkpoint/replay state; running a workflow "from the start" is not mandatory.
+- **External stream ingress is a library boundary, not an engine feature.** Kafka consumers persist source progress atomically with writes into ordinary Terracedb tables; Debezium support composes on top of Kafka ingress rather than extending the engine.
 - **Embedded virtual filesystems are libraries, not engine modes.** Their current-state filesystem/KV/tool rows live in ordinary tables; timelines and watchers are layered on top of append-only activity rows and change capture.
 - **Blob and large-object storage are libraries, not engine value variants.** Large bytes live out-of-line in a blob store; Terracedb stores metadata, references, and derived indexes.
 - **Virtual filesystem compatibility is semantic, not SQLite-format compatibility.** The goal is to provide an in-process virtual filesystem/KV/tool model on Terracedb, not SQL, a single-file transport format, or SQLite WAL behavior.
 - **Event sourcing is recommended** for data that drives history-dependent projections. Mutable-record projections cannot be safely recomputed from SSTables after `SnapshotTooOld`.
+- **Append-only ordered source tables are the replay surface for external CDC.** For Kafka-partitioned or Debezium-derived histories, deterministic replay order must be encoded in the Terracedb source keys and table layout; current-state mirrors are convenience read surfaces, not substitutes for replayable history.
 - **Execution domains are resource-isolation boundaries, not correctness boundaries.** A unit of work may be assigned both an execution domain and a durability class. Domains control placement and budgets; durability classes control persistence-path semantics. Changing domains may affect latency, throughput, and backlog behavior, but not logical outcomes.
 - **Control-plane work may use a protected domain and internal durability lane.** Catalog, manifest, schema, cursor, and other recovery-critical metadata must be able to make progress even under sustained user-data load.
 - **Tokio is the sole runtime.** io_uring is an optional backend optimization behind the `FileSystem` trait, not a semantic requirement.
@@ -2300,6 +2303,140 @@ The business write and the outbox entry are atomic (same `WriteBatch`). The exte
 
 ---
 
+## External Stream Ingress (Kafka)
+
+Kafka support should be provided by a **separate library** layered above the DB, not by extending the engine. The library consumes Kafka partitions, decodes records, writes them into ordinary Terracedb tables, and persists Kafka progress in the **same OCC unit** as those writes.
+
+```typescript
+interface KafkaIngressDefinition {
+  consumerGroup: string
+  sources: KafkaPartitionSource[]
+  filter?: KafkaRecordFilter
+  handler: KafkaIngressHandler
+}
+
+interface KafkaPartitionSource {
+  topic: string
+  partition: number
+  bootstrap: "earliest" | "latest"
+}
+
+interface KafkaIngressHandler {
+  apply(records: KafkaRecord[], tx: Transaction): Promise<void>
+}
+
+interface KafkaRecordFilter {
+  keep(record: KafkaRecord): boolean
+}
+```
+
+The critical correctness rule mirrors workflow source admission: **materialized writes and Kafka progress must commit together**. If the process crashes before commit, neither the Terracedb tables nor the Kafka offset advance is visible. If the commit succeeds, both are durably recoverable according to the selected storage mode.
+
+```typescript
+async function admitKafkaBatch(db: DB, source: KafkaPartitionSource, records: KafkaRecord[]) {
+  const tx = await Transaction.begin(db)
+
+  let nextOffset = loadPersistedOffset(source)
+  for (const record of records) {
+    await handler.apply([record], tx)
+    nextOffset = record.offset + 1
+  }
+
+  tx.write(kafkaOffsetTable, kafkaOffsetKey(source.topic, source.partition), encodeOffset(nextOffset))
+  await tx.commit({ flush: false })
+}
+```
+
+The persisted source-progress table is conceptually the Kafka counterpart of a durable `LogCursor` store:
+
+- one row per `(topic, partition)`,
+- loaded on restart before resuming consumption,
+- advanced only in the same commit as the materialized DB writes.
+
+Kafka ingress may also apply a **deterministic filter** before materialization. This is important when the upstream stream is much larger than the subset Terracedb should retain. The filter must be pure with respect to the consumed record and configuration; replay cannot depend on ambient time or external lookups.
+
+If a record is filtered out, Kafka progress still advances past it. In other words, filtered records are treated as intentionally ignored input, not as retriable failures. This makes filtering operationally practical for large streams, but it also means filtered records do not exist in Terracedb history unless a broader upstream or parallel materialization retains them elsewhere.
+
+**Ordering model:** Kafka partitions are the unit of authoritative order. If downstream replay depends on record order, the Terracedb materialization must preserve that partition-local order in user keys and table layout. Kafka does not provide a global total order across partitions, and Terracedb should not invent one.
+
+Two table layouts are natural:
+
+- **One Terracedb source table per Kafka partition.** This maps cleanly onto the existing projection/workflow runtimes, which already track one cursor per source table.
+- **One shared Terracedb table keyed by `(partition, offset)`.** This can work for current-state materializations or bespoke consumers, but replay-sensitive projections and workflows still need to reason in terms of per-partition ordering.
+
+External consumers above Kafka ingress use the resulting Terracedb tables just like any other source table. The projection and workflow libraries do **not** read Kafka directly.
+
+---
+
+## Debezium CDC on Kafka
+
+Debezium support should be a second library layered on top of Kafka ingress. The Kafka layer provides durable source-progress management and batched transactional apply; the Debezium layer is responsible for decoding connector envelopes, transaction metadata, tombstones, and snapshot markers, then materializing one or more Terracedb tables.
+
+Because Debezium is commonly attached to very large databases, filtering should be a **first-class concern** of the library. The intended model is:
+
+- **table/schema selection** at the connector or topic-routing layer, so unwanted tables are never materialized into Terracedb,
+- **deterministic row filtering** over the normalized Debezium event, so Terracedb can keep only the relevant subset of rows from the selected tables, and
+- optional **column projection/redaction** before writing Terracedb values, when the application needs only part of each row.
+
+Row filtering should be expressed over deterministic event fields such as:
+
+- connector/schema/table identity,
+- primary key,
+- operation kind,
+- snapshot marker,
+- `before`/`after` row values, and
+- connector-provided source metadata.
+
+For example, an application might ingest only:
+
+- the `public.orders` and `public.refunds` tables from a much larger commerce database,
+- only rows whose `tenant_id` is in an allowlist, or
+- only rows whose `region == "west"` and `priority == "expedited"`.
+
+For a relational source such as PostgreSQL, Debezium materialization should support three modes:
+
+| Mode | Terracedb tables | Best for | Trade-off |
+|---|---|---|---|
+| **EventLog** | append-only `*_cdc` tables keyed by deterministic replay order | history-sensitive projections, historical workflow bootstrap/replay, audit | highest storage and write amplification |
+| **Mirror** | PK-keyed `*_current` tables containing latest state | current-state queries and indexes | not sufficient as the only source for history-dependent replay/rebuild |
+| **Hybrid** | both `*_cdc` and `*_current`, written atomically | most production deployments | more space than mirror-only, but preserves replayable history |
+
+In **EventLog** mode, the Debezium row becomes a Terracedb append-only event. The key must encode the replay order the downstream consumer depends on. In practice, that usually means one table per Kafka partition with keys ordered by Kafka offset, or an equivalent partition-local ordering scheme explicitly encoded in the key. This is the correct source for:
+
+- history-sensitive projections,
+- workflow sources configured for historical bootstrap or replay,
+- transition detection,
+- audit/debug timelines, and
+- any future rebuild path that scans source SSTables rather than the commit log.
+
+In **Mirror** mode, Terracedb stores only the latest source row keyed by the relational primary key. Deletes remove the row or store a tombstone according to the selected materialization policy. This is space-efficient and query-friendly, but it intentionally gives up replayable mutation history. Mirror mode is therefore appropriate for:
+
+- read models that depend only on latest state,
+- point lookups and secondary indexes over current rows, and
+- applications that explicitly choose live-only workflow attachment rather than historical replay.
+
+In **Hybrid** mode, the ingress library writes both materializations and the Kafka/Debezium source-progress update in the same transaction. The append-only table is the **semantic source of truth**; the mirror is a convenience query surface.
+
+Filtering interacts with these modes in an important way:
+
+- in **filtered ingestion** mode, Terracedb stores only the selected subset, which is efficient for very large upstream databases,
+- in **full-fidelity** mode, Terracedb stores the whole selected upstream table history and derives narrower views later, and
+- in either case, if a row is filtered out before EventLog materialization, it is absent from Terracedb replay history as well as from current-state mirrors.
+
+For mirror/current-state materializations, row filtering must account for **membership transitions**. If a row previously matched the filter and now no longer does, the mirror should remove it rather than leave stale state behind.
+
+**Interaction with projections:** projections consume Debezium-derived Terracedb tables exactly like any other source table. History-dependent projections should read from append-only `*_cdc` tables. Current-state read models may read from `*_current` mirrors. When the source is Kafka-partitioned, a projection should usually declare one source table per partition and rely on the normal multi-source frontier rules rather than assuming a hidden global order.
+
+**Interaction with workflows:** workflows should generally not execute side effects directly from raw Debezium bootstrap snapshots unless that behavior is explicitly configured. A common pattern is:
+
+1. ingest Debezium into append-only `*_cdc` tables,
+2. use projections to derive higher-level transition tables or semantic events,
+3. route workflows from those transition tables rather than directly from raw row-level CDC.
+
+When a workflow does consume Debezium-derived sources directly, historical bootstrap/replay is only sound from append-only ordered `*_cdc` tables. Mirror tables are compatible with live-only attachment, but not with general replay after history loss.
+
+---
+
 ## Data Modeling: Event Sourcing
 
 This section describes a data modeling approach — not an engine feature — that significantly affects how projections (Part 3) and workflows (Part 4) behave, particularly during recomputation and recovery.
@@ -2448,6 +2585,22 @@ On `start()`, the library:
 3. Subscribes to the source tables via `db.subscribeDurable(table)`.
 4. On each notification, treats the notified table as a wake hint: it drains that source first, then continues probing/draining until the projection is quiescent again.
 5. Advances the projection's `WatermarkTracker` as source-sequence batches are committed, resolving any pending `waitForWatermark` futures.
+
+---
+
+## External CDC Sources
+
+The projection library consumes **Terracedb tables**, not Kafka topics directly. External stream systems such as Kafka and Debezium must first be materialized into ordinary source tables by ingress libraries from Part 2.
+
+For Debezium-derived sources, the intended mapping is:
+
+- use append-only ordered `*_cdc` tables for history-sensitive projections, replayable aggregations, transition detection, and any rebuild path that must survive `SnapshotTooOld`,
+- use current-state `*_current` mirrors for read models that depend only on latest state, and
+- in hybrid mode, treat the append-only table as the semantic source of truth and the mirror as a convenience/query surface.
+
+When ingress applies schema/table or row filtering before materialization, projections and workflows see only that retained subset. This is often the right trade-off for large upstream databases, but it should be an explicit choice: filtering before `*_cdc` materialization reduces Terracedb storage and fanout at the cost of losing the filtered-out portion of replay history inside Terracedb.
+
+When Kafka partitions are materialized as separate Terracedb tables, each partition naturally becomes one projection source. Deterministic replay then follows the ordinary multi-source frontier semantics of this Part: Terracedb preserves per-source order and records a vector frontier, but it does not impose a hidden total order across independent partitions.
 
 ---
 
@@ -3230,6 +3383,70 @@ Event and timer admission use `tx.commit({ flush: false })` intentionally. Atomi
 
 ---
 
+## Historical Source Processing
+
+Running a workflow from source history is optional. A workflow source should be configured with:
+
+- a **bootstrap policy** used when no persisted source progress exists yet, and
+- a **recovery policy** used when persisted source progress can no longer be resumed, for example after `SnapshotTooOld`.
+
+```typescript
+type WorkflowSourceBootstrap =
+  | { kind: "beginning" }
+  | { kind: "current-durable" }
+  | { kind: "checkpoint-or-beginning" }
+  | { kind: "checkpoint-or-current-durable" }
+
+type WorkflowSourceRecovery =
+  | { kind: "fail-closed" }
+  | { kind: "restore-checkpoint" }
+  | { kind: "restore-checkpoint-or-fast-forward" }
+  | { kind: "replay-from-history" }
+  | { kind: "fast-forward-to-current-durable" }
+
+interface WorkflowSourceConfig {
+  table: Table
+  bootstrap: WorkflowSourceBootstrap
+  recovery: WorkflowSourceRecovery
+}
+```
+
+The key distinction is:
+
+- **bootstrap** answers "what should this workflow do the first time it is attached to a source?"
+- **recovery** answers "what should this workflow do if its previously persisted source progress is no longer resumable?"
+
+Bootstrap policies:
+
+- **`beginning`**: start from the earliest retained source history. This is the authoritative historical catch-up mode.
+- **`current-durable`**: seed source progress at the table's current durable frontier and admit only future changes. This is a live-only attach mode for workflows that should not process historical backlog.
+- **`checkpoint-or-*`**: if a previously exported checkpoint exists, restore it; otherwise fall back to the named bootstrap behavior.
+
+Recovery policies:
+
+- **`fail-closed`**: stop the runtime and surface the history-loss error. This is the safest default.
+- **`restore-checkpoint`**: recover workflow-owned state and source progress from a checkpoint, then resume.
+- **`restore-checkpoint-or-fast-forward`**: prefer checkpoint restore, but if no checkpoint exists, explicitly skip missing history by advancing source progress to the current durable frontier.
+- **`replay-from-history`**: rebuild by replaying source history from an append-only ordered source table.
+- **`fast-forward-to-current-durable`**: explicitly skip missing source history and continue from "now." This is intentionally lossy and must be opt-in.
+
+Historical source replay is only sound for **append-only ordered** source tables. Kafka-partitioned Debezium `*_cdc` tables are a good example. Current-state mirror tables are not. More generally, replaying the source table alone is **not** a universal substitute for workflow checkpointing, because workflow correctness may also depend on:
+
+- already admitted inbox rows,
+- callback admissions,
+- durable timers, and
+- outbox entries that have not yet been delivered.
+
+Therefore:
+
+- live-only workflows may use `current-durable` bootstrap and mirror/current-state sources,
+- replay-capable workflows should consume append-only ordered sources such as Debezium event-log tables, and
+- mixed source/timer/callback workflows should pair historical source replay with workflow checkpoints or trigger journaling rather than assuming the source table alone can reconstruct all workflow state.
+
+Regardless of bootstrap policy, restart always resumes **local durable workflow state first**. Existing inbox rows, timer state, and outbox work are drained before the runtime waits for new source notifications. Bootstrap configuration affects source ingestion only; it does not discard already admitted workflow-local durable work.
+
+---
+
 ## Callback-Driven Workflows
 
 Callbacks follow the same durable-admission rule as events, but with one extra requirement: the application must not acknowledge external success until the callback's inbox row is itself durable. The executor still replays from `inboxTable` exactly like other trigger kinds.
@@ -3363,6 +3580,8 @@ On restart, the workflow library:
 5. **Workflow state is already consistent.** Because state transitions, outbox writes, timer updates, and inbox acknowledgement are all in the same `WriteBatch`, there is no partial state to reconcile.
 
 The recovery model is simple because all workflow state lives in DB tables and all state transitions are atomic. There is no in-memory state to reconstruct beyond loading durable cursors and replaying durable inbox/outbox work.
+
+If a persisted source cursor is older than the retained source history, recovery follows the source's configured **recovery policy** rather than always implying a single behavior. Some workflows should fail closed; some should restore from checkpoint; some live-only workflows may explicitly fast-forward to the current durable frontier. Historical replay without checkpoints is only appropriate for replayable append-only ordered sources.
 
 ---
 
