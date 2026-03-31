@@ -36,9 +36,28 @@ impl Db {
             let catalog_location = Self::catalog_location(&config.storage);
             let (tables, next_table_id) =
                 Self::load_tables(&dependencies, &catalog_location).await?;
+            let prior_decoded_cache_enabled = columnar_read_context
+                .decoded_cache_enabled
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            let prior_raw_byte_cache_population_enabled = columnar_read_context
+                .raw_byte_cache_population_enabled
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
             let loaded_manifest =
                 Self::load_local_manifest(&config.storage, &dependencies, &columnar_read_context)
-                    .await?;
+                    .await;
+            columnar_read_context.decoded_cache.clear();
+            columnar_read_context.decoded_cache.reset_stats();
+            columnar_read_context.decoded_cache_enabled.store(
+                prior_decoded_cache_enabled,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            columnar_read_context
+                .raw_byte_cache_population_enabled
+                .store(
+                    prior_raw_byte_cache_population_enabled,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            let loaded_manifest = loaded_manifest?;
             let mut commit_runtime =
                 Self::open_commit_runtime(&config.storage, &dependencies).await?;
             if let CommitLogBackend::Memory(log) = &mut commit_runtime.backend {
@@ -837,6 +856,7 @@ impl Db {
                 hybrid_read.decoded_column_cache_entries,
             ),
             raw_byte_cache_enabled: AtomicBool::new(true),
+            raw_byte_cache_population_enabled: AtomicBool::new(true),
             decoded_cache_enabled: AtomicBool::new(true),
             raw_byte_cache_budget_bytes: hybrid_read.raw_segment_cache_bytes,
             raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState {
@@ -865,6 +885,7 @@ impl Db {
                 config.decoded_column_cache_entries,
             ),
             raw_byte_cache_enabled: AtomicBool::new(false),
+            raw_byte_cache_population_enabled: AtomicBool::new(false),
             decoded_cache_enabled: AtomicBool::new(true),
             raw_byte_cache_budget_bytes: 0,
             raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState::default()),

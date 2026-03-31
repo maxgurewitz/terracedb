@@ -59,7 +59,11 @@ impl ColumnarReadContext {
 
         ColumnarCachePolicy {
             use_raw_byte_cache,
-            populate_raw_byte_cache: use_raw_byte_cache && populate_hot_data,
+            populate_raw_byte_cache: use_raw_byte_cache
+                && populate_hot_data
+                && self
+                    .raw_byte_cache_population_enabled
+                    .load(Ordering::Relaxed),
             use_decoded_cache,
             populate_decoded_cache: use_decoded_cache && populate_hot_data,
         }
