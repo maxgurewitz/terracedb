@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
+rskafka = { version = "0.6.0", default-features = false }
 terracedb = { path = "../.." }
 thiserror = "2.0.17"
 

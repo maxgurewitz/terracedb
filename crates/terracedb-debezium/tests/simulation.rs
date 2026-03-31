@@ -10,9 +10,10 @@ use terracedb::{
 };
 use terracedb_debezium::{
     DebeziumColumnProjection, DebeziumEvent, DebeziumEventLogTables, DebeziumIngressHandler,
-    DebeziumMaterializer, DebeziumMirrorRow, DebeziumMirrorTables, DebeziumPartitionedTableLayout,
-    DebeziumPrimaryKey, DebeziumRowPredicate, DebeziumSourceTable, DebeziumTableFilter,
-    DebeziumWorkflowEventPolicy, PostgresDebeziumDecoder, mirror_workflow_source_config,
+    DebeziumMaterializer, DebeziumMirrorChange, DebeziumMirrorRow, DebeziumMirrorTables,
+    DebeziumPartitionedTableLayout, DebeziumPrimaryKey, DebeziumRowPredicate, DebeziumSourceTable,
+    DebeziumTableFilter, DebeziumWorkflowEventPolicy, PostgresDebeziumDecoder,
+    mirror_workflow_source_config,
 };
 use terracedb_kafka::{
     DeterministicKafkaBroker, DeterministicKafkaFetchResponse, DeterministicKafkaPartitionScript,
@@ -90,12 +91,8 @@ struct MirrorWorkflowHandler;
 #[async_trait]
 impl WorkflowHandler for MirrorWorkflowHandler {
     async fn route_event(&self, entry: &ChangeEntry) -> Result<String, WorkflowHandlerError> {
-        if let Some(value) = &entry.value {
-            let row = DebeziumMirrorRow::from_value(value).map_err(WorkflowHandlerError::new)?;
-            return order_id_from_primary_key(&row.primary_key).map_err(WorkflowHandlerError::new);
-        }
-        let key = DebeziumPrimaryKey::decode(&entry.key).map_err(WorkflowHandlerError::new)?;
-        order_id_from_primary_key(&key).map_err(WorkflowHandlerError::new)
+        let change = DebeziumMirrorChange::decode(entry).map_err(WorkflowHandlerError::new)?;
+        order_id_from_primary_key(change.primary_key()).map_err(WorkflowHandlerError::new)
     }
 
     async fn handle(

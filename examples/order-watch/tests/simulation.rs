@@ -11,7 +11,7 @@ use terracedb::{
 };
 use terracedb_debezium::{
     DebeziumChangeEntry, DebeziumDerivedTransition, DebeziumDerivedTransitionProjection,
-    DebeziumMaterializationMode, DebeziumMirrorRow, DebeziumRowExt, create_layout_tables,
+    DebeziumMaterializationMode, DebeziumMirrorRow, DebeziumRowExt, ensure_layout_tables,
 };
 use terracedb_example_order_watch::{
     ATTENTION_ORDERS_TABLE_NAME, ATTENTION_TRANSITIONS_TABLE_NAME, BACKLOG_ALERT_ORDER_ID,
@@ -33,8 +33,8 @@ use terracedb_projections::{
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_workflows::{
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowHandler, WorkflowHandlerError,
-    WorkflowOutput, WorkflowRuntime, WorkflowSourceAttachMode, WorkflowStateMutation,
-    WorkflowTrigger,
+    WorkflowOutput, WorkflowRuntime, WorkflowSourceAttachMode, WorkflowSourceConfig,
+    WorkflowStateMutation, WorkflowTrigger,
 };
 
 const FULL_SCAN_START: &[u8] = b"";
@@ -620,13 +620,14 @@ fn run_campaign(
                 .await?;
 
             let row_template = row_table_config("template");
-            create_layout_tables(&db, boundary.source_layouts(), &row_template, &row_template)
+            let transitions_config = WorkflowSourceConfig::historical_replayable_source()
+                .prepare_source_table_config(row_table_config(ATTENTION_TRANSITIONS_TABLE_NAME));
+            ensure_layout_tables(&db, boundary.source_layouts(), &row_template, &row_template)
                 .await?;
-            db.create_table(row_table_config(ATTENTION_ORDERS_TABLE_NAME))
+            db.ensure_table(row_table_config(ATTENTION_ORDERS_TABLE_NAME))
                 .await?;
-            db.create_table(row_table_config(ATTENTION_TRANSITIONS_TABLE_NAME))
-                .await?;
-            let progress_table = db.create_table(row_table_config("kafka_progress")).await?;
+            db.ensure_table(transitions_config).await?;
+            let progress_table = db.ensure_table(row_table_config("kafka_progress")).await?;
 
             let progress_store = TableKafkaProgressStore::new(progress_table);
             let attention_orders = boundary.attention_orders_table(&db);
@@ -683,17 +684,12 @@ fn run_campaign(
                 .await?;
             let mut attention_transitions_handle = projection_runtime
                 .start_multi_source(
-                    MultiSourceProjection::new(
-                        "order-watch-attention-transitions",
-                        sources.clone(),
-                        DebeziumDerivedTransitionProjection::new(
-                            attention_transitions.table().clone(),
-                            boundary.attention_row_predicate(),
-                            encode_transition_value,
-                        ),
+                    DebeziumDerivedTransitionProjection::new(
+                        attention_transitions.table().clone(),
+                        boundary.attention_row_predicate(),
+                        encode_transition_value,
                     )
-                    .with_outputs([attention_transitions.table().clone()])
-                    .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+                    .into_multi_source("order-watch-attention-transitions", sources.clone()),
                 )
                 .await?;
 

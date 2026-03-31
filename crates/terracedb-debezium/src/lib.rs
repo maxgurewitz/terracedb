@@ -15,8 +15,8 @@ use terracedb_kafka::{
     KafkaTopicPartition,
 };
 use terracedb_projections::{
-    MultiSourceProjectionHandler, ProjectionContext, ProjectionHandlerError, ProjectionSequenceRun,
-    ProjectionTransaction,
+    MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionHandlerError,
+    ProjectionSequenceRun, ProjectionTransaction, RecomputeStrategy,
 };
 use terracedb_workflows::{WorkflowSource, WorkflowSourceConfig};
 use thiserror::Error;
@@ -71,6 +71,69 @@ pub enum DebeziumSnapshotMarker {
     Last,
     LastInDataCollection,
     Incremental,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DebeziumSnapshotPhase {
+    Initial,
+    Incremental,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DebeziumSnapshotBoundary {
+    Middle,
+    FirstRecordInCollection,
+    LastRecordInCollection,
+    LastRecordInSnapshot,
+}
+
+impl DebeziumSnapshotMarker {
+    pub const fn phase(self) -> DebeziumSnapshotPhase {
+        match self {
+            Self::Initial | Self::First | Self::Last | Self::LastInDataCollection => {
+                DebeziumSnapshotPhase::Initial
+            }
+            Self::Incremental => DebeziumSnapshotPhase::Incremental,
+        }
+    }
+
+    pub const fn boundary(self) -> DebeziumSnapshotBoundary {
+        match self {
+            Self::Initial | Self::Incremental => DebeziumSnapshotBoundary::Middle,
+            Self::First => DebeziumSnapshotBoundary::FirstRecordInCollection,
+            Self::LastInDataCollection => DebeziumSnapshotBoundary::LastRecordInCollection,
+            Self::Last => DebeziumSnapshotBoundary::LastRecordInSnapshot,
+        }
+    }
+
+    pub const fn is_initial(self) -> bool {
+        matches!(self.phase(), DebeziumSnapshotPhase::Initial)
+    }
+
+    pub const fn is_incremental(self) -> bool {
+        matches!(self.phase(), DebeziumSnapshotPhase::Incremental)
+    }
+
+    pub const fn is_boundary(self) -> bool {
+        !matches!(self.boundary(), DebeziumSnapshotBoundary::Middle)
+    }
+
+    pub const fn ends_data_collection(self) -> bool {
+        matches!(
+            self.boundary(),
+            DebeziumSnapshotBoundary::LastRecordInCollection
+                | DebeziumSnapshotBoundary::LastRecordInSnapshot
+        )
+    }
+
+    pub const fn ends_snapshot(self) -> bool {
+        matches!(
+            self.boundary(),
+            DebeziumSnapshotBoundary::LastRecordInSnapshot
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -258,6 +321,19 @@ impl DebeziumEvent {
         self.snapshot.is_some()
     }
 
+    pub fn snapshot_phase(&self) -> Option<DebeziumSnapshotPhase> {
+        self.snapshot.map(DebeziumSnapshotMarker::phase)
+    }
+
+    pub fn snapshot_boundary(&self) -> Option<DebeziumSnapshotBoundary> {
+        self.snapshot.map(DebeziumSnapshotMarker::boundary)
+    }
+
+    pub fn is_incremental_snapshot(&self) -> bool {
+        self.snapshot
+            .is_some_and(DebeziumSnapshotMarker::is_incremental)
+    }
+
     pub fn is_tombstone(&self) -> bool {
         self.kind.is_tombstone()
     }
@@ -416,12 +492,68 @@ impl DebeziumChangeEntry {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DebeziumMirrorChange {
+    Upsert(DebeziumMirrorRow),
+    Delete {
+        primary_key: DebeziumPrimaryKey,
+        sequence: SequenceNumber,
+    },
+}
+
+impl DebeziumMirrorChange {
+    pub fn decode(entry: &ChangeEntry) -> Result<Self, DebeziumMirrorChangeError> {
+        match DebeziumChangeEntry::decode(entry)? {
+            DebeziumChangeEntry::MirrorRow(row) => Ok(Self::Upsert(row)),
+            DebeziumChangeEntry::MirrorDelete {
+                primary_key,
+                sequence,
+            } => Ok(Self::Delete {
+                primary_key,
+                sequence,
+            }),
+            DebeziumChangeEntry::Event(_) => Err(DebeziumMirrorChangeError::UnexpectedEvent),
+        }
+    }
+
+    pub fn primary_key(&self) -> &DebeziumPrimaryKey {
+        match self {
+            Self::Upsert(row) => &row.primary_key,
+            Self::Delete { primary_key, .. } => primary_key,
+        }
+    }
+
+    pub fn kafka_coordinates(&self) -> Option<&DebeziumKafkaCoordinates> {
+        match self {
+            Self::Upsert(row) => Some(&row.kafka),
+            Self::Delete { .. } => None,
+        }
+    }
+
+    pub fn as_row(&self) -> Option<&DebeziumMirrorRow> {
+        match self {
+            Self::Upsert(row) => Some(row),
+            Self::Delete { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DebeziumChangeEntryError {
     #[error(transparent)]
     Codec(#[from] DebeziumCodecError),
     #[error("change entry value does not decode as a Debezium event or mirror row")]
     UnsupportedValue,
+}
+
+#[derive(Debug, Error)]
+pub enum DebeziumMirrorChangeError {
+    #[error(transparent)]
+    ChangeEntry(#[from] DebeziumChangeEntryError),
+    #[error(
+        "change entry decodes as a replayable Debezium event instead of a current-state mirror row"
+    )]
+    UnexpectedEvent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -756,6 +888,24 @@ impl DebeziumPartitionedTableLayout {
         Ok(())
     }
 
+    pub async fn ensure_tables(
+        &self,
+        db: &Db,
+        cdc_config: &TableConfig,
+        current_config: &TableConfig,
+    ) -> Result<(), CreateTableError> {
+        for table_name in self.cdc_table_names() {
+            let mut config = cdc_config.clone();
+            config.name = table_name;
+            db.ensure_table(config).await?;
+        }
+
+        let mut config = current_config.clone();
+        config.name = self.current.clone();
+        db.ensure_table(config).await?;
+        Ok(())
+    }
+
     pub fn projection_sources(&self, db: &Db) -> Vec<Table> {
         self.cdc_partitions
             .values()
@@ -787,6 +937,21 @@ where
 {
     for layout in layouts {
         layout.create_tables(db, cdc_config, current_config).await?;
+    }
+    Ok(())
+}
+
+pub async fn ensure_layout_tables<'a, I>(
+    db: &Db,
+    layouts: I,
+    cdc_config: &TableConfig,
+    current_config: &TableConfig,
+) -> Result<(), CreateTableError>
+where
+    I: IntoIterator<Item = &'a DebeziumPartitionedTableLayout>,
+{
+    for layout in layouts {
+        layout.ensure_tables(db, cdc_config, current_config).await?;
     }
     Ok(())
 }
@@ -1351,6 +1516,17 @@ impl<M> DebeziumDerivedTransitionProjection<M> {
 
     pub fn output(&self) -> &Table {
         &self.output
+    }
+
+    pub fn into_multi_source(
+        self,
+        name: impl Into<String>,
+        sources: Vec<Table>,
+    ) -> MultiSourceProjection<Self> {
+        let output = self.output.clone();
+        MultiSourceProjection::new(name, sources, self)
+            .with_outputs([output])
+            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState)
     }
 
     pub fn with_event_policy(mut self, policy: DebeziumWorkflowEventPolicy) -> Self {

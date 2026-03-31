@@ -4,15 +4,10 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use rskafka::client::{
-    Client, ClientBuilder,
-    partition::{OffsetAt, UnknownTopicHandling},
-};
 use terracedb::{
     ChangeEntry, CompactionStrategy, Db, DbBuilder, DbSettings, S3Location, ScanOptions,
     SequenceNumber, SystemClock, Table, TableConfig, TableFormat, TieredDurabilityMode,
@@ -20,7 +15,7 @@ use terracedb::{
 };
 use terracedb_debezium::{
     DebeziumChangeEntry, DebeziumDerivedTransition, DebeziumDerivedTransitionProjection,
-    DebeziumMaterializationMode, DebeziumMirrorRow, DebeziumRowExt, create_layout_tables,
+    DebeziumMaterializationMode, DebeziumMirrorRow, DebeziumRowExt, ensure_layout_tables,
 };
 use terracedb_example_order_watch::{
     ATTENTION_ORDERS_TABLE_NAME, ATTENTION_TRANSITIONS_TABLE_NAME, BACKLOG_ALERT_ORDER_ID,
@@ -29,10 +24,9 @@ use terracedb_example_order_watch::{
     OrderWatchOrder, OrderWatchSourceProgress, OrderWatchWorkflowMode, SNAPSHOT_WEST_ORDER_ID,
 };
 use terracedb_kafka::{
-    KafkaBootstrapPolicy, KafkaBroker, KafkaFetchedBatch, KafkaOffset, KafkaPartitionClaim,
-    KafkaPartitionSource, KafkaProgressStore, KafkaRecord, KafkaRecordHeader, KeepAllKafkaRecords,
-    NoopKafkaRuntimeObserver, NoopKafkaTelemetrySink, TableKafkaProgressStore,
-    drive_partition_once,
+    KafkaBootstrapPolicy, KafkaBroker, KafkaPartitionClaim, KafkaPartitionSource,
+    KafkaProgressStore, KeepAllKafkaRecords, NoopKafkaRuntimeObserver, NoopKafkaTelemetrySink,
+    RskafkaBroker, TableKafkaProgressStore, drive_partition_once,
 };
 use terracedb_projections::{
     MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionError,
@@ -41,9 +35,9 @@ use terracedb_projections::{
 };
 use terracedb_workflows::{
     WorkflowContext, WorkflowDefinition, WorkflowHandler, WorkflowHandlerError, WorkflowOutput,
-    WorkflowRuntime, WorkflowSourceAttachMode, WorkflowStateMutation, WorkflowTrigger,
+    WorkflowRuntime, WorkflowSourceAttachMode, WorkflowSourceConfig, WorkflowStateMutation,
+    WorkflowTrigger,
 };
-use thiserror::Error;
 
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
@@ -216,184 +210,6 @@ impl WorkflowHandler for AlertWorkflowHandler {
     }
 }
 
-#[derive(Debug, Error)]
-enum RskafkaBrokerError {
-    #[error("bootstrap server list cannot be empty")]
-    EmptyBootstrapServers,
-    #[error("kafka client request failed: {source}")]
-    Client {
-        #[source]
-        source: rskafka::client::error::Error,
-    },
-    #[error("kafka partition {topic}[{partition}] is not representable as i32")]
-    PartitionOutOfRange { topic: String, partition: u32 },
-    #[error("kafka request offset {offset} for {topic}[{partition}] exceeds i64")]
-    RequestOffsetOutOfRange {
-        topic: String,
-        partition: u32,
-        offset: u64,
-    },
-    #[error("kafka broker returned negative offset {offset} for {topic}[{partition}]")]
-    NegativeOffset {
-        topic: String,
-        partition: u32,
-        offset: i64,
-    },
-}
-
-#[derive(Clone, Debug)]
-struct RskafkaBroker {
-    client: Arc<Client>,
-    fetch_max_bytes: i32,
-    fetch_max_wait_ms: i32,
-}
-
-impl RskafkaBroker {
-    async fn connect(bootstrap_servers: &str) -> Result<Self, RskafkaBrokerError> {
-        let brokers = bootstrap_servers
-            .split(',')
-            .map(str::trim)
-            .filter(|server| !server.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if brokers.is_empty() {
-            return Err(RskafkaBrokerError::EmptyBootstrapServers);
-        }
-
-        let client = ClientBuilder::new(brokers)
-            .build()
-            .await
-            .map_err(|source| RskafkaBrokerError::Client { source })?;
-        Ok(Self {
-            client: Arc::new(client),
-            fetch_max_bytes: 1_048_576,
-            fetch_max_wait_ms: 250,
-        })
-    }
-
-    async fn partition_client(
-        &self,
-        claim: &KafkaPartitionClaim,
-    ) -> Result<rskafka::client::partition::PartitionClient, RskafkaBrokerError> {
-        let topic = claim.source.topic_partition.topic.clone();
-        let partition = claim.source.topic_partition.partition.get();
-        let partition =
-            i32::try_from(partition).map_err(|_| RskafkaBrokerError::PartitionOutOfRange {
-                topic: topic.clone(),
-                partition,
-            })?;
-
-        self.client
-            .partition_client(topic, partition, UnknownTopicHandling::Retry)
-            .await
-            .map_err(|source| RskafkaBrokerError::Client { source })
-    }
-
-    fn encode_offset(
-        topic: &str,
-        partition: u32,
-        offset: i64,
-    ) -> Result<KafkaOffset, RskafkaBrokerError> {
-        let offset = u64::try_from(offset).map_err(|_| RskafkaBrokerError::NegativeOffset {
-            topic: topic.to_string(),
-            partition,
-            offset,
-        })?;
-        Ok(KafkaOffset::new(offset))
-    }
-
-    fn request_offset(
-        topic: &str,
-        partition: u32,
-        offset: KafkaOffset,
-    ) -> Result<i64, RskafkaBrokerError> {
-        i64::try_from(offset.get()).map_err(|_| RskafkaBrokerError::RequestOffsetOutOfRange {
-            topic: topic.to_string(),
-            partition,
-            offset: offset.get(),
-        })
-    }
-}
-
-#[async_trait]
-impl KafkaBroker for RskafkaBroker {
-    type Error = RskafkaBrokerError;
-
-    async fn resolve_offset(
-        &self,
-        claim: &KafkaPartitionClaim,
-        policy: KafkaBootstrapPolicy,
-    ) -> Result<KafkaOffset, Self::Error> {
-        let topic = claim.source.topic_partition.topic.clone();
-        let partition = claim.source.topic_partition.partition.get();
-        let at = match policy {
-            KafkaBootstrapPolicy::Earliest => OffsetAt::Earliest,
-            KafkaBootstrapPolicy::Latest => OffsetAt::Latest,
-        };
-        let offset = self
-            .partition_client(claim)
-            .await?
-            .get_offset(at)
-            .await
-            .map_err(|source| RskafkaBrokerError::Client { source })?;
-        Self::encode_offset(&topic, partition, offset)
-    }
-
-    async fn fetch_batch(
-        &self,
-        claim: &KafkaPartitionClaim,
-        next_offset: KafkaOffset,
-        max_records: usize,
-    ) -> Result<KafkaFetchedBatch, Self::Error> {
-        let topic = claim.source.topic_partition.topic.clone();
-        let partition = claim.source.topic_partition.partition.get();
-        let client = self.partition_client(claim).await?;
-        let high = client
-            .get_offset(OffsetAt::Latest)
-            .await
-            .map_err(|source| RskafkaBrokerError::Client { source })?;
-        let high = Self::encode_offset(&topic, partition, high)?;
-        if next_offset >= high {
-            return Ok(KafkaFetchedBatch::empty(Some(high)));
-        }
-
-        let (records, observed_high) = client
-            .fetch_records(
-                Self::request_offset(&topic, partition, next_offset)?,
-                1..self.fetch_max_bytes,
-                self.fetch_max_wait_ms,
-            )
-            .await
-            .map_err(|source| RskafkaBrokerError::Client { source })?;
-        let high = Self::encode_offset(&topic, partition, observed_high)?;
-        let records = records
-            .into_iter()
-            .take(max_records.max(1))
-            .map(|record| {
-                Ok(KafkaRecord {
-                    topic_partition: terracedb_kafka::KafkaTopicPartition::new(
-                        topic.clone(),
-                        partition,
-                    ),
-                    offset: Self::encode_offset(&topic, partition, record.offset)?,
-                    timestamp_millis: u64::try_from(record.record.timestamp.timestamp_millis())
-                        .ok(),
-                    key: record.record.key,
-                    value: record.record.value,
-                    headers: record
-                        .record
-                        .headers
-                        .into_iter()
-                        .map(|(key, value)| KafkaRecordHeader::new(key, value))
-                        .collect(),
-                })
-            })
-            .collect::<Result<Vec<_>, RskafkaBrokerError>>()?;
-
-        Ok(KafkaFetchedBatch::new(records, Some(high)))
-    }
-}
-
 fn decode_state_count(state: Option<Value>) -> usize {
     match state {
         None => 0,
@@ -437,14 +253,6 @@ fn order_watch_db_settings(path: &str, prefix: &str) -> DbSettings {
 
 fn order_watch_db_builder(path: &str, prefix: &str) -> DbBuilder {
     Db::builder().settings(order_watch_db_settings(path, prefix))
-}
-
-async fn ensure_table(db: &Db, config: TableConfig) -> Result<Table, Box<dyn Error>> {
-    match db.create_table(config.clone()).await {
-        Ok(table) => Ok(table),
-        Err(terracedb::CreateTableError::AlreadyExists(_)) => Ok(db.table(config.name)),
-        Err(error) => Err(Box::new(error)),
-    }
 }
 
 async fn drive_until_offset<B>(
@@ -533,8 +341,17 @@ async fn wait_for_state(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
+            let telemetry = runtime.telemetry_snapshot().await.ok();
+            let attach_mode = telemetry
+                .as_ref()
+                .and_then(|snapshot| snapshot.source_lags.first())
+                .and_then(|lag| lag.attach_mode);
+            let lag = telemetry
+                .as_ref()
+                .and_then(|snapshot| snapshot.source_lags.first())
+                .map(|lag| lag.lag);
             return Err(Box::new(io::Error::other(format!(
-                "workflow state for {instance_id} did not reach {expected} before timeout"
+                "workflow state for {instance_id} did not reach {expected} before timeout (current={current}, attach_mode={attach_mode:?}, lag={lag:?})"
             ))));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -691,10 +508,13 @@ async fn run_mode(
     .await?;
 
     let row_template = row_table_config("template");
-    create_layout_tables(&db, boundary.source_layouts(), &row_template, &row_template).await?;
-    ensure_table(&db, row_table_config(ATTENTION_ORDERS_TABLE_NAME)).await?;
-    ensure_table(&db, row_table_config(ATTENTION_TRANSITIONS_TABLE_NAME)).await?;
-    let progress_table = ensure_table(&db, row_table_config("kafka_progress")).await?;
+    let transitions_config = WorkflowSourceConfig::historical_replayable_source()
+        .prepare_source_table_config(row_table_config(ATTENTION_TRANSITIONS_TABLE_NAME));
+    ensure_layout_tables(&db, boundary.source_layouts(), &row_template, &row_template).await?;
+    db.ensure_table(row_table_config(ATTENTION_ORDERS_TABLE_NAME))
+        .await?;
+    db.ensure_table(transitions_config).await?;
+    let progress_table = db.ensure_table(row_table_config("kafka_progress")).await?;
 
     let progress_store = TableKafkaProgressStore::new(progress_table);
     let attention_orders = boundary.attention_orders_table(&db);
@@ -741,17 +561,12 @@ async fn run_mode(
         .await?;
     let mut attention_transitions_handle = projection_runtime
         .start_multi_source(
-            MultiSourceProjection::new(
-                "order-watch-attention-transitions",
-                sources.clone(),
-                DebeziumDerivedTransitionProjection::new(
-                    attention_transitions.table().clone(),
-                    boundary.attention_row_predicate(),
-                    encode_transition_value,
-                ),
+            DebeziumDerivedTransitionProjection::new(
+                attention_transitions.table().clone(),
+                boundary.attention_row_predicate(),
+                encode_transition_value,
             )
-            .with_outputs([attention_transitions.table().clone()])
-            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+            .into_multi_source("order-watch-attention-transitions", sources.clone()),
         )
         .await?;
 
@@ -903,13 +718,19 @@ async fn run_mode(
             wait_for_projection(&mut attention_orders_handle, [(&sources[0], final_p0)]).await?;
             wait_for_projection(&mut attention_transitions_handle, [(&sources[0], final_p0)])
                 .await?;
-            wait_for_state(
+            if let Err(error) = wait_for_state(
                 &workflow_runtime,
                 LIVE_TRANSITION_ORDER_ID,
                 2,
                 options.timeout,
             )
-            .await?;
+            .await
+            {
+                let transitions = collect_attention_transitions(&attention_transitions).await?;
+                return Err(Box::new(io::Error::other(format!(
+                    "{error}; derived_transitions={transitions:?}"
+                ))));
+            }
 
             let telemetry = workflow_runtime.telemetry_snapshot().await?;
             let states = state_count_map(

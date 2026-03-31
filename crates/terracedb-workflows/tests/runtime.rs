@@ -10,7 +10,7 @@ use terracedb::{
     ChangeFeedError, Clock, Db, DeterministicRng, FileSystemFailure, FileSystemOperation,
     LogCursor, ObjectStoreFailure, ObjectStoreOperation, OutboxEntry, Rng as TerraceRng,
     ScanOptions, SequenceNumber, StorageError, StorageErrorKind, StubClock, StubFileSystem,
-    StubObjectStore, Table, TieredDurabilityMode, Timestamp, Value,
+    StubObjectStore, Table, TieredDurabilityMode, Timestamp, Transaction, Value,
     test_support::{
         FailpointMode, db_failpoint_registry, row_table_config, test_dependencies,
         test_dependencies_with_clock, tiered_test_config_with_durability,
@@ -1664,6 +1664,277 @@ async fn workflow_fail_closed_recovery_surfaces_snapshot_too_old_without_fast_fo
         stale_progress,
         "fail-closed recovery must not silently fast-forward the source progress",
     );
+}
+
+#[tokio::test]
+async fn workflow_current_durable_bootstrap_processes_multiple_live_events_for_one_instance() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-current-durable-multi-event",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("workflow_source"))
+        .await
+        .expect("create workflow source");
+
+    source
+        .write(b"skipped-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write skipped backlog");
+    let durable_before_start = db.current_durable_sequence();
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone()).with_config(
+                WorkflowSourceConfig::default()
+                    .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CurrentDurable),
+            )],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+    let handle = runtime.start().await.expect("start workflow runtime");
+
+    for _ in 0..100 {
+        let progress = runtime
+            .load_source_progress(&source)
+            .await
+            .expect("load source progress");
+        if progress.origin() == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
+            && progress.resume_point()
+                == (WorkflowSourceResumePoint::DurableSequenceFence {
+                    sequence: durable_before_start,
+                })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    source
+        .write(b"live-1:entered".to_vec(), Value::bytes("entered"))
+        .await
+        .expect("write first live event");
+    source
+        .write(b"live-1:exited".to_vec(), Value::bytes("exited"))
+        .await
+        .expect("write second live event");
+
+    for _ in 0..100 {
+        if runtime
+            .load_state("live-1")
+            .await
+            .expect("load live workflow state")
+            .is_some_and(|state| decode_count(Some(state)) == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        runtime
+            .load_state("skipped-1")
+            .await
+            .expect("load skipped backlog state"),
+        None,
+    );
+    assert_eq!(
+        runtime
+            .load_state("live-1")
+            .await
+            .expect("load final live workflow state")
+            .map(|state| decode_count(Some(state))),
+        Some(2),
+    );
+
+    handle.shutdown().await.expect("shutdown workflow runtime");
+}
+
+#[tokio::test]
+async fn workflow_current_durable_bootstrap_fails_closed_without_retained_history_for_batched_events()
+ {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-current-durable-batched-events-fail-closed",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("workflow_source"))
+        .await
+        .expect("create workflow source");
+
+    source
+        .write(b"live-1:event".to_vec(), Value::bytes("backlog"))
+        .await
+        .expect("write skipped backlog");
+    let durable_before_start = db.current_durable_sequence();
+
+    let runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone()).with_config(
+                WorkflowSourceConfig::default()
+                    .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CurrentDurable),
+            )],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+    let handle = runtime.start().await.expect("start workflow runtime");
+
+    for _ in 0..100 {
+        let progress = runtime
+            .load_source_progress(&source)
+            .await
+            .expect("load source progress");
+        if progress.origin() == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
+            && progress.resume_point()
+                == (WorkflowSourceResumePoint::DurableSequenceFence {
+                    sequence: durable_before_start,
+                })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut tx = Transaction::begin(&db).await;
+    tx.write(&source, b"live-1:entered".to_vec(), Value::bytes("entered"));
+    tx.write(&source, b"live-1:exited".to_vec(), Value::bytes("exited"));
+    tx.commit().await.expect("commit live event batch");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let shutdown_error = handle
+        .shutdown()
+        .await
+        .expect_err("runtime should fail closed once the durable fence falls behind");
+    let snapshot_too_old = shutdown_error
+        .snapshot_too_old()
+        .expect("fail-closed runtime should surface snapshot-too-old details");
+    assert_eq!(snapshot_too_old.requested, durable_before_start);
+    assert!(
+        snapshot_too_old.oldest_available > durable_before_start,
+        "expected the source history floor to move past the current-durable fence",
+    );
+}
+
+#[tokio::test]
+async fn workflow_current_durable_bootstrap_processes_multiple_live_events_in_one_commit_when_source_retains_history()
+ {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-current-durable-batched-events-retained",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source_config = WorkflowSourceConfig::live_only_replayable_append_only_source()
+        .prepare_source_table_config(row_table_config("workflow_source"));
+    let source = db
+        .create_table(source_config)
+        .await
+        .expect("create workflow source");
+
+    source
+        .write(b"skipped-1:backlog".to_vec(), Value::bytes("backlog"))
+        .await
+        .expect("write skipped backlog");
+    let durable_before_start = db.current_durable_sequence();
+
+    let runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone()).with_config(
+                WorkflowSourceConfig::default()
+                    .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CurrentDurable),
+            )],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+    let handle = runtime.start().await.expect("start workflow runtime");
+
+    for _ in 0..100 {
+        let progress = runtime
+            .load_source_progress(&source)
+            .await
+            .expect("load source progress");
+        if progress.origin() == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
+            && progress.resume_point()
+                == (WorkflowSourceResumePoint::DurableSequenceFence {
+                    sequence: durable_before_start,
+                })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut tx = Transaction::begin(&db).await;
+    tx.write(&source, b"live-1:entered".to_vec(), Value::bytes("entered"));
+    tx.write(&source, b"live-1:exited".to_vec(), Value::bytes("exited"));
+    tx.commit().await.expect("commit live event batch");
+
+    for _ in 0..100 {
+        if runtime
+            .load_state("live-1")
+            .await
+            .expect("load live workflow state")
+            .is_some_and(|state| decode_count(Some(state)) == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        runtime
+            .load_state("live-1")
+            .await
+            .expect("load final batched live workflow state")
+            .map(|state| decode_count(Some(state))),
+        Some(2),
+    );
+
+    handle.shutdown().await.expect("shutdown workflow runtime");
 }
 
 #[tokio::test]

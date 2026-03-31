@@ -2432,7 +2432,7 @@ dependencies = [
  "terracedb",
  "terracedb-records",
  "terracedb-simulation",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "turmoil",
 ]
@@ -2441,8 +2441,8 @@ dependencies = [
 name = "terracedb-example-order-watch"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
- "rskafka",
  "serde",
  "serde_json",
  "terracedb",
@@ -2452,7 +2452,6 @@ dependencies = [
  "terracedb-records",
  "terracedb-simulation",
  "terracedb-workflows",
- "thiserror 2.0.18",
  "tokio",
  "turmoil",
 ]
@@ -2547,6 +2546,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "rskafka",
  "terracedb",
  "terracedb-simulation",
  "thiserror 2.0.18",

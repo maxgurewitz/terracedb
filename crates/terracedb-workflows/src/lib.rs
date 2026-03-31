@@ -32,6 +32,9 @@ pub mod failpoints;
 pub const DEFAULT_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const DEFAULT_SOURCE_BATCH_LIMIT: usize = 128;
 pub const DEFAULT_TIMER_BATCH_LIMIT: usize = 128;
+/// Replayable workflow sources need some retained table history so fail-closed recovery can
+/// resume from a durable fence without immediately surfacing `SnapshotTooOld`.
+pub const DEFAULT_REPLAYABLE_SOURCE_HISTORY_RETENTION_SEQUENCES: u64 = 128;
 
 const WORKFLOW_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_SOURCE_PROGRESS_FORMAT_VERSION: u8 = 2;
@@ -343,6 +346,21 @@ impl WorkflowSourceConfig {
     pub fn with_replay_kind(mut self, replay: WorkflowReplayableSourceKind) -> Self {
         self.capabilities.replay = replay;
         self
+    }
+
+    /// Applies the table-level defaults needed for the configured source mode.
+    ///
+    /// In particular, replayable append-only sources need retained row history so
+    /// `CurrentDurable` bootstrap and fail-closed recovery can safely resume from their
+    /// durable-sequence fences.
+    pub fn prepare_source_table_config(self, mut config: TableConfig) -> TableConfig {
+        if self.capabilities.replay == WorkflowReplayableSourceKind::AppendOnlyOrdered
+            && config.history_retention_sequences.is_none()
+        {
+            config.history_retention_sequences =
+                Some(DEFAULT_REPLAYABLE_SOURCE_HISTORY_RETENTION_SEQUENCES);
+        }
+        config
     }
 
     pub fn with_checkpoint_support(

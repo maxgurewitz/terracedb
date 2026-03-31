@@ -36,14 +36,25 @@ Both workflow modes now run through the real workflow runtime from the same appe
 `attention_transitions` stream. The example intentionally uses the newer ergonomics added while
 freezing this boundary:
 
-- `create_layout_tables(...)` and `DebeziumMaterializer::from_layouts(...)` remove repetitive
-  layout bootstrapping.
+- `ensure_layout_tables(...)` and `Db::ensure_table(...)` make the example bootstrap idempotent
+  instead of forcing one-shot setup code.
+- `DebeziumMaterializer::from_layouts(...)` removes repetitive materializer wiring.
 - `PostgresDebeziumDecoder::from_layouts(...)` and `DebeziumIngressHandler::postgres(...)` let the
   ingress path come from layouts instead of hand-built table collections.
+- `terracedb_kafka::RskafkaBroker` is now the real Kafka adapter used by the example binary instead
+  of example-local broker glue.
 - `DebeziumDerivedTransitionProjection` derives append-only workflow routing rows directly from the
-  replayable Debezium event log, which avoids the old mirror-delete provenance pitfall.
+  replayable Debezium event log, and `into_multi_source(...)` turns that into a ready-to-run
+  projection with the intended recompute behavior.
+- `DebeziumSnapshotMarker::{phase,boundary}` and `DebeziumEvent::{snapshot_phase,
+  snapshot_boundary}` expose semantic snapshot state instead of pushing callers toward raw marker
+  strings.
+- `DebeziumMirrorChange::decode(...)` gives mirror consumers one typed surface for upserts and
+  deletes.
 - `WorkflowSourceConfig::{historical_replayable_source, live_only_current_state_source,
-  live_only_replayable_append_only_source}` captures the intended workflow attach presets.
+  live_only_replayable_append_only_source}` captures the intended workflow attach presets, and
+  `prepare_source_table_config(...)` makes sure replayable sources get the retained history those
+  presets need at the table layer.
 - `ProjectionSequenceRun::source_scoped_entry_key(...)` and
   `RecordTable::decode_change_entry(...)` remove a lot of example-specific key and decode plumbing.
 
