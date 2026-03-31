@@ -1138,6 +1138,7 @@ impl Db {
         table: &StoredTable,
         level: u32,
         rows: Vec<SstableRow>,
+        applied_generation: ManifestId,
     ) -> Result<Vec<ResidentRowSstable>, StorageError> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -1186,6 +1187,7 @@ impl Db {
                         local_id,
                         table,
                         rows[start..end].to_vec(),
+                        Some(applied_generation),
                     )
                     .await?
                 }
@@ -1524,6 +1526,8 @@ impl Db {
                 CompactionJobKind::DeleteOnly => FilteredCompactionRows::default(),
             };
 
+            let next_generation =
+                ManifestId::new(sstables.manifest_generation.get().saturating_add(1));
             let outputs = match job.kind {
                 CompactionJobKind::Rewrite => {
                     let outputs = self
@@ -1537,6 +1541,7 @@ impl Db {
                                 .cloned()
                                 .map(|row| row.row)
                                 .collect::<Vec<_>>(),
+                            next_generation,
                         )
                         .await?;
 
@@ -1559,8 +1564,6 @@ impl Db {
             new_live.extend(outputs);
             Self::sort_live_sstables(&mut new_live);
 
-            let next_generation =
-                ManifestId::new(current_state.manifest_generation.get().saturating_add(1));
             self.install_manifest(
                 next_generation,
                 current_state.last_flushed_sequence,

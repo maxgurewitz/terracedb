@@ -199,6 +199,147 @@ impl Db {
                 })?;
             }
         }
+        Self::validate_hybrid_table_features(config)
+            .map_err(|error| CreateTableError::InvalidConfig(error.message().to_string()))?;
+
+        Ok(())
+    }
+
+    pub(super) fn hybrid_table_features(
+        metadata: &TableMetadata,
+    ) -> Result<HybridTableFeatures, StorageError> {
+        let Some(value) = metadata.get(HYBRID_TABLE_FEATURES_METADATA_KEY).cloned() else {
+            return Ok(HybridTableFeatures::default());
+        };
+        serde_json::from_value(value).map_err(|error| {
+            StorageError::unsupported(format!(
+                "invalid {} table metadata: {error}",
+                HYBRID_TABLE_FEATURES_METADATA_KEY
+            ))
+        })
+    }
+
+    pub(super) fn validate_hybrid_table_features(config: &TableConfig) -> Result<(), StorageError> {
+        let features = Self::hybrid_table_features(&config.metadata)?;
+        if features.skip_indexes.is_empty() && features.projection_sidecars.is_empty() {
+            return Ok(());
+        }
+        if config.format != TableFormat::Columnar {
+            return Err(StorageError::unsupported(
+                "hybrid skip indexes and projection sidecars require a columnar table",
+            ));
+        }
+
+        let schema = config.schema.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar table {} is missing a schema",
+                config.name
+            ))
+        })?;
+        let validation = SchemaValidation::new(schema)?;
+        let mut seen_names = BTreeSet::new();
+
+        for skip in &features.skip_indexes {
+            if skip.name.trim().is_empty() {
+                return Err(StorageError::unsupported(
+                    "skip-index configs require a non-empty name",
+                ));
+            }
+            if !seen_names.insert(format!("skip:{}", skip.name)) {
+                return Err(StorageError::unsupported(format!(
+                    "duplicate skip-index config {}",
+                    skip.name
+                )));
+            }
+            if skip.max_values == 0 {
+                return Err(StorageError::unsupported(format!(
+                    "skip-index {} requires max_values > 0",
+                    skip.name
+                )));
+            }
+            match skip.family {
+                HybridSkipIndexFamily::UserKeyBloom => {
+                    if skip.field.is_some() {
+                        return Err(StorageError::unsupported(format!(
+                            "skip-index {} uses user_key_bloom and may not specify a field",
+                            skip.name
+                        )));
+                    }
+                }
+                HybridSkipIndexFamily::FieldValueBloom | HybridSkipIndexFamily::BoundedSet => {
+                    let field_name = skip.field.as_ref().ok_or_else(|| {
+                        StorageError::unsupported(format!(
+                            "skip-index {} requires a field",
+                            skip.name
+                        ))
+                    })?;
+                    let field_id =
+                        validation
+                            .field_ids_by_name
+                            .get(field_name)
+                            .ok_or_else(|| {
+                                StorageError::unsupported(format!(
+                                    "skip-index {} references unknown field {}",
+                                    skip.name, field_name
+                                ))
+                            })?;
+                    let field = validation.fields_by_id.get(field_id).ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "columnar table {} schema is missing field id {}",
+                            config.name,
+                            field_id.get()
+                        ))
+                    })?;
+                    if skip.family == HybridSkipIndexFamily::BoundedSet
+                        && field.field_type == FieldType::Float64
+                    {
+                        return Err(StorageError::unsupported(format!(
+                            "bounded-set skip-index {} does not support float64 field {}",
+                            skip.name, field_name
+                        )));
+                    }
+                }
+            }
+        }
+
+        for projection in &features.projection_sidecars {
+            if projection.name.trim().is_empty() {
+                return Err(StorageError::unsupported(
+                    "projection-sidecar configs require a non-empty name",
+                ));
+            }
+            if !seen_names.insert(format!("projection:{}", projection.name)) {
+                return Err(StorageError::unsupported(format!(
+                    "duplicate projection-sidecar config {}",
+                    projection.name
+                )));
+            }
+            if projection.fields.is_empty() {
+                return Err(StorageError::unsupported(format!(
+                    "projection-sidecar {} requires at least one field",
+                    projection.name
+                )));
+            }
+            let mut seen_fields = BTreeSet::new();
+            for field_name in &projection.fields {
+                let field_id = validation
+                    .field_ids_by_name
+                    .get(field_name)
+                    .copied()
+                    .ok_or_else(|| {
+                        StorageError::unsupported(format!(
+                            "projection-sidecar {} references unknown field {}",
+                            projection.name, field_name
+                        ))
+                    })?;
+                if !seen_fields.insert(field_id) {
+                    return Err(StorageError::unsupported(format!(
+                        "projection-sidecar {} lists field {} more than once",
+                        projection.name, field_name
+                    )));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -603,7 +744,7 @@ impl Db {
 
     pub(super) async fn open_columnar_read_context(
         storage: &StorageConfig,
-        config: &crate::HybridReadConfig,
+        hybrid_read: &crate::HybridReadConfig,
         dependencies: &DbDependencies,
     ) -> Result<ColumnarReadContext, StorageError> {
         let remote_cache_root = match storage {
@@ -649,17 +790,20 @@ impl Db {
             dependencies: dependencies.clone(),
             remote_cache,
             decoded_cache: DecodedColumnarCache::new(
-                config.decoded_metadata_cache_entries,
-                config.decoded_column_cache_entries,
+                hybrid_read.decoded_metadata_cache_entries,
+                hybrid_read.decoded_column_cache_entries,
             ),
             raw_byte_cache_enabled: AtomicBool::new(true),
             decoded_cache_enabled: AtomicBool::new(true),
-            raw_byte_cache_budget_bytes: config.raw_segment_cache_bytes,
+            raw_byte_cache_budget_bytes: hybrid_read.raw_segment_cache_bytes,
             raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState {
                 total_bytes: raw_byte_total,
                 order: raw_byte_order,
                 lengths: raw_byte_lengths,
             }),
+            skip_indexes_enabled: hybrid_read.skip_indexes_enabled,
+            projection_sidecars_enabled: hybrid_read.projection_sidecars_enabled,
+            aggressive_background_repair: hybrid_read.aggressive_background_repair,
         };
         context.trim_raw_byte_cache_to_budget().await?;
         Ok(context)
@@ -681,6 +825,9 @@ impl Db {
             decoded_cache_enabled: AtomicBool::new(true),
             raw_byte_cache_budget_bytes: 0,
             raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState::default()),
+            skip_indexes_enabled: false,
+            projection_sidecars_enabled: false,
+            aggressive_background_repair: false,
         }
     }
 
@@ -929,6 +1076,7 @@ impl Db {
                 Self::load_resident_sstable_with_context(
                     dependencies,
                     columnar_read_context,
+                    file.body.generation,
                     sstable,
                 )
                 .await?,
@@ -987,6 +1135,7 @@ impl Db {
                 Self::load_resident_sstable_with_context(
                     dependencies,
                     columnar_read_context,
+                    file.body.generation,
                     sstable,
                 )
                 .await?,

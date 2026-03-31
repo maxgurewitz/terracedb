@@ -202,6 +202,10 @@ pub(super) struct ColumnarReadContext {
     pub(super) decoded_cache_enabled: AtomicBool,
     pub(super) raw_byte_cache_budget_bytes: u64,
     pub(super) raw_byte_cache_budget_state: Mutex<RawByteCacheBudgetState>,
+    pub(super) skip_indexes_enabled: bool,
+    pub(super) projection_sidecars_enabled: bool,
+    #[allow(dead_code)]
+    pub(super) aggressive_background_repair: bool,
 }
 
 pub(super) struct DecodedColumnarCache {
@@ -893,6 +897,31 @@ pub(super) struct PersistedColumnarColumnFooter {
     pub(super) block: ColumnarBlockLocation,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PersistedSkipIndexSidecarDescriptor {
+    pub(super) file_name: String,
+    pub(super) index_name: String,
+    pub(super) family: HybridSkipIndexFamily,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) field_id: Option<FieldId>,
+    pub(super) checksum: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PersistedProjectionSidecarDescriptor {
+    pub(super) file_name: String,
+    pub(super) projection_name: String,
+    pub(super) projected_fields: Vec<FieldId>,
+    pub(super) checksum: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum PersistedOptionalSidecarDescriptor {
+    SkipIndex(PersistedSkipIndexSidecarDescriptor),
+    Projection(PersistedProjectionSidecarDescriptor),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct PersistedColumnarSstableFooter {
     pub(super) format_version: u32,
@@ -913,9 +942,106 @@ pub(super) struct PersistedColumnarSstableFooter {
     pub(super) columns: Vec<PersistedColumnarColumnFooter>,
     pub(super) layout: crate::hybrid::ColumnarFooter,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) applied_generation: Option<ManifestId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) digests: Vec<CompactPartDigest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) optional_sidecars: Vec<PersistedOptionalSidecarDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "family", rename_all = "snake_case")]
+pub(super) enum PersistedSkipIndexSidecarPayload {
+    UserKeyBloom {
+        filter: UserKeyBloomFilter,
+    },
+    FieldValueBloom {
+        filter: UserKeyBloomFilter,
+    },
+    BoundedSet {
+        values: Vec<FieldValue>,
+        saturated: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedSkipIndexSidecarBody {
+    pub(super) format_version: u32,
+    pub(super) table_id: TableId,
+    pub(super) local_id: String,
+    pub(super) index_name: String,
+    pub(super) family: HybridSkipIndexFamily,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) field_id: Option<FieldId>,
+    pub(super) schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) applied_generation: Option<ManifestId>,
+    pub(super) row_count: u64,
+    pub(super) digest: CompactPartDigest,
+    pub(super) payload: PersistedSkipIndexSidecarPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedSkipIndexSidecarFile {
+    pub(super) body: PersistedSkipIndexSidecarBody,
+    pub(super) checksum: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedProjectionSidecarBody {
+    pub(super) format_version: u32,
+    pub(super) table_id: TableId,
+    pub(super) local_id: String,
+    pub(super) projection_name: String,
+    pub(super) schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) applied_generation: Option<ManifestId>,
+    pub(super) row_count: u64,
+    pub(super) projected_fields: Vec<FieldId>,
+    pub(super) digest: CompactPartDigest,
+    pub(super) rows: Vec<Option<Value>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedProjectionSidecarFile {
+    pub(super) body: PersistedProjectionSidecarBody,
+    pub(super) checksum: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PersistedArtifactQuarantineMarker {
+    pub(super) format_version: u32,
+    pub(super) local_id: String,
+    pub(super) reason: String,
+    pub(super) quarantined_at_millis: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedNullableColumn<T> {
+    pub(super) present_bitmap: Vec<bool>,
+    pub(super) values: Vec<T>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedFloat64Column {
+    pub(super) present_bitmap: Vec<bool>,
+    pub(super) values_bits: Vec<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(super) enum PersistedColumnBlock {
+    Int64(PersistedNullableColumn<i64>),
+    Float64(PersistedFloat64Column),
+    String(PersistedNullableColumn<String>),
+    Bytes(PersistedNullableColumn<Vec<u8>>),
+    Bool(PersistedNullableColumn<bool>),
+}
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CompactionJobKind {

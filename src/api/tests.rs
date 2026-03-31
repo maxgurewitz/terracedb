@@ -962,6 +962,28 @@ fn columnar_all_types_table_config(name: &str) -> TableConfig {
     }
 }
 
+fn tiered_config_with_hybrid_read(
+    path: &str,
+    skip_indexes_enabled: bool,
+    projection_sidecars_enabled: bool,
+) -> DbConfig {
+    let mut config = tiered_config(path);
+    config.hybrid_read.skip_indexes_enabled = skip_indexes_enabled;
+    config.hybrid_read.projection_sidecars_enabled = projection_sidecars_enabled;
+    config
+}
+
+fn with_hybrid_features(
+    mut config: TableConfig,
+    features: crate::HybridTableFeatures,
+) -> TableConfig {
+    config.metadata.insert(
+        crate::HYBRID_TABLE_FEATURES_METADATA_KEY.to_string(),
+        serde_json::to_value(features).expect("serialize hybrid table features"),
+    );
+    config
+}
+
 fn assert_catalog_entry(table: &StoredTable, expected: &TableConfig) {
     assert_eq!(table.config.name, expected.name);
     assert_eq!(table.config.format, expected.format);
@@ -3657,9 +3679,19 @@ async fn flush_persists_columnar_sstables_manifest_footer_and_reopenable_reads()
     assert_eq!(footer.row_count, 3);
     assert_eq!(footer.columns.len(), 2);
     assert!(footer_start > COLUMNAR_SSTABLE_MAGIC.len());
+    assert_eq!(footer.applied_generation, Some(ManifestId::new(1)));
+    assert!(footer.optional_sidecars.is_empty());
+    assert_eq!(footer.digests.len(), 1);
+    Db::validate_compact_digest(
+        &footer.digests[0],
+        crate::ColumnarV2FormatTag::base_part(),
+        &file_bytes[COLUMNAR_SSTABLE_MAGIC.len()..footer_start],
+    )
+    .expect("validate persisted columnar compact digest");
     assert_eq!(
         footer
             .user_key_bloom_filter
+            .as_ref()
             .expect("persisted columnar bloom filter")
             .bits_per_key,
         6
@@ -4461,6 +4493,492 @@ async fn columnar_scan_pruning_skips_unrequested_column_decodes() {
         }
         other => panic!("expected storage error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn projection_sidecar_reads_requested_projection_without_decoding_corrupted_base_column() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+
+    let db = Db::open(
+        tiered_config_with_hybrid_read("/projection-sidecar-read", false, true),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = with_hybrid_features(
+        columnar_all_types_table_config("metrics"),
+        crate::HybridTableFeatures {
+            skip_indexes: Vec::new(),
+            projection_sidecars: vec![crate::HybridProjectionSidecarConfig {
+                name: "metric_only".to_string(),
+                fields: vec!["metric".to_string()],
+            }],
+        },
+    );
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    table
+        .write(
+            b"row:1".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("metric", FieldValue::String("cpu".to_string())),
+                    ("count", FieldValue::Int64(7)),
+                    ("ratio", FieldValue::Float64(1.25)),
+                    ("payload", FieldValue::Bytes(vec![1, 2, 3])),
+                    ("active", FieldValue::Bool(true)),
+                ],
+            )
+            .expect("encode row"),
+        )
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush columnar row");
+
+    let live = db
+        .sstables_read()
+        .live
+        .first()
+        .cloned()
+        .expect("live columnar sstable");
+    let file_bytes = read_path(&dependencies, &live.meta.file_path)
+        .await
+        .expect("read local columnar file");
+    let (footer, _) = Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes)
+        .expect("decode local columnar footer");
+    let metric_column = footer
+        .columns
+        .iter()
+        .find(|column| column.field_id == FieldId::new(1))
+        .expect("metric column");
+    let handle = file_system
+        .open(
+            &live.meta.file_path,
+            crate::OpenOptions {
+                create: false,
+                read: true,
+                write: true,
+                truncate: false,
+                append: false,
+            },
+        )
+        .await
+        .expect("open local columnar file for corruption");
+    file_system
+        .write_at(&handle, metric_column.block.offset, b"{not-valid-json")
+        .await
+        .expect("corrupt projected metric column");
+    file_system
+        .sync(&handle)
+        .await
+        .expect("sync corrupted column");
+
+    let projected_rows = collect_rows(
+        table
+            .scan(
+                Vec::new(),
+                vec![0xff],
+                ScanOptions {
+                    columns: Some(vec!["metric".to_string()]),
+                    ..ScanOptions::default()
+                },
+            )
+            .await
+            .expect("projection sidecar should satisfy the scan"),
+    )
+    .await;
+    assert_eq!(
+        projected_rows,
+        vec![(
+            b"row:1".to_vec(),
+            Value::record(BTreeMap::from([(
+                FieldId::new(1),
+                FieldValue::String("cpu".to_string()),
+            )])),
+        )]
+    );
+
+    let full_scan_error = match table
+        .scan(Vec::new(), vec![0xff], ScanOptions::default())
+        .await
+    {
+        Ok(_) => panic!("full scan should decode the corrupted metric column"),
+        Err(error) => error,
+    };
+    match full_scan_error {
+        ReadError::Storage(error) => {
+            assert!(error.message().contains("decode columnar field 1"));
+        }
+        other => panic!("expected storage error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn projection_sidecar_corruption_falls_back_to_base_and_survives_restart() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+
+    let db = Db::open(
+        tiered_config_with_hybrid_read("/projection-sidecar-fallback", false, true),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = with_hybrid_features(
+        columnar_all_types_table_config("metrics"),
+        crate::HybridTableFeatures {
+            skip_indexes: Vec::new(),
+            projection_sidecars: vec![crate::HybridProjectionSidecarConfig {
+                name: "metric_only".to_string(),
+                fields: vec!["metric".to_string()],
+            }],
+        },
+    );
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    table
+        .write(
+            b"row:1".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("metric", FieldValue::String("cpu".to_string())),
+                    ("count", FieldValue::Int64(7)),
+                    ("active", FieldValue::Bool(true)),
+                ],
+            )
+            .expect("encode row"),
+        )
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush columnar row");
+
+    let live = db
+        .sstables_read()
+        .live
+        .first()
+        .cloned()
+        .expect("live columnar sstable");
+    let columnar = live.columnar.as_ref().expect("columnar source");
+    let file_bytes = read_path(&dependencies, &live.meta.file_path)
+        .await
+        .expect("read local columnar file");
+    let (footer, _) = Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes)
+        .expect("decode local columnar footer");
+    let projection_descriptor = footer
+        .optional_sidecars
+        .iter()
+        .find_map(|descriptor| match descriptor {
+            super::PersistedOptionalSidecarDescriptor::Projection(descriptor)
+                if descriptor.projection_name == "metric_only" =>
+            {
+                Some(descriptor.clone())
+            }
+            super::PersistedOptionalSidecarDescriptor::Projection(_) => None,
+            super::PersistedOptionalSidecarDescriptor::SkipIndex(_) => None,
+        })
+        .expect("projection sidecar descriptor");
+    let sidecar_source = Db::sibling_source(&columnar.source, &projection_descriptor.file_name);
+    let sidecar_path = match &sidecar_source {
+        StorageSource::LocalFile { path } => path.clone(),
+        StorageSource::RemoteObject { .. } => panic!("expected local projection sidecar"),
+    };
+    overwrite_file(file_system.as_ref(), &sidecar_path, b"{not-valid-json").await;
+
+    let expected_rows = vec![(
+        b"row:1".to_vec(),
+        Value::record(BTreeMap::from([(
+            FieldId::new(1),
+            FieldValue::String("cpu".to_string()),
+        )])),
+    )];
+    let projected_rows = collect_rows(
+        table
+            .scan(
+                Vec::new(),
+                vec![0xff],
+                ScanOptions {
+                    columns: Some(vec!["metric".to_string()]),
+                    ..ScanOptions::default()
+                },
+            )
+            .await
+            .expect("corrupt sidecar should fall back to the base SSTable"),
+    )
+    .await;
+    assert_eq!(projected_rows, expected_rows);
+
+    let marker = Db::read_quarantine_marker(&dependencies, &sidecar_source)
+        .await
+        .expect("read projection sidecar quarantine marker")
+        .expect("projection sidecar should be quarantined");
+    assert!(marker.reason.contains("decode projection sidecar"));
+
+    let reopened = Db::open(
+        tiered_config_with_hybrid_read("/projection-sidecar-fallback", false, true),
+        dependencies,
+    )
+    .await
+    .expect("reopen after sidecar quarantine");
+    let reopened_rows = collect_rows(
+        reopened
+            .table("metrics")
+            .scan(
+                Vec::new(),
+                vec![0xff],
+                ScanOptions {
+                    columns: Some(vec!["metric".to_string()]),
+                    ..ScanOptions::default()
+                },
+            )
+            .await
+            .expect("reopened db should keep falling back to the base SSTable"),
+    )
+    .await;
+    assert_eq!(reopened_rows, expected_rows);
+}
+
+#[tokio::test]
+async fn skip_index_probe_prunes_and_falls_back_when_sidecar_is_missing() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(
+        tiered_config_with_hybrid_read("/skip-index-probe", true, false),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = with_hybrid_features(
+        columnar_table_config("metrics"),
+        crate::HybridTableFeatures {
+            skip_indexes: vec![crate::HybridSkipIndexConfig {
+                name: "user_id_set".to_string(),
+                family: crate::HybridSkipIndexFamily::BoundedSet,
+                field: Some("user_id".to_string()),
+                max_values: 8,
+            }],
+            projection_sidecars: Vec::new(),
+        },
+    );
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    table
+        .write(
+            b"row:1".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("user_id", FieldValue::String("alpha".to_string())),
+                    ("count", FieldValue::Int64(1)),
+                ],
+            )
+            .expect("encode first row"),
+        )
+        .await
+        .expect("write first row");
+    db.flush().await.expect("flush first row");
+
+    table
+        .write(
+            b"row:2".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("user_id", FieldValue::String("bravo".to_string())),
+                    ("count", FieldValue::Int64(2)),
+                ],
+            )
+            .expect("encode second row"),
+        )
+        .await
+        .expect("write second row");
+    db.flush().await.expect("flush second row");
+
+    let probe = crate::SkipIndexProbe::FieldEquals {
+        field: "user_id".to_string(),
+        value: FieldValue::String("bravo".to_string()),
+    };
+    let initial_results = table
+        .probe_skip_indexes(probe.clone())
+        .await
+        .expect("probe skip indexes");
+    assert_eq!(initial_results.len(), 2);
+    let pruned = initial_results
+        .iter()
+        .find(|result| !result.may_match)
+        .expect("one part should be pruned by the bounded set");
+    assert_eq!(pruned.used_indexes, vec!["user_id_set".to_string()]);
+    assert!(!pruned.fallback_to_base);
+
+    let pruned_sstable = db
+        .sstables_read()
+        .live
+        .iter()
+        .find(|sstable| sstable.meta.local_id == pruned.local_id)
+        .cloned()
+        .expect("sstable for the pruned result");
+    let columnar = pruned_sstable.columnar.as_ref().expect("columnar source");
+    let file_bytes = read_path(&dependencies, &pruned_sstable.meta.file_path)
+        .await
+        .expect("read pruned sstable");
+    let (footer, _) = Db::columnar_footer_from_bytes(&pruned_sstable.meta.file_path, &file_bytes)
+        .expect("decode pruned footer");
+    let descriptor = footer
+        .optional_sidecars
+        .iter()
+        .find_map(|descriptor| match descriptor {
+            super::PersistedOptionalSidecarDescriptor::SkipIndex(descriptor)
+                if descriptor.index_name == "user_id_set" =>
+            {
+                Some(descriptor.clone())
+            }
+            super::PersistedOptionalSidecarDescriptor::SkipIndex(_) => None,
+            super::PersistedOptionalSidecarDescriptor::Projection(_) => None,
+        })
+        .expect("skip-index descriptor");
+    let sidecar_source = Db::sibling_source(&columnar.source, &descriptor.file_name);
+    Db::delete_source_if_exists(&dependencies, &sidecar_source)
+        .await
+        .expect("delete skip-index sidecar");
+
+    let fallback_results = table
+        .probe_skip_indexes(probe)
+        .await
+        .expect("probe after sidecar deletion");
+    let fallback = fallback_results
+        .iter()
+        .find(|result| result.local_id == pruned.local_id)
+        .expect("fallback result for the deleted sidecar");
+    assert!(fallback.may_match);
+    assert!(fallback.fallback_to_base);
+    assert!(fallback.used_indexes.is_empty());
+    assert!(
+        Db::read_quarantine_marker(&dependencies, &sidecar_source)
+            .await
+            .expect("read quarantine marker after deleting sidecar")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn part_repair_controller_repairs_projection_sidecars_after_manual_quarantine() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(
+        tiered_config_with_hybrid_read("/projection-sidecar-repair", false, true),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = with_hybrid_features(
+        columnar_table_config("metrics"),
+        crate::HybridTableFeatures {
+            skip_indexes: Vec::new(),
+            projection_sidecars: vec![crate::HybridProjectionSidecarConfig {
+                name: "user_id_only".to_string(),
+                fields: vec!["user_id".to_string()],
+            }],
+        },
+    );
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    table
+        .write(
+            b"row:1".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("user_id", FieldValue::String("alpha".to_string())),
+                    ("count", FieldValue::Int64(7)),
+                ],
+            )
+            .expect("encode row"),
+        )
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush row");
+
+    let live = db
+        .sstables_read()
+        .live
+        .first()
+        .cloned()
+        .expect("live columnar sstable");
+    let columnar = live.columnar.as_ref().expect("columnar source");
+    let file_bytes = read_path(&dependencies, &live.meta.file_path)
+        .await
+        .expect("read local columnar file");
+    let (footer, _) = Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes)
+        .expect("decode local columnar footer");
+    let projection_descriptor = footer
+        .optional_sidecars
+        .iter()
+        .find_map(|descriptor| match descriptor {
+            super::PersistedOptionalSidecarDescriptor::Projection(descriptor)
+                if descriptor.projection_name == "user_id_only" =>
+            {
+                Some(descriptor.clone())
+            }
+            super::PersistedOptionalSidecarDescriptor::Projection(_) => None,
+            super::PersistedOptionalSidecarDescriptor::SkipIndex(_) => None,
+        })
+        .expect("projection sidecar descriptor");
+    let sidecar_source = Db::sibling_source(&columnar.source, &projection_descriptor.file_name);
+    let part = crate::HybridPartDescriptor {
+        table_id: live.meta.table_id,
+        local_id: live.meta.local_id.clone(),
+        source: sidecar_source.clone(),
+        format_tag: crate::ColumnarV2FormatTag::projection_sidecar(),
+        digests: Vec::new(),
+    };
+
+    assert_eq!(
+        crate::PartRepairController::verify(&db, &part)
+            .await
+            .expect("verify healthy projection sidecar"),
+        crate::RepairState::Verified
+    );
+    assert_eq!(
+        crate::PartRepairController::quarantine(&db, &part, "manual quarantine")
+            .await
+            .expect("manually quarantine projection sidecar"),
+        crate::RepairState::Quarantined {
+            reason: "manual quarantine".to_string(),
+        }
+    );
+    assert_eq!(
+        Db::read_quarantine_marker(&dependencies, &sidecar_source)
+            .await
+            .expect("read quarantine marker")
+            .expect("projection sidecar should be quarantined")
+            .reason,
+        "manual quarantine"
+    );
+
+    assert_eq!(
+        crate::PartRepairController::repair(&db, &part)
+            .await
+            .expect("repair quarantined projection sidecar"),
+        crate::RepairState::Repaired
+    );
+    assert!(
+        Db::read_quarantine_marker(&dependencies, &sidecar_source)
+            .await
+            .expect("read quarantine marker after repair")
+            .is_none()
+    );
 }
 
 #[tokio::test]

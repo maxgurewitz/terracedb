@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use crc32fast::hash as checksum32;
 use futures::{Stream, stream};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -33,6 +34,13 @@ use crate::{
     error::{
         ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
         SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
+    },
+    hybrid::{
+        COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION,
+        COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION, CompactPartDigest,
+        HYBRID_TABLE_FEATURES_METADATA_KEY, HybridPartDescriptor, HybridSkipIndexFamily,
+        HybridTableFeatures, PartDigestAlgorithm, PartRepairController, RepairState,
+        SkipIndexProbe, SkipIndexProbeResult,
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, OpenOptions},

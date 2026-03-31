@@ -503,23 +503,304 @@ impl ColumnarReadContext {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedSkipIndexSpec {
+    name: String,
+    family: HybridSkipIndexFamily,
+    field: Option<FieldDefinition>,
+    max_values: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedProjectionSidecarSpec {
+    name: String,
+    projection: ColumnProjection,
+}
+
+#[derive(Clone, Debug)]
+enum EncodedOptionalSidecar {
+    SkipIndex {
+        descriptor: PersistedSkipIndexSidecarDescriptor,
+        bytes: Vec<u8>,
+    },
+    Projection {
+        descriptor: PersistedProjectionSidecarDescriptor,
+        bytes: Vec<u8>,
+    },
+}
+
+impl EncodedOptionalSidecar {
+    fn file_name(&self) -> &str {
+        match self {
+            Self::SkipIndex { descriptor, .. } => descriptor.file_name.as_str(),
+            Self::Projection { descriptor, .. } => descriptor.file_name.as_str(),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::SkipIndex { bytes, .. } | Self::Projection { bytes, .. } => bytes,
+        }
+    }
+
+    fn descriptor(&self) -> PersistedOptionalSidecarDescriptor {
+        match self {
+            Self::SkipIndex { descriptor, .. } => {
+                PersistedOptionalSidecarDescriptor::SkipIndex(descriptor.clone())
+            }
+            Self::Projection { descriptor, .. } => {
+                PersistedOptionalSidecarDescriptor::Projection(descriptor.clone())
+            }
+        }
+    }
+}
+
 impl Db {
+    pub(super) fn compact_crc32_digest(
+        format_tag: crate::ColumnarV2FormatTag,
+        logical_bytes: u64,
+        bytes: &[u8],
+    ) -> CompactPartDigest {
+        CompactPartDigest {
+            format_tag,
+            algorithm: PartDigestAlgorithm::Crc32,
+            logical_bytes,
+            digest_bytes: checksum32(bytes).to_be_bytes().to_vec(),
+        }
+    }
+
+    pub(super) fn validate_compact_digest(
+        digest: &CompactPartDigest,
+        expected_format_tag: crate::ColumnarV2FormatTag,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        if digest.format_tag != expected_format_tag {
+            return Err(StorageError::corruption(format!(
+                "artifact digest format tag mismatch: expected {:?}, found {:?}",
+                expected_format_tag.kind, digest.format_tag.kind
+            )));
+        }
+        if digest.algorithm != PartDigestAlgorithm::Crc32 {
+            return Err(StorageError::unsupported(
+                "only crc32 compact digests are supported",
+            ));
+        }
+        if digest.logical_bytes != bytes.len() as u64 {
+            return Err(StorageError::corruption(format!(
+                "artifact digest length mismatch: expected {}, found {}",
+                digest.logical_bytes,
+                bytes.len()
+            )));
+        }
+        if digest.digest_bytes != checksum32(bytes).to_be_bytes() {
+            return Err(StorageError::corruption("artifact compact digest mismatch"));
+        }
+        Ok(())
+    }
+
+    fn sanitize_artifact_name_component(component: &str) -> String {
+        let sanitized = component
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        if sanitized.is_empty() {
+            "artifact".to_string()
+        } else {
+            sanitized
+        }
+    }
+
+    fn sibling_path(base_path: &str, file_name: &str) -> String {
+        let parent = PathBuf::from(base_path)
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if parent.is_empty() {
+            file_name.to_string()
+        } else {
+            Self::join_fs_path(&parent, file_name)
+        }
+    }
+
+    fn sibling_remote_key(base_key: &str, file_name: &str) -> String {
+        match base_key.rsplit_once('/') {
+            Some((prefix, _)) => format!("{prefix}/{file_name}"),
+            None => file_name.to_string(),
+        }
+    }
+
+    pub(super) fn sibling_source(source: &StorageSource, file_name: &str) -> StorageSource {
+        match source {
+            StorageSource::LocalFile { path } => {
+                StorageSource::local_file(Self::sibling_path(path, file_name))
+            }
+            StorageSource::RemoteObject { key } => {
+                StorageSource::remote_object(Self::sibling_remote_key(key, file_name))
+            }
+        }
+    }
+
+    fn artifact_quarantine_source(source: &StorageSource) -> StorageSource {
+        match source {
+            StorageSource::LocalFile { path } => {
+                StorageSource::local_file(format!("{path}.quarantine.json"))
+            }
+            StorageSource::RemoteObject { key } => {
+                StorageSource::remote_object(format!("{key}.quarantine.json"))
+            }
+        }
+    }
+
+    pub(super) async fn read_optional_source(
+        dependencies: &DbDependencies,
+        source: &StorageSource,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        match source {
+            StorageSource::LocalFile { path } => read_optional_path(dependencies, path).await,
+            StorageSource::RemoteObject { key } => {
+                read_optional_remote_object(dependencies, key).await
+            }
+        }
+    }
+
+    pub(super) async fn write_source_atomic(
+        dependencies: &DbDependencies,
+        rng: &Arc<dyn crate::Rng>,
+        source: &StorageSource,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        match source {
+            StorageSource::LocalFile { path } => {
+                write_local_file_atomic(dependencies, path, bytes).await
+            }
+            StorageSource::RemoteObject { key } => {
+                let temp_key = format!("{key}.tmp.{}", rng.uuid());
+                dependencies.object_store.put(&temp_key, bytes).await?;
+                dependencies.object_store.copy(&temp_key, key).await?;
+                let _ = dependencies.object_store.delete(&temp_key).await;
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) async fn delete_source_if_exists(
+        dependencies: &DbDependencies,
+        source: &StorageSource,
+    ) -> Result<(), StorageError> {
+        match source {
+            StorageSource::LocalFile { path } => {
+                delete_local_file_if_exists(dependencies, path).await
+            }
+            StorageSource::RemoteObject { key } => {
+                match dependencies.object_store.delete(key).await {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == StorageErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    pub(super) async fn read_quarantine_marker(
+        dependencies: &DbDependencies,
+        source: &StorageSource,
+    ) -> Result<Option<PersistedArtifactQuarantineMarker>, StorageError> {
+        let Some(bytes) =
+            Self::read_optional_source(dependencies, &Self::artifact_quarantine_source(source))
+                .await?
+        else {
+            return Ok(None);
+        };
+        let marker = serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::corruption(format!("decode artifact quarantine marker failed: {error}"))
+        })?;
+        Ok(Some(marker))
+    }
+
+    pub(super) async fn quarantine_artifact(
+        dependencies: &DbDependencies,
+        rng: &Arc<dyn crate::Rng>,
+        source: &StorageSource,
+        local_id: &str,
+        reason: &str,
+        now_millis: u64,
+    ) -> Result<(), StorageError> {
+        let marker = PersistedArtifactQuarantineMarker {
+            format_version: 1,
+            local_id: local_id.to_string(),
+            reason: reason.to_string(),
+            quarantined_at_millis: now_millis,
+        };
+        let payload = serde_json::to_vec(&marker).map_err(|error| {
+            StorageError::corruption(format!("encode artifact quarantine marker failed: {error}"))
+        })?;
+        Self::write_source_atomic(
+            dependencies,
+            rng,
+            &Self::artifact_quarantine_source(source),
+            &payload,
+        )
+        .await
+    }
+
+    pub(super) fn sidecar_projection_matches(
+        projected_fields: &[FieldId],
+        projection: &ColumnProjection,
+    ) -> bool {
+        let mut left = projected_fields.to_vec();
+        left.sort();
+        let mut right = projection
+            .fields
+            .iter()
+            .map(|field| field.id)
+            .collect::<Vec<_>>();
+        right.sort();
+        left == right
+    }
+
+    fn skip_index_file_name(local_id: &str, name: &str) -> String {
+        format!(
+            "{local_id}.skip-index.{}.json",
+            Self::sanitize_artifact_name_component(name)
+        )
+    }
+
+    fn projection_sidecar_file_name(local_id: &str, name: &str) -> String {
+        format!(
+            "{local_id}.projection.{}.json",
+            Self::sanitize_artifact_name_component(name)
+        )
+    }
+
     #[allow(dead_code)]
     pub(super) async fn load_resident_sstable(
         dependencies: &DbDependencies,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
         let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
-        Self::load_resident_sstable_with_context(dependencies, &columnar_read_context, meta).await
+        Self::load_resident_sstable_with_context(
+            dependencies,
+            &columnar_read_context,
+            ManifestId::default(),
+            meta,
+        )
+        .await
     }
 
     pub(super) async fn load_resident_sstable_with_context(
         dependencies: &DbDependencies,
         columnar_read_context: &ColumnarReadContext,
+        manifest_generation: ManifestId,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
         if meta.schema_version.is_some() {
-            Self::load_lazy_columnar_sstable(columnar_read_context, meta).await
+            Self::load_lazy_columnar_sstable(columnar_read_context, manifest_generation, meta).await
         } else {
             let source = meta.storage_source();
             let location = meta.storage_descriptor();
@@ -623,6 +904,7 @@ impl Db {
         location: &str,
         meta: &PersistedManifestSstable,
         footer: &PersistedColumnarSstableFooter,
+        manifest_generation: ManifestId,
     ) -> Result<(), StorageError> {
         if footer.table_id != meta.table_id
             || footer.level != meta.level
@@ -779,19 +1061,42 @@ impl Db {
             None,
             crate::ColumnarSubstreamKind::RowKind,
         )?;
+        if let Some(applied_generation) = footer.applied_generation
+            && applied_generation > manifest_generation
+        {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} applied generation {} exceeds manifest generation {}",
+                applied_generation.get(),
+                manifest_generation.get()
+            )));
+        }
         Ok(())
     }
 
     pub(super) async fn load_lazy_columnar_sstable(
         columnar_read_context: &ColumnarReadContext,
+        manifest_generation: ManifestId,
         meta: &PersistedManifestSstable,
     ) -> Result<ResidentRowSstable, StorageError> {
         let source = meta.storage_source();
         let location = meta.storage_descriptor();
+        if let Some(marker) =
+            Self::read_quarantine_marker(&columnar_read_context.dependencies, &source).await?
+        {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} is quarantined: {}",
+                marker.reason
+            )));
+        }
         let footer = columnar_read_context
             .footer_from_source(meta, &source, location, ColumnarReadAccessPattern::Point)
             .await?;
-        Self::validate_loaded_columnar_footer(location, meta, footer.footer.as_ref())?;
+        Self::validate_loaded_columnar_footer(
+            location,
+            meta,
+            footer.footer.as_ref(),
+            manifest_generation,
+        )?;
 
         Ok(ResidentRowSstable {
             meta: meta.clone(),
@@ -886,7 +1191,12 @@ impl Db {
         }
 
         let (footer, footer_start) = Self::columnar_footer_from_bytes(location, bytes)?;
-        Self::validate_loaded_columnar_footer(location, meta, &footer)?;
+        Self::validate_loaded_columnar_footer(
+            location,
+            meta,
+            &footer,
+            footer.applied_generation.unwrap_or_default(),
+        )?;
 
         let data_region = &bytes[COLUMNAR_SSTABLE_MAGIC.len()..footer_start];
         if checksum32(data_region) != footer.data_checksum
@@ -2115,6 +2425,7 @@ impl Db {
         &self,
         local_root: &str,
         immutable: &ImmutableMemtable,
+        applied_generation: ManifestId,
     ) -> Result<Vec<ResidentRowSstable>, FlushError> {
         let mut outputs = Vec::new();
         let tables = self.tables_read().clone();
@@ -2163,8 +2474,15 @@ impl Db {
                     .await
                 }
                 TableFormat::Columnar => {
-                    self.write_columnar_sstable(&path, 0, local_id, &stored, rows)
-                        .await
+                    self.write_columnar_sstable(
+                        &path,
+                        0,
+                        local_id,
+                        &stored,
+                        rows,
+                        Some(applied_generation),
+                    )
+                    .await
                 }
             }
             .map_err(FlushError::Storage)?;
@@ -2178,6 +2496,7 @@ impl Db {
         &self,
         config: &S3PrimaryStorageConfig,
         immutable: &ImmutableMemtable,
+        applied_generation: ManifestId,
     ) -> Result<Vec<ResidentRowSstable>, FlushError> {
         let mut outputs = Vec::new();
         let tables = self.tables_read().clone();
@@ -2226,8 +2545,15 @@ impl Db {
                     .await
                 }
                 TableFormat::Columnar => {
-                    self.write_columnar_sstable_remote(&object_key, 0, local_id, &stored, rows)
-                        .await
+                    self.write_columnar_sstable_remote(
+                        &object_key,
+                        0,
+                        local_id,
+                        &stored,
+                        rows,
+                        Some(applied_generation),
+                    )
+                    .await
                 }
             }
             .map_err(FlushError::Storage)?;
@@ -2737,6 +3063,414 @@ impl Db {
         Ok(block_bytes)
     }
 
+    fn encode_skip_index_body(
+        body: &PersistedSkipIndexSidecarBody,
+    ) -> Result<Vec<u8>, StorageError> {
+        serde_json::to_vec(body).map_err(|error| {
+            StorageError::corruption(format!("encode skip-index sidecar body failed: {error}"))
+        })
+    }
+
+    fn encode_projection_sidecar_body(
+        body: &PersistedProjectionSidecarBody,
+    ) -> Result<Vec<u8>, StorageError> {
+        serde_json::to_vec(body).map_err(|error| {
+            StorageError::corruption(format!("encode projection sidecar body failed: {error}"))
+        })
+    }
+
+    fn placeholder_compact_digest(format_tag: crate::ColumnarV2FormatTag) -> CompactPartDigest {
+        CompactPartDigest {
+            format_tag,
+            algorithm: PartDigestAlgorithm::Crc32,
+            logical_bytes: 0,
+            digest_bytes: vec![0; std::mem::size_of::<u32>()],
+        }
+    }
+
+    pub(super) fn skip_index_sidecar_digest_input(
+        body: &PersistedSkipIndexSidecarBody,
+    ) -> Result<Vec<u8>, StorageError> {
+        let mut digest_body = body.clone();
+        digest_body.digest =
+            Self::placeholder_compact_digest(crate::ColumnarV2FormatTag::skip_index_sidecar());
+        Self::encode_skip_index_body(&digest_body)
+    }
+
+    pub(super) fn projection_sidecar_digest_input(
+        body: &PersistedProjectionSidecarBody,
+    ) -> Result<Vec<u8>, StorageError> {
+        let mut digest_body = body.clone();
+        digest_body.digest =
+            Self::placeholder_compact_digest(crate::ColumnarV2FormatTag::projection_sidecar());
+        Self::encode_projection_sidecar_body(&digest_body)
+    }
+
+    pub(super) fn encoded_field_value_bytes(value: &FieldValue) -> Result<Vec<u8>, StorageError> {
+        serde_json::to_vec(value).map_err(|error| {
+            StorageError::corruption(format!("encode skip-index field value failed: {error}"))
+        })
+    }
+
+    fn build_bloom_from_encoded_values(
+        encoded_values: &[Vec<u8>],
+        bits_per_key: Option<u32>,
+    ) -> Option<UserKeyBloomFilter> {
+        let bits_per_key = bits_per_key?.max(1);
+        let unique_values = encoded_values
+            .iter()
+            .map(|value| value.as_slice())
+            .collect::<BTreeSet<_>>();
+        if unique_values.is_empty() {
+            return None;
+        }
+
+        let bit_count = unique_values
+            .len()
+            .saturating_mul(bits_per_key as usize)
+            .max(8);
+        let byte_len = bit_count.div_ceil(8);
+        let total_bits = byte_len * 8;
+        let hash_count = ((bits_per_key.saturating_mul(69)).saturating_add(50) / 100).max(1);
+        let mut filter = UserKeyBloomFilter {
+            bits_per_key,
+            hash_count,
+            bytes: vec![0; byte_len],
+        };
+
+        for value in unique_values {
+            filter.insert(value, total_bits);
+        }
+
+        Some(filter)
+    }
+
+    fn build_sidecar_specs(
+        &self,
+        stored: &StoredTable,
+    ) -> Result<
+        (
+            Vec<ResolvedSkipIndexSpec>,
+            Vec<ResolvedProjectionSidecarSpec>,
+        ),
+        StorageError,
+    > {
+        let features = Self::hybrid_table_features(&stored.config.metadata)?;
+        let Some(schema) = stored.config.schema.as_ref() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let validation = SchemaValidation::new(schema)?;
+
+        let skip_indexes = if self.inner.config.hybrid_read.skip_indexes_enabled {
+            features
+                .skip_indexes
+                .into_iter()
+                .map(|config| {
+                    let field = match config.family {
+                        HybridSkipIndexFamily::UserKeyBloom => None,
+                        HybridSkipIndexFamily::FieldValueBloom
+                        | HybridSkipIndexFamily::BoundedSet => {
+                            let field_name = config.field.ok_or_else(|| {
+                                StorageError::unsupported(format!(
+                                    "skip-index {} requires a field",
+                                    config.name
+                                ))
+                            })?;
+                            let field_id = validation
+                                .field_ids_by_name
+                                .get(&field_name)
+                                .copied()
+                                .ok_or_else(|| {
+                                StorageError::unsupported(format!(
+                                    "skip-index {} references unknown field {}",
+                                    config.name, field_name
+                                ))
+                            })?;
+                            Some(
+                                (*validation.fields_by_id.get(&field_id).ok_or_else(|| {
+                                    StorageError::corruption(format!(
+                                        "columnar table {} schema is missing field id {}",
+                                        stored.config.name,
+                                        field_id.get()
+                                    ))
+                                })?)
+                                .clone(),
+                            )
+                        }
+                    };
+                    Ok(ResolvedSkipIndexSpec {
+                        name: config.name,
+                        family: config.family,
+                        field,
+                        max_values: config.max_values,
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?
+        } else {
+            Vec::new()
+        };
+
+        let projection_sidecars = if self.inner.config.hybrid_read.projection_sidecars_enabled {
+            features
+                .projection_sidecars
+                .into_iter()
+                .map(|config| {
+                    let mut fields = Vec::with_capacity(config.fields.len());
+                    for field_name in config.fields {
+                        let field_id = validation
+                            .field_ids_by_name
+                            .get(&field_name)
+                            .copied()
+                            .ok_or_else(|| {
+                                StorageError::unsupported(format!(
+                                    "projection-sidecar {} references unknown field {}",
+                                    config.name, field_name
+                                ))
+                            })?;
+                        let field = validation.fields_by_id.get(&field_id).ok_or_else(|| {
+                            StorageError::corruption(format!(
+                                "columnar table {} schema is missing field id {}",
+                                stored.config.name,
+                                field_id.get()
+                            ))
+                        })?;
+                        fields.push((*field).clone());
+                    }
+                    Ok(ResolvedProjectionSidecarSpec {
+                        name: config.name,
+                        projection: ColumnProjection { fields },
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?
+        } else {
+            Vec::new()
+        };
+
+        Ok((skip_indexes, projection_sidecars))
+    }
+
+    fn build_optional_sidecars(
+        &self,
+        local_id: &str,
+        stored: &StoredTable,
+        rows: &[SstableRow],
+        applied_generation: Option<ManifestId>,
+    ) -> Result<Vec<EncodedOptionalSidecar>, StorageError> {
+        let schema = stored.config.schema.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar table {} is missing a schema",
+                stored.config.name
+            ))
+        })?;
+        let (skip_specs, projection_specs) = self.build_sidecar_specs(stored)?;
+        let mut encoded = Vec::new();
+
+        for spec in skip_specs {
+            let file_name = Self::skip_index_file_name(local_id, &spec.name);
+            let payload = match spec.family {
+                HybridSkipIndexFamily::UserKeyBloom => {
+                    let unique_keys = rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
+                    let filter = UserKeyBloomFilter::build(
+                        &unique_keys
+                            .iter()
+                            .map(|key| SstableRow {
+                                key: key.clone(),
+                                sequence: SequenceNumber::new(0),
+                                kind: ChangeKind::Put,
+                                value: Some(Value::bytes(Vec::new())),
+                            })
+                            .collect::<Vec<_>>(),
+                        stored.config.bloom_filter_bits_per_key,
+                    )
+                    .ok_or_else(|| {
+                        StorageError::unsupported(format!(
+                            "skip-index {} cannot be built for an empty part",
+                            spec.name
+                        ))
+                    })?;
+                    PersistedSkipIndexSidecarPayload::UserKeyBloom { filter }
+                }
+                HybridSkipIndexFamily::FieldValueBloom => {
+                    let field = spec.field.as_ref().ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "skip-index {} is missing its resolved field",
+                            spec.name
+                        ))
+                    })?;
+                    let encoded_values = rows
+                        .iter()
+                        .filter_map(|row| row.value.as_ref())
+                        .map(|value| {
+                            let Value::Record(record) = value else {
+                                return Err(StorageError::corruption(
+                                    "columnar row unexpectedly stored bytes in a skip index",
+                                ));
+                            };
+                            let field_value = record.get(&field.id).ok_or_else(|| {
+                                StorageError::corruption(format!(
+                                    "columnar row is missing field {} for skip-index {}",
+                                    field.name, spec.name
+                                ))
+                            })?;
+                            Self::encoded_field_value_bytes(field_value)
+                        })
+                        .collect::<Result<Vec<_>, StorageError>>()?;
+                    let filter = Self::build_bloom_from_encoded_values(
+                        &encoded_values,
+                        stored.config.bloom_filter_bits_per_key,
+                    )
+                    .ok_or_else(|| {
+                        StorageError::unsupported(format!(
+                            "skip-index {} cannot be built for an empty part",
+                            spec.name
+                        ))
+                    })?;
+                    PersistedSkipIndexSidecarPayload::FieldValueBloom { filter }
+                }
+                HybridSkipIndexFamily::BoundedSet => {
+                    let field = spec.field.as_ref().ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "skip-index {} is missing its resolved field",
+                            spec.name
+                        ))
+                    })?;
+                    let mut values = BTreeMap::<Vec<u8>, FieldValue>::new();
+                    let mut saturated = false;
+                    for row in rows.iter().filter_map(|row| row.value.as_ref()) {
+                        let Value::Record(record) = row else {
+                            return Err(StorageError::corruption(
+                                "columnar row unexpectedly stored bytes in a skip index",
+                            ));
+                        };
+                        let field_value = record.get(&field.id).ok_or_else(|| {
+                            StorageError::corruption(format!(
+                                "columnar row is missing field {} for skip-index {}",
+                                field.name, spec.name
+                            ))
+                        })?;
+                        values
+                            .entry(Self::encoded_field_value_bytes(field_value)?)
+                            .or_insert_with(|| field_value.clone());
+                        if values.len() > spec.max_values {
+                            saturated = true;
+                            break;
+                        }
+                    }
+                    PersistedSkipIndexSidecarPayload::BoundedSet {
+                        values: if saturated {
+                            Vec::new()
+                        } else {
+                            values.into_values().collect()
+                        },
+                        saturated,
+                    }
+                }
+            };
+            let body = PersistedSkipIndexSidecarBody {
+                format_version: COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
+                table_id: stored.id,
+                local_id: local_id.to_string(),
+                index_name: spec.name.clone(),
+                family: spec.family,
+                field_id: spec.field.as_ref().map(|field| field.id),
+                schema_version: schema.version,
+                applied_generation,
+                row_count: rows.len() as u64,
+                digest: Self::placeholder_compact_digest(
+                    crate::ColumnarV2FormatTag::skip_index_sidecar(),
+                ),
+                payload,
+            };
+            let mut body = body;
+            let body_bytes = Self::skip_index_sidecar_digest_input(&body)?;
+            body.digest = Self::compact_crc32_digest(
+                crate::ColumnarV2FormatTag::skip_index_sidecar(),
+                body_bytes.len() as u64,
+                &body_bytes,
+            );
+            let body_bytes = Self::encode_skip_index_body(&body)?;
+            let checksum = checksum32(&body_bytes);
+            let file = PersistedSkipIndexSidecarFile { body, checksum };
+            let bytes = serde_json::to_vec(&file).map_err(|error| {
+                StorageError::corruption(format!("encode skip-index sidecar file failed: {error}"))
+            })?;
+            encoded.push(EncodedOptionalSidecar::SkipIndex {
+                descriptor: PersistedSkipIndexSidecarDescriptor {
+                    file_name,
+                    index_name: spec.name,
+                    family: spec.family,
+                    field_id: spec.field.map(|field| field.id),
+                    checksum,
+                },
+                bytes,
+            });
+        }
+
+        for spec in projection_specs {
+            let file_name = Self::projection_sidecar_file_name(local_id, &spec.name);
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.value
+                        .as_ref()
+                        .map(|value| {
+                            Self::project_columnar_value(value, &spec.projection, row.kind)
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            let body = PersistedProjectionSidecarBody {
+                format_version: COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION,
+                table_id: stored.id,
+                local_id: local_id.to_string(),
+                projection_name: spec.name.clone(),
+                schema_version: schema.version,
+                applied_generation,
+                row_count: rows.len() as u64,
+                projected_fields: spec
+                    .projection
+                    .fields
+                    .iter()
+                    .map(|field| field.id)
+                    .collect(),
+                digest: Self::placeholder_compact_digest(
+                    crate::ColumnarV2FormatTag::projection_sidecar(),
+                ),
+                rows,
+            };
+            let mut body = body;
+            let body_bytes = Self::projection_sidecar_digest_input(&body)?;
+            body.digest = Self::compact_crc32_digest(
+                crate::ColumnarV2FormatTag::projection_sidecar(),
+                body_bytes.len() as u64,
+                &body_bytes,
+            );
+            let body_bytes = Self::encode_projection_sidecar_body(&body)?;
+            let checksum = checksum32(&body_bytes);
+            let file = PersistedProjectionSidecarFile { body, checksum };
+            let bytes = serde_json::to_vec(&file).map_err(|error| {
+                StorageError::corruption(format!("encode projection sidecar file failed: {error}"))
+            })?;
+            encoded.push(EncodedOptionalSidecar::Projection {
+                descriptor: PersistedProjectionSidecarDescriptor {
+                    file_name,
+                    projection_name: spec.name,
+                    projected_fields: spec
+                        .projection
+                        .fields
+                        .iter()
+                        .map(|field| field.id)
+                        .collect(),
+                    checksum,
+                },
+                bytes,
+            });
+        }
+
+        Ok(encoded)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_columnar_sstable(
         table_id: TableId,
         level: u32,
@@ -2744,6 +3478,8 @@ impl Db {
         schema: &SchemaDefinition,
         rows: Vec<SstableRow>,
         bloom_filter_bits_per_key: Option<u32>,
+        applied_generation: Option<ManifestId>,
+        optional_sidecars: Vec<PersistedOptionalSidecarDescriptor>,
     ) -> Result<(ResidentRowSstable, Vec<u8>), StorageError> {
         schema.validate()?;
 
@@ -2851,8 +3587,17 @@ impl Db {
             row_kind_column,
             columns,
             layout,
+            applied_generation,
+            digests: Vec::new(),
+            optional_sidecars,
             user_key_bloom_filter: user_key_bloom_filter.clone(),
         };
+        let mut footer = footer;
+        footer.digests = vec![Self::compact_crc32_digest(
+            crate::ColumnarV2FormatTag::base_part(),
+            bytes.len().saturating_sub(COLUMNAR_SSTABLE_MAGIC.len()) as u64,
+            &bytes[COLUMNAR_SSTABLE_MAGIC.len()..],
+        )];
         let footer_bytes = Self::encode_json_block("columnar SSTable footer", &footer)?;
         bytes.extend_from_slice(&footer_bytes);
         bytes.extend_from_slice(&(footer_bytes.len() as u64).to_le_bytes());
@@ -2912,6 +3657,38 @@ impl Db {
         Ok(resident)
     }
 
+    async fn publish_optional_sidecars_local(
+        &self,
+        base_path: &str,
+        sidecars: &[EncodedOptionalSidecar],
+    ) {
+        for sidecar in sidecars {
+            let target = Self::sibling_path(base_path, sidecar.file_name());
+            let _ =
+                write_local_file_atomic(&self.inner.dependencies, &target, sidecar.bytes()).await;
+        }
+    }
+
+    async fn publish_optional_sidecars_remote(
+        &self,
+        base_key: &str,
+        sidecars: &[EncodedOptionalSidecar],
+    ) {
+        for sidecar in sidecars {
+            let target = StorageSource::remote_object(Self::sibling_remote_key(
+                base_key,
+                sidecar.file_name(),
+            ));
+            let _ = Self::write_source_atomic(
+                &self.inner.dependencies,
+                &self.inner.dependencies.rng,
+                &target,
+                sidecar.bytes(),
+            )
+            .await;
+        }
+    }
+
     pub(super) async fn write_columnar_sstable(
         &self,
         path: &str,
@@ -2919,6 +3696,7 @@ impl Db {
         local_id: String,
         stored: &StoredTable,
         rows: Vec<SstableRow>,
+        applied_generation: Option<ManifestId>,
     ) -> Result<ResidentRowSstable, StorageError> {
         let schema = stored.config.schema.as_ref().ok_or_else(|| {
             StorageError::corruption(format!(
@@ -2926,6 +3704,8 @@ impl Db {
                 stored.config.name
             ))
         })?;
+        let sidecars =
+            self.build_optional_sidecars(&local_id, stored, &rows, applied_generation)?;
         let (mut resident, bytes) = Self::encode_columnar_sstable(
             stored.id,
             level,
@@ -2933,29 +3713,14 @@ impl Db {
             schema,
             rows,
             stored.config.bloom_filter_bits_per_key,
+            applied_generation,
+            sidecars
+                .iter()
+                .map(EncodedOptionalSidecar::descriptor)
+                .collect(),
         )?;
-
-        let handle = self
-            .inner
-            .dependencies
-            .file_system
-            .open(
-                path,
-                OpenOptions {
-                    create: true,
-                    read: true,
-                    write: true,
-                    truncate: true,
-                    append: false,
-                },
-            )
-            .await?;
-        self.inner
-            .dependencies
-            .file_system
-            .write_at(&handle, 0, &bytes)
-            .await?;
-        self.inner.dependencies.file_system.sync(&handle).await?;
+        self.publish_optional_sidecars_local(path, &sidecars).await;
+        write_local_file_atomic(&self.inner.dependencies, path, &bytes).await?;
 
         resident.meta.file_path = path.to_string();
         resident.columnar = Some(ResidentColumnarSstable {
@@ -2991,6 +3756,7 @@ impl Db {
         local_id: String,
         stored: &StoredTable,
         rows: Vec<SstableRow>,
+        applied_generation: Option<ManifestId>,
     ) -> Result<ResidentRowSstable, StorageError> {
         let schema = stored.config.schema.as_ref().ok_or_else(|| {
             StorageError::corruption(format!(
@@ -2998,6 +3764,8 @@ impl Db {
                 stored.config.name
             ))
         })?;
+        let sidecars =
+            self.build_optional_sidecars(&local_id, stored, &rows, applied_generation)?;
         let (mut resident, bytes) = Self::encode_columnar_sstable(
             stored.id,
             level,
@@ -3005,12 +3773,21 @@ impl Db {
             schema,
             rows,
             stored.config.bloom_filter_bits_per_key,
+            applied_generation,
+            sidecars
+                .iter()
+                .map(EncodedOptionalSidecar::descriptor)
+                .collect(),
         )?;
-        self.inner
-            .dependencies
-            .object_store
-            .put(object_key, &bytes)
-            .await?;
+        self.publish_optional_sidecars_remote(object_key, &sidecars)
+            .await;
+        Self::write_source_atomic(
+            &self.inner.dependencies,
+            &self.inner.dependencies.rng,
+            &StorageSource::remote_object(object_key.to_string()),
+            &bytes,
+        )
+        .await?;
         resident.meta.remote_key = Some(object_key.to_string());
         resident.columnar = Some(ResidentColumnarSstable {
             source: StorageSource::remote_object(object_key.to_string()),
@@ -3457,5 +4234,200 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    async fn verify_part_bytes(&self, part: &HybridPartDescriptor) -> Result<(), StorageError> {
+        let bytes = read_source(&self.inner.dependencies, &part.source).await?;
+        match part.format_tag.kind {
+            crate::ColumnarV2ArtifactKind::BasePart => {
+                let (footer, footer_start) =
+                    Self::columnar_footer_from_bytes(part.source.target(), &bytes)?;
+                let data_region = &bytes[COLUMNAR_SSTABLE_MAGIC.len()..footer_start];
+                let digests = if part.digests.is_empty() {
+                    footer.digests
+                } else {
+                    part.digests.clone()
+                };
+                if digests.is_empty() {
+                    return Err(StorageError::unsupported(
+                        "base part verification requires at least one digest",
+                    ));
+                }
+                for digest in &digests {
+                    Self::validate_compact_digest(
+                        digest,
+                        crate::ColumnarV2FormatTag::base_part(),
+                        data_region,
+                    )?;
+                }
+                if footer.local_id != part.local_id {
+                    return Err(StorageError::corruption(format!(
+                        "base part {} did not match requested local id {}",
+                        footer.local_id, part.local_id
+                    )));
+                }
+                Ok(())
+            }
+            crate::ColumnarV2ArtifactKind::SkipIndexSidecar => {
+                let file: PersistedSkipIndexSidecarFile =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        StorageError::corruption(format!(
+                            "decode skip-index sidecar {} failed: {error}",
+                            part.local_id
+                        ))
+                    })?;
+                let body_bytes = serde_json::to_vec(&file.body).map_err(|error| {
+                    StorageError::corruption(format!(
+                        "encode skip-index sidecar {} body failed: {error}",
+                        part.local_id
+                    ))
+                })?;
+                if checksum32(&body_bytes) != file.checksum {
+                    return Err(StorageError::corruption(format!(
+                        "skip-index sidecar {} checksum mismatch",
+                        part.local_id
+                    )));
+                }
+                let digest_input = Self::skip_index_sidecar_digest_input(&file.body)?;
+                Self::validate_compact_digest(
+                    &file.body.digest,
+                    crate::ColumnarV2FormatTag::skip_index_sidecar(),
+                    &digest_input,
+                )?;
+                for digest in &part.digests {
+                    Self::validate_compact_digest(
+                        digest,
+                        crate::ColumnarV2FormatTag::skip_index_sidecar(),
+                        &digest_input,
+                    )?;
+                }
+                if file.body.local_id != part.local_id {
+                    return Err(StorageError::corruption(format!(
+                        "skip-index sidecar {} did not match requested local id {}",
+                        file.body.local_id, part.local_id
+                    )));
+                }
+                Ok(())
+            }
+            crate::ColumnarV2ArtifactKind::ProjectionSidecar => {
+                let file: PersistedProjectionSidecarFile =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        StorageError::corruption(format!(
+                            "decode projection sidecar {} failed: {error}",
+                            part.local_id
+                        ))
+                    })?;
+                let body_bytes = serde_json::to_vec(&file.body).map_err(|error| {
+                    StorageError::corruption(format!(
+                        "encode projection sidecar {} body failed: {error}",
+                        part.local_id
+                    ))
+                })?;
+                if checksum32(&body_bytes) != file.checksum {
+                    return Err(StorageError::corruption(format!(
+                        "projection sidecar {} checksum mismatch",
+                        part.local_id
+                    )));
+                }
+                let digest_input = Self::projection_sidecar_digest_input(&file.body)?;
+                Self::validate_compact_digest(
+                    &file.body.digest,
+                    crate::ColumnarV2FormatTag::projection_sidecar(),
+                    &digest_input,
+                )?;
+                for digest in &part.digests {
+                    Self::validate_compact_digest(
+                        digest,
+                        crate::ColumnarV2FormatTag::projection_sidecar(),
+                        &digest_input,
+                    )?;
+                }
+                if file.body.local_id != part.local_id {
+                    return Err(StorageError::corruption(format!(
+                        "projection sidecar {} did not match requested local id {}",
+                        file.body.local_id, part.local_id
+                    )));
+                }
+                Ok(())
+            }
+            crate::ColumnarV2ArtifactKind::SynopsisSidecar
+            | crate::ColumnarV2ArtifactKind::CompactDigest => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl PartRepairController for Db {
+    async fn verify(&self, part: &HybridPartDescriptor) -> Result<RepairState, StorageError> {
+        if let Some(marker) =
+            Self::read_quarantine_marker(&self.inner.dependencies, &part.source).await?
+        {
+            return Ok(RepairState::Quarantined {
+                reason: marker.reason,
+            });
+        }
+
+        match self.verify_part_bytes(part).await {
+            Ok(()) => Ok(RepairState::Verified),
+            Err(error) => {
+                Self::quarantine_artifact(
+                    &self.inner.dependencies,
+                    &self.inner.dependencies.rng,
+                    &part.source,
+                    &part.local_id,
+                    error.message(),
+                    self.inner.dependencies.clock.now().get(),
+                )
+                .await?;
+                Ok(RepairState::Quarantined {
+                    reason: error.message().to_string(),
+                })
+            }
+        }
+    }
+
+    async fn quarantine(
+        &self,
+        part: &HybridPartDescriptor,
+        reason: &str,
+    ) -> Result<RepairState, StorageError> {
+        Self::quarantine_artifact(
+            &self.inner.dependencies,
+            &self.inner.dependencies.rng,
+            &part.source,
+            &part.local_id,
+            reason,
+            self.inner.dependencies.clock.now().get(),
+        )
+        .await?;
+        Ok(RepairState::Quarantined {
+            reason: reason.to_string(),
+        })
+    }
+
+    async fn repair(&self, part: &HybridPartDescriptor) -> Result<RepairState, StorageError> {
+        match self.verify_part_bytes(part).await {
+            Ok(()) => {
+                Self::delete_source_if_exists(
+                    &self.inner.dependencies,
+                    &Self::artifact_quarantine_source(&part.source),
+                )
+                .await?;
+                Ok(RepairState::Repaired)
+            }
+            Err(error) => {
+                let reason = error.message().to_string();
+                Self::quarantine_artifact(
+                    &self.inner.dependencies,
+                    &self.inner.dependencies.rng,
+                    &part.source,
+                    &part.local_id,
+                    &reason,
+                    self.inner.dependencies.clock.now().get(),
+                )
+                .await?;
+                Ok(RepairState::Quarantined { reason })
+            }
+        }
     }
 }

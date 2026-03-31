@@ -327,7 +327,11 @@ impl Db {
                     let mut manifest_generation = sstable_state.manifest_generation;
 
                     for immutable in &immutables {
-                        let outputs = self.flush_immutable(&local_root, immutable).await?;
+                        let next_generation =
+                            ManifestId::new(manifest_generation.get().saturating_add(1));
+                        let outputs = self
+                            .flush_immutable(&local_root, immutable, next_generation)
+                            .await?;
                         if outputs.is_empty() {
                             flushed_count += 1;
                             continue;
@@ -335,8 +339,7 @@ impl Db {
 
                         new_live.extend(outputs);
                         Self::sort_live_sstables(&mut new_live);
-                        manifest_generation =
-                            ManifestId::new(manifest_generation.get().saturating_add(1));
+                        manifest_generation = next_generation;
                         self.install_manifest(
                             manifest_generation,
                             immutable.max_sequence,
@@ -433,8 +436,13 @@ impl Db {
 
                     let mut sstable_state = self.sstables_read().clone();
                     let mut new_live = sstable_state.live.clone();
+                    let next_generation =
+                        ManifestId::new(sstable_state.manifest_generation.get().saturating_add(1));
                     for immutable in &immutables {
-                        new_live.extend(self.flush_immutable_remote(config, immutable).await?);
+                        new_live.extend(
+                            self.flush_immutable_remote(config, immutable, next_generation)
+                                .await?,
+                        );
                     }
                     Self::sort_live_sstables(&mut new_live);
 
@@ -446,8 +454,6 @@ impl Db {
                         .max()
                         .unwrap_or(sstable_state.last_flushed_sequence)
                         .max(sstable_state.last_flushed_sequence);
-                    let next_generation =
-                        ManifestId::new(sstable_state.manifest_generation.get().saturating_add(1));
                     self.install_remote_manifest(
                         config,
                         next_generation,
@@ -2260,6 +2266,78 @@ impl Db {
         }
 
         Ok(rows)
+    }
+
+    pub(super) async fn probe_skip_indexes(
+        &self,
+        table_id: TableId,
+        probe: &SkipIndexProbe,
+    ) -> Result<Vec<SkipIndexProbeResult>, ReadError> {
+        let table = Self::stored_table_by_id(&self.tables_read(), table_id)
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::not_found(format!("table id {} is not registered", table_id.get()))
+            })?;
+        if table.config.format != TableFormat::Columnar {
+            return Err(ReadError::Storage(StorageError::unsupported(format!(
+                "skip-index probes require a columnar table (got {})",
+                table.config.name
+            ))));
+        }
+
+        let probe_field_id = match probe {
+            SkipIndexProbe::Key(_) => None,
+            SkipIndexProbe::FieldEquals { field, .. } => {
+                let schema = table.config.schema.as_ref().ok_or_else(|| {
+                    ReadError::Storage(StorageError::corruption(format!(
+                        "columnar table {} is missing a schema",
+                        table.config.name
+                    )))
+                })?;
+                let validation = SchemaValidation::new(schema).map_err(ReadError::Storage)?;
+                Some(
+                    validation
+                        .field_ids_by_name
+                        .get(field)
+                        .copied()
+                        .ok_or_else(|| {
+                            ReadError::Storage(StorageError::unsupported(format!(
+                                "columnar table {} does not contain column {}",
+                                table.config.name, field
+                            )))
+                        })?,
+                )
+            }
+        };
+
+        let live = self.sstables_read().live.clone();
+        let mut results = Vec::new();
+        for sstable in live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
+        {
+            if !self.inner.config.hybrid_read.skip_indexes_enabled {
+                results.push(SkipIndexProbeResult {
+                    local_id: sstable.meta.local_id.clone(),
+                    used_indexes: Vec::new(),
+                    may_match: true,
+                    fallback_to_base: false,
+                });
+                continue;
+            }
+            results.push(
+                sstable
+                    .probe_skip_indexes_columnar(
+                        &self.inner.columnar_read_context,
+                        probe,
+                        probe_field_id,
+                    )
+                    .await
+                    .map_err(ReadError::Storage)?,
+            );
+        }
+
+        Ok(results)
     }
 
     pub(super) fn release_snapshot_registration(&self, id: u64) {
