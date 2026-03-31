@@ -523,12 +523,24 @@ impl Db {
         &self.inner.execution_profile
     }
 
+    pub fn execution_identity(&self) -> &str {
+        &self.inner.execution_identity
+    }
+
     pub fn resource_manager(&self) -> Arc<dyn ResourceManager> {
         self.inner.resource_manager.clone()
     }
 
     pub fn resource_manager_snapshot(&self) -> ResourceManagerSnapshot {
         self.inner.resource_manager.snapshot()
+    }
+
+    pub fn execution_placement_report(&self) -> crate::DbExecutionPlacementReport {
+        crate::execution::build_db_execution_placement_report(
+            &self.inner.resource_manager.snapshot(),
+            self.execution_identity(),
+            self.execution_profile(),
+        )
     }
 
     pub(super) fn execution_domain_budget(
@@ -546,7 +558,7 @@ impl Db {
     pub fn tag_user_foreground_work<T>(&self, work: T) -> DomainTaggedWork<T> {
         let request = self.execution_profile().work_request(
             ExecutionDomainOwner::Database {
-                name: self.telemetry_db_name(),
+                name: self.execution_identity().to_string(),
             },
             ExecutionLane::UserForeground,
             crate::ContentionClass::UserData,
@@ -557,7 +569,7 @@ impl Db {
     pub fn tag_control_plane_work<T>(&self, work: T) -> DomainTaggedWork<T> {
         let request = self.execution_profile().work_request(
             ExecutionDomainOwner::Subsystem {
-                database: Some(self.telemetry_db_name()),
+                database: Some(self.execution_identity().to_string()),
                 name: "control-plane".to_string(),
             },
             ExecutionLane::ControlPlane,
@@ -1139,12 +1151,12 @@ impl Db {
     pub fn tag_pending_work(&self, work: PendingWork) -> DomainTaggedWork<PendingWork> {
         let owner = if work.work_type == PendingWorkType::Backup {
             ExecutionDomainOwner::Subsystem {
-                database: Some(self.telemetry_db_name()),
+                database: Some(self.execution_identity().to_string()),
                 name: "backup".to_string(),
             }
         } else {
             ExecutionDomainOwner::Database {
-                name: self.telemetry_db_name(),
+                name: self.execution_identity().to_string(),
             }
         };
         let request = self

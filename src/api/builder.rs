@@ -271,6 +271,7 @@ pub struct DbBuilder {
     settings: Option<DbSettings>,
     hybrid_read: Option<HybridReadConfig>,
     execution_profile: Option<DbExecutionProfile>,
+    execution_identity: Option<String>,
     file_system: Option<Arc<dyn FileSystem>>,
     object_store: Option<Arc<dyn ObjectStore>>,
     clock: Option<Arc<dyn Clock>>,
@@ -369,6 +370,27 @@ impl DbBuilder {
         self
     }
 
+    pub fn execution_identity(mut self, execution_identity: impl Into<String>) -> Self {
+        self.execution_identity = Some(execution_identity.into());
+        self
+    }
+
+    pub fn colocated_database(
+        mut self,
+        deployment: &crate::execution::ColocatedDeployment,
+        database: impl Into<String>,
+    ) -> Result<Self, OpenError> {
+        let database = database.into();
+        if deployment.execution_profile(&database).is_none() {
+            return Err(OpenError::InvalidConfig(format!(
+                "colocated deployment does not declare database '{database}'"
+            )));
+        }
+        self.resource_manager = Some(deployment.resource_manager());
+        self.execution_identity = Some(database);
+        Ok(self)
+    }
+
     pub fn hybrid_read_config(mut self, hybrid_read: HybridReadConfig) -> Self {
         self.hybrid_read = Some(hybrid_read);
         self
@@ -408,6 +430,9 @@ impl DbBuilder {
         dependencies = dependencies.with_execution_profile(
             execution_profile_override.unwrap_or(settings_execution_profile),
         );
+        if let Some(execution_identity) = self.execution_identity {
+            dependencies = dependencies.with_execution_identity(execution_identity);
+        }
         let config = DbConfig {
             storage,
             hybrid_read: hybrid_read_override.unwrap_or(settings_hybrid_read),
@@ -428,6 +453,7 @@ impl fmt::Debug for DbBuilder {
             .field("settings", &self.settings)
             .field("hybrid_read", &self.hybrid_read)
             .field("execution_profile", &self.execution_profile)
+            .field("execution_identity", &self.execution_identity)
             .field(
                 "file_system",
                 &self.file_system.as_ref().map(|_| "<dyn FileSystem>"),

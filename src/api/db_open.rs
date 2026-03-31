@@ -14,6 +14,10 @@ impl Db {
         async move {
             Self::validate_storage_config(&config.storage)?;
             Self::validate_hybrid_read_config(&config.hybrid_read)?;
+            let execution_identity = dependencies
+                .execution_identity()
+                .unwrap_or(db_name.as_str())
+                .to_string();
             let scheduler = config
                 .scheduler
                 .clone()
@@ -23,17 +27,17 @@ impl Db {
             let execution_profile = Self::resolve_execution_profile(
                 &resource_manager,
                 dependencies.execution_profile().clone(),
-                &db_name,
+                &execution_identity,
             );
             Self::register_execution_profile_domains(
                 &resource_manager,
-                &db_name,
+                &execution_identity,
                 &execution_profile,
             );
             Self::ensure_control_plane_domain_registered(
                 &resource_manager,
                 &execution_profile,
-                &db_name,
+                &execution_identity,
             );
             if let StorageConfig::Tiered(tiered) = &config.storage {
                 Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
@@ -114,6 +118,7 @@ impl Db {
             let db = Self {
                 inner: Arc::new(DbInner {
                     config,
+                    execution_identity,
                     scheduler,
                     resource_manager,
                     execution_profile,
@@ -169,6 +174,7 @@ impl Db {
             crate::execution::ExecutionDomainOwner::Database {
                 name: db_name.to_string(),
             },
+            crate::execution::ExecutionLane::UserForeground,
             &execution_profile.foreground,
         );
         let background = Self::resolve_execution_lane(
@@ -176,6 +182,7 @@ impl Db {
             crate::execution::ExecutionDomainOwner::Database {
                 name: db_name.to_string(),
             },
+            crate::execution::ExecutionLane::UserBackground,
             &execution_profile.background,
         );
         let control_plane = Self::resolve_execution_lane(
@@ -184,6 +191,7 @@ impl Db {
                 database: Some(db_name.to_string()),
                 name: "control-plane".to_string(),
             },
+            crate::execution::ExecutionLane::ControlPlane,
             &execution_profile.control_plane,
         );
         execution_profile
@@ -195,10 +203,12 @@ impl Db {
     fn resolve_execution_lane(
         resource_manager: &Arc<dyn crate::execution::ResourceManager>,
         owner: crate::execution::ExecutionDomainOwner,
+        lane: crate::execution::ExecutionLane,
         binding: &crate::execution::ExecutionLaneBinding,
     ) -> crate::execution::ExecutionLaneBinding {
         let assignment = resource_manager.assign(crate::execution::PlacementRequest {
             owner,
+            lane,
             preferred_domain: binding.domain.clone(),
             requested_budget: crate::execution::ExecutionDomainBudget::default(),
             placement: crate::execution::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
@@ -237,50 +247,23 @@ impl Db {
                 budget: crate::execution::ExecutionDomainBudget::default(),
                 placement: crate::execution::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
                 metadata: BTreeMap::from([
+                    ("terracedb.execution.lane".to_string(), lane_key.to_string()),
                     (
                         format!("terracedb.execution.lane.{lane_key}"),
                         "true".to_string(),
                     ),
                     (
                         "terracedb.execution.durability".to_string(),
-                        Self::durability_class_name(&binding.durability_class).to_string(),
+                        crate::execution::durability_class_metadata_value(
+                            &binding.durability_class,
+                        ),
+                    ),
+                    (
+                        "terracedb.execution.database".to_string(),
+                        db_name.to_string(),
                     ),
                 ]),
             });
-        }
-    }
-
-    fn durability_class_name(durability_class: &crate::execution::DurabilityClass) -> &'static str {
-        match durability_class {
-            crate::execution::DurabilityClass::UserData => "user-data",
-            crate::execution::DurabilityClass::ControlPlane => "control-plane",
-            crate::execution::DurabilityClass::Deferred => "deferred",
-            crate::execution::DurabilityClass::RemotePrimary => "remote-primary",
-            crate::execution::DurabilityClass::Custom(_) => "custom",
-        }
-    }
-
-    fn reserved_control_plane_budget() -> crate::execution::ExecutionDomainBudget {
-        crate::execution::ExecutionDomainBudget {
-            cpu: crate::execution::DomainCpuBudget {
-                worker_slots: Some(1),
-                weight: Some(1),
-            },
-            memory: crate::execution::DomainMemoryBudget {
-                total_bytes: Some(64 * 1024),
-                cache_bytes: None,
-                mutable_bytes: Some(64 * 1024),
-            },
-            io: crate::execution::DomainIoBudget {
-                local_concurrency: Some(1),
-                local_bytes_per_second: Some(256 * 1024),
-                remote_concurrency: Some(1),
-                remote_bytes_per_second: Some(256 * 1024),
-            },
-            background: crate::execution::DomainBackgroundBudget {
-                task_slots: Some(1),
-                max_in_flight_bytes: Some(256 * 1024),
-            },
         }
     }
 
@@ -297,24 +280,37 @@ impl Db {
         resource_manager.register_domain(crate::execution::ExecutionDomainSpec {
             path,
             owner: crate::execution::ExecutionDomainOwner::ProcessControl,
-            budget: Self::reserved_control_plane_budget(),
+            budget: crate::execution::reserved_control_plane_budget(),
             placement: crate::execution::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
             metadata: BTreeMap::from([
                 ("reserved".to_string(), "true".to_string()),
                 (
                     "durability_class".to_string(),
-                    Self::durability_class_name(&execution_profile.control_plane.durability_class)
-                        .to_string(),
+                    crate::execution::durability_class_metadata_value(
+                        &execution_profile.control_plane.durability_class,
+                    ),
+                ),
+                (
+                    "terracedb.execution.lane".to_string(),
+                    crate::execution::execution_lane_name(
+                        crate::execution::ExecutionLane::ControlPlane,
+                    )
+                    .to_string(),
                 ),
                 ("db_name".to_string(), db_name.to_string()),
+                (
+                    "terracedb.execution.database".to_string(),
+                    db_name.to_string(),
+                ),
                 (
                     "terracedb.execution.lane.control-plane".to_string(),
                     "true".to_string(),
                 ),
                 (
                     "terracedb.execution.durability".to_string(),
-                    Self::durability_class_name(&execution_profile.control_plane.durability_class)
-                        .to_string(),
+                    crate::execution::durability_class_metadata_value(
+                        &execution_profile.control_plane.durability_class,
+                    ),
                 ),
             ]),
         });

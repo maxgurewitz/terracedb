@@ -82,18 +82,21 @@ pub use error::{
     SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
 };
 pub use execution::{
-    ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec, ContentionClass, DbExecutionProfile,
-    DomainBackgroundBudget, DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot,
-    DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork, DurabilityClass,
-    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainContentionSnapshot,
-    ExecutionDomainInvariant, ExecutionDomainInvariantSet, ExecutionDomainLifecycleEvent,
-    ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
-    ExecutionDomainPlacement, ExecutionDomainSnapshot, ExecutionDomainSpec, ExecutionDomainState,
-    ExecutionDomainUsageSnapshot, ExecutionLane, ExecutionLaneBinding, ExecutionResourceKind,
-    ExecutionResourceUsage, InMemoryDomainBudgetOracle, InMemoryResourceManager,
-    PlacementAssignment, PlacementPolicy, PlacementRequest, PreferRequestedDomainPolicy,
-    ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot, WorkPlacementRequest,
-    WorkRuntimeTag,
+    ColocatedDatabasePlacement, ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec,
+    ColocatedDeployment, ColocatedDeploymentBuilder, ColocatedDeploymentError,
+    ColocatedDeploymentPlacementPolicy, ColocatedDeploymentReport, ColocatedSubsystemPlacement,
+    ContentionClass, DbExecutionPlacementReport, DbExecutionProfile, DomainBackgroundBudget,
+    DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot, DomainCpuBudget, DomainIoBudget,
+    DomainMemoryBudget, DomainTaggedWork, DurabilityClass, ExecutionDomainBacklogSnapshot,
+    ExecutionDomainBudget, ExecutionDomainContentionSnapshot, ExecutionDomainInvariant,
+    ExecutionDomainInvariantSet, ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook,
+    ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSnapshot,
+    ExecutionDomainSpec, ExecutionDomainState, ExecutionDomainUsageSnapshot, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionPlacementDecision,
+    ExecutionResourceKind, ExecutionResourceUsage, InMemoryDomainBudgetOracle,
+    InMemoryResourceManager, PlacementAssignment, PlacementPolicy, PlacementRequest,
+    PlacementTarget, PreferRequestedDomainPolicy, ResourceAdmissionDecision, ResourceManager,
+    ResourceManagerSnapshot, WorkPlacementRequest, WorkRuntimeTag,
 };
 #[doc(hidden)]
 pub use failpoints::{
