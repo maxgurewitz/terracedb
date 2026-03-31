@@ -11,6 +11,7 @@ members = [
     "crates/terracedb-relays",
     "crates/terracedb-simulation",
     "crates/terracedb-vfs",
+    "crates/terracedb-sandbox",
     "crates/turmoil-determinism",
     "crates/terracedb-projections",
     "crates/terracedb-workflows",
