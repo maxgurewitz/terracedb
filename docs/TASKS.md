@@ -2924,6 +2924,220 @@ Add a sibling example to `examples/todo-api` that demonstrates why execution dom
 
 ---
 
+## Phase 13 — Unified-log pressure, flush reclamation, and adaptive write admission
+
+**Parallelization:** T67 first. After that, T68, T69, and T70 can proceed in parallel against the frozen interfaces. T71 depends on T69 + T70 + T66. T72 depends on T68 + T69 + T70 + T71.
+
+**Phase rule:** T67 freezes the accounting and admission interfaces first, and the rest of the phase should maximize parallel implementation against those fixed seams rather than re-opening the core contracts. This phase changes when the engine chooses to flush, throttle, or stall; it must not change commit ordering, visibility rules, durability semantics, crash-recovery results, or the logical answers returned by reads/scans.
+
+**Simulation rule:** Every task in this phase must extend the relevant deterministic oracle/cut-point/simulation harness in the same change as the production-path change. Do not defer task-local simulation to the capstone; T72 is additive whole-system hardening, not a substitute for self-contained coverage in T68-T71.
+
+**Adoption rule:** Treat the existing L0-driven controls as the conservative fallback, not something to delete immediately. The new unified-log pressure and fine-grained memory accounting signals should layer in alongside L0/compaction signals, with bounded default thresholds and explicit observability before more aggressive policies become the default. Domain-local soft policy may differ by workload shape — for example, stricter OLTP-oriented domains and looser OLAP-ingest-oriented domains — but process-wide hard guardrails for memory exhaustion, unified-log exhaustion, and liveness still override domain-local preferences.
+
+### T67. Freeze unified-log pressure, flush-reclaim, and admission-control contracts
+
+**Depends on:** T33, T59, T62
+
+**Description**
+
+Define the long-term contracts for pressure-aware flushing and write admission before implementation branches diverge. The goal is to make the engine reason explicitly about dirty bytes, queued-for-flush bytes, bytes already being flushed, and unified-log pressure without conflating those signals or changing correctness semantics.
+
+**Implementation steps**
+
+1. Extend the deterministic simulation/oracle harness first with a fake unified-log pressure model that can represent:
+   - mutable dirty bytes,
+   - immutable bytes queued for flush,
+   - immutable bytes already in-flight to flush,
+   - unified-log bytes pinned by unflushed state,
+   - oldest-unflushed age, and
+   - estimated relief from candidate flushes.
+2. Freeze a `PressureStats` / `FlushPressureCandidate` / `AdmissionSignals`-style interface that distinguishes:
+   - current dirty bytes versus already-flushing bytes,
+   - memory pressure versus unified-log pressure,
+   - local per-table/per-domain signals versus process-wide totals, and
+   - pressure signals versus correctness metadata such as durable watermarks.
+3. Define the crash/restart and failed-flush reconstruction rules up front so pressure accounting can be rebuilt deterministically from manifests, memtables, and unified-log state after reopen.
+4. Define the relationship to execution domains and the resource manager: domains may budget mutable memory and unified-log pressure, but the single-DB/single-domain default must remain simple and conservative. Make it explicit that domains may choose different soft policies by workload shape, while process-wide hard safety guardrails remain global.
+5. Freeze the scheduler/admission seam for pressure-aware flush scoring and write throttling/stalling so later tasks can implement policy without reworking the public contracts.
+6. Add compile-time stubs and placeholder types so the accounting, scheduler, and observability work can proceed in parallel against the same fixed interface.
+
+**Verification**
+
+- Compile-only tests proving the new pressure/admission contracts compose with the existing scheduler, maintenance, and DB builder APIs.
+- Deterministic smoke tests proving fake runtimes can tag work with pressure signals and reconstruct those signals after simulated restart.
+- Invariant tests making it explicit that changing pressure thresholds changes latency/backlog behavior only, not logical DB outcomes.
+
+---
+
+### T68. Implement fine-grained dirty-byte, flushing-byte, and unified-log pinning accounting
+
+**Depends on:** T67
+
+**Description**
+
+Implement the accounting substrate needed for pressure-aware flushing. This task owns the production tracking of dirty bytes, queued-for-flush bytes, bytes already being flushed, and unified-log pressure pinned by unflushed state across steady-state operation, failures, and restart.
+
+**Implementation steps**
+
+1. Extend the simulation/oracle harness first so it models accounting transitions across:
+   - commit into the mutable memtable,
+   - memtable rotation,
+   - flush start,
+   - flush completion,
+   - flush failure, and
+   - crash/restart reconstruction.
+2. Extend memtable / immutable-memtable state so the engine tracks at least:
+   - mutable dirty bytes,
+   - immutable queued bytes,
+   - immutable flushing bytes,
+   - per-table and per-domain contributions, and
+   - any unified-log segment/range or sequence-watermark information needed to estimate pinned log pressure.
+3. Implement deterministic reconstruction of those counters on open/recovery instead of trusting stale in-memory state.
+4. Expose the accounting through runtime stats/telemetry/introspection without turning it into correctness metadata.
+5. Keep the accounting precise enough to distinguish "still dirty" bytes from bytes already being drained by an in-flight flush.
+
+**Verification**
+
+- Accounting tests proving bytes transition cleanly between mutable, queued, flushing, and reclaimed states without double-counting.
+- Crash/restart tests proving pressure counters reconstruct deterministically after reopen and after failed flushes.
+- Simulation tests proving the same write history yields the same pressure-accounting trace across replay of the same seed.
+
+---
+
+### T69. Implement pressure-aware flush candidate scoring and forced-flush guardrails
+
+**Depends on:** T67
+
+**Description**
+
+Teach the maintenance loop to choose flush work based on actual relief value, not just the existence of immutable memtables. This task owns pressure-aware flush scoring, age-sensitive guardrails, and conservative forced-flush rules that react earlier than coarse L0-only pressure.
+
+**Implementation steps**
+
+1. Extend the deterministic maintenance harness first with a pressure-aware flush oracle that scores candidate flushes by:
+   - unified-log bytes likely to be reclaimed,
+   - dirty-byte relief,
+   - oldest-unflushed age,
+   - per-table/per-domain budget pressure, and
+   - interaction with existing L0/compaction guardrails.
+2. Enrich pending flush candidates with the estimated relief metadata needed by the scheduler/maintenance loop rather than surfacing only a raw byte count.
+3. Implement pressure-aware flush prioritization so the engine can prefer the flush that best relieves unified-log and memory pressure, while preserving conservative fallback behavior when the richer signals are unavailable.
+4. Add forced-flush rules based on unified-log pressure, dirty-byte pressure, and age ceilings, while retaining L0 hard ceilings as an independent safety guardrail.
+5. Surface operator-facing diagnostics that explain why a flush was selected or forced.
+
+**Verification**
+
+- Deterministic tests proving the chosen flush order changes when pressure relief changes, even if raw immutable-byte counts are similar.
+- Mixed-workload simulation tests proving pressure-aware flush selection reduces pathological stalls compared with L0-only heuristics while preserving correctness.
+- Guardrail tests proving the engine still forces progress when the scheduler defers work indefinitely.
+
+---
+
+### T70. Implement multi-signal write admission and domain-aware pressure budgeting
+
+**Depends on:** T67
+
+**Description**
+
+Teach the write-admission path to react to multiple pressure signals together instead of waiting mostly for L0 count to become unhealthy. This task owns adaptive throttling/stalling based on unified-log pressure, fine-grained memory pressure, flush backlog, and optional domain-local budgets.
+
+**Implementation steps**
+
+1. Extend the deterministic scheduler/admission harness first so it can model multi-signal throttling decisions using:
+   - unified-log pinned bytes,
+   - mutable dirty bytes,
+   - immutable queued/flushing bytes,
+   - oldest-unflushed age,
+   - L0/compaction debt, and
+   - optional per-domain budget pressure.
+2. Implement admission heuristics that combine those signals into:
+   - no throttle,
+   - rate limit, or
+   - stall,
+   while keeping the default thresholds conservative and debuggable.
+3. Integrate the new admission signals with execution domains / resource-manager budgets so one busy DB or domain cannot pin all mutable memory or unified-log headroom for the process.
+4. Support workload-shaped soft policy at the domain level, so OLTP-oriented domains can prefer earlier throttling/flush pressure relief while OLAP-ingest-oriented domains can tolerate larger buffers and later intervention.
+5. Preserve process-wide hard guardrails above all domain policy so global memory exhaustion, unified-log exhaustion, and liveness threats still force action even when a domain's preferred policy is more relaxed.
+6. Preserve a simple single-DB path where the engine can run without explicit domain configuration and still benefit from the richer pressure model.
+7. Add observability for which signal triggered throttling/stalling and how much pressure relief is needed to recover.
+
+**Verification**
+
+- Deterministic tests proving write admission reacts before the system reaches pathological L0 pressure when unified-log or memory pressure is already high.
+- Multi-DB/domain simulation tests proving one workload cannot monopolize pressure budgets and force unrelated tenants into avoidable stalls.
+- Equivalence tests proving richer admission signals change only performance/backlog behavior, not committed results.
+
+---
+
+### T71. Extend the example app to demonstrate pressure-aware flushing and write admission
+
+**Depends on:** T69, T70, T66
+
+**Description**
+
+Extend the domains example so users can see pressure-aware flushing and write admission in practice. The example should stay small and teachable while showing how dirty bytes, in-flight flush bytes, unified-log pressure, and domain budgets interact under a bursty workload.
+
+**Implementation steps**
+
+1. Extend the phase-local simulation/example harness first with an example-oriented workload model covering:
+   - a bursty primary writer,
+   - a lower-priority helper workload,
+   - slower background flush capacity, and
+   - a visible recovery path once pressure is relieved.
+2. Extend the domains sample app (or its successor example) so it surfaces:
+   - current dirty bytes,
+   - queued versus already-flushing bytes,
+   - unified-log pressure,
+   - active throttle/stall state, and
+   - the configured domain/resource budget layout.
+3. Demonstrate conservative defaults first, then optionally show a more aggressive profile where domain-aware budgets protect the primary workload sooner.
+4. Document clearly that these controls affect latency, backlog, and resource isolation rather than logical correctness.
+
+**Verification**
+
+- Example simulation tests proving the primary workload remains correct while pressure-aware throttling/flush selection changes backlog and latency behavior.
+- Example integration tests proving the surfaced pressure metrics and throttle states match the documented workload transitions.
+- Example-level equivalence tests proving conservative and aggressive profiles return the same logical answers.
+
+---
+
+### T72. Build the capstone whole-system simulation and chaos suite for pressure-aware flushing
+
+**Depends on:** T68, T69, T70, T71
+
+**Description**
+
+Add the capstone deterministic hardening pass for the pressure-aware flush/admission subsystem. This task owns the whole-system matrix across group commit, deferred durability, unified-log pressure, flush selection, multi-DB/domain contention, and restart/failure handling. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact.
+
+**Implementation steps**
+
+1. Compose the per-task pressure simulation/oracle helpers into a whole-system harness that can run:
+   - bursty write spikes,
+   - slow or failed flushes,
+   - group-commit and deferred-durability modes,
+   - multiple colocated DB/domain workloads, and
+   - restart/recovery under sustained pressure.
+2. Add long-running deterministic campaigns that combine:
+   - unified-log pressure plus L0/compaction debt,
+   - flush failures plus retry/reopen,
+   - pressure spikes during control-plane and user-data contention, and
+   - budget reconfiguration in the presence of in-flight flush work.
+3. Add a real-runtime chaos layer where appropriate, including injected flush stalls, delayed durability completion, and abrupt budget tightening events that complement the deterministic harness without weakening reproducibility requirements.
+4. Verify the full invariants matrix:
+   - no correctness change under different pressure thresholds,
+   - pressure counters eventually converge after work completes,
+   - domain-local soft policy differences change performance behavior only, while global hard guardrails still preserve liveness,
+   - protected domains retain progress under load, and
+   - recovery remains deterministic and fail-closed.
+
+**Verification**
+
+- Large-seed deterministic simulation campaigns proving pressure-aware flushing and admission remain reproducible across restart, failure, and multi-tenant contention scenarios.
+- Cross-feature chaos tests proving flush stalls, retry paths, and budget tightening still preserve deterministic recovery and liveness.
+- End-to-end invariant tests proving the subsystem changes performance behavior only, not logical DB outcomes.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
@@ -3064,6 +3278,18 @@ At this point the system should additionally support:
 - shard-ready placement/resource foundations without claiming completed physical data sharding,
 - whole-system deterministic simulation and chaos coverage across domain composition, and
 - a small example app that demonstrates two colocated workloads plus protected control-plane progress.
+
+### Milestone M — Pressure-aware flushing and adaptive admission
+Complete: T67–T72
+
+At this point the system should additionally support:
+- fixed interfaces for unified-log pressure, fine-grained memory accounting, and adaptive write-admission signals,
+- explicit distinction between dirty bytes, queued-for-flush bytes, and bytes already being flushed,
+- pressure-aware flush selection that optimizes for actual relief value rather than only immutable presence or coarse L0 heuristics,
+- adaptive throttling/stalling that considers unified-log pressure, memory pressure, flush backlog, and L0/compaction pressure together,
+- optional domain-aware pressure budgeting so one colocated workload cannot pin all mutable-memory or unified-log headroom,
+- whole-system deterministic simulation and chaos coverage for pressure spikes, failed flushes, and recovery, and
+- an example app that demonstrates pressure-aware flushing and admission without changing logical answers.
 
 ---
 
