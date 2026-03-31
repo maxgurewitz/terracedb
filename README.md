@@ -38,7 +38,7 @@ It supports long-lived workflow instances, durable trigger admission, timers, re
 
 ## Embedded virtual filesystem library
 
-The architecture also includes a planned **embedded virtual filesystem library** on top of Terracedb.
+The repository also includes an **embedded virtual filesystem library** on top of Terracedb (`terracedb-vfs`).
 
 Its scope is intentionally narrow: provide an in-process virtual filesystem, small KV state, tool-run history, point-in-time snapshots, and copy-on-write overlays for AI-agent runtimes. Exposing that filesystem as a real host mount or network service is explicitly out of scope.
 
