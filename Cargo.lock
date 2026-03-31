@@ -2283,6 +2283,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-example-domains-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "serde",
+ "tempfile",
+ "terracedb",
+ "terracedb-records",
+ "terracedb-simulation",
+ "thiserror",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-example-retention-api"
 version = "0.1.0"
 dependencies = [

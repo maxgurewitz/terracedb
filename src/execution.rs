@@ -1,3 +1,13 @@
+//! Execution-domain contracts, placement helpers, and colocated deployment APIs.
+//!
+//! Most applications should define process-wide topology with [`ColocatedDeployment`]
+//! and then interact with execution domains through [`crate::Db`] helpers such as
+//! [`crate::Db::tag_user_foreground_work`], [`crate::Db::with_lane_usage`], and
+//! [`crate::Db::with_lane_backlog`].
+//!
+//! [`ResourceManager`] remains public as the low-level escape hatch for tests,
+//! simulations, and advanced integrations that need to manage domains directly.
+//!
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -16,6 +26,10 @@ pub struct ExecutionDomainPath {
 }
 
 impl ExecutionDomainPath {
+    /// Builds a path from slash-like segments.
+    ///
+    /// Empty segments are discarded. If the resulting path would be empty, the
+    /// process root (`process`) is returned.
     pub fn new<I, S>(segments: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -34,12 +48,14 @@ impl ExecutionDomainPath {
         Self { segments }
     }
 
+    /// Returns a one-segment root path.
     pub fn root(segment: impl Into<String>) -> Self {
         Self {
             segments: vec![segment.into()],
         }
     }
 
+    /// Returns a child path beneath this path.
     pub fn child(&self, segment: impl Into<String>) -> Self {
         let mut segments = self.segments.clone();
         let segment = segment.into();
@@ -49,24 +65,29 @@ impl ExecutionDomainPath {
         Self { segments }
     }
 
+    /// Borrows the ordered path segments.
     pub fn segments(&self) -> &[String] {
         &self.segments
     }
 
+    /// Formats the path as a slash-separated string.
     pub fn as_string(&self) -> String {
         self.segments.join("/")
     }
 
+    /// Returns `true` when this path has exactly one segment.
     pub fn is_root(&self) -> bool {
         self.segments.len() == 1
     }
 
+    /// Returns the parent path, or `None` for a root path.
     pub fn parent(&self) -> Option<Self> {
         (!self.is_root()).then(|| Self {
             segments: self.segments[..self.segments.len() - 1].to_vec(),
         })
     }
 
+    /// Returns every ancestor in order, including this path.
     pub fn lineage(&self) -> Vec<Self> {
         (1..=self.segments.len())
             .map(|len| Self {
@@ -75,6 +96,7 @@ impl ExecutionDomainPath {
             .collect()
     }
 
+    /// Returns `true` when `ancestor` is this path or one of its ancestors.
     pub fn is_same_or_descendant_of(&self, ancestor: &Self) -> bool {
         self.segments.starts_with(ancestor.segments())
     }
@@ -92,7 +114,7 @@ impl fmt::Display for ExecutionDomainPath {
     }
 }
 
-/// Logical owner that a domain or placement request belongs to.
+/// Logical owner that a domain, placement request, or runtime tag belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ExecutionDomainOwner {
     ProcessControl,
@@ -113,12 +135,14 @@ pub enum ExecutionDomainOwner {
     },
 }
 
+/// CPU budget contract for one execution domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainCpuBudget {
     pub worker_slots: Option<u32>,
     pub weight: Option<u32>,
 }
 
+/// Memory budget contract for one execution domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainMemoryBudget {
     pub total_bytes: Option<u64>,
@@ -126,6 +150,7 @@ pub struct DomainMemoryBudget {
     pub mutable_bytes: Option<u64>,
 }
 
+/// Local and remote I/O budget contract for one execution domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainIoBudget {
     pub local_concurrency: Option<u32>,
@@ -134,6 +159,7 @@ pub struct DomainIoBudget {
     pub remote_bytes_per_second: Option<u64>,
 }
 
+/// Background-work budget contract for one execution domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainBackgroundBudget {
     pub task_slots: Option<u32>,
@@ -141,6 +167,9 @@ pub struct DomainBackgroundBudget {
 }
 
 /// Per-domain resource budget contract.
+///
+/// Budgets are interpreted by the active [`PlacementPolicy`] and
+/// [`ResourceManager`]. `None` means "no explicit limit from this contract".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainBudget {
     pub cpu: DomainCpuBudget,
@@ -150,6 +179,9 @@ pub struct ExecutionDomainBudget {
 }
 
 /// Placement mode for a domain inside a process-wide resource manager.
+///
+/// Shared domains participate in weighted borrowing under a parent branch,
+/// while dedicated domains reserve their own slice of capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionDomainPlacement {
     SharedWeighted { weight: u32 },
@@ -162,7 +194,7 @@ impl Default for ExecutionDomainPlacement {
     }
 }
 
-/// Frozen execution-domain contract used by later placement backends.
+/// Frozen execution-domain contract registered with a [`ResourceManager`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainSpec {
     pub path: ExecutionDomainPath,
@@ -172,6 +204,7 @@ pub struct ExecutionDomainSpec {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Lifecycle state of a registered execution domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionDomainState {
     Registered,
@@ -180,6 +213,10 @@ pub enum ExecutionDomainState {
     Retired,
 }
 
+/// Direct resource usage charged against an execution domain.
+///
+/// This is the unit used for admission probes and leases. Aggregated snapshots
+/// also include descendant usage and backlog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResourceUsage {
     pub cpu_workers: u32,
@@ -272,8 +309,22 @@ impl ExecutionResourceUsage {
     fn metric_is_non_zero(value: u64) -> bool {
         value > 0
     }
+
+    fn contains(&self, other: ExecutionResourceUsage) -> bool {
+        self.cpu_workers >= other.cpu_workers
+            && self.memory_bytes >= other.memory_bytes
+            && self.cache_bytes >= other.cache_bytes
+            && self.mutable_bytes >= other.mutable_bytes
+            && self.local_io_concurrency >= other.local_io_concurrency
+            && self.local_io_bytes_per_second >= other.local_io_bytes_per_second
+            && self.remote_io_concurrency >= other.remote_io_concurrency
+            && self.remote_io_bytes_per_second >= other.remote_io_bytes_per_second
+            && self.background_tasks >= other.background_tasks
+            && self.background_in_flight_bytes >= other.background_in_flight_bytes
+    }
 }
 
+/// Direct backlog reported for an execution domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainBacklogSnapshot {
     pub queued_work_items: u32,
@@ -288,11 +339,17 @@ impl ExecutionDomainBacklogSnapshot {
         self.queued_bytes = self.queued_bytes.saturating_add(other.queued_bytes);
     }
 
+    /// Returns `true` when both tracked backlog counters are zero.
+    pub fn is_empty(&self) -> bool {
+        !self.is_non_zero()
+    }
+
     fn is_non_zero(&self) -> bool {
         self.queued_work_items > 0 || self.queued_bytes > 0
     }
 }
 
+/// Resource kinds that can block admission into a domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ExecutionResourceKind {
     CpuWorkers,
@@ -322,6 +379,7 @@ impl ExecutionResourceKind {
     ];
 }
 
+/// Aggregated usage snapshot for a domain, including direct backlog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainUsageSnapshot {
     pub cpu_workers_in_use: u32,
@@ -360,6 +418,7 @@ impl ExecutionDomainUsageSnapshot {
     }
 }
 
+/// Aggregate contention counters for a domain.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainContentionSnapshot {
     pub blocked_requests: u64,
@@ -392,6 +451,7 @@ impl ExecutionDomainContentionSnapshot {
     }
 }
 
+/// Materialized runtime snapshot for one execution domain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainSnapshot {
     pub spec: ExecutionDomainSpec,
@@ -403,6 +463,7 @@ pub struct ExecutionDomainSnapshot {
     pub contention: ExecutionDomainContentionSnapshot,
 }
 
+/// Domain lifecycle transitions emitted by a [`ResourceManager`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionDomainLifecycleEvent {
     Registered,
@@ -412,6 +473,7 @@ pub enum ExecutionDomainLifecycleEvent {
     Retired,
 }
 
+/// Hook that observes domain lifecycle changes.
 pub trait ExecutionDomainLifecycleHook: Send + Sync {
     fn on_event(&self, snapshot: &ExecutionDomainSnapshot, event: ExecutionDomainLifecycleEvent);
 }
@@ -426,6 +488,7 @@ pub enum DurabilityClass {
     Custom(String),
 }
 
+/// Logical runtime lane used by database code and scheduler work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ExecutionLane {
     UserForeground,
@@ -433,6 +496,7 @@ pub enum ExecutionLane {
     ControlPlane,
 }
 
+/// Coarse contention category attached to tagged work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ContentionClass {
     UserData,
@@ -441,6 +505,7 @@ pub enum ContentionClass {
     Recovery,
 }
 
+/// Maps one logical lane onto an execution domain and durability class.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionLaneBinding {
     pub domain: ExecutionDomainPath,
@@ -448,6 +513,7 @@ pub struct ExecutionLaneBinding {
 }
 
 impl ExecutionLaneBinding {
+    /// Builds a binding for a lane.
     pub fn new(domain: ExecutionDomainPath, durability_class: DurabilityClass) -> Self {
         Self {
             domain,
@@ -456,6 +522,7 @@ impl ExecutionLaneBinding {
     }
 }
 
+/// Returns the stable public name for an execution lane.
 pub fn execution_lane_name(lane: ExecutionLane) -> &'static str {
     match lane {
         ExecutionLane::UserForeground => "user-foreground",
@@ -472,6 +539,7 @@ fn execution_lane_domain_segment(lane: ExecutionLane) -> &'static str {
     }
 }
 
+/// Serializes a durability class into metadata-friendly text.
 pub fn durability_class_metadata_value(durability_class: &DurabilityClass) -> String {
     match durability_class {
         DurabilityClass::UserData => "user-data".to_string(),
@@ -482,6 +550,7 @@ pub fn durability_class_metadata_value(durability_class: &DurabilityClass) -> St
     }
 }
 
+/// Parses [`durability_class_metadata_value`] output back into a durability class.
 pub fn durability_class_from_metadata_value(value: &str) -> DurabilityClass {
     match value {
         "user-data" => DurabilityClass::UserData,
@@ -495,6 +564,7 @@ pub fn durability_class_from_metadata_value(value: &str) -> DurabilityClass {
     }
 }
 
+/// Returns the conservative default budget reserved for control-plane progress.
 pub fn reserved_control_plane_budget() -> ExecutionDomainBudget {
     ExecutionDomainBudget {
         cpu: DomainCpuBudget {
@@ -520,6 +590,9 @@ pub fn reserved_control_plane_budget() -> ExecutionDomainBudget {
 }
 
 /// Default execution and durability bindings for one database runtime.
+///
+/// Most applications will read this through [`crate::Db::execution_profile`] or
+/// declare it indirectly through [`ColocatedDatabasePlacement`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbExecutionProfile {
     pub foreground: ExecutionLaneBinding,
@@ -547,21 +620,25 @@ impl Default for DbExecutionProfile {
 }
 
 impl DbExecutionProfile {
+    /// Replaces the foreground binding.
     pub fn with_foreground(mut self, binding: ExecutionLaneBinding) -> Self {
         self.foreground = binding;
         self
     }
 
+    /// Replaces the background binding.
     pub fn with_background(mut self, binding: ExecutionLaneBinding) -> Self {
         self.background = binding;
         self
     }
 
+    /// Replaces the control-plane binding.
     pub fn with_control_plane(mut self, binding: ExecutionLaneBinding) -> Self {
         self.control_plane = binding;
         self
     }
 
+    /// Returns the binding for one logical lane.
     pub fn binding(&self, lane: ExecutionLane) -> &ExecutionLaneBinding {
         match lane {
             ExecutionLane::UserForeground => &self.foreground,
@@ -570,6 +647,7 @@ impl DbExecutionProfile {
         }
     }
 
+    /// Builds a placement request for tagged user or subsystem work.
     pub fn work_request(
         &self,
         owner: ExecutionDomainOwner,
@@ -585,6 +663,7 @@ impl DbExecutionProfile {
         }
     }
 
+    /// Builds a placement request for scheduler-owned pending work.
     pub fn pending_work_request(
         &self,
         owner: ExecutionDomainOwner,
@@ -609,6 +688,7 @@ impl DbExecutionProfile {
     }
 }
 
+/// Placement request built from a database execution profile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkPlacementRequest {
     pub owner: ExecutionDomainOwner,
@@ -617,6 +697,7 @@ pub struct WorkPlacementRequest {
     pub binding: ExecutionLaneBinding,
 }
 
+/// Resolved runtime tag attached to work after placement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkRuntimeTag {
     pub owner: ExecutionDomainOwner,
@@ -626,6 +707,7 @@ pub struct WorkRuntimeTag {
     pub durability_class: DurabilityClass,
 }
 
+/// Work value paired with a runtime execution tag.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainTaggedWork<T> {
     pub work: T,
@@ -633,10 +715,12 @@ pub struct DomainTaggedWork<T> {
 }
 
 impl<T> DomainTaggedWork<T> {
+    /// Wraps a work value with a previously computed runtime tag.
     pub fn new(work: T, tag: WorkRuntimeTag) -> Self {
         Self { work, tag }
     }
 
+    /// Maps the inner work value while preserving the execution tag.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> DomainTaggedWork<U> {
         DomainTaggedWork {
             work: f(self.work),
@@ -696,9 +780,12 @@ pub struct PlacementAssignment {
     pub default_durability_class: DurabilityClass,
 }
 
+/// Strategy hook that maps owner/lane requests onto concrete domains.
 pub trait PlacementPolicy: Send + Sync {
+    /// Returns a stable policy name for reports and observability.
     fn name(&self) -> &'static str;
 
+    /// Resolves placement for one request against the current manager snapshot.
     fn assign(
         &self,
         request: &PlacementRequest,
@@ -735,6 +822,7 @@ impl fmt::Debug for PreferRequestedDomainPolicy {
     }
 }
 
+/// Stable key for one owner/lane pair inside a placement policy.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlacementTarget {
     pub owner: ExecutionDomainOwner,
@@ -742,11 +830,13 @@ pub struct PlacementTarget {
 }
 
 impl PlacementTarget {
+    /// Builds a placement target.
     pub fn new(owner: ExecutionDomainOwner, lane: ExecutionLane) -> Self {
         Self { owner, lane }
     }
 }
 
+/// Declares how one logical lane should be placed and budgeted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionLanePlacementConfig {
     pub binding: ExecutionLaneBinding,
@@ -756,10 +846,12 @@ pub struct ExecutionLanePlacementConfig {
 }
 
 impl ExecutionLanePlacementConfig {
+    /// Creates a shared lane binding with weight `1`.
     pub fn shared(domain: ExecutionDomainPath, durability_class: DurabilityClass) -> Self {
         Self::shared_weighted(domain, durability_class, 1)
     }
 
+    /// Creates a shared lane binding with an explicit borrowing weight.
     pub fn shared_weighted(
         domain: ExecutionDomainPath,
         durability_class: DurabilityClass,
@@ -775,6 +867,7 @@ impl ExecutionLanePlacementConfig {
         }
     }
 
+    /// Creates a dedicated lane binding with reserved budget.
     pub fn reserved(
         domain: ExecutionDomainPath,
         durability_class: DurabilityClass,
@@ -788,17 +881,22 @@ impl ExecutionLanePlacementConfig {
         }
     }
 
+    /// Overrides the budget attached to this lane.
     pub fn with_budget(mut self, budget: ExecutionDomainBudget) -> Self {
         self.budget = budget;
         self
     }
 
+    /// Adds free-form metadata preserved in the registered domain spec.
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
     }
 }
 
+/// Colocated placement recipe for one database.
+///
+/// This is the main declaration type used by [`ColocatedDeploymentBuilder`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColocatedDatabasePlacement {
     pub name: String,
@@ -867,6 +965,7 @@ impl ShardReadyPlacementLayout {
 }
 
 impl ColocatedDatabasePlacement {
+    /// Builds a placement recipe from explicit lane configs.
     pub fn new(
         name: impl Into<String>,
         foreground: ExecutionLanePlacementConfig,
@@ -882,6 +981,10 @@ impl ColocatedDatabasePlacement {
         }
     }
 
+    /// Returns the default colocated profile for one database.
+    ///
+    /// Foreground and background lanes share parent capacity, while the
+    /// control plane gets a reserved dedicated slice.
     pub fn shared(name: impl Into<String>) -> Self {
         let name = name.into();
         let root = Self::database_root(&name);
@@ -903,6 +1006,7 @@ impl ColocatedDatabasePlacement {
         )
     }
 
+    /// Returns a helper-oriented profile intended for secondary analytics work.
     pub fn analytics_helper(name: impl Into<String>) -> Self {
         let name = name.into();
         let mut placement = Self::shared(name);
@@ -915,6 +1019,7 @@ impl ColocatedDatabasePlacement {
         placement
     }
 
+    /// Returns a profile whose naming scheme leaves room for future shard paths.
     pub fn shard_ready(name: impl Into<String>) -> Self {
         let layout = ShardReadyPlacementLayout::new(name.into());
         let mut placement = Self::new(
@@ -948,6 +1053,7 @@ impl ColocatedDatabasePlacement {
         placement
     }
 
+    /// Converts the placement recipe into the lane bindings a [`crate::Db`] will use.
     pub fn execution_profile(&self) -> DbExecutionProfile {
         DbExecutionProfile {
             foreground: self.foreground.binding.clone(),
@@ -956,16 +1062,19 @@ impl ColocatedDatabasePlacement {
         }
     }
 
+    /// Adds free-form placement metadata.
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
     }
 
+    /// Returns the default root path used by colocated database profiles.
     pub fn database_root(name: &str) -> ExecutionDomainPath {
         ExecutionDomainPath::new(["process", "dbs", name])
     }
 }
 
+/// Placement recipe for a subsystem that should participate in the same process budget.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColocatedSubsystemPlacement {
     pub database: Option<String>,
@@ -975,6 +1084,7 @@ pub struct ColocatedSubsystemPlacement {
 }
 
 impl ColocatedSubsystemPlacement {
+    /// Declares a subsystem attached to one colocated database.
     pub fn database_local(
         database: impl Into<String>,
         name: impl Into<String>,
@@ -989,6 +1099,7 @@ impl ColocatedSubsystemPlacement {
         }
     }
 
+    /// Declares a process-wide subsystem shared by all colocated databases.
     pub fn process_local(
         name: impl Into<String>,
         lane: ExecutionLane,
@@ -1002,6 +1113,7 @@ impl ColocatedSubsystemPlacement {
         }
     }
 
+    /// Returns the placement-policy target for this subsystem.
     pub fn target(&self) -> PlacementTarget {
         PlacementTarget::new(
             ExecutionDomainOwner::Subsystem {
@@ -1013,6 +1125,7 @@ impl ColocatedSubsystemPlacement {
     }
 }
 
+/// Placement lookup result for one owner/lane pair.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionPlacementDecision {
     pub owner: ExecutionDomainOwner,
@@ -1021,6 +1134,7 @@ pub struct ExecutionPlacementDecision {
     pub snapshot: Option<ExecutionDomainSnapshot>,
 }
 
+/// Runtime placement report for one opened database.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbExecutionPlacementReport {
     pub database: String,
@@ -1032,6 +1146,7 @@ pub struct DbExecutionPlacementReport {
     pub domain_topology: BTreeMap<ExecutionDomainPath, ExecutionDomainSnapshot>,
 }
 
+/// Runtime placement report for a whole colocated deployment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColocatedDeploymentReport {
     pub placement_policy_name: String,
@@ -1041,6 +1156,7 @@ pub struct ColocatedDeploymentReport {
     pub domain_topology: BTreeMap<ExecutionDomainPath, ExecutionDomainSnapshot>,
 }
 
+/// Validation errors produced while building a colocated deployment topology.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColocatedDeploymentError {
     DuplicateDatabase {
@@ -1116,6 +1232,7 @@ impl fmt::Debug for ColocatedDeploymentPlacementPolicy {
     }
 }
 
+/// Builder for a process-wide colocated deployment.
 #[derive(Clone, Debug)]
 pub struct ColocatedDeploymentBuilder {
     process_budget: ExecutionDomainBudget,
@@ -1124,6 +1241,7 @@ pub struct ColocatedDeploymentBuilder {
 }
 
 impl ColocatedDeploymentBuilder {
+    /// Starts a colocated deployment with the given process budget.
     pub fn new(process_budget: ExecutionDomainBudget) -> Self {
         Self {
             process_budget,
@@ -1132,6 +1250,7 @@ impl ColocatedDeploymentBuilder {
         }
     }
 
+    /// Adds one database placement recipe to the deployment.
     pub fn with_database(
         mut self,
         placement: ColocatedDatabasePlacement,
@@ -1152,6 +1271,7 @@ impl ColocatedDeploymentBuilder {
         Ok(self)
     }
 
+    /// Adds one colocated subsystem placement recipe to the deployment.
     pub fn with_subsystem(
         mut self,
         placement: ColocatedSubsystemPlacement,
@@ -1172,11 +1292,16 @@ impl ColocatedDeploymentBuilder {
         Ok(self)
     }
 
+    /// Freezes the topology and builds a deployment with an in-memory resource manager.
     pub fn build(self) -> ColocatedDeployment {
         ColocatedDeployment::from_builder(self)
     }
 }
 
+/// Process-wide execution-domain topology shared by multiple opened databases.
+///
+/// Most applications should use this type as the entry point for colocated
+/// execution domains instead of wiring a [`ResourceManager`] by hand.
 #[derive(Clone)]
 pub struct ColocatedDeployment {
     resource_manager: Arc<dyn ResourceManager>,
@@ -1185,10 +1310,12 @@ pub struct ColocatedDeployment {
 }
 
 impl ColocatedDeployment {
+    /// Starts a builder for a colocated deployment.
     pub fn builder(process_budget: ExecutionDomainBudget) -> ColocatedDeploymentBuilder {
         ColocatedDeploymentBuilder::new(process_budget)
     }
 
+    /// Convenience helper for one colocated database.
     pub fn single_database(
         process_budget: ExecutionDomainBudget,
         name: impl Into<String>,
@@ -1198,6 +1325,7 @@ impl ColocatedDeployment {
             .build())
     }
 
+    /// Convenience helper for two symmetric colocated databases.
     pub fn two_databases(
         process_budget: ExecutionDomainBudget,
         left: impl Into<String>,
@@ -1209,6 +1337,7 @@ impl ColocatedDeployment {
             .build())
     }
 
+    /// Convenience helper for a primary database paired with an analytics helper.
     pub fn primary_with_analytics(
         process_budget: ExecutionDomainBudget,
         primary: impl Into<String>,
@@ -1229,6 +1358,7 @@ impl ColocatedDeployment {
             .build())
     }
 
+    /// Convenience helper for the shard-ready single-database layout.
     pub fn shard_ready(
         process_budget: ExecutionDomainBudget,
         name: impl Into<String>,
@@ -1253,21 +1383,77 @@ impl ColocatedDeployment {
         }
     }
 
+    /// Returns the shared resource manager backing this deployment.
     pub fn resource_manager(&self) -> Arc<dyn ResourceManager> {
         self.resource_manager.clone()
     }
 
+    /// Returns the declared colocated database names.
     pub fn database_names(&self) -> Vec<String> {
         self.databases.keys().cloned().collect()
     }
 
+    /// Returns the effective execution profile for a declared database.
     pub fn execution_profile(&self, database: &str) -> Option<DbExecutionProfile> {
         self.databases
             .get(database)
             .map(ColocatedDatabasePlacement::execution_profile)
     }
 
-    pub fn report(&self) -> ColocatedDeploymentReport {
+    /// Builds a [`crate::DbBuilder`] already bound to this deployment.
+    pub fn builder_for_database(
+        &self,
+        database: impl Into<String>,
+        settings: crate::DbSettings,
+    ) -> Result<crate::DbBuilder, crate::OpenError> {
+        crate::Db::builder()
+            .settings(settings)
+            .colocated_database(self, database)
+    }
+
+    /// Opens one database against this deployment using the supplied runtime components.
+    pub async fn open_database(
+        &self,
+        database: impl Into<String>,
+        settings: crate::DbSettings,
+        components: crate::DbComponents,
+    ) -> Result<crate::Db, crate::OpenError> {
+        self.builder_for_database(database, settings)?
+            .components(components)
+            .open()
+            .await
+    }
+
+    /// Opens multiple databases against this deployment with the same component bundle.
+    ///
+    /// Each database receives a clone of `components`. If different databases need
+    /// distinct clocks, RNGs, or other per-instance dependencies, call
+    /// [`Self::open_database`] separately instead.
+    pub async fn open_all<I>(
+        &self,
+        databases: I,
+        components: crate::DbComponents,
+    ) -> Result<BTreeMap<String, crate::Db>, crate::OpenError>
+    where
+        I: IntoIterator<Item = (String, crate::DbSettings)>,
+    {
+        let mut opened = BTreeMap::new();
+        for (database, settings) in databases {
+            if opened.contains_key(&database) {
+                return Err(crate::OpenError::InvalidConfig(format!(
+                    "duplicate colocated open request for database '{database}'"
+                )));
+            }
+            let db = self
+                .open_database(database.clone(), settings, components.clone())
+                .await?;
+            opened.insert(database, db);
+        }
+        Ok(opened)
+    }
+
+    /// Returns a process-wide runtime report for the current colocated topology.
+    pub fn runtime_report(&self) -> ColocatedDeploymentReport {
         let snapshot = self.resource_manager.snapshot();
         ColocatedDeploymentReport {
             placement_policy_name: snapshot.placement_policy_name.clone(),
@@ -1299,6 +1485,11 @@ impl ColocatedDeployment {
                 .collect(),
             domain_topology: snapshot.domains,
         }
+    }
+
+    /// Alias for [`Self::runtime_report`].
+    pub fn report(&self) -> ColocatedDeploymentReport {
+        self.runtime_report()
     }
 }
 
@@ -1454,6 +1645,7 @@ fn register_colocated_domains(
     }
 }
 
+/// Builds the runtime placement report exposed by [`crate::Db::execution_placement_report`].
 pub fn build_db_execution_placement_report(
     snapshot: &ResourceManagerSnapshot,
     database: &str,
@@ -1561,6 +1753,7 @@ fn build_execution_placement_decision(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Snapshot of the whole resource manager state.
 pub struct ResourceManagerSnapshot {
     pub process_budget: ExecutionDomainBudget,
     pub placement_policy_name: String,
@@ -1568,6 +1761,7 @@ pub struct ResourceManagerSnapshot {
     pub domains: BTreeMap<ExecutionDomainPath, ExecutionDomainSnapshot>,
 }
 
+/// Result of probing or acquiring usage in one execution domain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceAdmissionDecision {
     pub admitted: bool,
@@ -1577,26 +1771,269 @@ pub struct ResourceAdmissionDecision {
     pub snapshot: ExecutionDomainSnapshot,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ExecutionUsageReleaseErrorDetails {
+    path: ExecutionDomainPath,
+    held_usage: ExecutionResourceUsage,
+    requested_release: ExecutionResourceUsage,
+}
+
+/// Structured underflow error from [`ResourceManager::checked_release`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionUsageReleaseError {
+    details: Box<ExecutionUsageReleaseErrorDetails>,
+}
+
+impl ExecutionUsageReleaseError {
+    /// Builds a structured release error.
+    pub fn new(
+        path: ExecutionDomainPath,
+        held_usage: ExecutionResourceUsage,
+        requested_release: ExecutionResourceUsage,
+    ) -> Self {
+        Self {
+            details: Box::new(ExecutionUsageReleaseErrorDetails {
+                path,
+                held_usage,
+                requested_release,
+            }),
+        }
+    }
+
+    /// Returns the domain that was over-released.
+    pub fn path(&self) -> &ExecutionDomainPath {
+        &self.details.path
+    }
+
+    /// Returns the usage that was currently held when release was attempted.
+    pub fn held_usage(&self) -> ExecutionResourceUsage {
+        self.details.held_usage
+    }
+
+    /// Returns the release amount that would have underflowed.
+    pub fn requested_release(&self) -> ExecutionResourceUsage {
+        self.details.requested_release
+    }
+}
+
+impl fmt::Display for ExecutionUsageReleaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "attempted to release more execution-domain usage than acquired for {}: have {:?}, requested {:?}",
+            self.path(),
+            self.held_usage(),
+            self.requested_release()
+        )
+    }
+}
+
+impl std::error::Error for ExecutionUsageReleaseError {}
+
+/// RAII guard for domain usage accounting.
+///
+/// Prefer [`crate::Db::acquire_lane_usage`] or the scoped
+/// [`crate::Db::with_lane_usage`] helpers in application code.
+#[must_use = "execution usage is released when the lease is dropped"]
+pub struct ExecutionUsageLease {
+    manager: Arc<dyn ResourceManager>,
+    path: ExecutionDomainPath,
+    usage: ExecutionResourceUsage,
+    decision: ResourceAdmissionDecision,
+    released: bool,
+}
+
+impl ExecutionUsageLease {
+    /// Acquires usage against a specific domain path.
+    pub fn acquire(
+        manager: Arc<dyn ResourceManager>,
+        path: ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> Self {
+        let decision = manager.try_acquire(&path, usage);
+        Self {
+            manager,
+            path,
+            usage,
+            decision,
+            released: false,
+        }
+    }
+
+    /// Returns whether the request was admitted.
+    pub fn admitted(&self) -> bool {
+        self.decision.admitted
+    }
+
+    /// Returns the full admission decision captured when the lease was acquired.
+    pub fn decision(&self) -> &ResourceAdmissionDecision {
+        &self.decision
+    }
+
+    /// Returns the domain path this lease charges against.
+    pub fn path(&self) -> &ExecutionDomainPath {
+        &self.path
+    }
+
+    /// Returns the usage originally requested for this lease.
+    pub fn usage(&self) -> ExecutionResourceUsage {
+        self.usage
+    }
+
+    /// Releases the lease immediately and returns the updated snapshot if admitted.
+    pub fn release(mut self) -> Option<ExecutionDomainSnapshot> {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> Option<ExecutionDomainSnapshot> {
+        if !self.decision.admitted || self.released {
+            return None;
+        }
+        self.released = true;
+        Some(self.manager.release(&self.path, self.usage))
+    }
+}
+
+impl Drop for ExecutionUsageLease {
+    fn drop(&mut self) {
+        let _ = self.release_inner();
+    }
+}
+
+impl fmt::Debug for ExecutionUsageLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionUsageLease")
+            .field("path", &self.path)
+            .field("usage", &self.usage)
+            .field("decision", &self.decision)
+            .field("released", &self.released)
+            .finish()
+    }
+}
+
+/// RAII guard for temporarily overriding direct backlog on a domain.
+///
+/// Prefer [`crate::Db::set_lane_backlog`] or [`crate::Db::with_lane_backlog`]
+/// in application code.
+#[must_use = "backlog is restored when the guard is dropped"]
+pub struct ExecutionBacklogGuard {
+    manager: Arc<dyn ResourceManager>,
+    path: ExecutionDomainPath,
+    previous: ExecutionDomainBacklogSnapshot,
+    current: ExecutionDomainBacklogSnapshot,
+    restored: bool,
+}
+
+impl ExecutionBacklogGuard {
+    /// Sets direct backlog on a specific domain path and records the previous value.
+    pub fn set(
+        manager: Arc<dyn ResourceManager>,
+        path: ExecutionDomainPath,
+        backlog: ExecutionDomainBacklogSnapshot,
+    ) -> Self {
+        let previous = manager.direct_backlog(&path);
+        manager.set_backlog(&path, backlog);
+        Self {
+            manager,
+            path,
+            previous,
+            current: backlog,
+            restored: false,
+        }
+    }
+
+    /// Returns the direct backlog that was present before the guard was created.
+    pub fn previous(&self) -> ExecutionDomainBacklogSnapshot {
+        self.previous
+    }
+
+    /// Returns the direct backlog set by this guard.
+    pub fn current(&self) -> ExecutionDomainBacklogSnapshot {
+        self.current
+    }
+
+    /// Restores the previous backlog immediately.
+    pub fn restore(mut self) -> ExecutionDomainSnapshot {
+        self.restore_inner()
+    }
+
+    fn restore_inner(&mut self) -> ExecutionDomainSnapshot {
+        if self.restored {
+            return self.manager.set_backlog(&self.path, self.previous);
+        }
+        self.restored = true;
+        self.manager.set_backlog(&self.path, self.previous)
+    }
+}
+
+impl Drop for ExecutionBacklogGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            self.restored = true;
+            self.manager.set_backlog(&self.path, self.previous);
+        }
+    }
+}
+
+impl fmt::Debug for ExecutionBacklogGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionBacklogGuard")
+            .field("path", &self.path)
+            .field("previous", &self.previous)
+            .field("current", &self.current)
+            .field("restored", &self.restored)
+            .finish()
+    }
+}
+
+/// Low-level execution-domain registry and accounting interface.
+///
+/// Most applications should prefer the higher-level [`crate::Db`] execution
+/// helpers. This trait stays public for tests, simulations, alternative
+/// runtime integrations, and other advanced use cases.
 pub trait ResourceManager: Send + Sync {
+    /// Returns the process-wide root budget.
     fn process_budget(&self) -> ExecutionDomainBudget;
+    /// Returns the placement policy used to resolve owner/lane requests.
     fn placement_policy(&self) -> Arc<dyn PlacementPolicy>;
+    /// Registers or reactivates a domain spec.
     fn register_domain(&self, spec: ExecutionDomainSpec) -> ExecutionDomainSnapshot;
+    /// Replaces an existing domain spec.
     fn update_domain(&self, spec: ExecutionDomainSpec) -> ExecutionDomainSnapshot;
+    /// Marks a domain as retired.
     fn retire_domain(&self, path: &ExecutionDomainPath);
+    /// Adds a lifecycle observer.
     fn register_lifecycle_hook(&self, hook: Arc<dyn ExecutionDomainLifecycleHook>);
+    /// Returns a snapshot of the full manager state.
     fn snapshot(&self) -> ResourceManagerSnapshot;
+    /// Resolves placement for one owner/lane request.
     fn assign(&self, request: PlacementRequest) -> PlacementAssignment;
+    /// Builds a runtime tag for work after placement.
     fn placement_tag(&self, request: WorkPlacementRequest) -> WorkRuntimeTag;
+    /// Attempts to charge usage against a domain without panicking.
     fn try_acquire(
         &self,
         path: &ExecutionDomainPath,
         usage: ExecutionResourceUsage,
     ) -> ResourceAdmissionDecision;
+    /// Releases previously acquired usage and returns a structured error on underflow.
+    ///
+    /// Prefer leases in normal application code; this method exists for lower-level
+    /// callers that need explicit checked accounting.
+    fn checked_release(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> Result<ExecutionDomainSnapshot, ExecutionUsageReleaseError>;
+    /// Releases previously acquired usage, panicking if the release would underflow.
     fn release(
         &self,
         path: &ExecutionDomainPath,
         usage: ExecutionResourceUsage,
     ) -> ExecutionDomainSnapshot;
+    /// Returns the direct backlog currently recorded on a domain.
+    fn direct_backlog(&self, path: &ExecutionDomainPath) -> ExecutionDomainBacklogSnapshot;
+    /// Replaces the direct backlog recorded on a domain.
     fn set_backlog(
         &self,
         path: &ExecutionDomainPath,
@@ -2302,18 +2739,42 @@ impl ResourceManager for InMemoryResourceManager {
         }
     }
 
-    fn release(
+    fn checked_release(
         &self,
         path: &ExecutionDomainPath,
         usage: ExecutionResourceUsage,
-    ) -> ExecutionDomainSnapshot {
+    ) -> Result<ExecutionDomainSnapshot, ExecutionUsageReleaseError> {
         let mut domains = self.domains.lock();
         Self::ensure_record(&mut domains, path);
         let entry = domains
             .get_mut(path)
             .expect("domain must exist before releasing usage");
+        if !entry.direct_usage.contains(usage) {
+            return Err(ExecutionUsageReleaseError::new(
+                path.clone(),
+                entry.direct_usage,
+                usage,
+            ));
+        }
         entry.direct_usage.saturating_sub_assign(usage);
-        self.domain_snapshot_locked(&domains, path)
+        Ok(self.domain_snapshot_locked(&domains, path))
+    }
+
+    fn release(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> ExecutionDomainSnapshot {
+        self.checked_release(path, usage)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn direct_backlog(&self, path: &ExecutionDomainPath) -> ExecutionDomainBacklogSnapshot {
+        self.domains
+            .lock()
+            .get(path)
+            .map(|entry| entry.backlog)
+            .unwrap_or_default()
     }
 
     fn set_backlog(
@@ -2360,17 +2821,22 @@ impl DomainBudgetCharge {
     }
 }
 
+/// Aggregated workload charges for one execution domain lineage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainBudgetSnapshot {
     pub total: DomainBudgetCharge,
     pub by_contention_class: BTreeMap<ContentionClass, DomainBudgetCharge>,
 }
 
+/// Records workload charges against execution-domain paths.
 pub trait DomainBudgetOracle: Send + Sync {
+    /// Records one charge using the lineage implied by `tag.domain`.
     fn record(&self, tag: &WorkRuntimeTag, charge: DomainBudgetCharge);
+    /// Returns the current by-domain budget accounting snapshot.
     fn snapshot(&self) -> BTreeMap<ExecutionDomainPath, DomainBudgetSnapshot>;
 }
 
+/// In-memory [`DomainBudgetOracle`] implementation for tests and simulations.
 #[derive(Default)]
 pub struct InMemoryDomainBudgetOracle {
     by_domain: Mutex<BTreeMap<ExecutionDomainPath, DomainBudgetSnapshot>>,
@@ -2404,6 +2870,7 @@ pub struct ColocatedDbWorkloadSpec {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Generates deterministic colocated database workloads from a seed.
 pub trait ColocatedDbWorkloadGenerator: Send + Sync {
     fn generate(&self, seed: u64) -> Vec<ColocatedDbWorkloadSpec>;
 }

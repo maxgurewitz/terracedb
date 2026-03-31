@@ -849,6 +849,7 @@ impl Db {
             PendingWorkSpec::Flush => self
                 .flush_internal(false)
                 .await
+                .map(|_| ())
                 .map_err(Self::flush_error_into_storage),
             PendingWorkSpec::Compaction(job) => self.execute_compaction_job(local_root, job).await,
             PendingWorkSpec::Offload(job) => self.execute_offload_job(job).await,

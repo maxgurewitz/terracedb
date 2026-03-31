@@ -544,29 +544,22 @@ pub async fn ensure_telemetry_tables(
     let sensor_schema = telemetry_sensor_schema();
     Ok(TelemetryTables {
         device_state: RecordTable::with_codecs(
-            ensure_table(db, row_table_config(DEVICE_STATE_TABLE_NAME)).await?,
+            db.ensure_table(row_table_config(DEVICE_STATE_TABLE_NAME))
+                .await?,
             Utf8StringCodec,
             JsonValueCodec::new(),
         ),
         sensor_readings: ColumnarTable::with_codecs(
-            ensure_table(
-                db,
-                sensor_readings_table_config(SENSOR_READINGS_TABLE_NAME, profile),
-            )
+            db.ensure_table(sensor_readings_table_config(
+                SENSOR_READINGS_TABLE_NAME,
+                profile,
+            ))
             .await?,
             sensor_schema,
             SensorReadingKeyCodec,
             SensorReadingRecordCodec,
         ),
     })
-}
-
-async fn ensure_table(db: &Db, config: TableConfig) -> Result<Table, CreateTableError> {
-    match db.create_table(config.clone()).await {
-        Ok(table) => Ok(table),
-        Err(CreateTableError::AlreadyExists(_)) => Ok(db.table(config.name)),
-        Err(error) => Err(error),
-    }
 }
 
 fn row_table_config(name: &str) -> TableConfig {

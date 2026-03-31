@@ -511,19 +511,12 @@ pub fn todo_db_config(path: &str, prefix: &str) -> DbConfig {
 
 pub async fn ensure_todo_tables(db: &Db) -> Result<TodoTables, TodoAppError> {
     Ok(TodoTables {
-        todos: todo_table(ensure_table(db, row_table_config(TODOS_TABLE_NAME)).await?),
+        todos: todo_table(db.ensure_table(row_table_config(TODOS_TABLE_NAME)).await?),
         recent_todos: recent_todos_table(
-            ensure_table(db, row_table_config(RECENT_TODOS_TABLE_NAME)).await?,
+            db.ensure_table(row_table_config(RECENT_TODOS_TABLE_NAME))
+                .await?,
         ),
     })
-}
-
-async fn ensure_table(db: &Db, config: TableConfig) -> Result<Table, CreateTableError> {
-    match db.create_table(config.clone()).await {
-        Ok(table) => Ok(table),
-        Err(CreateTableError::AlreadyExists(_)) => Ok(db.table(config.name)),
-        Err(error) => Err(error),
-    }
 }
 
 fn row_table_config(name: &str) -> TableConfig {

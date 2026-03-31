@@ -13,7 +13,7 @@ use terracedb::{
     InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType, PressureScope,
     ResourceManager, S3Location, ScanOptions, Scheduler, ShardReadyPlacementLayout, StubClock,
     StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TableStats,
-    ThrottleDecision, Value,
+    ThrottleDecision, TieredDurabilityMode, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -28,6 +28,16 @@ fn tiered_settings(path: &str) -> DbSettings {
             prefix: "phase13".to_string(),
         },
     )
+}
+
+fn deferred_tiered_settings(path: &str) -> DbSettings {
+    let mut settings = tiered_settings(path);
+    if let terracedb::StorageConfig::Tiered(storage) = settings.storage_config() {
+        let mut storage = storage.clone();
+        storage.durability = TieredDurabilityMode::Deferred;
+        settings = DbSettings::tiered_storage(storage);
+    }
+    settings
 }
 
 fn row_table_config(name: &str) -> TableConfig {
@@ -1071,12 +1081,12 @@ async fn open_deployed_db(
     file_system: Arc<StubFileSystem>,
     object_store: Arc<StubObjectStore>,
 ) -> Db {
-    Db::builder()
-        .settings(tiered_settings(path))
-        .components(shared_stub_components(file_system, object_store))
-        .colocated_database(deployment, database)
-        .expect("bind builder to colocated deployment")
-        .open()
+    deployment
+        .open_database(
+            database,
+            tiered_settings(path),
+            shared_stub_components(file_system, object_store),
+        )
         .await
         .expect("open deployed db")
 }
@@ -1144,7 +1154,8 @@ async fn changing_execution_domain_placement_does_not_change_logical_db_outcomes
 fn colocated_deployment_presets_publish_default_profiles_and_budgets() {
     let single =
         ColocatedDeployment::single_database(process_budget(), "primary").expect("single layout");
-    let single_report = single.report();
+    let single_report = single.runtime_report();
+    assert_eq!(single.report(), single_report);
     let primary = &single_report.databases["primary"];
     assert_eq!(
         primary.foreground.binding.domain,
@@ -1263,22 +1274,24 @@ async fn colocated_deployment_builder_supports_multi_db_open_and_recovery() {
     let file_system = Arc::new(StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
 
-    let primary = open_deployed_db(
-        &deployment,
-        "primary",
-        "/execution-deployment-primary",
-        file_system.clone(),
-        object_store.clone(),
-    )
-    .await;
-    let analytics = open_deployed_db(
-        &deployment,
-        "analytics",
-        "/execution-deployment-analytics",
-        file_system.clone(),
-        object_store.clone(),
-    )
-    .await;
+    let mut opened = deployment
+        .open_all(
+            [
+                (
+                    "primary".to_string(),
+                    tiered_settings("/execution-deployment-primary"),
+                ),
+                (
+                    "analytics".to_string(),
+                    tiered_settings("/execution-deployment-analytics"),
+                ),
+            ],
+            shared_stub_components(file_system.clone(), object_store.clone()),
+        )
+        .await
+        .expect("open colocated deployment");
+    let primary = opened.remove("primary").expect("primary db");
+    let analytics = opened.remove("analytics").expect("analytics db");
 
     let primary_rows = run_workload(&primary).await;
     let analytics_rows = run_workload(&analytics).await;
@@ -1287,22 +1300,24 @@ async fn colocated_deployment_builder_supports_multi_db_open_and_recovery() {
     drop(primary);
     drop(analytics);
 
-    let reopened_primary = open_deployed_db(
-        &deployment,
-        "primary",
-        "/execution-deployment-primary",
-        file_system.clone(),
-        object_store.clone(),
-    )
-    .await;
-    let reopened_analytics = open_deployed_db(
-        &deployment,
-        "analytics",
-        "/execution-deployment-analytics",
-        file_system,
-        object_store,
-    )
-    .await;
+    let mut reopened = deployment
+        .open_all(
+            [
+                (
+                    "primary".to_string(),
+                    tiered_settings("/execution-deployment-primary"),
+                ),
+                (
+                    "analytics".to_string(),
+                    tiered_settings("/execution-deployment-analytics"),
+                ),
+            ],
+            shared_stub_components(file_system, object_store),
+        )
+        .await
+        .expect("reopen colocated deployment");
+    let reopened_primary = reopened.remove("primary").expect("reopened primary");
+    let reopened_analytics = reopened.remove("analytics").expect("reopened analytics");
 
     assert!(Arc::ptr_eq(
         &reopened_primary.resource_manager(),
@@ -1328,6 +1343,266 @@ async fn colocated_deployment_builder_supports_multi_db_open_and_recovery() {
             .foreground
             .binding
             .domain
+    );
+}
+
+#[tokio::test]
+async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
+    let deployment =
+        ColocatedDeployment::single_database(process_budget(), "primary").expect("single layout");
+    let db = open_deployed_db(
+        &deployment,
+        "primary",
+        "/execution-lane-helpers",
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+    )
+    .await;
+
+    let foreground_path = db
+        .execution_lane_binding(ExecutionLane::UserForeground)
+        .domain
+        .clone();
+    let background_path = db
+        .execution_lane_binding(ExecutionLane::UserBackground)
+        .domain
+        .clone();
+    assert_eq!(db.tag_user_background_work(()).tag.domain, background_path);
+    assert_eq!(
+        db.tag_work(
+            (),
+            ExecutionDomainOwner::Subsystem {
+                database: Some("primary".to_string()),
+                name: "repair".to_string(),
+            },
+            ExecutionLane::ControlPlane,
+            terracedb::ContentionClass::ControlPlane,
+        )
+        .tag
+        .domain,
+        db.execution_lane_binding(ExecutionLane::ControlPlane)
+            .domain
+            .clone()
+    );
+
+    let probe = db.probe_lane_admission(
+        ExecutionLane::UserForeground,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        },
+    );
+    assert!(probe.admitted);
+    assert!(db.with_lane_usage(
+        ExecutionLane::UserForeground,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        },
+        |decision| decision.admitted
+    ));
+    let observed_during_scoped_usage = db.with_lane_usage(
+        ExecutionLane::UserForeground,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        },
+        |_| {
+            db.resource_manager_snapshot().domains[&foreground_path]
+                .usage
+                .cpu_workers_in_use
+        },
+    );
+    assert_eq!(observed_during_scoped_usage, 1);
+    assert_eq!(
+        db.resource_manager_snapshot().domains[&foreground_path]
+            .usage
+            .cpu_workers_in_use,
+        0
+    );
+    assert!(
+        db.with_lane_usage_async(
+            ExecutionLane::UserForeground,
+            ExecutionResourceUsage {
+                cpu_workers: 1,
+                ..ExecutionResourceUsage::default()
+            },
+            |decision| async move { decision.admitted }
+        )
+        .await
+    );
+    assert_eq!(
+        db.resource_manager_snapshot().domains[&foreground_path]
+            .usage
+            .cpu_workers_in_use,
+        0
+    );
+
+    {
+        let lease = db.acquire_lane_usage(
+            ExecutionLane::UserForeground,
+            ExecutionResourceUsage {
+                cpu_workers: 1,
+                ..ExecutionResourceUsage::default()
+            },
+        );
+        assert!(lease.admitted());
+        assert_eq!(
+            db.resource_manager_snapshot().domains[&foreground_path]
+                .usage
+                .cpu_workers_in_use,
+            1
+        );
+    }
+    assert_eq!(
+        db.resource_manager_snapshot().domains[&foreground_path]
+            .usage
+            .cpu_workers_in_use,
+        0
+    );
+
+    {
+        let _backlog = db.set_lane_backlog(
+            ExecutionLane::UserBackground,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 2,
+                queued_bytes: 64,
+            },
+        );
+        let snapshot = db.resource_manager_snapshot();
+        assert_eq!(
+            snapshot.domains[&background_path].backlog.queued_work_items,
+            2
+        );
+        assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 64);
+    }
+    let snapshot = db.resource_manager_snapshot();
+    assert_eq!(
+        snapshot.domains[&background_path].backlog.queued_work_items,
+        0
+    );
+    assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
+    let queued = db.with_lane_backlog(
+        ExecutionLane::UserBackground,
+        ExecutionDomainBacklogSnapshot {
+            queued_work_items: 3,
+            queued_bytes: 96,
+        },
+        || db.resource_manager_snapshot().domains[&background_path].backlog,
+    );
+    assert_eq!(queued.queued_work_items, 3);
+    assert_eq!(queued.queued_bytes, 96);
+    let queued_async = db
+        .with_lane_backlog_async(
+            ExecutionLane::UserBackground,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 4,
+                queued_bytes: 128,
+            },
+            || async {
+                db.resource_manager_snapshot().domains[&background_path]
+                    .backlog
+                    .queued_work_items
+            },
+        )
+        .await;
+    assert_eq!(queued_async, 4);
+    let snapshot = db.resource_manager_snapshot();
+    assert_eq!(
+        snapshot.domains[&background_path].backlog.queued_work_items,
+        0
+    );
+    assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
+}
+
+#[tokio::test]
+async fn ensure_table_and_flush_with_status_surface_happy_path_state() {
+    let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
+    let db = Db::builder()
+        .settings(deferred_tiered_settings("/execution-flush-status"))
+        .components(stub_components(resource_manager))
+        .open()
+        .await
+        .expect("open db");
+
+    let table = db
+        .ensure_table(row_table_config("events"))
+        .await
+        .expect("create events table");
+    let reopened = db
+        .ensure_table(row_table_config("events"))
+        .await
+        .expect("reuse events table");
+    assert_eq!(table.id(), reopened.id());
+
+    let sequence = table
+        .write(b"k".to_vec(), Value::Bytes(b"v".to_vec()))
+        .await
+        .expect("write row");
+    let status = db.flush_with_status().await.expect("flush with status");
+    assert_eq!(status.current_sequence_before, sequence);
+    assert_eq!(status.current_sequence_after, sequence);
+    assert!(!status.visible_sequence_advanced());
+    assert!(status.durable_sequence_before < sequence);
+    assert!(status.had_visible_non_durable_writes());
+    assert!(status.durable_sequence_advanced());
+    assert!(status.changed_any_frontier());
+    assert!(status.durable_sequence_after >= sequence);
+}
+
+#[test]
+fn checked_release_returns_structured_error_on_underflow() {
+    let manager = InMemoryResourceManager::new(process_budget());
+    let path = ExecutionDomainPath::new(["process", "db-a", "foreground"]);
+    manager.register_domain(shared_spec(
+        path.clone(),
+        ExecutionDomainOwner::Database {
+            name: "db-a".to_string(),
+        },
+        1,
+        ExecutionDomainBudget::default(),
+    ));
+
+    let error = manager
+        .checked_release(
+            &path,
+            ExecutionResourceUsage {
+                cpu_workers: 1,
+                ..ExecutionResourceUsage::default()
+            },
+        )
+        .expect_err("checked release should report underflow");
+    assert_eq!(error.path(), &path);
+    assert_eq!(error.held_usage(), ExecutionResourceUsage::default());
+    assert_eq!(
+        error.requested_release(),
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        }
+    );
+}
+
+#[test]
+#[should_panic(expected = "attempted to release more execution-domain usage than acquired")]
+fn release_panics_when_usage_would_underflow() {
+    let manager = InMemoryResourceManager::new(process_budget());
+    let path = ExecutionDomainPath::new(["process", "db-a", "foreground"]);
+    manager.register_domain(shared_spec(
+        path.clone(),
+        ExecutionDomainOwner::Database {
+            name: "db-a".to_string(),
+        },
+        1,
+        ExecutionDomainBudget::default(),
+    ));
+
+    manager.release(
+        &path,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        },
     );
 }
 

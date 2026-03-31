@@ -322,8 +322,12 @@ impl DbBuilder {
         self.object_store = Some(components.object_store);
         self.clock = Some(components.clock);
         self.rng = Some(components.rng);
-        self.scheduler = components.scheduler;
-        self.resource_manager = components.resource_manager;
+        if let Some(scheduler) = components.scheduler {
+            self.scheduler = Some(scheduler);
+        }
+        if let Some(resource_manager) = components.resource_manager {
+            self.resource_manager = Some(resource_manager);
+        }
         self
     }
 
@@ -375,6 +379,12 @@ impl DbBuilder {
         self
     }
 
+    /// Binds this builder to a database declared by a [`crate::ColocatedDeployment`].
+    ///
+    /// This wires in the deployment's shared resource manager and execution
+    /// identity. Runtime components such as clocks, RNGs, or object stores still
+    /// come from later builder calls like [`Self::components`] or
+    /// [`Self::object_store`].
     pub fn colocated_database(
         mut self,
         deployment: &crate::execution::ColocatedDeployment,
