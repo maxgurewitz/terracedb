@@ -2518,6 +2518,174 @@ where
     }
 }
 
+async fn retag_restored_source_progress<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    for source in &runtime.sources {
+        let Some(progress) =
+            read_workflow_source_progress(runtime.tables.source_progress_table(), source.table())
+                .await?
+        else {
+            continue;
+        };
+        persist_workflow_source_progress(
+            runtime,
+            source,
+            progress.with_origin(WorkflowSourceProgressOrigin::CheckpointRestore),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn detect_snapshot_too_old_for_source_progress<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    source: &WorkflowSource,
+    progress: WorkflowSourceProgress,
+) -> Result<Option<SnapshotTooOld>, WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    match runtime
+        .db
+        .scan_durable_since(
+            source.table(),
+            progress.as_log_cursor(),
+            ScanOptions {
+                limit: Some(1),
+                ..ScanOptions::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(None),
+        Err(error) => match error.snapshot_too_old().cloned() {
+            Some(snapshot_too_old) => Ok(Some(snapshot_too_old)),
+            None => Err(error.into()),
+        },
+    }
+}
+
+async fn resolve_workflow_source_progress_on_start<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    source: &WorkflowSource,
+    event: WorkflowHistoricalEvent,
+    snapshot_too_old: Option<&SnapshotTooOld>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let current_durable_sequence = runtime.db.subscribe_durable(source.table()).current();
+    let checkpoint_progress = load_checkpoint_source_progress(runtime, source).await?;
+    let checkpoint_available = checkpoint_progress.is_some();
+    let resolution = match event {
+        WorkflowHistoricalEvent::FirstAttach => {
+            source.initial_resolution(checkpoint_available, current_durable_sequence)
+        }
+        WorkflowHistoricalEvent::SnapshotTooOld => {
+            source.recovery_resolution(checkpoint_available, current_durable_sequence)
+        }
+    };
+
+    if resolution == WorkflowHistoricalSourceResolution::RestoreCheckpoint {
+        let Some(checkpoint_store) = runtime.checkpoint_store.clone() else {
+            return Err(WorkflowError::MissingCheckpointStore {
+                name: runtime.name.clone(),
+            });
+        };
+        let Some(manifest) = checkpoint_store
+            .load_latest_manifest(&runtime.name)
+            .await
+            .map_err(|error| checkpoint_store_error(&runtime.name, error))?
+        else {
+            return Err(StorageError::not_found(format!(
+                "workflow {} requested checkpoint restore for source {}, but no latest checkpoint exists",
+                runtime.name,
+                source.table().name(),
+            ))
+            .into());
+        };
+        restore_checkpoint_manifest(runtime, checkpoint_store, manifest).await?;
+        retag_restored_source_progress(runtime).await?;
+        resume_local_durable_work(runtime, shutdown_rx).await?;
+        return Ok(());
+    }
+
+    let _ = resolve_workflow_source_progress(runtime, source, event, snapshot_too_old).await?;
+    Ok(())
+}
+
+async fn prepare_workflow_sources_on_start<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    for source in &runtime.sources {
+        let mut prepared = false;
+        let mut last_snapshot_progress = None;
+
+        for _ in 0..4 {
+            if *shutdown_rx.borrow() {
+                return Ok(());
+            }
+
+            let progress = read_workflow_source_progress(
+                runtime.tables.source_progress_table(),
+                source.table(),
+            )
+            .await?;
+            let Some(progress) = progress else {
+                resolve_workflow_source_progress_on_start(
+                    runtime,
+                    source,
+                    WorkflowHistoricalEvent::FirstAttach,
+                    None,
+                    shutdown_rx,
+                )
+                .await?;
+                continue;
+            };
+
+            let Some(snapshot_too_old) =
+                detect_snapshot_too_old_for_source_progress(runtime, source, progress).await?
+            else {
+                prepared = true;
+                break;
+            };
+
+            if last_snapshot_progress == Some(progress) {
+                return Err(WorkflowError::SnapshotTooOld(snapshot_too_old));
+            }
+            last_snapshot_progress = Some(progress);
+
+            resolve_workflow_source_progress_on_start(
+                runtime,
+                source,
+                WorkflowHistoricalEvent::SnapshotTooOld,
+                Some(&snapshot_too_old),
+                shutdown_rx,
+            )
+            .await?;
+        }
+
+        if !prepared {
+            return Err(StorageError::unsupported(format!(
+                "workflow source {} could not establish resumable historical progress during startup",
+                source.table().name(),
+            ))
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
 async fn resume_local_durable_work<H>(
     runtime: &WorkflowRuntimeInner<H>,
     shutdown_rx: &watch::Receiver<bool>,
@@ -2592,6 +2760,7 @@ where
     async move {
         if !runtime.sources.is_empty() {
             resume_local_durable_work(&runtime, &shutdown_rx).await?;
+            prepare_workflow_sources_on_start(&runtime, &shutdown_rx).await?;
         }
 
         let mut tasks = tokio::task::JoinSet::new();
