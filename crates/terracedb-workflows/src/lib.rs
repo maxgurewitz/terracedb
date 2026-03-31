@@ -18,9 +18,9 @@ use tracing::{Instrument, instrument::WithSubscriber};
 
 use terracedb::{
     ChangeEntry, ChangeFeedError, ChangeKind, Clock, CommitError, CreateTableError, Db,
-    DurableCursorStore, DurableTimerSet, Key, LogCursor, OperationContext, OutboxEntry, ReadError,
-    ScanOptions, ScheduledTimer, SnapshotTooOld, StorageError, Table, TableConfig, TableFormat,
-    Timestamp, Transaction, TransactionCommitError, TransactionalOutbox, Value,
+    DurableTimerSet, Key, LogCursor, OperationContext, OutboxEntry, ReadError, ScanOptions,
+    ScheduledTimer, SnapshotTooOld, StorageError, Table, TableConfig, TableFormat, Timestamp,
+    Transaction, TransactionCommitError, TransactionalOutbox, Value,
 };
 use terracedb::{
     CompactionStrategy, SequenceNumber, SpanRelation, set_span_attribute, telemetry_attrs,
@@ -33,6 +33,7 @@ pub const DEFAULT_SOURCE_BATCH_LIMIT: usize = 128;
 pub const DEFAULT_TIMER_BATCH_LIMIT: usize = 128;
 
 const WORKFLOW_FORMAT_VERSION: u8 = 1;
+const WORKFLOW_SOURCE_PROGRESS_FORMAT_VERSION: u8 = 2;
 const WORKFLOW_TRIGGER_ORDER_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_TABLE_PREFIX: &str = "_workflow_";
 const INBOX_KEY_SEPARATOR: u8 = 0;
@@ -204,6 +205,687 @@ impl WorkflowError {
             | Self::Panic { .. } => None,
         }
     }
+}
+
+/// First-attach behavior for a workflow source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowSourceBootstrapPolicy {
+    /// Replay retained history from the start of the source.
+    #[default]
+    Beginning,
+    /// Skip historical backlog and attach live from the current durable frontier.
+    CurrentDurable,
+    /// Restore from checkpoint when available, otherwise replay from the beginning.
+    CheckpointOrBeginning,
+    /// Restore from checkpoint when available, otherwise attach live from current durable.
+    CheckpointOrCurrentDurable,
+}
+
+/// Recovery behavior when persisted workflow source progress is no longer resumable.
+///
+/// `FailClosed` is the safe default. More permissive modes must be selected
+/// deliberately because they may drop history or depend on replay/checkpoint
+/// support outside the source table itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowSourceRecoveryPolicy {
+    #[default]
+    FailClosed,
+    RestoreCheckpoint,
+    RestoreCheckpointOrFastForward,
+    ReplayFromHistory,
+    FastForwardToCurrentDurable,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowReplayableSourceKind {
+    #[default]
+    NonReplayable,
+    AppendOnlyOrdered,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowHistoricalArtifactSupport {
+    #[default]
+    Unsupported,
+    Optional,
+    Required,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSourceCapabilities {
+    pub replay: WorkflowReplayableSourceKind,
+    pub checkpoint: WorkflowHistoricalArtifactSupport,
+    pub trigger_journal: WorkflowHistoricalArtifactSupport,
+}
+
+impl WorkflowSourceCapabilities {
+    pub fn replayable_append_only() -> Self {
+        Self {
+            replay: WorkflowReplayableSourceKind::AppendOnlyOrdered,
+            ..Self::default()
+        }
+    }
+
+    pub fn supports_checkpoint_restore(self) -> bool {
+        self.checkpoint != WorkflowHistoricalArtifactSupport::Unsupported
+    }
+
+    pub fn supports_trigger_journal(self) -> bool {
+        self.trigger_journal != WorkflowHistoricalArtifactSupport::Unsupported
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSourceConfig {
+    pub bootstrap: WorkflowSourceBootstrapPolicy,
+    pub recovery: WorkflowSourceRecoveryPolicy,
+    pub capabilities: WorkflowSourceCapabilities,
+}
+
+impl WorkflowSourceConfig {
+    pub fn with_bootstrap_policy(mut self, bootstrap: WorkflowSourceBootstrapPolicy) -> Self {
+        self.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_recovery_policy(mut self, recovery: WorkflowSourceRecoveryPolicy) -> Self {
+        self.recovery = recovery;
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: WorkflowSourceCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_replay_kind(mut self, replay: WorkflowReplayableSourceKind) -> Self {
+        self.capabilities.replay = replay;
+        self
+    }
+
+    pub fn with_checkpoint_support(
+        mut self,
+        checkpoint: WorkflowHistoricalArtifactSupport,
+    ) -> Self {
+        self.capabilities.checkpoint = checkpoint;
+        self
+    }
+
+    pub fn with_trigger_journal_support(
+        mut self,
+        trigger_journal: WorkflowHistoricalArtifactSupport,
+    ) -> Self {
+        self.capabilities.trigger_journal = trigger_journal;
+        self
+    }
+
+    pub fn initial_resolution(
+        self,
+        checkpoint_available: bool,
+        current_durable_sequence: SequenceNumber,
+    ) -> WorkflowHistoricalSourceResolution {
+        match self.bootstrap {
+            WorkflowSourceBootstrapPolicy::Beginning => {
+                WorkflowHistoricalSourceResolution::AttachFromBeginning
+            }
+            WorkflowSourceBootstrapPolicy::CurrentDurable => {
+                WorkflowHistoricalSourceResolution::AttachFromCurrentDurable {
+                    durable_sequence: current_durable_sequence,
+                }
+            }
+            WorkflowSourceBootstrapPolicy::CheckpointOrBeginning => {
+                if checkpoint_available {
+                    WorkflowHistoricalSourceResolution::RestoreCheckpoint
+                } else {
+                    WorkflowHistoricalSourceResolution::AttachFromBeginning
+                }
+            }
+            WorkflowSourceBootstrapPolicy::CheckpointOrCurrentDurable => {
+                if checkpoint_available {
+                    WorkflowHistoricalSourceResolution::RestoreCheckpoint
+                } else {
+                    WorkflowHistoricalSourceResolution::AttachFromCurrentDurable {
+                        durable_sequence: current_durable_sequence,
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn recovery_resolution(
+        self,
+        checkpoint_available: bool,
+        current_durable_sequence: SequenceNumber,
+    ) -> WorkflowHistoricalSourceResolution {
+        match self.recovery {
+            WorkflowSourceRecoveryPolicy::FailClosed => {
+                WorkflowHistoricalSourceResolution::FailClosedSnapshotTooOld
+            }
+            WorkflowSourceRecoveryPolicy::RestoreCheckpoint => {
+                WorkflowHistoricalSourceResolution::RestoreCheckpoint
+            }
+            WorkflowSourceRecoveryPolicy::RestoreCheckpointOrFastForward => {
+                if checkpoint_available {
+                    WorkflowHistoricalSourceResolution::RestoreCheckpoint
+                } else {
+                    WorkflowHistoricalSourceResolution::FastForwardToCurrentDurable {
+                        durable_sequence: current_durable_sequence,
+                    }
+                }
+            }
+            WorkflowSourceRecoveryPolicy::ReplayFromHistory => {
+                WorkflowHistoricalSourceResolution::ReplayFromHistory
+            }
+            WorkflowSourceRecoveryPolicy::FastForwardToCurrentDurable => {
+                WorkflowHistoricalSourceResolution::FastForwardToCurrentDurable {
+                    durable_sequence: current_durable_sequence,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowSource {
+    table: Table,
+    config: WorkflowSourceConfig,
+}
+
+impl WorkflowSource {
+    pub fn new(table: Table) -> Self {
+        Self {
+            table,
+            config: WorkflowSourceConfig::default(),
+        }
+    }
+
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    pub fn config(&self) -> &WorkflowSourceConfig {
+        &self.config
+    }
+
+    pub fn with_config(mut self, config: WorkflowSourceConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_bootstrap_policy(mut self, bootstrap: WorkflowSourceBootstrapPolicy) -> Self {
+        self.config.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_recovery_policy(mut self, recovery: WorkflowSourceRecoveryPolicy) -> Self {
+        self.config.recovery = recovery;
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: WorkflowSourceCapabilities) -> Self {
+        self.config.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_replay_kind(mut self, replay: WorkflowReplayableSourceKind) -> Self {
+        self.config.capabilities.replay = replay;
+        self
+    }
+
+    pub fn with_checkpoint_support(
+        mut self,
+        checkpoint: WorkflowHistoricalArtifactSupport,
+    ) -> Self {
+        self.config.capabilities.checkpoint = checkpoint;
+        self
+    }
+
+    pub fn with_trigger_journal_support(
+        mut self,
+        trigger_journal: WorkflowHistoricalArtifactSupport,
+    ) -> Self {
+        self.config.capabilities.trigger_journal = trigger_journal;
+        self
+    }
+
+    pub fn initial_resolution(
+        &self,
+        checkpoint_available: bool,
+        current_durable_sequence: SequenceNumber,
+    ) -> WorkflowHistoricalSourceResolution {
+        self.config
+            .initial_resolution(checkpoint_available, current_durable_sequence)
+    }
+
+    pub fn recovery_resolution(
+        &self,
+        checkpoint_available: bool,
+        current_durable_sequence: SequenceNumber,
+    ) -> WorkflowHistoricalSourceResolution {
+        self.config
+            .recovery_resolution(checkpoint_available, current_durable_sequence)
+    }
+}
+
+impl From<Table> for WorkflowSource {
+    fn from(table: Table) -> Self {
+        Self::new(table)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowHistoricalEvent {
+    FirstAttach,
+    SnapshotTooOld,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowSourceAttachMode {
+    Historical,
+    LiveOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum WorkflowHistoricalSourceResolution {
+    AttachFromBeginning,
+    AttachFromCurrentDurable { durable_sequence: SequenceNumber },
+    RestoreCheckpoint,
+    ReplayFromHistory,
+    FastForwardToCurrentDurable { durable_sequence: SequenceNumber },
+    FailClosedSnapshotTooOld,
+}
+
+impl WorkflowHistoricalSourceResolution {
+    pub fn attach_mode(self) -> Option<WorkflowSourceAttachMode> {
+        match self {
+            Self::AttachFromBeginning | Self::RestoreCheckpoint | Self::ReplayFromHistory => {
+                Some(WorkflowSourceAttachMode::Historical)
+            }
+            Self::AttachFromCurrentDurable { .. } | Self::FastForwardToCurrentDurable { .. } => {
+                Some(WorkflowSourceAttachMode::LiveOnly)
+            }
+            Self::FailClosedSnapshotTooOld => None,
+        }
+    }
+
+    pub fn is_lossy(self) -> bool {
+        matches!(self, Self::FastForwardToCurrentDurable { .. })
+    }
+
+    pub fn surfaces_snapshot_too_old(self) -> bool {
+        matches!(self, Self::FailClosedSnapshotTooOld)
+    }
+
+    pub fn progress_origin(self) -> Option<WorkflowSourceProgressOrigin> {
+        match self {
+            Self::AttachFromBeginning => Some(WorkflowSourceProgressOrigin::BeginningBootstrap),
+            Self::AttachFromCurrentDurable { .. } => {
+                Some(WorkflowSourceProgressOrigin::CurrentDurableBootstrap)
+            }
+            Self::RestoreCheckpoint => Some(WorkflowSourceProgressOrigin::CheckpointRestore),
+            Self::ReplayFromHistory => Some(WorkflowSourceProgressOrigin::ReplayFromHistory),
+            Self::FastForwardToCurrentDurable { .. } => {
+                Some(WorkflowSourceProgressOrigin::FastForwardToCurrentDurable)
+            }
+            Self::FailClosedSnapshotTooOld => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowHistoricalSourceScenario {
+    pub source_name: String,
+    pub config: WorkflowSourceConfig,
+    pub event: WorkflowHistoricalEvent,
+    pub checkpoint_available: bool,
+    pub current_durable_sequence: SequenceNumber,
+}
+
+impl WorkflowHistoricalSourceScenario {
+    pub fn new(
+        source_name: impl Into<String>,
+        config: WorkflowSourceConfig,
+        event: WorkflowHistoricalEvent,
+        current_durable_sequence: SequenceNumber,
+    ) -> Self {
+        Self {
+            source_name: source_name.into(),
+            config,
+            event,
+            checkpoint_available: false,
+            current_durable_sequence,
+        }
+    }
+
+    pub fn with_checkpoint_available(mut self, checkpoint_available: bool) -> Self {
+        self.checkpoint_available = checkpoint_available;
+        self
+    }
+
+    pub fn resolve(&self) -> WorkflowHistoricalSourceResolution {
+        match self.event {
+            WorkflowHistoricalEvent::FirstAttach => self
+                .config
+                .initial_resolution(self.checkpoint_available, self.current_durable_sequence),
+            WorkflowHistoricalEvent::SnapshotTooOld => self
+                .config
+                .recovery_resolution(self.checkpoint_available, self.current_durable_sequence),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowSourceProgressOrigin {
+    #[default]
+    DurableCursor,
+    BeginningBootstrap,
+    CurrentDurableBootstrap,
+    CheckpointRestore,
+    ReplayFromHistory,
+    FastForwardToCurrentDurable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum WorkflowSourceResumePoint {
+    Cursor {
+        #[serde(with = "log_cursor_serde")]
+        cursor: LogCursor,
+    },
+    DurableSequenceFence {
+        sequence: SequenceNumber,
+    },
+}
+
+impl WorkflowSourceResumePoint {
+    pub fn sequence(self) -> SequenceNumber {
+        match self {
+            Self::Cursor { cursor } => cursor.sequence(),
+            Self::DurableSequenceFence { sequence } => sequence,
+        }
+    }
+
+    pub fn as_log_cursor(self) -> LogCursor {
+        match self {
+            Self::Cursor { cursor } => cursor,
+            // A durable-sequence fence means "skip everything durable through this sequence".
+            Self::DurableSequenceFence { sequence } => LogCursor::new(sequence, u16::MAX),
+        }
+    }
+
+    fn order_key(self) -> (SequenceNumber, u32) {
+        match self {
+            Self::Cursor { cursor } => (cursor.sequence(), u32::from(cursor.op_index())),
+            Self::DurableSequenceFence { sequence } => (sequence, u32::MAX),
+        }
+    }
+}
+
+impl PartialOrd for WorkflowSourceResumePoint {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorkflowSourceResumePoint {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order_key().cmp(&other.order_key())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSourceProgress {
+    resume_from: WorkflowSourceResumePoint,
+    origin: WorkflowSourceProgressOrigin,
+}
+
+impl Default for WorkflowSourceProgress {
+    fn default() -> Self {
+        Self::from_cursor(LogCursor::beginning())
+    }
+}
+
+impl WorkflowSourceProgress {
+    pub fn from_cursor(cursor: LogCursor) -> Self {
+        Self {
+            resume_from: WorkflowSourceResumePoint::Cursor { cursor },
+            origin: WorkflowSourceProgressOrigin::DurableCursor,
+        }
+    }
+
+    pub fn from_durable_sequence(sequence: SequenceNumber) -> Self {
+        Self {
+            resume_from: WorkflowSourceResumePoint::DurableSequenceFence { sequence },
+            origin: WorkflowSourceProgressOrigin::CurrentDurableBootstrap,
+        }
+    }
+
+    pub fn resume_point(self) -> WorkflowSourceResumePoint {
+        self.resume_from
+    }
+
+    pub fn as_log_cursor(self) -> LogCursor {
+        self.resume_from.as_log_cursor()
+    }
+
+    pub fn sequence(self) -> SequenceNumber {
+        self.resume_from.sequence()
+    }
+
+    pub fn origin(self) -> WorkflowSourceProgressOrigin {
+        self.origin
+    }
+
+    pub fn with_origin(mut self, origin: WorkflowSourceProgressOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    pub fn encode(self) -> Result<Vec<u8>, StorageError> {
+        encode_workflow_source_progress(self)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        decode_workflow_source_progress(bytes)
+    }
+}
+
+impl PartialOrd for WorkflowSourceProgress {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorkflowSourceProgress {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.resume_from
+            .cmp(&other.resume_from)
+            .then_with(|| self.origin.cmp(&other.origin))
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct WorkflowCheckpointId(u64);
+
+impl WorkflowCheckpointId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for WorkflowCheckpointId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:06}", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowCheckpointArtifactKind {
+    State,
+    Inbox,
+    TriggerOrder,
+    SourceProgress,
+    TimerSchedule,
+    TimerLookup,
+    Outbox,
+    TriggerJournal,
+}
+
+impl WorkflowCheckpointArtifactKind {
+    pub fn filename_stem(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Inbox => "inbox",
+            Self::TriggerOrder => "trigger-order",
+            Self::SourceProgress => "source-progress",
+            Self::TimerSchedule => "timer-schedule",
+            Self::TimerLookup => "timer-lookup",
+            Self::Outbox => "outbox",
+            Self::TriggerJournal => "trigger-journal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCheckpointArtifact {
+    pub kind: WorkflowCheckpointArtifactKind,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowCheckpointArtifactPayload {
+    pub kind: WorkflowCheckpointArtifactKind,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCheckpointManifest {
+    pub workflow_name: String,
+    pub checkpoint_id: WorkflowCheckpointId,
+    pub captured_at: Timestamp,
+    pub source_frontier: BTreeMap<String, WorkflowSourceProgress>,
+    pub artifacts: Vec<WorkflowCheckpointArtifact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCheckpointLayout {
+    pub workflow_name: String,
+    pub checkpoint_id: WorkflowCheckpointId,
+}
+
+impl WorkflowCheckpointLayout {
+    pub fn new(workflow_name: impl Into<String>, checkpoint_id: WorkflowCheckpointId) -> Self {
+        Self {
+            workflow_name: workflow_name.into(),
+            checkpoint_id,
+        }
+    }
+
+    pub fn checkpoint_prefix(&self) -> String {
+        format!(
+            "workflow/{}/checkpoints/CHK-{}",
+            self.workflow_name, self.checkpoint_id
+        )
+    }
+
+    pub fn manifest_path(&self) -> String {
+        format!("{}/MANIFEST.json", self.checkpoint_prefix())
+    }
+
+    pub fn artifact_path(&self, kind: WorkflowCheckpointArtifactKind) -> String {
+        format!("{}/{}.bin", self.checkpoint_prefix(), kind.filename_stem())
+    }
+
+    pub fn manifest_with_frontier(
+        &self,
+        captured_at: Timestamp,
+        source_frontier: BTreeMap<String, WorkflowSourceProgress>,
+        artifact_kinds: impl IntoIterator<Item = WorkflowCheckpointArtifactKind>,
+    ) -> WorkflowCheckpointManifest {
+        WorkflowCheckpointManifest {
+            workflow_name: self.workflow_name.clone(),
+            checkpoint_id: self.checkpoint_id,
+            captured_at,
+            source_frontier,
+            artifacts: artifact_kinds
+                .into_iter()
+                .map(|kind| WorkflowCheckpointArtifact {
+                    kind,
+                    path: self.artifact_path(kind),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkflowCheckpointStoreError {
+    inner: Box<dyn StdError + Send + Sync + 'static>,
+}
+
+impl WorkflowCheckpointStoreError {
+    pub fn new<E>(error: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self {
+            inner: Box::new(error),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowCheckpointStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl StdError for WorkflowCheckpointStoreError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.inner.as_ref())
+    }
+}
+
+#[async_trait]
+pub trait WorkflowCheckpointStore: Send + Sync {
+    async fn load_latest_manifest(
+        &self,
+        workflow_name: &str,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowCheckpointStoreError>;
+
+    async fn load_manifest(
+        &self,
+        workflow_name: &str,
+        checkpoint_id: WorkflowCheckpointId,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowCheckpointStoreError>;
+
+    async fn read_artifact(
+        &self,
+        workflow_name: &str,
+        checkpoint_id: WorkflowCheckpointId,
+        kind: WorkflowCheckpointArtifactKind,
+    ) -> Result<Option<Vec<u8>>, WorkflowCheckpointStoreError>;
+
+    async fn publish_checkpoint(
+        &self,
+        manifest: WorkflowCheckpointManifest,
+        artifacts: Vec<WorkflowCheckpointArtifactPayload>,
+    ) -> Result<(), WorkflowCheckpointStoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -420,8 +1102,12 @@ impl WorkflowTables {
         &self.trigger_order
     }
 
-    pub fn source_cursor_table(&self) -> &Table {
+    pub fn source_progress_table(&self) -> &Table {
         &self.source_cursors
+    }
+
+    pub fn source_cursor_table(&self) -> &Table {
+        self.source_progress_table()
     }
 
     pub fn timer_schedule_table(&self) -> &Table {
@@ -447,9 +1133,10 @@ impl WorkflowTables {
 
 pub struct WorkflowDefinition<H> {
     name: String,
-    sources: Vec<Table>,
+    sources: Vec<WorkflowSource>,
     handler: H,
     scheduler: Option<Arc<dyn WorkflowScheduler>>,
+    checkpoint_store: Option<Arc<dyn WorkflowCheckpointStore>>,
     table_names: WorkflowTableNames,
     timer_poll_interval: Duration,
     source_batch_limit: usize,
@@ -458,17 +1145,19 @@ pub struct WorkflowDefinition<H> {
 }
 
 impl<H> WorkflowDefinition<H> {
-    pub fn new<I>(name: impl Into<String>, sources: I, handler: H) -> Self
+    pub fn new<I, S>(name: impl Into<String>, sources: I, handler: H) -> Self
     where
-        I: IntoIterator<Item = Table>,
+        I: IntoIterator<Item = S>,
+        S: Into<WorkflowSource>,
     {
         let name = name.into();
         Self {
             table_names: WorkflowTableNames::for_workflow(&name),
             name,
-            sources: sources.into_iter().collect(),
+            sources: sources.into_iter().map(Into::into).collect(),
             handler,
             scheduler: None,
+            checkpoint_store: None,
             timer_poll_interval: DEFAULT_TIMER_POLL_INTERVAL,
             source_batch_limit: DEFAULT_SOURCE_BATCH_LIMIT,
             timer_batch_limit: DEFAULT_TIMER_BATCH_LIMIT,
@@ -478,6 +1167,22 @@ impl<H> WorkflowDefinition<H> {
 
     pub fn with_scheduler(mut self, scheduler: Arc<dyn WorkflowScheduler>) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_checkpoint_store(
+        mut self,
+        checkpoint_store: Arc<dyn WorkflowCheckpointStore>,
+    ) -> Self {
+        self.checkpoint_store = Some(checkpoint_store);
+        self
+    }
+
+    fn with_checkpoint_store_opt(
+        mut self,
+        checkpoint_store: Option<Arc<dyn WorkflowCheckpointStore>>,
+    ) -> Self {
+        self.checkpoint_store = checkpoint_store;
         self
     }
 
@@ -550,11 +1255,11 @@ struct WorkflowRuntimeInner<H> {
     name: String,
     db: Db,
     clock: Arc<dyn Clock>,
-    sources: Vec<Table>,
+    sources: Vec<WorkflowSource>,
     handler: Arc<H>,
     scheduler: Arc<dyn WorkflowScheduler>,
     tables: WorkflowTables,
-    source_cursors: DurableCursorStore,
+    checkpoint_store: Option<Arc<dyn WorkflowCheckpointStore>>,
     timer_poll_interval: Duration,
     source_batch_limit: usize,
     timer_batch_limit: usize,
@@ -595,7 +1300,7 @@ where
                     sources: definition.sources,
                     handler: Arc::new(definition.handler),
                     scheduler,
-                    source_cursors: DurableCursorStore::new(tables.source_cursors.clone()),
+                    checkpoint_store: definition.checkpoint_store,
                     tables,
                     timer_poll_interval: definition.timer_poll_interval,
                     source_batch_limit: definition.source_batch_limit,
@@ -619,6 +1324,10 @@ where
         &self.inner.tables
     }
 
+    pub fn checkpoint_store(&self) -> Option<&Arc<dyn WorkflowCheckpointStore>> {
+        self.inner.checkpoint_store.as_ref()
+    }
+
     pub async fn load_state(&self, instance_id: &str) -> Result<Option<Value>, WorkflowError> {
         Ok(self
             .inner
@@ -628,12 +1337,15 @@ where
             .await?)
     }
 
+    pub async fn load_source_progress(
+        &self,
+        source: &Table,
+    ) -> Result<WorkflowSourceProgress, WorkflowError> {
+        load_workflow_source_progress(self.inner.tables.source_progress_table(), source).await
+    }
+
     pub async fn load_source_cursor(&self, source: &Table) -> Result<LogCursor, WorkflowError> {
-        Ok(self
-            .inner
-            .source_cursors
-            .load(&source_cursor_key(source))
-            .await?)
+        Ok(self.load_source_progress(source).await?.as_log_cursor())
     }
 
     pub async fn admit_callback(
@@ -778,15 +1490,15 @@ where
             .len();
         let mut source_lags = Vec::with_capacity(self.inner.sources.len());
         for source in &self.inner.sources {
-            let durable_source_sequence = self.inner.db.subscribe_durable(source).current();
-            let cursor = self.load_source_cursor(source).await?;
+            let durable_source_sequence = self.inner.db.subscribe_durable(source.table()).current();
+            let progress = self.load_source_progress(source.table()).await?;
             source_lags.push(WorkflowSourceTelemetrySnapshot {
-                source_table: source.name().to_string(),
+                source_table: source.table().name().to_string(),
                 durable_sequence: durable_source_sequence,
-                cursor_sequence: cursor.sequence(),
+                cursor_sequence: progress.sequence(),
                 lag: durable_source_sequence
                     .get()
-                    .saturating_sub(cursor.sequence().get()),
+                    .saturating_sub(progress.sequence().get()),
             });
         }
 
@@ -903,6 +1615,7 @@ pub struct RecurringWorkflowDefinition<H> {
     schedule: RecurringSchedule,
     handler: H,
     scheduler: Option<Arc<dyn WorkflowScheduler>>,
+    checkpoint_store: Option<Arc<dyn WorkflowCheckpointStore>>,
     table_names: WorkflowTableNames,
     timer_poll_interval: Duration,
     timer_batch_limit: usize,
@@ -924,6 +1637,7 @@ impl<H> RecurringWorkflowDefinition<H> {
             schedule,
             handler,
             scheduler: None,
+            checkpoint_store: None,
             timer_poll_interval: DEFAULT_TIMER_POLL_INTERVAL,
             timer_batch_limit: DEFAULT_TIMER_BATCH_LIMIT,
             progress_mode: WorkflowProgressMode::Auto,
@@ -932,6 +1646,14 @@ impl<H> RecurringWorkflowDefinition<H> {
 
     pub fn with_scheduler(mut self, scheduler: Arc<dyn WorkflowScheduler>) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_checkpoint_store(
+        mut self,
+        checkpoint_store: Arc<dyn WorkflowCheckpointStore>,
+    ) -> Self {
+        self.checkpoint_store = Some(checkpoint_store);
         self
     }
 
@@ -1002,6 +1724,7 @@ where
                     .scheduler
                     .unwrap_or_else(|| Arc::new(RoundRobinWorkflowScheduler::default())),
             )
+            .with_checkpoint_store_opt(definition.checkpoint_store)
             .with_table_names(definition.table_names)
             .with_timer_poll_interval(definition.timer_poll_interval)
             .with_timer_batch_limit(definition.timer_batch_limit)
@@ -1273,24 +1996,23 @@ where
 
 async fn run_source_admission_loop<H>(
     runtime: Arc<WorkflowRuntimeInner<H>>,
-    source: Table,
+    source: WorkflowSource,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
     H: WorkflowHandler + 'static,
 {
-    let mut cursor = runtime
-        .source_cursors
-        .load(&source_cursor_key(&source))
-        .await?;
-    let mut durable_wakes = runtime.db.subscribe_durable(&source);
+    let mut progress =
+        load_workflow_source_progress(runtime.tables.source_progress_table(), source.table())
+            .await?;
+    let mut durable_wakes = runtime.db.subscribe_durable(source.table());
 
     loop {
         if *shutdown_rx.borrow() {
             return Ok(());
         }
 
-        while admit_source_page(&runtime, &source, &mut cursor).await? {
+        while admit_source_page(&runtime, &source, &mut progress).await? {
             if *shutdown_rx.borrow() {
                 return Ok(());
             }
@@ -1300,7 +2022,7 @@ where
             return Ok(());
         }
 
-        if durable_wakes.current() > cursor.sequence() {
+        if durable_wakes.current() > progress.sequence() {
             continue;
         }
 
@@ -1323,8 +2045,8 @@ where
 
 async fn admit_source_page<H>(
     runtime: &WorkflowRuntimeInner<H>,
-    source: &Table,
-    cursor: &mut LogCursor,
+    source: &WorkflowSource,
+    progress: &mut WorkflowSourceProgress,
 ) -> Result<bool, WorkflowError>
 where
     H: WorkflowHandler + 'static,
@@ -1332,8 +2054,8 @@ where
     let mut stream = runtime
         .db
         .scan_durable_since(
-            source,
-            *cursor,
+            source.table(),
+            progress.as_log_cursor(),
             ScanOptions {
                 limit: Some(runtime.source_batch_limit),
                 ..ScanOptions::default()
@@ -1360,7 +2082,7 @@ where
     set_span_attribute(
         &span,
         telemetry_attrs::SOURCE_TABLE,
-        source.name().to_string(),
+        source.table().name().to_string(),
     );
     set_span_attribute(
         &span,
@@ -1375,7 +2097,7 @@ where
             let mut tx = Transaction::begin(&runtime.db).await;
             let mut ready_seen = BTreeSet::new();
             let mut newly_ready = Vec::new();
-            let mut new_cursor = *cursor;
+            let mut new_progress = *progress;
 
             for entry in &page {
                 let instance_id = runtime.handler.route_event(entry).await.map_err(|source| {
@@ -1399,22 +2121,28 @@ where
                 if ready_seen.insert(instance_id.clone()) {
                     newly_ready.push(instance_id);
                 }
-                new_cursor = entry.cursor;
+                new_progress = WorkflowSourceProgress::from_cursor(entry.cursor)
+                    .with_origin(progress.origin());
             }
 
-            runtime.source_cursors.stage_persist_in_transaction(
+            stage_workflow_source_progress_in_transaction(
                 &mut tx,
-                source_cursor_key(source),
-                new_cursor,
-            );
+                runtime.tables.source_progress_table(),
+                source.table(),
+                new_progress,
+            )?;
 
             match commit_runtime_transaction(runtime, tx).await {
                 Ok(_) => {
-                    *cursor = new_cursor;
+                    *progress = new_progress;
                     set_span_attribute(
                         &span_for_attrs,
                         telemetry_attrs::LOG_CURSOR,
-                        format!("{}:{}", new_cursor.sequence().get(), new_cursor.op_index()),
+                        format!(
+                            "{}:{}",
+                            new_progress.sequence().get(),
+                            new_progress.as_log_cursor().op_index()
+                        ),
                     );
                     for instance_id in newly_ready {
                         runtime.scheduler.mark_ready(instance_id);
@@ -1959,6 +2687,44 @@ fn source_cursor_key(source: &Table) -> Key {
     source.name().as_bytes().to_vec()
 }
 
+async fn load_workflow_source_progress(
+    progress_table: &Table,
+    source: &Table,
+) -> Result<WorkflowSourceProgress, WorkflowError> {
+    let Some(value) = progress_table.read(source_cursor_key(source)).await? else {
+        return Ok(WorkflowSourceProgress::default());
+    };
+    decode_workflow_source_progress_value(&value).map_err(Into::into)
+}
+
+fn stage_workflow_source_progress_in_transaction(
+    tx: &mut Transaction,
+    progress_table: &Table,
+    source: &Table,
+    progress: WorkflowSourceProgress,
+) -> Result<(), WorkflowError> {
+    tx.write(
+        progress_table,
+        source_cursor_key(source),
+        Value::bytes(progress.encode()?),
+    );
+    Ok(())
+}
+
+fn decode_workflow_source_progress_value(
+    value: &Value,
+) -> Result<WorkflowSourceProgress, StorageError> {
+    let bytes = match value {
+        Value::Bytes(bytes) => bytes.as_slice(),
+        Value::Record(_) => {
+            return Err(StorageError::corruption(
+                "workflow source progress expected a byte value",
+            ));
+        }
+    };
+    WorkflowSourceProgress::decode(bytes)
+}
+
 fn inbox_key(instance_id: &str, trigger_seq: u64) -> Key {
     let mut key = Vec::with_capacity(instance_id.len() + 1 + 8);
     key.extend_from_slice(instance_id.as_bytes());
@@ -2012,6 +2778,39 @@ fn decode_u64_bytes(bytes: &[u8], context: &str) -> Result<u64, std::io::Error> 
     let mut raw = [0_u8; 8];
     raw.copy_from_slice(bytes);
     Ok(u64::from_be_bytes(raw))
+}
+
+fn encode_workflow_source_progress(
+    progress: WorkflowSourceProgress,
+) -> Result<Vec<u8>, StorageError> {
+    let json = serde_json::to_vec(&progress).map_err(|error| {
+        StorageError::corruption(format!(
+            "workflow source progress serialization failed: {error}"
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(1 + json.len());
+    // Version 1 was the legacy bare-cursor encoding from DurableCursorStore.
+    bytes.push(WORKFLOW_SOURCE_PROGRESS_FORMAT_VERSION);
+    bytes.extend_from_slice(&json);
+    Ok(bytes)
+}
+
+fn decode_workflow_source_progress(bytes: &[u8]) -> Result<WorkflowSourceProgress, StorageError> {
+    if bytes.first().copied() == Some(WORKFLOW_SOURCE_PROGRESS_FORMAT_VERSION) {
+        return serde_json::from_slice(&bytes[1..]).map_err(|error| {
+            StorageError::corruption(format!("workflow source progress decoding failed: {error}"))
+        });
+    }
+
+    if bytes.len() == 1 + LogCursor::ENCODED_LEN && bytes.first().copied() == Some(1) {
+        let cursor = LogCursor::decode(&bytes[1..])
+            .map_err(|error| StorageError::corruption(error.to_string()))?;
+        return Ok(WorkflowSourceProgress::from_cursor(cursor));
+    }
+
+    Err(StorageError::corruption(
+        "workflow source progress encoding is invalid",
+    ))
 }
 
 fn encode_payload<T>(value: &T, context: &str) -> Result<Vec<u8>, WorkflowError>
