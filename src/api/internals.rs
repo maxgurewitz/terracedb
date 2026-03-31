@@ -299,6 +299,8 @@ pub(super) struct SchedulerObservabilityStats {
     pub(super) background_delay_events_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
     pub(super) background_delay_millis_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
     pub(super) throttled_writes_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
+    pub(super) last_admission_diagnostics_by_domain:
+        Mutex<BTreeMap<crate::ExecutionDomainPath, crate::AdmissionDiagnostics>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2059,6 +2061,7 @@ impl CommitRuntime {
     pub(super) async fn recover_after(
         &self,
         after_sequence: SequenceNumber,
+        recovered_at: Timestamp,
     ) -> Result<RecoveredCommitLogState, StorageError> {
         let records = match &self.backend {
             CommitLogBackend::Local(manager) => manager.scan_from_sequence(after_sequence).await?,
@@ -2073,7 +2076,7 @@ impl CommitRuntime {
             recovered.max_sequence = recovered.max_sequence.max(record.sequence());
             recovered
                 .memtables
-                .apply_recovered_record(&record, Timestamp::new(0));
+                .apply_recovered_record(&record, recovered_at);
         }
 
         Ok(recovered)

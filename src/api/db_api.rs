@@ -643,15 +643,23 @@ impl Db {
         )
     }
 
-    pub(super) fn execution_domain_budget(
+    pub(super) fn execution_domain_snapshot(
         &self,
         path: &ExecutionDomainPath,
-    ) -> Option<ExecutionDomainBudget> {
+    ) -> Option<crate::ExecutionDomainSnapshot> {
         self.inner
             .resource_manager
             .snapshot()
             .domains
             .get(path)
+            .cloned()
+    }
+
+    pub(super) fn execution_domain_budget(
+        &self,
+        path: &ExecutionDomainPath,
+    ) -> Option<ExecutionDomainBudget> {
+        self.execution_domain_snapshot(path)
             .map(|snapshot| snapshot.spec.budget)
     }
 
@@ -1422,21 +1430,82 @@ impl Db {
         }
     }
 
-    fn pressure_budget(&self, domain_budget: Option<ExecutionDomainBudget>) -> PressureBudget {
-        let mutable_hard_limit_bytes = domain_budget
-            .and_then(|budget| budget.memory.mutable_bytes)
-            .or_else(|| self.memtable_budget_bytes());
-        let unified_log_hard_limit_bytes = mutable_hard_limit_bytes;
-        PressureBudget {
-            mutable_soft_limit_bytes: crate::pressure::derived_soft_limit_bytes(
-                mutable_hard_limit_bytes,
-            ),
-            mutable_hard_limit_bytes,
-            unified_log_soft_limit_bytes: crate::pressure::derived_soft_limit_bytes(
-                unified_log_hard_limit_bytes,
-            ),
-            unified_log_hard_limit_bytes,
+    fn process_mutable_budget_bytes(&self) -> Option<u64> {
+        match &self.inner.config.storage {
+            StorageConfig::Tiered(config) => Some(config.max_local_bytes),
+            StorageConfig::S3Primary(_) => None,
         }
+    }
+
+    fn admission_policy_from_metadata(
+        metadata: &BTreeMap<String, String>,
+    ) -> crate::AdmissionPolicyProfile {
+        [
+            "terracedb.pressure.write_policy",
+            "terracedb.pressure.policy",
+            "terracedb.execution.role",
+        ]
+        .into_iter()
+        .find_map(|key| metadata.get(key).and_then(|value| value.parse().ok()))
+        .unwrap_or_default()
+    }
+
+    fn admission_policy_for_domain(
+        &self,
+        domain_path: Option<&ExecutionDomainPath>,
+    ) -> crate::AdmissionPolicyProfile {
+        domain_path
+            .and_then(|path| self.execution_domain_snapshot(path))
+            .map(|snapshot| Self::admission_policy_from_metadata(&snapshot.spec.metadata))
+            .unwrap_or_default()
+    }
+
+    fn pressure_metadata(
+        &self,
+        domain_path: Option<&ExecutionDomainPath>,
+        policy: crate::AdmissionPolicyProfile,
+    ) -> BTreeMap<String, serde_json::Value> {
+        let mut metadata = BTreeMap::from([(
+            "terracedb.pressure.policy".to_string(),
+            serde_json::Value::String(policy.as_str().to_string()),
+        )]);
+        if let Some(path) = domain_path
+            && let Some(snapshot) = self.execution_domain_snapshot(path)
+        {
+            metadata.extend(
+                snapshot
+                    .spec
+                    .metadata
+                    .into_iter()
+                    .map(|(key, value)| (key, serde_json::Value::String(value))),
+            );
+        }
+        metadata
+    }
+
+    fn pressure_budget(
+        &self,
+        domain_path: Option<&ExecutionDomainPath>,
+        domain_budget: Option<ExecutionDomainBudget>,
+    ) -> PressureBudget {
+        let policy = self.admission_policy_for_domain(domain_path);
+        let process_hard_limit_bytes = self.process_mutable_budget_bytes();
+        let mutable_hard_limit_bytes = match (
+            process_hard_limit_bytes,
+            domain_budget.and_then(|budget| budget.memory.mutable_bytes),
+        ) {
+            (Some(process), Some(domain)) => Some(process.min(domain)),
+            (Some(process), None) => Some(process),
+            (None, Some(domain)) => Some(domain),
+            (None, None) => None,
+        };
+        let background_in_flight_limit_bytes =
+            domain_budget.and_then(|budget| budget.background.max_in_flight_bytes);
+        crate::derive_pressure_budget(
+            policy,
+            mutable_hard_limit_bytes,
+            background_in_flight_limit_bytes,
+        )
     }
 
     fn pressure_age_since(&self, oldest_unflushed_at: Option<Timestamp>) -> Option<Duration> {
@@ -1543,14 +1612,17 @@ impl Db {
     pub async fn process_pressure_stats(&self) -> PressureStats {
         let memtables = self.memtables_read();
         let total = Self::total_pressure_accounting(&memtables);
+        let policy = self.admission_policy_for_domain(None);
+        let mut metadata = total.metadata();
+        metadata.extend(self.pressure_metadata(None, policy));
         PressureStats {
             scope: PressureScope::Process,
             local: total.bytes,
             domain_total: Some(total.bytes),
             process_total: Some(total.bytes),
             oldest_unflushed_age: self.pressure_age_since(memtables.oldest_unflushed_at()),
-            budget: self.pressure_budget(None),
-            metadata: total.metadata(),
+            budget: self.pressure_budget(None, None),
+            metadata,
         }
     }
 
@@ -1562,6 +1634,10 @@ impl Db {
         } else {
             PressureAccountingSnapshot::default()
         };
+        let budget = self.execution_domain_budget(path);
+        let policy = self.admission_policy_for_domain(Some(path));
+        let mut metadata = local.metadata();
+        metadata.extend(self.pressure_metadata(Some(path), policy));
 
         PressureStats {
             scope: PressureScope::Domain(path.clone()),
@@ -1572,8 +1648,8 @@ impl Db {
                 .domain_tracks_db_pressure(path)
                 .then(|| self.pressure_age_since(memtables.oldest_unflushed_at()))
                 .flatten(),
-            budget: self.pressure_budget(self.execution_domain_budget(path)),
-            metadata: local.metadata(),
+            budget: self.pressure_budget(Some(path), budget),
+            metadata,
         }
     }
 
@@ -1584,6 +1660,9 @@ impl Db {
             .resolve_id()
             .map(|table_id| Self::table_pressure_accounting(&memtables, table_id))
             .unwrap_or_default();
+        let policy = self.admission_policy_for_domain(None);
+        let mut metadata = local.metadata();
+        metadata.extend(self.pressure_metadata(None, policy));
 
         PressureStats {
             scope: PressureScope::Table(table.name().to_string()),
@@ -1593,8 +1672,8 @@ impl Db {
             oldest_unflushed_age: table.id().and_then(|table_id| {
                 self.pressure_age_since(memtables.oldest_unflushed_at_for_table(table_id))
             }),
-            budget: self.pressure_budget(None),
-            metadata: local.metadata(),
+            budget: self.pressure_budget(None, None),
+            metadata,
         }
     }
 
@@ -1610,20 +1689,28 @@ impl Db {
             let mut pressure = self.table_pressure_stats(&table).await;
             let domain = self.domain_pressure_stats(&candidate.tag.domain).await;
             pressure.domain_total = Some(domain.local);
-            pressure.budget =
-                self.pressure_budget(self.execution_domain_budget(&candidate.tag.domain));
+            pressure.budget = self.pressure_budget(
+                Some(&candidate.tag.domain),
+                self.execution_domain_budget(&candidate.tag.domain),
+            );
+            let policy = self.admission_policy_for_domain(Some(&candidate.tag.domain));
+            let policy_metadata = self.pressure_metadata(Some(&candidate.tag.domain), policy);
+            let mut pressure_metadata = pressure.metadata.clone();
+            pressure_metadata.extend(policy_metadata.clone());
+            pressure.metadata = pressure_metadata;
             let estimated_relief = PressureBytes {
                 mutable_dirty_bytes: pressure.local.mutable_dirty_bytes,
                 immutable_queued_bytes: pressure.local.immutable_queued_bytes,
                 unified_log_pinned_bytes: pressure.local.unified_log_pinned_bytes,
                 ..PressureBytes::default()
             };
-            let metadata = crate::pressure::build_flush_candidate_metadata(
+            let mut metadata = crate::pressure::build_flush_candidate_metadata(
                 &pressure,
                 estimated_relief,
                 table_stats.l0_sstable_count,
                 table_stats.compaction_debt,
             );
+            metadata.extend(policy_metadata);
             candidates.push(DomainTaggedWork::new(
                 FlushPressureCandidate {
                     work: candidate.pending,
@@ -1665,8 +1752,13 @@ impl Db {
     ) -> AdmissionSignals {
         let mut pressure = self.table_pressure_stats(table).await;
         let domain = self.domain_pressure_stats(&runtime_tag.domain).await;
+        let policy = self.admission_policy_for_domain(Some(&runtime_tag.domain));
         pressure.domain_total = Some(domain.local);
-        pressure.budget = self.pressure_budget(domain_budget);
+        pressure.budget = self.pressure_budget(Some(&runtime_tag.domain), domain_budget);
+        let mut metadata = pressure.metadata.clone();
+        metadata.extend(self.pressure_metadata(Some(&runtime_tag.domain), policy));
+        pressure.metadata = metadata;
+        let metadata = pressure.metadata.clone();
 
         AdmissionSignals {
             table: table.name().to_string(),
@@ -1683,7 +1775,7 @@ impl Db {
                 commit_log_recovery_floor_sequence: stats.commit_log_recovery_floor_sequence,
                 commit_log_gc_floor_sequence: stats.commit_log_gc_floor_sequence,
             },
-            metadata: BTreeMap::new(),
+            metadata,
         }
     }
 
@@ -1776,6 +1868,7 @@ impl Db {
             .into_values()
             .collect::<Vec<_>>();
 
+        let mut pending_delay = Duration::ZERO;
         loop {
             let mut max_delay = Duration::ZERO;
             let flush_guardrail = self
@@ -1806,19 +1899,41 @@ impl Db {
                     &foreground_tag,
                     foreground_budget.as_ref(),
                 );
+                let diagnostics = self.inner.scheduler.admission_diagnostics(
+                    table,
+                    &stats,
+                    &signals,
+                    &foreground_tag,
+                    foreground_budget.as_ref(),
+                );
 
-                if let Some(rate) = decision.max_write_bytes_per_second {
-                    max_delay = max_delay.max(Self::throttle_delay(table_bytes, rate));
-                }
+                let table_delay = decision
+                    .max_write_bytes_per_second
+                    .map(|rate| Self::throttle_delay(table_bytes, rate))
+                    .unwrap_or_default();
+                max_delay = max_delay.max(table_delay);
+                let carry_delay = crate::carry_write_delay_across_maintenance(
+                    decision.max_write_bytes_per_second,
+                    diagnostics.as_ref(),
+                );
                 if decision.throttle {
+                    if let Some(diagnostics) = diagnostics.clone() {
+                        self.record_admission_diagnostics(&foreground_tag, diagnostics);
+                    }
                     self.record_throttled_write_domain(&foreground_tag);
                     should_run_maintenance = true;
                 }
                 if decision.stall || stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
                 {
+                    if let Some(diagnostics) = diagnostics {
+                        self.record_admission_diagnostics(&foreground_tag, diagnostics);
+                    }
                     self.record_throttled_write_domain(&foreground_tag);
                     should_run_maintenance = true;
                     must_stall = true;
+                }
+                if carry_delay {
+                    pending_delay = pending_delay.max(table_delay);
                 }
             }
 
@@ -1833,18 +1948,19 @@ impl Db {
                 if must_stall {
                     // Oversized writes can still trip a hard guardrail after
                     // maintenance has already exhausted the relievable
-                    // pressure. Preserve any explicit scheduler backoff before
-                    // allowing the write through so domain throttles still
-                    // apply in those cases.
-                    if max_delay > Duration::ZERO {
-                        self.inner.dependencies.clock.sleep(max_delay).await;
+                    // pressure. Preserve any explicit scheduler backoff, and
+                    // keep it even if maintenance made progress earlier in the
+                    // loop, so domain throttles still apply in those cases.
+                    if pending_delay > Duration::ZERO {
+                        self.inner.dependencies.clock.sleep(pending_delay).await;
                     }
                     break;
                 }
             }
 
-            if max_delay > Duration::ZERO {
-                self.inner.dependencies.clock.sleep(max_delay).await;
+            let delay = pending_delay.max(max_delay);
+            if delay > Duration::ZERO {
+                self.inner.dependencies.clock.sleep(delay).await;
             }
             break;
         }
@@ -4302,7 +4418,27 @@ impl Db {
                 .throttled_writes_by_domain
                 .lock()
                 .clone(),
+            last_admission_diagnostics_by_domain: self
+                .inner
+                .scheduler_observability
+                .last_admission_diagnostics_by_domain
+                .lock()
+                .clone(),
         }
+    }
+
+    pub(super) fn record_admission_diagnostics(
+        &self,
+        tag: &WorkRuntimeTag,
+        diagnostics: crate::AdmissionDiagnostics,
+    ) {
+        mutex_lock(
+            &self
+                .inner
+                .scheduler_observability
+                .last_admission_diagnostics_by_domain,
+        )
+        .insert(tag.domain.clone(), diagnostics);
     }
 
     pub(super) fn record_throttled_write_domain(&self, tag: &WorkRuntimeTag) {

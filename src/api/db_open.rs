@@ -93,7 +93,10 @@ impl Db {
                     .max(1);
             }
             let recovered_commit_log = commit_runtime
-                .recover_after(loaded_manifest.last_flushed_sequence)
+                .recover_after(
+                    loaded_manifest.last_flushed_sequence,
+                    dependencies.clock.now(),
+                )
                 .await?;
             let recovered_sequence = recovered_commit_log
                 .max_sequence

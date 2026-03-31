@@ -7,14 +7,21 @@ use std::time::Duration;
 
 use futures::{StreamExt, TryStreamExt};
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DbConfig,
-    FieldDefinition, FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure,
-    FileSystemOperation, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore, ObjectStoreOperation,
-    OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint, RoundRobinScheduler,
-    S3Location, S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
-    SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
-    StorageSource, TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredStorageConfig, Transaction, UnifiedStorage, Value,
+    Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
+    CommitOptions, CompactionStrategy, ContentionClass, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db,
+    DbComponents, DbConfig, DbSettings, DomainBackgroundBudget, DomainBudgetCharge,
+    DomainBudgetOracle, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DurabilityClass,
+    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceUsage, FieldDefinition,
+    FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure, FileSystemOperation,
+    InMemoryDomainBudgetOracle, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore,
+    ObjectStoreOperation, OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint,
+    ResourceManager, RoundRobinScheduler, S3Location, S3PrimaryStorageConfig, ScanOptions,
+    ScheduleAction, ScheduleDecision, Scheduler, SchemaDefinition, SegmentId, SequenceNumber,
+    SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubRng, TableConfig, TableFormat,
+    TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Transaction,
+    UnifiedStorage, Value, WorkPlacementRequest,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
@@ -335,6 +342,887 @@ fn simulation_s3_primary_config(prefix: &str) -> DbConfig {
         hybrid_read: Default::default(),
         scheduler: None,
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WholeSystemSimulationCampaignOutcome {
+    database_order: Vec<String>,
+    durable_rows_by_db: BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>,
+    control_tables_by_db: BTreeMap<String, Vec<String>>,
+    visible_sequence_by_db: BTreeMap<String, u64>,
+    durable_sequence_by_db: BTreeMap<String, u64>,
+    throttled_writes_by_domain: BTreeMap<String, u64>,
+    mutable_budget_by_domain: BTreeMap<String, Option<u64>>,
+    background_slots_by_domain: BTreeMap<String, Option<u32>>,
+    backlog_items_by_domain: BTreeMap<String, u64>,
+    backlog_bytes_by_domain: BTreeMap<String, u64>,
+    oracle_cpu_millis_by_domain: BTreeMap<String, u64>,
+    admissions: BTreeMap<String, bool>,
+}
+
+#[derive(Clone, Debug)]
+struct WholeSystemCampaignRng {
+    state: u64,
+}
+
+impl WholeSystemCampaignRng {
+    fn seeded(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut next = self.state;
+        next ^= next << 7;
+        next ^= next >> 9;
+        next ^= next << 8;
+        self.state = next;
+        next
+    }
+}
+
+#[derive(Debug, Default)]
+struct MutableBudgetThrottleSimulationScheduler;
+
+impl Scheduler for MutableBudgetThrottleSimulationScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_decision_in_domain(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+        signals: &terracedb::AdmissionSignals,
+        tag: &terracedb::WorkRuntimeTag,
+        domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        if tag.durability_class == DurabilityClass::ControlPlane {
+            return ThrottleDecision::default();
+        }
+
+        let Some(limit) = domain_budget.and_then(|budget| budget.memory.mutable_bytes) else {
+            return ThrottleDecision::default();
+        };
+        let projected_bytes = signals
+            .pressure
+            .local
+            .mutable_dirty_bytes
+            .saturating_add(signals.batch_write_bytes);
+        if projected_bytes >= limit {
+            return ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: None,
+                stall: false,
+            };
+        }
+
+        ThrottleDecision::default()
+    }
+}
+
+fn whole_system_simulation_process_budget() -> ExecutionDomainBudget {
+    ExecutionDomainBudget {
+        cpu: DomainCpuBudget {
+            worker_slots: Some(10),
+            weight: None,
+        },
+        memory: DomainMemoryBudget {
+            total_bytes: Some(4096),
+            cache_bytes: Some(2048),
+            mutable_bytes: Some(2048),
+        },
+        io: DomainIoBudget {
+            local_concurrency: Some(6),
+            local_bytes_per_second: Some(8192),
+            remote_concurrency: Some(4),
+            remote_bytes_per_second: Some(6144),
+        },
+        background: DomainBackgroundBudget {
+            task_slots: Some(6),
+            max_in_flight_bytes: Some(4096),
+        },
+    }
+}
+
+fn whole_system_lane_budget(
+    mutable_bytes: u64,
+    cpu_slots: u32,
+    remote_concurrency: u32,
+    background_slots: u32,
+) -> ExecutionDomainBudget {
+    ExecutionDomainBudget {
+        cpu: DomainCpuBudget {
+            worker_slots: Some(cpu_slots),
+            weight: Some(cpu_slots.max(1)),
+        },
+        memory: DomainMemoryBudget {
+            total_bytes: Some(mutable_bytes.saturating_mul(2)),
+            cache_bytes: Some(mutable_bytes),
+            mutable_bytes: Some(mutable_bytes),
+        },
+        io: DomainIoBudget {
+            local_concurrency: Some(remote_concurrency.max(1)),
+            local_bytes_per_second: Some(2048),
+            remote_concurrency: Some(remote_concurrency.max(1)),
+            remote_bytes_per_second: Some(2048),
+        },
+        background: DomainBackgroundBudget {
+            task_slots: Some(background_slots.max(1)),
+            max_in_flight_bytes: Some(mutable_bytes.saturating_mul(4)),
+        },
+    }
+}
+
+fn whole_system_simulation_deployment() -> (ColocatedDeployment, ExecutionDomainPath) {
+    let mut primary = ColocatedDatabasePlacement::shared("primary")
+        .with_metadata("terracedb.execution.role", "primary");
+    primary.foreground.placement = ExecutionDomainPlacement::SharedWeighted { weight: 3 };
+    primary.background.placement = ExecutionDomainPlacement::SharedWeighted { weight: 2 };
+    primary.foreground.budget = whole_system_lane_budget(512, 3, 2, 2);
+    primary.background.budget = whole_system_lane_budget(256, 2, 2, 2);
+
+    let mut analytics = ColocatedDatabasePlacement::analytics_helper("analytics");
+    analytics.foreground.budget = whole_system_lane_budget(192, 1, 1, 1);
+    analytics.background.budget = whole_system_lane_budget(128, 1, 1, 1);
+
+    let mut warehouse = ColocatedDatabasePlacement::shard_ready("warehouse");
+    warehouse.foreground.budget = whole_system_lane_budget(256, 2, 1, 1);
+    warehouse.background.budget = whole_system_lane_budget(160, 1, 1, 1);
+
+    let maintenance_path =
+        ExecutionDomainPath::new(["process", "dbs", "primary", "subsystems", "maintenance"]);
+    let maintenance_budget = ExecutionDomainBudget {
+        cpu: DomainCpuBudget {
+            worker_slots: Some(1),
+            weight: None,
+        },
+        memory: DomainMemoryBudget {
+            total_bytes: Some(128),
+            cache_bytes: Some(64),
+            mutable_bytes: Some(64),
+        },
+        io: DomainIoBudget {
+            local_concurrency: Some(1),
+            local_bytes_per_second: Some(512),
+            remote_concurrency: Some(1),
+            remote_bytes_per_second: Some(512),
+        },
+        background: DomainBackgroundBudget {
+            task_slots: Some(1),
+            max_in_flight_bytes: Some(256),
+        },
+    };
+
+    let deployment = ColocatedDeployment::builder(whole_system_simulation_process_budget())
+        .with_database(primary)
+        .expect("register primary deployment")
+        .with_database(analytics)
+        .expect("register analytics deployment")
+        .with_database(warehouse)
+        .expect("register warehouse deployment")
+        .with_subsystem(ColocatedSubsystemPlacement::database_local(
+            "primary",
+            "maintenance",
+            ExecutionLane::UserBackground,
+            ExecutionLanePlacementConfig::reserved(
+                maintenance_path.clone(),
+                DurabilityClass::UserData,
+                maintenance_budget,
+            ),
+        ))
+        .expect("register maintenance subsystem")
+        .build();
+
+    (deployment, maintenance_path)
+}
+
+fn simulation_tiered_settings_with_durability(
+    path: &str,
+    durability: TieredDurabilityMode,
+) -> DbSettings {
+    DbSettings::tiered_storage(TieredStorageConfig {
+        ssd: SsdConfig {
+            path: path.to_string(),
+        },
+        s3: S3Location {
+            bucket: "terracedb-sim".to_string(),
+            prefix: "execution-domains".to_string(),
+        },
+        max_local_bytes: 1024 * 1024,
+        durability,
+        local_retention: terracedb::TieredLocalRetentionMode::Offload,
+    })
+}
+
+fn simulation_runtime_components(
+    context: &SimulationContext,
+    scheduler: Arc<dyn Scheduler>,
+) -> DbComponents {
+    DbComponents::new(
+        context.file_system(),
+        context.object_store(),
+        context.clock(),
+        Arc::new(StubRng::seeded(17)),
+    )
+    .with_scheduler(scheduler)
+}
+
+async fn open_simulated_deployed_db(
+    deployment: &ColocatedDeployment,
+    database: &str,
+    path: &str,
+    context: &SimulationContext,
+    scheduler: Arc<dyn Scheduler>,
+    durability: TieredDurabilityMode,
+) -> Result<Db, OpenError> {
+    Db::builder()
+        .settings(simulation_tiered_settings_with_durability(path, durability))
+        .components(simulation_runtime_components(context, scheduler))
+        .colocated_database(deployment, database)?
+        .open()
+        .await
+}
+
+fn update_simulation_domain_spec(
+    manager: &Arc<dyn ResourceManager>,
+    path: &ExecutionDomainPath,
+    mutate: impl FnOnce(&mut ExecutionDomainSpec),
+) {
+    let mut spec = manager
+        .snapshot()
+        .domains
+        .get(path)
+        .unwrap_or_else(|| panic!("missing execution domain {}", path.as_string()))
+        .spec
+        .clone();
+    mutate(&mut spec);
+    manager.update_domain(spec);
+}
+
+async fn read_existing_event_rows(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let table = db.table("events");
+    let snapshot = db.snapshot().await;
+    let rows = snapshot
+        .scan(&table, b"a".to_vec(), b"z".to_vec(), ScanOptions::default())
+        .await
+        .expect("scan recovered logical result")
+        .map(|(key, value)| match value {
+            Value::Bytes(bytes) => (key, bytes),
+            Value::Record(_) => panic!("whole-system simulation only uses byte values"),
+        })
+        .collect::<Vec<_>>()
+        .await;
+    snapshot.release();
+    rows
+}
+
+async fn run_simulated_whole_system_execution_domain_campaign(
+    context: &SimulationContext,
+    seed: u64,
+) -> turmoil::Result<WholeSystemSimulationCampaignOutcome> {
+    let scheduler: Arc<dyn Scheduler> = Arc::new(MutableBudgetThrottleSimulationScheduler);
+    let durability = TieredDurabilityMode::Deferred;
+    let (deployment, maintenance_path) = whole_system_simulation_deployment();
+    let manager = deployment.resource_manager();
+
+    let primary = open_simulated_deployed_db(
+        &deployment,
+        "primary",
+        &format!("/terracedb/sim/execution-whole-system-primary-{seed:x}"),
+        context,
+        scheduler.clone(),
+        durability,
+    )
+    .await?;
+    let analytics = open_simulated_deployed_db(
+        &deployment,
+        "analytics",
+        &format!("/terracedb/sim/execution-whole-system-analytics-{seed:x}"),
+        context,
+        scheduler.clone(),
+        durability,
+    )
+    .await?;
+    let warehouse = open_simulated_deployed_db(
+        &deployment,
+        "warehouse",
+        &format!("/terracedb/sim/execution-whole-system-warehouse-{seed:x}"),
+        context,
+        scheduler.clone(),
+        durability,
+    )
+    .await?;
+
+    let primary_events = primary
+        .create_table(SimulationTableSpec::row("events").table_config())
+        .await?;
+    let analytics_events = analytics
+        .create_table(SimulationTableSpec::row("events").table_config())
+        .await?;
+    let warehouse_events = warehouse
+        .create_table(SimulationTableSpec::row("events").table_config())
+        .await?;
+
+    let oracle = InMemoryDomainBudgetOracle::default();
+    let mut pending = BTreeMap::from([
+        ("primary".to_string(), BTreeMap::<Vec<u8>, Vec<u8>>::new()),
+        ("analytics".to_string(), BTreeMap::<Vec<u8>, Vec<u8>>::new()),
+        ("warehouse".to_string(), BTreeMap::<Vec<u8>, Vec<u8>>::new()),
+    ]);
+    let mut durable = pending.clone();
+    let mut control_tables = BTreeMap::from([
+        ("primary".to_string(), Vec::<String>::new()),
+        ("analytics".to_string(), Vec::<String>::new()),
+        ("warehouse".to_string(), Vec::<String>::new()),
+    ]);
+
+    for (name, db, table, control_bytes) in [
+        ("primary", &primary, &primary_events, 24_u64),
+        ("analytics", &analytics, &analytics_events, 16_u64),
+        ("warehouse", &warehouse, &warehouse_events, 20_u64),
+    ] {
+        oracle.record(
+            &db.tag_control_plane_work(format!("create-table:{name}:events"))
+                .tag,
+            DomainBudgetCharge {
+                cpu_millis: 1,
+                memory_bytes: control_bytes,
+                local_io_bytes: control_bytes,
+                remote_io_bytes: 0,
+                background_tasks: 0,
+            },
+        );
+
+        let value = format!("{name}-bootstrap-{seed:04x}").into_bytes();
+        table
+            .write(b"bootstrap".to_vec(), Value::bytes(value.clone()))
+            .await?;
+        pending
+            .get_mut(name)
+            .expect("bootstrap pending domain")
+            .insert(b"bootstrap".to_vec(), value.clone());
+        if db.current_durable_sequence() == db.current_sequence() {
+            durable
+                .get_mut(name)
+                .expect("bootstrap durable domain")
+                .extend(pending.get(name).expect("bootstrap pending state").clone());
+            pending
+                .get_mut(name)
+                .expect("clear bootstrap pending state after implicit durability")
+                .clear();
+        }
+        db.flush().await?;
+        durable
+            .get_mut(name)
+            .expect("bootstrap durable domain")
+            .extend(pending.get(name).expect("bootstrap pending state").clone());
+        pending
+            .get_mut(name)
+            .expect("clear bootstrap pending state")
+            .clear();
+        oracle.record(
+            &db.tag_user_foreground_work(()).tag,
+            DomainBudgetCharge {
+                cpu_millis: 2,
+                memory_bytes: value.len() as u64,
+                local_io_bytes: value.len() as u64,
+                remote_io_bytes: 0,
+                background_tasks: 0,
+            },
+        );
+    }
+
+    let primary_report = primary.execution_placement_report();
+    let analytics_report = analytics.execution_placement_report();
+    let warehouse_report = warehouse.execution_placement_report();
+    let analytics_foreground = analytics_report.foreground.binding.domain.clone();
+    let analytics_background = analytics_report.background.binding.domain.clone();
+    let primary_control = primary_report.control_plane.binding.domain.clone();
+    let warehouse_background = warehouse_report.background.binding.domain.clone();
+
+    let mut rng = WholeSystemCampaignRng::seeded(seed);
+    let mut database_order = Vec::new();
+    for round in 0..6 {
+        let target = match rng.next_u64() % 3 {
+            0 => "primary",
+            1 => "analytics",
+            _ => "warehouse",
+        };
+        database_order.push(target.to_string());
+
+        let (db, table) = match target {
+            "primary" => (&primary, &primary_events),
+            "analytics" => (&analytics, &analytics_events),
+            "warehouse" => (&warehouse, &warehouse_events),
+            _ => unreachable!("campaign only targets declared databases"),
+        };
+        let key = format!("seed-{seed:04x}-round-{round}").into_bytes();
+        let value = format!("{target}-{:016x}", rng.next_u64()).into_bytes();
+        table
+            .write(key.clone(), Value::bytes(value.clone()))
+            .await?;
+        pending
+            .get_mut(target)
+            .expect("seeded pending domain")
+            .insert(key, value.clone());
+        if db.current_durable_sequence() == db.current_sequence() {
+            durable
+                .get_mut(target)
+                .expect("seeded durable domain")
+                .extend(pending.get(target).expect("seeded pending state").clone());
+            pending
+                .get_mut(target)
+                .expect("clear seeded pending state after implicit durability")
+                .clear();
+        }
+        oracle.record(
+            &db.tag_user_foreground_work(()).tag,
+            DomainBudgetCharge {
+                cpu_millis: 3,
+                memory_bytes: value.len() as u64,
+                local_io_bytes: value.len() as u64,
+                remote_io_bytes: if target == "primary" { 0 } else { 64 },
+                background_tasks: 0,
+            },
+        );
+
+        if round % 2 == 0 && target != "analytics" {
+            db.flush().await?;
+            durable
+                .get_mut(target)
+                .expect("round durable domain")
+                .extend(pending.get(target).expect("round pending state").clone());
+            pending
+                .get_mut(target)
+                .expect("clear round pending state")
+                .clear();
+        }
+    }
+
+    let primary_control_table = format!("audit_{seed:04x}");
+    primary
+        .create_table(SimulationTableSpec::row(&primary_control_table).table_config())
+        .await?;
+    primary.flush().await?;
+    durable
+        .get_mut("primary")
+        .expect("primary durable domain")
+        .extend(
+            pending
+                .get("primary")
+                .expect("primary pending state")
+                .clone(),
+        );
+    pending
+        .get_mut("primary")
+        .expect("clear primary pending state")
+        .clear();
+    control_tables
+        .get_mut("primary")
+        .expect("primary control-table set")
+        .push(primary_control_table.clone());
+    oracle.record(
+        &primary.tag_control_plane_work(primary_control_table).tag,
+        DomainBudgetCharge {
+            cpu_millis: 2,
+            memory_bytes: 48,
+            local_io_bytes: 48,
+            remote_io_bytes: 0,
+            background_tasks: 0,
+        },
+    );
+
+    let warehouse_control_table = format!("warehouse_meta_{seed:04x}");
+    warehouse
+        .create_table(SimulationTableSpec::row(&warehouse_control_table).table_config())
+        .await?;
+    warehouse.flush().await?;
+    durable
+        .get_mut("warehouse")
+        .expect("warehouse durable domain")
+        .extend(
+            pending
+                .get("warehouse")
+                .expect("warehouse pending state")
+                .clone(),
+        );
+    pending
+        .get_mut("warehouse")
+        .expect("clear warehouse pending state")
+        .clear();
+    control_tables
+        .get_mut("warehouse")
+        .expect("warehouse control-table set")
+        .push(warehouse_control_table.clone());
+    oracle.record(
+        &warehouse
+            .tag_control_plane_work(warehouse_control_table)
+            .tag,
+        DomainBudgetCharge {
+            cpu_millis: 2,
+            memory_bytes: 52,
+            local_io_bytes: 52,
+            remote_io_bytes: 0,
+            background_tasks: 0,
+        },
+    );
+
+    let analytics_pressure_admitted = manager
+        .try_acquire(
+            &analytics_background,
+            ExecutionResourceUsage {
+                remote_io_concurrency: 1,
+                remote_io_bytes_per_second: 256,
+                background_tasks: 1,
+                background_in_flight_bytes: 128,
+                ..ExecutionResourceUsage::default()
+            },
+        )
+        .admitted;
+    let warehouse_pressure_admitted = manager
+        .try_acquire(
+            &warehouse_background,
+            ExecutionResourceUsage {
+                remote_io_concurrency: 1,
+                remote_io_bytes_per_second: 256,
+                background_tasks: 1,
+                background_in_flight_bytes: 128,
+                ..ExecutionResourceUsage::default()
+            },
+        )
+        .admitted;
+
+    update_simulation_domain_spec(&manager, &analytics_foreground, |spec| {
+        spec.budget.memory.mutable_bytes = Some(64);
+    });
+    update_simulation_domain_spec(&manager, &warehouse_background, |spec| {
+        spec.budget.background.task_slots = Some(1);
+        spec.budget.io.remote_concurrency = Some(1);
+    });
+
+    for burst in 0..3_usize {
+        let key = format!("analytics-burst-{seed:04x}-{burst}").into_bytes();
+        let value = vec![b'a'; 48 + (burst * 8)];
+        analytics_events
+            .write(key.clone(), Value::bytes(value.clone()))
+            .await?;
+        pending
+            .get_mut("analytics")
+            .expect("analytics pending domain")
+            .insert(key, value.clone());
+        if analytics.current_durable_sequence() == analytics.current_sequence() {
+            durable
+                .get_mut("analytics")
+                .expect("analytics durable domain")
+                .extend(
+                    pending
+                        .get("analytics")
+                        .expect("analytics pending state")
+                        .clone(),
+                );
+            pending
+                .get_mut("analytics")
+                .expect("clear analytics pending state after implicit durability")
+                .clear();
+        }
+        oracle.record(
+            &analytics.tag_user_foreground_work(()).tag,
+            DomainBudgetCharge {
+                cpu_millis: 4,
+                memory_bytes: value.len() as u64,
+                local_io_bytes: value.len() as u64,
+                remote_io_bytes: 96,
+                background_tasks: 0,
+            },
+        );
+    }
+
+    manager.set_backlog(
+        &warehouse_background,
+        ExecutionDomainBacklogSnapshot {
+            queued_work_items: 2,
+            queued_bytes: 256,
+        },
+    );
+    let warehouse_shared_overflow_blocked = !manager
+        .try_acquire(
+            &warehouse_background,
+            ExecutionResourceUsage {
+                remote_io_concurrency: 1,
+                remote_io_bytes_per_second: 128,
+                background_tasks: 1,
+                background_in_flight_bytes: 64,
+                ..ExecutionResourceUsage::default()
+            },
+        )
+        .admitted;
+
+    let maintenance_tag = manager.placement_tag(WorkPlacementRequest {
+        owner: ExecutionDomainOwner::Subsystem {
+            database: Some("primary".to_string()),
+            name: "maintenance".to_string(),
+        },
+        lane: ExecutionLane::UserBackground,
+        contention_class: ContentionClass::UserData,
+        binding: ExecutionLaneBinding::new(maintenance_path.clone(), DurabilityClass::UserData),
+    });
+    oracle.record(
+        &maintenance_tag,
+        DomainBudgetCharge {
+            cpu_millis: 2,
+            memory_bytes: 32,
+            local_io_bytes: 0,
+            remote_io_bytes: 32,
+            background_tasks: 1,
+        },
+    );
+    let maintenance_admitted = manager
+        .try_acquire(
+            &maintenance_path,
+            ExecutionResourceUsage {
+                background_tasks: 1,
+                background_in_flight_bytes: 64,
+                ..ExecutionResourceUsage::default()
+            },
+        )
+        .admitted;
+    let control_plane_admitted = manager
+        .try_acquire(
+            &primary_control,
+            ExecutionResourceUsage {
+                cpu_workers: 1,
+                background_tasks: 1,
+                ..ExecutionResourceUsage::default()
+            },
+        )
+        .admitted;
+
+    primary.flush().await?;
+    durable
+        .get_mut("primary")
+        .expect("final primary durable domain")
+        .extend(
+            pending
+                .get("primary")
+                .expect("final primary pending state")
+                .clone(),
+        );
+    pending
+        .get_mut("primary")
+        .expect("clear final primary pending state")
+        .clear();
+    warehouse.flush().await?;
+    durable
+        .get_mut("warehouse")
+        .expect("final warehouse durable domain")
+        .extend(
+            pending
+                .get("warehouse")
+                .expect("final warehouse pending state")
+                .clone(),
+        );
+    pending
+        .get_mut("warehouse")
+        .expect("clear final warehouse pending state")
+        .clear();
+
+    let mut throttled_writes_by_domain = BTreeMap::new();
+    for db in [&primary, &analytics, &warehouse] {
+        for (path, count) in db
+            .scheduler_observability_snapshot()
+            .throttled_writes_by_domain
+        {
+            *throttled_writes_by_domain
+                .entry(path.as_string())
+                .or_insert(0) += count;
+        }
+    }
+
+    context.crash_filesystem(CutPoint::AfterStep);
+    drop(primary_events);
+    drop(analytics_events);
+    drop(warehouse_events);
+    drop(primary);
+    drop(analytics);
+    drop(warehouse);
+
+    let reopened_scheduler: Arc<dyn Scheduler> = Arc::new(MutableBudgetThrottleSimulationScheduler);
+    let reopened_primary = open_simulated_deployed_db(
+        &deployment,
+        "primary",
+        &format!("/terracedb/sim/execution-whole-system-primary-{seed:x}"),
+        context,
+        reopened_scheduler.clone(),
+        durability,
+    )
+    .await?;
+    let reopened_analytics = open_simulated_deployed_db(
+        &deployment,
+        "analytics",
+        &format!("/terracedb/sim/execution-whole-system-analytics-{seed:x}"),
+        context,
+        reopened_scheduler.clone(),
+        durability,
+    )
+    .await?;
+    let reopened_warehouse = open_simulated_deployed_db(
+        &deployment,
+        "warehouse",
+        &format!("/terracedb/sim/execution-whole-system-warehouse-{seed:x}"),
+        context,
+        reopened_scheduler,
+        durability,
+    )
+    .await?;
+
+    let actual_primary_rows = read_existing_event_rows(&reopened_primary).await;
+    let actual_analytics_rows = read_existing_event_rows(&reopened_analytics).await;
+    let actual_warehouse_rows = read_existing_event_rows(&reopened_warehouse).await;
+    for table_name in control_tables
+        .get("primary")
+        .expect("primary control tables")
+        .iter()
+    {
+        assert!(reopened_primary.try_table(table_name.clone()).is_some());
+    }
+    for table_name in control_tables
+        .get("warehouse")
+        .expect("warehouse control tables")
+        .iter()
+    {
+        assert!(reopened_warehouse.try_table(table_name.clone()).is_some());
+    }
+
+    let snapshot = manager.snapshot();
+    Ok(WholeSystemSimulationCampaignOutcome {
+        database_order,
+        durable_rows_by_db: BTreeMap::from([
+            ("primary".to_string(), actual_primary_rows),
+            ("analytics".to_string(), actual_analytics_rows),
+            ("warehouse".to_string(), actual_warehouse_rows),
+        ]),
+        control_tables_by_db: control_tables,
+        visible_sequence_by_db: BTreeMap::from([
+            (
+                "primary".to_string(),
+                reopened_primary.current_sequence().get(),
+            ),
+            (
+                "analytics".to_string(),
+                reopened_analytics.current_sequence().get(),
+            ),
+            (
+                "warehouse".to_string(),
+                reopened_warehouse.current_sequence().get(),
+            ),
+        ]),
+        durable_sequence_by_db: BTreeMap::from([
+            (
+                "primary".to_string(),
+                reopened_primary.current_durable_sequence().get(),
+            ),
+            (
+                "analytics".to_string(),
+                reopened_analytics.current_durable_sequence().get(),
+            ),
+            (
+                "warehouse".to_string(),
+                reopened_warehouse.current_durable_sequence().get(),
+            ),
+        ]),
+        throttled_writes_by_domain,
+        mutable_budget_by_domain: BTreeMap::from([
+            (
+                analytics_foreground.as_string(),
+                snapshot.domains[&analytics_foreground]
+                    .spec
+                    .budget
+                    .memory
+                    .mutable_bytes,
+            ),
+            (
+                warehouse_background.as_string(),
+                snapshot.domains[&warehouse_background]
+                    .spec
+                    .budget
+                    .memory
+                    .mutable_bytes,
+            ),
+            (
+                maintenance_path.as_string(),
+                snapshot.domains[&maintenance_path]
+                    .spec
+                    .budget
+                    .memory
+                    .mutable_bytes,
+            ),
+        ]),
+        background_slots_by_domain: BTreeMap::from([
+            (
+                warehouse_background.as_string(),
+                snapshot.domains[&warehouse_background]
+                    .spec
+                    .budget
+                    .background
+                    .task_slots,
+            ),
+            (
+                maintenance_path.as_string(),
+                snapshot.domains[&maintenance_path]
+                    .spec
+                    .budget
+                    .background
+                    .task_slots,
+            ),
+        ]),
+        backlog_items_by_domain: BTreeMap::from([(
+            warehouse_background.as_string(),
+            u64::from(
+                snapshot.domains[&warehouse_background]
+                    .backlog
+                    .queued_work_items,
+            ),
+        )]),
+        backlog_bytes_by_domain: BTreeMap::from([(
+            warehouse_background.as_string(),
+            snapshot.domains[&warehouse_background].backlog.queued_bytes,
+        )]),
+        oracle_cpu_millis_by_domain: oracle
+            .snapshot()
+            .into_iter()
+            .map(|(path, usage)| (path.as_string(), usage.total.cpu_millis))
+            .collect(),
+        admissions: BTreeMap::from([
+            (
+                "analytics-background-pressure".to_string(),
+                analytics_pressure_admitted,
+            ),
+            (
+                "warehouse-background-pressure".to_string(),
+                warehouse_pressure_admitted,
+            ),
+            (
+                "warehouse-shared-overflow-blocked".to_string(),
+                warehouse_shared_overflow_blocked,
+            ),
+            ("primary-maintenance".to_string(), maintenance_admitted),
+            ("primary-control-plane".to_string(), control_plane_admitted),
+        ]),
+    })
+}
+
+fn run_simulated_whole_system_execution_domain_seed(
+    seed: u64,
+) -> turmoil::Result<WholeSystemSimulationCampaignOutcome> {
+    SeededSimulationRunner::new(seed)
+        .with_simulation_duration(Duration::from_secs(20))
+        .run_with(move |context| async move {
+            run_simulated_whole_system_execution_domain_campaign(&context, seed).await
+        })
 }
 
 async fn collect_change_feed(stream: terracedb::ChangeStream) -> Vec<DbOracleChange> {
@@ -2248,6 +3136,90 @@ fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
 
             Ok(())
         })
+}
+
+#[test]
+fn whole_system_execution_domain_simulation_seed_campaign_is_reproducible() -> turmoil::Result {
+    let seeds = [0x6901_u64, 0x6902, 0x6903];
+
+    let first_pass = seeds
+        .into_iter()
+        .map(|seed| {
+            run_simulated_whole_system_execution_domain_seed(seed).map(|outcome| (seed, outcome))
+        })
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+    let second_pass = seeds
+        .into_iter()
+        .map(|seed| {
+            run_simulated_whole_system_execution_domain_seed(seed).map(|outcome| (seed, outcome))
+        })
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+
+    assert_eq!(first_pass, second_pass);
+
+    let first = first_pass.get(&0x6901).expect("seed 0x6901");
+    let second = first_pass.get(&0x6902).expect("seed 0x6902");
+    assert!(
+        first.database_order != second.database_order
+            || first.durable_rows_by_db != second.durable_rows_by_db
+            || first.oracle_cpu_millis_by_domain != second.oracle_cpu_millis_by_domain,
+        "different seeds should change the whole-system simulation shape"
+    );
+
+    for (seed, outcome) in &first_pass {
+        assert!(
+            outcome.admissions["warehouse-shared-overflow-blocked"],
+            "seed {seed:#x} should block extra shard-ready background work after tightening budgets"
+        );
+        assert!(
+            outcome.admissions["primary-control-plane"],
+            "seed {seed:#x} should keep the protected control-plane domain progressing"
+        );
+        assert_eq!(
+            outcome.mutable_budget_by_domain["process/dbs/analytics/foreground"],
+            Some(64)
+        );
+        assert_eq!(
+            outcome.background_slots_by_domain["process/shards/warehouse/background"],
+            Some(1)
+        );
+        assert_eq!(
+            outcome.backlog_items_by_domain["process/shards/warehouse/background"],
+            2
+        );
+        assert_eq!(
+            outcome.backlog_bytes_by_domain["process/shards/warehouse/background"],
+            256
+        );
+        assert!(
+            outcome
+                .throttled_writes_by_domain
+                .contains_key("process/dbs/analytics/foreground"),
+            "seed {seed:#x} should observe analytics foreground throttling after the mutable budget tightens"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "slow simulated whole-system domain chaos matrix"]
+fn whole_system_execution_domain_simulation_nightly_seed_matrix() -> turmoil::Result {
+    let seeds = [0x6904_u64, 0x6905, 0x6906, 0x6907, 0x6908, 0x6909];
+
+    for seed in seeds {
+        let outcome = run_simulated_whole_system_execution_domain_seed(seed)?;
+        assert!(
+            outcome.admissions["warehouse-shared-overflow-blocked"],
+            "seed {seed:#x} should block extra shard-ready background work"
+        );
+        assert!(
+            outcome.admissions["primary-control-plane"],
+            "seed {seed:#x} should protect the control-plane lane"
+        );
+    }
+
+    Ok(())
 }
 
 #[test]

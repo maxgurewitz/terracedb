@@ -129,6 +129,7 @@ impl DeterministicPressureOracle {
                 .saturating_add(state.pressure.immutable_flushing_bytes);
             state.pressure.immutable_queued_bytes = 0;
             state.pressure.immutable_flushing_bytes = 0;
+            state.oldest_unflushed_since = None;
             Self::refresh_table_state(restored.elapsed, state);
         }
         restored
@@ -476,7 +477,119 @@ fn flush_selection_reason(pressure: &PressureStats, estimated_relief: PressureBy
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terracedb::{ContentionClass, DurabilityClass, ExecutionDomainOwner, ExecutionLane};
+    use serde_json::json;
+    use terracedb::{
+        AdmissionPressureLevel, AdmissionPressureSignal, ContentionClass, DurabilityClass,
+        ExecutionDomainOwner, ExecutionLane, carry_write_delay_across_maintenance,
+        multi_signal_write_admission,
+    };
+
+    fn diagnostics_with_metadata(
+        oracle: &DeterministicPressureOracle,
+        table: &str,
+        runtime_tag: &WorkRuntimeTag,
+        batch_write_bytes: u64,
+        metadata: &BTreeMap<String, serde_json::Value>,
+    ) -> terracedb::AdmissionDiagnostics {
+        let mut signals = oracle.admission_signals(table, runtime_tag.clone(), batch_write_bytes);
+        signals.metadata.extend(metadata.clone());
+        multi_signal_write_admission(&signals)
+    }
+
+    fn throttle_delay(bytes: u64, max_write_bytes_per_second: u64) -> Duration {
+        if bytes == 0 || max_write_bytes_per_second == 0 {
+            return Duration::ZERO;
+        }
+
+        let millis = ((bytes as u128).saturating_mul(1000))
+            .div_ceil(max_write_bytes_per_second as u128) as u64;
+        Duration::from_millis(millis)
+    }
+
+    fn simulate_write_backpressure_delay<F>(
+        oracle: &mut DeterministicPressureOracle,
+        table: &str,
+        runtime_tag: &WorkRuntimeTag,
+        batch_write_bytes: u64,
+        metadata: &BTreeMap<String, serde_json::Value>,
+        mut run_maintenance: F,
+    ) -> Duration
+    where
+        F: FnMut(&mut DeterministicPressureOracle) -> bool,
+    {
+        let mut pending_delay = Duration::ZERO;
+
+        loop {
+            let diagnostics =
+                diagnostics_with_metadata(oracle, table, runtime_tag, batch_write_bytes, metadata);
+            let table_delay = diagnostics
+                .max_write_bytes_per_second
+                .map(|rate| throttle_delay(batch_write_bytes, rate))
+                .unwrap_or_default();
+            if carry_write_delay_across_maintenance(
+                diagnostics.max_write_bytes_per_second,
+                Some(&diagnostics),
+            ) {
+                pending_delay = pending_delay.max(table_delay);
+            }
+
+            let should_run_maintenance = diagnostics.level != AdmissionPressureLevel::Open;
+            let must_stall = diagnostics.level == AdmissionPressureLevel::Stall;
+            if should_run_maintenance {
+                let progressed = run_maintenance(oracle);
+                if progressed {
+                    continue;
+                }
+                if must_stall {
+                    break;
+                }
+            }
+            break;
+        }
+
+        pending_delay
+    }
+
+    fn simulate_write_backpressure_delay_from_signals<F, G>(
+        batch_write_bytes: u64,
+        mut next_signals: F,
+        mut run_maintenance: G,
+    ) -> Duration
+    where
+        F: FnMut() -> AdmissionSignals,
+        G: FnMut() -> bool,
+    {
+        let mut pending_delay = Duration::ZERO;
+
+        loop {
+            let diagnostics = multi_signal_write_admission(&next_signals());
+            let table_delay = diagnostics
+                .max_write_bytes_per_second
+                .map(|rate| throttle_delay(batch_write_bytes, rate))
+                .unwrap_or_default();
+            if carry_write_delay_across_maintenance(
+                diagnostics.max_write_bytes_per_second,
+                Some(&diagnostics),
+            ) {
+                pending_delay = pending_delay.max(table_delay);
+            }
+
+            let should_run_maintenance = diagnostics.level != AdmissionPressureLevel::Open;
+            let must_stall = diagnostics.level == AdmissionPressureLevel::Stall;
+            if should_run_maintenance {
+                let progressed = run_maintenance();
+                if progressed {
+                    continue;
+                }
+                if must_stall {
+                    break;
+                }
+            }
+            break;
+        }
+
+        pending_delay
+    }
 
     #[test]
     fn deterministic_pressure_oracle_reconstructs_and_tags_work() {
@@ -554,6 +667,10 @@ mod tests {
         assert_eq!(restarted_pressure.local.mutable_dirty_bytes, 64);
         assert_eq!(restarted_pressure.local.immutable_queued_bytes, 0);
         assert_eq!(restarted_pressure.local.immutable_flushing_bytes, 0);
+        assert_eq!(
+            restarted_pressure.oldest_unflushed_age,
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
@@ -614,6 +731,284 @@ mod tests {
                 .get("force_reason")
                 .and_then(serde_json::Value::as_str),
             Some("unified-log pressure")
+        );
+    }
+
+    #[test]
+    fn multi_signal_admission_reacts_before_l0_pressure_when_mutable_bytes_run_hot() {
+        let domain = ExecutionDomainPath::new(["process", "db", "foreground"]);
+        let tag = WorkRuntimeTag {
+            owner: ExecutionDomainOwner::Database {
+                name: "pressure-db".to_string(),
+            },
+            lane: ExecutionLane::UserForeground,
+            contention_class: ContentionClass::UserData,
+            domain: domain.clone(),
+            durability_class: DurabilityClass::UserData,
+        };
+
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(256),
+            ..PressureBudget::default()
+        });
+        oracle.bind_table_domain("events", domain);
+        oracle.record_mutable_write("events", 176);
+
+        let signals = oracle.admission_signals("events", tag, 48);
+        assert_eq!(signals.l0_sstable_count, 0);
+
+        let diagnostics = multi_signal_write_admission(&signals);
+        assert_eq!(diagnostics.level, AdmissionPressureLevel::RateLimit);
+        assert!(
+            diagnostics
+                .triggered_by
+                .contains(&AdmissionPressureSignal::MutableBudget)
+        );
+        assert!(
+            !diagnostics
+                .triggered_by
+                .contains(&AdmissionPressureSignal::L0Sstables)
+        );
+        assert!(diagnostics.max_write_bytes_per_second.is_some());
+    }
+
+    #[test]
+    fn domain_budgets_and_workload_policies_shift_admission_without_changing_correctness_signals() {
+        let tight_domain = ExecutionDomainPath::new(["process", "db", "primary"]);
+        let relaxed_domain = ExecutionDomainPath::new(["process", "db", "analytics"]);
+        let make_tag = |domain: &ExecutionDomainPath, name: &str| WorkRuntimeTag {
+            owner: ExecutionDomainOwner::Database {
+                name: name.to_string(),
+            },
+            lane: ExecutionLane::UserForeground,
+            contention_class: ContentionClass::UserData,
+            domain: domain.clone(),
+            durability_class: DurabilityClass::UserData,
+        };
+
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(1024),
+            ..PressureBudget::default()
+        });
+        oracle.set_domain_budget(
+            tight_domain.clone(),
+            PressureBudget {
+                mutable_hard_limit_bytes: Some(320),
+                ..PressureBudget::default()
+            },
+        );
+        oracle.set_domain_budget(
+            relaxed_domain.clone(),
+            PressureBudget {
+                mutable_hard_limit_bytes: Some(512),
+                ..PressureBudget::default()
+            },
+        );
+        oracle.bind_table_domain("orders", tight_domain.clone());
+        oracle.bind_table_domain("rollups", relaxed_domain.clone());
+        oracle.record_mutable_write("orders", 240);
+        oracle.record_mutable_write("rollups", 240);
+
+        let tight = oracle.admission_signals("orders", make_tag(&tight_domain, "primary"), 48);
+        let relaxed =
+            oracle.admission_signals("rollups", make_tag(&relaxed_domain, "analytics"), 48);
+
+        assert_eq!(
+            multi_signal_write_admission(&tight).level,
+            AdmissionPressureLevel::RateLimit
+        );
+        assert_eq!(
+            multi_signal_write_admission(&relaxed).level,
+            AdmissionPressureLevel::Open
+        );
+
+        let mut primary_policy = relaxed.clone();
+        primary_policy
+            .metadata
+            .insert("terracedb.execution.role".to_string(), json!("primary"));
+        let mut analytics_policy = relaxed;
+        analytics_policy.metadata.insert(
+            "terracedb.execution.role".to_string(),
+            json!("analytics-helper"),
+        );
+
+        assert_eq!(
+            multi_signal_write_admission(&primary_policy).level,
+            AdmissionPressureLevel::RateLimit
+        );
+        assert_eq!(
+            multi_signal_write_admission(&analytics_policy).level,
+            AdmissionPressureLevel::Open
+        );
+        assert_eq!(
+            primary_policy.correctness, analytics_policy.correctness,
+            "policy changes should not alter correctness metadata",
+        );
+    }
+
+    #[test]
+    fn domain_mutable_budget_stall_clears_once_flush_relief_finishes() {
+        let domain = ExecutionDomainPath::new(["process", "db", "foreground"]);
+        let tag = WorkRuntimeTag {
+            owner: ExecutionDomainOwner::Database {
+                name: "domain-mutable".to_string(),
+            },
+            lane: ExecutionLane::UserForeground,
+            contention_class: ContentionClass::UserData,
+            domain: domain.clone(),
+            durability_class: DurabilityClass::UserData,
+        };
+
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(1024),
+            ..PressureBudget::default()
+        });
+        oracle.set_domain_budget(
+            domain.clone(),
+            PressureBudget {
+                mutable_hard_limit_bytes: Some(300),
+                ..PressureBudget::default()
+            },
+        );
+        oracle.bind_table_domain("events", domain);
+        oracle.record_mutable_write("events", 220);
+
+        let before_flush = oracle.admission_signals("events", tag.clone(), 200);
+        let before_diagnostics = multi_signal_write_admission(&before_flush);
+        assert_eq!(before_diagnostics.level, AdmissionPressureLevel::Stall);
+        assert!(
+            before_diagnostics
+                .triggered_by
+                .contains(&AdmissionPressureSignal::MutableBudget)
+        );
+        assert!(before_diagnostics.required_relief.mutable_dirty_bytes > 0);
+
+        oracle.queue_flush("events");
+        let queued_flush = oracle.admission_signals("events", tag.clone(), 200);
+        assert_ne!(
+            multi_signal_write_admission(&queued_flush).level,
+            AdmissionPressureLevel::Open,
+            "queued-but-unfinished flush pressure should still gate admission",
+        );
+
+        oracle.begin_flush("events", 220);
+        oracle.finish_flush("events", 220);
+        let after_flush = oracle.admission_signals("events", tag, 200);
+        assert_eq!(
+            multi_signal_write_admission(&after_flush).level,
+            AdmissionPressureLevel::Open
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_survives_maintenance_progress() {
+        let domain = ExecutionDomainPath::new(["process", "db", "foreground"]);
+        let tag = WorkRuntimeTag {
+            owner: ExecutionDomainOwner::Database {
+                name: "multi-signal".to_string(),
+            },
+            lane: ExecutionLane::UserForeground,
+            contention_class: ContentionClass::UserData,
+            domain: domain.clone(),
+            durability_class: DurabilityClass::UserData,
+        };
+
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(1024),
+            ..PressureBudget::default()
+        });
+        oracle.set_domain_budget(
+            domain.clone(),
+            PressureBudget {
+                mutable_hard_limit_bytes: Some(512),
+                ..PressureBudget::default()
+            },
+        );
+        oracle.bind_table_domain("events", domain);
+        oracle.record_mutable_write("events", 220);
+
+        let policy_metadata =
+            BTreeMap::from([("terracedb.execution.role".to_string(), json!("primary"))]);
+        let before = diagnostics_with_metadata(&oracle, "events", &tag, 96, &policy_metadata);
+        assert_eq!(before.level, AdmissionPressureLevel::RateLimit);
+        assert!(
+            before
+                .triggered_by
+                .contains(&AdmissionPressureSignal::MutableBudget)
+        );
+
+        let mut maintenance_ran = false;
+        let delay = simulate_write_backpressure_delay(
+            &mut oracle,
+            "events",
+            &tag,
+            96,
+            &policy_metadata,
+            |oracle| {
+                if maintenance_ran {
+                    return false;
+                }
+                maintenance_ran = true;
+                oracle.queue_flush("events");
+                oracle.begin_flush("events", 220);
+                oracle.finish_flush("events", 220);
+                true
+            },
+        );
+
+        let after = diagnostics_with_metadata(&oracle, "events", &tag, 96, &policy_metadata);
+        assert_eq!(after.level, AdmissionPressureLevel::Open);
+        assert!(
+            delay > Duration::ZERO,
+            "maintenance progress should not erase a previously observed rate-limit delay",
+        );
+    }
+
+    #[test]
+    fn l0_only_backoff_clears_once_maintenance_progresses() {
+        let l0_sstable_count =
+            std::cell::Cell::new(terracedb::DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT);
+        let domain = ExecutionDomainPath::new(["process", "db", "foreground"]);
+        let tag = WorkRuntimeTag {
+            owner: ExecutionDomainOwner::Database {
+                name: "workflow".to_string(),
+            },
+            lane: ExecutionLane::UserForeground,
+            contention_class: ContentionClass::UserData,
+            domain,
+            durability_class: DurabilityClass::UserData,
+        };
+
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(1024 * 1024),
+            ..PressureBudget::default()
+        });
+
+        let delay = simulate_write_backpressure_delay_from_signals(
+            64,
+            || {
+                let mut signals = oracle.admission_signals("events", tag.clone(), 64);
+                signals.l0_sstable_count = l0_sstable_count.get();
+                signals
+            },
+            || {
+                if l0_sstable_count.get() == 0 {
+                    return false;
+                }
+                l0_sstable_count.set(0);
+                true
+            },
+        );
+
+        assert_eq!(
+            delay,
+            Duration::ZERO,
+            "maintenance that clears pure L0 pressure should not leave a carried-over delay",
         );
     }
 }
