@@ -2388,6 +2388,95 @@ fn remote_columnar_cache_survives_simulated_restart_and_masks_warmed_range_fault
         );
 
         Ok(())
+        })
+}
+
+#[test]
+fn wide_columnar_point_reads_complete_after_simulated_restart() -> turmoil::Result {
+    SeededSimulationRunner::new(0x4c4f).run_with(|context| async move {
+        let config = simulation_s3_primary_config("sim/columnar-point-read-prefetch");
+        let schema = SchemaDefinition {
+            version: 1,
+            fields: vec![
+                FieldDefinition {
+                    id: FieldId::new(1),
+                    name: "metric".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(2),
+                    name: "count".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(3),
+                    name: "ratio".to_string(),
+                    field_type: FieldType::Float64,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(4),
+                    name: "payload".to_string(),
+                    field_type: FieldType::Bytes,
+                    nullable: false,
+                    default: None,
+                },
+                FieldDefinition {
+                    id: FieldId::new(5),
+                    name: "active".to_string(),
+                    field_type: FieldType::Bool,
+                    nullable: false,
+                    default: None,
+                },
+            ],
+        };
+
+        let db = context.open_db(config.clone()).await?;
+        let metrics = db
+            .create_table(TableConfig {
+                name: "metrics".to_string(),
+                format: TableFormat::Columnar,
+                merge_operator: None,
+                max_merge_operand_chain_length: None,
+                compaction_filter: None,
+                bloom_filter_bits_per_key: Some(8),
+                history_retention_sequences: Some(16),
+                compaction_strategy: CompactionStrategy::Tiered,
+                schema: Some(schema.clone()),
+                metadata: Default::default(),
+            })
+            .await
+            .expect("create columnar table");
+        let expected = Value::named_record(
+            &schema,
+            [
+                ("metric", FieldValue::String("cpu".to_string())),
+                ("count", FieldValue::Int64(3)),
+                ("ratio", FieldValue::Float64(1.5)),
+                ("payload", FieldValue::Bytes(vec![1, 2, 3])),
+                ("active", FieldValue::Bool(true)),
+            ],
+        )
+        .expect("encode wide columnar row");
+        metrics
+            .write(b"row:1".to_vec(), expected.clone())
+            .await
+            .expect("write row");
+        db.flush().await?;
+
+        let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+        let reopened_metrics = reopened.table("metrics");
+        assert_eq!(
+            reopened_metrics.read(b"row:1".to_vec()).await?,
+            Some(expected),
+        );
+
+        Ok(())
     })
 }
 

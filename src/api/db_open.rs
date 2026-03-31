@@ -1085,6 +1085,9 @@ impl Db {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        if requested_raw.values().all(Option::is_none) {
+            return Self::default_columnar_cache_lane_budgets(hybrid_read);
+        }
         let weights = cache_domain_paths
             .iter()
             .map(|(lane, path)| {
@@ -1159,19 +1162,12 @@ impl Db {
             .collect::<BTreeMap<_, _>>();
         let fixed_total = requested.values().flatten().copied().sum::<u64>();
         if fixed_total > 0 && fixed_total >= total {
-            let mut remaining = total;
             let fixed_lanes = requested
                 .iter()
                 .filter_map(|(lane, bytes)| bytes.map(|bytes| (*lane, bytes)))
-                .collect::<Vec<_>>();
-            for (index, (lane, bytes)) in fixed_lanes.iter().enumerate() {
-                let share = if index + 1 == fixed_lanes.len() {
-                    remaining
-                } else {
-                    total.saturating_mul(*bytes) / fixed_total
-                };
-                allocated.insert(*lane, share);
-                remaining = remaining.saturating_sub(share);
+                .collect::<BTreeMap<_, _>>();
+            for (lane, share) in Self::apportion_u64(total, &fixed_lanes, weights) {
+                allocated.insert(lane, share);
             }
             return allocated;
         }
@@ -1183,34 +1179,13 @@ impl Db {
                 remaining = remaining.saturating_sub(*bytes);
             }
         }
-        let weight_total = requested
+        let flexible_weights = requested
             .iter()
             .filter(|(_, bytes)| bytes.is_none())
-            .map(|(lane, _)| weights.get(lane).copied().unwrap_or(1))
-            .sum::<u32>();
-        let flexible_lanes = requested
-            .iter()
-            .filter(|(_, bytes)| bytes.is_none())
-            .map(|(lane, _)| *lane)
-            .collect::<Vec<_>>();
-        let mut allocated_flexible = 0_u64;
-        for (index, lane) in flexible_lanes.iter().enumerate() {
-            let share = if index + 1 == flexible_lanes.len() || weight_total == 0 {
-                remaining.saturating_sub(allocated_flexible)
-            } else {
-                remaining.saturating_mul(weights.get(lane).copied().unwrap_or(1) as u64)
-                    / u64::from(weight_total)
-            };
-            allocated.insert(
-                *lane,
-                allocated.get(lane).copied().unwrap_or_default() + share,
-            );
-            allocated_flexible = allocated_flexible.saturating_add(share);
-        }
-        if allocated_flexible < remaining && !flexible_lanes.is_empty() {
-            *allocated
-                .entry(crate::ExecutionLane::UserForeground)
-                .or_default() += remaining.saturating_sub(allocated_flexible);
+            .map(|(lane, _)| (*lane, u64::from(weights.get(lane).copied().unwrap_or(1))))
+            .collect::<BTreeMap<_, _>>();
+        for (lane, share) in Self::apportion_u64(remaining, &flexible_weights, weights) {
+            *allocated.entry(lane).or_default() += share;
         }
         allocated
     }
@@ -1231,37 +1206,73 @@ impl Db {
         budget: &BTreeMap<crate::ExecutionLane, u64>,
         weights: &BTreeMap<crate::ExecutionLane, u32>,
     ) -> BTreeMap<crate::ExecutionLane, usize> {
-        let mut allocated = budget
+        Self::apportion_u64(total as u64, budget, weights)
+            .into_iter()
+            .map(|(lane, share)| (lane, share as usize))
+            .collect()
+    }
+
+    fn apportion_u64(
+        total: u64,
+        numerators: &BTreeMap<crate::ExecutionLane, u64>,
+        weights: &BTreeMap<crate::ExecutionLane, u32>,
+    ) -> BTreeMap<crate::ExecutionLane, u64> {
+        let mut allocated = numerators
             .keys()
             .copied()
-            .map(|lane| (lane, 0_usize))
+            .map(|lane| (lane, 0_u64))
             .collect::<BTreeMap<_, _>>();
-        let total_budget = budget.values().copied().sum::<u64>();
-        if total_budget == 0 || total == 0 {
+        let total_numerator = numerators.values().copied().sum::<u64>();
+        if total == 0 || total_numerator == 0 {
             return allocated;
         }
-        let mut allocated_total = 0_usize;
-        let lanes = budget.keys().copied().collect::<Vec<_>>();
-        for (index, lane) in lanes.iter().enumerate() {
-            let share = if index + 1 == lanes.len() {
-                total.saturating_sub(allocated_total)
-            } else if total_budget == 0 {
-                0
-            } else {
-                total.saturating_mul(budget.get(lane).copied().unwrap_or_default() as usize)
-                    / total_budget as usize
-            };
-            allocated.insert(*lane, share);
+
+        let total_u128 = u128::from(total);
+        let denominator_u128 = u128::from(total_numerator);
+        let mut allocated_total = 0_u64;
+        let mut remainders = Vec::with_capacity(numerators.len());
+        for (&lane, &numerator) in numerators {
+            let quota = total_u128.saturating_mul(u128::from(numerator));
+            let share = (quota / denominator_u128) as u64;
+            let remainder = quota % denominator_u128;
+            allocated.insert(lane, share);
             allocated_total = allocated_total.saturating_add(share);
+            remainders.push((lane, remainder));
         }
-        if allocated_total < total {
-            let lane = lanes
-                .into_iter()
-                .max_by_key(|lane| weights.get(lane).copied().unwrap_or(1))
-                .unwrap_or(crate::ExecutionLane::UserForeground);
-            *allocated.entry(lane).or_default() += total.saturating_sub(allocated_total);
+
+        remainders.sort_by(
+            |(left_lane, left_remainder), (right_lane, right_remainder)| {
+                right_remainder
+                    .cmp(left_remainder)
+                    .then_with(|| {
+                        weights
+                            .get(right_lane)
+                            .copied()
+                            .unwrap_or(1)
+                            .cmp(&weights.get(left_lane).copied().unwrap_or(1))
+                    })
+                    .then_with(|| {
+                        Self::lane_allocation_priority(*left_lane)
+                            .cmp(&Self::lane_allocation_priority(*right_lane))
+                    })
+            },
+        );
+
+        for (lane, _) in remainders
+            .into_iter()
+            .take(total.saturating_sub(allocated_total) as usize)
+        {
+            *allocated.entry(lane).or_default() += 1;
         }
         allocated
+    }
+
+    fn lane_allocation_priority(lane: crate::ExecutionLane) -> u8 {
+        match lane {
+            crate::ExecutionLane::UserForeground => 0,
+            crate::ExecutionLane::UserBackground => 1,
+            crate::ExecutionLane::ControlPlane => 2,
+        }
     }
 
     pub(super) async fn open_columnar_read_context(
@@ -1282,7 +1293,10 @@ impl Db {
         let background_prefetch_budget = cache_lane_budgets
             .get(&crate::ExecutionLane::UserBackground)
             .map(|budget| budget.raw_byte_budget_bytes)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            // Prefetch is a per-read lookahead window, not a signal to download
+            // the entire background cache partition behind one point read.
+            .min(crate::remote::DEFAULT_REMOTE_CACHE_PREFETCH_BYTES);
         let remote_cache_config = match storage {
             StorageConfig::Tiered(config) => Some((
                 Self::join_fs_path(&config.ssd.path, LOCAL_REMOTE_CACHE_RELATIVE_DIR),
