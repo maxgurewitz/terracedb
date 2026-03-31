@@ -18,7 +18,10 @@ pub use bash::{
     JustBashFilesystemAdapter, TERRACE_BASH_SESSION_STATE_PATH,
 };
 pub use capabilities::{
-    CapabilityManifest, CapabilityRegistry, SandboxCapability, StaticCapabilityRegistry,
+    CapabilityCallRequest, CapabilityCallResult, CapabilityManifest, CapabilityRegistry,
+    DeterministicCapabilityMethodBehavior, DeterministicCapabilityModule,
+    DeterministicCapabilityRegistry, SandboxCapability, SandboxCapabilityMethod,
+    SandboxCapabilityModule, StaticCapabilityRegistry,
 };
 pub use disk::{ConflictEntry, ConflictReport, EjectMode, EjectRequest, HoistMode, HoistRequest};
 pub use error::SandboxError;
@@ -27,17 +30,26 @@ pub use git::{
     DeterministicGitWorkspaceManager, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest,
 };
 pub use loader::{
-    HOST_CAPABILITY_PREFIX, SANDBOX_BASH_LIBRARY_SPECIFIER, SANDBOX_FS_LIBRARY_SPECIFIER,
-    SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleSpecifier, TERRACE_WORKSPACE_PREFIX,
+    HOST_CAPABILITY_PREFIX, LoadedSandboxModule, SANDBOX_BASH_LIBRARY_SPECIFIER,
+    SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry,
+    SandboxModuleKind, SandboxModuleLoadTrace, SandboxModuleLoader, SandboxModuleSpecifier,
+    TERRACE_WORKSPACE_PREFIX,
 };
 pub use packages::{
-    DeterministicPackageInstaller, PackageInstallReport, PackageInstallRequest, PackageInstaller,
+    DeterministicPackageClass, DeterministicPackageDefinition, DeterministicPackageInstaller,
+    InstalledPackageManifest, PackageInstallReport, PackageInstallRequest, PackageInstaller,
+    SessionPackageManifest, installed_package_names, read_package_install_manifest,
+    write_package_install_manifest,
 };
 pub use pr::{
     DeterministicPullRequestProviderClient, PullRequestProviderClient, PullRequestReport,
     PullRequestRequest,
 };
-pub use runtime::{DeterministicRuntimeBackend, SandboxRuntimeBackend, SandboxRuntimeHandle};
+pub use runtime::{
+    DeterministicRuntimeBackend, SandboxExecutionKind, SandboxExecutionRequest,
+    SandboxExecutionResult, SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle,
+    SandboxRuntimeState, SandboxRuntimeStateHandle,
+};
 pub use session::{
     CloseSessionOptions, DefaultSandboxStore, ReopenSessionOptions, SandboxServices,
     SandboxSession, SandboxStore,
@@ -46,7 +58,9 @@ pub use types::{
     BaseSnapshotIdentity, ConflictPolicy, DEFAULT_WORKSPACE_ROOT, GitProvenance, HoistedSource,
     PackageCompatibilityMode, SANDBOX_SESSION_FORMAT_VERSION, SandboxConfig,
     SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
-    TERRACE_METADATA_DIR, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
+    TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT, TERRACE_NPM_DIR,
+    TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
+    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
 };
 pub use typescript::{
     DeterministicTypeScriptService, TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,

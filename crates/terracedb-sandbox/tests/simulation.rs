@@ -1,13 +1,15 @@
 use std::time::Duration;
 
+use serde_json::json;
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 
 use terracedb_sandbox::{
-    BashRequest, BashService, DefaultSandboxStore, DeterministicBashService,
-    DeterministicTypeScriptService, GitProvenance, PackageInstallRequest, ReadonlyViewCut,
-    ReadonlyViewRequest, ReopenSessionOptions, SandboxConfig, SandboxServices, SandboxStore,
-    TypeCheckRequest, TypeScriptService,
+    BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
+    DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicTypeScriptService,
+    GitProvenance, PackageCompatibilityMode, PackageInstallRequest, ReadonlyViewCut,
+    ReadonlyViewRequest, ReopenSessionOptions, SandboxCapability, SandboxConfig, SandboxServices,
+    SandboxStore, TypeCheckRequest, TypeScriptService, read_package_install_manifest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +20,10 @@ struct SandboxSimulationCapture {
     tool_names: Vec<String>,
     active_view_handles: usize,
     package_names: Vec<String>,
+    initial_cache_misses: Vec<String>,
+    replayed_cache_hits: Vec<String>,
+    manifest_packages: Vec<String>,
+    materialized: bool,
     branch: String,
     typescript_diagnostics: usize,
     bash_cwd: String,
@@ -69,7 +75,9 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
 
             let session = sandbox
                 .open_session(
-                    SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096),
+                    SandboxConfig::new(base_volume_id, session_volume_id)
+                        .with_chunk_size(4096)
+                        .with_package_compat(PackageCompatibilityMode::NpmPureJs),
                 )
                 .await
                 .expect("open session");
@@ -136,11 +144,22 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 })
                 .await
                 .expect("reopen session");
+            let replayed = reopened
+                .install_packages(PackageInstallRequest {
+                    packages: vec!["zod".to_string(), "lodash".to_string()],
+                    materialize_compatibility_view: true,
+                })
+                .await
+                .expect("reinstall packages after reopen");
             reopened
                 .close_readonly_view(&handle.handle_id)
                 .await
                 .expect("close reopened view");
             let info = reopened.info().await;
+            let manifest = read_package_install_manifest(reopened.filesystem().as_ref())
+                .await
+                .expect("read package manifest")
+                .expect("package manifest should exist");
             let tool_names = reopened
                 .volume()
                 .tools()
@@ -157,6 +176,24 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 tool_names,
                 active_view_handles: info.provenance.active_view_handles.len(),
                 package_names: packages.packages,
+                initial_cache_misses: packages.metadata["cache_misses"]
+                    .as_array()
+                    .expect("cache misses array")
+                    .iter()
+                    .map(|value| value.as_str().expect("cache miss string").to_string())
+                    .collect(),
+                replayed_cache_hits: replayed.metadata["cache_hits"]
+                    .as_array()
+                    .expect("cache hits array")
+                    .iter()
+                    .map(|value| value.as_str().expect("cache hit string").to_string())
+                    .collect(),
+                manifest_packages: manifest
+                    .packages
+                    .iter()
+                    .map(|package| package.package.clone())
+                    .collect(),
+                materialized: manifest.materialized_compatibility_view,
                 branch: info
                     .provenance
                     .git
@@ -164,6 +201,112 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                     .expect("branch should be set"),
                 typescript_diagnostics: diagnostics.diagnostics.len(),
                 bash_cwd: bash_report.cwd,
+            })
+        })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SandboxRuntimeSimulationCapture {
+    actor_id: String,
+    result: serde_json::Value,
+    tool_names: Vec<String>,
+    module_graph: Vec<String>,
+    cache_entries: usize,
+}
+
+fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulationCapture> {
+    SeededSimulationRunner::new(seed)
+        .with_simulation_duration(Duration::from_millis(50))
+        .run_with(move |context| async move {
+            let vfs = InMemoryVfsStore::new(context.clock(), context.rng());
+            let capabilities = DeterministicCapabilityRegistry::new(vec![
+                DeterministicCapabilityModule::new(SandboxCapability::host_module("tickets"))
+                    .expect("valid capability")
+                    .with_echo_method("echo"),
+            ])
+            .expect("registry");
+            let sandbox = DefaultSandboxStore::new(
+                std::sync::Arc::new(vfs.clone()),
+                context.clock(),
+                SandboxServices::deterministic()
+                    .with_capabilities(std::sync::Arc::new(capabilities.clone())),
+            );
+            let base_volume_id = VolumeId::new(0x7200 + seed as u128);
+            let session_volume_id = VolumeId::new(0x7300 + seed as u128);
+
+            let base = vfs
+                .open_volume(
+                    VolumeConfig::new(base_volume_id)
+                        .with_chunk_size(4096)
+                        .with_create_if_missing(true),
+                )
+                .await
+                .expect("open base volume");
+            base.fs()
+                .write_file(
+                    "/workspace/main.js",
+                    br#"
+                    import { readTextFile, writeTextFile } from "@terracedb/sandbox/fs";
+                    import { echo } from "terrace:host/tickets";
+                    const input = readTextFile("/workspace/input.txt");
+                    writeTextFile("/workspace/out.txt", `${input}:${input.length}`);
+                    export default echo({ value: readTextFile("/workspace/out.txt") });
+                    "#
+                    .to_vec(),
+                    CreateOptions {
+                        create_parents: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed runtime module");
+            base.fs()
+                .write_file(
+                    "/workspace/input.txt",
+                    format!("seed-{seed}").into_bytes(),
+                    CreateOptions {
+                        create_parents: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed input file");
+
+            let session = sandbox
+                .open_session(SandboxConfig {
+                    session_volume_id,
+                    session_chunk_size: Some(4096),
+                    base_volume_id,
+                    durable_base: false,
+                    workspace_root: "/workspace".to_string(),
+                    package_compat: terracedb_sandbox::PackageCompatibilityMode::TerraceOnly,
+                    conflict_policy: terracedb_sandbox::ConflictPolicy::Fail,
+                    capabilities: capabilities.manifest(),
+                    hoisted_source: None,
+                    git_provenance: None,
+                })
+                .await
+                .expect("open session");
+
+            let result = session
+                .exec_module("/workspace/main.js")
+                .await
+                .expect("execute module");
+            let tool_names = session
+                .volume()
+                .tools()
+                .recent(None)
+                .await
+                .expect("recent tool runs")
+                .into_iter()
+                .map(|run| run.name)
+                .collect::<Vec<_>>();
+            Ok(SandboxRuntimeSimulationCapture {
+                actor_id: session.runtime_handle().actor_id,
+                result: result.result.expect("result json"),
+                tool_names,
+                module_graph: result.module_graph,
+                cache_entries: result.cache_entries.len(),
             })
         })
 }
@@ -194,8 +337,51 @@ fn seeded_stub_sandbox_replays_open_reopen_close_and_metadata_updates() -> turmo
             .tool_names
             .contains(&"sandbox.session.close".to_string())
     );
+    assert_eq!(first.initial_cache_misses, vec!["lodash", "zod"]);
+    assert_eq!(first.replayed_cache_hits, vec!["lodash", "zod"]);
+    assert_eq!(first.manifest_packages, vec!["lodash", "zod"]);
+    assert!(first.materialized);
     assert!(first.revision >= 4);
     assert_eq!(first.typescript_diagnostics, 1);
     assert_eq!(first.bash_cwd, "/workspace/scratch");
+    Ok(())
+}
+
+#[test]
+fn seeded_runtime_execution_replays_module_graph_and_capability_calls() -> turmoil::Result {
+    let first = run_runtime_simulation(0x1234)?;
+    let second = run_runtime_simulation(0x1234)?;
+    assert_eq!(first, second);
+    assert!(
+        first
+            .tool_names
+            .contains(&"sandbox.runtime.exec_module".to_string())
+    );
+    assert!(
+        first
+            .tool_names
+            .contains(&"host_api.tickets.echo".to_string())
+    );
+    assert!(
+        first
+            .module_graph
+            .contains(&"terrace:/workspace/main.js".to_string())
+    );
+    assert!(
+        first
+            .module_graph
+            .contains(&"terrace:host/tickets".to_string())
+    );
+    assert_eq!(
+        first.result,
+        json!({
+            "specifier": "terrace:host/tickets",
+            "method": "echo",
+            "args": [{
+                "value": "seed-4660:9"
+            }]
+        })
+    );
+    assert!(first.cache_entries >= 2);
     Ok(())
 }

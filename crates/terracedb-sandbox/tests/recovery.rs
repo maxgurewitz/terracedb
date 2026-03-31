@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
+use serde_json::json;
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_sandbox::{
     BashRequest, BashService, DefaultSandboxStore, DeterministicBashService,
-    DeterministicTypeScriptService, GitProvenance, ReopenSessionOptions, SandboxConfig,
-    SandboxServices, SandboxStore, TERRACE_BASH_SESSION_STATE_PATH, TERRACE_SESSION_INFO_KV_KEY,
-    TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,
-    TypeCheckRequest, TypeScriptService, TypeScriptTranspileRequest,
+    DeterministicTypeScriptService, GitProvenance, PackageCompatibilityMode, PackageInstallRequest,
+    ReopenSessionOptions, SandboxConfig, SandboxServices, SandboxStore,
+    TERRACE_BASH_SESSION_STATE_PATH, TERRACE_NPM_INSTALL_MANIFEST_PATH,
+    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
+    TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH, TypeCheckRequest,
+    TypeScriptService, TypeScriptTranspileRequest,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore,
@@ -59,6 +62,59 @@ async fn seed_base(store: &InMemoryVfsStore, volume_id: VolumeId) {
         )
         .await
         .expect("seed tooling");
+}
+
+async fn seed_runtime_module(store: &InMemoryVfsStore, volume_id: VolumeId) {
+    let base = store
+        .open_volume(
+            VolumeConfig::new(volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open base");
+    base.fs()
+        .write_file(
+            "/workspace/main.js",
+            br#"
+            import { writeTextFile } from "@terracedb/sandbox/fs";
+            writeTextFile("/workspace/generated.txt", "generated");
+            export default "ok";
+            "#
+            .to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed runtime module");
+}
+
+async fn seed_package_runtime_module(store: &InMemoryVfsStore, volume_id: VolumeId) {
+    let base = store
+        .open_volume(
+            VolumeConfig::new(volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open base");
+    base.fs()
+        .write_file(
+            "/workspace/main.js",
+            br#"
+            import { camelCase } from "lodash";
+            export default camelCase("flushed package install");
+            "#
+            .to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed package runtime module");
 }
 
 #[tokio::test]
@@ -312,4 +368,200 @@ async fn reopen_preserves_typescript_and_bash_service_metadata() {
         .expect("resume bash");
     assert_eq!(resumed.stdout, "Terrace\n/workspace/notes\n");
     assert_eq!(resumed.cwd, "/workspace/notes");
+}
+
+#[tokio::test]
+async fn runtime_cache_manifest_only_survives_durable_recovery_after_flush() {
+    let (source_vfs, sandbox) = sandbox_store(90, 206);
+    let base_volume_id = VolumeId::new(0x8210);
+    let session_volume_id = VolumeId::new(0x8211);
+    seed_runtime_module(&source_vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open session");
+    session
+        .flush()
+        .await
+        .expect("flush initial session metadata");
+    session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("execute runtime module");
+
+    let unflushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut before flush");
+    let (unflushed_vfs, unflushed_sandbox) = sandbox_store(100, 207);
+    unflushed_vfs
+        .import_volume(
+            unflushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut before flush");
+    let unflushed_session = unflushed_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen durable cut before flush");
+    assert_eq!(
+        unflushed_session
+            .filesystem()
+            .read_file(TERRACE_RUNTIME_MODULE_CACHE_PATH)
+            .await
+            .expect("read unflushed runtime cache"),
+        None
+    );
+
+    session
+        .flush()
+        .await
+        .expect("flush session with runtime cache");
+
+    let flushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut after flush");
+    let (flushed_vfs, flushed_sandbox) = sandbox_store(110, 208);
+    flushed_vfs
+        .import_volume(
+            flushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut after flush");
+    let flushed_session = flushed_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen durable cut after flush");
+    let cache = flushed_session
+        .filesystem()
+        .read_file(TERRACE_RUNTIME_MODULE_CACHE_PATH)
+        .await
+        .expect("read flushed runtime cache")
+        .expect("runtime cache manifest should survive after flush");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&cache).expect("decode runtime cache manifest");
+    assert!(
+        manifest
+            .as_array()
+            .expect("runtime cache entries array")
+            .iter()
+            .any(|entry| entry["specifier"] == "terrace:/workspace/main.js")
+    );
+}
+
+#[tokio::test]
+async fn package_install_manifest_and_compatibility_view_only_survive_durable_recovery_after_flush()
+{
+    let (source_vfs, sandbox) = sandbox_store(120, 209);
+    let base_volume_id = VolumeId::new(0x8300);
+    let session_volume_id = VolumeId::new(0x8301);
+    seed_package_runtime_module(&source_vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::NpmPureJs,
+            conflict_policy: terracedb_sandbox::ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open package session");
+    session.flush().await.expect("flush initial session");
+    session
+        .install_packages(PackageInstallRequest {
+            packages: vec!["lodash".to_string()],
+            materialize_compatibility_view: true,
+        })
+        .await
+        .expect("install packages");
+
+    let unflushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut before package flush");
+    let (unflushed_vfs, unflushed_sandbox) = sandbox_store(130, 210);
+    unflushed_vfs
+        .import_volume(
+            unflushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut before package flush");
+    let unflushed_session = unflushed_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen durable cut before package flush");
+    assert_eq!(
+        unflushed_session
+            .filesystem()
+            .read_file(TERRACE_NPM_INSTALL_MANIFEST_PATH)
+            .await
+            .expect("read unflushed package manifest"),
+        None
+    );
+
+    session
+        .flush()
+        .await
+        .expect("flush session with package manifest");
+
+    let flushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut after package flush");
+    let (flushed_vfs, flushed_sandbox) = sandbox_store(140, 211);
+    flushed_vfs
+        .import_volume(
+            flushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut after package flush");
+    let flushed_session = flushed_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen durable cut after package flush");
+    assert!(
+        flushed_session
+            .filesystem()
+            .read_file(TERRACE_NPM_INSTALL_MANIFEST_PATH)
+            .await
+            .expect("read flushed package manifest")
+            .is_some()
+    );
+    let result = flushed_session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("execute recovered package module");
+    assert_eq!(result.result, Some(json!("flushedPackageInstall")));
 }

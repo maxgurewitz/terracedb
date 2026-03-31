@@ -20,10 +20,24 @@ pub enum SandboxError {
     InvalidCapabilitySpecifier { specifier: String },
     #[error("unsupported sandbox module specifier: {specifier}")]
     InvalidModuleSpecifier { specifier: String },
+    #[error("sandbox module not found: {specifier}")]
+    ModuleNotFound { specifier: String },
+    #[error("sandbox capability is not allowed in this session: {specifier}")]
+    CapabilityDenied { specifier: String },
+    #[error("sandbox capability is not available from the host registry: {specifier}")]
+    CapabilityUnavailable { specifier: String },
+    #[error("sandbox capability method was not found: {specifier}::{method}")]
+    CapabilityMethodNotFound { specifier: String, method: String },
+    #[error("sandbox package request is unsupported: {package} ({reason})")]
+    UnsupportedPackage { package: String, reason: String },
+    #[error("sandbox package is not installed: {package}")]
+    PackageNotInstalled { package: String },
     #[error("readonly view uri is invalid: {uri}")]
     InvalidReadonlyViewUri { uri: String },
     #[error("readonly view handle {handle_id} not found")]
     ViewHandleNotFound { handle_id: String },
+    #[error("sandbox execution failed for {entrypoint}: {message}")]
+    Execution { entrypoint: String, message: String },
     #[error("{service} backend error: {message}")]
     Service {
         service: &'static str,

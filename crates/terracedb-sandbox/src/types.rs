@@ -9,6 +9,12 @@ pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 pub const TERRACE_METADATA_DIR: &str = "/.terrace";
 pub const TERRACE_SESSION_METADATA_PATH: &str = "/.terrace/session.json";
 pub const TERRACE_SESSION_INFO_KV_KEY: &str = "sandbox.session.info";
+pub const TERRACE_RUNTIME_CACHE_DIR: &str = "/.terrace/cache/runtime";
+pub const TERRACE_RUNTIME_MODULE_CACHE_PATH: &str = "/.terrace/cache/runtime/modules.json";
+pub const TERRACE_NPM_DIR: &str = "/.terrace/npm";
+pub const TERRACE_NPM_INSTALL_MANIFEST_PATH: &str = "/.terrace/npm/install-manifest.json";
+pub const TERRACE_NPM_SESSION_CACHE_DIR: &str = "/.terrace/npm/cache/packages";
+pub const TERRACE_NPM_COMPATIBILITY_ROOT: &str = "/.terrace/npm/node_modules";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseSnapshotIdentity {
@@ -112,7 +118,7 @@ impl SandboxConfig {
             base_volume_id,
             durable_base: false,
             workspace_root: DEFAULT_WORKSPACE_ROOT.to_string(),
-            package_compat: PackageCompatibilityMode::TerraceOnly,
+            package_compat: PackageCompatibilityMode::NpmPureJs,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: CapabilityManifest::default(),
             hoisted_source: None,
@@ -127,6 +133,11 @@ impl SandboxConfig {
 
     pub fn with_durable_base(mut self, durable_base: bool) -> Self {
         self.durable_base = durable_base;
+        self
+    }
+
+    pub fn with_package_compat(mut self, package_compat: PackageCompatibilityMode) -> Self {
+        self.package_compat = package_compat;
         self
     }
 }
