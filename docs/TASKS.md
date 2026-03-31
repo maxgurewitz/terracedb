@@ -3572,6 +3572,12 @@ Finish the simulation-safety pass across introspection surfaces that may still b
 2. Convert the high-value surfaces to published immutable snapshots, subscriptions, or explicit poll/step interfaces, depending on whether tests need sampled state, ordered events, or deterministic progress control.
 3. Remove test-only retry loops that compensate for blocking inspection, and replace them with direct subscription- or progress-driven assertions.
 4. Extend the debugging guide with the preferred simulation-safe observation patterns so future work does not regress into blocking shared-state reads.
+5. Prioritize the next slices that are already identified by the current refactor:
+   - DB progress subscriptions that replace repeated `current_sequence()` / `current_durable_sequence()` sampling in async and simulation tests.
+   - Remaining resource-manager snapshot callsites that still poll synchronous state from async tests instead of using the published subscription path.
+   - Columnar cache usage observability, especially the public usage snapshot that still assembles live state from locks.
+   - Failpoint polling helpers that currently advance time by repeated `yield_now()` loops.
+   - Remote cache / prefetch progress events for range-cache and dedupe completion assertions.
 
 **Verification**
 
@@ -3595,6 +3601,7 @@ Expose explicit progress probes for scheduler-driven background work so simulati
 2. Introduce poll/step helpers or bounded "wait until idle" probes where that can be done without weakening production invariants.
 3. Rewrite representative simulation tests to use the new probes instead of time-based heuristics.
 4. Keep the new probes clearly test/debug oriented so they do not become accidental correctness boundaries in production code.
+5. Treat `direct_backlog()` and similar lock-backed helper reads as candidates for this bucket when they are only needed to drive simulation progress or backlog assertions.
 
 **Verification**
 

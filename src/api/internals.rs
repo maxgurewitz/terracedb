@@ -63,6 +63,7 @@ pub(super) struct DbInner {
     pub(super) compaction_filter_stats: Mutex<BTreeMap<TableId, CompactionFilterStats>>,
     pub(super) visible_watchers: Arc<WatermarkRegistry>,
     pub(super) durable_watchers: Arc<WatermarkRegistry>,
+    pub(super) db_progress: DbProgressPublisher,
     pub(super) pending_work_budget_state: Mutex<PendingWorkBudgetState>,
     pub(super) scheduler_observability: SchedulerObservabilityStats,
     pub(super) compact_to_wide_stats: Mutex<BTreeMap<CompactToWideStatsKey, CompactToWideStats>>,

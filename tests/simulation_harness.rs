@@ -9,19 +9,20 @@ use futures::{StreamExt, TryStreamExt};
 use terracedb::{
     Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
     CommitOptions, CompactionStrategy, ContentionClass, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db,
-    DbComponents, DbConfig, DbSettings, DomainBackgroundBudget, DomainBudgetCharge,
-    DomainBudgetOracle, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DurabilityClass,
-    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainOwner,
-    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane,
-    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceUsage, FieldDefinition,
-    FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure, FileSystemOperation,
-    InMemoryDomainBudgetOracle, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore,
-    ObjectStoreOperation, OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint,
-    ResourceManager, RoundRobinScheduler, S3Location, S3PrimaryStorageConfig, ScanOptions,
-    ScheduleAction, ScheduleDecision, Scheduler, SchemaDefinition, SegmentId, SequenceNumber,
-    SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubRng, TableConfig, TableFormat,
-    TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Transaction,
-    UnifiedStorage, Value, WorkPlacementRequest,
+    DbComponents, DbConfig, DbProgressSnapshot, DbProgressSubscription, DbSettings,
+    DomainBackgroundBudget, DomainBudgetCharge, DomainBudgetOracle, DomainCpuBudget,
+    DomainIoBudget, DomainMemoryBudget, DurabilityClass, ExecutionDomainBacklogSnapshot,
+    ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement,
+    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, ExecutionLanePlacementConfig,
+    ExecutionResourceUsage, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
+    FileSystemFailure, FileSystemOperation, InMemoryDomainBudgetOracle, LogCursor, ManifestId,
+    ObjectKeyLayout, ObjectStore, ObjectStoreOperation, OpenError, PendingWork, PendingWorkType,
+    RemoteCache, RemoteRecoveryHint, ResourceManager, RoundRobinScheduler, S3Location,
+    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+    SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
+    StorageSource, StubRng, TableConfig, TableFormat, TableStats, ThrottleDecision,
+    TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage, Value,
+    WorkPlacementRequest,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
@@ -572,10 +573,23 @@ where
         if predicate(&snapshot) {
             return snapshot;
         }
-        updates
-            .changed()
-            .await
-            .expect("resource manager update");
+        updates.changed().await.expect("resource manager update");
+    }
+}
+
+async fn next_db_progress_snapshot<F>(
+    updates: &mut DbProgressSubscription,
+    predicate: F,
+) -> DbProgressSnapshot
+where
+    F: Fn(&DbProgressSnapshot) -> bool,
+{
+    loop {
+        let snapshot = updates.current();
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        updates.changed().await.expect("db progress update");
     }
 }
 
@@ -836,6 +850,9 @@ async fn run_simulated_whole_system_execution_domain_campaign(
     let warehouse_events = warehouse
         .create_table(SimulationTableSpec::row("events").table_config())
         .await?;
+    let primary_progress = primary.subscribe_progress();
+    let analytics_progress = analytics.subscribe_progress();
+    let warehouse_progress = warehouse.subscribe_progress();
 
     let oracle = InMemoryDomainBudgetOracle::default();
     let mut pending = BTreeMap::from([
@@ -875,7 +892,14 @@ async fn run_simulated_whole_system_execution_domain_campaign(
             .get_mut(name)
             .expect("bootstrap pending domain")
             .insert(b"bootstrap".to_vec(), value.clone());
-        if db.current_durable_sequence() == db.current_sequence() {
+        let progress = match name {
+            "primary" => &primary_progress,
+            "analytics" => &analytics_progress,
+            "warehouse" => &warehouse_progress,
+            _ => unreachable!("bootstrap only targets declared databases"),
+        };
+        let snapshot = progress.current();
+        if snapshot.current_sequence == snapshot.durable_sequence {
             durable
                 .get_mut(name)
                 .expect("bootstrap durable domain")
@@ -939,7 +963,14 @@ async fn run_simulated_whole_system_execution_domain_campaign(
             .get_mut(target)
             .expect("seeded pending domain")
             .insert(key, value.clone());
-        if db.current_durable_sequence() == db.current_sequence() {
+        let progress = match target {
+            "primary" => &primary_progress,
+            "analytics" => &analytics_progress,
+            "warehouse" => &warehouse_progress,
+            _ => unreachable!("campaign only targets declared databases"),
+        };
+        let snapshot = progress.current();
+        if snapshot.current_sequence == snapshot.durable_sequence {
             durable
                 .get_mut(target)
                 .expect("seeded durable domain")
@@ -3134,8 +3165,7 @@ fn simulation_resource_manager_subscription_tracks_backlog_transitions() -> turm
                     .domains
                     .get(&background_path)
                     .is_some_and(|domain| {
-                        domain.backlog.queued_work_items == 0
-                            && domain.backlog.queued_bytes == 0
+                        domain.backlog.queued_work_items == 0 && domain.backlog.queued_bytes == 0
                     })
             })
             .await;
@@ -4041,6 +4071,7 @@ fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
             let table = db
                 .create_table(SimulationTableSpec::row("events").table_config())
                 .await?;
+            let progress = db.subscribe_progress();
 
             for index in 0..12_u64 {
                 table
@@ -4054,8 +4085,9 @@ fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
                 }
             }
 
-            assert_eq!(db.current_sequence(), SequenceNumber::new(12));
-            assert_eq!(db.current_durable_sequence(), SequenceNumber::new(12));
+            let snapshot = progress.current();
+            assert_eq!(snapshot.current_sequence, SequenceNumber::new(12));
+            assert_eq!(snapshot.durable_sequence, SequenceNumber::new(12));
             assert_eq!(
                 table.read(b"k-11".to_vec()).await?,
                 Some(Value::bytes("v-11"))
@@ -4065,6 +4097,46 @@ fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
                     <= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
                 "random scheduling should never outrun the engine guardrails"
             );
+
+            Ok(())
+        })
+}
+
+#[test]
+fn simulation_db_progress_subscription_tracks_visible_then_durable_frontiers() -> turmoil::Result {
+    SeededSimulationRunner::new(0x8186)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_tiered_config(
+                    "/terracedb/sim/t16-db-progress-subscription",
+                    TieredDurabilityMode::Deferred,
+                ))
+                .await?;
+            let table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let mut progress = db.subscribe_progress();
+
+            assert_eq!(progress.current(), DbProgressSnapshot::default());
+
+            let visible = table.write(b"k".to_vec(), Value::bytes("v1")).await?;
+            let published_visible = next_db_progress_snapshot(&mut progress, |snapshot| {
+                snapshot.current_sequence == visible
+                    && snapshot.durable_sequence == SequenceNumber::default()
+            })
+            .await;
+            assert_eq!(published_visible.current_sequence, visible);
+            assert_eq!(
+                published_visible.durable_sequence,
+                SequenceNumber::default()
+            );
+
+            db.flush().await?;
+            let published_durable = progress.current();
+            assert_eq!(published_durable.current_sequence, visible);
+            assert_eq!(published_durable.durable_sequence, visible);
+            assert_eq!(db.progress_snapshot(), published_durable);
 
             Ok(())
         })

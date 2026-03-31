@@ -1,3 +1,5 @@
+use arc_swap::ArcSwap;
+
 use super::*;
 
 #[derive(Debug)]
@@ -42,12 +44,87 @@ impl Clone for WatermarkReceiver {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DbProgressSnapshot {
+    pub current_sequence: SequenceNumber,
+    pub durable_sequence: SequenceNumber,
+}
+
+#[derive(Debug)]
+pub struct DbProgressSubscription {
+    inner: watch::Receiver<Arc<DbProgressSnapshot>>,
+}
+
+impl DbProgressSubscription {
+    pub(super) fn new(inner: watch::Receiver<Arc<DbProgressSnapshot>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn current(&self) -> DbProgressSnapshot {
+        self.inner.borrow().as_ref().clone()
+    }
+
+    pub async fn changed(&mut self) -> Result<DbProgressSnapshot, SubscriptionClosed> {
+        self.inner.changed().await.map_err(|_| SubscriptionClosed)?;
+        Ok(self.current())
+    }
+}
+
+impl Clone for DbProgressSubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct WatermarkAdvance {
     pub(super) visible_sequence: Option<SequenceNumber>,
     pub(super) visible_tables: BTreeMap<String, SequenceNumber>,
     pub(super) durable_sequence: Option<SequenceNumber>,
     pub(super) durable_tables: BTreeMap<String, SequenceNumber>,
+}
+
+#[derive(Debug)]
+pub(super) struct DbProgressPublisher {
+    latest_snapshot: ArcSwap<DbProgressSnapshot>,
+    published_snapshot: watch::Sender<Arc<DbProgressSnapshot>>,
+}
+
+impl DbProgressPublisher {
+    pub(super) fn new(current_sequence: SequenceNumber, durable_sequence: SequenceNumber) -> Self {
+        let initial_snapshot = Arc::new(DbProgressSnapshot {
+            current_sequence,
+            durable_sequence,
+        });
+        let (published_snapshot, _receiver) = watch::channel(initial_snapshot.clone());
+        Self {
+            latest_snapshot: ArcSwap::from(initial_snapshot),
+            published_snapshot,
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> DbProgressSnapshot {
+        self.latest_snapshot.load_full().as_ref().clone()
+    }
+
+    pub(super) fn subscribe(&self) -> DbProgressSubscription {
+        DbProgressSubscription::new(self.published_snapshot.subscribe())
+    }
+
+    pub(super) fn publish(
+        &self,
+        current_sequence: SequenceNumber,
+        durable_sequence: SequenceNumber,
+    ) {
+        let snapshot = Arc::new(DbProgressSnapshot {
+            current_sequence,
+            durable_sequence,
+        });
+        self.latest_snapshot.store(snapshot.clone());
+        self.published_snapshot.send_replace(snapshot);
+    }
 }
 
 #[derive(Debug)]

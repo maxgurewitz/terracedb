@@ -2062,9 +2062,7 @@ impl ResourceManagerSubscription {
     }
 
     /// Waits for the next published snapshot.
-    pub async fn changed(
-        &mut self,
-    ) -> Result<ResourceManagerSnapshot, crate::SubscriptionClosed> {
+    pub async fn changed(&mut self) -> Result<ResourceManagerSnapshot, crate::SubscriptionClosed> {
         self.inner
             .changed()
             .await
@@ -3024,7 +3022,10 @@ mod tests {
         let mut subscription = ResourceManager::subscribe(&manager);
         let current = subscription.current();
         assert!(current.domains.contains_key(&path));
-        assert_eq!(current.domains[&path].backlog, ExecutionDomainBacklogSnapshot::default());
+        assert_eq!(
+            current.domains[&path].backlog,
+            ExecutionDomainBacklogSnapshot::default()
+        );
 
         let backlog = ExecutionDomainBacklogSnapshot {
             queued_work_items: 3,
@@ -3033,7 +3034,10 @@ mod tests {
         let updated = ResourceManager::set_backlog(&manager, &path, backlog);
         assert_eq!(updated.backlog, backlog);
 
-        let published = subscription.changed().await.expect("resource manager snapshot");
+        let published = subscription
+            .changed()
+            .await
+            .expect("resource manager snapshot");
         assert_eq!(published.domains[&path].backlog, backlog);
         assert_eq!(published, manager.snapshot());
     }

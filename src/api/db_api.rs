@@ -1,3 +1,4 @@
+use super::watermark::{DbProgressSnapshot, DbProgressSubscription};
 use super::*;
 use crate::execution::{
     DbExecutionProfile, DomainTaggedWork, ExecutionBacklogGuard, ExecutionDomainBudget,
@@ -597,6 +598,16 @@ impl Db {
 
     pub fn current_durable_sequence(&self) -> SequenceNumber {
         SequenceNumber::new(self.inner.current_durable_sequence.load(Ordering::SeqCst))
+    }
+
+    /// Returns the latest published database progress snapshot.
+    pub fn progress_snapshot(&self) -> DbProgressSnapshot {
+        self.inner.db_progress.snapshot()
+    }
+
+    /// Subscribes to published database progress updates.
+    pub fn subscribe_progress(&self) -> DbProgressSubscription {
+        self.inner.db_progress.subscribe()
     }
 
     pub fn write_batch(&self) -> WriteBatch {
@@ -2533,6 +2544,11 @@ impl Db {
             self.inner
                 .current_durable_sequence
                 .store(sequence.get(), Ordering::SeqCst);
+        }
+        if advance.visible_sequence.is_some() || advance.durable_sequence.is_some() {
+            self.inner
+                .db_progress
+                .publish(self.current_sequence(), self.current_durable_sequence());
         }
 
         self.notify_table_sequences(&self.inner.visible_watchers, &advance.visible_tables);

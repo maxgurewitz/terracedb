@@ -4,16 +4,17 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use terracedb::{
     ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement, CommitOptions,
-    CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbSettings, DomainBackgroundBudget,
-    DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork, DurabilityClass,
-    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainLifecycleEvent,
-    ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
-    ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding,
-    ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage, FileSystemFailure,
-    FileSystemOperation, InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType,
-    PressureScope, ResourceManager, S3Location, ScanOptions, Scheduler, ShardReadyPlacementLayout,
-    StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TableStats,
-    ThrottleDecision, TieredDurabilityMode, Timestamp, Value,
+    CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbProgressSnapshot,
+    DbProgressSubscription, DbSettings, DomainBackgroundBudget, DomainCpuBudget, DomainIoBudget,
+    DomainMemoryBudget, DomainTaggedWork, DurabilityClass, ExecutionDomainBacklogSnapshot,
+    ExecutionDomainBudget, ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook,
+    ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec,
+    ExecutionLane, ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceKind,
+    ExecutionResourceUsage, FileSystemFailure, FileSystemOperation, InMemoryResourceManager,
+    NoopScheduler, PendingWork, PendingWorkType, PressureScope, ResourceManager, S3Location,
+    ScanOptions, Scheduler, ShardReadyPlacementLayout, StubClock, StubFileSystem, StubObjectStore,
+    StubRng, TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
+    Timestamp, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -228,6 +229,22 @@ where
             .changed()
             .await
             .expect("resource manager snapshot update");
+    }
+}
+
+async fn await_db_progress_snapshot<F>(
+    subscription: &mut DbProgressSubscription,
+    predicate: F,
+) -> DbProgressSnapshot
+where
+    F: Fn(&DbProgressSnapshot) -> bool,
+{
+    loop {
+        let snapshot = subscription.current();
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        subscription.changed().await.expect("db progress update");
     }
 }
 
@@ -2712,11 +2729,15 @@ async fn db_lane_backlog_subscription_observes_transition_edges() {
     let mut updates = db.subscribe_resource_manager();
 
     assert_eq!(
-        updates.current().domains[&background_path].backlog.queued_work_items,
+        updates.current().domains[&background_path]
+            .backlog
+            .queued_work_items,
         0
     );
     assert_eq!(
-        updates.current().domains[&background_path].backlog.queued_bytes,
+        updates.current().domains[&background_path]
+            .backlog
+            .queued_bytes,
         0
     );
 
@@ -2764,10 +2785,7 @@ async fn db_lane_backlog_subscription_observes_transition_edges() {
                     snapshot.domains[&background_path].backlog.queued_work_items,
                     4
                 );
-                assert_eq!(
-                    snapshot.domains[&background_path].backlog.queued_bytes,
-                    128
-                );
+                assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 128);
                 snapshot.domains[&background_path].backlog
             },
         )
@@ -2780,12 +2798,59 @@ async fn db_lane_backlog_subscription_observes_transition_edges() {
             && snapshot.domains[&background_path].backlog.queued_bytes == 0
     })
     .await;
-    assert_eq!(cleared.domains[&background_path].backlog.queued_work_items, 0);
+    assert_eq!(
+        cleared.domains[&background_path].backlog.queued_work_items,
+        0
+    );
     assert_eq!(cleared.domains[&background_path].backlog.queued_bytes, 0);
     assert_eq!(
         db.resource_manager_snapshot().domains[&background_path].backlog,
         cleared.domains[&background_path].backlog
     );
+}
+
+#[tokio::test]
+async fn db_progress_subscription_observes_visible_then_durable_transitions() {
+    let db = Db::builder()
+        .settings(deferred_tiered_settings("/execution-progress-subscription"))
+        .components(stub_components(
+            Arc::new(InMemoryResourceManager::default()),
+        ))
+        .open()
+        .await
+        .expect("open db");
+
+    let table = db
+        .ensure_table(row_table_config("events"))
+        .await
+        .expect("create events table");
+    let mut progress = db.subscribe_progress();
+
+    assert_eq!(progress.current(), DbProgressSnapshot::default());
+
+    let visible = table
+        .write(b"k".to_vec(), Value::Bytes(b"v".to_vec()))
+        .await
+        .expect("write row");
+    let published_visible = await_db_progress_snapshot(&mut progress, |snapshot| {
+        snapshot.current_sequence == visible
+            && snapshot.durable_sequence == terracedb::SequenceNumber::default()
+    })
+    .await;
+    assert_eq!(published_visible.current_sequence, visible);
+    assert_eq!(
+        published_visible.durable_sequence,
+        terracedb::SequenceNumber::default()
+    );
+
+    db.flush().await.expect("flush row");
+    let published_durable = await_db_progress_snapshot(&mut progress, |snapshot| {
+        snapshot.current_sequence == visible && snapshot.durable_sequence == visible
+    })
+    .await;
+    assert_eq!(published_durable.current_sequence, visible);
+    assert_eq!(published_durable.durable_sequence, visible);
+    assert_eq!(db.progress_snapshot(), published_durable);
 }
 
 #[tokio::test]
