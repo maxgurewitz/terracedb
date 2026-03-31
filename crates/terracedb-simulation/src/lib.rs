@@ -18,13 +18,14 @@ use turmoil::net::{TcpListener, TcpStream};
 use terracedb::{
     ChangeKind, Clock, CommitError, CompactionFilterRef, CompactionStrategy,
     CurrentStateOracleMutation, CurrentStateOracleRow, CurrentStateRetentionContract,
-    CurrentStateRetentionError, CurrentStateRetentionEvaluation, CurrentStateRetentionOracle, Db,
-    DbConfig, DbDependencies, DeterministicRng, FileHandle, FileSystem, FileSystemFailure,
-    FileSystemOperation, FlushError, Key, KvStream, LogCursor, MergeOperator, MergeOperatorRef,
-    ObjectStore, ObjectStoreOperation, OpenError, OpenOptions, ReadError, Rng, S3Location,
-    ScanOptions, SequenceNumber, SimulatedFileSystem, SsdConfig, StorageConfig, StorageError,
-    StorageErrorKind, Table, TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig,
-    Timestamp, TtlCompactionFilter, Value, WriteError, test_support::FailpointRegistry,
+    CurrentStateRetentionCoordinationContext, CurrentStateRetentionCoordinator,
+    CurrentStateRetentionError, CurrentStateRetentionEvaluation, Db, DbConfig, DbDependencies,
+    DeterministicRng, FileHandle, FileSystem, FileSystemFailure, FileSystemOperation, FlushError,
+    Key, KvStream, LogCursor, MergeOperator, MergeOperatorRef, ObjectStore, ObjectStoreOperation,
+    OpenError, OpenOptions, ReadError, Rng, S3Location, ScanOptions, SequenceNumber,
+    SimulatedFileSystem, SsdConfig, StorageConfig, StorageError, StorageErrorKind, Table,
+    TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp,
+    TtlCompactionFilter, Value, WriteError, test_support::FailpointRegistry,
 };
 
 mod hybrid;
@@ -1788,6 +1789,7 @@ fn decode_oracle_value(table: &str, key: &[u8], value: Value) -> Result<Vec<u8>,
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentStateSimulationScenario {
     pub initial_contract: CurrentStateRetentionContract,
+    pub coordination: CurrentStateRetentionCoordinationContext,
     pub operations: Vec<CurrentStateSimulationOperation>,
 }
 
@@ -1805,6 +1807,8 @@ pub enum CurrentStateSimulationOperation {
     },
     ClearSnapshotPins,
     PublishRetainedSet,
+    PublishManifest,
+    CompleteLocalCleanup,
     Restart,
 }
 
@@ -1828,39 +1832,49 @@ pub enum CurrentStateSimulationError {
 pub fn run_current_state_simulation(
     scenario: &CurrentStateSimulationScenario,
 ) -> Result<CurrentStateSimulationOutcome, CurrentStateSimulationError> {
-    let mut oracle = CurrentStateRetentionOracle::new(scenario.initial_contract.clone());
+    let mut coordinator = CurrentStateRetentionCoordinator::new(
+        scenario.initial_contract.clone(),
+        scenario.coordination.clone(),
+    );
     let mut steps = Vec::with_capacity(scenario.operations.len());
 
     for operation in &scenario.operations {
         match operation {
             CurrentStateSimulationOperation::Upsert(row) => {
-                oracle.apply(CurrentStateOracleMutation::Upsert(row.clone()));
+                coordinator.apply(CurrentStateOracleMutation::Upsert(row.clone()));
             }
             CurrentStateSimulationOperation::Delete { row_key } => {
-                oracle.apply(CurrentStateOracleMutation::Delete {
+                coordinator.apply(CurrentStateOracleMutation::Delete {
                     row_key: row_key.clone(),
                 });
             }
             CurrentStateSimulationOperation::ReviseContract { contract } => {
-                oracle.set_contract(contract.clone());
+                coordinator.set_contract(contract.clone());
             }
             CurrentStateSimulationOperation::PinSnapshotRows { row_keys } => {
-                oracle.set_snapshot_pins(row_keys.clone());
+                coordinator.set_snapshot_pins(row_keys.clone());
             }
             CurrentStateSimulationOperation::ClearSnapshotPins => {
-                oracle.clear_snapshot_pins();
+                coordinator.clear_snapshot_pins();
+            }
+            CurrentStateSimulationOperation::PublishManifest => {
+                coordinator.publish_manifest();
+            }
+            CurrentStateSimulationOperation::CompleteLocalCleanup => {
+                coordinator.complete_local_cleanup();
             }
             CurrentStateSimulationOperation::PublishRetainedSet => {
-                oracle.publish_retained_set()?;
+                coordinator.publish_retained_set()?;
             }
             CurrentStateSimulationOperation::Restart => {
-                oracle = CurrentStateRetentionOracle::from_snapshot(oracle.snapshot());
+                coordinator =
+                    CurrentStateRetentionCoordinator::from_snapshot(coordinator.snapshot());
             }
         }
 
         steps.push(CurrentStateSimulationStep {
             operation: operation.clone(),
-            evaluation: oracle.evaluate()?,
+            evaluation: coordinator.plan()?,
         });
     }
 

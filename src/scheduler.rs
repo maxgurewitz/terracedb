@@ -18,6 +18,7 @@ pub trait Scheduler: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PendingWorkType {
     Flush,
+    CurrentStateRetention,
     Compaction,
     Backup,
     Offload,
@@ -199,6 +200,19 @@ impl Scheduler for RoundRobinScheduler {
     }
 
     fn should_throttle(&self, _table: &Table, stats: &TableStats) -> ThrottleDecision {
+        if let Some(retention) = stats.current_state_retention.as_ref()
+            && retention.coordination.backpressure.throttle_writes
+        {
+            return ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: retention
+                    .coordination
+                    .backpressure
+                    .max_write_bytes_per_second,
+                stall: retention.coordination.backpressure.stall_writes,
+            };
+        }
+
         if stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT {
             return ThrottleDecision {
                 throttle: true,
@@ -228,10 +242,11 @@ impl fmt::Debug for RoundRobinScheduler {
 fn pending_work_priority(work: &PendingWork) -> (u8, u32) {
     match work.work_type {
         PendingWorkType::Flush => (0, 0),
-        PendingWorkType::Compaction => (1, work.level.unwrap_or(u32::MAX)),
-        PendingWorkType::Backup => (2, 0),
-        PendingWorkType::Offload => (3, 0),
-        PendingWorkType::Prefetch => (4, 0),
+        PendingWorkType::CurrentStateRetention => (1, 0),
+        PendingWorkType::Compaction => (2, work.level.unwrap_or(u32::MAX)),
+        PendingWorkType::Backup => (3, 0),
+        PendingWorkType::Offload => (4, 0),
+        PendingWorkType::Prefetch => (5, 0),
     }
 }
 
@@ -246,8 +261,13 @@ mod tests {
         PendingWorkType, RoundRobinScheduler, ScheduleAction, Scheduler, TableStats,
     };
     use crate::{
-        Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig, StubClock,
-        StubFileSystem, StubObjectStore, StubRng, Table, TieredDurabilityMode, TieredStorageConfig,
+        CurrentStateEffectiveMode, CurrentStateRetainedSetSummary,
+        CurrentStateRetentionBackpressure, CurrentStateRetentionBackpressureSignal,
+        CurrentStateRetentionCoordinationStats, CurrentStateRetentionEvaluationCost,
+        CurrentStateRetentionMembershipChanges, CurrentStateRetentionStats,
+        CurrentStateRetentionStatus, Db, DbConfig, DbDependencies, S3Location, SsdConfig,
+        StorageConfig, StubClock, StubFileSystem, StubObjectStore, StubRng, Table,
+        TieredDurabilityMode, TieredStorageConfig,
     };
 
     fn make_table(name: &str) -> Table {
@@ -279,6 +299,40 @@ mod tests {
                 .await
                 .expect("create scheduler test table")
         })
+    }
+
+    fn retention_stats_with_backpressure() -> CurrentStateRetentionStats {
+        CurrentStateRetentionStats {
+            policy_revision: 7,
+            effective_logical_floor: None,
+            retained_set: CurrentStateRetainedSetSummary { rows: 2, bytes: 96 },
+            membership_changes: CurrentStateRetentionMembershipChanges::default(),
+            evaluation_cost: CurrentStateRetentionEvaluationCost::default(),
+            reclaimed_rows: 0,
+            reclaimed_bytes: 0,
+            deferred_rows: 2,
+            deferred_bytes: 64,
+            coordination: CurrentStateRetentionCoordinationStats {
+                logical_rows_pending: 2,
+                deferred_physical_rows: 2,
+                physical_bytes_pending: 64,
+                evaluation_cost: CurrentStateRetentionEvaluationCost::default(),
+                backpressure: CurrentStateRetentionBackpressure {
+                    signals: vec![
+                        CurrentStateRetentionBackpressureSignal::CpuBound,
+                        CurrentStateRetentionBackpressureSignal::RewriteCompactionBlocked,
+                    ],
+                    throttle_writes: true,
+                    stall_writes: false,
+                    max_write_bytes_per_second: Some(64),
+                },
+                ..Default::default()
+            },
+            status: CurrentStateRetentionStatus {
+                effective_mode: CurrentStateEffectiveMode::PhysicalReclaim,
+                reasons: Vec::new(),
+            },
+        }
     }
 
     #[test]
@@ -355,5 +409,64 @@ mod tests {
                 )
                 .stall
         );
+    }
+
+    #[test]
+    fn round_robin_scheduler_prioritizes_current_state_retention_before_compaction() {
+        let scheduler = RoundRobinScheduler::default();
+        let work = vec![
+            PendingWork {
+                id: "compaction:events".to_string(),
+                work_type: PendingWorkType::Compaction,
+                table: "events".to_string(),
+                level: Some(0),
+                estimated_bytes: 128,
+            },
+            PendingWork {
+                id: "retention:events".to_string(),
+                work_type: PendingWorkType::CurrentStateRetention,
+                table: "events".to_string(),
+                level: None,
+                estimated_bytes: 96,
+            },
+            PendingWork {
+                id: "retention:metrics".to_string(),
+                work_type: PendingWorkType::CurrentStateRetention,
+                table: "metrics".to_string(),
+                level: None,
+                estimated_bytes: 64,
+            },
+        ];
+
+        let first = scheduler.on_work_available(&work);
+        let first_executed = first
+            .iter()
+            .find(|decision| decision.action == ScheduleAction::Execute)
+            .expect("one current-state retention item should be selected");
+        assert_eq!(first_executed.work_id, "retention:events");
+
+        let second = scheduler.on_work_available(&work);
+        let second_executed = second
+            .iter()
+            .find(|decision| decision.action == ScheduleAction::Execute)
+            .expect("one current-state retention item should be selected");
+        assert_eq!(second_executed.work_id, "retention:metrics");
+    }
+
+    #[test]
+    fn round_robin_scheduler_honors_current_state_retention_backpressure() {
+        let scheduler = RoundRobinScheduler::default();
+        let table = make_table("events");
+        let decision = scheduler.should_throttle(
+            &table,
+            &TableStats {
+                current_state_retention: Some(retention_stats_with_backpressure()),
+                ..TableStats::default()
+            },
+        );
+
+        assert!(decision.throttle);
+        assert!(!decision.stall);
+        assert_eq!(decision.max_write_bytes_per_second, Some(64));
     }
 }
