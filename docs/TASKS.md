@@ -4797,11 +4797,6 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
    - a named preset/profile that seeds the draft sandbox manifest,
    - optional host-mediated draft authorization for requesting an additional binding,
    - at least one capability or reviewed procedure exposed through the shell-facing bridge as well as the typed import path,
-   - row-scoped access to a shared-record domain enforced through bound DB capabilities,
-   - a projection-maintained visibility index for shared rows,
-   - a named preset/profile that seeds the draft sandbox manifest,
-   - optional host-mediated draft authorization for requesting an additional binding,
-   - at least one capability or reviewed procedure exposed through the shell-facing bridge as well as the typed import path,
    - one or more reviewed published procedures for external callers,
    - MCP exposure of approved procedure and read-only sandbox surfaces,
    - a foreground session-state surface for active draft work.
@@ -4823,11 +4818,6 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
    - how presets/profiles expand into concrete manifests,
    - how typed imports and shell-facing bridges share the same authority model,
    - the difference between a capability that is absent from a draft session and a host-enforced denial on a granted binding,
-   - row-scope policies vs projection-maintained visibility indexes,
-   - why ACL-like shared visibility should usually route through projected indexes or reviewed procedures instead of ad hoc full scans,
-   - how presets/profiles expand into concrete manifests,
-   - how typed imports and shell-facing bridges share the same authority model,
-   - the difference between a capability that is absent from a draft session and a host-enforced denial on a granted binding,
    - why published procedures are immutable,
    - why migrations are intentionally catalog-scoped in version 1,
    - how MCP reuses the same permission model instead of introducing a second one,
@@ -4839,9 +4829,6 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
 
 - Example-level deterministic simulation tests proving the documented migration, row-scoped query, procedure, and MCP flows behave as described.
 - Tests proving the example's internal and external subjects receive meaningfully different capabilities and execution-domain assignments.
-- Tests proving visibility-index transitions such as share/unshare or tenant mismatch produce the documented visible vs hidden outcomes.
-- Tests proving the example's preset/profile selection, optional draft authorization flow, and foreground session-state surface behave as documented.
-- Tests proving the example's shell-facing bridge and typed-import path stay aligned under the same effective manifest and audit model.
 - Tests proving visibility-index transitions such as share/unshare or tenant mismatch produce the documented visible vs hidden outcomes.
 - Tests proving the example's preset/profile selection, optional draft authorization flow, and foreground session-state surface behave as documented.
 - Tests proving the example's shell-facing bridge and typed-import path stay aligned under the same effective manifest and audit model.
