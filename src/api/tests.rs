@@ -8,9 +8,9 @@ use serde_json::json;
 
 use super::{
     BACKUP_GC_METADATA_FORMAT_VERSION, BackupObjectBirthRecord, CATALOG_FORMAT_VERSION,
-    COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, COLUMNAR_SSTABLE_V1_FORMAT_VERSION,
-    ColumnarCacheStatsSnapshot, ColumnarReadAccessPattern, CommitPhase, CompactionJobKind,
-    CompactionPhase, Db, DurableRemoteCommitLogSegment, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
+    COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, ColumnarCacheStatsSnapshot,
+    ColumnarReadAccessPattern, CommitPhase, CompactionJobKind, CompactionPhase, Db,
+    DurableRemoteCommitLogSegment, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
     LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
     LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, MANIFEST_FORMAT_VERSION, ManifestId,
     OffloadJobKind, OffloadPhase, PendingWorkSpec, PersistedManifestBody, PersistedManifestFile,
@@ -3804,10 +3804,11 @@ async fn columnar_sstables_round_trip_all_supported_field_types_and_tombstones()
             FieldType::Bool,
         ]
     );
-    let v2 = footer.v2.as_ref().expect("columnar-v2 footer metadata");
-    assert_eq!(v2.decode_metadata.schema_version, schema.version);
+    let layout = &footer.layout;
+    assert_eq!(layout.decode_metadata.schema_version, schema.version);
     assert_eq!(
-        v2.decode_metadata
+        layout
+            .decode_metadata
             .fields
             .iter()
             .map(|field| field.field_type)
@@ -3821,19 +3822,22 @@ async fn columnar_sstables_round_trip_all_supported_field_types_and_tombstones()
         ]
     );
     assert!(
-        v2.substreams
+        layout
+            .substreams
             .iter()
-            .any(|substream| substream.compression == crate::ColumnarV2Compression::None)
+            .any(|substream| substream.compression == crate::ColumnarCompression::None)
     );
     assert!(
-        v2.substreams
+        layout
+            .substreams
             .iter()
-            .any(|substream| substream.compression == crate::ColumnarV2Compression::Lz4)
+            .any(|substream| substream.compression == crate::ColumnarCompression::Lz4)
     );
     assert!(
-        v2.substreams
+        layout
+            .substreams
             .iter()
-            .any(|substream| substream.compression == crate::ColumnarV2Compression::Zstd)
+            .any(|substream| substream.compression == crate::ColumnarCompression::Zstd)
     );
 
     let reopened = Db::open(tiered_config("/columnar-all-types"), dependencies)
@@ -3864,7 +3868,7 @@ async fn columnar_sstables_round_trip_all_supported_field_types_and_tombstones()
 }
 
 #[tokio::test]
-async fn mixed_v1_and_v2_columnar_sstables_reopen_with_same_logical_reads() {
+async fn columnar_decode_metadata_mismatch_fails_closed_on_reopen() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
     let dependencies = dependencies(file_system.clone(), object_store);
@@ -3872,167 +3876,7 @@ async fn mixed_v1_and_v2_columnar_sstables_reopen_with_same_logical_reads() {
     let config = columnar_table_config("metrics");
     let schema = config.schema.clone().expect("columnar schema");
     let db = Db::open(
-        tiered_config("/columnar-mixed-v1-v2-reopen"),
-        dependencies.clone(),
-    )
-    .await
-    .expect("open db");
-    let table = db
-        .create_table(config.clone())
-        .await
-        .expect("create columnar table");
-
-    let legacy_record = Value::named_record(
-        &schema,
-        vec![
-            ("user_id", FieldValue::String("legacy".to_string())),
-            ("count", FieldValue::Int64(1)),
-        ],
-    )
-    .expect("encode legacy record");
-    table
-        .write(b"user:legacy".to_vec(), legacy_record.clone())
-        .await
-        .expect("write legacy record");
-    db.flush().await.expect("flush legacy v2 sstable");
-
-    let modern_record = Value::named_record(
-        &schema,
-        vec![
-            ("user_id", FieldValue::String("modern".to_string())),
-            ("count", FieldValue::Int64(7)),
-        ],
-    )
-    .expect("encode modern record");
-    table
-        .write(b"user:modern".to_vec(), modern_record.clone())
-        .await
-        .expect("write modern record");
-    db.flush().await.expect("flush modern v2 sstable");
-
-    let mut live = db.sstables_read().live.clone();
-    assert_eq!(live.len(), 2);
-    live.sort_by_key(|sstable| sstable.meta.max_sequence);
-    let legacy_v2 = live.remove(0);
-    let modern_v2 = live.remove(0);
-
-    let (mut legacy_v1, legacy_bytes) = Db::encode_columnar_sstable_v1(
-        table.id().expect("table id"),
-        legacy_v2.meta.level,
-        legacy_v2.meta.local_id.clone(),
-        &schema,
-        legacy_v2.rows.clone(),
-        config.bloom_filter_bits_per_key,
-    )
-    .expect("encode v1-compatible columnar sstable");
-    let handle = file_system
-        .open(
-            &legacy_v2.meta.file_path,
-            crate::OpenOptions {
-                create: true,
-                read: true,
-                write: true,
-                truncate: true,
-                append: false,
-            },
-        )
-        .await
-        .expect("open legacy sstable path");
-    file_system
-        .write_at(&handle, 0, &legacy_bytes)
-        .await
-        .expect("rewrite legacy sstable as v1");
-    file_system
-        .sync(&handle)
-        .await
-        .expect("sync rewritten legacy sstable");
-    legacy_v1.meta.file_path = legacy_v2.meta.file_path.clone();
-    legacy_v1.columnar = Some(ResidentColumnarSstable {
-        source: StorageSource::local_file(legacy_v2.meta.file_path.clone()),
-    });
-
-    let state = db.sstables_read().clone();
-    let next_generation = ManifestId::new(state.manifest_generation.get().saturating_add(1));
-    db.install_manifest(
-        next_generation,
-        state.last_flushed_sequence,
-        &[legacy_v1.clone(), modern_v2.clone()],
-    )
-    .await
-    .expect("install mixed v1/v2 manifest");
-    {
-        let mut sstables = db.sstables_write();
-        sstables.manifest_generation = next_generation;
-        sstables.last_flushed_sequence = state.last_flushed_sequence;
-        sstables.live = vec![legacy_v1.clone(), modern_v2.clone()];
-    }
-
-    let legacy_footer = Db::columnar_footer_from_bytes(
-        &legacy_v1.meta.file_path,
-        &read_path(&dependencies, &legacy_v1.meta.file_path)
-            .await
-            .expect("read rewritten v1 sstable"),
-    )
-    .expect("decode v1 footer");
-    assert_eq!(
-        legacy_footer.0.format_version,
-        COLUMNAR_SSTABLE_V1_FORMAT_VERSION
-    );
-    let modern_footer = Db::columnar_footer_from_bytes(
-        &modern_v2.meta.file_path,
-        &read_path(&dependencies, &modern_v2.meta.file_path)
-            .await
-            .expect("read v2 sstable"),
-    )
-    .expect("decode v2 footer");
-    assert_eq!(
-        modern_footer.0.format_version,
-        COLUMNAR_SSTABLE_FORMAT_VERSION
-    );
-
-    let reopened = Db::open(tiered_config("/columnar-mixed-v1-v2-reopen"), dependencies)
-        .await
-        .expect("reopen mixed-format db");
-    let reopened_table = reopened.table("metrics");
-    assert_eq!(
-        reopened_table
-            .read(b"user:legacy".to_vec())
-            .await
-            .expect("read legacy v1 row"),
-        Some(legacy_record.clone())
-    );
-    assert_eq!(
-        reopened_table
-            .read(b"user:modern".to_vec())
-            .await
-            .expect("read modern v2 row"),
-        Some(modern_record.clone())
-    );
-    assert_eq!(
-        collect_rows(
-            reopened_table
-                .scan(Vec::new(), vec![0xff], ScanOptions::default())
-                .await
-                .expect("scan mixed-format rows"),
-        )
-        .await,
-        vec![
-            (b"user:legacy".to_vec(), legacy_record),
-            (b"user:modern".to_vec(), modern_record),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn columnar_v2_decode_metadata_mismatch_fails_closed_on_reopen() {
-    let file_system = Arc::new(crate::StubFileSystem::default());
-    let object_store = Arc::new(StubObjectStore::default());
-    let dependencies = dependencies(file_system.clone(), object_store);
-
-    let config = columnar_table_config("metrics");
-    let schema = config.schema.clone().expect("columnar schema");
-    let db = Db::open(
-        tiered_config("/columnar-v2-decode-metadata-mismatch"),
+        tiered_config("/columnar-decode-metadata-mismatch"),
         dependencies.clone(),
     )
     .await
@@ -4056,22 +3900,21 @@ async fn columnar_v2_decode_metadata_mismatch_fails_closed_on_reopen() {
         )
         .await
         .expect("write row");
-    db.flush().await.expect("flush v2 sstable");
+    db.flush().await.expect("flush columnar sstable");
 
     let live = db
         .sstables_read()
         .live
         .first()
         .cloned()
-        .expect("live v2 sstable");
+        .expect("live columnar sstable");
     let file_bytes = read_path(&dependencies, &live.meta.file_path)
         .await
-        .expect("read v2 sstable");
+        .expect("read columnar sstable");
     let (mut footer, footer_start) =
-        Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes)
-            .expect("decode v2 footer");
-    let v2 = footer.v2.as_mut().expect("v2 footer metadata");
-    let decode_field = v2
+        Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes).expect("decode footer");
+    let layout = &mut footer.layout;
+    let decode_field = layout
         .decode_metadata
         .fields
         .iter_mut()
@@ -4114,7 +3957,7 @@ async fn columnar_v2_decode_metadata_mismatch_fails_closed_on_reopen() {
         .expect("sync corrupted footer");
 
     match Db::open(
-        tiered_config("/columnar-v2-decode-metadata-mismatch"),
+        tiered_config("/columnar-decode-metadata-mismatch"),
         dependencies,
     )
     .await

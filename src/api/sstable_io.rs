@@ -1,9 +1,9 @@
 use super::*;
 
-type ColumnarV2SubstreamDescriptor = (
+type ColumnarSubstreamDescriptor = (
     Option<FieldId>,
     Option<FieldType>,
-    crate::ColumnarV2SubstreamKind,
+    crate::ColumnarSubstreamKind,
 );
 
 impl ColumnarReadContext {
@@ -288,15 +288,8 @@ impl ColumnarReadContext {
                 "columnar SSTable {location} row count exceeds platform limits"
             ))
         })?;
-        let values: Arc<Vec<Key>> = Arc::new(match footer.footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar key index for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Db::decode_columnar_v2_key_index(
+        let values: Arc<Vec<Key>> = Arc::new(
+            Db::decode_columnar_key_index(
                 location,
                 footer.footer.as_ref(),
                 &footer.footer.key_index,
@@ -308,13 +301,7 @@ impl ColumnarReadContext {
                     "decode columnar key index for {location} failed: {error}"
                 ))
             })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        });
+        );
         if policy.populate_decoded_cache {
             self.decoded_cache
                 .insert_key_index(identity, values.clone());
@@ -352,15 +339,8 @@ impl ColumnarReadContext {
                 "columnar SSTable {location} row count exceeds platform limits"
             ))
         })?;
-        let values: Arc<Vec<SequenceNumber>> = Arc::new(match footer.footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar sequence column for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Db::decode_columnar_v2_sequences(
+        let values: Arc<Vec<SequenceNumber>> = Arc::new(
+            Db::decode_columnar_sequences(
                 location,
                 footer.footer.as_ref(),
                 &footer.footer.sequence_column,
@@ -372,13 +352,7 @@ impl ColumnarReadContext {
                     "decode columnar sequence column for {location} failed: {error}"
                 ))
             })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        });
+        );
         if policy.populate_decoded_cache {
             self.decoded_cache
                 .insert_sequence_column(identity, values.clone());
@@ -416,15 +390,8 @@ impl ColumnarReadContext {
                 "columnar SSTable {location} row count exceeds platform limits"
             ))
         })?;
-        let values: Arc<Vec<bool>> = Arc::new(match footer.footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar tombstone bitmap for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Db::decode_columnar_v2_tombstones(
+        let values: Arc<Vec<bool>> = Arc::new(
+            Db::decode_columnar_tombstones(
                 location,
                 footer.footer.as_ref(),
                 &footer.footer.tombstone_bitmap,
@@ -436,13 +403,7 @@ impl ColumnarReadContext {
                     "decode columnar tombstone bitmap for {location} failed: {error}"
                 ))
             })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        });
+        );
         if policy.populate_decoded_cache {
             self.decoded_cache
                 .insert_tombstone_bitmap(identity, values.clone());
@@ -480,15 +441,8 @@ impl ColumnarReadContext {
                 "columnar SSTable {location} row count exceeds platform limits"
             ))
         })?;
-        let values: Arc<Vec<ChangeKind>> = Arc::new(match footer.footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar row-kind column for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Db::decode_columnar_v2_row_kinds(
+        let values: Arc<Vec<ChangeKind>> = Arc::new(
+            Db::decode_columnar_row_kinds(
                 location,
                 footer.footer.as_ref(),
                 &footer.footer.row_kind_column,
@@ -500,13 +454,7 @@ impl ColumnarReadContext {
                     "decode columnar row-kind column for {location} failed: {error}"
                 ))
             })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        });
+        );
         if policy.populate_decoded_cache {
             self.decoded_cache
                 .insert_row_kind_column(identity, values.clone());
@@ -690,157 +638,147 @@ impl Db {
             )));
         }
 
-        match footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                if footer.v2.is_some() {
-                    return Err(StorageError::corruption(format!(
-                        "columnar SSTable {location} stores v2 metadata inside a v1 footer",
-                    )));
-                }
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => {
-                let v2 = Self::columnar_v2_footer(location, footer)?;
-                if v2.format_tag != crate::ColumnarV2FormatTag::base_part()
-                    || v2.table_id != footer.table_id
-                    || v2.local_id != footer.local_id
-                    || v2.schema_version != footer.schema_version
-                    || v2.row_count != footer.row_count
-                    || v2.decode_metadata.schema_version != footer.schema_version
-                {
-                    return Err(StorageError::corruption(format!(
-                        "columnar SSTable {location} v2 footer metadata does not match the persisted footer",
-                    )));
-                }
-                let mut decode_field_ids = BTreeSet::new();
-                for field in &v2.decode_metadata.fields {
-                    if !decode_field_ids.insert(field.field_id) {
-                        return Err(StorageError::corruption(format!(
-                            "columnar SSTable {location} decode metadata repeats field {}",
-                            field.field_id.get()
-                        )));
-                    }
-                }
-                let mut column_field_ids = BTreeSet::new();
-                for column in &footer.columns {
-                    if !column_field_ids.insert(column.field_id) {
-                        return Err(StorageError::corruption(format!(
-                            "columnar SSTable {location} contains duplicate field id {}",
-                            column.field_id.get()
-                        )));
-                    }
-                    let Some(decode_field) =
-                        Self::columnar_v2_decode_field(location, footer, column.field_id)?
-                    else {
-                        return Err(StorageError::corruption(format!(
-                            "columnar SSTable {location} decode metadata is missing field {}",
-                            column.field_id.get()
-                        )));
-                    };
-                    if decode_field.field_type != column.field_type {
-                        return Err(StorageError::corruption(format!(
-                            "columnar SSTable {location} decode metadata type for field {} does not match the column footer",
-                            column.field_id.get()
-                        )));
-                    }
-                    let _ = Self::columnar_v2_substream(
-                        location,
-                        footer,
-                        Some(column.field_id),
-                        crate::ColumnarV2SubstreamKind::PresentBitmap,
-                    )?;
-                    match column.field_type {
-                        FieldType::Int64 => {
-                            let _ = Self::columnar_v2_substream(
-                                location,
-                                footer,
-                                Some(column.field_id),
-                                crate::ColumnarV2SubstreamKind::Int64Values,
-                            )?;
-                        }
-                        FieldType::Float64 => {
-                            let _ = Self::columnar_v2_substream(
-                                location,
-                                footer,
-                                Some(column.field_id),
-                                crate::ColumnarV2SubstreamKind::Float64Bits,
-                            )?;
-                        }
-                        FieldType::String => {
-                            let _ = Self::columnar_v2_substream(
-                                location,
-                                footer,
-                                Some(column.field_id),
-                                crate::ColumnarV2SubstreamKind::StringOffsets,
-                            )?;
-                            let _ = Self::columnar_v2_substream(
-                                location,
-                                footer,
-                                Some(column.field_id),
-                                crate::ColumnarV2SubstreamKind::StringData,
-                            )?;
-                        }
-                        FieldType::Bytes => {
-                            let _ = Self::columnar_v2_substream(
-                                location,
-                                footer,
-                                Some(column.field_id),
-                                crate::ColumnarV2SubstreamKind::BytesOffsets,
-                            )?;
-                            let _ = Self::columnar_v2_substream(
-                                location,
-                                footer,
-                                Some(column.field_id),
-                                crate::ColumnarV2SubstreamKind::BytesData,
-                            )?;
-                        }
-                        FieldType::Bool => {
-                            let _ = Self::columnar_v2_substream(
-                                location,
-                                footer,
-                                Some(column.field_id),
-                                crate::ColumnarV2SubstreamKind::BoolValues,
-                            )?;
-                        }
-                    }
-                }
-                let _ = Self::columnar_v2_substream(
-                    location,
-                    footer,
-                    None,
-                    crate::ColumnarV2SubstreamKind::KeyOffsets,
-                )?;
-                let _ = Self::columnar_v2_substream(
-                    location,
-                    footer,
-                    None,
-                    crate::ColumnarV2SubstreamKind::KeyData,
-                )?;
-                let _ = Self::columnar_v2_substream(
-                    location,
-                    footer,
-                    None,
-                    crate::ColumnarV2SubstreamKind::Sequence,
-                )?;
-                let _ = Self::columnar_v2_substream(
-                    location,
-                    footer,
-                    None,
-                    crate::ColumnarV2SubstreamKind::TombstoneBitmap,
-                )?;
-                let _ = Self::columnar_v2_substream(
-                    location,
-                    footer,
-                    None,
-                    crate::ColumnarV2SubstreamKind::RowKind,
-                )?;
-            }
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
+        if footer.format_version != COLUMNAR_SSTABLE_FORMAT_VERSION {
+            return Err(StorageError::unsupported(format!(
+                "unsupported columnar SSTable version {}",
+                footer.format_version
+            )));
+        }
+
+        let layout = &footer.layout;
+        if layout.format_tag != crate::ColumnarFormatTag::base_part()
+            || layout.table_id != footer.table_id
+            || layout.local_id != footer.local_id
+            || layout.schema_version != footer.schema_version
+            || layout.row_count != footer.row_count
+            || layout.decode_metadata.schema_version != footer.schema_version
+        {
+            return Err(StorageError::corruption(format!(
+                "columnar SSTable {location} footer metadata does not match the persisted footer",
+            )));
+        }
+        let mut decode_field_ids = BTreeSet::new();
+        for field in &layout.decode_metadata.fields {
+            if !decode_field_ids.insert(field.field_id) {
+                return Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} decode metadata repeats field {}",
+                    field.field_id.get()
                 )));
             }
         }
+        let mut column_field_ids = BTreeSet::new();
+        for column in &footer.columns {
+            if !column_field_ids.insert(column.field_id) {
+                return Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} contains duplicate field id {}",
+                    column.field_id.get()
+                )));
+            }
+            let Some(decode_field) =
+                Self::columnar_decode_field(location, footer, column.field_id)?
+            else {
+                return Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} decode metadata is missing field {}",
+                    column.field_id.get()
+                )));
+            };
+            if decode_field.field_type != column.field_type {
+                return Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} decode metadata type for field {} does not match the column footer",
+                    column.field_id.get()
+                )));
+            }
+            let _ = Self::columnar_substream(
+                location,
+                footer,
+                Some(column.field_id),
+                crate::ColumnarSubstreamKind::PresentBitmap,
+            )?;
+            match column.field_type {
+                FieldType::Int64 => {
+                    let _ = Self::columnar_substream(
+                        location,
+                        footer,
+                        Some(column.field_id),
+                        crate::ColumnarSubstreamKind::Int64Values,
+                    )?;
+                }
+                FieldType::Float64 => {
+                    let _ = Self::columnar_substream(
+                        location,
+                        footer,
+                        Some(column.field_id),
+                        crate::ColumnarSubstreamKind::Float64Bits,
+                    )?;
+                }
+                FieldType::String => {
+                    let _ = Self::columnar_substream(
+                        location,
+                        footer,
+                        Some(column.field_id),
+                        crate::ColumnarSubstreamKind::StringOffsets,
+                    )?;
+                    let _ = Self::columnar_substream(
+                        location,
+                        footer,
+                        Some(column.field_id),
+                        crate::ColumnarSubstreamKind::StringData,
+                    )?;
+                }
+                FieldType::Bytes => {
+                    let _ = Self::columnar_substream(
+                        location,
+                        footer,
+                        Some(column.field_id),
+                        crate::ColumnarSubstreamKind::BytesOffsets,
+                    )?;
+                    let _ = Self::columnar_substream(
+                        location,
+                        footer,
+                        Some(column.field_id),
+                        crate::ColumnarSubstreamKind::BytesData,
+                    )?;
+                }
+                FieldType::Bool => {
+                    let _ = Self::columnar_substream(
+                        location,
+                        footer,
+                        Some(column.field_id),
+                        crate::ColumnarSubstreamKind::BoolValues,
+                    )?;
+                }
+            }
+        }
+        let _ = Self::columnar_substream(
+            location,
+            footer,
+            None,
+            crate::ColumnarSubstreamKind::KeyOffsets,
+        )?;
+        let _ = Self::columnar_substream(
+            location,
+            footer,
+            None,
+            crate::ColumnarSubstreamKind::KeyData,
+        )?;
+        let _ = Self::columnar_substream(
+            location,
+            footer,
+            None,
+            crate::ColumnarSubstreamKind::Sequence,
+        )?;
+        let _ = Self::columnar_substream(
+            location,
+            footer,
+            None,
+            crate::ColumnarSubstreamKind::TombstoneBitmap,
+        )?;
+        let _ = Self::columnar_substream(
+            location,
+            footer,
+            None,
+            crate::ColumnarSubstreamKind::RowKind,
+        )?;
         Ok(())
     }
 
@@ -992,114 +930,54 @@ impl Db {
             "row-kind column",
             &footer.row_kind_column,
         )?;
-        let key_index: Vec<Key> = match footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(key_index_block).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar key index for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Self::decode_columnar_v2_key_index(
-                location,
-                &footer,
-                &footer.key_index,
-                key_index_block,
-                row_count,
-            )
-            .map_err(|error| {
-                StorageError::corruption(format!(
-                    "decode columnar key index for {location} failed: {error}"
-                ))
-            })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        };
-        let sequences: Vec<SequenceNumber> = match footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(sequence_block).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar sequence column for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Self::decode_columnar_v2_sequences(
-                location,
-                &footer,
-                &footer.sequence_column,
-                sequence_block,
-                row_count,
-            )
-            .map_err(|error| {
-                StorageError::corruption(format!(
-                    "decode columnar sequence column for {location} failed: {error}"
-                ))
-            })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        };
-        let tombstones: Vec<bool> = match footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(tombstone_block).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar tombstone bitmap for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Self::decode_columnar_v2_tombstones(
-                location,
-                &footer,
-                &footer.tombstone_bitmap,
-                tombstone_block,
-                row_count,
-            )
-            .map_err(|error| {
-                StorageError::corruption(format!(
-                    "decode columnar tombstone bitmap for {location} failed: {error}"
-                ))
-            })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        };
-        let row_kinds: Vec<ChangeKind> = match footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                serde_json::from_slice(row_kind_block).map_err(|error| {
-                    StorageError::corruption(format!(
-                        "decode columnar row-kind column for {location} failed: {error}"
-                    ))
-                })?
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => Self::decode_columnar_v2_row_kinds(
-                location,
-                &footer,
-                &footer.row_kind_column,
-                row_kind_block,
-                row_count,
-            )
-            .map_err(|error| {
-                StorageError::corruption(format!(
-                    "decode columnar row-kind column for {location} failed: {error}"
-                ))
-            })?,
-            version => {
-                return Err(StorageError::unsupported(format!(
-                    "unsupported columnar SSTable version {}",
-                    version
-                )));
-            }
-        };
+        let key_index: Vec<Key> = Self::decode_columnar_key_index(
+            location,
+            &footer,
+            &footer.key_index,
+            key_index_block,
+            row_count,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar key index for {location} failed: {error}"
+            ))
+        })?;
+        let sequences: Vec<SequenceNumber> = Self::decode_columnar_sequences(
+            location,
+            &footer,
+            &footer.sequence_column,
+            sequence_block,
+            row_count,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar sequence column for {location} failed: {error}"
+            ))
+        })?;
+        let tombstones: Vec<bool> = Self::decode_columnar_tombstones(
+            location,
+            &footer,
+            &footer.tombstone_bitmap,
+            tombstone_block,
+            row_count,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar tombstone bitmap for {location} failed: {error}"
+            ))
+        })?;
+        let row_kinds: Vec<ChangeKind> = Self::decode_columnar_row_kinds(
+            location,
+            &footer,
+            &footer.row_kind_column,
+            row_kind_block,
+            row_count,
+        )
+        .map_err(|error| {
+            StorageError::corruption(format!(
+                "decode columnar row-kind column for {location} failed: {error}"
+            ))
+        })?;
 
         if key_index.len() != row_count
             || sequences.len() != row_count
@@ -1297,24 +1175,13 @@ impl Db {
         Ok(block.offset..block.offset.saturating_add(block.length))
     }
 
-    fn columnar_v2_footer<'a>(
-        location: &str,
-        footer: &'a PersistedColumnarSstableFooter,
-    ) -> Result<&'a crate::hybrid::ColumnarV2Footer, StorageError> {
-        footer.v2.as_ref().ok_or_else(|| {
-            StorageError::corruption(format!(
-                "columnar SSTable {location} is missing columnar-v2 footer metadata",
-            ))
-        })
-    }
-
-    fn columnar_v2_decode_field<'a>(
+    fn columnar_decode_field<'a>(
         location: &str,
         footer: &'a PersistedColumnarSstableFooter,
         field_id: FieldId,
-    ) -> Result<Option<&'a crate::hybrid::ColumnarV2DecodeField>, StorageError> {
-        let v2 = Self::columnar_v2_footer(location, footer)?;
-        let mut matches = v2
+    ) -> Result<Option<&'a crate::hybrid::ColumnarDecodeField>, StorageError> {
+        let layout = &footer.layout;
+        let mut matches = layout
             .decode_metadata
             .fields
             .iter()
@@ -1329,14 +1196,14 @@ impl Db {
         Ok(first)
     }
 
-    fn columnar_v2_substream<'a>(
+    fn columnar_substream<'a>(
         location: &str,
         footer: &'a PersistedColumnarSstableFooter,
         field_id: Option<FieldId>,
-        kind: crate::ColumnarV2SubstreamKind,
-    ) -> Result<&'a crate::ColumnarV2SubstreamRef, StorageError> {
-        let v2 = Self::columnar_v2_footer(location, footer)?;
-        let mut matches = v2
+        kind: crate::ColumnarSubstreamKind,
+    ) -> Result<&'a crate::ColumnarSubstreamRef, StorageError> {
+        let layout = &footer.layout;
+        let mut matches = layout
             .substreams
             .iter()
             .filter(|substream| substream.field_id == field_id && substream.kind == kind);
@@ -1353,12 +1220,12 @@ impl Db {
         Ok(first)
     }
 
-    fn columnar_v2_substream_slice<'a>(
+    fn columnar_substream_slice<'a>(
         location: &str,
         block_name: &str,
         block: &ColumnarBlockLocation,
         block_bytes: &'a [u8],
-        substream: &crate::ColumnarV2SubstreamRef,
+        substream: &crate::ColumnarSubstreamRef,
     ) -> Result<&'a [u8], StorageError> {
         let block_end = block.offset.checked_add(block.length).ok_or_else(|| {
             StorageError::corruption(format!(
@@ -1392,7 +1259,7 @@ impl Db {
         Ok(&block_bytes[start..end])
     }
 
-    fn encode_columnar_v2_bitmap(bits: &[bool]) -> Vec<u8> {
+    fn encode_columnar_bitmap(bits: &[bool]) -> Vec<u8> {
         let mut bytes = vec![0; bits.len().div_ceil(8)];
         for (index, bit) in bits.iter().copied().enumerate() {
             if bit {
@@ -1402,7 +1269,7 @@ impl Db {
         bytes
     }
 
-    fn decode_columnar_v2_bitmap(
+    fn decode_columnar_bitmap(
         location: &str,
         label: &str,
         count: usize,
@@ -1434,7 +1301,7 @@ impl Db {
         Ok(decoded)
     }
 
-    fn encode_columnar_v2_u64_stream(values: impl IntoIterator<Item = u64>) -> Vec<u8> {
+    fn encode_columnar_u64_stream(values: impl IntoIterator<Item = u64>) -> Vec<u8> {
         let values = values.into_iter().collect::<Vec<_>>();
         let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<u64>());
         for value in values {
@@ -1443,7 +1310,7 @@ impl Db {
         bytes
     }
 
-    fn decode_columnar_v2_u64_stream(
+    fn decode_columnar_u64_stream(
         location: &str,
         label: &str,
         bytes: &[u8],
@@ -1463,7 +1330,7 @@ impl Db {
             .collect())
     }
 
-    fn encode_columnar_v2_i64_stream(values: impl IntoIterator<Item = i64>) -> Vec<u8> {
+    fn encode_columnar_i64_stream(values: impl IntoIterator<Item = i64>) -> Vec<u8> {
         let values = values.into_iter().collect::<Vec<_>>();
         let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
         for value in values {
@@ -1472,7 +1339,7 @@ impl Db {
         bytes
     }
 
-    fn decode_columnar_v2_i64_stream(
+    fn decode_columnar_i64_stream(
         location: &str,
         label: &str,
         bytes: &[u8],
@@ -1492,7 +1359,7 @@ impl Db {
             .collect())
     }
 
-    fn decode_columnar_v2_u8_stream(
+    fn decode_columnar_u8_stream(
         location: &str,
         label: &str,
         bytes: &[u8],
@@ -1507,7 +1374,7 @@ impl Db {
         Ok(bytes.to_vec())
     }
 
-    fn encode_columnar_v2_offsets_and_data(values: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
+    fn encode_columnar_offsets_and_data(values: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
         let mut offsets = Vec::with_capacity(values.len() + 1);
         let mut data = Vec::new();
         offsets.push(0_u64);
@@ -1515,15 +1382,15 @@ impl Db {
             data.extend_from_slice(value);
             offsets.push(data.len() as u64);
         }
-        (Self::encode_columnar_v2_u64_stream(offsets), data)
+        (Self::encode_columnar_u64_stream(offsets), data)
     }
 
-    fn decode_columnar_v2_offsets(
+    fn decode_columnar_offsets(
         location: &str,
         label: &str,
         bytes: &[u8],
     ) -> Result<Vec<u64>, StorageError> {
-        let offsets = Self::decode_columnar_v2_u64_stream(location, label, bytes)?;
+        let offsets = Self::decode_columnar_u64_stream(location, label, bytes)?;
         if offsets.is_empty() {
             return Err(StorageError::corruption(format!(
                 "columnar SSTable {location} {label} is empty",
@@ -1542,7 +1409,7 @@ impl Db {
         Ok(offsets)
     }
 
-    fn decode_columnar_v2_variable_values(
+    fn decode_columnar_variable_values(
         location: &str,
         label: &str,
         offsets: &[u64],
@@ -1571,7 +1438,7 @@ impl Db {
         Ok(values)
     }
 
-    fn encode_columnar_v2_change_kinds(values: impl IntoIterator<Item = ChangeKind>) -> Vec<u8> {
+    fn encode_columnar_change_kinds(values: impl IntoIterator<Item = ChangeKind>) -> Vec<u8> {
         values
             .into_iter()
             .map(|kind| match kind {
@@ -1582,12 +1449,12 @@ impl Db {
             .collect()
     }
 
-    fn decode_columnar_v2_change_kinds(
+    fn decode_columnar_change_kinds(
         location: &str,
         bytes: &[u8],
         row_count: usize,
     ) -> Result<Vec<ChangeKind>, StorageError> {
-        Self::decode_columnar_v2_u8_stream(location, "row-kind column", bytes, row_count)?
+        Self::decode_columnar_u8_stream(location, "row-kind column", bytes, row_count)?
             .into_iter()
             .map(|value| match value {
                 0 => Ok(ChangeKind::Put),
@@ -1600,14 +1467,14 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    fn encode_columnar_v2_payload(
-        compression: crate::ColumnarV2Compression,
+    fn encode_columnar_payload(
+        compression: crate::ColumnarCompression,
         raw_bytes: &[u8],
     ) -> Result<Vec<u8>, StorageError> {
         match compression {
-            crate::ColumnarV2Compression::None => Ok(raw_bytes.to_vec()),
-            crate::ColumnarV2Compression::Lz4 => Ok(lz4_flex::compress_prepend_size(raw_bytes)),
-            crate::ColumnarV2Compression::Zstd => {
+            crate::ColumnarCompression::None => Ok(raw_bytes.to_vec()),
+            crate::ColumnarCompression::Lz4 => Ok(lz4_flex::compress_prepend_size(raw_bytes)),
+            crate::ColumnarCompression::Zstd => {
                 zstd::stream::encode_all(std::io::Cursor::new(raw_bytes), 0).map_err(|error| {
                     StorageError::unsupported(format!(
                         "encode zstd columnar substream failed: {error}"
@@ -1617,21 +1484,22 @@ impl Db {
         }
     }
 
-    fn decode_columnar_v2_payload(
+    fn decode_columnar_payload(
         location: &str,
         label: &str,
-        substream: &crate::ColumnarV2SubstreamRef,
+        substream: &crate::ColumnarSubstreamRef,
         bytes: &[u8],
     ) -> Result<Vec<u8>, StorageError> {
         let decoded = match substream.compression {
-            crate::ColumnarV2Compression::None => Ok(bytes.to_vec()),
-            crate::ColumnarV2Compression::Lz4 => lz4_flex::decompress_size_prepended(bytes)
-                .map_err(|error| {
+            crate::ColumnarCompression::None => Ok(bytes.to_vec()),
+            crate::ColumnarCompression::Lz4 => {
+                lz4_flex::decompress_size_prepended(bytes).map_err(|error| {
                     StorageError::corruption(format!(
                         "decode columnar SSTable {location} {label} lz4 payload failed: {error}"
                     ))
-                }),
-            crate::ColumnarV2Compression::Zstd => {
+                })
+            }
+            crate::ColumnarCompression::Zstd => {
                 zstd::stream::decode_all(std::io::Cursor::new(bytes)).map_err(|error| {
                     StorageError::corruption(format!(
                         "decode columnar SSTable {location} {label} zstd payload failed: {error}"
@@ -1647,34 +1515,34 @@ impl Db {
         Ok(decoded)
     }
 
-    fn columnar_v2_codec_for_substream(
-        kind: crate::ColumnarV2SubstreamKind,
-    ) -> crate::ColumnarV2Compression {
+    fn columnar_codec_for_substream(
+        kind: crate::ColumnarSubstreamKind,
+    ) -> crate::ColumnarCompression {
         match kind {
-            crate::ColumnarV2SubstreamKind::KeyData
-            | crate::ColumnarV2SubstreamKind::StringData
-            | crate::ColumnarV2SubstreamKind::BytesData => crate::ColumnarV2Compression::Lz4,
-            crate::ColumnarV2SubstreamKind::Sequence
-            | crate::ColumnarV2SubstreamKind::Int64Values
-            | crate::ColumnarV2SubstreamKind::Float64Bits => crate::ColumnarV2Compression::Zstd,
-            crate::ColumnarV2SubstreamKind::KeyOffsets
-            | crate::ColumnarV2SubstreamKind::TombstoneBitmap
-            | crate::ColumnarV2SubstreamKind::RowKind
-            | crate::ColumnarV2SubstreamKind::DefinitionLevels
-            | crate::ColumnarV2SubstreamKind::PresentBitmap
-            | crate::ColumnarV2SubstreamKind::StringOffsets
-            | crate::ColumnarV2SubstreamKind::BytesOffsets
-            | crate::ColumnarV2SubstreamKind::BoolValues => crate::ColumnarV2Compression::None,
+            crate::ColumnarSubstreamKind::KeyData
+            | crate::ColumnarSubstreamKind::StringData
+            | crate::ColumnarSubstreamKind::BytesData => crate::ColumnarCompression::Lz4,
+            crate::ColumnarSubstreamKind::Sequence
+            | crate::ColumnarSubstreamKind::Int64Values
+            | crate::ColumnarSubstreamKind::Float64Bits => crate::ColumnarCompression::Zstd,
+            crate::ColumnarSubstreamKind::KeyOffsets
+            | crate::ColumnarSubstreamKind::TombstoneBitmap
+            | crate::ColumnarSubstreamKind::RowKind
+            | crate::ColumnarSubstreamKind::DefinitionLevels
+            | crate::ColumnarSubstreamKind::PresentBitmap
+            | crate::ColumnarSubstreamKind::StringOffsets
+            | crate::ColumnarSubstreamKind::BytesOffsets
+            | crate::ColumnarSubstreamKind::BoolValues => crate::ColumnarCompression::None,
         }
     }
 
-    fn columnar_v2_decode_metadata(schema: &SchemaDefinition) -> crate::ColumnarV2DecodeMetadata {
-        crate::ColumnarV2DecodeMetadata {
+    fn columnar_decode_metadata(schema: &SchemaDefinition) -> crate::ColumnarDecodeMetadata {
+        crate::ColumnarDecodeMetadata {
             schema_version: schema.version,
             fields: schema
                 .fields
                 .iter()
-                .map(|field| crate::ColumnarV2DecodeField {
+                .map(|field| crate::ColumnarDecodeField {
                     field_id: field.id,
                     field_type: field.field_type,
                     nullable: field.nullable,
@@ -1684,26 +1552,26 @@ impl Db {
         }
     }
 
-    fn append_columnar_v2_substream(
+    fn append_columnar_substream(
         block_start: u64,
         block_bytes: &mut Vec<u8>,
-        substreams: &mut Vec<crate::ColumnarV2SubstreamRef>,
+        substreams: &mut Vec<crate::ColumnarSubstreamRef>,
         next_ordinal: &mut u32,
-        descriptor: ColumnarV2SubstreamDescriptor,
+        descriptor: ColumnarSubstreamDescriptor,
         raw_bytes: &[u8],
     ) -> Result<(), StorageError> {
         let (field_id, field_type, kind) = descriptor;
-        let compression = Self::columnar_v2_codec_for_substream(kind);
-        let encoded = Self::encode_columnar_v2_payload(compression, raw_bytes)?;
+        let compression = Self::columnar_codec_for_substream(kind);
+        let encoded = Self::encode_columnar_payload(compression, raw_bytes)?;
         let start = block_start + block_bytes.len() as u64;
         block_bytes.extend_from_slice(&encoded);
         let end = block_start + block_bytes.len() as u64;
-        substreams.push(crate::ColumnarV2SubstreamRef {
+        substreams.push(crate::ColumnarSubstreamRef {
             ordinal: *next_ordinal,
             field_id,
             field_type,
             kind,
-            encoding: crate::ColumnarV2Encoding::Plain,
+            encoding: crate::ColumnarEncoding::Plain,
             compression,
             range: crate::ByteRange::new(start, end),
             checksum: checksum32(&encoded),
@@ -1712,41 +1580,35 @@ impl Db {
         Ok(())
     }
 
-    fn decode_columnar_v2_key_index(
+    fn decode_columnar_key_index(
         location: &str,
         footer: &PersistedColumnarSstableFooter,
         block: &ColumnarBlockLocation,
         block_bytes: &[u8],
         row_count: usize,
     ) -> Result<Vec<Key>, StorageError> {
-        let offsets = Self::columnar_v2_substream(
+        let offsets = Self::columnar_substream(
             location,
             footer,
             None,
-            crate::ColumnarV2SubstreamKind::KeyOffsets,
+            crate::ColumnarSubstreamKind::KeyOffsets,
         )?;
-        let data = Self::columnar_v2_substream(
+        let data = Self::columnar_substream(
             location,
             footer,
             None,
-            crate::ColumnarV2SubstreamKind::KeyData,
+            crate::ColumnarSubstreamKind::KeyData,
         )?;
         let offsets_label = "key index offsets";
         let data_label = "key index data";
-        let offsets = Self::decode_columnar_v2_offsets(
+        let offsets = Self::decode_columnar_offsets(
             location,
             offsets_label,
-            &Self::decode_columnar_v2_payload(
+            &Self::decode_columnar_payload(
                 location,
                 offsets_label,
                 offsets,
-                Self::columnar_v2_substream_slice(
-                    location,
-                    "key index",
-                    block,
-                    block_bytes,
-                    offsets,
-                )?,
+                Self::columnar_substream_slice(location, "key index", block, block_bytes, offsets)?,
             )?,
         )?;
         if offsets.len() != row_count + 1 {
@@ -1754,40 +1616,40 @@ impl Db {
                 "columnar SSTable {location} key index offset count mismatch",
             )));
         }
-        Self::decode_columnar_v2_variable_values(
+        Self::decode_columnar_variable_values(
             location,
             "key index",
             &offsets,
-            &Self::decode_columnar_v2_payload(
+            &Self::decode_columnar_payload(
                 location,
                 data_label,
                 data,
-                Self::columnar_v2_substream_slice(location, "key index", block, block_bytes, data)?,
+                Self::columnar_substream_slice(location, "key index", block, block_bytes, data)?,
             )?,
         )
     }
 
-    fn decode_columnar_v2_sequences(
+    fn decode_columnar_sequences(
         location: &str,
         footer: &PersistedColumnarSstableFooter,
         block: &ColumnarBlockLocation,
         block_bytes: &[u8],
         row_count: usize,
     ) -> Result<Vec<SequenceNumber>, StorageError> {
-        let substream = Self::columnar_v2_substream(
+        let substream = Self::columnar_substream(
             location,
             footer,
             None,
-            crate::ColumnarV2SubstreamKind::Sequence,
+            crate::ColumnarSubstreamKind::Sequence,
         )?;
-        let values = Self::decode_columnar_v2_u64_stream(
+        let values = Self::decode_columnar_u64_stream(
             location,
             "sequence column",
-            &Self::decode_columnar_v2_payload(
+            &Self::decode_columnar_payload(
                 location,
                 "sequence column",
                 substream,
-                Self::columnar_v2_substream_slice(
+                Self::columnar_substream_slice(
                     location,
                     "sequence column",
                     block,
@@ -1804,28 +1666,28 @@ impl Db {
         Ok(values.into_iter().map(SequenceNumber::new).collect())
     }
 
-    fn decode_columnar_v2_tombstones(
+    fn decode_columnar_tombstones(
         location: &str,
         footer: &PersistedColumnarSstableFooter,
         block: &ColumnarBlockLocation,
         block_bytes: &[u8],
         row_count: usize,
     ) -> Result<Vec<bool>, StorageError> {
-        let substream = Self::columnar_v2_substream(
+        let substream = Self::columnar_substream(
             location,
             footer,
             None,
-            crate::ColumnarV2SubstreamKind::TombstoneBitmap,
+            crate::ColumnarSubstreamKind::TombstoneBitmap,
         )?;
-        Self::decode_columnar_v2_bitmap(
+        Self::decode_columnar_bitmap(
             location,
             "tombstone bitmap",
             row_count,
-            &Self::decode_columnar_v2_payload(
+            &Self::decode_columnar_payload(
                 location,
                 "tombstone bitmap",
                 substream,
-                Self::columnar_v2_substream_slice(
+                Self::columnar_substream_slice(
                     location,
                     "tombstone bitmap",
                     block,
@@ -1836,26 +1698,26 @@ impl Db {
         )
     }
 
-    fn decode_columnar_v2_row_kinds(
+    fn decode_columnar_row_kinds(
         location: &str,
         footer: &PersistedColumnarSstableFooter,
         block: &ColumnarBlockLocation,
         block_bytes: &[u8],
         row_count: usize,
     ) -> Result<Vec<ChangeKind>, StorageError> {
-        let substream = Self::columnar_v2_substream(
+        let substream = Self::columnar_substream(
             location,
             footer,
             None,
-            crate::ColumnarV2SubstreamKind::RowKind,
+            crate::ColumnarSubstreamKind::RowKind,
         )?;
-        Self::decode_columnar_v2_change_kinds(
+        Self::decode_columnar_change_kinds(
             location,
-            &Self::decode_columnar_v2_payload(
+            &Self::decode_columnar_payload(
                 location,
                 "row-kind column",
                 substream,
-                Self::columnar_v2_substream_slice(
+                Self::columnar_substream_slice(
                     location,
                     "row-kind column",
                     block,
@@ -1867,14 +1729,14 @@ impl Db {
         )
     }
 
-    fn decode_columnar_v2_field_values(
+    fn decode_columnar_substream_field_values(
         location: &str,
         footer: &PersistedColumnarSstableFooter,
         column: &PersistedColumnarColumnFooter,
         row_count: usize,
         block_bytes: &[u8],
     ) -> Result<Vec<FieldValue>, StorageError> {
-        let decode_field = Self::columnar_v2_decode_field(location, footer, column.field_id)?
+        let decode_field = Self::columnar_decode_field(location, footer, column.field_id)?
             .ok_or_else(|| {
                 StorageError::corruption(format!(
                     "columnar SSTable {location} decode metadata is missing field {}",
@@ -1888,22 +1750,22 @@ impl Db {
             )));
         }
 
-        let present = Self::decode_columnar_v2_bitmap(
+        let present = Self::decode_columnar_bitmap(
             location,
             &format!("field {} present bitmap", column.field_id.get()),
             row_count,
             &{
-                let substream = Self::columnar_v2_substream(
+                let substream = Self::columnar_substream(
                     location,
                     footer,
                     Some(column.field_id),
-                    crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    crate::ColumnarSubstreamKind::PresentBitmap,
                 )?;
-                Self::decode_columnar_v2_payload(
+                Self::decode_columnar_payload(
                     location,
                     &format!("field {} present bitmap", column.field_id.get()),
                     substream,
-                    Self::columnar_v2_substream_slice(
+                    Self::columnar_substream_slice(
                         location,
                         "column block",
                         &column.block,
@@ -1916,21 +1778,21 @@ impl Db {
         let present_count = present.iter().filter(|present| **present).count();
 
         let values = match column.field_type {
-            FieldType::Int64 => Self::decode_columnar_v2_i64_stream(
+            FieldType::Int64 => Self::decode_columnar_i64_stream(
                 location,
                 &format!("field {} int64 values", column.field_id.get()),
                 &{
-                    let substream = Self::columnar_v2_substream(
+                    let substream = Self::columnar_substream(
                         location,
                         footer,
                         Some(column.field_id),
-                        crate::ColumnarV2SubstreamKind::Int64Values,
+                        crate::ColumnarSubstreamKind::Int64Values,
                     )?;
-                    Self::decode_columnar_v2_payload(
+                    Self::decode_columnar_payload(
                         location,
                         &format!("field {} int64 values", column.field_id.get()),
                         substream,
-                        Self::columnar_v2_substream_slice(
+                        Self::columnar_substream_slice(
                             location,
                             "column block",
                             &column.block,
@@ -1943,21 +1805,21 @@ impl Db {
             .into_iter()
             .map(FieldValue::Int64)
             .collect(),
-            FieldType::Float64 => Self::decode_columnar_v2_u64_stream(
+            FieldType::Float64 => Self::decode_columnar_u64_stream(
                 location,
                 &format!("field {} float64 bits", column.field_id.get()),
                 &{
-                    let substream = Self::columnar_v2_substream(
+                    let substream = Self::columnar_substream(
                         location,
                         footer,
                         Some(column.field_id),
-                        crate::ColumnarV2SubstreamKind::Float64Bits,
+                        crate::ColumnarSubstreamKind::Float64Bits,
                     )?;
-                    Self::decode_columnar_v2_payload(
+                    Self::decode_columnar_payload(
                         location,
                         &format!("field {} float64 bits", column.field_id.get()),
                         substream,
-                        Self::columnar_v2_substream_slice(
+                        Self::columnar_substream_slice(
                             location,
                             "column block",
                             &column.block,
@@ -1972,20 +1834,20 @@ impl Db {
             .collect(),
             FieldType::String => {
                 let offsets = {
-                    let substream = Self::columnar_v2_substream(
+                    let substream = Self::columnar_substream(
                         location,
                         footer,
                         Some(column.field_id),
-                        crate::ColumnarV2SubstreamKind::StringOffsets,
+                        crate::ColumnarSubstreamKind::StringOffsets,
                     )?;
-                    Self::decode_columnar_v2_offsets(
+                    Self::decode_columnar_offsets(
                         location,
                         &format!("field {} string offsets", column.field_id.get()),
-                        &Self::decode_columnar_v2_payload(
+                        &Self::decode_columnar_payload(
                             location,
                             &format!("field {} string offsets", column.field_id.get()),
                             substream,
-                            Self::columnar_v2_substream_slice(
+                            Self::columnar_substream_slice(
                                 location,
                                 "column block",
                                 &column.block,
@@ -1996,17 +1858,17 @@ impl Db {
                     )?
                 };
                 let data = {
-                    let substream = Self::columnar_v2_substream(
+                    let substream = Self::columnar_substream(
                         location,
                         footer,
                         Some(column.field_id),
-                        crate::ColumnarV2SubstreamKind::StringData,
+                        crate::ColumnarSubstreamKind::StringData,
                     )?;
-                    Self::decode_columnar_v2_payload(
+                    Self::decode_columnar_payload(
                         location,
                         &format!("field {} string data", column.field_id.get()),
                         substream,
-                        Self::columnar_v2_substream_slice(
+                        Self::columnar_substream_slice(
                             location,
                             "column block",
                             &column.block,
@@ -2015,7 +1877,7 @@ impl Db {
                         )?,
                     )?
                 };
-                Self::decode_columnar_v2_variable_values(
+                Self::decode_columnar_variable_values(
                     location,
                     &format!("field {} string values", column.field_id.get()),
                     &offsets,
@@ -2034,20 +1896,20 @@ impl Db {
             }
             FieldType::Bytes => {
                 let offsets = {
-                    let substream = Self::columnar_v2_substream(
+                    let substream = Self::columnar_substream(
                         location,
                         footer,
                         Some(column.field_id),
-                        crate::ColumnarV2SubstreamKind::BytesOffsets,
+                        crate::ColumnarSubstreamKind::BytesOffsets,
                     )?;
-                    Self::decode_columnar_v2_offsets(
+                    Self::decode_columnar_offsets(
                         location,
                         &format!("field {} bytes offsets", column.field_id.get()),
-                        &Self::decode_columnar_v2_payload(
+                        &Self::decode_columnar_payload(
                             location,
                             &format!("field {} bytes offsets", column.field_id.get()),
                             substream,
-                            Self::columnar_v2_substream_slice(
+                            Self::columnar_substream_slice(
                                 location,
                                 "column block",
                                 &column.block,
@@ -2058,17 +1920,17 @@ impl Db {
                     )?
                 };
                 let data = {
-                    let substream = Self::columnar_v2_substream(
+                    let substream = Self::columnar_substream(
                         location,
                         footer,
                         Some(column.field_id),
-                        crate::ColumnarV2SubstreamKind::BytesData,
+                        crate::ColumnarSubstreamKind::BytesData,
                     )?;
-                    Self::decode_columnar_v2_payload(
+                    Self::decode_columnar_payload(
                         location,
                         &format!("field {} bytes data", column.field_id.get()),
                         substream,
-                        Self::columnar_v2_substream_slice(
+                        Self::columnar_substream_slice(
                             location,
                             "column block",
                             &column.block,
@@ -2077,7 +1939,7 @@ impl Db {
                         )?,
                     )?
                 };
-                Self::decode_columnar_v2_variable_values(
+                Self::decode_columnar_variable_values(
                     location,
                     &format!("field {} bytes values", column.field_id.get()),
                     &offsets,
@@ -2088,21 +1950,21 @@ impl Db {
                 .collect()
             }
             FieldType::Bool => {
-                let substream = Self::columnar_v2_substream(
+                let substream = Self::columnar_substream(
                     location,
                     footer,
                     Some(column.field_id),
-                    crate::ColumnarV2SubstreamKind::BoolValues,
+                    crate::ColumnarSubstreamKind::BoolValues,
                 )?;
-                Self::decode_columnar_v2_bitmap(
+                Self::decode_columnar_bitmap(
                     location,
                     &format!("field {} bool values", column.field_id.get()),
                     present_count,
-                    &Self::decode_columnar_v2_payload(
+                    &Self::decode_columnar_payload(
                         location,
                         &format!("field {} bool values", column.field_id.get()),
                         substream,
-                        Self::columnar_v2_substream_slice(
+                        Self::columnar_substream_slice(
                             location,
                             "column block",
                             &column.block,
@@ -2152,85 +2014,13 @@ impl Db {
         row_count: usize,
         block: &[u8],
     ) -> Result<Vec<FieldValue>, StorageError> {
-        match footer.format_version {
-            COLUMNAR_SSTABLE_V1_FORMAT_VERSION => {
-                let decoded: PersistedColumnBlock =
-                    serde_json::from_slice(block).map_err(|error| {
-                        StorageError::corruption(format!(
-                            "decode columnar field {} for {location} failed: {error}",
-                            column.field_id.get()
-                        ))
-                    })?;
-                match (column.field_type, decoded) {
-                    (FieldType::Int64, PersistedColumnBlock::Int64(values)) => {
-                        Self::decode_nullable_column_values(
-                            location,
-                            column,
-                            row_count,
-                            &values.present_bitmap,
-                            values.values.into_iter().map(FieldValue::Int64).collect(),
-                        )
-                    }
-                    (FieldType::Float64, PersistedColumnBlock::Float64(values)) => {
-                        Self::decode_nullable_column_values(
-                            location,
-                            column,
-                            row_count,
-                            &values.present_bitmap,
-                            values
-                                .values_bits
-                                .into_iter()
-                                .map(|bits| FieldValue::Float64(f64::from_bits(bits)))
-                                .collect(),
-                        )
-                    }
-                    (FieldType::String, PersistedColumnBlock::String(values)) => {
-                        Self::decode_nullable_column_values(
-                            location,
-                            column,
-                            row_count,
-                            &values.present_bitmap,
-                            values.values.into_iter().map(FieldValue::String).collect(),
-                        )
-                    }
-                    (FieldType::Bytes, PersistedColumnBlock::Bytes(values)) => {
-                        Self::decode_nullable_column_values(
-                            location,
-                            column,
-                            row_count,
-                            &values.present_bitmap,
-                            values.values.into_iter().map(FieldValue::Bytes).collect(),
-                        )
-                    }
-                    (FieldType::Bool, PersistedColumnBlock::Bool(values)) => {
-                        Self::decode_nullable_column_values(
-                            location,
-                            column,
-                            row_count,
-                            &values.present_bitmap,
-                            values.values.into_iter().map(FieldValue::Bool).collect(),
-                        )
-                    }
-                    _ => Err(StorageError::corruption(format!(
-                        "columnar SSTable {location} field {} type metadata does not match its block",
-                        column.field_id.get()
-                    ))),
-                }
-            }
-            COLUMNAR_SSTABLE_FORMAT_VERSION => {
-                Self::decode_columnar_v2_field_values(location, footer, column, row_count, block)
-                    .map_err(|error| {
-                        StorageError::corruption(format!(
-                            "decode columnar field {} for {location} failed: {error}",
-                            column.field_id.get()
-                        ))
-                    })
-            }
-            version => Err(StorageError::unsupported(format!(
-                "unsupported columnar SSTable version {}",
-                version
-            ))),
-        }
+        Self::decode_columnar_substream_field_values(location, footer, column, row_count, block)
+            .map_err(|error| {
+                StorageError::corruption(format!(
+                    "decode columnar field {} for {location} failed: {error}",
+                    column.field_id.get()
+                ))
+            })
     }
 
     pub(super) fn decode_nullable_column_values(
@@ -2591,201 +2381,57 @@ impl Db {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn encode_columnar_field_block_v1(
-        field: &FieldDefinition,
-        rows: &[SstableRow],
-    ) -> Result<Vec<u8>, StorageError> {
-        match field.field_type {
-            FieldType::Int64 => {
-                let mut present_bitmap = Vec::with_capacity(rows.len());
-                let mut values = Vec::new();
-                for row in rows {
-                    match Self::columnar_field_value_for_row(field, row)? {
-                        Some(FieldValue::Int64(value)) => {
-                            present_bitmap.push(true);
-                            values.push(value);
-                        }
-                        Some(other) => {
-                            return Err(StorageError::corruption(format!(
-                                "columnar row value for field {} had type {}, expected int64",
-                                field.name,
-                                field_value_type_name(&other)
-                            )));
-                        }
-                        None => present_bitmap.push(false),
-                    }
-                }
-                Self::encode_json_block(
-                    &format!("columnar field {} block", field.name),
-                    &PersistedColumnBlock::Int64(PersistedNullableColumn {
-                        present_bitmap,
-                        values,
-                    }),
-                )
-            }
-            FieldType::Float64 => {
-                let mut present_bitmap = Vec::with_capacity(rows.len());
-                let mut values_bits = Vec::new();
-                for row in rows {
-                    match Self::columnar_field_value_for_row(field, row)? {
-                        Some(FieldValue::Float64(value)) => {
-                            present_bitmap.push(true);
-                            values_bits.push(value.to_bits());
-                        }
-                        Some(other) => {
-                            return Err(StorageError::corruption(format!(
-                                "columnar row value for field {} had type {}, expected float64",
-                                field.name,
-                                field_value_type_name(&other)
-                            )));
-                        }
-                        None => present_bitmap.push(false),
-                    }
-                }
-                Self::encode_json_block(
-                    &format!("columnar field {} block", field.name),
-                    &PersistedColumnBlock::Float64(PersistedFloat64Column {
-                        present_bitmap,
-                        values_bits,
-                    }),
-                )
-            }
-            FieldType::String => {
-                let mut present_bitmap = Vec::with_capacity(rows.len());
-                let mut values = Vec::new();
-                for row in rows {
-                    match Self::columnar_field_value_for_row(field, row)? {
-                        Some(FieldValue::String(value)) => {
-                            present_bitmap.push(true);
-                            values.push(value);
-                        }
-                        Some(other) => {
-                            return Err(StorageError::corruption(format!(
-                                "columnar row value for field {} had type {}, expected string",
-                                field.name,
-                                field_value_type_name(&other)
-                            )));
-                        }
-                        None => present_bitmap.push(false),
-                    }
-                }
-                Self::encode_json_block(
-                    &format!("columnar field {} block", field.name),
-                    &PersistedColumnBlock::String(PersistedNullableColumn {
-                        present_bitmap,
-                        values,
-                    }),
-                )
-            }
-            FieldType::Bytes => {
-                let mut present_bitmap = Vec::with_capacity(rows.len());
-                let mut values = Vec::new();
-                for row in rows {
-                    match Self::columnar_field_value_for_row(field, row)? {
-                        Some(FieldValue::Bytes(value)) => {
-                            present_bitmap.push(true);
-                            values.push(value);
-                        }
-                        Some(other) => {
-                            return Err(StorageError::corruption(format!(
-                                "columnar row value for field {} had type {}, expected bytes",
-                                field.name,
-                                field_value_type_name(&other)
-                            )));
-                        }
-                        None => present_bitmap.push(false),
-                    }
-                }
-                Self::encode_json_block(
-                    &format!("columnar field {} block", field.name),
-                    &PersistedColumnBlock::Bytes(PersistedNullableColumn {
-                        present_bitmap,
-                        values,
-                    }),
-                )
-            }
-            FieldType::Bool => {
-                let mut present_bitmap = Vec::with_capacity(rows.len());
-                let mut values = Vec::new();
-                for row in rows {
-                    match Self::columnar_field_value_for_row(field, row)? {
-                        Some(FieldValue::Bool(value)) => {
-                            present_bitmap.push(true);
-                            values.push(value);
-                        }
-                        Some(other) => {
-                            return Err(StorageError::corruption(format!(
-                                "columnar row value for field {} had type {}, expected bool",
-                                field.name,
-                                field_value_type_name(&other)
-                            )));
-                        }
-                        None => present_bitmap.push(false),
-                    }
-                }
-                Self::encode_json_block(
-                    &format!("columnar field {} block", field.name),
-                    &PersistedColumnBlock::Bool(PersistedNullableColumn {
-                        present_bitmap,
-                        values,
-                    }),
-                )
-            }
-        }
-    }
-
-    fn encode_columnar_v2_key_block(
+    fn encode_columnar_key_block(
         block_start: u64,
         rows: &[SstableRow],
-        substreams: &mut Vec<crate::ColumnarV2SubstreamRef>,
+        substreams: &mut Vec<crate::ColumnarSubstreamRef>,
         next_ordinal: &mut u32,
     ) -> Result<Vec<u8>, StorageError> {
         let mut block_bytes = Vec::new();
         let key_bytes = rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
-        let (offsets, data) = Self::encode_columnar_v2_offsets_and_data(&key_bytes);
-        Self::append_columnar_v2_substream(
+        let (offsets, data) = Self::encode_columnar_offsets_and_data(&key_bytes);
+        Self::append_columnar_substream(
             block_start,
             &mut block_bytes,
             substreams,
             next_ordinal,
-            (None, None, crate::ColumnarV2SubstreamKind::KeyOffsets),
+            (None, None, crate::ColumnarSubstreamKind::KeyOffsets),
             &offsets,
         )?;
-        Self::append_columnar_v2_substream(
+        Self::append_columnar_substream(
             block_start,
             &mut block_bytes,
             substreams,
             next_ordinal,
-            (None, None, crate::ColumnarV2SubstreamKind::KeyData),
+            (None, None, crate::ColumnarSubstreamKind::KeyData),
             &data,
         )?;
         Ok(block_bytes)
     }
 
-    fn encode_columnar_v2_sequence_block(
+    fn encode_columnar_sequence_block(
         block_start: u64,
         rows: &[SstableRow],
-        substreams: &mut Vec<crate::ColumnarV2SubstreamRef>,
+        substreams: &mut Vec<crate::ColumnarSubstreamRef>,
         next_ordinal: &mut u32,
     ) -> Result<Vec<u8>, StorageError> {
         let mut block_bytes = Vec::new();
-        let raw = Self::encode_columnar_v2_u64_stream(rows.iter().map(|row| row.sequence.get()));
-        Self::append_columnar_v2_substream(
+        let raw = Self::encode_columnar_u64_stream(rows.iter().map(|row| row.sequence.get()));
+        Self::append_columnar_substream(
             block_start,
             &mut block_bytes,
             substreams,
             next_ordinal,
-            (None, None, crate::ColumnarV2SubstreamKind::Sequence),
+            (None, None, crate::ColumnarSubstreamKind::Sequence),
             &raw,
         )?;
         Ok(block_bytes)
     }
 
-    fn encode_columnar_v2_tombstone_block(
+    fn encode_columnar_tombstone_block(
         block_start: u64,
         rows: &[SstableRow],
-        substreams: &mut Vec<crate::ColumnarV2SubstreamRef>,
+        substreams: &mut Vec<crate::ColumnarSubstreamRef>,
         next_ordinal: &mut u32,
     ) -> Result<(Vec<u8>, Vec<bool>), StorageError> {
         let mut tombstones = Vec::with_capacity(rows.len());
@@ -2793,42 +2439,42 @@ impl Db {
             tombstones.push(Self::columnar_row_is_tombstone(row)?);
         }
         let mut block_bytes = Vec::new();
-        let raw = Self::encode_columnar_v2_bitmap(&tombstones);
-        Self::append_columnar_v2_substream(
+        let raw = Self::encode_columnar_bitmap(&tombstones);
+        Self::append_columnar_substream(
             block_start,
             &mut block_bytes,
             substreams,
             next_ordinal,
-            (None, None, crate::ColumnarV2SubstreamKind::TombstoneBitmap),
+            (None, None, crate::ColumnarSubstreamKind::TombstoneBitmap),
             &raw,
         )?;
         Ok((block_bytes, tombstones))
     }
 
-    fn encode_columnar_v2_row_kind_block(
+    fn encode_columnar_row_kind_block(
         block_start: u64,
         rows: &[SstableRow],
-        substreams: &mut Vec<crate::ColumnarV2SubstreamRef>,
+        substreams: &mut Vec<crate::ColumnarSubstreamRef>,
         next_ordinal: &mut u32,
     ) -> Result<Vec<u8>, StorageError> {
         let mut block_bytes = Vec::new();
-        let raw = Self::encode_columnar_v2_change_kinds(rows.iter().map(|row| row.kind));
-        Self::append_columnar_v2_substream(
+        let raw = Self::encode_columnar_change_kinds(rows.iter().map(|row| row.kind));
+        Self::append_columnar_substream(
             block_start,
             &mut block_bytes,
             substreams,
             next_ordinal,
-            (None, None, crate::ColumnarV2SubstreamKind::RowKind),
+            (None, None, crate::ColumnarSubstreamKind::RowKind),
             &raw,
         )?;
         Ok(block_bytes)
     }
 
-    fn encode_columnar_v2_field_block(
+    fn encode_columnar_field_block(
         field: &FieldDefinition,
         rows: &[SstableRow],
         block_start: u64,
-        substreams: &mut Vec<crate::ColumnarV2SubstreamRef>,
+        substreams: &mut Vec<crate::ColumnarSubstreamRef>,
         next_ordinal: &mut u32,
     ) -> Result<Vec<u8>, StorageError> {
         let mut block_bytes = Vec::new();
@@ -2852,9 +2498,9 @@ impl Db {
                         None => present_bitmap.push(false),
                     }
                 }
-                let present = Self::encode_columnar_v2_bitmap(&present_bitmap);
-                let values = Self::encode_columnar_v2_i64_stream(values);
-                Self::append_columnar_v2_substream(
+                let present = Self::encode_columnar_bitmap(&present_bitmap);
+                let values = Self::encode_columnar_i64_stream(values);
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -2862,11 +2508,11 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                        crate::ColumnarSubstreamKind::PresentBitmap,
                     ),
                     &present,
                 )?;
-                Self::append_columnar_v2_substream(
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -2874,7 +2520,7 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::Int64Values,
+                        crate::ColumnarSubstreamKind::Int64Values,
                     ),
                     &values,
                 )?;
@@ -2898,9 +2544,9 @@ impl Db {
                         None => present_bitmap.push(false),
                     }
                 }
-                let present = Self::encode_columnar_v2_bitmap(&present_bitmap);
-                let values = Self::encode_columnar_v2_u64_stream(values_bits);
-                Self::append_columnar_v2_substream(
+                let present = Self::encode_columnar_bitmap(&present_bitmap);
+                let values = Self::encode_columnar_u64_stream(values_bits);
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -2908,11 +2554,11 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                        crate::ColumnarSubstreamKind::PresentBitmap,
                     ),
                     &present,
                 )?;
-                Self::append_columnar_v2_substream(
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -2920,7 +2566,7 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::Float64Bits,
+                        crate::ColumnarSubstreamKind::Float64Bits,
                     ),
                     &values,
                 )?;
@@ -2944,9 +2590,9 @@ impl Db {
                         None => present_bitmap.push(false),
                     }
                 }
-                let present = Self::encode_columnar_v2_bitmap(&present_bitmap);
-                let (offsets, data) = Self::encode_columnar_v2_offsets_and_data(&values);
-                Self::append_columnar_v2_substream(
+                let present = Self::encode_columnar_bitmap(&present_bitmap);
+                let (offsets, data) = Self::encode_columnar_offsets_and_data(&values);
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -2954,11 +2600,11 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                        crate::ColumnarSubstreamKind::PresentBitmap,
                     ),
                     &present,
                 )?;
-                Self::append_columnar_v2_substream(
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -2966,11 +2612,11 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::StringOffsets,
+                        crate::ColumnarSubstreamKind::StringOffsets,
                     ),
                     &offsets,
                 )?;
-                Self::append_columnar_v2_substream(
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -2978,7 +2624,7 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::StringData,
+                        crate::ColumnarSubstreamKind::StringData,
                     ),
                     &data,
                 )?;
@@ -3002,9 +2648,9 @@ impl Db {
                         None => present_bitmap.push(false),
                     }
                 }
-                let present = Self::encode_columnar_v2_bitmap(&present_bitmap);
-                let (offsets, data) = Self::encode_columnar_v2_offsets_and_data(&values);
-                Self::append_columnar_v2_substream(
+                let present = Self::encode_columnar_bitmap(&present_bitmap);
+                let (offsets, data) = Self::encode_columnar_offsets_and_data(&values);
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -3012,11 +2658,11 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                        crate::ColumnarSubstreamKind::PresentBitmap,
                     ),
                     &present,
                 )?;
-                Self::append_columnar_v2_substream(
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -3024,11 +2670,11 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::BytesOffsets,
+                        crate::ColumnarSubstreamKind::BytesOffsets,
                     ),
                     &offsets,
                 )?;
-                Self::append_columnar_v2_substream(
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -3036,7 +2682,7 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::BytesData,
+                        crate::ColumnarSubstreamKind::BytesData,
                     ),
                     &data,
                 )?;
@@ -3060,9 +2706,9 @@ impl Db {
                         None => present_bitmap.push(false),
                     }
                 }
-                let present = Self::encode_columnar_v2_bitmap(&present_bitmap);
-                let values = Self::encode_columnar_v2_bitmap(&values);
-                Self::append_columnar_v2_substream(
+                let present = Self::encode_columnar_bitmap(&present_bitmap);
+                let values = Self::encode_columnar_bitmap(&values);
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -3070,11 +2716,11 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                        crate::ColumnarSubstreamKind::PresentBitmap,
                     ),
                     &present,
                 )?;
-                Self::append_columnar_v2_substream(
+                Self::append_columnar_substream(
                     block_start,
                     &mut block_bytes,
                     substreams,
@@ -3082,117 +2728,13 @@ impl Db {
                     (
                         Some(field.id),
                         Some(field.field_type),
-                        crate::ColumnarV2SubstreamKind::BoolValues,
+                        crate::ColumnarSubstreamKind::BoolValues,
                     ),
                     &values,
                 )?;
             }
         }
         Ok(block_bytes)
-    }
-
-    #[cfg(test)]
-    pub(super) fn encode_columnar_sstable_v1(
-        table_id: TableId,
-        level: u32,
-        local_id: String,
-        schema: &SchemaDefinition,
-        rows: Vec<SstableRow>,
-        bloom_filter_bits_per_key: Option<u32>,
-    ) -> Result<(ResidentRowSstable, Vec<u8>), StorageError> {
-        schema.validate()?;
-
-        let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
-        meta.schema_version = Some(schema.version);
-        let user_key_bloom_filter = UserKeyBloomFilter::build(&rows, bloom_filter_bits_per_key);
-
-        let mut bytes = Vec::from(&COLUMNAR_SSTABLE_MAGIC[..]);
-        let key_index = Self::append_columnar_block(
-            &mut bytes,
-            &Self::encode_json_block(
-                "columnar key index",
-                &rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>(),
-            )?,
-        );
-        let sequence_column = Self::append_columnar_block(
-            &mut bytes,
-            &Self::encode_json_block(
-                "columnar sequence column",
-                &rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
-            )?,
-        );
-
-        let mut tombstones = Vec::with_capacity(rows.len());
-        for row in &rows {
-            tombstones.push(Self::columnar_row_is_tombstone(row)?);
-        }
-        let tombstone_bitmap = Self::append_columnar_block(
-            &mut bytes,
-            &Self::encode_json_block("columnar tombstone bitmap", &tombstones)?,
-        );
-        let row_kind_column = Self::append_columnar_block(
-            &mut bytes,
-            &Self::encode_json_block(
-                "columnar row-kind column",
-                &rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
-            )?,
-        );
-
-        let mut columns = Vec::with_capacity(schema.fields.len());
-        for field in &schema.fields {
-            let block = Self::append_columnar_block(
-                &mut bytes,
-                &Self::encode_columnar_field_block_v1(field, &rows)?,
-            );
-            columns.push(PersistedColumnarColumnFooter {
-                field_id: field.id,
-                field_type: field.field_type,
-                encoding: ColumnEncoding::Plain,
-                compression: ColumnCompression::None,
-                block,
-            });
-        }
-
-        let data_checksum = checksum32(&bytes[COLUMNAR_SSTABLE_MAGIC.len()..]);
-        let footer = PersistedColumnarSstableFooter {
-            format_version: COLUMNAR_SSTABLE_V1_FORMAT_VERSION,
-            table_id,
-            level,
-            local_id: local_id.clone(),
-            row_count: rows.len() as u64,
-            min_key: meta.min_key.clone(),
-            max_key: meta.max_key.clone(),
-            min_sequence: meta.min_sequence,
-            max_sequence: meta.max_sequence,
-            schema_version: schema.version,
-            data_checksum,
-            key_index,
-            sequence_column,
-            tombstone_bitmap,
-            row_kind_column,
-            columns,
-            v2: None,
-            user_key_bloom_filter: user_key_bloom_filter.clone(),
-        };
-        let footer_bytes = Self::encode_json_block("columnar SSTable footer", &footer)?;
-        bytes.extend_from_slice(&footer_bytes);
-        bytes.extend_from_slice(&(footer_bytes.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(COLUMNAR_SSTABLE_MAGIC);
-
-        let checksum = checksum32(&bytes);
-        meta.length = bytes.len() as u64;
-        meta.checksum = checksum;
-        meta.data_checksum = data_checksum;
-
-        Ok((
-            ResidentRowSstable {
-                meta,
-                rows,
-                user_key_bloom_filter,
-                columnar: None,
-            },
-            bytes,
-        ))
     }
 
     pub(super) fn encode_columnar_sstable(
@@ -3213,7 +2755,7 @@ impl Db {
         let mut substreams = Vec::new();
         let mut next_ordinal = 0_u32;
 
-        let key_index_block = Self::encode_columnar_v2_key_block(
+        let key_index_block = Self::encode_columnar_key_block(
             bytes.len() as u64,
             &rows,
             &mut substreams,
@@ -3221,7 +2763,7 @@ impl Db {
         )?;
         let key_index = Self::append_columnar_block(&mut bytes, &key_index_block);
 
-        let sequence_block = Self::encode_columnar_v2_sequence_block(
+        let sequence_block = Self::encode_columnar_sequence_block(
             bytes.len() as u64,
             &rows,
             &mut substreams,
@@ -3229,7 +2771,7 @@ impl Db {
         )?;
         let sequence_column = Self::append_columnar_block(&mut bytes, &sequence_block);
 
-        let (tombstone_block, _tombstones) = Self::encode_columnar_v2_tombstone_block(
+        let (tombstone_block, _tombstones) = Self::encode_columnar_tombstone_block(
             bytes.len() as u64,
             &rows,
             &mut substreams,
@@ -3237,7 +2779,7 @@ impl Db {
         )?;
         let tombstone_bitmap = Self::append_columnar_block(&mut bytes, &tombstone_block);
 
-        let row_kind_block = Self::encode_columnar_v2_row_kind_block(
+        let row_kind_block = Self::encode_columnar_row_kind_block(
             bytes.len() as u64,
             &rows,
             &mut substreams,
@@ -3247,7 +2789,7 @@ impl Db {
 
         let mut columns = Vec::with_capacity(schema.fields.len());
         for field in &schema.fields {
-            let block_bytes = Self::encode_columnar_v2_field_block(
+            let block_bytes = Self::encode_columnar_field_block(
                 field,
                 &rows,
                 bytes.len() as u64,
@@ -3267,25 +2809,25 @@ impl Db {
         let data_range =
             crate::ByteRange::new(COLUMNAR_SSTABLE_MAGIC.len() as u64, bytes.len() as u64);
         let data_checksum = checksum32(&bytes[COLUMNAR_SSTABLE_MAGIC.len()..]);
-        let v2_footer = crate::ColumnarV2Footer {
-            format_tag: crate::ColumnarV2FormatTag::base_part(),
+        let layout = crate::ColumnarFooter {
+            format_tag: crate::ColumnarFormatTag::base_part(),
             table_id,
             local_id: local_id.clone(),
             schema_version: schema.version,
             row_count: rows.len() as u64,
             data_range,
-            decode_metadata: Self::columnar_v2_decode_metadata(schema),
+            decode_metadata: Self::columnar_decode_metadata(schema),
             substreams,
             marks: Vec::new(),
             synopsis: crate::ColumnarSynopsisSidecar {
-                format_tag: crate::ColumnarV2FormatTag::synopsis_sidecar(),
+                format_tag: crate::ColumnarFormatTag::synopsis_sidecar(),
                 part_local_id: local_id.clone(),
                 granules: Vec::new(),
                 checksum: 0,
             },
             optional_sidecars: Vec::new(),
             digests: vec![crate::CompactPartDigest {
-                format_tag: crate::ColumnarV2FormatTag::compact_digest(),
+                format_tag: crate::ColumnarFormatTag::compact_digest(),
                 algorithm: crate::PartDigestAlgorithm::Crc32,
                 logical_bytes: data_range.len(),
                 digest_bytes: data_checksum.to_le_bytes().to_vec(),
@@ -3308,7 +2850,7 @@ impl Db {
             tombstone_bitmap,
             row_kind_column,
             columns,
-            v2: Some(v2_footer),
+            layout,
             user_key_bloom_filter: user_key_bloom_filter.clone(),
         };
         let footer_bytes = Self::encode_json_block("columnar SSTable footer", &footer)?;

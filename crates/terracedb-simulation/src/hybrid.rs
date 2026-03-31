@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use terracedb::{
-    BaseZoneMapPruner, ByteRange, ColumnarGranuleSynopsis, ColumnarSequenceBounds,
-    ColumnarSynopsisSidecar, ColumnarV2FormatTag, ColumnarV2GranuleRef, ColumnarV2PageDirectory,
-    ColumnarV2PageRef, DeterministicRng, FieldId, FieldValue, HybridKeyRange, HybridReadConfig,
-    HybridSynopsisPruner, LateMaterializationPlan, Rng, RowProjection, SchemaDefinition,
-    SelectionMask, SequenceNumber, TableFormat, Value, ZoneMapPredicate, ZoneMapSynopsis,
+    BaseZoneMapPruner, ByteRange, ColumnarFormatTag, ColumnarGranuleRef, ColumnarGranuleSynopsis,
+    ColumnarPageDirectory, ColumnarPageRef, ColumnarSequenceBounds, ColumnarSynopsisSidecar,
+    DeterministicRng, FieldId, FieldValue, HybridKeyRange, HybridReadConfig, HybridSynopsisPruner,
+    LateMaterializationPlan, Rng, RowProjection, SchemaDefinition, SelectionMask, SequenceNumber,
+    TableFormat, Value, ZoneMapPredicate, ZoneMapSynopsis,
 };
 use thiserror::Error;
 
@@ -36,12 +36,6 @@ pub struct HybridStagedScanExpectation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HybridColumnarPartVersion {
-    V1JsonBlocks,
-    V2TypedSubstreams,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HybridSubstreamCodec {
     None,
     Lz4,
@@ -64,7 +58,6 @@ pub struct HybridDecodeMetadata {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HybridColumnarReadExpectation {
-    pub part_version: HybridColumnarPartVersion,
     pub projection: RowProjection,
     pub rows: HybridReadRows,
     pub decode_metadata: Option<HybridDecodeMetadata>,
@@ -267,7 +260,7 @@ impl HybridReadOracle {
             let has_tombstones = chunk.iter().any(|(_, version)| version.value.is_none());
             let granule_index = granule_index as u32;
 
-            granules.push(ColumnarV2GranuleRef {
+            granules.push(ColumnarGranuleRef {
                 granule_index,
                 first_key: chunk[0].0.clone(),
                 row_range: ByteRange::new(row_start, row_end),
@@ -278,7 +271,7 @@ impl HybridReadOracle {
                 },
                 has_tombstones,
             });
-            pages.push(ColumnarV2PageRef {
+            pages.push(ColumnarPageRef {
                 granule_index,
                 substream_ordinal: 0,
                 page_ordinal: granule_index,
@@ -300,9 +293,9 @@ impl HybridReadOracle {
 
         let outcome = BaseZoneMapPruner
             .prune(
-                &ColumnarV2PageDirectory { granules, pages },
+                &ColumnarPageDirectory { granules, pages },
                 &ColumnarSynopsisSidecar {
-                    format_tag: ColumnarV2FormatTag::synopsis_sidecar(),
+                    format_tag: ColumnarFormatTag::synopsis_sidecar(),
                     part_local_id: format!("{table}-oracle"),
                     granules: synopsis_granules,
                     checksum: 0,
@@ -420,21 +413,16 @@ impl HybridReadOracle {
         table: &str,
         sequence: SequenceNumber,
         projection: &RowProjection,
-        part_version: HybridColumnarPartVersion,
     ) -> Result<HybridColumnarReadExpectation, HybridReadOracleError> {
         Ok(HybridColumnarReadExpectation {
-            part_version,
             projection: projection.clone(),
             rows: self.scan(table, sequence, projection)?,
             decode_metadata: self.compact_decode_metadata(table)?,
-            codecs: match part_version {
-                HybridColumnarPartVersion::V1JsonBlocks => Vec::new(),
-                HybridColumnarPartVersion::V2TypedSubstreams => vec![
-                    HybridSubstreamCodec::None,
-                    HybridSubstreamCodec::Lz4,
-                    HybridSubstreamCodec::Zstd,
-                ],
-            },
+            codecs: vec![
+                HybridSubstreamCodec::None,
+                HybridSubstreamCodec::Lz4,
+                HybridSubstreamCodec::Zstd,
+            ],
         })
     }
 
@@ -850,9 +838,9 @@ pub enum HybridReadWorkloadOperation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HybridReadCutPoint {
-    V2SstableWriteBeforeFooterPublish,
-    V2CodecSubstreamWrite,
-    V2FooterPublish,
+    ColumnarSstableWriteBeforeFooterPublish,
+    ColumnarCodecSubstreamWrite,
+    ColumnarFooterPublish,
     PartDigestPublish,
     RemoteCacheSegmentAdmission,
     RemoteCacheBackgroundCompletion,
@@ -867,9 +855,9 @@ pub enum HybridReadCutPoint {
 
 impl HybridReadCutPoint {
     pub const ALL: [Self; 13] = [
-        Self::V2SstableWriteBeforeFooterPublish,
-        Self::V2CodecSubstreamWrite,
-        Self::V2FooterPublish,
+        Self::ColumnarSstableWriteBeforeFooterPublish,
+        Self::ColumnarCodecSubstreamWrite,
+        Self::ColumnarFooterPublish,
         Self::PartDigestPublish,
         Self::RemoteCacheSegmentAdmission,
         Self::RemoteCacheBackgroundCompletion,
@@ -1384,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_read_oracle_tracks_v1_and_v2_expectations() {
+    fn hybrid_read_oracle_tracks_columnar_expectations() {
         let mut oracle =
             HybridReadOracle::new(&[HybridTableSpec::columnar("metrics", metric_schema())]);
         oracle
@@ -1399,26 +1387,12 @@ mod tests {
             .expect("apply metric row");
 
         let projection = RowProjection::Fields(vec![FieldId::new(2)]);
-        let v1 = oracle
-            .read_expectation(
-                "metrics",
-                SequenceNumber::new(1),
-                &projection,
-                HybridColumnarPartVersion::V1JsonBlocks,
-            )
-            .expect("build v1 expectation");
-        let v2 = oracle
-            .read_expectation(
-                "metrics",
-                SequenceNumber::new(1),
-                &projection,
-                HybridColumnarPartVersion::V2TypedSubstreams,
-            )
-            .expect("build v2 expectation");
+        let expectation = oracle
+            .read_expectation("metrics", SequenceNumber::new(1), &projection)
+            .expect("build columnar expectation");
 
-        assert_eq!(v1.rows, v2.rows);
         assert_eq!(
-            v2.decode_metadata,
+            expectation.decode_metadata,
             Some(HybridDecodeMetadata {
                 schema_version: 1,
                 fields: vec![
@@ -1438,7 +1412,7 @@ mod tests {
             })
         );
         assert_eq!(
-            v2.codecs,
+            expectation.codecs,
             vec![
                 HybridSubstreamCodec::None,
                 HybridSubstreamCodec::Lz4,
