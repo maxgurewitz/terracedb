@@ -7,8 +7,8 @@ use std::{
 use async_trait::async_trait;
 use terracedb::{
     ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
-    StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table,
-    TieredDurabilityMode, Timestamp, Value,
+    SequenceNumber, StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore,
+    Table, TieredDurabilityMode, Timestamp, Value,
     test_support::{
         FailpointMode, db_failpoint_registry, row_table_config, test_dependencies,
         test_dependencies_with_clock, tiered_test_config_with_durability,
@@ -21,8 +21,12 @@ use terracedb_workflows::{
     DEFAULT_TIMER_POLL_INTERVAL, RecurringSchedule, RecurringTickOutput,
     RecurringWorkflowDefinition, RecurringWorkflowHandle, RecurringWorkflowHandler,
     RecurringWorkflowRuntime, RecurringWorkflowState, WorkflowContext, WorkflowDefinition,
-    WorkflowError, WorkflowHandle, WorkflowHandler, WorkflowHandlerError, WorkflowOutput,
-    WorkflowProgressMode, WorkflowRuntime, WorkflowStateMutation, WorkflowTimerCommand,
+    WorkflowError, WorkflowHandle, WorkflowHandler, WorkflowHandlerError,
+    WorkflowHistoricalArtifactSupport, WorkflowHistoricalEvent, WorkflowHistoricalSourceResolution,
+    WorkflowHistoricalSourceScenario, WorkflowOutput, WorkflowProgressMode,
+    WorkflowReplayableSourceKind, WorkflowRuntime, WorkflowSourceBootstrapPolicy,
+    WorkflowSourceConfig, WorkflowSourceProgress, WorkflowSourceProgressOrigin,
+    WorkflowSourceRecoveryPolicy, WorkflowStateMutation, WorkflowTimerCommand,
     failpoints::names as workflow_failpoint_names,
 };
 
@@ -679,6 +683,223 @@ where
             },
         )
         .await
+}
+
+#[test]
+fn workflow_source_config_round_trips_and_defaults_fail_closed() {
+    let config = WorkflowSourceConfig::default()
+        .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CheckpointOrCurrentDurable)
+        .with_recovery_policy(WorkflowSourceRecoveryPolicy::RestoreCheckpointOrFastForward)
+        .with_replay_kind(WorkflowReplayableSourceKind::AppendOnlyOrdered)
+        .with_checkpoint_support(WorkflowHistoricalArtifactSupport::Optional)
+        .with_trigger_journal_support(WorkflowHistoricalArtifactSupport::Required);
+
+    let encoded = serde_json::to_string(&config).expect("encode workflow source config");
+    let decoded: WorkflowSourceConfig =
+        serde_json::from_str(&encoded).expect("decode workflow source config");
+
+    assert_eq!(decoded, config);
+    assert_eq!(
+        WorkflowSourceConfig::default().recovery,
+        WorkflowSourceRecoveryPolicy::FailClosed,
+        "workflow sources should fail closed unless a weaker recovery mode is selected",
+    );
+}
+
+#[test]
+fn workflow_source_progress_round_trips_and_preserves_ordering_semantics() {
+    let earlier = WorkflowSourceProgress::from_cursor(LogCursor::new(SequenceNumber::new(7), 3));
+    let durable_fence = WorkflowSourceProgress::from_durable_sequence(SequenceNumber::new(7))
+        .with_origin(WorkflowSourceProgressOrigin::CurrentDurableBootstrap);
+    let later = WorkflowSourceProgress::from_cursor(LogCursor::new(SequenceNumber::new(8), 0))
+        .with_origin(WorkflowSourceProgressOrigin::ReplayFromHistory);
+
+    for progress in [earlier, durable_fence, later] {
+        let encoded = progress.encode().expect("encode source progress");
+        let decoded = WorkflowSourceProgress::decode(&encoded).expect("decode source progress");
+        assert_eq!(decoded, progress);
+    }
+
+    let legacy_cursor = LogCursor::new(SequenceNumber::new(11), 4);
+    let legacy_bytes = {
+        let mut bytes = Vec::with_capacity(1 + LogCursor::ENCODED_LEN);
+        bytes.push(1);
+        bytes.extend_from_slice(&legacy_cursor.encode());
+        bytes
+    };
+    assert_eq!(
+        WorkflowSourceProgress::decode(&legacy_bytes).expect("decode legacy cursor progress"),
+        WorkflowSourceProgress::from_cursor(legacy_cursor),
+    );
+
+    let mut ordered = vec![later, durable_fence, earlier];
+    ordered.sort();
+    assert_eq!(ordered, vec![earlier, durable_fence, later]);
+}
+
+#[test]
+fn workflow_bootstrap_contract_smoke_cases_are_deterministic() -> turmoil::Result {
+    SeededSimulationRunner::new(0x84_01)
+        .with_simulation_duration(Duration::from_millis(150))
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/workflow-bootstrap-contracts",
+                    TieredDurabilityMode::GroupCommit,
+                ),
+                SimulationStackBuilder::db_only(),
+            )
+            .await?;
+            let source = harness
+                .db()
+                .create_table(row_table_config("workflow_source"))
+                .await?;
+
+            let empty_resolution =
+                WorkflowSourceConfig::default().initial_resolution(false, SequenceNumber::new(0));
+            harness.require_eq(
+                "empty-state bootstrap",
+                &empty_resolution,
+                &WorkflowHistoricalSourceResolution::AttachFromBeginning,
+            )?;
+
+            source
+                .write(b"order-1".to_vec(), Value::bytes("created"))
+                .await?;
+            source
+                .write(b"order-2".to_vec(), Value::bytes("confirmed"))
+                .await?;
+            let durable_sequence = harness.db().current_durable_sequence();
+
+            let beginning_resolution =
+                WorkflowSourceConfig::default().initial_resolution(false, durable_sequence);
+            harness.require_eq(
+                "beginning bootstrap with backlog",
+                &beginning_resolution,
+                &WorkflowHistoricalSourceResolution::AttachFromBeginning,
+            )?;
+
+            let current_durable_resolution = WorkflowSourceConfig::default()
+                .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CurrentDurable)
+                .initial_resolution(false, durable_sequence);
+            harness.require_eq(
+                "current-durable bootstrap",
+                &current_durable_resolution,
+                &WorkflowHistoricalSourceResolution::AttachFromCurrentDurable { durable_sequence },
+            )?;
+
+            harness
+                .checkpoint_with("bootstrap-contracts", move |_db, _stack| {
+                    let durable_sequence = durable_sequence.get();
+                    Box::pin(async move {
+                        Ok(BTreeMap::from([(
+                            "workflow.bootstrap.decisions".to_string(),
+                            format!(
+                                "beginning={:?};current_durable={durable_sequence}",
+                                current_durable_resolution
+                            ),
+                        )]))
+                    })
+                })
+                .await?;
+
+            Ok(())
+        })
+}
+
+#[test]
+fn workflow_historical_scenarios_round_trip_through_simulation_checkpoints() -> turmoil::Result {
+    SeededSimulationRunner::new(0x84_02)
+        .with_simulation_duration(Duration::from_millis(150))
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/workflow-historical-oracle",
+                    TieredDurabilityMode::GroupCommit,
+                ),
+                SimulationStackBuilder::db_only(),
+            )
+            .await?;
+
+            let scenarios = vec![
+                WorkflowHistoricalSourceScenario::new(
+                    "orders_cdc",
+                    WorkflowSourceConfig::default()
+                        .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::Beginning)
+                        .with_recovery_policy(WorkflowSourceRecoveryPolicy::ReplayFromHistory)
+                        .with_replay_kind(WorkflowReplayableSourceKind::AppendOnlyOrdered),
+                    WorkflowHistoricalEvent::FirstAttach,
+                    SequenceNumber::new(5),
+                ),
+                WorkflowHistoricalSourceScenario::new(
+                    "orders_cdc",
+                    WorkflowSourceConfig::default()
+                        .with_recovery_policy(
+                            WorkflowSourceRecoveryPolicy::RestoreCheckpointOrFastForward,
+                        )
+                        .with_checkpoint_support(WorkflowHistoricalArtifactSupport::Optional)
+                        .with_trigger_journal_support(WorkflowHistoricalArtifactSupport::Optional),
+                    WorkflowHistoricalEvent::SnapshotTooOld,
+                    SequenceNumber::new(12),
+                ),
+            ]
+            .into_iter()
+            .map(|scenario| scenario.with_checkpoint_available(true))
+            .collect::<Vec<_>>();
+
+            let encoded = serde_json::to_string(&scenarios).expect("encode historical scenarios");
+            harness
+                .checkpoint_with("workflow-historical-scenarios", move |_db, _stack| {
+                    let encoded = encoded.clone();
+                    Box::pin(async move {
+                        Ok(BTreeMap::from([(
+                            "workflow.historical.scenarios".to_string(),
+                            encoded,
+                        )]))
+                    })
+                })
+                .await?;
+
+            let stored = harness
+                .checkpoints()
+                .iter()
+                .find(|checkpoint| checkpoint.label == "workflow-historical-scenarios")
+                .and_then(|checkpoint| {
+                    checkpoint
+                        .metadata
+                        .get("workflow.historical.scenarios")
+                        .cloned()
+                })
+                .expect("checkpoint should retain historical scenarios");
+            let decoded: Vec<WorkflowHistoricalSourceScenario> =
+                serde_json::from_str(&stored).expect("decode stored historical scenarios");
+            harness.require_eq("historical scenario roundtrip", &decoded, &scenarios)?;
+
+            let resolutions = decoded
+                .iter()
+                .map(WorkflowHistoricalSourceScenario::resolve)
+                .collect::<Vec<_>>();
+            harness.require_eq(
+                "historical scenario resolutions",
+                &resolutions,
+                &vec![
+                    WorkflowHistoricalSourceResolution::AttachFromBeginning,
+                    WorkflowHistoricalSourceResolution::RestoreCheckpoint,
+                ],
+            )?;
+
+            Ok(())
+        })
 }
 
 #[test]
