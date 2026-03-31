@@ -23,6 +23,8 @@ Included in this plan:
 - scheduler integration,
 - composition primitives built on top of the engine,
 - projection and workflow libraries,
+- configurable historical workflow bootstrap and recovery,
+- external stream ingress libraries for Kafka and Debezium,
 - an embedded virtual filesystem library, and
 - a `terracedb-bricks` blob / large-object library for out-of-line bytes plus metadata search, and
 - an optional Arrow-ecosystem analytical export crate for derived snapshot / CDC-friendly outputs, and
@@ -64,10 +66,14 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 13** adds execution domains, control-plane isolation, and colocated multi-DB foundations.
 - **Phase 14** adds unified-log pressure, flush reclamation, and adaptive write admission.
 - **Phase 15** adds opt-in physical sharding, resharding via virtual partitions, and a small sharded example app.
+- **Phase 16** adds configurable historical workflow bootstrap, replay, and recovery.
+- **Phase 17** adds a Kafka ingress crate and deterministic broker simulation support.
+- **Phase 18** adds a Debezium crate on top of Kafka ingress, including EventLog / Mirror / Hybrid materialization.
+- **Phase 19** adds end-to-end CDC deterministic hardening and a small example app that demonstrates Kafka + Debezium + projections + workflows together.
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into fifteen mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into nineteen mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -84,6 +90,10 @@ Once Phase 0 is complete, the work naturally splits into fifteen mostly independ
 - **Track M — execution domains and colocated multi-DB:** T63 first; T64, T65, and T66 can proceed in parallel; T67 depends on T64 + T65 + T66; T68 depends on T64 + T66 + T67; T69 depends on T64 + T65 + T66 + T67 + T68; T70 depends on T64 + T65 + T66 + T67
 - **Track N — pressure-aware flushing and adaptive admission:** T71 first; T72, T73, and T74 can proceed in parallel; T75 depends on T73 + T74 + T70; T76 depends on T72 + T73 + T74 + T75
 - **Track O — physical sharding and resharding:** T77 first; T78, T79, and T80 can proceed in parallel; T81 depends on T78 + T79 + T80; T82 depends on T78 + T79 + T80 + T81; T83 depends on T78 + T79 + T80 + T81
+- **Track P — historical workflow processing:** T84 first; T85 and T86 can proceed in parallel after T84; T87 follows T85 + T86
+- **Track Q — Kafka ingress:** T88 first; T89 follows T88; T90 follows T88 + T89; T91 follows T89 + T90
+- **Track R — Debezium CDC materialization:** T92 follows T31 + T84 + T88 + T90 + T91; T93 follows T92; T94 follows T84 + T92 + T93; T95 follows T93 + T94
+- **Track S — end-to-end CDC hardening and example app:** T96 follows T87 + T91 + T95; T97 follows T96; T98 follows T33 + T96 + T97; T99 follows T97 + T98
 
 ---
 
@@ -3440,6 +3450,547 @@ Add a sibling example to `examples/todo-api` that demonstrates the intended shar
 
 ---
 
+## Phase 16 — Historical workflow bootstrap, replay, and recovery
+
+**Parallelization:** T84 must land first to freeze the source/recovery interfaces. After that, T85 and T86 can proceed in parallel: one owns runtime/bootstrap plumbing, the other owns checkpoint/export/restore. T87 follows once both surfaces exist and composes them into deterministic historical-recovery suites.
+
+### T84. Freeze historical workflow source contracts, recovery policies, and shared simulation/oracle seams
+
+**Depends on:** T32, T32a
+
+**Description**
+
+Freeze the public and internal interfaces for workflow sources that may attach to history, skip backlog, restore from checkpoints, or replay append-only sources. This task exists to maximize later parallelism: runtime plumbing, checkpoint storage, and replay logic should all target stable contracts rather than redefining source progress independently.
+
+**Implementation steps**
+
+1. Define workflow source configuration contracts for:
+   - bootstrap policy,
+   - recovery policy,
+   - source-progress encoding,
+   - replayable-source capabilities, and
+   - optional trigger-journal/checkpoint support.
+2. Decide the persisted representation of workflow source progress so it can express more than the current bare durable cursor when needed.
+3. Freeze the `WorkflowCheckpointStore` / equivalent trait boundary and manifest/artifact naming expectations for checkpoint-capable workflows.
+4. Define the simulation/oracle seams needed for later tasks:
+   - historical attach vs live-only attach,
+   - `SnapshotTooOld` on workflow sources,
+   - checkpoint restore,
+   - append-only source replay, and
+   - lossy fast-forward policies.
+5. Document the default safety stance explicitly: fail closed unless a weaker recovery mode is deliberately selected.
+
+**Verification**
+
+- API tests proving bootstrap and recovery policies are constructible and survive round-trip config handling.
+- Progress-encoding tests proving persisted source progress round-trips and preserves ordering semantics.
+- Deterministic simulation smoke tests covering empty state, beginning bootstrap, and current-durable bootstrap without yet implementing the full runtime behavior.
+- Oracle scaffolding tests proving historical replay scenarios can be expressed reproducibly in the shared simulation harness.
+
+---
+
+### T85. Implement workflow source bootstrap and recovery-policy plumbing
+
+**Depends on:** T32, T84
+
+**Description**
+
+Implement the runtime-level behavior for workflow source bootstrap and recovery policies. This task owns the behavior difference between “replay history from the beginning,” “attach live from the current durable frontier,” and “fail closed or fast-forward when old cursors are no longer resumable.”
+
+**Implementation steps**
+
+1. Extend workflow source admission to load source configuration rather than assuming all sources always begin at `LogCursor::beginning()`.
+2. Implement first-attach bootstrap modes:
+   - beginning,
+   - current durable,
+   - checkpoint-or-beginning, and
+   - checkpoint-or-current-durable.
+3. Implement recovery-policy dispatch when a persisted source cursor becomes too old to resume.
+4. Preserve the rule that existing durable local workflow state (inbox, timers, outbox, state rows) is always resumed before any source bootstrap decision is applied.
+5. Surface recovery decisions clearly in runtime state/telemetry so operators can distinguish historical replay, live-only attach, checkpoint restore, and fail-closed behavior.
+
+**Verification**
+
+- Deterministic tests proving `current-durable` bootstrap skips historical backlog but still processes new events.
+- Deterministic tests proving `beginning` bootstrap replays retained history in durable order.
+- Recovery tests proving `fail-closed` surfaces `SnapshotTooOld` without silently fast-forwarding.
+- Simulation tests proving restart with existing inbox/timer/outbox state resumes local durable work before source bootstrap logic runs.
+
+---
+
+### T86. Implement workflow checkpoints, restore, and optional trigger journaling
+
+**Depends on:** T22, T23, T84
+
+**Description**
+
+Implement the durable checkpoint/export/restore path for workflow-owned state and the optional trigger journal needed for workflows that cannot be reconstructed from source history alone. This task is intentionally independent of the bootstrap-policy plumbing from T85 so both can proceed in parallel after contracts are frozen.
+
+**Implementation steps**
+
+1. Implement checkpoint capture for workflow-owned tables:
+   - state,
+   - inbox,
+   - trigger order,
+   - source progress,
+   - timer schedule/lookup, and
+   - outbox.
+2. Implement checkpoint manifest publication and artifact storage with the same fail-closed durability discipline used elsewhere in Terracedb.
+3. Implement checkpoint restore on runtime open, including clearing and repopulating workflow-owned tables atomically enough for crash-safe reopen semantics.
+4. Add optional admitted-trigger journaling for workflows that need to preserve timer/callback/source trigger history beyond what source replay alone can reconstruct.
+5. Expose enough metadata for later replay logic to know what source frontier and trigger-journal point a checkpoint represents.
+
+**Verification**
+
+- Crash/recovery simulation tests around checkpoint capture, manifest publication, and restore.
+- Deterministic restore tests proving restored workflow-owned state matches the captured checkpoint exactly.
+- Trigger-journal tests proving admitted triggers can be replayed deterministically after restart.
+- Simulation tests proving partial/incomplete checkpoints fail closed and never produce mixed restored state.
+
+---
+
+### T87. Add deterministic historical-workflow replay and recovery suites
+
+**Depends on:** T33, T85, T86
+
+**Description**
+
+Compose the new workflow-historical surfaces into deterministic replay and recovery suites. This is the phase-local capstone: it does not replace task-local tests, but it proves the historical bootstrap, checkpoint, trigger-journal, and lossy/live-only policies behave coherently when combined.
+
+**Implementation steps**
+
+1. Add scenario generators that vary:
+   - beginning vs current-durable bootstrap,
+   - fail-closed vs restore-checkpoint vs replay-from-history vs fast-forward recovery,
+   - append-only vs non-replayable source tables, and
+   - presence/absence of timers, callbacks, and pending outbox work.
+2. Extend the workflow oracle to reason about:
+   - skipped historical work under live-only attach,
+   - restored checkpoint state,
+   - replayed trigger journals, and
+   - intentionally lossy fast-forward behavior.
+3. Add restart campaigns that inject `SnapshotTooOld`, crashes during restore, and duplicate timer/callback delivery around historical replay.
+4. Verify that replay-capable append-only sources can rebuild correctly while non-replayable sources fail closed or follow the explicitly selected lossy policy.
+
+**Verification**
+
+- Large-seed deterministic simulation suites covering historical replay, checkpoint restore, and live-only attachment.
+- Cross-cutting replay tests proving append-only replayable sources rebuild workflow progress correctly across crash/restart.
+- Negative tests proving current-state-only sources cannot silently opt into replay-from-history semantics.
+- Reproducibility tests proving the same seed reproduces bootstrap and recovery choices exactly.
+
+---
+
+## Phase 17 — Kafka ingress crate and deterministic broker simulation
+
+**Parallelization:** T88 lands first to freeze the ingress interfaces. After that, T89 and T90 can proceed mostly independently: T89 owns durable source progress and partition-worker control flow, while T90 owns table layouts/materialization helpers. T91 composes both into a deterministic broker simulation and ingress hardening suite.
+
+### T88. Freeze the `terracedb-kafka` crate boundary, broker abstraction, and offset/progress contracts
+
+**Depends on:** T28, T32a
+
+**Description**
+
+Freeze the contract for a Kafka ingress library that materializes ordinary Terracedb tables and persists source progress atomically with those writes. The goal is to prevent the later runtime and materialization work from disagreeing about offset storage, partition ownership, bootstrap semantics, or record-filter behavior.
+
+**Implementation steps**
+
+1. Define the public `terracedb-kafka` crate boundary, including:
+   - source/partition definitions,
+   - bootstrap policy (`earliest` / `latest` or equivalent),
+   - deterministic record-filter contracts,
+   - record/batch handler traits,
+   - offset/progress storage contracts, and
+   - worker lifecycle/shutdown semantics.
+2. Freeze the broker abstraction used by tests and simulation so later tasks can support both a production Kafka adapter and a deterministic simulated broker without changing the higher-level runtime.
+3. Define supported Terracedb materialization layouts up front:
+   - one table per partition,
+   - shared `(partition, offset)` table, and
+   - any helper types needed to make replay-sensitive ordering explicit.
+4. Decide the telemetry/debug surface for partition lag, applied offsets, filtered/skipped record counts, and restart/bootstrap decisions.
+5. Add the shared simulation/oracle seams needed for later tasks: restart from offset, duplicate delivery, filtered-but-acknowledged records, partition-local ordering, rebalance/claim changes if supported, and crash between write and offset persist.
+
+**Verification**
+
+- API tests proving the new crate surface compiles without a concrete broker implementation.
+- Offset/progress round-trip tests proving persisted ordering semantics are stable.
+- Deterministic simulation smoke tests using a stub broker abstraction to prove the runtime can be driven without real Kafka.
+- Deterministic smoke tests proving filtered records are modeled as intentional skips rather than as delivery failures.
+- Layout tests proving the partition/materialization policies can be selected without changing core interfaces.
+
+---
+
+### T89. Implement durable Kafka source-progress storage, bootstrap, and partition workers
+
+**Depends on:** T88
+
+**Description**
+
+Implement the runtime that consumes partitioned Kafka batches, applies them through a transaction, and persists offsets in the same OCC unit. This task owns source-progress correctness, deterministic filtering, and restart/bootstrap behavior for Kafka ingress.
+
+**Implementation steps**
+
+1. Implement the persisted offset/progress store with one durable entry per `(consumer-group, topic, partition)` or equivalent identity.
+2. Implement bootstrap behavior for earliest/latest attachment using the persisted source-progress contract from T88.
+3. Implement partition workers that:
+   - load progress,
+   - fetch a batch,
+   - evaluate deterministic filters,
+   - open a Terracedb transaction,
+   - apply retained records through the handler,
+   - persist the next offset in the same transaction, and
+   - commit atomically.
+4. Ensure skipped/filtered records still advance source progress intentionally, while restart and worker handoff behavior never advances offsets without the corresponding retained Terracedb writes becoming visible.
+5. Surface typed runtime errors for broker failure, decode failure, storage failure, and aborted transaction/retry.
+
+**Verification**
+
+- Restart tests proving the runtime resumes from the persisted offset rather than re-reading from the wrong bootstrap point.
+- Crash simulation tests proving offsets do not advance unless the materialized writes commit.
+- Duplicate-delivery tests proving retried batches can be handled deterministically when the handler is written appropriately.
+- Deterministic tests proving filtered records are skipped reproducibly and do not reappear after restart.
+- Deterministic simulation tests proving partition-local ordering is preserved across restart and worker retry.
+
+---
+
+### T90. Implement Kafka materialization helpers and ordering-preserving table layouts
+
+**Depends on:** T88, T89
+
+**Description**
+
+Implement reusable helpers for mapping Kafka records into Terracedb tables while preserving the ordering guarantees that downstream projections and workflows need. This task is separate from T89 so table-layout/materialization choices, filtered materialization surfaces, and worker/offset runtime concerns do not become entangled.
+
+**Implementation steps**
+
+1. Implement helper builders for:
+   - one table per partition, and
+   - shared `(partition, offset)` key layouts.
+2. Provide utilities for encoding Kafka partition/offset into deterministic Terracedb keys suitable for replay-sensitive append-only sources.
+3. Add convenience helpers for current-state mirrors built from Kafka records where the handler wants both append-only and current-state outputs.
+4. Add helper patterns for pairing filtered append-only outputs with narrower current-state mirrors, while keeping the filtering semantics explicit in the API.
+5. Ensure materializers can write multiple tables in one transaction while still persisting the source offset atomically.
+6. Document when each materialization layout is appropriate for projections, workflows, live-only current-state consumers, and aggressively filtered large-stream use cases.
+
+**Verification**
+
+- Key-ordering tests proving encoded partition/offset keys preserve the intended replay order.
+- Transaction tests proving multiple materializations plus offset persistence commit atomically.
+- Deterministic simulation tests proving downstream table scans replay in the same order as the source partition stream.
+- Tests proving filtered append-only and current-state outputs stay aligned at the same applied offset frontier.
+- Current-state mirror tests proving append-only and mirror writes stay aligned at the same applied offset frontier.
+
+---
+
+### T91. Add deterministic Kafka ingress simulation and runtime hardening suites
+
+**Depends on:** T33, T89, T90
+
+**Description**
+
+Add the Kafka-ingress-specific deterministic test matrix. This task is the phase-local hardening pass for ingress semantics: source progress, ordering, duplicate delivery, restart, and worker failure under a deterministic broker model.
+
+**Implementation steps**
+
+1. Implement a deterministic simulated broker host or adapter capable of:
+   - partitioned ordered delivery,
+   - repeated delivery,
+   - delayed delivery,
+   - fetch failure, and
+   - restartable source progress.
+2. Add ingress-specific oracles for partition-local ordering, applied-offset frontiers, filtered/skipped record accounting, and atomicity between materialized writes and offset persistence.
+3. Run multi-seed campaigns covering batch retries, worker restarts, offset corruption/failure, filtered batches, and mixed append-only/current-state materialization.
+4. Add regression suites for the exact failure window where records are materialized but the next offset has not yet committed.
+
+**Verification**
+
+- Large-seed deterministic simulations proving applied offsets and Terracedb writes stay in lockstep.
+- Ordering tests proving partition-local replay remains deterministic across retries and restart.
+- Filtering tests proving skipped records still advance source progress and never materialize accidentally.
+- Failure-window tests proving no offset is durably advanced ahead of its writes.
+- Reproducibility tests proving the same seed yields the same broker delivery/order/failure trace.
+
+---
+
+## Phase 18 — Debezium crate, materialization modes, and runtime integration
+
+**Parallelization:** T92 lands first to freeze Debezium-specific contracts and materialization modes. T93 then implements connector-envelope decoding. Once the decoder contracts are stable, T94 can implement EventLog / Mirror / Hybrid materialization and the helper surfaces that projections and workflows consume. T95 closes the phase with deterministic Debezium integration suites.
+
+### T92. Freeze the `terracedb-debezium` crate boundary, envelope normalization contracts, and materialization modes
+
+**Depends on:** T31, T84, T88, T90, T91
+
+**Description**
+
+Freeze the Debezium-on-Kafka interfaces before implementation splits across decoder, materializer, and runtime-integration tasks. This task should explicitly codify the EventLog / Mirror / Hybrid modes described in the architecture, along with the schema/table/row-filter contracts and the bootstrap/replay expectations that workflows and projections may rely on.
+
+**Implementation steps**
+
+1. Define the `terracedb-debezium` crate boundary and the normalized Debezium event model consumed by materializers.
+2. Freeze the semantics of the three materialization modes:
+   - EventLog,
+   - Mirror, and
+   - Hybrid.
+3. Define first-class filtering contracts for:
+   - schema/table selection,
+   - deterministic row predicates over normalized events, and
+   - optional column projection/redaction before writing Terracedb values.
+4. Define the supported connector-specific metadata surface for the first connector target (PostgreSQL), including:
+   - snapshot markers,
+   - tombstones,
+   - operation kinds,
+   - source identifiers, and
+   - transaction metadata where supported.
+5. Define helper contracts for projections/workflows, such as snapshot-event filtering, source-table layout builders, and policies for routing workflows from raw CDC vs derived transition tables.
+6. Add deterministic fixture/simulation seams for normalized envelopes, table/row filters, snapshot batches, deletes/tombstones, and transaction ordering.
+
+**Verification**
+
+- Contract tests for the normalized Debezium event types and materialization-mode selection.
+- Fixture tests proving representative normalized envelopes round-trip cleanly through the public surface.
+- Contract tests proving schema/table and row-filter contracts evaluate over stable normalized fields.
+- Simulation smoke tests proving snapshot and tombstone semantics can be expressed before the full runtime exists.
+- Tests proving the workflow/projection helper contracts do not require direct Kafka access.
+
+---
+
+### T93. Implement PostgreSQL Debezium envelope decoding and normalization
+
+**Depends on:** T92
+
+**Description**
+
+Implement decoding and normalization for PostgreSQL Debezium messages first. This task owns the envelope semantics that every later Debezium materialization relies on, so it should be explicit and fail closed rather than loosely mapping JSON into ad hoc application data.
+
+**Implementation steps**
+
+1. Implement decoding of PostgreSQL Debezium change events into the normalized event model.
+2. Normalize operation kinds, before/after payloads, primary-key extraction, snapshot markers, tombstones, and source metadata.
+3. Ensure the normalized event surface exposes the stable fields needed for deterministic schema/table filtering, row filtering, and optional column projection/redaction.
+4. Add support for transaction metadata when present, but keep row-event materialization sound even when the upstream deployment does not emit a separate transaction topic.
+5. Fail closed on malformed/unsupported payloads rather than silently dropping fields or guessing semantics.
+6. Add deterministic fixtures for inserts, updates, deletes, snapshot rows, tombstones, transaction metadata, and rows that transition into or out of a filter predicate.
+
+**Verification**
+
+- Fixture-driven decode tests for inserts, updates, deletes, snapshot rows, and tombstones.
+- Negative tests proving malformed payloads fail closed with structured errors.
+- Filter-surface tests proving normalized events expose stable schema/table/value fields for predicate evaluation.
+- Deterministic simulation tests proving decode output is stable and reproducible from the same input fixture stream.
+- Transaction-metadata tests proving normalized ordering metadata is preserved where available.
+
+---
+
+### T94. Implement Debezium EventLog / Mirror / Hybrid materializers and runtime integration helpers
+
+**Depends on:** T84, T92, T93
+
+**Description**
+
+Implement the actual Debezium materializers and the helper surfaces needed by projections and workflows. This task should make the trade-offs between replayable append-only history, filtering for large databases, and space-efficient current-state mirrors explicit rather than implicit.
+
+**Implementation steps**
+
+1. Implement **EventLog** materialization into append-only ordered `*_cdc` tables suitable for replay-sensitive projections and historical workflow sources.
+2. Implement **Mirror** materialization into PK-keyed `*_current` tables suitable for current-state reads and live-only workflow attachment.
+3. Implement **Hybrid** materialization that writes both surfaces atomically with Kafka source-progress persistence.
+4. Implement schema/table filtering, row-filter application, and mirror membership-transition handling (`false -> true`, `true -> false`, etc.) so filtered current-state tables never retain stale rows.
+5. Add helper builders/utilities for:
+   - one-table-per-partition Debezium source layouts,
+   - snapshot-event filtering or routing policies for workflows,
+   - projection source declarations over partitioned Debezium tables, and
+   - transition-friendly patterns that encourage workflows to consume semantic derived tables rather than raw row-level CDC where appropriate.
+6. Document the limitations clearly: mirror-only sources are not sufficient for general historical replay after history loss, and filtering before EventLog materialization removes the filtered-out subset from Terracedb replay history by design.
+
+**Verification**
+
+- Transaction tests proving EventLog/Mirror/Hybrid materializations commit atomically with source progress.
+- Ordering tests proving EventLog keys preserve deterministic replay order.
+- Filtering tests proving schema/table filters and row predicates retain only the intended subset, while mirror membership transitions remove rows that stop matching.
+- Snapshot/tombstone tests proving current-state mirrors and append-only logs behave as documented.
+- Deterministic simulation tests proving projections and workflows can consume the resulting tables without direct broker access.
+
+---
+
+### T95. Add deterministic Debezium integration suites for projections and workflows
+
+**Depends on:** T33, T93, T94
+
+**Description**
+
+Add the Debezium-specific deterministic hardening pass. This phase-local capstone should verify that Debezium EventLog / Mirror / Hybrid materializations and filtering behavior interact correctly with projection rebuild rules and workflow bootstrap/recovery policies.
+
+**Implementation steps**
+
+1. Add end-to-end deterministic suites that drive normalized Debezium fixtures through Kafka ingress into Terracedb tables, then into projections and workflows.
+2. Cover snapshot-heavy startup, tombstones, reorder-resistant partition-local delivery, mixed EventLog/Mirror/Hybrid materialization modes, and schema/table/row filtering.
+3. Verify projection behavior for:
+   - history-sensitive EventLog consumers, and
+   - current-state-only mirror consumers.
+4. Verify workflow behavior for:
+   - beginning bootstrap on replayable EventLog sources,
+   - current-durable live-only attach on mirror sources, and
+   - fail-closed behavior when replay is requested from non-replayable sources.
+
+**Verification**
+
+- Deterministic simulation suites proving EventLog projections rebuild correctly from Debezium-derived append-only tables.
+- Deterministic simulation suites proving mirror-backed live-only workflows skip backlog but process new changes correctly.
+- Filtering suites proving ignored tables and rows never materialize while retained rows still replay deterministically.
+- Negative tests proving non-replayable mirror sources cannot silently satisfy replay-from-history recovery policies.
+- Reproducibility tests proving the same Debezium fixture stream and seed yield the same projection/workflow outcomes.
+
+---
+
+## Phase 19 — End-to-end CDC hardening and example app
+
+**Parallelization:** T96 lands first to freeze the example boundary, cross-cutting harness, and oracle seams. T97 then implements the example app itself. T98 follows once the example and the three underlying feature phases exist, and T99 hardens the example with restart/fault suites and polished documentation.
+
+### T96. Freeze the end-to-end CDC harness, oracle seams, and example-app boundary
+
+**Depends on:** T87, T91, T95
+
+**Description**
+
+Freeze the final integration target before building the capstone app and tests. This task defines the end-to-end harness, the example scenario, and the cross-cutting invariants so the final work can proceed in parallel-free but low-churn fashion.
+
+**Implementation steps**
+
+1. Define the end-to-end harness boundary that composes:
+   - deterministic broker delivery,
+   - Kafka ingress,
+   - Debezium normalization/materialization,
+   - projections,
+   - workflows, and
+   - application-facing reads/outbox effects.
+2. Freeze the example scenario and table layout for a small CDC-driven app, including explicit table-level and row-level filtering choices.
+3. Extend the oracle seams to reason across:
+   - source offsets,
+   - Debezium materializations,
+   - projection frontiers,
+   - workflow bootstrap/recovery choices, and
+   - example-visible outputs.
+4. Document the exact historical-vs-live-only behaviors the example must demonstrate.
+
+**Verification**
+
+- Harness smoke tests proving the full stack can be wired together deterministically.
+- Oracle tests proving end-to-end invariants can be checked from a single seed-driven run.
+- Example-boundary tests proving the chosen scenario exercises filtering, Debezium, projections, and workflows together.
+
+---
+
+### T97. Build a small CDC example app (`order-watch`)
+
+**Depends on:** T96
+
+**Description**
+
+Build a small example app that demonstrates the new feature set with a simplified but realistic use case. The recommended scenario is `order-watch`: Debezium captures a larger commerce database on Kafka, Terracedb filters that stream down to the `public.orders` table and then further to only the watched subset of rows (for example `region == "west"`), materializes both append-only and current-state views, uses a projection to derive “orders needing attention,” and runs a workflow that emits one alert per order transition. The example should make both the filtering behavior and the difference between historical bootstrap and live-only attach visible.
+
+**Implementation steps**
+
+1. Create a new example app crate/directory that wires together:
+   - Kafka ingress,
+   - Debezium EventLog / Mirror / Hybrid materialization,
+   - explicit table filtering that ignores non-`orders` tables from the larger source database,
+   - explicit row filtering that keeps only the watched `orders` subset,
+   - one projection that derives an `attention_orders` view or transition stream, and
+   - one workflow that emits durable outbox alerts.
+2. Provide a minimal application-facing read surface showing:
+   - the current mirrored order row,
+   - the derived attention/read-model output, and
+   - the workflow/outbox-visible alert state, and
+   - that filtered-out tables/rows never appear in Terracedb-visible outputs.
+3. Add configuration toggles or profiles that demonstrate:
+   - historical workflow bootstrap from EventLog history, and
+   - live-only workflow attachment from the current durable frontier.
+4. Include fixtures or scripted inputs that show:
+   - an ignored non-`orders` table event,
+   - an `orders` row that is filtered out,
+   - an `orders` row that is retained, and
+   - a retained row that later leaves the watched subset.
+5. Keep the scenario intentionally small and typed, reusing `terracedb-records` where it improves clarity.
+
+**Verification**
+
+- Example integration tests proving the projection and workflow outputs match the documented `order-watch` scenario.
+- Example integration tests proving table-level and row-level filtering produce the documented retained vs ignored outcomes.
+- Deterministic simulation tests proving historical bootstrap and live-only attach produce intentionally different but reproducible outcomes.
+- Restart tests proving the example resumes correctly from persisted ingress/projection/workflow state.
+- Example-level tests proving EventLog and Hybrid modes expose the same logical attention/alert outputs while Mirror-only mode is limited as documented.
+
+---
+
+### T98. Add cross-cutting deterministic simulation suites for historical workflows + Kafka + Debezium
+
+**Depends on:** T33, T96, T97
+
+**Description**
+
+Add the post-implementation cross-cutting deterministic test matrix that composes the three new feature areas. This is the place to verify their interaction as one subsystem: historical workflow bootstrap/recovery, Kafka source progress, Debezium materialization modes, projections, and example-visible outputs under crash/restart and history loss.
+
+**Implementation steps**
+
+1. Build long-running deterministic campaigns that vary:
+   - workflow bootstrap/recovery policy,
+   - Kafka bootstrap policy and batch boundaries,
+   - table/row filtering policy,
+   - Debezium EventLog / Mirror / Hybrid mode,
+   - projection rebuild vs normal tailing, and
+   - crash/restart at ingress, projection, and workflow cut points.
+2. Extend the oracle to assert cross-cutting invariants such as:
+   - offsets never outrun materialized tables,
+   - filtered-out tables and rows never appear in Terracedb-visible state,
+   - EventLog replay reproduces historical projection/workflow results,
+   - Mirror-only live attach intentionally skips backlog,
+   - checkpoint restore and append-only replay converge to the same state where both are supported, and
+   - example-visible outputs remain deterministic under restart and duplicate delivery.
+3. Add failure campaigns for `SnapshotTooOld`, checkpoint corruption, broker retry, duplicate Debezium delivery, and mixed replay/live-only workflow sources.
+
+**Verification**
+
+- Large-seed deterministic suites covering the full Kafka + Debezium + projection + workflow stack.
+- Cross-cutting restart/recovery tests proving the combined system remains fail-closed or explicitly lossy according to configuration, never ambiguously in between.
+- Filtering-aware regression tests proving filter configuration changes only the intentionally retained subset and does not break offset/progress correctness.
+- Reproducibility tests proving failing seeds preserve the full end-to-end trace needed for local replay.
+- Oracle-backed tests proving example-visible behavior matches the intended historical/live-only semantics.
+
+---
+
+### T99. Harden the CDC example with restart/fault suites and polished docs
+
+**Depends on:** T97, T98
+
+**Description**
+
+Finish the capstone work by hardening the new example app under failure/restart and documenting it as the reference implementation pattern for Kafka + Debezium + projections + workflows on Terracedb.
+
+**Implementation steps**
+
+1. Add restart/fault suites for the example covering:
+   - broker restart,
+   - ingress retry,
+   - projection rebuild,
+   - workflow checkpoint restore or replay,
+   - duplicate Debezium delivery, and
+   - outbox retry.
+2. Add user-facing example docs that explain:
+   - EventLog vs Mirror vs Hybrid trade-offs,
+   - table/schema and row-filter trade-offs for large upstream databases,
+   - historical bootstrap vs live-only workflow modes, and
+   - why projections/workflows consume Terracedb tables rather than Kafka directly.
+3. Make the example easy to run in deterministic simulation and easy to inspect when a seed fails.
+4. Ensure the example is small enough to serve as a reference rather than a framework of its own.
+
+**Verification**
+
+- Example-level deterministic fault suites proving the documented operational modes survive restart and duplicate delivery as intended.
+- Smoke tests or docs checks proving the example can be run and understood without hidden setup.
+- Regression tests ensuring the example remains aligned with the supported crate APIs rather than drifting into bespoke internals.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
@@ -3604,6 +4155,45 @@ At this point the system should additionally support:
 - conservative resharding that moves virtual partitions between physical shards without rehashing keys or rewriting row/column payload bytes,
 - whole-system deterministic simulation and chaos coverage for routing, hot-shard skew, reshard cutover, and mixed sharded/unsharded operation, and
 - a small `chat-rooms-api` example that demonstrates how to build a sharded application around a clear single-entity shard key.
+
+### Milestone P — Historical workflow bootstrap and recovery
+Complete: T84–T87
+
+At this point the system should additionally support:
+- configurable workflow source bootstrap from the beginning, the current durable frontier, or restored checkpoint state,
+- explicit workflow recovery policies for fail-closed, checkpoint restore, append-only replay, and opt-in lossy fast-forward behavior,
+- workflow checkpoints and optional trigger journaling for mixed source/timer/callback workflows, and
+- deterministic simulation coverage for historical replay, checkpoint restore, and live-only attachment.
+
+### Milestone Q — Kafka ingress
+Complete: T88–T91
+
+At this point the system should additionally support:
+- a dedicated `terracedb-kafka` ingress crate,
+- durable Kafka source-progress persistence coupled atomically to Terracedb writes,
+- deterministic record filtering with skipped-record progress semantics,
+- ordering-preserving partition materialization helpers for append-only and current-state surfaces, and
+- deterministic broker simulation coverage for restart, duplicate delivery, and offset/write atomicity.
+
+### Milestone R — Debezium CDC materialization
+Complete: T92–T95
+
+At this point the system should additionally support:
+- a dedicated `terracedb-debezium` crate on top of Kafka ingress,
+- PostgreSQL Debezium envelope decoding with explicit snapshot, tombstone, and transaction-metadata handling,
+- first-class schema/table and row filtering over normalized Debezium events,
+- EventLog, Mirror, and Hybrid materialization modes into ordinary Terracedb tables, and
+- deterministic projection/workflow integration coverage over Debezium-derived tables.
+
+### Milestone S — End-to-end CDC workflows and example app
+Complete: T96–T99
+
+At this point the system should additionally support:
+- a small `order-watch` example app demonstrating Kafka + Debezium + projections + workflows together,
+- explicit table-level and row-level filtering in that example's ingress path,
+- explicit historical-bootstrap vs live-only workflow modes in a concrete application,
+- cross-cutting deterministic simulation campaigns for the full CDC ingestion/materialization/runtime stack, and
+- polished reference docs that show how to build on the new crates without coupling projections or workflows directly to Kafka.
 
 ---
 
