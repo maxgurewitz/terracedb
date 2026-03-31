@@ -103,7 +103,7 @@ Once Phase 0 is complete, the work naturally splits into twenty-three mostly ind
 - **Track Q — Kafka ingress:** T88 first; T89 follows T88; T90 follows T88 + T89; T91 follows T89 + T90
 - **Track R — Debezium CDC materialization:** T92 follows T31 + T84 + T88 + T90 + T91; T93 follows T92; T94 follows T84 + T92 + T93; T95 follows T93 + T94
 - **Track S — end-to-end CDC hardening and example app:** T96 follows T87 + T91 + T95; T97 follows T96; T98 follows T33 + T96 + T97; T99 follows T97 + T98
-- **Track T — sandbox capabilities, procedures, and MCP:** T100 first; T101 follows T100; T102 follows T100 + T101; T103 and T104 can proceed in parallel once T102 exists; T105 follows T101 + T102 + T104 + T40g; T106 depends on T33 + T103 + T104 + T105; T107 depends on T103 + T104 + T105 + T106
+- **Track T — sandbox capabilities, procedures, and MCP:** T100 first; T101 follows T100; T101a follows T101 + T31a; T102 follows T100 + T101 + T101a; T102a follows T101a + T102 + T31a; T103 and T104 can proceed in parallel once T102 exists; T105 follows T101 + T102 + T104 + T40g; T106 depends on T33 + T102a + T103 + T104 + T105; T107 depends on T102a + T103 + T104 + T105 + T106
 - **Track U — workflow run model and execution contract:** T108 first; T109, T110, and T111 can proceed in parallel once T108 exists; T112 depends on T109 + T110 + T111; T113 depends on T33 + T109 + T110 + T111 + T112; T114 depends on T109 + T110 + T111 + T112 + T113
 - **Track V — workflow deployment, visibility, and upgrades:** T115 follows T108; T116, T117, and T118 can proceed in parallel once T115 exists; T119 depends on T116 + T117 + T118; T120 depends on T116 + T119 + T40i; T121 depends on T33 + T116 + T117 + T118 + T119 + T120; T122 depends on T116 + T117 + T118 + T119 + T120 + T121
 
@@ -4325,9 +4325,9 @@ Finish the capstone work by hardening the new example app under failure/restart 
 
 ## Phase 20 — Sandbox capability policy, reviewed procedures, MCP exposure, and example app
 
-**Phase rule:** T100 freezes the shared capability, procedure, and MCP-facing contracts first so the rest of the phase can parallelize without interface churn. Every implementation task in this phase must add deterministic simulation coverage for the semantics it introduces rather than deferring simulation to the end. T106 is the capstone cross-cutting deterministic hardening task for the combined stack, and T107 adds a small example repo/app with its own simulation tests that demonstrates the intended end-to-end usage.
+**Phase rule:** T100 freezes the shared capability, procedure, and MCP-facing contracts first, and T101a freezes the row-scope and visibility-index contracts before the row-permission-specific implementation branches diverge. Every implementation task in this phase must add deterministic simulation coverage for the semantics it introduces rather than deferring simulation to the end. T106 is the capstone cross-cutting deterministic hardening task for the combined stack, and T107 adds a small example repo/app with its own simulation tests that demonstrates the intended end-to-end usage.
 
-**Parallelization:** T100 first. T101 follows T100. T102 follows T100 + T101. T103 and T104 can proceed in parallel once T102 exists. T105 follows T101 + T102 + T104 + T40g. T106 depends on T33 + T103 + T104 + T105. T107 depends on T103 + T104 + T105 + T106.
+**Parallelization:** T100 first. T101 follows T100. T101a follows T101 + T31a. T102 follows T100 + T101 + T101a. T102a follows T101a + T102 + T31a. T103 and T104 can proceed in parallel once T102 exists. T105 follows T101 + T102 + T104 + T40g. T106 depends on T33 + T102a + T103 + T104 + T105. T107 depends on T102a + T103 + T104 + T105 + T106.
 
 ### T100. Freeze sandbox capability, migration, procedure, and MCP contracts plus deterministic seams
 
@@ -4411,13 +4411,56 @@ Implement the shared policy substrate used by every later task: subject-to-grant
 
 ---
 
-### T102. Implement database capability families and host-enforced policy checks
+### T101a. Freeze row-scope policy, visibility-index, and denial contracts
 
-**Depends on:** T100, T101, T40c, T27
+**Depends on:** T101, T31a
 
 **Description**
 
-Implement the first real host capability families for sandboxed code, especially the database-facing ones. The goal is to keep the host in the enforcement path for every database action so table allowlists, tenant scoping, query-shape restrictions, key-prefix filters, budgets, and audit logging stay authoritative.
+Freeze the row-level-permission model before the implementation branches diverge. The goal is to make row-scope bindings, visibility-index-backed access, denial semantics, and write-time preimage checks first-class contracts rather than letting each later task invent its own interpretation.
+
+**Implementation steps**
+
+1. Freeze the shared public contracts for row-scoped database access, for example:
+   - `PolicyContext`,
+   - `RowScopePolicy`,
+   - `RowScopeBinding`,
+   - `VisibilityIndexSpec`,
+   - denial/audit metadata for "not visible" vs "explicitly denied" outcomes,
+   - scan continuation or resume tokens for filtered access paths.
+2. Define the supported version-1 row-scope families and their intended use:
+   - deterministic key-prefix scopes,
+   - typed row predicates over decoded rows plus caller context,
+   - projection-backed visibility indexes for ACL-like sharing,
+   - explicit fail-closed or `procedure_only` escapes for queries that cannot be safely bounded.
+3. Freeze which query shapes each row-scope family may authorize, including:
+   - point read,
+   - bounded prefix scan,
+   - write/update/delete,
+   - caller-selected multi-table query,
+   - aggregate or count-like surfaces that may leak existence.
+4. Freeze write-time semantics for row-scoped updates:
+   - preimage/postimage policy evaluation,
+   - scope-escaping-write rejection,
+   - required OCC/read-set integration,
+   - budget accounting for scanned vs returned rows.
+5. Freeze the projection-helper contracts for visibility indexes and membership transitions, along with deterministic stubs/fakes that let simulation model projected visibility state before the full helper implementation lands.
+
+**Verification**
+
+- Compile-only tests that instantiate the row-scope, visibility-index, and denial contracts together with the base capability/grant/manifest types.
+- Unit tests that round-trip row-scope policy encodings, visibility-index specs, and denial metadata.
+- A deterministic smoke test that resolves a fake caller context into an effective row-scope binding and simulated visibility-index lookup using only stubbed seams.
+
+---
+
+### T102. Implement database capability families and host-enforced policy checks
+
+**Depends on:** T100, T101, T101a, T40c, T27
+
+**Description**
+
+Implement the first real host capability families for sandboxed code, especially the database-facing ones. The goal is to keep the host in the enforcement path for every database action so table allowlists, tenant scoping, query-shape restrictions, row-level filters, budgets, and audit logging stay authoritative.
 
 **Implementation steps**
 
@@ -4430,17 +4473,55 @@ Implement the first real host capability families for sandboxed code, especially
    - table and database allowlists,
    - fixed-tenant or caller-derived tenant scoping,
    - query-shape restrictions such as point read vs prefix scan vs write vs schema mutation,
-   - key-prefix or row-scope filters,
-   - per-binding row/byte/time budgets.
+   - deterministic key-prefix validation or rewriting where the access path can be expressed in the key,
+   - typed row-predicate evaluation for point reads and bounded scans,
+   - scope-escaping-write rejection using preimage/postimage checks plus OCC read sets,
+   - per-binding row/byte/time budgets, including accounting for scanned candidates vs returned rows where applicable.
 3. Generate matching TypeScript declarations and guest-visible bound modules from the resolved manifest instead of hand-maintaining separate runtime and type definitions.
-4. Ensure denied operations fail predictably and carry enough machine-readable metadata for callers, audit logs, and simulations.
+4. Ensure denied operations fail predictably, carry enough machine-readable metadata for callers, audit logs, and simulations, and can normalize "not visible" to "not found" where low-leakage behavior is required.
 5. Record capability usage with consistent tool-run or capability-event metadata so later procedure and MCP layers inherit the same audit surface automatically.
 
 **Verification**
 
-- Deterministic simulation tests for allowed and denied reads/writes/scans across table allowlists, tenant scopes, query-shape restrictions, and key-prefix filters.
+- Deterministic simulation tests for allowed and denied reads/writes/scans across table allowlists, tenant scopes, query-shape restrictions, deterministic key-prefix filters, typed row predicates, and scope-escaping writes.
 - Integration tests that import generated bound modules from guest code and verify the host remains in the enforcement path.
 - Restart or reopen tests for any persisted capability metadata introduced by the implementation.
+
+---
+
+### T102a. Implement projection helpers for row-level visibility indexes and membership transitions
+
+**Depends on:** T101a, T102, T31a
+
+**Description**
+
+Implement reusable projection helpers that materialize visibility indexes for ACL-like row permissions. This task should make relationship-driven visibility cheap and deterministic without turning `db.query.v1` into a general-purpose ad hoc join planner.
+
+**Implementation steps**
+
+1. Add helper APIs in `terracedb-projections` for materializing visibility tables such as:
+   - `visible_by_subject/{subject_id}/{row_id}`,
+   - `visible_by_tenant/{tenant_id}/{row_id}`,
+   - `visible_by_group/{group_id}/{row_id}`.
+2. Support deterministic membership transitions explicitly, including:
+   - `false -> true`,
+   - `true -> false`,
+   - share/unshare,
+   - subject- or tenant-reassignment,
+   - optional emission of narrowed or redacted read mirrors alongside the membership index.
+3. Allow a helper to expand one logical visibility rule into multiple output rows when the authorized subject set comes from deterministic row fields or a companion membership table, while preserving deterministic output ordering and rebuild semantics.
+4. Define rebuild/recompute behavior clearly:
+   - helpers may rebuild from append-only/event-sourced inputs when available,
+   - current-state visibility helpers may rebuild from authoritative current-state plus membership sources when provenance supports it,
+   - unsupported provenance combinations must fail closed rather than invent visibility.
+5. Add integration recipes or helper glue so `db.query.v1` and reviewed procedures can route scans through projected visibility indexes instead of relying on unbounded post-filtered scans of primary tables.
+
+**Verification**
+
+- Projection tests covering grant, revoke, share, unshare, reassignment, deletion, and redaction transitions.
+- Recompute tests proving visibility indexes rebuilt from their authoritative sources match incremental tailing.
+- Deterministic simulation tests that interleave visibility projection updates with row-scoped reads and writes, proving the answers match the intended oracle.
+- Integration tests proving visibility-index-backed access respects the same row/byte/time budget accounting surface used by direct bindings.
 
 ---
 
@@ -4503,6 +4584,7 @@ Implement a `terracedb-procedures` library that turns reviewed sandbox code into
 3. Implement invocation:
    - fresh session from immutable base,
    - caller identity and tenant context injection,
+   - caller-context-aware row-scope binding resolution, including visibility-index-backed helper bindings where requested by the reviewed manifest,
    - manifest intersection with deployment policy,
    - JSON-schema or equivalent input/output validation,
    - host-selected execution-domain assignment.
@@ -4554,7 +4636,7 @@ Implement `terracedb-mcp` as an external adapter for agents such as Claude Deskt
 
 ### T106. Build cross-cutting deterministic simulation, crash, and fault suites for the capability/procedure/MCP stack
 
-**Depends on:** T33, T103, T104, T105
+**Depends on:** T33, T102a, T103, T104, T105
 
 **Description**
 
@@ -4565,6 +4647,8 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
 1. Extend the deterministic shadow/oracle model to cover:
    - capability-grant resolution,
    - manifest intersections,
+   - row-scope policy resolution,
+   - visibility-index projection state and membership transitions,
    - execution-domain assignment outcomes,
    - migration history state,
    - published-procedure metadata and immutable-version selection,
@@ -4573,6 +4657,8 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
 2. Add randomized workloads that combine:
    - draft sandbox execution,
    - approved and denied DB capability calls,
+   - direct row-scoped reads and writes,
+   - visibility-index-backed shared-row queries,
    - reviewed migration application,
    - procedure publication,
    - procedure invocation under varying caller contexts,
@@ -4587,6 +4673,8 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
    - MCP session state if any is persisted.
 4. Add failure campaigns for:
    - denied capability escalation attempts,
+   - scope-escaping writes,
+   - stale or divergent visibility-index state,
    - stale review metadata,
    - rate-limit exhaustion,
    - domain-budget exhaustion,
@@ -4598,30 +4686,33 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
 
 - Large-seed deterministic suites covering the full capability/policy/procedure/MCP stack.
 - Cross-cutting restart/recovery tests proving reviewed artifacts remain immutable and fail closed under partial publication or invocation crashes.
-- Oracle-backed tests proving allow/deny, tenant-scope, query-shape, and execution-domain outcomes match the intended contracts.
+- Oracle-backed tests proving allow/deny, tenant-scope, row-scope, query-shape, visibility-index, and execution-domain outcomes match the intended contracts.
 - Reproducibility tests proving failing seeds preserve the necessary trace and policy context for replay.
 
 ---
 
 ### T107. Build a small example repo/app that demonstrates reviewed migrations, draft queries, published procedures, and MCP exposure
 
-**Depends on:** T103, T104, T105, T106
+**Depends on:** T102a, T103, T104, T105, T106
 
 **Description**
 
-Add a small, teachable example repo/app that demonstrates the intended way to use the new stack in practice: reviewed migrations for catalog setup, trusted draft query sandboxes for internal users, immutable published procedures for lower-trust callers, and an MCP surface that exposes the approved capabilities to an external agent. The example should include its own simulation tests and serve as the reference integration pattern for these libraries.
+Add a small, teachable example repo/app that demonstrates the intended way to use the new stack in practice: reviewed migrations for catalog setup, trusted draft query sandboxes for internal users, row-scoped visibility rules, immutable published procedures for lower-trust callers, and an MCP surface that exposes the approved capabilities to an external agent. The example should include its own simulation tests and serve as the reference integration pattern for these libraries.
 
 **Implementation steps**
 
 1. Add a compact example app and companion sandboxed project that demonstrates:
    - reviewed migration authoring and apply flow,
    - an employee draft-query sandbox with broader internal grants,
+   - row-scoped access to a shared-record domain enforced through bound DB capabilities,
+   - a projection-maintained visibility index for shared rows,
    - one or more reviewed published procedures for external callers,
    - MCP exposure of approved procedure and read-only sandbox surfaces.
 2. Give the example a simple but realistic authorization model with at least:
    - an internal employee subject,
    - a publication/reviewer subject,
-   - an external caller subject.
+   - an external caller subject,
+   - at least one share/unshare or tenant-scoped visibility rule that changes over time.
 3. Demonstrate execution-domain isolation in the example by assigning:
    - foreground draft-query work,
    - procedure invocation,
@@ -4630,6 +4721,8 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
    to distinct domains or domain classes.
 4. Add example docs that explain:
    - capability templates vs grants vs manifests,
+   - row-scope policies vs projection-maintained visibility indexes,
+   - why ACL-like shared visibility should usually route through projected indexes or reviewed procedures instead of ad hoc full scans,
    - why published procedures are immutable,
    - why migrations are intentionally catalog-scoped in version 1,
    - how MCP reuses the same permission model instead of introducing a second one,
@@ -4638,8 +4731,9 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
 
 **Verification**
 
-- Example-level deterministic simulation tests proving the documented migration, query, procedure, and MCP flows behave as described.
+- Example-level deterministic simulation tests proving the documented migration, row-scoped query, procedure, and MCP flows behave as described.
 - Tests proving the example's internal and external subjects receive meaningfully different capabilities and execution-domain assignments.
+- Tests proving visibility-index transitions such as share/unshare or tenant mismatch produce the documented visible vs hidden outcomes.
 - Smoke tests or docs checks proving the example can be run and inspected without hidden setup.
 - Regression tests ensuring the example remains aligned with the supported public crate APIs instead of drifting into bespoke internals.
 
@@ -5376,7 +5470,7 @@ Complete: T100–T107
 
 At this point the system should additionally support:
 - a shared capability/grant/manifest model for sandbox, migration, procedure, and MCP-facing access,
-- host-enforced database capability families with table allowlists, tenant scoping, query-shape restrictions, key-prefix filters, rate limits, and audit hooks,
+- host-enforced database capability families with table allowlists, tenant scoping, query-shape restrictions, key-prefix and row-scope filters, visibility-index projection helpers, rate limits, and audit hooks,
 - reviewed migration flows for catalog setup and app-schema evolution without claiming large backfill support,
 - immutable published procedures with reviewed manifests, typed inputs/outputs, and caller-context-aware invocation,
 - an external `terracedb-mcp` adapter that reuses the same permission and audit model as in-process sandboxes,
