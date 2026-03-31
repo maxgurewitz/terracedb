@@ -84,13 +84,15 @@ pub use execution::{
     ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec, ContentionClass, DbExecutionProfile,
     DomainBackgroundBudget, DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot,
     DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork, DurabilityClass,
-    ExecutionDomainBudget, ExecutionDomainInvariant, ExecutionDomainInvariantSet,
-    ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook, ExecutionDomainOwner,
-    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSnapshot, ExecutionDomainSpec,
-    ExecutionDomainState, ExecutionDomainUsageSnapshot, ExecutionLane, ExecutionLaneBinding,
-    InMemoryDomainBudgetOracle, InMemoryResourceManager, PlacementAssignment, PlacementPolicy,
-    PlacementRequest, PreferRequestedDomainPolicy, ResourceManager, ResourceManagerSnapshot,
-    WorkPlacementRequest, WorkRuntimeTag,
+    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainContentionSnapshot,
+    ExecutionDomainInvariant, ExecutionDomainInvariantSet, ExecutionDomainLifecycleEvent,
+    ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
+    ExecutionDomainPlacement, ExecutionDomainSnapshot, ExecutionDomainSpec, ExecutionDomainState,
+    ExecutionDomainUsageSnapshot, ExecutionLane, ExecutionLaneBinding, ExecutionResourceKind,
+    ExecutionResourceUsage, InMemoryDomainBudgetOracle, InMemoryResourceManager,
+    PlacementAssignment, PlacementPolicy, PlacementRequest, PreferRequestedDomainPolicy,
+    ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot, WorkPlacementRequest,
+    WorkRuntimeTag,
 };
 #[doc(hidden)]
 pub use failpoints::{

@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -51,6 +55,28 @@ impl ExecutionDomainPath {
 
     pub fn as_string(&self) -> String {
         self.segments.join("/")
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.segments.len() == 1
+    }
+
+    pub fn parent(&self) -> Option<Self> {
+        (!self.is_root()).then(|| Self {
+            segments: self.segments[..self.segments.len() - 1].to_vec(),
+        })
+    }
+
+    pub fn lineage(&self) -> Vec<Self> {
+        (1..=self.segments.len())
+            .map(|len| Self {
+                segments: self.segments[..len].to_vec(),
+            })
+            .collect()
+    }
+
+    pub fn is_same_or_descendant_of(&self, ancestor: &Self) -> bool {
+        self.segments.starts_with(ancestor.segments())
     }
 }
 
@@ -155,20 +181,226 @@ pub enum ExecutionDomainState {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionResourceUsage {
+    pub cpu_workers: u32,
+    pub memory_bytes: u64,
+    pub cache_bytes: u64,
+    pub mutable_bytes: u64,
+    pub local_io_concurrency: u32,
+    pub local_io_bytes_per_second: u64,
+    pub remote_io_concurrency: u32,
+    pub remote_io_bytes_per_second: u64,
+    pub background_tasks: u32,
+    pub background_in_flight_bytes: u64,
+}
+
+impl ExecutionResourceUsage {
+    fn metric(&self, kind: ExecutionResourceKind) -> u64 {
+        match kind {
+            ExecutionResourceKind::CpuWorkers => u64::from(self.cpu_workers),
+            ExecutionResourceKind::MemoryBytes => self.memory_bytes,
+            ExecutionResourceKind::CacheBytes => self.cache_bytes,
+            ExecutionResourceKind::MutableBytes => self.mutable_bytes,
+            ExecutionResourceKind::LocalIoConcurrency => u64::from(self.local_io_concurrency),
+            ExecutionResourceKind::LocalIoBandwidth => self.local_io_bytes_per_second,
+            ExecutionResourceKind::RemoteIoConcurrency => u64::from(self.remote_io_concurrency),
+            ExecutionResourceKind::RemoteIoBandwidth => self.remote_io_bytes_per_second,
+            ExecutionResourceKind::BackgroundTasks => u64::from(self.background_tasks),
+            ExecutionResourceKind::BackgroundInFlightBytes => self.background_in_flight_bytes,
+        }
+    }
+
+    fn saturating_add_assign(&mut self, other: ExecutionResourceUsage) {
+        self.cpu_workers = self.cpu_workers.saturating_add(other.cpu_workers);
+        self.memory_bytes = self.memory_bytes.saturating_add(other.memory_bytes);
+        self.cache_bytes = self.cache_bytes.saturating_add(other.cache_bytes);
+        self.mutable_bytes = self.mutable_bytes.saturating_add(other.mutable_bytes);
+        self.local_io_concurrency = self
+            .local_io_concurrency
+            .saturating_add(other.local_io_concurrency);
+        self.local_io_bytes_per_second = self
+            .local_io_bytes_per_second
+            .saturating_add(other.local_io_bytes_per_second);
+        self.remote_io_concurrency = self
+            .remote_io_concurrency
+            .saturating_add(other.remote_io_concurrency);
+        self.remote_io_bytes_per_second = self
+            .remote_io_bytes_per_second
+            .saturating_add(other.remote_io_bytes_per_second);
+        self.background_tasks = self.background_tasks.saturating_add(other.background_tasks);
+        self.background_in_flight_bytes = self
+            .background_in_flight_bytes
+            .saturating_add(other.background_in_flight_bytes);
+    }
+
+    fn saturating_sub_assign(&mut self, other: ExecutionResourceUsage) {
+        self.cpu_workers = self.cpu_workers.saturating_sub(other.cpu_workers);
+        self.memory_bytes = self.memory_bytes.saturating_sub(other.memory_bytes);
+        self.cache_bytes = self.cache_bytes.saturating_sub(other.cache_bytes);
+        self.mutable_bytes = self.mutable_bytes.saturating_sub(other.mutable_bytes);
+        self.local_io_concurrency = self
+            .local_io_concurrency
+            .saturating_sub(other.local_io_concurrency);
+        self.local_io_bytes_per_second = self
+            .local_io_bytes_per_second
+            .saturating_sub(other.local_io_bytes_per_second);
+        self.remote_io_concurrency = self
+            .remote_io_concurrency
+            .saturating_sub(other.remote_io_concurrency);
+        self.remote_io_bytes_per_second = self
+            .remote_io_bytes_per_second
+            .saturating_sub(other.remote_io_bytes_per_second);
+        self.background_tasks = self.background_tasks.saturating_sub(other.background_tasks);
+        self.background_in_flight_bytes = self
+            .background_in_flight_bytes
+            .saturating_sub(other.background_in_flight_bytes);
+    }
+
+    fn is_non_zero(&self) -> bool {
+        Self::metric_is_non_zero(self.cpu_workers as u64)
+            || Self::metric_is_non_zero(self.memory_bytes)
+            || Self::metric_is_non_zero(self.cache_bytes)
+            || Self::metric_is_non_zero(self.mutable_bytes)
+            || Self::metric_is_non_zero(self.local_io_concurrency as u64)
+            || Self::metric_is_non_zero(self.local_io_bytes_per_second)
+            || Self::metric_is_non_zero(self.remote_io_concurrency as u64)
+            || Self::metric_is_non_zero(self.remote_io_bytes_per_second)
+            || Self::metric_is_non_zero(self.background_tasks as u64)
+            || Self::metric_is_non_zero(self.background_in_flight_bytes)
+    }
+
+    fn metric_is_non_zero(value: u64) -> bool {
+        value > 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionDomainBacklogSnapshot {
+    pub queued_work_items: u32,
+    pub queued_bytes: u64,
+}
+
+impl ExecutionDomainBacklogSnapshot {
+    fn saturating_add_assign(&mut self, other: ExecutionDomainBacklogSnapshot) {
+        self.queued_work_items = self
+            .queued_work_items
+            .saturating_add(other.queued_work_items);
+        self.queued_bytes = self.queued_bytes.saturating_add(other.queued_bytes);
+    }
+
+    fn is_non_zero(&self) -> bool {
+        self.queued_work_items > 0 || self.queued_bytes > 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ExecutionResourceKind {
+    CpuWorkers,
+    MemoryBytes,
+    CacheBytes,
+    MutableBytes,
+    LocalIoConcurrency,
+    LocalIoBandwidth,
+    RemoteIoConcurrency,
+    RemoteIoBandwidth,
+    BackgroundTasks,
+    BackgroundInFlightBytes,
+}
+
+impl ExecutionResourceKind {
+    const ALL: [Self; 10] = [
+        Self::CpuWorkers,
+        Self::MemoryBytes,
+        Self::CacheBytes,
+        Self::MutableBytes,
+        Self::LocalIoConcurrency,
+        Self::LocalIoBandwidth,
+        Self::RemoteIoConcurrency,
+        Self::RemoteIoBandwidth,
+        Self::BackgroundTasks,
+        Self::BackgroundInFlightBytes,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainUsageSnapshot {
     pub cpu_workers_in_use: u32,
     pub memory_bytes: u64,
+    pub cache_bytes: u64,
+    pub mutable_bytes: u64,
     pub local_io_in_flight: u32,
+    pub local_io_bytes_per_second: u64,
     pub remote_io_in_flight: u32,
+    pub remote_io_bytes_per_second: u64,
     pub background_tasks: u32,
+    pub background_in_flight_bytes: u64,
     pub queued_work_items: u32,
+    pub queued_bytes: u64,
+}
+
+impl ExecutionDomainUsageSnapshot {
+    fn from_usage_and_backlog(
+        usage: ExecutionResourceUsage,
+        backlog: ExecutionDomainBacklogSnapshot,
+    ) -> Self {
+        Self {
+            cpu_workers_in_use: usage.cpu_workers,
+            memory_bytes: usage.memory_bytes,
+            cache_bytes: usage.cache_bytes,
+            mutable_bytes: usage.mutable_bytes,
+            local_io_in_flight: usage.local_io_concurrency,
+            local_io_bytes_per_second: usage.local_io_bytes_per_second,
+            remote_io_in_flight: usage.remote_io_concurrency,
+            remote_io_bytes_per_second: usage.remote_io_bytes_per_second,
+            background_tasks: usage.background_tasks,
+            background_in_flight_bytes: usage.background_in_flight_bytes,
+            queued_work_items: backlog.queued_work_items,
+            queued_bytes: backlog.queued_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionDomainContentionSnapshot {
+    pub blocked_requests: u64,
+    pub contention_events: u64,
+    pub last_blocked_by: Vec<ExecutionResourceKind>,
+}
+
+impl ExecutionDomainContentionSnapshot {
+    fn record_blocked(&mut self, blocked_by: &[ExecutionResourceKind]) {
+        if blocked_by.is_empty() {
+            return;
+        }
+        self.blocked_requests = self.blocked_requests.saturating_add(1);
+        self.contention_events = self.contention_events.saturating_add(1);
+        self.last_blocked_by = blocked_by.to_vec();
+    }
+
+    fn saturating_add_assign(&mut self, other: &ExecutionDomainContentionSnapshot) {
+        self.blocked_requests = self.blocked_requests.saturating_add(other.blocked_requests);
+        self.contention_events = self
+            .contention_events
+            .saturating_add(other.contention_events);
+        let mut reasons = self
+            .last_blocked_by
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        reasons.extend(other.last_blocked_by.iter().copied());
+        self.last_blocked_by = reasons.into_iter().collect();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionDomainSnapshot {
     pub spec: ExecutionDomainSpec,
+    pub parent: Option<ExecutionDomainPath>,
     pub state: ExecutionDomainState,
+    pub effective_budget: ExecutionDomainBudget,
     pub usage: ExecutionDomainUsageSnapshot,
+    pub backlog: ExecutionDomainBacklogSnapshot,
+    pub contention: ExecutionDomainContentionSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +677,15 @@ pub struct ResourceManagerSnapshot {
     pub domains: BTreeMap<ExecutionDomainPath, ExecutionDomainSnapshot>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceAdmissionDecision {
+    pub admitted: bool,
+    pub borrowed_shared_capacity: bool,
+    pub blocked_by: Vec<ExecutionResourceKind>,
+    pub effective_budget: ExecutionDomainBudget,
+    pub snapshot: ExecutionDomainSnapshot,
+}
+
 pub trait ResourceManager: Send + Sync {
     fn process_budget(&self) -> ExecutionDomainBudget;
     fn placement_policy(&self) -> Arc<dyn PlacementPolicy>;
@@ -455,14 +696,46 @@ pub trait ResourceManager: Send + Sync {
     fn snapshot(&self) -> ResourceManagerSnapshot;
     fn assign(&self, request: PlacementRequest) -> PlacementAssignment;
     fn placement_tag(&self, request: WorkPlacementRequest) -> WorkRuntimeTag;
+    fn try_acquire(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> ResourceAdmissionDecision;
+    fn release(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> ExecutionDomainSnapshot;
+    fn set_backlog(
+        &self,
+        path: &ExecutionDomainPath,
+        backlog: ExecutionDomainBacklogSnapshot,
+    ) -> ExecutionDomainSnapshot;
 }
 
-/// Deterministic in-memory stub used until a real process-wide scheduler lands.
+#[derive(Clone)]
+struct DomainRuntimeRecord {
+    spec: ExecutionDomainSpec,
+    state: ExecutionDomainState,
+    direct_usage: ExecutionResourceUsage,
+    backlog: ExecutionDomainBacklogSnapshot,
+    contention: ExecutionDomainContentionSnapshot,
+    explicit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MetricLimit {
+    limit: u64,
+    strict_share: u64,
+}
+
+/// Deterministic in-memory manager used until a runtime-backed process-wide
+/// scheduler lands.
 pub struct InMemoryResourceManager {
     process_budget: ExecutionDomainBudget,
     invariants: ExecutionDomainInvariantSet,
     placement_policy: Arc<dyn PlacementPolicy>,
-    domains: Mutex<BTreeMap<ExecutionDomainPath, ExecutionDomainSnapshot>>,
+    domains: Mutex<BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>>,
     hooks: Mutex<Vec<Arc<dyn ExecutionDomainLifecycleHook>>>,
 }
 
@@ -493,11 +766,121 @@ impl InMemoryResourceManager {
         self
     }
 
-    fn snapshot_for_spec(&self, spec: ExecutionDomainSpec) -> ExecutionDomainSnapshot {
-        ExecutionDomainSnapshot {
-            spec,
-            state: ExecutionDomainState::Active,
-            usage: ExecutionDomainUsageSnapshot::default(),
+    fn synthetic_spec(path: &ExecutionDomainPath) -> ExecutionDomainSpec {
+        ExecutionDomainSpec {
+            path: path.clone(),
+            owner: if path.is_root() {
+                ExecutionDomainOwner::ProcessControl
+            } else {
+                ExecutionDomainOwner::Custom {
+                    kind: "hierarchy".to_string(),
+                    name: path.as_string(),
+                }
+            },
+            budget: ExecutionDomainBudget::default(),
+            placement: ExecutionDomainPlacement::default(),
+            metadata: BTreeMap::from([("terracedb.synthetic".to_string(), "true".to_string())]),
+        }
+    }
+
+    fn ensure_record(
+        domains: &mut BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+    ) {
+        for ancestor in path.lineage() {
+            domains
+                .entry(ancestor.clone())
+                .or_insert_with(|| DomainRuntimeRecord {
+                    spec: Self::synthetic_spec(&ancestor),
+                    state: ExecutionDomainState::Active,
+                    direct_usage: ExecutionResourceUsage::default(),
+                    backlog: ExecutionDomainBacklogSnapshot::default(),
+                    contention: ExecutionDomainContentionSnapshot::default(),
+                    explicit: false,
+                });
+        }
+    }
+
+    fn merge_budget(
+        left: ExecutionDomainBudget,
+        right: ExecutionDomainBudget,
+    ) -> ExecutionDomainBudget {
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: merge_optional_u32(left.cpu.worker_slots, right.cpu.worker_slots),
+                weight: merge_optional_weight(left.cpu.weight, right.cpu.weight),
+            },
+            memory: DomainMemoryBudget {
+                total_bytes: merge_optional_u64(left.memory.total_bytes, right.memory.total_bytes),
+                cache_bytes: merge_optional_u64(left.memory.cache_bytes, right.memory.cache_bytes),
+                mutable_bytes: merge_optional_u64(
+                    left.memory.mutable_bytes,
+                    right.memory.mutable_bytes,
+                ),
+            },
+            io: DomainIoBudget {
+                local_concurrency: merge_optional_u32(
+                    left.io.local_concurrency,
+                    right.io.local_concurrency,
+                ),
+                local_bytes_per_second: merge_optional_u64(
+                    left.io.local_bytes_per_second,
+                    right.io.local_bytes_per_second,
+                ),
+                remote_concurrency: merge_optional_u32(
+                    left.io.remote_concurrency,
+                    right.io.remote_concurrency,
+                ),
+                remote_bytes_per_second: merge_optional_u64(
+                    left.io.remote_bytes_per_second,
+                    right.io.remote_bytes_per_second,
+                ),
+            },
+            background: DomainBackgroundBudget {
+                task_slots: merge_optional_u32(
+                    left.background.task_slots,
+                    right.background.task_slots,
+                ),
+                max_in_flight_bytes: merge_optional_u64(
+                    left.background.max_in_flight_bytes,
+                    right.background.max_in_flight_bytes,
+                ),
+            },
+        }
+    }
+
+    fn merge_spec(left: ExecutionDomainSpec, right: ExecutionDomainSpec) -> ExecutionDomainSpec {
+        let owner = if left.owner == right.owner {
+            left.owner.clone()
+        } else {
+            ExecutionDomainOwner::Custom {
+                kind: "shared-domain".to_string(),
+                name: left.path.as_string(),
+            }
+        };
+        let placement = match (left.placement, right.placement) {
+            (ExecutionDomainPlacement::Dedicated, _) | (_, ExecutionDomainPlacement::Dedicated) => {
+                ExecutionDomainPlacement::Dedicated
+            }
+            (
+                ExecutionDomainPlacement::SharedWeighted {
+                    weight: left_weight,
+                },
+                ExecutionDomainPlacement::SharedWeighted {
+                    weight: right_weight,
+                },
+            ) => ExecutionDomainPlacement::SharedWeighted {
+                weight: left_weight.max(right_weight),
+            },
+        };
+        let mut metadata = left.metadata.clone();
+        metadata.extend(right.metadata);
+        ExecutionDomainSpec {
+            path: left.path,
+            owner,
+            budget: Self::merge_budget(left.budget, right.budget),
+            placement,
+            metadata,
         }
     }
 
@@ -505,6 +888,361 @@ impl InMemoryResourceManager {
         let hooks = self.hooks.lock().clone();
         for hook in hooks {
             hook.on_event(snapshot, event);
+        }
+    }
+
+    fn aggregate_usage(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+    ) -> ExecutionResourceUsage {
+        let mut usage = ExecutionResourceUsage::default();
+        for (candidate, record) in domains {
+            if candidate.is_same_or_descendant_of(path) {
+                usage.saturating_add_assign(record.direct_usage);
+            }
+        }
+        usage
+    }
+
+    fn aggregate_metric(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+        kind: ExecutionResourceKind,
+    ) -> u64 {
+        domains
+            .iter()
+            .filter(|(candidate, _)| candidate.is_same_or_descendant_of(path))
+            .fold(0_u64, |total, (_, record)| {
+                total.saturating_add(record.direct_usage.metric(kind))
+            })
+    }
+
+    fn aggregate_backlog(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+    ) -> ExecutionDomainBacklogSnapshot {
+        let mut backlog = ExecutionDomainBacklogSnapshot::default();
+        for (candidate, record) in domains {
+            if candidate.is_same_or_descendant_of(path) {
+                backlog.saturating_add_assign(record.backlog);
+            }
+        }
+        backlog
+    }
+
+    fn aggregate_contention(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+    ) -> ExecutionDomainContentionSnapshot {
+        let mut contention = ExecutionDomainContentionSnapshot::default();
+        for (candidate, record) in domains {
+            if candidate.is_same_or_descendant_of(path) {
+                contention.saturating_add_assign(&record.contention);
+            }
+        }
+        contention
+    }
+
+    fn direct_children(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        parent: &ExecutionDomainPath,
+    ) -> Vec<ExecutionDomainPath> {
+        domains
+            .keys()
+            .filter(|path| path.parent().as_ref() == Some(parent))
+            .cloned()
+            .collect()
+    }
+
+    fn is_branch_busy(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        branch: &ExecutionDomainPath,
+        active_path: &ExecutionDomainPath,
+    ) -> bool {
+        active_path.is_same_or_descendant_of(branch)
+            || self.aggregate_usage(domains, branch).is_non_zero()
+            || self.aggregate_backlog(domains, branch).is_non_zero()
+    }
+
+    fn metric_weight_for_path(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+        kind: ExecutionResourceKind,
+    ) -> u32 {
+        let record = domains
+            .get(path)
+            .expect("execution domain must exist before computing weight");
+        if kind == ExecutionResourceKind::CpuWorkers
+            && let Some(weight) = record.spec.budget.cpu.weight
+        {
+            return weight.max(1);
+        }
+        match record.spec.placement {
+            ExecutionDomainPlacement::SharedWeighted { weight } => weight.max(1),
+            ExecutionDomainPlacement::Dedicated => 1,
+        }
+    }
+
+    fn metric_budget_limit(
+        budget: ExecutionDomainBudget,
+        kind: ExecutionResourceKind,
+    ) -> Option<u64> {
+        match kind {
+            ExecutionResourceKind::CpuWorkers => budget.cpu.worker_slots.map(u64::from),
+            ExecutionResourceKind::MemoryBytes => budget.memory.total_bytes,
+            ExecutionResourceKind::CacheBytes => budget.memory.cache_bytes,
+            ExecutionResourceKind::MutableBytes => budget.memory.mutable_bytes,
+            ExecutionResourceKind::LocalIoConcurrency => budget.io.local_concurrency.map(u64::from),
+            ExecutionResourceKind::LocalIoBandwidth => budget.io.local_bytes_per_second,
+            ExecutionResourceKind::RemoteIoConcurrency => {
+                budget.io.remote_concurrency.map(u64::from)
+            }
+            ExecutionResourceKind::RemoteIoBandwidth => budget.io.remote_bytes_per_second,
+            ExecutionResourceKind::BackgroundTasks => budget.background.task_slots.map(u64::from),
+            ExecutionResourceKind::BackgroundInFlightBytes => budget.background.max_in_flight_bytes,
+        }
+    }
+
+    fn reserved_child_limit(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        child: &ExecutionDomainPath,
+        kind: ExecutionResourceKind,
+        parent_limit: u64,
+    ) -> u64 {
+        let record = domains
+            .get(child)
+            .expect("dedicated child must exist before computing reservations");
+        let requested = Self::metric_budget_limit(record.spec.budget, kind).unwrap_or(parent_limit);
+        requested.min(parent_limit)
+    }
+
+    fn metric_limit_locked(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+        kind: ExecutionResourceKind,
+        active_path: &ExecutionDomainPath,
+    ) -> MetricLimit {
+        let record = domains
+            .get(path)
+            .expect("execution domain must exist before computing limits");
+        let own_requested_limit = Self::metric_budget_limit(record.spec.budget, kind);
+
+        let Some(parent) = path.parent() else {
+            let process_limit =
+                Self::metric_budget_limit(self.process_budget, kind).unwrap_or(u64::MAX);
+            let own_limit = own_requested_limit
+                .unwrap_or(process_limit)
+                .min(process_limit);
+            return MetricLimit {
+                limit: own_limit,
+                strict_share: own_limit,
+            };
+        };
+
+        let parent_limit = self
+            .metric_limit_locked(domains, &parent, kind, active_path)
+            .limit;
+        let own_ceiling = own_requested_limit
+            .unwrap_or(parent_limit)
+            .min(parent_limit);
+
+        match record.spec.placement {
+            ExecutionDomainPlacement::Dedicated => MetricLimit {
+                limit: own_ceiling,
+                strict_share: own_ceiling,
+            },
+            ExecutionDomainPlacement::SharedWeighted { .. } => {
+                let children = self.direct_children(domains, &parent);
+                let shared_children = children
+                    .iter()
+                    .filter(|child| {
+                        let child_record = domains
+                            .get(*child)
+                            .expect("child domain must exist before filtering");
+                        child_record.state != ExecutionDomainState::Retired
+                            && matches!(
+                                child_record.spec.placement,
+                                ExecutionDomainPlacement::SharedWeighted { .. }
+                            )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let reserved_total = children
+                    .iter()
+                    .filter_map(|child| {
+                        let child_record = domains
+                            .get(child)
+                            .expect("child domain must exist before computing reservations");
+                        (child_record.state != ExecutionDomainState::Retired
+                            && matches!(
+                                child_record.spec.placement,
+                                ExecutionDomainPlacement::Dedicated
+                            ))
+                        .then_some(self.reserved_child_limit(
+                            domains,
+                            child,
+                            kind,
+                            parent_limit,
+                        ))
+                    })
+                    .fold(0_u64, |total, reserved| total.saturating_add(reserved));
+                let shared_pool = parent_limit.saturating_sub(reserved_total);
+
+                let total_registered_weight = shared_children.iter().fold(0_u32, |total, child| {
+                    total.saturating_add(self.metric_weight_for_path(domains, child, kind))
+                });
+                let own_weight = self.metric_weight_for_path(domains, path, kind);
+                let strict_share = if shared_children.len() <= 1 || total_registered_weight == 0 {
+                    shared_pool
+                } else {
+                    weighted_share(shared_pool, own_weight, total_registered_weight)
+                };
+
+                let busy_children = shared_children
+                    .iter()
+                    .filter(|child| self.is_branch_busy(domains, child, active_path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let busy_weight = busy_children.iter().fold(0_u32, |total, child| {
+                    total.saturating_add(self.metric_weight_for_path(domains, child, kind))
+                });
+                let nonbusy_usage = shared_children
+                    .iter()
+                    .filter(|child| !busy_children.contains(child))
+                    .fold(0_u64, |total, child| {
+                        total.saturating_add(self.aggregate_metric(domains, child, kind))
+                    });
+                let busy_pool = shared_pool.saturating_sub(nonbusy_usage);
+                let dynamic_share = if busy_children.len() <= 1 || busy_weight == 0 {
+                    busy_pool
+                } else {
+                    weighted_share(busy_pool, own_weight, busy_weight)
+                };
+
+                MetricLimit {
+                    limit: own_ceiling.min(dynamic_share),
+                    strict_share: own_ceiling.min(strict_share),
+                }
+            }
+        }
+    }
+
+    fn effective_budget_locked(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+    ) -> ExecutionDomainBudget {
+        let cpu_limit =
+            self.metric_limit_locked(domains, path, ExecutionResourceKind::CpuWorkers, path);
+        let memory_limit =
+            self.metric_limit_locked(domains, path, ExecutionResourceKind::MemoryBytes, path);
+        let cache_limit =
+            self.metric_limit_locked(domains, path, ExecutionResourceKind::CacheBytes, path);
+        let mutable_limit =
+            self.metric_limit_locked(domains, path, ExecutionResourceKind::MutableBytes, path);
+        let local_io_limit = self.metric_limit_locked(
+            domains,
+            path,
+            ExecutionResourceKind::LocalIoConcurrency,
+            path,
+        );
+        let local_io_bandwidth_limit =
+            self.metric_limit_locked(domains, path, ExecutionResourceKind::LocalIoBandwidth, path);
+        let remote_io_limit = self.metric_limit_locked(
+            domains,
+            path,
+            ExecutionResourceKind::RemoteIoConcurrency,
+            path,
+        );
+        let remote_io_bandwidth_limit = self.metric_limit_locked(
+            domains,
+            path,
+            ExecutionResourceKind::RemoteIoBandwidth,
+            path,
+        );
+        let background_limit =
+            self.metric_limit_locked(domains, path, ExecutionResourceKind::BackgroundTasks, path);
+        let background_bytes_limit = self.metric_limit_locked(
+            domains,
+            path,
+            ExecutionResourceKind::BackgroundInFlightBytes,
+            path,
+        );
+
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: limit_u64_to_u32_option(cpu_limit.limit),
+                weight: Some(self.metric_weight_for_path(
+                    domains,
+                    path,
+                    ExecutionResourceKind::CpuWorkers,
+                )),
+            },
+            memory: DomainMemoryBudget {
+                total_bytes: limit_u64_to_option(memory_limit.limit),
+                cache_bytes: limit_u64_to_option(cache_limit.limit),
+                mutable_bytes: limit_u64_to_option(mutable_limit.limit),
+            },
+            io: DomainIoBudget {
+                local_concurrency: limit_u64_to_u32_option(local_io_limit.limit),
+                local_bytes_per_second: limit_u64_to_option(local_io_bandwidth_limit.limit),
+                remote_concurrency: limit_u64_to_u32_option(remote_io_limit.limit),
+                remote_bytes_per_second: limit_u64_to_option(remote_io_bandwidth_limit.limit),
+            },
+            background: DomainBackgroundBudget {
+                task_slots: limit_u64_to_u32_option(background_limit.limit),
+                max_in_flight_bytes: limit_u64_to_option(background_bytes_limit.limit),
+            },
+        }
+    }
+
+    fn domain_snapshot_locked(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+        path: &ExecutionDomainPath,
+    ) -> ExecutionDomainSnapshot {
+        let record = domains
+            .get(path)
+            .expect("execution domain must exist before snapshotting");
+        let backlog = self.aggregate_backlog(domains, path);
+        let usage = self.aggregate_usage(domains, path);
+        let contention = self.aggregate_contention(domains, path);
+        ExecutionDomainSnapshot {
+            spec: record.spec.clone(),
+            parent: path.parent(),
+            state: record.state,
+            effective_budget: self.effective_budget_locked(domains, path),
+            usage: ExecutionDomainUsageSnapshot::from_usage_and_backlog(usage, backlog),
+            backlog,
+            contention,
+        }
+    }
+
+    fn build_snapshot_locked(
+        &self,
+        domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>,
+    ) -> ResourceManagerSnapshot {
+        ResourceManagerSnapshot {
+            process_budget: self.process_budget,
+            placement_policy_name: self.placement_policy.name().to_string(),
+            invariants: self.invariants.clone(),
+            domains: domains
+                .keys()
+                .cloned()
+                .map(|path| {
+                    let snapshot = self.domain_snapshot_locked(domains, &path);
+                    (path, snapshot)
+                })
+                .collect(),
         }
     }
 }
@@ -519,31 +1257,65 @@ impl ResourceManager for InMemoryResourceManager {
     }
 
     fn register_domain(&self, spec: ExecutionDomainSpec) -> ExecutionDomainSnapshot {
-        let snapshot = self.snapshot_for_spec(spec);
-        self.domains
-            .lock()
-            .insert(snapshot.spec.path.clone(), snapshot.clone());
-        self.notify(&snapshot, ExecutionDomainLifecycleEvent::Registered);
+        let (snapshot, event) = {
+            let mut domains = self.domains.lock();
+            Self::ensure_record(&mut domains, &spec.path);
+            let event = if domains
+                .get(&spec.path)
+                .is_some_and(|record| record.explicit)
+            {
+                ExecutionDomainLifecycleEvent::Updated
+            } else {
+                ExecutionDomainLifecycleEvent::Registered
+            };
+            let entry = domains
+                .get_mut(&spec.path)
+                .expect("domain must exist after ensuring hierarchy");
+            entry.spec = Self::merge_spec(entry.spec.clone(), spec);
+            entry.state = ExecutionDomainState::Active;
+            entry.explicit = true;
+            let path = entry.spec.path.clone();
+            let snapshot = self.domain_snapshot_locked(&domains, &path);
+            (snapshot, event)
+        };
+        self.notify(&snapshot, event);
         snapshot
     }
 
     fn update_domain(&self, spec: ExecutionDomainSpec) -> ExecutionDomainSnapshot {
-        let snapshot = self.snapshot_for_spec(spec);
-        self.domains
-            .lock()
-            .insert(snapshot.spec.path.clone(), snapshot.clone());
-        self.notify(&snapshot, ExecutionDomainLifecycleEvent::Updated);
+        let (snapshot, event) = {
+            let mut domains = self.domains.lock();
+            Self::ensure_record(&mut domains, &spec.path);
+            let event = if domains
+                .get(&spec.path)
+                .is_some_and(|record| record.explicit)
+            {
+                ExecutionDomainLifecycleEvent::Updated
+            } else {
+                ExecutionDomainLifecycleEvent::Registered
+            };
+            let entry = domains
+                .get_mut(&spec.path)
+                .expect("domain must exist after ensuring hierarchy");
+            entry.spec = Self::merge_spec(entry.spec.clone(), spec);
+            entry.state = ExecutionDomainState::Active;
+            entry.explicit = true;
+            let path = entry.spec.path.clone();
+            let snapshot = self.domain_snapshot_locked(&domains, &path);
+            (snapshot, event)
+        };
+        self.notify(&snapshot, event);
         snapshot
     }
 
     fn retire_domain(&self, path: &ExecutionDomainPath) {
         let snapshot = {
             let mut domains = self.domains.lock();
-            let Some(existing) = domains.get_mut(path) else {
+            let Some(entry) = domains.get_mut(path) else {
                 return;
             };
-            existing.state = ExecutionDomainState::Retired;
-            existing.clone()
+            entry.state = ExecutionDomainState::Retired;
+            self.domain_snapshot_locked(&domains, path)
         };
         self.notify(&snapshot, ExecutionDomainLifecycleEvent::Retired);
     }
@@ -553,12 +1325,8 @@ impl ResourceManager for InMemoryResourceManager {
     }
 
     fn snapshot(&self) -> ResourceManagerSnapshot {
-        ResourceManagerSnapshot {
-            process_budget: self.process_budget,
-            placement_policy_name: self.placement_policy.name().to_string(),
-            invariants: self.invariants.clone(),
-            domains: self.domains.lock().clone(),
-        }
+        let domains = self.domains.lock();
+        self.build_snapshot_locked(&domains)
     }
 
     fn assign(&self, request: PlacementRequest) -> PlacementAssignment {
@@ -573,6 +1341,98 @@ impl ResourceManager for InMemoryResourceManager {
             domain: request.binding.domain,
             durability_class: request.binding.durability_class,
         }
+    }
+
+    fn try_acquire(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> ResourceAdmissionDecision {
+        let mut domains = self.domains.lock();
+        Self::ensure_record(&mut domains, path);
+
+        let current_usage = self.aggregate_usage(&domains, path);
+        let mut after_usage = current_usage;
+        after_usage.saturating_add_assign(usage);
+
+        let mut blocked = BTreeSet::new();
+        let mut borrowed_shared_capacity = false;
+
+        for kind in ExecutionResourceKind::ALL {
+            let path_limit = self.metric_limit_locked(&domains, path, kind, path);
+            let after_path_metric = after_usage.metric(kind);
+            if after_path_metric > path_limit.limit {
+                blocked.insert(kind);
+            }
+
+            for ancestor in path.lineage() {
+                let current_metric = self.aggregate_metric(&domains, &ancestor, kind);
+                let after_metric = current_metric.saturating_add(usage.metric(kind));
+                let ancestor_limit = self.metric_limit_locked(&domains, &ancestor, kind, path);
+                if after_metric > ancestor_limit.limit {
+                    blocked.insert(kind);
+                } else if after_metric > ancestor_limit.strict_share {
+                    borrowed_shared_capacity = true;
+                }
+            }
+        }
+
+        if blocked.is_empty() {
+            let entry = domains
+                .get_mut(path)
+                .expect("domain must exist before applying usage");
+            entry.direct_usage.saturating_add_assign(usage);
+            let snapshot = self.domain_snapshot_locked(&domains, path);
+            return ResourceAdmissionDecision {
+                admitted: true,
+                borrowed_shared_capacity,
+                blocked_by: Vec::new(),
+                effective_budget: snapshot.effective_budget,
+                snapshot,
+            };
+        }
+
+        let blocked_by = blocked.into_iter().collect::<Vec<_>>();
+        let entry = domains
+            .get_mut(path)
+            .expect("domain must exist before recording contention");
+        entry.contention.record_blocked(&blocked_by);
+        let snapshot = self.domain_snapshot_locked(&domains, path);
+        ResourceAdmissionDecision {
+            admitted: false,
+            borrowed_shared_capacity: false,
+            blocked_by,
+            effective_budget: snapshot.effective_budget,
+            snapshot,
+        }
+    }
+
+    fn release(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> ExecutionDomainSnapshot {
+        let mut domains = self.domains.lock();
+        Self::ensure_record(&mut domains, path);
+        let entry = domains
+            .get_mut(path)
+            .expect("domain must exist before releasing usage");
+        entry.direct_usage.saturating_sub_assign(usage);
+        self.domain_snapshot_locked(&domains, path)
+    }
+
+    fn set_backlog(
+        &self,
+        path: &ExecutionDomainPath,
+        backlog: ExecutionDomainBacklogSnapshot,
+    ) -> ExecutionDomainSnapshot {
+        let mut domains = self.domains.lock();
+        Self::ensure_record(&mut domains, path);
+        let entry = domains
+            .get_mut(path)
+            .expect("domain must exist before updating backlog");
+        entry.backlog = backlog;
+        self.domain_snapshot_locked(&domains, path)
     }
 }
 
@@ -624,13 +1484,15 @@ pub struct InMemoryDomainBudgetOracle {
 impl DomainBudgetOracle for InMemoryDomainBudgetOracle {
     fn record(&self, tag: &WorkRuntimeTag, charge: DomainBudgetCharge) {
         let mut by_domain = self.by_domain.lock();
-        let snapshot = by_domain.entry(tag.domain.clone()).or_default();
-        snapshot.total.saturating_add_assign(charge);
-        snapshot
-            .by_contention_class
-            .entry(tag.contention_class)
-            .or_default()
-            .saturating_add_assign(charge);
+        for path in tag.domain.lineage() {
+            let snapshot = by_domain.entry(path).or_default();
+            snapshot.total.saturating_add_assign(charge);
+            snapshot
+                .by_contention_class
+                .entry(tag.contention_class)
+                .or_default()
+                .saturating_add_assign(charge);
+        }
     }
 
     fn snapshot(&self) -> BTreeMap<ExecutionDomainPath, DomainBudgetSnapshot> {
@@ -649,4 +1511,49 @@ pub struct ColocatedDbWorkloadSpec {
 
 pub trait ColocatedDbWorkloadGenerator: Send + Sync {
     fn generate(&self, seed: u64) -> Vec<ColocatedDbWorkloadSpec>;
+}
+
+fn merge_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_optional_u32(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_optional_weight(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value.max(1)),
+        (None, None) => None,
+    }
+}
+
+fn weighted_share(pool: u64, weight: u32, total_weight: u32) -> u64 {
+    if total_weight == 0 {
+        return pool;
+    }
+    let share = ((u128::from(pool) * u128::from(weight)) / u128::from(total_weight))
+        .min(u128::from(u64::MAX)) as u64;
+    if share == 0 && pool > 0 { 1 } else { share }
+}
+
+fn limit_u64_to_option(limit: u64) -> Option<u64> {
+    (limit != u64::MAX).then_some(limit)
+}
+
+fn limit_u64_to_u32_option(limit: u64) -> Option<u32> {
+    if limit == u64::MAX {
+        None
+    } else {
+        Some(limit.min(u64::from(u32::MAX)) as u32)
+    }
 }

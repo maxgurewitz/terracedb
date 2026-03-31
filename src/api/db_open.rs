@@ -20,7 +20,16 @@ impl Db {
                 .unwrap_or_else(|| Arc::new(RoundRobinScheduler::default()));
             config.scheduler = Some(scheduler.clone());
             let resource_manager = dependencies.resource_manager();
-            let execution_profile = dependencies.execution_profile().clone();
+            let execution_profile = Self::resolve_execution_profile(
+                &resource_manager,
+                dependencies.execution_profile().clone(),
+                &db_name,
+            );
+            Self::register_execution_profile_domains(
+                &resource_manager,
+                &db_name,
+                &execution_profile,
+            );
             if let StorageConfig::Tiered(tiered) = &config.storage {
                 Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
             }
@@ -140,6 +149,116 @@ impl Db {
         }
         .instrument(span.clone())
         .await
+    }
+
+    fn resolve_execution_profile(
+        resource_manager: &Arc<dyn crate::execution::ResourceManager>,
+        execution_profile: crate::execution::DbExecutionProfile,
+        db_name: &str,
+    ) -> crate::execution::DbExecutionProfile {
+        let foreground = Self::resolve_execution_lane(
+            resource_manager,
+            crate::execution::ExecutionDomainOwner::Database {
+                name: db_name.to_string(),
+            },
+            &execution_profile.foreground,
+        );
+        let background = Self::resolve_execution_lane(
+            resource_manager,
+            crate::execution::ExecutionDomainOwner::Database {
+                name: db_name.to_string(),
+            },
+            &execution_profile.background,
+        );
+        let control_plane = Self::resolve_execution_lane(
+            resource_manager,
+            crate::execution::ExecutionDomainOwner::Subsystem {
+                database: Some(db_name.to_string()),
+                name: "control-plane".to_string(),
+            },
+            &execution_profile.control_plane,
+        );
+        execution_profile
+            .with_foreground(foreground)
+            .with_background(background)
+            .with_control_plane(control_plane)
+    }
+
+    fn resolve_execution_lane(
+        resource_manager: &Arc<dyn crate::execution::ResourceManager>,
+        owner: crate::execution::ExecutionDomainOwner,
+        binding: &crate::execution::ExecutionLaneBinding,
+    ) -> crate::execution::ExecutionLaneBinding {
+        let assignment = resource_manager.assign(crate::execution::PlacementRequest {
+            owner,
+            preferred_domain: binding.domain.clone(),
+            requested_budget: crate::execution::ExecutionDomainBudget::default(),
+            placement: crate::execution::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+            default_durability_class: binding.durability_class.clone(),
+        });
+        crate::execution::ExecutionLaneBinding::new(
+            assignment.domain,
+            assignment.default_durability_class,
+        )
+    }
+
+    fn register_execution_profile_domains(
+        resource_manager: &Arc<dyn crate::execution::ResourceManager>,
+        db_name: &str,
+        execution_profile: &crate::execution::DbExecutionProfile,
+    ) {
+        let user_owner = crate::execution::ExecutionDomainOwner::Database {
+            name: db_name.to_string(),
+        };
+        let control_owner = crate::execution::ExecutionDomainOwner::Subsystem {
+            database: Some(db_name.to_string()),
+            name: "control-plane".to_string(),
+        };
+
+        for (binding, owner, lane_key) in [
+            (
+                &execution_profile.foreground,
+                user_owner.clone(),
+                "user-foreground",
+            ),
+            (
+                &execution_profile.background,
+                user_owner.clone(),
+                "user-background",
+            ),
+            (
+                &execution_profile.control_plane,
+                control_owner,
+                "control-plane",
+            ),
+        ] {
+            resource_manager.register_domain(crate::execution::ExecutionDomainSpec {
+                path: binding.domain.clone(),
+                owner,
+                budget: crate::execution::ExecutionDomainBudget::default(),
+                placement: crate::execution::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+                metadata: BTreeMap::from([
+                    (
+                        format!("terracedb.execution.lane.{lane_key}"),
+                        "true".to_string(),
+                    ),
+                    (
+                        "terracedb.execution.durability".to_string(),
+                        Self::durability_class_name(&binding.durability_class).to_string(),
+                    ),
+                ]),
+            });
+        }
+    }
+
+    fn durability_class_name(durability_class: &crate::execution::DurabilityClass) -> &'static str {
+        match durability_class {
+            crate::execution::DurabilityClass::UserData => "user-data",
+            crate::execution::DurabilityClass::ControlPlane => "control-plane",
+            crate::execution::DurabilityClass::Deferred => "deferred",
+            crate::execution::DurabilityClass::RemotePrimary => "remote-primary",
+            crate::execution::DurabilityClass::Custom(_) => "custom",
+        }
     }
 
     pub(super) fn validate_storage_config(storage: &StorageConfig) -> Result<(), OpenError> {

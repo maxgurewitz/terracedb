@@ -36,10 +36,12 @@ pub use self::hybrid::*;
 pub use terracedb::{
     ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec, ContentionClass, DbExecutionProfile,
     DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot, DomainTaggedWork,
-    DurabilityClass, ExecutionDomainBudget, ExecutionDomainInvariant, ExecutionDomainInvariantSet,
+    DurabilityClass, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget,
+    ExecutionDomainContentionSnapshot, ExecutionDomainInvariant, ExecutionDomainInvariantSet,
     ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSnapshot,
-    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, InMemoryDomainBudgetOracle,
-    InMemoryResourceManager, PlacementAssignment, PlacementRequest, ResourceManager,
+    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, ExecutionResourceKind,
+    ExecutionResourceUsage, InMemoryDomainBudgetOracle, InMemoryResourceManager,
+    PlacementAssignment, PlacementRequest, ResourceAdmissionDecision, ResourceManager,
     ResourceManagerSnapshot, WorkPlacementRequest, WorkRuntimeTag,
 };
 
