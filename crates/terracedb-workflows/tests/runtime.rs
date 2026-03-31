@@ -7,10 +7,10 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor,
-    ObjectStoreFailure, ObjectStoreOperation, OutboxEntry, ScanOptions, SequenceNumber,
-    StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table,
-    TieredDurabilityMode, Timestamp, Value,
+    ChangeFeedError, Clock, Db, DeterministicRng, FileSystemFailure, FileSystemOperation,
+    LogCursor, ObjectStoreFailure, ObjectStoreOperation, OutboxEntry, Rng as TerraceRng,
+    ScanOptions, SequenceNumber, StorageError, StorageErrorKind, StubClock, StubFileSystem,
+    StubObjectStore, Table, TieredDurabilityMode, Timestamp, Value,
     test_support::{
         FailpointMode, db_failpoint_registry, row_table_config, test_dependencies,
         test_dependencies_with_clock, tiered_test_config_with_durability,
@@ -797,6 +797,131 @@ struct WorkflowTablesSnapshot {
     rows: BTreeMap<String, Vec<(Vec<u8>, Value)>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkflowHistoricalCampaignCase {
+    scenario: WorkflowHistoricalSourceScenario,
+    has_timers: bool,
+    has_callbacks: bool,
+    has_pending_outbox: bool,
+}
+
+fn generated_historical_campaign(seed: u64) -> Vec<WorkflowHistoricalCampaignCase> {
+    let rng = DeterministicRng::seeded(seed);
+    let bootstraps = [
+        WorkflowSourceBootstrapPolicy::Beginning,
+        WorkflowSourceBootstrapPolicy::CurrentDurable,
+    ];
+    let recoveries = [
+        WorkflowSourceRecoveryPolicy::FailClosed,
+        WorkflowSourceRecoveryPolicy::RestoreCheckpoint,
+        WorkflowSourceRecoveryPolicy::ReplayFromHistory,
+        WorkflowSourceRecoveryPolicy::FastForwardToCurrentDurable,
+    ];
+
+    (0..8)
+        .map(|index| {
+            let (bootstrap, recovery, replay, checkpoint_support, event, checkpoint_available) =
+                match index {
+                    0 => (
+                        WorkflowSourceBootstrapPolicy::Beginning,
+                        WorkflowSourceRecoveryPolicy::FailClosed,
+                        WorkflowReplayableSourceKind::NonReplayable,
+                        WorkflowHistoricalArtifactSupport::Unsupported,
+                        WorkflowHistoricalEvent::FirstAttach,
+                        false,
+                    ),
+                    1 => (
+                        WorkflowSourceBootstrapPolicy::CurrentDurable,
+                        WorkflowSourceRecoveryPolicy::FailClosed,
+                        WorkflowReplayableSourceKind::NonReplayable,
+                        WorkflowHistoricalArtifactSupport::Unsupported,
+                        WorkflowHistoricalEvent::FirstAttach,
+                        false,
+                    ),
+                    2 => (
+                        WorkflowSourceBootstrapPolicy::Beginning,
+                        WorkflowSourceRecoveryPolicy::RestoreCheckpoint,
+                        WorkflowReplayableSourceKind::NonReplayable,
+                        WorkflowHistoricalArtifactSupport::Optional,
+                        WorkflowHistoricalEvent::SnapshotTooOld,
+                        true,
+                    ),
+                    3 => (
+                        WorkflowSourceBootstrapPolicy::Beginning,
+                        WorkflowSourceRecoveryPolicy::ReplayFromHistory,
+                        WorkflowReplayableSourceKind::AppendOnlyOrdered,
+                        WorkflowHistoricalArtifactSupport::Unsupported,
+                        WorkflowHistoricalEvent::SnapshotTooOld,
+                        false,
+                    ),
+                    4 => (
+                        WorkflowSourceBootstrapPolicy::Beginning,
+                        WorkflowSourceRecoveryPolicy::FastForwardToCurrentDurable,
+                        WorkflowReplayableSourceKind::NonReplayable,
+                        WorkflowHistoricalArtifactSupport::Unsupported,
+                        WorkflowHistoricalEvent::SnapshotTooOld,
+                        false,
+                    ),
+                    _ => {
+                        let bootstrap = bootstraps[(rng.next_u64() as usize) % bootstraps.len()];
+                        let recovery = recoveries[(rng.next_u64() as usize) % recoveries.len()];
+                        let replay =
+                            if matches!(recovery, WorkflowSourceRecoveryPolicy::ReplayFromHistory)
+                                && rng.next_u64() % 2 == 0
+                            {
+                                WorkflowReplayableSourceKind::AppendOnlyOrdered
+                            } else {
+                                WorkflowReplayableSourceKind::NonReplayable
+                            };
+                        let checkpoint_support =
+                            if matches!(recovery, WorkflowSourceRecoveryPolicy::RestoreCheckpoint)
+                                || rng.next_u64() % 3 == 0
+                            {
+                                WorkflowHistoricalArtifactSupport::Optional
+                            } else {
+                                WorkflowHistoricalArtifactSupport::Unsupported
+                            };
+                        let event = if rng.next_u64() % 2 == 0 {
+                            WorkflowHistoricalEvent::FirstAttach
+                        } else {
+                            WorkflowHistoricalEvent::SnapshotTooOld
+                        };
+                        let checkpoint_available =
+                            matches!(recovery, WorkflowSourceRecoveryPolicy::RestoreCheckpoint)
+                                || rng.next_u64() % 2 == 0;
+                        (
+                            bootstrap,
+                            recovery,
+                            replay,
+                            checkpoint_support,
+                            event,
+                            checkpoint_available,
+                        )
+                    }
+                };
+            let scenario = WorkflowHistoricalSourceScenario::new(
+                format!("campaign_source_{index}"),
+                WorkflowSourceConfig::default()
+                    .with_bootstrap_policy(bootstrap)
+                    .with_recovery_policy(recovery)
+                    .with_replay_kind(replay)
+                    .with_checkpoint_support(checkpoint_support)
+                    .with_trigger_journal_support(WorkflowHistoricalArtifactSupport::Optional),
+                event,
+                SequenceNumber::new(1 + (rng.next_u64() % 32)),
+            )
+            .with_checkpoint_available(checkpoint_available);
+
+            WorkflowHistoricalCampaignCase {
+                scenario,
+                has_timers: index == 0 || rng.next_u64() % 2 == 0,
+                has_callbacks: index == 1 || rng.next_u64() % 2 == 0,
+                has_pending_outbox: index == 2 || rng.next_u64() % 2 == 0,
+            }
+        })
+        .collect()
+}
+
 async fn wait_for_runtime_state<H>(
     runtime: &WorkflowRuntime<H>,
     instance_id: &str,
@@ -908,6 +1033,27 @@ async fn open_checkpointed_runtime(
         definition = definition.with_restore_latest_checkpoint_on_open();
     }
     WorkflowRuntime::open(db, clock, definition).await
+}
+
+async fn open_historical_checkpoint_runtime(
+    db: Db,
+    source: Table,
+    clock: Arc<dyn Clock>,
+    checkpoint_store: Arc<WorkflowObjectStoreCheckpointStore>,
+    source_config: WorkflowSourceConfig,
+) -> Result<WorkflowRuntime<CheckpointCaptureHandler>, WorkflowError> {
+    WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "checkpointed",
+            [WorkflowSource::new(source).with_config(source_config)],
+            CheckpointCaptureHandler,
+        )
+        .with_checkpoint_store(checkpoint_store)
+        .with_timer_poll_interval(Duration::from_millis(1)),
+    )
+    .await
 }
 
 async fn wait_for_recurring_state<H, P>(
@@ -1176,6 +1322,55 @@ fn workflow_historical_scenarios_round_trip_through_simulation_checkpoints() -> 
 
             Ok(())
         })
+}
+
+#[test]
+fn workflow_historical_campaign_generator_is_reproducible_and_varies_historical_choices() {
+    let first = generated_historical_campaign(0x8701);
+    let second = generated_historical_campaign(0x8701);
+    let different = generated_historical_campaign(0x8702);
+
+    assert_eq!(first, second);
+    assert_ne!(first, different);
+    assert!(first.iter().any(|case| case.has_timers));
+    assert!(first.iter().any(|case| case.has_callbacks));
+    assert!(first.iter().any(|case| case.has_pending_outbox));
+    assert!(first.iter().any(|case| {
+        matches!(
+            case.scenario.resolve(),
+            WorkflowHistoricalSourceResolution::AttachFromBeginning
+        )
+    }));
+    assert!(first.iter().any(|case| {
+        matches!(
+            case.scenario.resolve(),
+            WorkflowHistoricalSourceResolution::AttachFromCurrentDurable { .. }
+        )
+    }));
+    assert!(first.iter().any(|case| {
+        matches!(
+            case.scenario.resolve(),
+            WorkflowHistoricalSourceResolution::RestoreCheckpoint
+        )
+    }));
+    assert!(first.iter().any(|case| {
+        matches!(
+            case.scenario.resolve(),
+            WorkflowHistoricalSourceResolution::ReplayFromHistory
+        )
+    }));
+    assert!(first.iter().any(|case| {
+        matches!(
+            case.scenario.resolve(),
+            WorkflowHistoricalSourceResolution::FastForwardToCurrentDurable { .. }
+        )
+    }));
+    assert!(first.iter().any(|case| {
+        case.scenario.resolve().attach_mode() == Some(WorkflowSourceAttachMode::LiveOnly)
+    }));
+    assert!(first.iter().any(|case| {
+        case.scenario.resolve().attach_mode() == Some(WorkflowSourceAttachMode::Historical)
+    }));
 }
 
 #[test]
@@ -1468,6 +1663,206 @@ async fn workflow_fail_closed_recovery_surfaces_snapshot_too_old_without_fast_fo
             .expect("load source progress after fail-closed recovery"),
         stale_progress,
         "fail-closed recovery must not silently fast-forward the source progress",
+    );
+}
+
+#[tokio::test]
+async fn workflow_fast_forward_recovery_skips_stale_backlog_and_processes_new_events() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-fast-forward-recovery",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let mut source_config = row_table_config("workflow_source");
+    source_config.history_retention_sequences = Some(1);
+    let source = db
+        .create_table(source_config)
+        .await
+        .expect("create source table");
+
+    let first = source
+        .write(b"skipped-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write first stale source event");
+    source
+        .write(b"skipped-2:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write retained stale source event");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone())
+                .with_recovery_policy(WorkflowSourceRecoveryPolicy::FastForwardToCurrentDurable)],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+
+    let stale_progress = WorkflowSourceProgress::from_cursor(LogCursor::new(first, 0));
+    runtime
+        .tables()
+        .source_progress_table()
+        .write(
+            source.name().as_bytes().to_vec(),
+            Value::bytes(
+                stale_progress
+                    .encode()
+                    .expect("encode stale source progress"),
+            ),
+        )
+        .await
+        .expect("persist stale workflow source progress");
+
+    let handle = runtime.start().await.expect("start workflow runtime");
+    for _ in 0..100 {
+        if runtime
+            .load_source_progress(&source)
+            .await
+            .expect("load fast-forwarded source progress")
+            .origin()
+            == WorkflowSourceProgressOrigin::FastForwardToCurrentDurable
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        runtime
+            .load_state("skipped-1")
+            .await
+            .expect("load skipped stale state"),
+        None,
+    );
+    assert_eq!(
+        runtime
+            .load_state("skipped-2")
+            .await
+            .expect("load retained-but-fast-forwarded state"),
+        None,
+    );
+
+    let telemetry = runtime
+        .telemetry_snapshot()
+        .await
+        .expect("capture fast-forward telemetry");
+    assert_eq!(
+        telemetry.source_lags[0].progress_origin,
+        WorkflowSourceProgressOrigin::FastForwardToCurrentDurable,
+    );
+    assert_eq!(
+        telemetry.source_lags[0].attach_mode,
+        Some(WorkflowSourceAttachMode::LiveOnly),
+    );
+
+    handle
+        .abort()
+        .await
+        .expect("abort fast-forward workflow runtime");
+}
+
+#[tokio::test]
+async fn workflow_non_replayable_sources_cannot_opt_into_replay_from_history_recovery() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-non-replayable-recovery",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let mut source_config = row_table_config("workflow_source");
+    source_config.history_retention_sequences = Some(1);
+    let source = db
+        .create_table(source_config)
+        .await
+        .expect("create source table");
+
+    let first = source
+        .write(b"dropped-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write first stale source event");
+    source
+        .write(b"retained-2:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write retained source event");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone())
+                .with_recovery_policy(WorkflowSourceRecoveryPolicy::ReplayFromHistory)],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+
+    let stale_progress = WorkflowSourceProgress::from_cursor(LogCursor::new(first, 0));
+    runtime
+        .tables()
+        .source_progress_table()
+        .write(
+            source.name().as_bytes().to_vec(),
+            Value::bytes(
+                stale_progress
+                    .encode()
+                    .expect("encode stale source progress"),
+            ),
+        )
+        .await
+        .expect("persist stale workflow source progress");
+
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let error = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("workflow shutdown should return promptly")
+        .expect_err(
+            "non-replayable source should fail closed when replay-from-history is requested",
+        );
+
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Unsupported);
+            assert!(
+                storage.to_string().contains(
+                    "cannot replay from history unless it is configured as append-only ordered"
+                ),
+                "expected explicit non-replayable recovery error, got {storage}",
+            );
+        }
+        other => panic!("unexpected non-replayable recovery error: {other:?}"),
+    }
+
+    assert_eq!(
+        runtime
+            .load_source_progress(&source)
+            .await
+            .expect("load source progress after failed replay recovery"),
+        stale_progress,
+        "non-replayable sources must not silently rewrite stale progress during recovery",
     );
 }
 
@@ -2018,6 +2413,299 @@ async fn workflow_checkpoint_restore_failpoint_leaves_existing_local_state_untou
         .await
         .expect("capture restored workflow tables");
     assert_eq!(restored_snapshot, expected_snapshot);
+}
+
+#[tokio::test]
+async fn workflow_checkpoint_bootstrap_restores_checkpointed_state_and_retags_progress() {
+    let root = "/workflow-auto-checkpoint-bootstrap";
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(7)));
+    let checkpoint_store = Arc::new(WorkflowObjectStoreCheckpointStore::new(
+        object_store.clone(),
+        "workflow-checkpoints",
+    ));
+
+    let db = Db::open(
+        tiered_test_config_with_durability(root, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("checkpoint_source"))
+        .await
+        .expect("create source table");
+    let runtime = open_checkpointed_runtime(
+        db.clone(),
+        source.clone(),
+        clock.clone(),
+        checkpoint_store.clone(),
+        false,
+    )
+    .await
+    .expect("open initial checkpoint runtime");
+
+    source
+        .write(b"order-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write source event");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    wait_for_runtime_state(&runtime, "order-1", "event:order-1:created")
+        .await
+        .expect("wait for event state");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown checkpoint runtime");
+
+    runtime
+        .capture_checkpoint(WorkflowCheckpointId::new(21))
+        .await
+        .expect("capture checkpoint");
+
+    clear_workflow_tables(runtime.tables())
+        .await
+        .expect("clear workflow tables before bootstrap restore");
+    drop(runtime);
+    drop(db);
+
+    let reopened_db = Db::open(
+        tiered_test_config_with_durability(root, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("reopen db");
+    let reopened_source = reopened_db.table("checkpoint_source");
+    let restored_runtime = open_historical_checkpoint_runtime(
+        reopened_db,
+        reopened_source.clone(),
+        clock,
+        checkpoint_store,
+        WorkflowSourceConfig::default()
+            .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CheckpointOrBeginning)
+            .with_checkpoint_support(WorkflowHistoricalArtifactSupport::Optional)
+            .with_trigger_journal_support(WorkflowHistoricalArtifactSupport::Optional),
+    )
+    .await
+    .expect("open bootstrap-restore runtime");
+
+    let handle = restored_runtime
+        .start()
+        .await
+        .expect("start bootstrap-restore runtime");
+
+    for _ in 0..100 {
+        if restored_runtime
+            .load_source_progress(&reopened_source)
+            .await
+            .expect("load source progress after bootstrap restore")
+            .origin()
+            == WorkflowSourceProgressOrigin::CheckpointRestore
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        restored_runtime
+            .load_state("order-1")
+            .await
+            .expect("load restored workflow state"),
+        Some(Value::bytes("event:order-1:created")),
+    );
+    assert!(
+        restored_runtime
+            .tables()
+            .outbox_table()
+            .read(b"order-1:event".to_vec())
+            .await
+            .expect("read restored outbox entry")
+            .is_some(),
+        "checkpoint bootstrap should restore durable outbox work",
+    );
+    assert_eq!(
+        scan_table_rows(restored_runtime.tables().timer_schedule_table())
+            .await
+            .expect("scan restored timer schedule")
+            .len(),
+        1,
+        "checkpoint bootstrap should restore the durable timer schedule",
+    );
+
+    let telemetry = restored_runtime
+        .telemetry_snapshot()
+        .await
+        .expect("capture restored telemetry");
+    assert_eq!(
+        telemetry.source_lags[0].progress_origin,
+        WorkflowSourceProgressOrigin::CheckpointRestore,
+    );
+    assert_eq!(
+        telemetry.source_lags[0].attach_mode,
+        Some(WorkflowSourceAttachMode::Historical),
+    );
+
+    handle
+        .abort()
+        .await
+        .expect("abort bootstrap-restore runtime");
+}
+
+#[tokio::test]
+async fn workflow_restore_checkpoint_recovery_replays_restored_callback_and_new_history() {
+    let root = "/workflow-auto-checkpoint-recovery";
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(7)));
+    let checkpoint_store = Arc::new(WorkflowObjectStoreCheckpointStore::new(
+        object_store.clone(),
+        "workflow-checkpoints",
+    ));
+
+    let db = Db::open(
+        tiered_test_config_with_durability(root, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let mut source_config = row_table_config("checkpoint_source");
+    source_config.history_retention_sequences = Some(3);
+    let source = db
+        .create_table(source_config)
+        .await
+        .expect("create checkpoint source");
+    let runtime = open_checkpointed_runtime(
+        db.clone(),
+        source.clone(),
+        clock.clone(),
+        checkpoint_store.clone(),
+        false,
+    )
+    .await
+    .expect("open initial checkpoint runtime");
+
+    let first = source
+        .write(b"order-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write first source event");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    wait_for_runtime_state(&runtime, "order-1", "event:order-1:created")
+        .await
+        .expect("wait for first source event");
+    handle.shutdown().await.expect("shutdown workflow runtime");
+
+    let second = source
+        .write(b"order-2:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write second source event");
+    runtime
+        .tables()
+        .source_progress_table()
+        .write(
+            source.name().as_bytes().to_vec(),
+            Value::bytes(
+                WorkflowSourceProgress::from_cursor(LogCursor::new(second, 0))
+                    .encode()
+                    .expect("encode checkpoint frontier"),
+            ),
+        )
+        .await
+        .expect("advance checkpoint source frontier");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit callback before checkpoint");
+    runtime
+        .capture_checkpoint(WorkflowCheckpointId::new(22))
+        .await
+        .expect("capture checkpoint");
+
+    let stale_progress = WorkflowSourceProgress::from_cursor(LogCursor::new(first, 0));
+    source
+        .write(b"order-3:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write retained post-checkpoint source event");
+
+    clear_workflow_tables(runtime.tables())
+        .await
+        .expect("clear workflow tables before stale-progress recovery");
+    runtime
+        .tables()
+        .state_table()
+        .write(b"order-1".to_vec(), Value::bytes("mutated"))
+        .await
+        .expect("write mutated local state");
+    runtime
+        .tables()
+        .source_progress_table()
+        .write(
+            source.name().as_bytes().to_vec(),
+            Value::bytes(
+                stale_progress
+                    .encode()
+                    .expect("encode stale source progress"),
+            ),
+        )
+        .await
+        .expect("persist stale local source progress");
+
+    drop(runtime);
+    drop(db);
+
+    let reopened_db = Db::open(
+        tiered_test_config_with_durability(root, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("reopen db");
+    let reopened_source = reopened_db.table("checkpoint_source");
+    let recovery_runtime = open_historical_checkpoint_runtime(
+        reopened_db,
+        reopened_source.clone(),
+        clock,
+        checkpoint_store,
+        WorkflowSourceConfig::default()
+            .with_recovery_policy(WorkflowSourceRecoveryPolicy::RestoreCheckpoint)
+            .with_checkpoint_support(WorkflowHistoricalArtifactSupport::Optional)
+            .with_trigger_journal_support(WorkflowHistoricalArtifactSupport::Optional),
+    )
+    .await
+    .expect("open checkpoint-recovery runtime");
+
+    let handle = recovery_runtime
+        .start()
+        .await
+        .expect("start checkpoint-recovery runtime");
+    wait_for_runtime_state(&recovery_runtime, "order-1", "callback:cb-1")
+        .await
+        .expect("replay restored callback from checkpoint");
+
+    assert!(
+        recovery_runtime
+            .tables()
+            .outbox_table()
+            .read(b"order-1:cb-1".to_vec())
+            .await
+            .expect("read replayed callback outbox entry")
+            .is_some(),
+        "checkpoint recovery should replay restored callback work",
+    );
+    assert_eq!(
+        recovery_runtime
+            .load_source_progress(&reopened_source)
+            .await
+            .expect("load recovered source progress")
+            .origin(),
+        WorkflowSourceProgressOrigin::CheckpointRestore,
+    );
+
+    handle
+        .abort()
+        .await
+        .expect("abort checkpoint-recovery runtime");
 }
 
 #[tokio::test]
