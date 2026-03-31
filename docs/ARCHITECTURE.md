@@ -3093,6 +3093,22 @@ Projection library ──→ DB
 Workflow library   ──→ DB
 ```
 
+The stronger long-term model for workflows should be explicitly **run-based and history-first**.
+
+- a **workflow definition** names long-lived logic and routing,
+- a **workflow bundle** is an immutable implementation artifact for that logic,
+- a **workflow run** is one execution epoch pinned to one bundle,
+- **workflow history** is the append-only durable replay record,
+- **workflow state** is the current mutable summary used for fast execution, and
+- **workflow visibility** is a separate operator-facing projection optimized for list/search/describe/history APIs.
+
+This split matters. History is the durable source of truth. State is a speed-oriented summary derived from history and current execution tables. Visibility is a separate product for operators and tooling. These should not collapse into one table or one API.
+
+One design constraint should stay explicit throughout the workflow library:
+
+- workflows must remain implementable directly in Rust without the sandbox, and
+- sandbox-authored workflows should be an additional handler/deployment path rather than the only workflow authoring model.
+
 ---
 
 ## Workflow Instances
@@ -3102,7 +3118,10 @@ A workflow instance is a persistent state machine. Its state is stored in a DB t
 ```typescript
 interface WorkflowDefinition {
   name: string
-  stateTable: Table               // persists workflow instance state
+  runTable: Table                 // durable workflow runs and lifecycle metadata, keyed by runId
+  historyTable: Table             // append-only replay record, keyed by (runId, historySeq)
+  stateTable: Table               // current mutable workflow state summary, keyed by active run or instance
+  visibilityTable: Table          // operator-facing projection for list/search/describe
   inboxTable: Table               // durably admitted event/timer/callback triggers awaiting execution, keyed by (instanceId, triggerSeq)
   triggerOrderTable: Table        // per-instance next trigger sequence for durable ordering
   sourceCursorTable: Table        // progress of durable event-ingress per source table
@@ -3110,7 +3129,7 @@ interface WorkflowDefinition {
   timerLookupTable: Table         // timers keyed by timerId → fireAt
   outboxTable: Table              // side-effect intents
   scheduler?: WorkflowScheduler   // optional inter-instance scheduler; default is fair round-robin over ready instances
-  handler: WorkflowHandler
+  handler: WorkflowHandler        // native Rust handler or adapted sandbox handler
 }
 
 interface WorkflowHandler {
@@ -3149,6 +3168,8 @@ interface AdmittedWorkflowTrigger {
   trigger: WorkflowTrigger
 }
 ```
+
+In simple single-run-per-instance configurations, the active `runId` may line up naturally with the logical instance identity. The architecture should still model runs explicitly so upgrades, restarts-as-new, and bundle pinning remain first-class rather than implicit.
 
 The handler is a pure function of `(currentState, trigger) → output`. Every trigger type is first turned into a **self-contained durable inbox row** before execution. The inbox row is the replay unit; the executor then applies the handler output atomically with inbox acknowledgement and timer deletion where relevant.
 
@@ -3234,6 +3255,40 @@ async function processWorkflowTrigger(
 
 State update, outbox entries, timer changes, inbox acknowledgement, and fired-timer deletion are all in one `WriteBatch`. If the process crashes before commit, nothing changes. After commit, the workflow state transition and the acknowledgement of the durable inbox row are atomically visible.
 
+### Workflow Transition Engine and Durability Fences
+
+All workflow inputs should flow through one Rust-owned transition engine:
+
+- admitted source events,
+- admitted timer firings,
+- admitted callbacks,
+- workflow-local retries or wakeups, and
+- later query/update-style control messages that are accepted into workflow execution.
+
+That transition engine should be the only place allowed to:
+
+- append workflow history,
+- update current workflow state,
+- change lifecycle status,
+- modify timer ownership or retry state,
+- schedule effect intents,
+- and acknowledge the admitted inbox row.
+
+The architectural rule is:
+
+- guest code interprets admitted input and proposes commands,
+- the Rust executor validates and durably applies those commands,
+- and only after that durable apply completes does the runtime hand work to effect delivery, timer wakeup machinery, or other external execution paths.
+
+This is a stricter form of the outbox principle and should be applied uniformly. Workflow correctness must not depend on side effects leaving the process before the durable transition that justifies them.
+
+The workflow library should therefore keep two distinct internal contracts:
+
+- a **public handler contract** used by native Rust handlers and sandbox adapters, and
+- a **private internal transition/effects contract** used inside the executor to reduce commands into history/state/timer/outbox mutations.
+
+Those are related, but they should not be conflated.
+
 Admission allocates the per-instance ordering key in the **same OCC unit** that writes the inbox row and any associated cursor/progress update. The helper is therefore a **staging helper**, not a separately committing transaction:
 
 ```typescript
@@ -3265,11 +3320,15 @@ The important rule is the atomicity boundary: **trigger-sequence allocation, inb
 
 The workflow executor should remain Rust-owned even when workflow logic is authored in TypeScript. A sandbox-authored workflow is therefore a different implementation strategy for `WorkflowHandler`, not a second workflow runtime with different correctness rules.
 
+Native Rust workflows remain first-class. A Rust application should be able to implement `WorkflowHandler` directly without depending on the sandbox stack at all. The sandbox path is a companion handler adapter and deployment mechanism, not a replacement for native workflow authoring.
+
 Recommended layering:
 
 - `terracedb-workflows` remains authoritative for durable inbox ordering, timer admission and firing, outbox persistence and delivery, state commits, and crash recovery,
 - a companion crate such as `terracedb-workflows-sandbox` adapts a draft or published sandbox module into a `WorkflowHandler`, and
 - a workflow registry or deployment layer resolves draft sessions or published bundles, then starts, stops, or upgrades workflows dynamically at runtime without changing executor semantics.
+
+The sandbox-facing boundary should be treated as a real versioned contract, for example `workflow-task/v1`, rather than as direct guest access to engine internals. The executor may keep richer private transition/effects types internally, but guest code should see only the narrower task/command surface.
 
 If the current executor surface is too compile-time-oriented for dynamic workflow loading, it is reasonable to extend it with a type-erased handler adapter or factory. That is an implementation detail; the important architectural rule is that TypeScript plugs into the existing executor contract rather than replacing it.
 
@@ -3623,6 +3682,48 @@ class WorkflowOutboxProcessor {
 **Exactly-once for workflow state:** the state transition and outbox write are atomic (same `WriteBatch`). If the process crashes after commit, the state is advanced and the outbox entry exists.
 
 **At-least-once for external effects:** the outbox processor may retry on crash. The idempotency key allows the external system to deduplicate.
+
+---
+
+## Queries, Updates, Visibility, and Upgrades
+
+Not every interaction with a running workflow should become a durable workflow-history event.
+
+The library should support three distinct lanes:
+
+1. **durable admitted triggers** that become part of run history and participate in replay,
+2. **read-only queries** that inspect current state or derived visibility without mutating run history, and
+3. **update/control requests** that may validate against live state first and become durable only if accepted.
+
+This keeps cheap inspection and validation-style interaction from paying the full history-append cost when no state transition is accepted.
+
+Visibility should also be a first-class workflow product rather than a side effect of raw table inspection. The workflow library should expose dedicated surfaces for:
+
+- list and search over runs,
+- describe-style live inspection of one run,
+- paginated history retrieval for one run, and
+- optional lower-level SQL or raw-table introspection for deeper operator forensics.
+
+The key split is:
+
+- `historyTable` is the authoritative replay record,
+- `stateTable` is the fast mutable summary,
+- `visibilityTable` is the operator-facing projection.
+
+Raw table access may still exist for debugging or advanced tooling, but common operator paths should not require distributed scans or bespoke joins over raw workflow storage.
+
+Workflow upgrades should also remain explicit. A run should be pinned to an immutable bundle or native registration identity for its execution epoch. New runs may pick newer bundles under rollout policy, but changing code under an already-running execution should require an explicit compatibility decision. The default upgrade boundary should be:
+
+- keep the current run pinned,
+- let new runs start on the new bundle,
+- and use continue-as-new / restart-as-new style transitions when a running execution must migrate to new code with a clean compatibility boundary.
+
+This applies equally to:
+
+- native Rust workflows registered directly with the runtime, and
+- sandbox-authored workflows published as immutable reviewed bundles.
+
+Both should participate in the same deployment and visibility model.
 
 ---
 
@@ -4440,6 +4541,8 @@ The same sandbox runtime should support five distinct products with different tr
 5. **published workflow bundles** that plug into the Rust workflow executor in preview or production.
 
 These should be modeled as separate libraries above `terracedb-sandbox` and `terracedb-workflows`, not as one undifferentiated execution mode.
+
+These sandbox-facing workflow products are optional complements to the core workflow library. Native Rust workflows should remain first-class and should participate in the same runtime, history, visibility, and deployment model without needing `terracedb-sandbox`.
 
 #### Migrations
 
