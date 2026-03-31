@@ -25,6 +25,8 @@ These are the architectural choices that most constrain the rest of the design:
 - **External stream ingress is a library boundary, not an engine feature.** Kafka consumers persist source progress atomically with writes into ordinary Terracedb tables; Debezium support composes on top of Kafka ingress rather than extending the engine.
 - **Embedded virtual filesystems are libraries, not engine modes.** Their current-state filesystem/KV/tool rows live in ordinary tables; timelines and watchers are layered on top of append-only activity rows and change capture.
 - **Embedded sandbox runtimes are libraries on top of `terracedb-vfs`, not engine modes.** Sandboxes get their own session/overlay, capability model, host-disk/git interop, and editor-facing read-only view layer without turning the engine into a shell, CLI, or host-filesystem runtime.
+- **Migration, query-sandbox, and stored-procedure surfaces are capability-driven libraries layered above the sandbox runtime.** Guest code should receive explicit versioned modules with host-enforced policy, not raw engine handles.
+- **External agent protocols such as MCP are adapter layers above the library stack, not engine or VFS modes.** They should reuse the same capability and audit model as in-process sandboxes instead of introducing a parallel permission system.
 - **Blob and large-object storage are libraries, not engine value variants.** Large bytes live out-of-line in a blob store; Terracedb stores metadata, references, and derived indexes.
 - **Virtual filesystem compatibility is semantic, not SQLite-format compatibility.** The goal is to provide an in-process virtual filesystem/KV/tool model on Terracedb, not SQL, a single-file transport format, or SQLite WAL behavior.
 - **Event sourcing is recommended** for data that drives history-dependent projections. Mutable-record projections cannot be safely recomputed from SSTables after `SnapshotTooOld`.
@@ -3981,6 +3983,7 @@ These decisions most constrain the sandbox design:
 - **Execution, TypeScript tooling, package installation, disk/git interop, and editor visibility are separate subsystems sharing one virtual tree.** They should not collapse into one giant runtime abstraction.
 - **Guest-runtime compatibility is layered above a small VFS-backed op surface.** The Rust layer should expose a narrow host op set over `terracedb-vfs`; Node or Deno compatibility shims should mostly live in guest-side libraries.
 - **Host integration is capability-first.** Application APIs are explicit versioned modules, not ambient globals.
+- **Sandbox workloads should run in explicit execution domains.** Capability policy controls what guest code may do; execution domains control what CPU, memory, local I/O, remote I/O, and background capacity it may consume.
 - **Tool-like actions are first-class audited events.** `bash`, package install, type-check, hoist/eject, PR export, and host-capability calls should flow through the tool-run and activity model rather than bypassing it.
 - **Package installation is a host service, not a literal embedded npm CLI.** A useful pure-JS/TS subset comes first; native addons, arbitrary postinstall scripts, and full host-process expectations are deferred.
 - **Host-disk, git, PR, and editor interop are explicit library services.** They are not side effects of exposing the sandbox as a writable real filesystem.
@@ -4000,6 +4003,16 @@ interface SandboxConfig {
   bash?: "off" | "enabled"
   typescript?: "off" | "transpile_only" | "full"
   capabilities?: CapabilityManifest
+  execution?: SandboxExecutionPolicy
+}
+
+interface SandboxExecutionPolicy {
+  sessionDomain?: string
+  toolDomain?: string
+  typescriptDomain?: string
+  packageDomain?: string
+  exportDomain?: string
+  controlPlaneDomain?: string
 }
 
 interface SandboxStore {
@@ -4235,6 +4248,229 @@ await tickets.addComment({ id: open[0].id, body: "Investigating" })
 ```
 
 The sandbox should prefer imports over globals, small domain-specific modules over one giant `Terrace` object, async JSON-serializable calls over opaque handles, and idempotent write APIs where possible.
+
+### Capability and Permission Model
+
+The sandbox should treat injected APIs as a first-class domain model rather than as an ad hoc bag of permissions. The important distinction is:
+
+- a **capability template** defines what API shape exists,
+- a **capability grant** defines which subject may use that API against which resources and budgets, and
+- a **capability manifest** is the concrete set of bound modules injected into one sandbox session or one published procedure.
+
+Recommended model:
+
+```typescript
+interface CapabilityTemplate {
+  id: string
+  version: string
+  methods: string[]
+  dtsText: string
+}
+
+interface ResourcePolicy {
+  dbs?: string[]
+  tables?: string[]
+  keyPrefixes?: string[]
+  tenantScope?: "none" | "caller" | { fixed: string }
+  queryShapes?: Array<"point_read" | "prefix_scan" | "range_scan" | "index_query" | "write" | "schema">
+}
+
+interface BudgetPolicy {
+  timeoutMs: number
+  maxRows?: number
+  maxBytes?: number
+  rateLimitBucket?: string
+}
+
+interface CapabilityGrant {
+  binding: string
+  templateId: string
+  authMode: "caller" | "service"
+  resourcePolicy: ResourcePolicy
+  budgets: BudgetPolicy
+  auditLabel: string
+}
+
+interface CapabilityManifest {
+  subjectId: string
+  bindings: CapabilityGrant[]
+}
+```
+
+This model should remain host-authoritative. Guest code may request a capability by import specifier, but it must not be able to mint new grants or widen its own scope from inside the sandbox.
+
+The recommended import shape is one injected module per binding:
+
+```typescript
+import { orders } from "terrace:host/orders_ro"
+import { catalog } from "terrace:host/catalog_admin"
+```
+
+The effective manifest for a draft session should be derived from the intersection of:
+
+- the subject's standing grants,
+- any environment or deployment policy, and
+- the capabilities explicitly requested for that session.
+
+The effective manifest for a published procedure should be the reviewed immutable manifest attached to that procedure version, optionally intersected with deployment policy at invocation time. This keeps review and runtime enforcement aligned while preventing code from self-escalating after publication.
+
+### Database Access Capability Families
+
+Database access should be exposed through a small set of versioned capability families rather than by handing guest code raw `Db` or `Table` objects. The host must stay in the enforcement path for every database operation so it can apply policy consistently.
+
+Useful starter families are:
+
+- `db.table.v1`
+  Fixed-table access with methods such as `get`, `put`, `delete`, and `scanPrefix`.
+- `db.query.v1`
+  Broader query access for trusted internal subjects that need to choose among multiple tables or indexes dynamically.
+- `catalog.migrate.v1`
+  Catalog and schema-change helpers such as `ensureTable`, `installSchemaSuccessor`, `updateTableMetadata`, and precondition checks.
+- `procedure.invoke.v1`
+  Invocation of already-published reviewed procedures without exposing underlying table access directly.
+
+This is the layer that should own:
+
+- table allowlists,
+- tenant scoping,
+- query-shape restrictions,
+- row or key-prefix filters,
+- rate limits, and
+- audit logging.
+
+For example, a subject may receive a `db.table.v1` binding scoped to:
+
+- one database,
+- one or more specific tables,
+- a fixed tenant or caller-derived tenant,
+- a limited set of query shapes such as point reads and prefix scans only, and
+- per-binding timeout and row-count budgets.
+
+Even when a subject is trusted enough to run arbitrary draft query code, that code should still call versioned host capabilities such as `db.query.v1` rather than touching engine objects directly. This preserves one policy enforcement surface for employee sandboxes, reviewed procedures, and external adapters.
+
+### Execution Domains for Sandbox Workloads
+
+Capability policy and execution-domain policy should be treated as complementary but separate:
+
+- capabilities answer "what may this code touch?",
+- execution domains answer "how much of the process may this workload consume while doing it?"
+
+Sandbox execution should reuse the engine's existing execution-domain model rather than introducing a second resource-isolation mechanism. This is how the host prevents sandbox, procedure, or MCP activity from exhausting process resources and degrading the enclosing application.
+
+Recommended sandbox execution policy:
+
+- draft employee query sessions run in a bounded interactive sandbox domain,
+- published procedure invocations run in a request-oriented domain with tighter CPU, memory, and row/byte budgets,
+- package install, type-check, bash, export, and other heavier helper flows may run in sibling sandbox background domains,
+- publication, catalog updates, procedure registry writes, and auth bookkeeping stay in protected control-plane domains,
+- read-only editor and MCP inspection traffic may use their own low-priority domains so observability traffic cannot starve foreground app work.
+
+Important rules:
+
+- guest code must never choose or mutate its own execution domain,
+- the host chooses domains based on subject, operation kind, and deployment policy,
+- per-capability budgets such as timeout and row limits apply in addition to domain budgets rather than replacing them, and
+- moving sandbox work between domains may change latency or throughput, but must not change correctness semantics.
+
+Illustrative mappings:
+
+- a trusted employee draft session might execute guest code in `sandbox.employee.foreground`,
+- the same session's `npm install` may run in `sandbox.employee.packages`,
+- a published customer-facing procedure may run in `sandbox.procedure.invoke`,
+- procedure publication and migration-catalog writes may run in `control.sandbox.publish`, and
+- MCP connections may resolve tools in `sandbox.mcp.foreground` while publication metadata reads stay in control-plane lanes.
+
+This separation is especially important for colocated embeddings. A runaway sandbox or external-agent session should be throttled, shed, or rate-limited by its assigned domains before it can starve core application request handling or database control-plane recovery work.
+
+### Migrations, Draft Queries, and Published Procedures
+
+The same sandbox runtime should support three distinct products with different trust and lifecycle models:
+
+1. **reviewed migrations** for table/catalog setup and app-schema changes,
+2. **draft query sandboxes** for trusted internal users who may run arbitrary code within their granted capabilities, and
+3. **published procedures** for lower-trust or external callers who may invoke only reviewed immutable code artifacts.
+
+These should be modeled as separate libraries above `terracedb-sandbox`, not as one undifferentiated execution mode.
+
+#### Migrations
+
+A migration library such as `terracedb-migrate` should execute reviewed TypeScript modules inside the sandbox, but it should intentionally remain narrow in scope for version 1:
+
+- create or ensure tables,
+- evolve columnar schemas through validated successors,
+- update table metadata and related catalog settings,
+- record migration metadata and audit history.
+
+Version 1 should explicitly not treat large data backfills or arbitrary row-rewrite jobs as part of this migration surface. Those are operational workloads with different scheduling, retry, and observability needs.
+
+The preferred migration model is reviewed code that drives catalog-scoped host capabilities, not guest code with unrestricted write access to arbitrary tables.
+
+#### Draft Query Sandboxes
+
+Trusted internal users such as company employees may be granted the right to run arbitrary TypeScript code for exploratory or operational queries. Those sessions should still execute under an explicit manifest and should still be constrained by per-binding resource policy and budgets.
+
+This keeps "arbitrary code" compatible with:
+
+- tenant scoping,
+- table allowlists,
+- query-shape restrictions,
+- rate limiting,
+- audit logging, and
+- future deployment-specific controls.
+
+#### Published Procedures
+
+A procedure library such as `terracedb-procedures` should turn reviewed sandbox code into immutable published artifacts. External or lower-trust callers should invoke a named reviewed version, not mutate the code that runs on their behalf.
+
+Recommended published-procedure metadata:
+
+```typescript
+interface PublishedProcedureManifest {
+  name: string
+  version: string
+  codeHash: string
+  entrypoint: string
+  inputSchema: JsonSchema
+  outputSchema: JsonSchema
+  capabilities: CapabilityGrant[]
+  budgets: BudgetPolicy
+  reviewedBy: string
+}
+```
+
+Recommended publish flow:
+
+1. author or update code in a draft sandbox,
+2. review code plus requested capability manifest,
+3. freeze an immutable snapshot or module bundle,
+4. persist publication metadata such as code hash, schemas, budgets, and reviewer, and
+5. invoke published versions by opening a fresh session from that immutable base.
+
+Invocation should accept caller identity and tenant context, then evaluate the published procedure under the reviewed manifest and host-enforced budgets. The caller should not be able to widen capabilities, modify the code, or reuse a mutable draft session as the invocation target.
+
+### External Agent Adapters and MCP
+
+The repo should support an external agent adapter crate, tentatively `terracedb-mcp`, that exposes selected sandbox and procedure surfaces to outside agents such as Claude Desktop. This adapter should sit above `terracedb-sandbox` and any procedure library; it should not be treated as a mode of `terracedb-vfs` itself.
+
+That layering matters because `terracedb-vfs` remains an embedded library surface rather than a general service boundary, while MCP is explicitly a protocol adapter for external tools.
+
+The MCP adapter should reuse the same capability model as in-process sandboxes:
+
+- each MCP connection is resolved to a subject identity,
+- the server derives an effective capability manifest for that subject and environment,
+- every exposed tool or resource maps onto host capabilities or published procedures, and
+- all invocations produce the same audit and tool-run history that local sandbox execution would.
+
+A good starter surface is:
+
+- list and inspect published procedures,
+- invoke reviewed procedures,
+- inspect read-only sandbox views,
+- read or diff files from a sandbox snapshot,
+- inspect tool-run and activity history,
+- optionally run draft query code only for explicitly trusted subjects.
+
+The important rule is that MCP should not introduce a second permission system. It should be a transport and presentation layer over the same capability templates, grants, manifests, quotas, and audit hooks already used by the sandbox runtime.
 
 ### Pull Requests and Editor Visibility
 

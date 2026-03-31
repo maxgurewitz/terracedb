@@ -23,6 +23,9 @@ Included in this plan:
 - scheduler integration,
 - composition primitives built on top of the engine,
 - projection and workflow libraries,
+- an embedded sandbox runtime library,
+- sandbox capability, migration, query, and published-procedure libraries layered above that runtime,
+- an external MCP adapter layered above the sandbox/procedure stack,
 - configurable historical workflow bootstrap and recovery,
 - external stream ingress libraries for Kafka and Debezium,
 - an embedded virtual filesystem library, and
@@ -32,7 +35,7 @@ Included in this plan:
 
 Explicitly excluded from the main execution plan:
 
-- mount/protocol adapters that expose the embedded virtual filesystem as a real host filesystem or network service,
+- mount/protocol adapters that expose the embedded virtual filesystem as a general-purpose writable host filesystem or generic network service,
 - zero-downtime upgrade handoff,
 - deployment choreography/platform rollout details,
 - time estimates or staffing concerns.
@@ -71,10 +74,11 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 17** adds a Kafka ingress crate and deterministic broker simulation support.
 - **Phase 18** adds a Debezium crate on top of Kafka ingress, including EventLog / Mirror / Hybrid materialization.
 - **Phase 19** adds end-to-end CDC deterministic hardening and a small example app that demonstrates Kafka + Debezium + projections + workflows together.
+- **Phase 20** adds sandbox capability policy, reviewed migrations, published procedures, MCP exposure, and an end-to-end example app on top of the sandbox/runtime stack.
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into twenty mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into twenty-one mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -96,6 +100,7 @@ Once Phase 0 is complete, the work naturally splits into twenty mostly independe
 - **Track Q — Kafka ingress:** T88 first; T89 follows T88; T90 follows T88 + T89; T91 follows T89 + T90
 - **Track R — Debezium CDC materialization:** T92 follows T31 + T84 + T88 + T90 + T91; T93 follows T92; T94 follows T84 + T92 + T93; T95 follows T93 + T94
 - **Track S — end-to-end CDC hardening and example app:** T96 follows T87 + T91 + T95; T97 follows T96; T98 follows T33 + T96 + T97; T99 follows T97 + T98
+- **Track T — sandbox capabilities, procedures, and MCP:** T100 first; T101 follows T100; T102 follows T100 + T101; T103 and T104 can proceed in parallel once T102 exists; T105 follows T101 + T102 + T104 + T40g; T106 depends on T33 + T103 + T104 + T105; T107 depends on T103 + T104 + T105 + T106
 
 ---
 
@@ -4313,6 +4318,328 @@ Finish the capstone work by hardening the new example app under failure/restart 
 
 ---
 
+## Phase 20 — Sandbox capability policy, reviewed procedures, MCP exposure, and example app
+
+**Phase rule:** T100 freezes the shared capability, procedure, and MCP-facing contracts first so the rest of the phase can parallelize without interface churn. Every implementation task in this phase must add deterministic simulation coverage for the semantics it introduces rather than deferring simulation to the end. T106 is the capstone cross-cutting deterministic hardening task for the combined stack, and T107 adds a small example repo/app with its own simulation tests that demonstrates the intended end-to-end usage.
+
+**Parallelization:** T100 first. T101 follows T100. T102 follows T100 + T101. T103 and T104 can proceed in parallel once T102 exists. T105 follows T101 + T102 + T104 + T40g. T106 depends on T33 + T103 + T104 + T105. T107 depends on T103 + T104 + T105 + T106.
+
+### T100. Freeze sandbox capability, migration, procedure, and MCP contracts plus deterministic seams
+
+**Depends on:** T40a, T63
+
+**Description**
+
+Freeze the shared contracts that the rest of the phase will implement: capability templates and grants, manifest resolution, reviewed procedure metadata, migration-library boundaries, and the external MCP adapter surface. This task should also decide the deterministic seams up front so later tasks can land simulation coverage incrementally instead of retrofitting it.
+
+**Implementation steps**
+
+1. Add or reserve new workspace members for the shared policy and adapter layers, for example:
+   - `terracedb-capabilities`,
+   - `terracedb-migrate`,
+   - `terracedb-procedures`,
+   - `terracedb-mcp`.
+2. Freeze the shared public contracts for:
+   - `CapabilityTemplate`,
+   - `CapabilityGrant`,
+   - `CapabilityManifest`,
+   - `ResourcePolicy`,
+   - `BudgetPolicy`,
+   - sandbox execution-policy wiring that maps operations into execution domains,
+   - reviewed procedure publication metadata and invocation contracts,
+   - migration-plan and migration-history metadata,
+   - MCP tool/resource descriptors and session/auth context.
+3. Freeze the guest-visible module conventions for bound capabilities, including import shapes such as `terrace:host/<binding>`.
+4. Decide which boundaries must sit behind deterministic stubs or fakes from the start, including:
+   - auth and subject-resolution,
+   - rate limiting,
+   - execution-domain placement and budget accounting hooks,
+   - reviewed-procedure publication storage,
+   - MCP connection/session state.
+5. Document the rule that capability policy and execution-domain policy are separate and composable: capabilities constrain authority, domains constrain resource consumption.
+
+**Verification**
+
+- Compile-only tests that instantiate the frozen capability, manifest, migration, procedure, and MCP contracts together.
+- Unit tests that round-trip grant, manifest, publication-metadata, and execution-policy encodings.
+- A deterministic smoke test that resolves a fake subject into a manifest and execution policy using only stubbed seams.
+
+---
+
+### T101. Implement capability resolution, audit metadata, and execution-domain assignment substrate
+
+**Depends on:** T100, T40b, T64, T66
+
+**Description**
+
+Implement the shared policy substrate used by every later task: subject-to-grant resolution, manifest construction, audit labels, budget enforcement hooks, and host-controlled execution-domain assignment for sandbox and procedure work.
+
+**Implementation steps**
+
+1. Implement the shared capability registry and manifest-resolution path:
+   - capability templates,
+   - subject grants,
+   - environment/deployment policy intersection,
+   - binding-name generation,
+   - immutable reviewed-manifest loading for published procedures.
+2. Implement host-owned execution-policy resolution that maps:
+   - draft sandbox execution,
+   - package install / type-check / bash helpers,
+   - migration publication/application,
+   - procedure invocation,
+   - MCP requests
+   into configured execution domains.
+3. Implement reusable audit metadata and event shapes for:
+   - subject identity,
+   - binding or capability used,
+   - target resource set,
+   - rate-limit/budget outcome,
+   - chosen execution domain.
+4. Add stub/fake implementations for auth, rate limiting, and domain-resolution seams so deterministic simulation can exercise policy outcomes without real external identity or quota systems.
+5. Ensure every policy decision can be attached to tool runs, activity entries, or equivalent procedure/audit records without inventing an unrelated telemetry plane.
+
+**Verification**
+
+- Deterministic simulation tests proving the same subject/grant/environment inputs resolve to the same manifest and execution-domain assignments on replay.
+- Tests covering deny, allow, rate-limited, and budget-exhausted outcomes with stable audit metadata.
+- Crash/recovery tests if any manifest or reviewed-policy metadata becomes persistent state.
+
+---
+
+### T102. Implement database capability families and host-enforced policy checks
+
+**Depends on:** T100, T101, T40c, T27
+
+**Description**
+
+Implement the first real host capability families for sandboxed code, especially the database-facing ones. The goal is to keep the host in the enforcement path for every database action so table allowlists, tenant scoping, query-shape restrictions, key-prefix filters, budgets, and audit logging stay authoritative.
+
+**Implementation steps**
+
+1. Implement initial capability families such as:
+   - `db.table.v1`,
+   - `db.query.v1`,
+   - `catalog.migrate.v1`,
+   - `procedure.invoke.v1`.
+2. Implement host-side enforcement for:
+   - table and database allowlists,
+   - fixed-tenant or caller-derived tenant scoping,
+   - query-shape restrictions such as point read vs prefix scan vs write vs schema mutation,
+   - key-prefix or row-scope filters,
+   - per-binding row/byte/time budgets.
+3. Generate matching TypeScript declarations and guest-visible bound modules from the resolved manifest instead of hand-maintaining separate runtime and type definitions.
+4. Ensure denied operations fail predictably and carry enough machine-readable metadata for callers, audit logs, and simulations.
+5. Record capability usage with consistent tool-run or capability-event metadata so later procedure and MCP layers inherit the same audit surface automatically.
+
+**Verification**
+
+- Deterministic simulation tests for allowed and denied reads/writes/scans across table allowlists, tenant scopes, query-shape restrictions, and key-prefix filters.
+- Integration tests that import generated bound modules from guest code and verify the host remains in the enforcement path.
+- Restart or reopen tests for any persisted capability metadata introduced by the implementation.
+
+---
+
+### T103. Implement reviewed migration library for catalog setup and app-schema evolution
+
+**Depends on:** T102, T40d
+
+**Description**
+
+Implement a `terracedb-migrate` library that executes reviewed TypeScript modules in the sandbox for table/catalog setup and application-schema changes. Version 1 is intentionally narrow: this task owns catalog and schema evolution, not large data backfills or arbitrary row-rewrite jobs.
+
+**Implementation steps**
+
+1. Implement migration authoring and application helpers that run inside the sandbox but call host-enforced catalog capability modules rather than raw engine handles.
+2. Implement the reviewed migration model, including:
+   - migration identity and ordering,
+   - requested capability manifest,
+   - migration history metadata,
+   - audit records for review and apply outcomes.
+3. Support the version-1 migration surface:
+   - create or ensure tables,
+   - validated columnar schema successors,
+   - table-metadata updates,
+   - idempotent precondition checks and no-op reapply semantics where possible.
+4. Keep migration execution in host-selected execution domains and control-plane lanes so catalog work stays isolated from general sandbox traffic.
+5. Add deterministic fakes or stubs for any review/publication seam that is not purely local.
+
+**Verification**
+
+- Deterministic simulation tests proving migration ordering, idempotence, schema-successor validation, and audit/history behavior under replay and crash.
+- Tests showing migrations cannot widen their own capability set or escape catalog-scoped authority.
+- Restart tests proving partially published or partially applied migration metadata fails closed and replays deterministically.
+
+---
+
+### T104. Implement reviewed procedure publication, immutable versions, and invocation runtime
+
+**Depends on:** T102, T40d, T40f
+
+**Description**
+
+Implement a `terracedb-procedures` library that turns reviewed sandbox code into immutable published artifacts. Lower-trust or external callers should invoke reviewed named versions rather than mutating the code that runs on their behalf.
+
+**Implementation steps**
+
+1. Implement procedure publication metadata and storage:
+   - name/version identity,
+   - code hash,
+   - entrypoint,
+   - input/output schemas,
+   - reviewed capability manifest,
+   - reviewer and publication metadata,
+   - execution-budget metadata.
+2. Implement the publish flow:
+   - start from draft sandbox code,
+   - review code plus requested manifest,
+   - freeze an immutable snapshot or module bundle,
+   - persist publication metadata,
+   - make later invocation resolve from the immutable published version.
+3. Implement invocation:
+   - fresh session from immutable base,
+   - caller identity and tenant context injection,
+   - manifest intersection with deployment policy,
+   - JSON-schema or equivalent input/output validation,
+   - host-selected execution-domain assignment.
+4. Ensure callers cannot mutate published code, widen capability scope, or reuse mutable draft sessions as invocation targets.
+5. Record invocation history, policy outcomes, and audit metadata using the shared capability substrate from earlier tasks.
+
+**Verification**
+
+- Deterministic simulation tests for publish, invoke, deny, and replay semantics across reviewed manifests and caller context changes.
+- Crash/recovery tests around publication metadata, immutable snapshot publication, and invocation bookkeeping.
+- Integration tests proving published procedures are immutable and version-addressable from the host surface.
+
+---
+
+### T105. Implement external MCP adapter over published procedures and approved sandbox surfaces
+
+**Depends on:** T101, T102, T104, T40g
+
+**Description**
+
+Implement `terracedb-mcp` as an external adapter for agents such as Claude Desktop. The adapter should expose selected sandbox and procedure surfaces while reusing the same subject/grant/manifest model as in-process sandboxes instead of inventing a parallel permission system.
+
+**Implementation steps**
+
+1. Implement MCP connection/session resolution into:
+   - subject identity,
+   - effective capability manifest,
+   - execution-domain policy,
+   - audit context.
+2. Expose a minimal approved tool/resource surface such as:
+   - list procedures,
+   - inspect procedure metadata,
+   - invoke reviewed procedures,
+   - inspect read-only sandbox views,
+   - read or diff sandbox files,
+   - inspect capability/tool-run history,
+   - optionally run draft queries only for explicitly trusted subjects.
+3. Reuse the read-only view/service protocol from the sandbox/editor work rather than creating a separate file-inspection path for MCP.
+4. Ensure every MCP-visible action maps onto the same host capabilities, procedure runtime, or read-only view surface already used in-process.
+5. Add deterministic stub transport/session backends so protocol-facing logic can be simulated without depending on a real desktop client or live IPC transport.
+
+**Verification**
+
+- Deterministic simulation tests for subject resolution, allow/deny behavior, approved tool exposure, and audit-history publication over the MCP adapter.
+- Integration tests proving MCP invocations reuse published-procedure enforcement and read-only sandbox views rather than bypassing them.
+- Tests showing lower-trust MCP subjects cannot access draft-query or broader sandbox capabilities unless explicitly granted.
+
+---
+
+### T106. Build cross-cutting deterministic simulation, crash, and fault suites for the capability/procedure/MCP stack
+
+**Depends on:** T33, T103, T104, T105
+
+**Description**
+
+Bring the new stack up to the same correctness bar as the rest of Terracedb by adding whole-system deterministic workloads, restart/fault campaigns, and oracle-backed validation for policy, review/publication, invocation, and external-agent access.
+
+**Implementation steps**
+
+1. Extend the deterministic shadow/oracle model to cover:
+   - capability-grant resolution,
+   - manifest intersections,
+   - execution-domain assignment outcomes,
+   - migration history state,
+   - published-procedure metadata and immutable-version selection,
+   - MCP request-to-capability mapping,
+   - audit/tool-run history.
+2. Add randomized workloads that combine:
+   - draft sandbox execution,
+   - approved and denied DB capability calls,
+   - reviewed migration application,
+   - procedure publication,
+   - procedure invocation under varying caller contexts,
+   - read-only sandbox inspection over MCP,
+   - execution-domain throttling or budget exhaustion.
+3. Add crash cut points around:
+   - manifest publication,
+   - migration-history updates,
+   - reviewed-procedure publication,
+   - immutable snapshot registration,
+   - invocation bookkeeping,
+   - MCP session state if any is persisted.
+4. Add failure campaigns for:
+   - denied capability escalation attempts,
+   - stale review metadata,
+   - rate-limit exhaustion,
+   - domain-budget exhaustion,
+   - conflicting procedure publication,
+   - read-only view reconnect behavior through MCP.
+5. Ensure failing seeds preserve enough manifest, subject, procedure-version, and execution-domain context for exact local replay.
+
+**Verification**
+
+- Large-seed deterministic suites covering the full capability/policy/procedure/MCP stack.
+- Cross-cutting restart/recovery tests proving reviewed artifacts remain immutable and fail closed under partial publication or invocation crashes.
+- Oracle-backed tests proving allow/deny, tenant-scope, query-shape, and execution-domain outcomes match the intended contracts.
+- Reproducibility tests proving failing seeds preserve the necessary trace and policy context for replay.
+
+---
+
+### T107. Build a small example repo/app that demonstrates reviewed migrations, draft queries, published procedures, and MCP exposure
+
+**Depends on:** T103, T104, T105, T106
+
+**Description**
+
+Add a small, teachable example repo/app that demonstrates the intended way to use the new stack in practice: reviewed migrations for catalog setup, trusted draft query sandboxes for internal users, immutable published procedures for lower-trust callers, and an MCP surface that exposes the approved capabilities to an external agent. The example should include its own simulation tests and serve as the reference integration pattern for these libraries.
+
+**Implementation steps**
+
+1. Add a compact example app and companion sandboxed project that demonstrates:
+   - reviewed migration authoring and apply flow,
+   - an employee draft-query sandbox with broader internal grants,
+   - one or more reviewed published procedures for external callers,
+   - MCP exposure of approved procedure and read-only sandbox surfaces.
+2. Give the example a simple but realistic authorization model with at least:
+   - an internal employee subject,
+   - a publication/reviewer subject,
+   - an external caller subject.
+3. Demonstrate execution-domain isolation in the example by assigning:
+   - foreground draft-query work,
+   - procedure invocation,
+   - publication/catalog work, and
+   - MCP inspection traffic
+   to distinct domains or domain classes.
+4. Add example docs that explain:
+   - capability templates vs grants vs manifests,
+   - why published procedures are immutable,
+   - why migrations are intentionally catalog-scoped in version 1,
+   - how MCP reuses the same permission model instead of introducing a second one,
+   - how execution domains limit resource blast radius.
+5. Add deterministic simulation tests owned by the example itself for its documented happy paths and representative deny/fault cases.
+
+**Verification**
+
+- Example-level deterministic simulation tests proving the documented migration, query, procedure, and MCP flows behave as described.
+- Tests proving the example's internal and external subjects receive meaningfully different capabilities and execution-domain assignments.
+- Smoke tests or docs checks proving the example can be run and inspected without hidden setup.
+- Regression tests ensuring the example remains aligned with the supported public crate APIs instead of drifting into bespoke internals.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
@@ -4516,6 +4843,18 @@ At this point the system should additionally support:
 - explicit historical-bootstrap vs live-only workflow modes in a concrete application,
 - cross-cutting deterministic simulation campaigns for the full CDC ingestion/materialization/runtime stack, and
 - polished reference docs that show how to build on the new crates without coupling projections or workflows directly to Kafka.
+
+### Milestone T — Sandbox capability policy, reviewed procedures, MCP exposure, and example app
+Complete: T100–T107
+
+At this point the system should additionally support:
+- a shared capability/grant/manifest model for sandbox, migration, procedure, and MCP-facing access,
+- host-enforced database capability families with table allowlists, tenant scoping, query-shape restrictions, key-prefix filters, rate limits, and audit hooks,
+- reviewed migration flows for catalog setup and app-schema evolution without claiming large backfill support,
+- immutable published procedures with reviewed manifests, typed inputs/outputs, and caller-context-aware invocation,
+- an external `terracedb-mcp` adapter that reuses the same permission and audit model as in-process sandboxes,
+- execution-domain isolation for sandbox, procedure, publication, and MCP work so resource exhaustion cannot trivially starve the enclosing app, and
+- a small reference example app with its own deterministic simulation suites covering the intended end-to-end usage.
 
 ---
 
