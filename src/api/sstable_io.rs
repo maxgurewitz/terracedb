@@ -1,5 +1,11 @@
 use super::*;
 
+type ColumnarV2SubstreamDescriptor = (
+    Option<FieldId>,
+    Option<FieldType>,
+    crate::ColumnarV2SubstreamKind,
+);
+
 impl ColumnarReadContext {
     pub(super) fn cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
         let mut usage = self
@@ -1410,8 +1416,9 @@ impl Db {
             )));
         }
 
-        if count % 8 != 0 {
-            let used_mask = (1_u8 << (count % 8)) - 1;
+        let trailing_bits = count % 8;
+        if !count.is_multiple_of(8) {
+            let used_mask = (1_u8 << trailing_bits) - 1;
             if bytes.last().copied().unwrap_or_default() & !used_mask != 0 {
                 return Err(StorageError::corruption(format!(
                     "columnar SSTable {location} {label} sets unused bitmap bits",
@@ -1580,19 +1587,17 @@ impl Db {
         bytes: &[u8],
         row_count: usize,
     ) -> Result<Vec<ChangeKind>, StorageError> {
-        Ok(
-            Self::decode_columnar_v2_u8_stream(location, "row-kind column", bytes, row_count)?
-                .into_iter()
-                .map(|value| match value {
-                    0 => Ok(ChangeKind::Put),
-                    1 => Ok(ChangeKind::Delete),
-                    2 => Ok(ChangeKind::Merge),
-                    other => Err(StorageError::corruption(format!(
-                        "columnar SSTable {location} contains unknown row kind tag {other}",
-                    ))),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
+        Self::decode_columnar_v2_u8_stream(location, "row-kind column", bytes, row_count)?
+            .into_iter()
+            .map(|value| match value {
+                0 => Ok(ChangeKind::Put),
+                1 => Ok(ChangeKind::Delete),
+                2 => Ok(ChangeKind::Merge),
+                other => Err(StorageError::corruption(format!(
+                    "columnar SSTable {location} contains unknown row kind tag {other}",
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn encode_columnar_v2_payload(
@@ -1684,11 +1689,10 @@ impl Db {
         block_bytes: &mut Vec<u8>,
         substreams: &mut Vec<crate::ColumnarV2SubstreamRef>,
         next_ordinal: &mut u32,
-        field_id: Option<FieldId>,
-        field_type: Option<FieldType>,
-        kind: crate::ColumnarV2SubstreamKind,
+        descriptor: ColumnarV2SubstreamDescriptor,
         raw_bytes: &[u8],
     ) -> Result<(), StorageError> {
+        let (field_id, field_type, kind) = descriptor;
         let compression = Self::columnar_v2_codec_for_substream(kind);
         let encoded = Self::encode_columnar_v2_payload(compression, raw_bytes)?;
         let start = block_start + block_bytes.len() as u64;
@@ -2745,9 +2749,7 @@ impl Db {
             &mut block_bytes,
             substreams,
             next_ordinal,
-            None,
-            None,
-            crate::ColumnarV2SubstreamKind::KeyOffsets,
+            (None, None, crate::ColumnarV2SubstreamKind::KeyOffsets),
             &offsets,
         )?;
         Self::append_columnar_v2_substream(
@@ -2755,9 +2757,7 @@ impl Db {
             &mut block_bytes,
             substreams,
             next_ordinal,
-            None,
-            None,
-            crate::ColumnarV2SubstreamKind::KeyData,
+            (None, None, crate::ColumnarV2SubstreamKind::KeyData),
             &data,
         )?;
         Ok(block_bytes)
@@ -2776,9 +2776,7 @@ impl Db {
             &mut block_bytes,
             substreams,
             next_ordinal,
-            None,
-            None,
-            crate::ColumnarV2SubstreamKind::Sequence,
+            (None, None, crate::ColumnarV2SubstreamKind::Sequence),
             &raw,
         )?;
         Ok(block_bytes)
@@ -2801,9 +2799,7 @@ impl Db {
             &mut block_bytes,
             substreams,
             next_ordinal,
-            None,
-            None,
-            crate::ColumnarV2SubstreamKind::TombstoneBitmap,
+            (None, None, crate::ColumnarV2SubstreamKind::TombstoneBitmap),
             &raw,
         )?;
         Ok((block_bytes, tombstones))
@@ -2822,9 +2818,7 @@ impl Db {
             &mut block_bytes,
             substreams,
             next_ordinal,
-            None,
-            None,
-            crate::ColumnarV2SubstreamKind::RowKind,
+            (None, None, crate::ColumnarV2SubstreamKind::RowKind),
             &raw,
         )?;
         Ok(block_bytes)
@@ -2865,9 +2859,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    ),
                     &present,
                 )?;
                 Self::append_columnar_v2_substream(
@@ -2875,9 +2871,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::Int64Values,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::Int64Values,
+                    ),
                     &values,
                 )?;
             }
@@ -2907,9 +2905,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    ),
                     &present,
                 )?;
                 Self::append_columnar_v2_substream(
@@ -2917,9 +2917,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::Float64Bits,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::Float64Bits,
+                    ),
                     &values,
                 )?;
             }
@@ -2949,9 +2951,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    ),
                     &present,
                 )?;
                 Self::append_columnar_v2_substream(
@@ -2959,9 +2963,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::StringOffsets,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::StringOffsets,
+                    ),
                     &offsets,
                 )?;
                 Self::append_columnar_v2_substream(
@@ -2969,9 +2975,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::StringData,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::StringData,
+                    ),
                     &data,
                 )?;
             }
@@ -3001,9 +3009,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    ),
                     &present,
                 )?;
                 Self::append_columnar_v2_substream(
@@ -3011,9 +3021,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::BytesOffsets,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::BytesOffsets,
+                    ),
                     &offsets,
                 )?;
                 Self::append_columnar_v2_substream(
@@ -3021,9 +3033,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::BytesData,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::BytesData,
+                    ),
                     &data,
                 )?;
             }
@@ -3053,9 +3067,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::PresentBitmap,
+                    ),
                     &present,
                 )?;
                 Self::append_columnar_v2_substream(
@@ -3063,9 +3079,11 @@ impl Db {
                     &mut block_bytes,
                     substreams,
                     next_ordinal,
-                    Some(field.id),
-                    Some(field.field_type),
-                    crate::ColumnarV2SubstreamKind::BoolValues,
+                    (
+                        Some(field.id),
+                        Some(field.field_type),
+                        crate::ColumnarV2SubstreamKind::BoolValues,
+                    ),
                     &values,
                 )?;
             }

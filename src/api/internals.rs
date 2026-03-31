@@ -675,7 +675,7 @@ impl DecodedColumnarCache {
             .footers
             .read()
             .values()
-            .map(|footer| estimate_cached_footer_bytes(footer))
+            .map(estimate_cached_footer_bytes)
             .sum::<u64>();
         let key_index_bytes = self
             .key_indexes
