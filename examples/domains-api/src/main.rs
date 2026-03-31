@@ -1,9 +1,9 @@
-use std::{env, sync::Arc};
+use std::env;
 
-use terracedb::SystemClock;
+use terracedb::DbComponents;
 use terracedb_example_domains_api::{
     ANALYTICS_DATABASE_NAME, DOMAINS_SERVER_PORT, DomainsApp, DomainsExampleProfile,
-    PRIMARY_DATABASE_NAME, domains_db_builder,
+    PRIMARY_DATABASE_NAME, domains_db_settings,
 };
 
 #[tokio::main]
@@ -17,27 +17,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or_default();
     let deployment = profile.deployment()?;
-    let clock = Arc::new(SystemClock);
     let object_store_root = format!("{data_root}/object-store");
+    let components = DbComponents::production_local(object_store_root);
 
-    let primary = domains_db_builder(&format!("{data_root}/primary/ssd"), "domains-api/primary")
-        .local_object_store(object_store_root.clone())
-        .clock(clock.clone())
-        .colocated_database(&deployment, PRIMARY_DATABASE_NAME)?
-        .open()
+    let primary = deployment
+        .open_database(
+            PRIMARY_DATABASE_NAME,
+            domains_db_settings(&format!("{data_root}/primary/ssd"), "domains-api/primary"),
+            components.clone(),
+        )
         .await?;
 
-    let analytics = domains_db_builder(
-        &format!("{data_root}/analytics/ssd"),
-        "domains-api/analytics",
-    )
-    .local_object_store(object_store_root)
-    .clock(clock)
-    .colocated_database(&deployment, ANALYTICS_DATABASE_NAME)?
-    .open()
-    .await?;
+    let analytics = deployment
+        .open_database(
+            ANALYTICS_DATABASE_NAME,
+            domains_db_settings(
+                &format!("{data_root}/analytics/ssd"),
+                "domains-api/analytics",
+            ),
+            components,
+        )
+        .await?;
 
-    let app = DomainsApp::open(primary, analytics, profile).await?;
+    let app = DomainsApp::open(deployment, primary, analytics, profile).await?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let serve_result = axum::serve(listener, app.router()).await;
     app.shutdown().await?;

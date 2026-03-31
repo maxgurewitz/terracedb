@@ -9,8 +9,9 @@ use axum::{
 };
 use futures::StreamExt;
 use terracedb::{
-    CreateTableError, Db, DbBuilder, FlushError, ReadError, ResourceAdmissionDecision,
-    ResourceManager, ScanOptions, StorageError, Table,
+    ColocatedDeployment, CreateTableError, Db, DbBuilder, ExecutionBacklogGuard, ExecutionLane,
+    ExecutionUsageLease, FlushError, ReadError, ResourceAdmissionDecision, ScanOptions,
+    StorageError,
 };
 use terracedb_records::{
     JsonValueCodec, RecordReadError, RecordStream, RecordTable, RecordWriteError, Utf8StringCodec,
@@ -22,9 +23,9 @@ use crate::model::{
     BackgroundMaintenanceRequest, BackgroundMaintenanceResponse, BackgroundPressureView,
     ControlPlaneTableRequest, ControlPlaneTableResponse, CreatePrimaryItemRequest,
     DOMAINS_SERVER_PORT, DomainsExampleProfile, DomainsObservabilityResponse, ExampleDatabase,
-    ExampleLane, HELPER_REPORTS_TABLE_NAME, HelperLoadRequest, HelperLoadResponse,
-    HelperPressureView, HelperReportRecord, PRIMARY_DATABASE_NAME, PRIMARY_ITEMS_TABLE_NAME,
-    PrimaryItemRecord, domains_db_settings, row_table_config,
+    HELPER_REPORTS_TABLE_NAME, HelperLoadRequest, HelperLoadResponse, HelperPressureView,
+    HelperReportRecord, PRIMARY_DATABASE_NAME, PRIMARY_ITEMS_TABLE_NAME, PrimaryItemRecord,
+    domains_db_settings, row_table_config,
 };
 
 type PrimaryItemsTable =
@@ -100,17 +101,35 @@ impl IntoResponse for DomainsApiError {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
+struct ActivePrimaryPressure {
+    view: BackgroundPressureView,
+    _usage: Option<ExecutionUsageLease>,
+    _backlog: Option<ExecutionBacklogGuard>,
+}
+
+#[derive(Debug)]
+struct ActiveHelperPressure {
+    view: HelperPressureView,
+    _foreground: Option<ExecutionUsageLease>,
+    _background_usage: Option<ExecutionUsageLease>,
+    _background_backlog: Option<ExecutionBacklogGuard>,
+}
+
+#[derive(Default)]
 struct ActivePressureState {
-    primary_background: Option<BackgroundPressureView>,
-    helper: Option<HelperPressureView>,
+    primary_background: Option<ActivePrimaryPressure>,
+    helper: Option<ActiveHelperPressure>,
 }
 
 impl ActivePressureState {
     fn view(&self) -> ActivePressureView {
         ActivePressureView {
-            primary_background: self.primary_background.clone(),
-            helper: self.helper.clone(),
+            primary_background: self
+                .primary_background
+                .as_ref()
+                .map(|pressure| pressure.view.clone()),
+            helper: self.helper.as_ref().map(|pressure| pressure.view.clone()),
         }
     }
 }
@@ -118,6 +137,7 @@ impl ActivePressureState {
 #[derive(Clone)]
 pub struct DomainsAppState {
     profile: DomainsExampleProfile,
+    deployment: ColocatedDeployment,
     primary_db: Db,
     analytics_db: Db,
     primary_items: PrimaryItemsTable,
@@ -141,6 +161,7 @@ pub struct DomainsApp {
 
 impl DomainsApp {
     pub async fn open(
+        deployment: ColocatedDeployment,
         primary_db: Db,
         analytics_db: Db,
         profile: DomainsExampleProfile,
@@ -157,22 +178,30 @@ impl DomainsApp {
                 analytics_db.execution_identity()
             )));
         }
-        if !Arc::ptr_eq(
-            &primary_db.resource_manager(),
-            &analytics_db.resource_manager(),
-        ) {
+        if deployment
+            .execution_profile(PRIMARY_DATABASE_NAME)
+            .is_none()
+            || deployment
+                .execution_profile(ANALYTICS_DATABASE_NAME)
+                .is_none()
+        {
             return Err(DomainsAppError::InvalidConfig(
-                "example requires colocated databases to share one resource manager".to_string(),
+                "example requires databases opened from the provided colocated deployment"
+                    .to_string(),
             ));
         }
 
         let primary_items = PrimaryItemsTable::with_codecs(
-            ensure_table(&primary_db, row_table_config(PRIMARY_ITEMS_TABLE_NAME)).await?,
+            primary_db
+                .ensure_table(row_table_config(PRIMARY_ITEMS_TABLE_NAME))
+                .await?,
             Utf8StringCodec,
             JsonValueCodec::new(),
         );
         let helper_reports = HelperReportsTable::with_codecs(
-            ensure_table(&analytics_db, row_table_config(HELPER_REPORTS_TABLE_NAME)).await?,
+            analytics_db
+                .ensure_table(row_table_config(HELPER_REPORTS_TABLE_NAME))
+                .await?,
             Utf8StringCodec,
             JsonValueCodec::new(),
         );
@@ -180,6 +209,7 @@ impl DomainsApp {
         Ok(Self {
             state: DomainsAppState {
                 profile,
+                deployment,
                 primary_db,
                 analytics_db,
                 primary_items,
@@ -284,12 +314,12 @@ impl DomainsAppState {
                     .get(),
             );
         }
-        let flushed = if request.flush_after_write {
-            self.analytics_db.flush().await?;
-            true
+        let flush_status = if request.flush_after_write {
+            Some(self.analytics_db.flush_with_status().await?)
         } else {
-            last_sequence.is_some()
+            None
         };
+        let flushed = flush_status.is_some() || last_sequence.is_some();
 
         let helper_pressure = HelperPressureView {
             hold_foreground_cpu_workers: request.hold_foreground_cpu_workers,
@@ -308,6 +338,7 @@ impl DomainsAppState {
             written_reports: request.report_count,
             helper_report_count,
             flushed,
+            flush_status,
             foreground_admission,
             background_admission,
         })
@@ -315,23 +346,19 @@ impl DomainsAppState {
 
     pub fn release_helper_pressure(&self) -> Result<Option<HelperPressureView>, DomainsAppError> {
         let mut state = self.lock_pressure()?;
-        let previous = state.helper.take();
-        if previous.is_some() {
-            self.apply_helper_pressure_release(previous.as_ref());
-        }
-        Ok(previous)
+        Ok(state.helper.take().map(|pressure| pressure.view))
     }
 
     pub async fn apply_primary_maintenance(
         &self,
         request: BackgroundMaintenanceRequest,
     ) -> Result<BackgroundMaintenanceResponse, DomainsAppError> {
-        let flushed = if request.flush_now {
-            self.primary_db.flush().await?;
-            true
+        let flush_status = if request.flush_now {
+            Some(self.primary_db.flush_with_status().await?)
         } else {
-            false
+            None
         };
+        let flushed = flush_status.is_some();
         let pressure = BackgroundPressureView {
             hold_background_tasks: request.hold_background_tasks,
             background_in_flight_bytes: request.background_in_flight_bytes,
@@ -341,6 +368,7 @@ impl DomainsAppState {
         let background_admission = self.replace_primary_background_pressure(pressure.clone())?;
         Ok(BackgroundMaintenanceResponse {
             flushed,
+            flush_status,
             background_admission,
             active_pressure: (!pressure.is_empty()).then_some(pressure),
         })
@@ -350,11 +378,10 @@ impl DomainsAppState {
         &self,
     ) -> Result<Option<BackgroundPressureView>, DomainsAppError> {
         let mut state = self.lock_pressure()?;
-        let previous = state.primary_background.take();
-        if previous.is_some() {
-            self.apply_primary_background_release(previous.as_ref());
-        }
-        Ok(previous)
+        Ok(state
+            .primary_background
+            .take()
+            .map(|pressure| pressure.view))
     }
 
     pub async fn ensure_control_plane_table(
@@ -384,42 +411,26 @@ impl DomainsAppState {
     ) -> Result<AdmissionProbeResponse, DomainsAppError> {
         let database = self.db_for(request.database);
         let lane = request.lane.as_execution_lane();
-        let domain = database.execution_profile().binding(lane).domain.clone();
-        let usage = request.usage.into();
-        let manager = self.resource_manager();
-        let decision = manager.try_acquire(&domain, usage);
-        if decision.admitted {
-            manager.release(&domain, usage);
-        }
         Ok(AdmissionProbeResponse {
             database: request.database,
             lane: request.lane,
-            decision,
+            decision: database.probe_lane_admission(lane, request.usage.into()),
         })
     }
 
     pub fn observability_report(&self) -> Result<DomainsObservabilityResponse, DomainsAppError> {
         Ok(DomainsObservabilityResponse {
             profile: self.profile,
-            primary: self.primary_db.execution_placement_report(),
-            analytics: self.analytics_db.execution_placement_report(),
-            resource_manager: self.primary_db.resource_manager_snapshot(),
+            deployment: self.deployment.runtime_report(),
             active_pressure: self.lock_pressure()?.view(),
         })
     }
 
     pub fn release_all_pressure(&self) -> Result<(), DomainsAppError> {
         let mut state = self.lock_pressure()?;
-        let primary = state.primary_background.take();
-        let helper = state.helper.take();
-        drop(state);
-        self.apply_primary_background_release(primary.as_ref());
-        self.apply_helper_pressure_release(helper.as_ref());
+        let _ = state.primary_background.take();
+        let _ = state.helper.take();
         Ok(())
-    }
-
-    fn resource_manager(&self) -> Arc<dyn ResourceManager> {
-        self.primary_db.resource_manager()
     }
 
     fn replace_helper_pressure(
@@ -433,35 +444,31 @@ impl DomainsAppState {
         DomainsAppError,
     > {
         let mut state = self.lock_pressure()?;
-        let previous = state.helper.take();
+        let _ = state.helper.take();
         drop(state);
-        self.apply_helper_pressure_release(previous.as_ref());
 
         if pressure.is_empty() {
             return Ok((None, None));
         }
 
-        let manager = self.resource_manager();
-        let analytics_profile = self.analytics_db.execution_profile();
-        let foreground_domain = analytics_profile
-            .binding(ExampleLane::Foreground.as_execution_lane())
-            .domain
-            .clone();
-        let background_domain = analytics_profile
-            .binding(ExampleLane::Background.as_execution_lane())
-            .domain
-            .clone();
-
-        let foreground_usage = pressure.foreground_usage();
-        let background_usage = pressure.background.usage();
-        let background_backlog = pressure.background.backlog();
-
-        let foreground_admission = (pressure.hold_foreground_cpu_workers > 0)
-            .then(|| manager.try_acquire(&foreground_domain, foreground_usage));
-        let background_admission = (!pressure.background.is_empty()).then(|| {
-            manager.set_backlog(&background_domain, background_backlog);
-            manager.try_acquire(&background_domain, background_usage)
+        let foreground_lease = (pressure.hold_foreground_cpu_workers > 0).then(|| {
+            self.analytics_db
+                .acquire_lane_usage(ExecutionLane::UserForeground, pressure.foreground_usage())
         });
+        let background_backlog = (!pressure.background.backlog().is_empty()).then(|| {
+            self.analytics_db
+                .set_lane_backlog(ExecutionLane::UserBackground, pressure.background.backlog())
+        });
+        let background_lease = (!pressure.background.is_empty()).then(|| {
+            self.analytics_db
+                .acquire_lane_usage(ExecutionLane::UserBackground, pressure.background.usage())
+        });
+        let foreground_admission = foreground_lease
+            .as_ref()
+            .map(|lease| lease.decision().clone());
+        let background_admission = background_lease
+            .as_ref()
+            .map(|lease| lease.decision().clone());
 
         let admitted_pressure = HelperPressureView {
             hold_foreground_cpu_workers: foreground_admission
@@ -486,7 +493,12 @@ impl DomainsAppState {
         };
 
         if !admitted_pressure.is_empty() {
-            self.lock_pressure()?.helper = Some(admitted_pressure);
+            self.lock_pressure()?.helper = Some(ActiveHelperPressure {
+                view: admitted_pressure,
+                _foreground: foreground_lease.filter(|lease| lease.admitted()),
+                _background_usage: background_lease.filter(|lease| lease.admitted()),
+                _background_backlog: background_backlog,
+            });
         }
 
         Ok((foreground_admission, background_admission))
@@ -497,23 +509,21 @@ impl DomainsAppState {
         pressure: BackgroundPressureView,
     ) -> Result<Option<ResourceAdmissionDecision>, DomainsAppError> {
         let mut state = self.lock_pressure()?;
-        let previous = state.primary_background.take();
+        let _ = state.primary_background.take();
         drop(state);
-        self.apply_primary_background_release(previous.as_ref());
 
         if pressure.is_empty() {
             return Ok(None);
         }
 
-        let manager = self.resource_manager();
-        let background_domain = self
+        let backlog = (!pressure.backlog().is_empty()).then(|| {
+            self.primary_db
+                .set_lane_backlog(ExecutionLane::UserBackground, pressure.backlog())
+        });
+        let usage_lease = self
             .primary_db
-            .execution_profile()
-            .binding(ExampleLane::Background.as_execution_lane())
-            .domain
-            .clone();
-        manager.set_backlog(&background_domain, pressure.backlog());
-        let admission = manager.try_acquire(&background_domain, pressure.usage());
+            .acquire_lane_usage(ExecutionLane::UserBackground, pressure.usage());
+        let admission = usage_lease.decision().clone();
         let admitted_pressure = BackgroundPressureView {
             hold_background_tasks: admission
                 .admitted
@@ -526,42 +536,12 @@ impl DomainsAppState {
             queued_work_items: pressure.queued_work_items,
             queued_bytes: pressure.queued_bytes,
         };
-        self.lock_pressure()?.primary_background = Some(admitted_pressure);
+        self.lock_pressure()?.primary_background = Some(ActivePrimaryPressure {
+            view: admitted_pressure,
+            _usage: usage_lease.admitted().then_some(usage_lease),
+            _backlog: backlog,
+        });
         Ok(Some(admission))
-    }
-
-    fn apply_primary_background_release(&self, pressure: Option<&BackgroundPressureView>) {
-        let Some(pressure) = pressure else {
-            return;
-        };
-        let manager = self.resource_manager();
-        let background_domain = self
-            .primary_db
-            .execution_profile()
-            .binding(ExampleLane::Background.as_execution_lane())
-            .domain
-            .clone();
-        manager.release(&background_domain, pressure.usage());
-        manager.set_backlog(&background_domain, Default::default());
-    }
-
-    fn apply_helper_pressure_release(&self, pressure: Option<&HelperPressureView>) {
-        let Some(pressure) = pressure else {
-            return;
-        };
-        let manager = self.resource_manager();
-        let analytics_profile = self.analytics_db.execution_profile();
-        let foreground_domain = analytics_profile
-            .binding(ExampleLane::Foreground.as_execution_lane())
-            .domain
-            .clone();
-        let background_domain = analytics_profile
-            .binding(ExampleLane::Background.as_execution_lane())
-            .domain
-            .clone();
-        manager.release(&foreground_domain, pressure.foreground_usage());
-        manager.release(&background_domain, pressure.background.usage());
-        manager.set_backlog(&background_domain, Default::default());
     }
 
     fn db_for(&self, database: ExampleDatabase) -> &Db {
@@ -580,14 +560,6 @@ impl DomainsAppState {
 
 pub fn domains_db_builder(path: &str, prefix: &str) -> DbBuilder {
     Db::builder().settings(domains_db_settings(path, prefix))
-}
-
-async fn ensure_table(db: &Db, config: terracedb::TableConfig) -> Result<Table, CreateTableError> {
-    match db.create_table(config.clone()).await {
-        Ok(table) => Ok(table),
-        Err(CreateTableError::AlreadyExists(_)) => Ok(db.table(config.name)),
-        Err(error) => Err(error),
-    }
 }
 
 async fn collect_values<V>(mut stream: RecordStream<String, V>) -> Vec<V> {

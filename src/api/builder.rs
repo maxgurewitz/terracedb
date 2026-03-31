@@ -322,8 +322,12 @@ impl DbBuilder {
         self.object_store = Some(components.object_store);
         self.clock = Some(components.clock);
         self.rng = Some(components.rng);
-        self.scheduler = components.scheduler;
-        self.resource_manager = components.resource_manager;
+        if let Some(scheduler) = components.scheduler {
+            self.scheduler = Some(scheduler);
+        }
+        if let Some(resource_manager) = components.resource_manager {
+            self.resource_manager = Some(resource_manager);
+        }
         self
     }
 

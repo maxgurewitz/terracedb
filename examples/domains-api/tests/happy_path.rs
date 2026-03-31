@@ -1,10 +1,10 @@
 use tempfile::tempdir;
-use terracedb::{ExecutionDomainPlacement, ResourceAdmissionDecision};
+use terracedb::{DbComponents, ExecutionDomainPlacement, ResourceAdmissionDecision};
 use terracedb_example_domains_api::{
     ANALYTICS_DATABASE_NAME, AdmissionProbeRequest, BackgroundMaintenanceRequest,
     ControlPlaneTableRequest, CreatePrimaryItemRequest, DomainsApp, DomainsExampleProfile,
     ExampleDatabase, ExampleLane, HelperLoadRequest, PRIMARY_DATABASE_NAME, ProbeUsage,
-    domains_db_builder,
+    domains_db_settings,
 };
 
 struct AppFixture {
@@ -19,28 +19,33 @@ async fn open_fixture(
     let data_root = dir.path();
     let deployment = profile.deployment()?;
     let object_store_root = data_root.join("object-store");
+    let components = DbComponents::production_local(object_store_root);
 
-    let primary = domains_db_builder(
-        data_root.join("primary-ssd").to_string_lossy().as_ref(),
-        "fixture/primary",
-    )
-    .local_object_store(object_store_root.clone())
-    .colocated_database(&deployment, PRIMARY_DATABASE_NAME)?
-    .open()
-    .await?;
+    let primary = deployment
+        .open_database(
+            PRIMARY_DATABASE_NAME,
+            domains_db_settings(
+                data_root.join("primary-ssd").to_string_lossy().as_ref(),
+                "fixture/primary",
+            ),
+            components.clone(),
+        )
+        .await?;
 
-    let analytics = domains_db_builder(
-        data_root.join("analytics-ssd").to_string_lossy().as_ref(),
-        "fixture/analytics",
-    )
-    .local_object_store(object_store_root)
-    .colocated_database(&deployment, ANALYTICS_DATABASE_NAME)?
-    .open()
-    .await?;
+    let analytics = deployment
+        .open_database(
+            ANALYTICS_DATABASE_NAME,
+            domains_db_settings(
+                data_root.join("analytics-ssd").to_string_lossy().as_ref(),
+                "fixture/analytics",
+            ),
+            components,
+        )
+        .await?;
 
     Ok(AppFixture {
         _dir: dir,
-        app: DomainsApp::open(primary, analytics, profile).await?,
+        app: DomainsApp::open(deployment, primary, analytics, profile).await?,
     })
 }
 
@@ -52,31 +57,39 @@ async fn default_profile_reopens_with_reserved_control_plane_and_domain_introspe
         .deployment()
         .expect("deployment");
     let object_store_root = data_root.join("object-store");
+    let components = DbComponents::production_local(object_store_root.clone());
 
-    let primary = domains_db_builder(
-        data_root.join("primary-ssd").to_string_lossy().as_ref(),
-        "reopen/primary",
-    )
-    .local_object_store(object_store_root.clone())
-    .colocated_database(&deployment, PRIMARY_DATABASE_NAME)
-    .expect("bind primary")
-    .open()
-    .await
-    .expect("open primary");
-    let analytics = domains_db_builder(
-        data_root.join("analytics-ssd").to_string_lossy().as_ref(),
-        "reopen/analytics",
-    )
-    .local_object_store(object_store_root.clone())
-    .colocated_database(&deployment, ANALYTICS_DATABASE_NAME)
-    .expect("bind analytics")
-    .open()
-    .await
-    .expect("open analytics");
-
-    let app = DomainsApp::open(primary, analytics, DomainsExampleProfile::Conservative)
+    let primary = deployment
+        .open_database(
+            PRIMARY_DATABASE_NAME,
+            domains_db_settings(
+                data_root.join("primary-ssd").to_string_lossy().as_ref(),
+                "reopen/primary",
+            ),
+            components.clone(),
+        )
         .await
-        .expect("open app");
+        .expect("open primary");
+    let analytics = deployment
+        .open_database(
+            ANALYTICS_DATABASE_NAME,
+            domains_db_settings(
+                data_root.join("analytics-ssd").to_string_lossy().as_ref(),
+                "reopen/analytics",
+            ),
+            components.clone(),
+        )
+        .await
+        .expect("open analytics");
+
+    let app = DomainsApp::open(
+        deployment.clone(),
+        primary,
+        analytics,
+        DomainsExampleProfile::Conservative,
+    )
+    .await
+    .expect("open app");
     app.state()
         .create_primary_item(CreatePrimaryItemRequest {
             item_id: "ticket-1".to_string(),
@@ -108,12 +121,15 @@ async fn default_profile_reopens_with_reserved_control_plane_and_domain_introspe
     let report = app.state().observability_report().expect("report");
     assert_eq!(report.profile, DomainsExampleProfile::Conservative);
     assert_eq!(
-        report.primary.foreground.binding.domain.to_string(),
+        report.deployment.databases[PRIMARY_DATABASE_NAME]
+            .foreground
+            .binding
+            .domain
+            .to_string(),
         "process/dbs/primary/foreground"
     );
     assert_eq!(
-        report
-            .analytics
+        report.deployment.databases[ANALYTICS_DATABASE_NAME]
             .foreground
             .snapshot
             .as_ref()
@@ -122,8 +138,7 @@ async fn default_profile_reopens_with_reserved_control_plane_and_domain_introspe
             .placement,
         ExecutionDomainPlacement::SharedWeighted { weight: 1 }
     );
-    let control = report
-        .primary
+    let control = report.deployment.databases[PRIMARY_DATABASE_NAME]
         .control_plane
         .snapshot
         .as_ref()
@@ -136,28 +151,32 @@ async fn default_profile_reopens_with_reserved_control_plane_and_domain_introspe
 
     app.shutdown().await.expect("shutdown");
 
-    let reopened_primary = domains_db_builder(
-        data_root.join("primary-ssd").to_string_lossy().as_ref(),
-        "reopen/primary",
-    )
-    .local_object_store(object_store_root.clone())
-    .colocated_database(&deployment, PRIMARY_DATABASE_NAME)
-    .expect("rebind primary")
-    .open()
-    .await
-    .expect("reopen primary");
-    let reopened_analytics = domains_db_builder(
-        data_root.join("analytics-ssd").to_string_lossy().as_ref(),
-        "reopen/analytics",
-    )
-    .local_object_store(object_store_root)
-    .colocated_database(&deployment, ANALYTICS_DATABASE_NAME)
-    .expect("rebind analytics")
-    .open()
-    .await
-    .expect("reopen analytics");
+    let reopened_components = DbComponents::production_local(object_store_root);
+    let reopened_primary = deployment
+        .open_database(
+            PRIMARY_DATABASE_NAME,
+            domains_db_settings(
+                data_root.join("primary-ssd").to_string_lossy().as_ref(),
+                "reopen/primary",
+            ),
+            reopened_components.clone(),
+        )
+        .await
+        .expect("reopen primary");
+    let reopened_analytics = deployment
+        .open_database(
+            ANALYTICS_DATABASE_NAME,
+            domains_db_settings(
+                data_root.join("analytics-ssd").to_string_lossy().as_ref(),
+                "reopen/analytics",
+            ),
+            reopened_components,
+        )
+        .await
+        .expect("reopen analytics");
 
     let reopened = DomainsApp::open(
+        deployment,
         reopened_primary,
         reopened_analytics,
         DomainsExampleProfile::Conservative,
@@ -218,7 +237,7 @@ async fn run_profile_workload(
             title: "Still correct under load".to_string(),
         })
         .await?;
-    state
+    let maintenance = state
         .apply_primary_maintenance(BackgroundMaintenanceRequest {
             flush_now: true,
             hold_background_tasks: 1,
@@ -227,7 +246,8 @@ async fn run_profile_workload(
             queued_bytes: 1024,
         })
         .await?;
-    state
+    assert!(maintenance.flush_status.is_some());
+    let helper = state
         .run_helper_load(HelperLoadRequest {
             batch_id: "batch-b".to_string(),
             report_count: 3,
@@ -239,6 +259,7 @@ async fn run_profile_workload(
             flush_after_write: true,
         })
         .await?;
+    assert!(helper.flush_status.is_some());
 
     let probe = state.probe_admission(AdmissionProbeRequest {
         database: ExampleDatabase::Primary,

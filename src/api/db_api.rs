@@ -2,8 +2,10 @@ use super::*;
 
 use crate::ZoneMapPredicate;
 use crate::execution::{
-    DbExecutionProfile, DomainTaggedWork, ExecutionDomainBudget, ExecutionDomainOwner,
-    ExecutionDomainPath, ExecutionLane, ResourceManager, ResourceManagerSnapshot, WorkRuntimeTag,
+    DbExecutionProfile, DomainTaggedWork, ExecutionBacklogGuard, ExecutionDomainBudget,
+    ExecutionDomainOwner, ExecutionDomainPath, ExecutionLane, ExecutionResourceUsage,
+    ExecutionUsageLease, ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot,
+    WorkRuntimeTag,
 };
 
 #[derive(Clone, Debug)]
@@ -35,6 +37,20 @@ struct ColumnarScanExecutionState {
     rows_evaluated: usize,
     rows_returned: usize,
     parts: BTreeMap<String, ColumnarScanPartExecution>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushStatus {
+    pub current_sequence_before: SequenceNumber,
+    pub current_sequence_after: SequenceNumber,
+    pub durable_sequence_before: SequenceNumber,
+    pub durable_sequence_after: SequenceNumber,
+}
+
+impl FlushStatus {
+    pub fn durable_sequence_advanced(&self) -> bool {
+        self.durable_sequence_after > self.durable_sequence_before
+    }
 }
 
 impl ResolvedScanPredicate {
@@ -479,6 +495,21 @@ impl Db {
         Ok(table)
     }
 
+    pub async fn ensure_table(&self, config: TableConfig) -> Result<Table, CreateTableError> {
+        let table_name = config.name.clone();
+        match self.create_table(config).await {
+            Ok(table) => Ok(table),
+            Err(CreateTableError::AlreadyExists(_)) => {
+                self.try_table(&table_name).ok_or_else(|| {
+                    CreateTableError::Storage(StorageError::not_found(format!(
+                        "table does not exist: {table_name}"
+                    )))
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn snapshot(&self) -> Snapshot {
         let sequence = self.current_sequence();
         self.register_snapshot(sequence)
@@ -523,6 +554,10 @@ impl Db {
         &self.inner.execution_profile
     }
 
+    pub fn execution_lane_binding(&self, lane: ExecutionLane) -> &crate::ExecutionLaneBinding {
+        self.execution_profile().binding(lane)
+    }
+
     pub fn execution_identity(&self) -> &str {
         &self.inner.execution_identity
     }
@@ -555,27 +590,88 @@ impl Db {
             .map(|snapshot| snapshot.spec.budget)
     }
 
-    pub fn tag_user_foreground_work<T>(&self, work: T) -> DomainTaggedWork<T> {
-        let request = self.execution_profile().work_request(
-            ExecutionDomainOwner::Database {
-                name: self.execution_identity().to_string(),
-            },
-            ExecutionLane::UserForeground,
-            crate::ContentionClass::UserData,
-        );
+    pub fn tag_work<T>(
+        &self,
+        work: T,
+        owner: ExecutionDomainOwner,
+        lane: ExecutionLane,
+        contention_class: crate::ContentionClass,
+    ) -> DomainTaggedWork<T> {
+        let request = self
+            .execution_profile()
+            .work_request(owner, lane, contention_class);
         DomainTaggedWork::new(work, self.inner.resource_manager.placement_tag(request))
     }
 
+    pub fn tag_lane_work<T>(
+        &self,
+        work: T,
+        lane: ExecutionLane,
+        contention_class: crate::ContentionClass,
+    ) -> DomainTaggedWork<T> {
+        self.tag_work(
+            work,
+            self.default_execution_owner(lane),
+            lane,
+            contention_class,
+        )
+    }
+
+    pub fn tag_user_foreground_work<T>(&self, work: T) -> DomainTaggedWork<T> {
+        self.tag_lane_work(
+            work,
+            ExecutionLane::UserForeground,
+            crate::ContentionClass::UserData,
+        )
+    }
+
+    pub fn tag_user_background_work<T>(&self, work: T) -> DomainTaggedWork<T> {
+        self.tag_lane_work(
+            work,
+            ExecutionLane::UserBackground,
+            crate::ContentionClass::UserData,
+        )
+    }
+
     pub fn tag_control_plane_work<T>(&self, work: T) -> DomainTaggedWork<T> {
-        let request = self.execution_profile().work_request(
-            ExecutionDomainOwner::Subsystem {
-                database: Some(self.execution_identity().to_string()),
-                name: "control-plane".to_string(),
-            },
+        self.tag_lane_work(
+            work,
             ExecutionLane::ControlPlane,
             crate::ContentionClass::ControlPlane,
-        );
-        DomainTaggedWork::new(work, self.inner.resource_manager.placement_tag(request))
+        )
+    }
+
+    pub fn acquire_lane_usage(
+        &self,
+        lane: ExecutionLane,
+        usage: ExecutionResourceUsage,
+    ) -> ExecutionUsageLease {
+        ExecutionUsageLease::acquire(
+            self.resource_manager(),
+            self.execution_lane_binding(lane).domain.clone(),
+            usage,
+        )
+    }
+
+    pub fn probe_lane_admission(
+        &self,
+        lane: ExecutionLane,
+        usage: ExecutionResourceUsage,
+    ) -> ResourceAdmissionDecision {
+        let lease = self.acquire_lane_usage(lane, usage);
+        lease.decision().clone()
+    }
+
+    pub fn set_lane_backlog(
+        &self,
+        lane: ExecutionLane,
+        backlog: crate::ExecutionDomainBacklogSnapshot,
+    ) -> ExecutionBacklogGuard {
+        ExecutionBacklogGuard::set(
+            self.resource_manager(),
+            self.execution_lane_binding(lane).domain.clone(),
+            backlog,
+        )
     }
 
     pub fn telemetry_db_name(&self) -> String {
@@ -734,13 +830,17 @@ impl Db {
     }
 
     pub async fn flush(&self) -> Result<(), FlushError> {
+        self.flush_with_status().await.map(|_| ())
+    }
+
+    pub async fn flush_with_status(&self) -> Result<FlushStatus, FlushError> {
         self.flush_internal(true).await
     }
 
     pub(super) async fn flush_internal(
         &self,
         _allow_scheduler_follow_up: bool,
-    ) -> Result<(), FlushError> {
+    ) -> Result<FlushStatus, FlushError> {
         let span = tracing::info_span!("terracedb.db.flush");
         apply_db_span_attributes(
             &span,
@@ -754,8 +854,16 @@ impl Db {
             opentelemetry::Value::String("flush".into()),
         );
         let span_for_attrs = span.clone();
+        let current_sequence_before = self.current_sequence();
+        let durable_sequence_before = self.current_durable_sequence();
 
         async move {
+            let build_status = || FlushStatus {
+                current_sequence_before,
+                current_sequence_after: self.current_sequence(),
+                durable_sequence_before,
+                durable_sequence_after: self.current_durable_sequence(),
+            };
             let _maintenance_guard = self.inner.maintenance_lock.lock().await;
             match &self.inner.config.storage {
                 StorageConfig::Tiered(_) => {
@@ -874,7 +982,13 @@ impl Db {
                     };
 
                     if immutables.is_empty() && buffered_records.is_empty() {
-                        return Ok(());
+                        let status = build_status();
+                        crate::set_span_attribute(
+                            &span_for_attrs,
+                            crate::telemetry_attrs::DURABLE_SEQUENCE,
+                            status.durable_sequence_after.get(),
+                        );
+                        return Ok(status);
                     }
 
                     if !buffered_records.is_empty() {
@@ -962,12 +1076,13 @@ impl Db {
                 }
             }
 
+            let status = build_status();
             crate::set_span_attribute(
                 &span_for_attrs,
                 crate::telemetry_attrs::DURABLE_SEQUENCE,
-                self.current_durable_sequence().get(),
+                status.durable_sequence_after.get(),
             );
-            Ok(())
+            Ok(status)
         }
         .instrument(span.clone())
         .await
@@ -1350,6 +1465,20 @@ impl Db {
         DomainTaggedWork::new(work, self.inner.resource_manager.placement_tag(request))
     }
 
+    fn default_execution_owner(&self, lane: ExecutionLane) -> ExecutionDomainOwner {
+        match lane {
+            ExecutionLane::UserForeground | ExecutionLane::UserBackground => {
+                ExecutionDomainOwner::Database {
+                    name: self.execution_identity().to_string(),
+                }
+            }
+            ExecutionLane::ControlPlane => ExecutionDomainOwner::Subsystem {
+                database: Some(self.execution_identity().to_string()),
+                name: "control-plane".to_string(),
+            },
+        }
+    }
+
     pub(super) async fn apply_write_backpressure(
         &self,
         operations: &[ResolvedBatchOperation],
@@ -1363,6 +1492,7 @@ impl Db {
             self.record_forced_flush();
             self.flush_internal(false)
                 .await
+                .map(|_| ())
                 .map_err(|error| CommitError::Storage(Self::flush_error_into_storage(error)))?;
         }
 

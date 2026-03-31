@@ -272,6 +272,19 @@ impl ExecutionResourceUsage {
     fn metric_is_non_zero(value: u64) -> bool {
         value > 0
     }
+
+    fn contains(&self, other: ExecutionResourceUsage) -> bool {
+        self.cpu_workers >= other.cpu_workers
+            && self.memory_bytes >= other.memory_bytes
+            && self.cache_bytes >= other.cache_bytes
+            && self.mutable_bytes >= other.mutable_bytes
+            && self.local_io_concurrency >= other.local_io_concurrency
+            && self.local_io_bytes_per_second >= other.local_io_bytes_per_second
+            && self.remote_io_concurrency >= other.remote_io_concurrency
+            && self.remote_io_bytes_per_second >= other.remote_io_bytes_per_second
+            && self.background_tasks >= other.background_tasks
+            && self.background_in_flight_bytes >= other.background_in_flight_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +299,10 @@ impl ExecutionDomainBacklogSnapshot {
             .queued_work_items
             .saturating_add(other.queued_work_items);
         self.queued_bytes = self.queued_bytes.saturating_add(other.queued_bytes);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.is_non_zero()
     }
 
     fn is_non_zero(&self) -> bool {
@@ -1267,7 +1284,29 @@ impl ColocatedDeployment {
             .map(ColocatedDatabasePlacement::execution_profile)
     }
 
-    pub fn report(&self) -> ColocatedDeploymentReport {
+    pub fn builder_for_database(
+        &self,
+        database: impl Into<String>,
+        settings: crate::DbSettings,
+    ) -> Result<crate::DbBuilder, crate::OpenError> {
+        crate::Db::builder()
+            .settings(settings)
+            .colocated_database(self, database)
+    }
+
+    pub async fn open_database(
+        &self,
+        database: impl Into<String>,
+        settings: crate::DbSettings,
+        components: crate::DbComponents,
+    ) -> Result<crate::Db, crate::OpenError> {
+        self.builder_for_database(database, settings)?
+            .components(components)
+            .open()
+            .await
+    }
+
+    pub fn runtime_report(&self) -> ColocatedDeploymentReport {
         let snapshot = self.resource_manager.snapshot();
         ColocatedDeploymentReport {
             placement_policy_name: snapshot.placement_policy_name.clone(),
@@ -1299,6 +1338,10 @@ impl ColocatedDeployment {
                 .collect(),
             domain_topology: snapshot.domains,
         }
+    }
+
+    pub fn report(&self) -> ColocatedDeploymentReport {
+        self.runtime_report()
     }
 }
 
@@ -1577,6 +1620,144 @@ pub struct ResourceAdmissionDecision {
     pub snapshot: ExecutionDomainSnapshot,
 }
 
+#[must_use = "execution usage is released when the lease is dropped"]
+pub struct ExecutionUsageLease {
+    manager: Arc<dyn ResourceManager>,
+    path: ExecutionDomainPath,
+    usage: ExecutionResourceUsage,
+    decision: ResourceAdmissionDecision,
+    released: bool,
+}
+
+impl ExecutionUsageLease {
+    pub fn acquire(
+        manager: Arc<dyn ResourceManager>,
+        path: ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> Self {
+        let decision = manager.try_acquire(&path, usage);
+        Self {
+            manager,
+            path,
+            usage,
+            decision,
+            released: false,
+        }
+    }
+
+    pub fn admitted(&self) -> bool {
+        self.decision.admitted
+    }
+
+    pub fn decision(&self) -> &ResourceAdmissionDecision {
+        &self.decision
+    }
+
+    pub fn path(&self) -> &ExecutionDomainPath {
+        &self.path
+    }
+
+    pub fn usage(&self) -> ExecutionResourceUsage {
+        self.usage
+    }
+
+    pub fn release(mut self) -> Option<ExecutionDomainSnapshot> {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> Option<ExecutionDomainSnapshot> {
+        if !self.decision.admitted || self.released {
+            return None;
+        }
+        self.released = true;
+        Some(self.manager.release(&self.path, self.usage))
+    }
+}
+
+impl Drop for ExecutionUsageLease {
+    fn drop(&mut self) {
+        let _ = self.release_inner();
+    }
+}
+
+impl fmt::Debug for ExecutionUsageLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionUsageLease")
+            .field("path", &self.path)
+            .field("usage", &self.usage)
+            .field("decision", &self.decision)
+            .field("released", &self.released)
+            .finish()
+    }
+}
+
+#[must_use = "backlog is restored when the guard is dropped"]
+pub struct ExecutionBacklogGuard {
+    manager: Arc<dyn ResourceManager>,
+    path: ExecutionDomainPath,
+    previous: ExecutionDomainBacklogSnapshot,
+    current: ExecutionDomainBacklogSnapshot,
+    restored: bool,
+}
+
+impl ExecutionBacklogGuard {
+    pub fn set(
+        manager: Arc<dyn ResourceManager>,
+        path: ExecutionDomainPath,
+        backlog: ExecutionDomainBacklogSnapshot,
+    ) -> Self {
+        let previous = manager.direct_backlog(&path);
+        manager.set_backlog(&path, backlog);
+        Self {
+            manager,
+            path,
+            previous,
+            current: backlog,
+            restored: false,
+        }
+    }
+
+    pub fn previous(&self) -> ExecutionDomainBacklogSnapshot {
+        self.previous
+    }
+
+    pub fn current(&self) -> ExecutionDomainBacklogSnapshot {
+        self.current
+    }
+
+    pub fn restore(mut self) -> ExecutionDomainSnapshot {
+        self.restore_inner()
+    }
+
+    fn restore_inner(&mut self) -> ExecutionDomainSnapshot {
+        if self.restored {
+            return self.manager.set_backlog(&self.path, self.previous);
+        }
+        self.restored = true;
+        self.manager.set_backlog(&self.path, self.previous)
+    }
+}
+
+impl Drop for ExecutionBacklogGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            self.restored = true;
+            self.manager.set_backlog(&self.path, self.previous);
+        }
+    }
+}
+
+impl fmt::Debug for ExecutionBacklogGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionBacklogGuard")
+            .field("path", &self.path)
+            .field("previous", &self.previous)
+            .field("current", &self.current)
+            .field("restored", &self.restored)
+            .finish()
+    }
+}
+
 pub trait ResourceManager: Send + Sync {
     fn process_budget(&self) -> ExecutionDomainBudget;
     fn placement_policy(&self) -> Arc<dyn PlacementPolicy>;
@@ -1597,6 +1778,7 @@ pub trait ResourceManager: Send + Sync {
         path: &ExecutionDomainPath,
         usage: ExecutionResourceUsage,
     ) -> ExecutionDomainSnapshot;
+    fn direct_backlog(&self, path: &ExecutionDomainPath) -> ExecutionDomainBacklogSnapshot;
     fn set_backlog(
         &self,
         path: &ExecutionDomainPath,
@@ -2312,8 +2494,23 @@ impl ResourceManager for InMemoryResourceManager {
         let entry = domains
             .get_mut(path)
             .expect("domain must exist before releasing usage");
+        assert!(
+            entry.direct_usage.contains(usage),
+            "attempted to release more execution-domain usage than acquired for {}: have {:?}, requested {:?}",
+            path,
+            entry.direct_usage,
+            usage
+        );
         entry.direct_usage.saturating_sub_assign(usage);
         self.domain_snapshot_locked(&domains, path)
+    }
+
+    fn direct_backlog(&self, path: &ExecutionDomainPath) -> ExecutionDomainBacklogSnapshot {
+        self.domains
+            .lock()
+            .get(path)
+            .map(|entry| entry.backlog)
+            .unwrap_or_default()
     }
 
     fn set_backlog(

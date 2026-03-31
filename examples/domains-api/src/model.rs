@@ -245,6 +245,7 @@ pub struct HelperLoadResponse {
     pub written_reports: u32,
     pub helper_report_count: usize,
     pub flushed: bool,
+    pub flush_status: Option<terracedb::FlushStatus>,
     pub foreground_admission: Option<terracedb::ResourceAdmissionDecision>,
     pub background_admission: Option<terracedb::ResourceAdmissionDecision>,
 }
@@ -252,6 +253,7 @@ pub struct HelperLoadResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundMaintenanceResponse {
     pub flushed: bool,
+    pub flush_status: Option<terracedb::FlushStatus>,
     pub background_admission: Option<terracedb::ResourceAdmissionDecision>,
     pub active_pressure: Option<BackgroundPressureView>,
 }
@@ -273,9 +275,7 @@ pub struct AdmissionProbeResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainsObservabilityResponse {
     pub profile: DomainsExampleProfile,
-    pub primary: terracedb::DbExecutionPlacementReport,
-    pub analytics: terracedb::DbExecutionPlacementReport,
-    pub resource_manager: terracedb::ResourceManagerSnapshot,
+    pub deployment: terracedb::ColocatedDeploymentReport,
     pub active_pressure: ActivePressureView,
 }
 

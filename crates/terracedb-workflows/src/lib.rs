@@ -3988,11 +3988,9 @@ async fn ensure_workflow_tables(
 }
 
 async fn ensure_table(db: &Db, name: &str) -> Result<Table, WorkflowError> {
-    match db.create_table(workflow_table_config(name)).await {
-        Ok(table) => Ok(table),
-        Err(CreateTableError::AlreadyExists(_)) => lookup_table(db, name).map_err(Into::into),
-        Err(error) => Err(error.into()),
-    }
+    db.ensure_table(workflow_table_config(name))
+        .await
+        .map_err(Into::into)
 }
 
 fn lookup_table(db: &Db, name: &str) -> Result<Table, StorageError> {

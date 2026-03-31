@@ -1,11 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
-use terracedb::{DeterministicRng, SimulatedFileSystem, SimulatedObjectStore};
+use terracedb::{DbComponents, DeterministicRng, SimulatedFileSystem, SimulatedObjectStore};
 use terracedb_example_domains_api::{
     ANALYTICS_DATABASE_NAME, AdmissionProbeRequest, BackgroundMaintenanceRequest,
     ControlPlaneTableRequest, CreatePrimaryItemRequest, DomainsApp, DomainsExampleProfile,
     ExampleDatabase, ExampleLane, HelperLoadRequest, PRIMARY_DATABASE_NAME, ProbeUsage,
-    domains_db_builder,
+    domains_db_settings,
 };
 use terracedb_simulation::{SeededSimulationRunner, TurmoilClock};
 
@@ -28,30 +28,41 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
             let object_store = Arc::new(SimulatedObjectStore::default());
             let clock = Arc::new(TurmoilClock);
 
-            let primary = domains_db_builder("/domains-sim/primary", "domains/sim/primary")
-                .file_system(file_system.clone())
-                .object_store(object_store.clone())
-                .clock(clock.clone())
-                .rng(Arc::new(DeterministicRng::seeded(seed)))
-                .colocated_database(&deployment, PRIMARY_DATABASE_NAME)
-                .expect("bind primary")
-                .open()
+            let primary = deployment
+                .open_database(
+                    PRIMARY_DATABASE_NAME,
+                    domains_db_settings("/domains-sim/primary", "domains/sim/primary"),
+                    DbComponents::new(
+                        file_system.clone(),
+                        object_store.clone(),
+                        clock.clone(),
+                        Arc::new(DeterministicRng::seeded(seed)),
+                    ),
+                )
                 .await
                 .expect("open primary");
-            let analytics = domains_db_builder("/domains-sim/analytics", "domains/sim/analytics")
-                .file_system(file_system)
-                .object_store(object_store)
-                .clock(clock)
-                .rng(Arc::new(DeterministicRng::seeded(seed.wrapping_add(1))))
-                .colocated_database(&deployment, ANALYTICS_DATABASE_NAME)
-                .expect("bind analytics")
-                .open()
+            let analytics = deployment
+                .open_database(
+                    ANALYTICS_DATABASE_NAME,
+                    domains_db_settings("/domains-sim/analytics", "domains/sim/analytics"),
+                    DbComponents::new(
+                        file_system,
+                        object_store,
+                        clock,
+                        Arc::new(DeterministicRng::seeded(seed.wrapping_add(1))),
+                    ),
+                )
                 .await
                 .expect("open analytics");
 
-            let app = DomainsApp::open(primary, analytics, DomainsExampleProfile::Conservative)
-                .await
-                .expect("open app");
+            let app = DomainsApp::open(
+                deployment,
+                primary,
+                analytics,
+                DomainsExampleProfile::Conservative,
+            )
+            .await
+            .expect("open app");
             let state = app.state();
 
             state
@@ -109,14 +120,17 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
             let helper_reports = state.list_helper_reports().await.expect("list helper");
             assert!(state.primary_db().try_table("audit_log").is_some());
 
-            let control_domain = &report.primary.control_plane.binding.domain;
+            let control_domain = &report.deployment.databases[PRIMARY_DATABASE_NAME]
+                .control_plane
+                .binding
+                .domain;
             let capture = SimulationCapture {
                 primary_titles: primary_items.into_iter().map(|item| item.title).collect(),
                 helper_report_ids: helper_reports
                     .into_iter()
                     .map(|report| report.report_id)
                     .collect(),
-                control_domain_reserved: report.resource_manager.domains[control_domain]
+                control_domain_reserved: report.deployment.domain_topology[control_domain]
                     .spec
                     .metadata
                     .get("reserved")
