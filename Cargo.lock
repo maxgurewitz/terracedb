@@ -1753,6 +1753,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-kafka"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "terracedb",
+ "terracedb-simulation",
+ "thiserror",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-otel"
 version = "0.1.0"
 dependencies = [
