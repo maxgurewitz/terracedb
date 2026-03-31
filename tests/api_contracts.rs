@@ -7,8 +7,9 @@ use std::{
 use terracedb::{
     CommitOptions, CompactionStrategy, Db, DbComponents, DbConfig, DbDependencies, DbSettings,
     FieldDefinition, FieldId, FieldType, FieldValue, LogCursor, MergeOperator, NoopScheduler,
-    S3Location, ScanOptions, SchemaDefinition, SequenceNumber, StorageConfig, StorageError,
-    StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, Value,
+    PendingWorkType, S3Location, ScanOptions, SchemaDefinition, SequenceNumber, StorageConfig,
+    StorageError, StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat,
+    Value,
 };
 
 #[derive(Debug)]
@@ -262,7 +263,12 @@ async fn public_api_surface_compiles_and_is_instantiable() {
 
     let stats = db.table_stats(&row_table).await;
     assert_eq!(stats.total_bytes, 0);
-    assert!(db.pending_work().await.is_empty());
+    let pending = db.pending_work().await;
+    assert!(pending.iter().any(|work| {
+        work.work_type == PendingWorkType::Flush
+            && work.table == row_table.name()
+            && work.estimated_bytes > 0
+    }));
 }
 
 #[tokio::test]

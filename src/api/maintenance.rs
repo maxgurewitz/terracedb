@@ -380,7 +380,7 @@ impl Db {
         let tables = self.tables_read().clone();
         let mut candidates = self
             .memtables_read()
-            .immutable_flush_backlog_by_table()
+            .pending_flush_bytes_by_table()
             .into_iter()
             .filter_map(|(table_id, estimated_bytes)| {
                 let stored = Self::stored_table_by_id(&tables, table_id)?;
@@ -839,6 +839,38 @@ impl Db {
             .cloned()
     }
 
+    pub(super) fn forced_flush_candidate(
+        &self,
+        candidates: &[PendingWorkCandidate],
+        flush_candidates: &[crate::DomainTaggedWork<FlushPressureCandidate>],
+    ) -> Option<PendingWorkCandidate> {
+        let mut forced = flush_candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .work
+                    .metadata
+                    .get(crate::pressure::FLUSH_FORCE_REASON_METADATA_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        forced.sort_by(|left, right| {
+            crate::pressure::flush_candidate_priority_key(&right.work)
+                .cmp(&crate::pressure::flush_candidate_priority_key(&left.work))
+                .then_with(|| left.tag.domain.cmp(&right.tag.domain))
+                .then_with(|| left.work.work.table.cmp(&right.work.work.table))
+                .then_with(|| left.work.work.id.cmp(&right.work.work.id))
+        });
+
+        forced.into_iter().find_map(|candidate| {
+            candidates
+                .iter()
+                .find(|pending| pending.pending.id == candidate.work.work.id)
+                .cloned()
+        })
+    }
+
     pub(super) async fn execute_pending_work(
         &self,
         local_root: &str,
@@ -913,6 +945,69 @@ impl Db {
                 )
                 .await?;
                 return Ok(true);
+            }
+
+            let flush_candidates = self.pending_flush_pressure_candidates().await;
+            if let Some(candidate) = self.forced_flush_candidate(&candidates, &flush_candidates) {
+                self.record_forced_execution();
+                self.record_forced_flush();
+                self.execute_pending_work_budgeted(
+                    &local_root,
+                    candidate,
+                    PendingWorkBudget::default(),
+                    true,
+                )
+                .await?;
+                return Ok(true);
+            }
+
+            if !flush_candidates.is_empty() {
+                let flush_decisions = self
+                    .inner
+                    .scheduler
+                    .on_flush_pressure_available(&flush_candidates)
+                    .into_iter()
+                    .map(|decision| (decision.work_id, decision.action))
+                    .collect::<BTreeMap<_, _>>();
+                let mut scheduled_flushes = flush_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        flush_decisions
+                            .get(&candidate.work.work.id)
+                            .copied()
+                            .unwrap_or(ScheduleAction::Defer)
+                            == ScheduleAction::Execute
+                    })
+                    .collect::<Vec<_>>();
+                scheduled_flushes.sort_by(|left, right| {
+                    crate::pressure::flush_candidate_priority_key(&right.work)
+                        .cmp(&crate::pressure::flush_candidate_priority_key(&left.work))
+                        .then_with(|| left.tag.domain.cmp(&right.tag.domain))
+                        .then_with(|| left.work.work.table.cmp(&right.work.work.table))
+                        .then_with(|| left.work.work.id.cmp(&right.work.work.id))
+                });
+
+                for selected in scheduled_flushes {
+                    let Some(candidate) = candidates
+                        .iter()
+                        .find(|pending| pending.pending.id == selected.work.work.id)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let budget = self.scheduler_budget_for_candidate(&candidate).await;
+                    if self
+                        .pending_work_budget_block_reason(&candidate, budget)
+                        .is_some()
+                    {
+                        self.record_budget_blocked_execution(&candidate.tag);
+                        continue;
+                    }
+
+                    self.execute_pending_work_budgeted(&local_root, candidate, budget, false)
+                        .await?;
+                    return Ok(true);
+                }
             }
 
             let pending = candidates

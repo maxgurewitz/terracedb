@@ -3,6 +3,9 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
+while IFS= read -r git_env_var; do
+    unset "$git_env_var"
+done < <(git rev-parse --local-env-vars)
 cd "$repo_root"
 
 if ! command -v cargo-nextest >/dev/null 2>&1; then

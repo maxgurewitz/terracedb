@@ -1,10 +1,14 @@
 use std::{collections::BTreeMap, time::Duration};
 
+use serde_json::json;
 use terracedb::{
     AdmissionCorrectnessContext, AdmissionSignals, DomainMemoryBudget, ExecutionDomainBudget,
     ExecutionDomainPath, FlushPressureCandidate, PendingWork, PendingWorkType, PressureBudget,
     PressureBytes, PressureScope, PressureStats, SequenceNumber, WorkRuntimeTag,
 };
+
+const SOFT_AGE_TRIGGER: Duration = Duration::from_secs(2);
+const FORCE_AGE_CEILING: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeterministicPressureTableState {
@@ -179,9 +183,35 @@ impl DeterministicPressureOracle {
 
     pub fn flush_candidate(&self, table: &str) -> Option<FlushPressureCandidate> {
         let pressure = self.table_pressure_stats(table);
-        let estimated_bytes = pressure.local.immutable_queued_bytes;
+        let estimated_bytes = pressure
+            .local
+            .mutable_dirty_bytes
+            .saturating_add(pressure.local.immutable_queued_bytes);
         if estimated_bytes == 0 {
             return None;
+        }
+
+        let estimated_relief = PressureBytes {
+            mutable_dirty_bytes: pressure.local.mutable_dirty_bytes,
+            immutable_queued_bytes: pressure.local.immutable_queued_bytes,
+            unified_log_pinned_bytes: pressure.local.unified_log_pinned_bytes,
+            ..PressureBytes::default()
+        };
+        let score = flush_score(&pressure, estimated_relief);
+        let force_reason = flush_force_reason(&pressure);
+        let mut metadata = BTreeMap::from([
+            ("flush_score".to_string(), json!(score)),
+            (
+                "selection_reason".to_string(),
+                json!(flush_selection_reason(&pressure, estimated_relief)),
+            ),
+            (
+                "soft_guardrail".to_string(),
+                json!(flush_soft_guardrail_triggered(&pressure)),
+            ),
+        ]);
+        if let Some(reason) = force_reason {
+            metadata.insert("force_reason".to_string(), json!(reason));
         }
 
         Some(FlushPressureCandidate {
@@ -193,12 +223,8 @@ impl DeterministicPressureOracle {
                 estimated_bytes,
             },
             pressure,
-            estimated_relief: PressureBytes {
-                immutable_queued_bytes: estimated_bytes,
-                unified_log_pinned_bytes: estimated_bytes,
-                ..PressureBytes::default()
-            },
-            metadata: BTreeMap::new(),
+            estimated_relief,
+            metadata,
         })
     }
 
@@ -327,6 +353,126 @@ impl DeterministicPressureOracle {
     }
 }
 
+fn budget_pressure_bps(pressure: &PressureStats) -> u64 {
+    let hard_limit = pressure
+        .budget
+        .mutable_hard_limit_bytes
+        .or(pressure.budget.unified_log_hard_limit_bytes)
+        .filter(|limit| *limit > 0);
+    let Some(limit) = hard_limit else {
+        return 0;
+    };
+
+    [
+        pressure.local.total_memory_bytes(),
+        pressure
+            .domain_total
+            .unwrap_or(pressure.local)
+            .total_memory_bytes(),
+        pressure
+            .process_total
+            .unwrap_or(pressure.domain_total.unwrap_or(pressure.local))
+            .total_memory_bytes(),
+        pressure.local.unified_log_pinned_bytes,
+        pressure
+            .domain_total
+            .unwrap_or(pressure.local)
+            .unified_log_pinned_bytes,
+        pressure
+            .process_total
+            .unwrap_or(pressure.domain_total.unwrap_or(pressure.local))
+            .unified_log_pinned_bytes,
+    ]
+    .into_iter()
+    .map(|bytes| bytes.saturating_mul(10_000).div_ceil(limit))
+    .max()
+    .unwrap_or_default()
+}
+
+fn flush_soft_guardrail_triggered(pressure: &PressureStats) -> bool {
+    let soft_limit = pressure
+        .budget
+        .mutable_soft_limit_bytes
+        .or_else(|| {
+            pressure
+                .budget
+                .mutable_hard_limit_bytes
+                .map(|limit| limit * 3 / 4)
+        })
+        .or_else(|| {
+            pressure.budget.unified_log_soft_limit_bytes.or(pressure
+                .budget
+                .unified_log_hard_limit_bytes
+                .map(|limit| limit * 3 / 4))
+        });
+    pressure.oldest_unflushed_age >= Some(SOFT_AGE_TRIGGER)
+        || pressure.local.total_memory_bytes() >= soft_limit.unwrap_or(u64::MAX)
+        || pressure.local.unified_log_pinned_bytes >= soft_limit.unwrap_or(u64::MAX)
+}
+
+fn flush_force_reason(pressure: &PressureStats) -> Option<&'static str> {
+    let force_limit = pressure
+        .budget
+        .mutable_hard_limit_bytes
+        .or(pressure.budget.unified_log_hard_limit_bytes)
+        .map(|limit| limit * 7 / 8);
+    if pressure.local.unified_log_pinned_bytes >= force_limit.unwrap_or(u64::MAX) {
+        return Some("unified-log pressure");
+    }
+    if pressure.local.mutable_dirty_bytes >= force_limit.unwrap_or(u64::MAX) {
+        return Some("dirty-byte pressure");
+    }
+    if pressure.oldest_unflushed_age >= Some(FORCE_AGE_CEILING) {
+        return Some("oldest-unflushed age");
+    }
+    None
+}
+
+fn flush_score(pressure: &PressureStats, estimated_relief: PressureBytes) -> u64 {
+    let guardrail_bonus: u64 = if flush_force_reason(pressure).is_some() {
+        2_000_000
+    } else if flush_soft_guardrail_triggered(pressure) {
+        1_000_000
+    } else {
+        0
+    };
+    let age_millis = pressure
+        .oldest_unflushed_age
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or_default()
+        .min(60_000);
+
+    guardrail_bonus
+        .saturating_add(budget_pressure_bps(pressure).saturating_mul(128))
+        .saturating_add(estimated_relief.unified_log_pinned_bytes.saturating_mul(4))
+        .saturating_add(estimated_relief.mutable_dirty_bytes.saturating_mul(3))
+        .saturating_add(estimated_relief.immutable_queued_bytes.saturating_mul(2))
+        .saturating_add(age_millis.saturating_mul(32))
+}
+
+fn flush_selection_reason(pressure: &PressureStats, estimated_relief: PressureBytes) -> String {
+    let mut reasons = Vec::new();
+    if let Some(reason) = flush_force_reason(pressure) {
+        reasons.push(format!("guardrail triggered by {reason}"));
+    } else if flush_soft_guardrail_triggered(pressure) {
+        reasons.push("pressure is above the soft guardrail".to_string());
+    }
+    if estimated_relief.unified_log_pinned_bytes > 0 {
+        reasons.push("reclaims unified-log headroom".to_string());
+    }
+    if estimated_relief.mutable_dirty_bytes > 0 {
+        reasons.push("drains mutable dirty bytes".to_string());
+    }
+    if pressure.oldest_unflushed_age >= Some(SOFT_AGE_TRIGGER) {
+        reasons.push("oldest unflushed data is aging".to_string());
+    }
+    if reasons.is_empty() {
+        "conservative flush fallback".to_string()
+    } else {
+        reasons.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,8 +515,16 @@ mod tests {
         let candidate = oracle
             .flush_candidate("events")
             .expect("queued bytes should produce a flush candidate");
+        assert_eq!(candidate.estimated_relief.mutable_dirty_bytes, 0);
         assert_eq!(candidate.estimated_relief.immutable_queued_bytes, 64);
         assert_eq!(candidate.estimated_relief.unified_log_pinned_bytes, 64);
+        assert!(
+            candidate
+                .metadata
+                .get("flush_score")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
 
         let signals = oracle.admission_signals("events", tag.clone(), 32);
         assert_eq!(signals.runtime_tag, tag);
@@ -400,5 +554,66 @@ mod tests {
         assert_eq!(restarted_pressure.local.mutable_dirty_bytes, 64);
         assert_eq!(restarted_pressure.local.immutable_queued_bytes, 0);
         assert_eq!(restarted_pressure.local.immutable_flushing_bytes, 0);
+    }
+
+    #[test]
+    fn deterministic_pressure_oracle_scores_older_flush_higher_when_bytes_match() {
+        let domain = ExecutionDomainPath::new(["process", "db", "background"]);
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(256),
+            unified_log_hard_limit_bytes: Some(256),
+            ..PressureBudget::default()
+        });
+        oracle.bind_table_domain("hot", domain.clone());
+        oracle.bind_table_domain("fresh", domain);
+
+        oracle.record_mutable_write("hot", 64);
+        oracle.advance(Duration::from_secs(3));
+        oracle.record_mutable_write("fresh", 64);
+
+        let hot = oracle.flush_candidate("hot").expect("hot candidate");
+        let fresh = oracle.flush_candidate("fresh").expect("fresh candidate");
+        let hot_score = hot
+            .metadata
+            .get("flush_score")
+            .and_then(serde_json::Value::as_u64)
+            .expect("hot score");
+        let fresh_score = fresh
+            .metadata
+            .get("flush_score")
+            .and_then(serde_json::Value::as_u64)
+            .expect("fresh score");
+
+        assert_eq!(hot.work.estimated_bytes, fresh.work.estimated_bytes);
+        assert!(hot_score > fresh_score);
+        assert_eq!(
+            hot.metadata
+                .get("selection_reason")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                "pressure is above the soft guardrail, reclaims unified-log headroom, drains mutable dirty bytes, oldest unflushed data is aging"
+            )
+        );
+    }
+
+    #[test]
+    fn deterministic_pressure_oracle_marks_force_reasons_before_hard_ceiling() {
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(160),
+            unified_log_hard_limit_bytes: Some(160),
+            ..PressureBudget::default()
+        });
+        oracle.record_mutable_write("events", 140);
+
+        let candidate = oracle.flush_candidate("events").expect("force candidate");
+        assert_eq!(
+            candidate
+                .metadata
+                .get("force_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("unified-log pressure")
+        );
     }
 }

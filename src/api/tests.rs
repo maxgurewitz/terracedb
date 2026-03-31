@@ -396,6 +396,60 @@ impl Scheduler for RefusingScheduler {
     }
 }
 
+#[derive(Default)]
+struct CompactionOnlyFlushHookScheduler;
+
+impl Scheduler for CompactionOnlyFlushHookScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        let selected = work
+            .iter()
+            .find(|candidate| candidate.work_type == PendingWorkType::Compaction)
+            .map(|candidate| candidate.id.clone());
+        work.iter()
+            .map(|candidate| ScheduleDecision {
+                work_id: candidate.id.clone(),
+                action: if selected.as_ref() == Some(&candidate.id) {
+                    ScheduleAction::Execute
+                } else {
+                    ScheduleAction::Defer
+                },
+            })
+            .collect()
+    }
+
+    fn on_flush_pressure_available(
+        &self,
+        candidates: &[crate::DomainTaggedWork<crate::FlushPressureCandidate>],
+    ) -> Vec<ScheduleDecision> {
+        let selected = candidates
+            .iter()
+            .max_by_key(|candidate| {
+                candidate
+                    .work
+                    .metadata
+                    .get(crate::pressure::FLUSH_SCORE_METADATA_KEY)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default()
+            })
+            .map(|candidate| candidate.work.work.id.clone());
+        candidates
+            .iter()
+            .map(|candidate| ScheduleDecision {
+                work_id: candidate.work.work.id.clone(),
+                action: if selected.as_ref() == Some(&candidate.work.work.id) {
+                    ScheduleAction::Execute
+                } else {
+                    ScheduleAction::Defer
+                },
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+}
+
 struct PreferredTableScheduler {
     preferred_table: String,
 }
@@ -1884,6 +1938,19 @@ async fn pending_flush_pressure_candidates_surface_relief_estimates() {
         candidate.work.estimated_relief.unified_log_pinned_bytes,
         candidate.work.work.estimated_bytes
     );
+    assert_eq!(candidate.work.estimated_relief.mutable_dirty_bytes, 0);
+    assert!(
+        candidate
+            .work
+            .metadata
+            .contains_key(crate::pressure::FLUSH_SCORE_METADATA_KEY)
+    );
+    assert!(
+        candidate
+            .work
+            .metadata
+            .contains_key(crate::pressure::FLUSH_SELECTION_REASON_METADATA_KEY)
+    );
 }
 
 #[tokio::test]
@@ -2360,6 +2427,133 @@ async fn forced_flush_ignores_scheduler_deferrals_when_memtable_budget_is_exhaus
         "forced flush should install SSTables"
     );
     assert!(!db.sstables_read().live.is_empty());
+}
+
+#[tokio::test]
+async fn pressure_aware_flush_hook_preempts_compaction_when_dirty_relief_is_urgent() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_limits_and_scheduler(
+            "/pressure-aware-flush-hook",
+            160,
+            Arc::new(CompactionOnlyFlushHookScheduler),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let alpha = db
+        .create_table(row_table_config("alpha"))
+        .await
+        .expect("create alpha");
+    let beta = db
+        .create_table(row_table_config("beta"))
+        .await
+        .expect("create beta");
+
+    for round in 0..2_u8 {
+        alpha
+            .write(vec![b'a', round], Value::Bytes(vec![round]))
+            .await
+            .expect("write alpha seed");
+        db.flush().await.expect("flush alpha seed");
+    }
+    assert!(db.table_stats(&alpha).await.compaction_debt > 0);
+
+    beta.write(b"hot-0".to_vec(), Value::Bytes(vec![b'x'; 80]))
+        .await
+        .expect("write beta first batch");
+    assert_eq!(db.table_stats(&beta).await.local_bytes, 0);
+
+    beta.write(b"hot-1".to_vec(), Value::Bytes(vec![b'y'; 60]))
+        .await
+        .expect("write beta second batch under soft pressure");
+
+    assert!(
+        db.table_stats(&beta).await.local_bytes > 0,
+        "the flush-pressure hook should flush beta before the compaction-only scheduler can consume alpha's backlog"
+    );
+    assert!(
+        db.table_stats(&alpha).await.compaction_debt > 0,
+        "alpha compaction should still be pending because flush work ran first"
+    );
+}
+
+#[tokio::test]
+async fn forced_flush_triggers_before_the_memtable_hard_ceiling_when_pressure_is_high() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_limits_and_scheduler(
+            "/forced-flush-before-hard-limit",
+            160,
+            Arc::new(RefusingScheduler),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    table
+        .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 80]))
+        .await
+        .expect("write first large value");
+    assert_eq!(db.sstables_read().live.len(), 0);
+
+    table
+        .write(b"user:2".to_vec(), Value::Bytes(vec![b'y'; 60]))
+        .await
+        .expect("write second value below hard limit");
+
+    let stats = db.table_stats(&table).await;
+    assert!(
+        stats.local_bytes > 0,
+        "pressure-aware force flush should fire before the hard memtable ceiling"
+    );
+    assert!(db.scheduler_observability_snapshot().forced_flushes >= 1);
+}
+
+#[tokio::test]
+async fn age_ceiling_forces_flush_even_when_byte_pressure_is_low() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_config_with_limits_and_scheduler(
+            "/age-ceiling-forced-flush",
+            1024,
+            Arc::new(RefusingScheduler),
+        ),
+        dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    table
+        .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 32]))
+        .await
+        .expect("write aged value");
+    clock.advance(Duration::from_secs(6));
+
+    table
+        .write(b"user:2".to_vec(), Value::Bytes(vec![b'y'; 1]))
+        .await
+        .expect("write after age ceiling");
+
+    assert!(
+        db.table_stats(&table).await.local_bytes > 0,
+        "oldest-unflushed age should force a flush even without large byte pressure"
+    );
+    assert!(db.scheduler_observability_snapshot().forced_flushes >= 1);
 }
 
 #[tokio::test]

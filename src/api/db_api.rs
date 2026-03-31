@@ -1,4 +1,5 @@
 use super::*;
+use crate::Timestamp;
 
 use crate::ZoneMapPredicate;
 use crate::execution::{
@@ -932,8 +933,12 @@ impl Db {
             self.maybe_pause_commit_phase(CommitPhase::BeforeMemtableInsert, participant.sequence)
                 .await
                 .map_err(CommitError::Storage)?;
-            self.memtables_write()
-                .apply(participant.sequence, &participant.operations);
+            let memtable_inserted_at = self.inner.dependencies.clock.now();
+            self.memtables_write().apply(
+                participant.sequence,
+                &participant.operations,
+                memtable_inserted_at,
+            );
             self.mark_memtable_inserted(participant.sequence);
             self.maybe_pause_commit_phase(CommitPhase::AfterMemtableInsert, participant.sequence)
                 .await
@@ -1418,14 +1423,42 @@ impl Db {
     }
 
     fn pressure_budget(&self, domain_budget: Option<ExecutionDomainBudget>) -> PressureBudget {
+        let mutable_hard_limit_bytes = domain_budget
+            .and_then(|budget| budget.memory.mutable_bytes)
+            .or_else(|| self.memtable_budget_bytes());
+        let unified_log_hard_limit_bytes = mutable_hard_limit_bytes;
         PressureBudget {
-            mutable_soft_limit_bytes: None,
-            mutable_hard_limit_bytes: domain_budget
-                .and_then(|budget| budget.memory.mutable_bytes)
-                .or_else(|| self.memtable_budget_bytes()),
-            unified_log_soft_limit_bytes: None,
-            unified_log_hard_limit_bytes: None,
+            mutable_soft_limit_bytes: crate::pressure::derived_soft_limit_bytes(
+                mutable_hard_limit_bytes,
+            ),
+            mutable_hard_limit_bytes,
+            unified_log_soft_limit_bytes: crate::pressure::derived_soft_limit_bytes(
+                unified_log_hard_limit_bytes,
+            ),
+            unified_log_hard_limit_bytes,
         }
+    }
+
+    fn pressure_age_since(&self, oldest_unflushed_at: Option<Timestamp>) -> Option<Duration> {
+        let now = self.inner.dependencies.clock.now().get();
+        oldest_unflushed_at
+            .map(|oldest: Timestamp| Duration::from_millis(now.saturating_sub(oldest.get())))
+    }
+
+    async fn flush_pressure_guardrail_for_domain(
+        &self,
+        path: &ExecutionDomainPath,
+        additional_batch_bytes: u64,
+    ) -> crate::pressure::FlushPressureGuardrail {
+        let pressure = self.domain_pressure_stats(path).await;
+        crate::pressure::evaluate_flush_guardrail(
+            &pressure,
+            PressureBytes {
+                mutable_dirty_bytes: additional_batch_bytes,
+                unified_log_pinned_bytes: additional_batch_bytes,
+                ..PressureBytes::default()
+            },
+        )
     }
 
     fn total_pressure_accounting(memtables: &MemtableState) -> PressureAccountingSnapshot {
@@ -1508,20 +1541,22 @@ impl Db {
     }
 
     pub async fn process_pressure_stats(&self) -> PressureStats {
-        let total = Self::total_pressure_accounting(&self.memtables_read());
+        let memtables = self.memtables_read();
+        let total = Self::total_pressure_accounting(&memtables);
         PressureStats {
             scope: PressureScope::Process,
             local: total.bytes,
             domain_total: Some(total.bytes),
             process_total: Some(total.bytes),
-            oldest_unflushed_age: None,
+            oldest_unflushed_age: self.pressure_age_since(memtables.oldest_unflushed_at()),
             budget: self.pressure_budget(None),
             metadata: total.metadata(),
         }
     }
 
     pub async fn domain_pressure_stats(&self, path: &ExecutionDomainPath) -> PressureStats {
-        let total = Self::total_pressure_accounting(&self.memtables_read());
+        let memtables = self.memtables_read();
+        let total = Self::total_pressure_accounting(&memtables);
         let local = if self.domain_tracks_db_pressure(path) {
             total.clone()
         } else {
@@ -1533,7 +1568,10 @@ impl Db {
             local: local.bytes,
             domain_total: Some(local.bytes),
             process_total: Some(total.bytes),
-            oldest_unflushed_age: None,
+            oldest_unflushed_age: self
+                .domain_tracks_db_pressure(path)
+                .then(|| self.pressure_age_since(memtables.oldest_unflushed_at()))
+                .flatten(),
             budget: self.pressure_budget(self.execution_domain_budget(path)),
             metadata: local.metadata(),
         }
@@ -1552,7 +1590,9 @@ impl Db {
             local: local.bytes,
             domain_total: None,
             process_total: Some(total.bytes),
-            oldest_unflushed_age: None,
+            oldest_unflushed_age: table.id().and_then(|table_id| {
+                self.pressure_age_since(memtables.oldest_unflushed_at_for_table(table_id))
+            }),
             budget: self.pressure_budget(None),
             metadata: local.metadata(),
         }
@@ -1566,22 +1606,30 @@ impl Db {
             let Some(table) = self.try_table(candidate.pending.table.clone()) else {
                 continue;
             };
-            let estimated_bytes = candidate.pending.estimated_bytes;
+            let table_stats = self.table_stats(&table).await;
             let mut pressure = self.table_pressure_stats(&table).await;
             let domain = self.domain_pressure_stats(&candidate.tag.domain).await;
             pressure.domain_total = Some(domain.local);
             pressure.budget =
                 self.pressure_budget(self.execution_domain_budget(&candidate.tag.domain));
+            let estimated_relief = PressureBytes {
+                mutable_dirty_bytes: pressure.local.mutable_dirty_bytes,
+                immutable_queued_bytes: pressure.local.immutable_queued_bytes,
+                unified_log_pinned_bytes: pressure.local.unified_log_pinned_bytes,
+                ..PressureBytes::default()
+            };
+            let metadata = crate::pressure::build_flush_candidate_metadata(
+                &pressure,
+                estimated_relief,
+                table_stats.l0_sstable_count,
+                table_stats.compaction_debt,
+            );
             candidates.push(DomainTaggedWork::new(
                 FlushPressureCandidate {
                     work: candidate.pending,
                     pressure,
-                    estimated_relief: PressureBytes {
-                        immutable_queued_bytes: estimated_bytes,
-                        unified_log_pinned_bytes: estimated_bytes,
-                        ..PressureBytes::default()
-                    },
-                    metadata: BTreeMap::new(),
+                    estimated_relief,
+                    metadata,
                 },
                 candidate.tag,
             ));
@@ -1693,6 +1741,16 @@ impl Db {
         let total_batch_bytes = batch_bytes_by_table.values().copied().sum::<u64>();
         let foreground_tag = self.tag_user_foreground_work(()).tag;
         let foreground_budget = self.execution_domain_budget(&foreground_tag.domain);
+        let flush_guardrail = self
+            .flush_pressure_guardrail_for_domain(&foreground_tag.domain, total_batch_bytes)
+            .await;
+        if flush_guardrail.force_triggered {
+            self.record_forced_execution();
+            self.record_forced_flush();
+            self.flush_internal(false)
+                .await
+                .map_err(|error| CommitError::Storage(Self::flush_error_into_storage(error)))?;
+        }
         if self.memtable_budget_exceeded_by(total_batch_bytes) {
             self.record_forced_execution();
             self.record_forced_flush();
@@ -1720,8 +1778,11 @@ impl Db {
 
         loop {
             let mut max_delay = Duration::ZERO;
-            let mut should_run_maintenance = false;
-            let mut must_stall = false;
+            let flush_guardrail = self
+                .flush_pressure_guardrail_for_domain(&foreground_tag.domain, total_batch_bytes)
+                .await;
+            let mut should_run_maintenance = flush_guardrail.soft_triggered;
+            let mut must_stall = flush_guardrail.force_triggered;
 
             for table in &touched_tables {
                 let stats = self.table_stats(table).await;
@@ -2723,6 +2784,7 @@ impl Db {
             key.to_vec(),
             collapse.sequence,
             collapse.value,
+            self.inner.dependencies.clock.now(),
         );
     }
 

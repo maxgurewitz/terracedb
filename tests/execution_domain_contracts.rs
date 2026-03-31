@@ -818,7 +818,15 @@ async fn pressure_contracts_compose_with_builder_scheduler_and_public_db_apis() 
     );
 
     let flush_candidates = db.pending_flush_pressure_candidates().await;
-    assert!(flush_candidates.is_empty());
+    assert_eq!(flush_candidates.len(), 1);
+    assert_eq!(flush_candidates[0].work.work.table, "events");
+    assert_eq!(
+        flush_candidates[0]
+            .work
+            .estimated_relief
+            .mutable_dirty_bytes,
+        table_pressure.local.mutable_dirty_bytes
+    );
     assert!(
         NoopScheduler
             .on_flush_pressure_available(&flush_candidates)

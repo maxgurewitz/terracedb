@@ -1,4 +1,5 @@
 use super::*;
+use crate::Timestamp;
 
 #[derive(Clone, Debug)]
 pub(super) struct MemtableEntry {
@@ -37,10 +38,11 @@ pub(super) struct TableMemtable {
     pub(super) pending_flush_bytes: u64,
     pub(super) min_sequence: Option<SequenceNumber>,
     pub(super) max_sequence: Option<SequenceNumber>,
+    pub(super) oldest_unflushed_at: Option<Timestamp>,
 }
 
 impl TableMemtable {
-    pub(super) fn insert(&mut self, entry: MemtableEntry) {
+    pub(super) fn insert(&mut self, entry: MemtableEntry, now: Timestamp) {
         let encoded_key = encode_mvcc_key(&entry.user_key, CommitId::new(entry.sequence));
         if let Some(replaced) = self.entries.insert(encoded_key, entry.clone()) {
             self.pending_flush_bytes = self.pending_flush_bytes.saturating_sub(replaced.size_bytes);
@@ -56,6 +58,7 @@ impl TableMemtable {
                 .map(|current| current.max(entry.sequence))
                 .unwrap_or(entry.sequence),
         );
+        self.oldest_unflushed_at.get_or_insert(now);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -105,6 +108,10 @@ impl TableMemtable {
     pub(super) fn sequence_range(&self) -> Option<(SequenceNumber, SequenceNumber)> {
         self.min_sequence.zip(self.max_sequence)
     }
+
+    pub(super) fn restamp_oldest_unflushed_at(&mut self, now: Timestamp) {
+        self.oldest_unflushed_at = (self.pending_flush_bytes > 0).then_some(now);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -115,40 +122,45 @@ pub(super) struct Memtable {
 }
 
 impl Memtable {
-    pub(super) fn apply(&mut self, sequence: SequenceNumber, operation: &ResolvedBatchOperation) {
+    pub(super) fn apply(
+        &mut self,
+        sequence: SequenceNumber,
+        operation: &ResolvedBatchOperation,
+        now: Timestamp,
+    ) {
         self.min_sequence = Some(
             self.min_sequence
                 .map(|current| current.min(sequence))
                 .unwrap_or(sequence),
         );
         self.max_sequence = self.max_sequence.max(sequence);
-        self.tables
-            .entry(operation.table_id)
-            .or_default()
-            .insert(MemtableEntry::new(
+        self.tables.entry(operation.table_id).or_default().insert(
+            MemtableEntry::new(
                 operation.key.clone(),
                 sequence,
                 operation.kind,
                 operation.value.clone(),
-            ));
+            ),
+            now,
+        );
     }
 
-    pub(super) fn apply_recovered_entry(&mut self, sequence: SequenceNumber, entry: &CommitEntry) {
+    pub(super) fn apply_recovered_entry(
+        &mut self,
+        sequence: SequenceNumber,
+        entry: &CommitEntry,
+        recovered_at: Timestamp,
+    ) {
         self.min_sequence = Some(
             self.min_sequence
                 .map(|current| current.min(sequence))
                 .unwrap_or(sequence),
         );
         self.max_sequence = self.max_sequence.max(sequence);
-        self.tables
-            .entry(entry.table_id)
-            .or_default()
-            .insert(MemtableEntry::new(
-                entry.key.clone(),
-                sequence,
-                entry.kind,
-                entry.value.clone(),
-            ));
+        self.tables.entry(entry.table_id).or_default().insert(
+            MemtableEntry::new(entry.key.clone(), sequence, entry.kind, entry.value.clone()),
+            recovered_at,
+        );
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -190,6 +202,7 @@ impl Memtable {
         key: Key,
         sequence: SequenceNumber,
         value: Value,
+        now: Timestamp,
     ) {
         self.min_sequence = Some(
             self.min_sequence
@@ -197,15 +210,10 @@ impl Memtable {
                 .unwrap_or(sequence),
         );
         self.max_sequence = self.max_sequence.max(sequence);
-        self.tables
-            .entry(table_id)
-            .or_default()
-            .insert(MemtableEntry::new(
-                key,
-                sequence,
-                ChangeKind::Put,
-                Some(value),
-            ));
+        self.tables.entry(table_id).or_default().insert(
+            MemtableEntry::new(key, sequence, ChangeKind::Put, Some(value)),
+            now,
+        );
     }
 
     pub(super) fn pending_flush_bytes(&self, table_id: TableId) -> u64 {
@@ -222,6 +230,17 @@ impl Memtable {
                 (table.pending_flush_bytes > 0).then_some((table_id, table.pending_flush_bytes))
             })
             .collect()
+    }
+
+    pub(super) fn oldest_unflushed_at(&self, table_id: TableId) -> Option<Timestamp> {
+        self.tables.get(&table_id)?.oldest_unflushed_at
+    }
+
+    pub(super) fn oldest_unflushed_at_all_tables(&self) -> Option<Timestamp> {
+        self.tables
+            .values()
+            .filter_map(|table| table.oldest_unflushed_at)
+            .min()
     }
 
     pub(super) fn total_pending_flush_bytes(&self) -> u64 {
@@ -254,6 +273,12 @@ impl Memtable {
 
     pub(super) fn is_empty(&self) -> bool {
         self.tables.values().all(TableMemtable::is_empty)
+    }
+
+    pub(super) fn restamp_oldest_unflushed_at(&mut self, now: Timestamp) {
+        for table in self.tables.values_mut() {
+            table.restamp_oldest_unflushed_at(now);
+        }
     }
 
     pub(super) fn record_table_watermarks(
@@ -981,15 +1006,21 @@ impl MemtableState {
         &mut self,
         sequence: SequenceNumber,
         operations: &[ResolvedBatchOperation],
+        now: Timestamp,
     ) {
         for operation in operations {
-            self.mutable.apply(sequence, operation);
+            self.mutable.apply(sequence, operation, now);
         }
     }
 
-    pub(super) fn apply_recovered_record(&mut self, record: &CommitRecord) {
+    pub(super) fn apply_recovered_record(
+        &mut self,
+        record: &CommitRecord,
+        recovered_at: Timestamp,
+    ) {
         for entry in &record.entries {
-            self.mutable.apply_recovered_entry(record.sequence(), entry);
+            self.mutable
+                .apply_recovered_entry(record.sequence(), entry, recovered_at);
         }
     }
 
@@ -1062,8 +1093,10 @@ impl MemtableState {
         key: Key,
         sequence: SequenceNumber,
         value: Value,
+        now: Timestamp,
     ) {
-        self.mutable.force_collapse(table_id, key, sequence, value);
+        self.mutable
+            .force_collapse(table_id, key, sequence, value, now);
     }
 
     pub(super) fn rotate_mutable(&mut self) -> Option<SequenceNumber> {
@@ -1094,6 +1127,22 @@ impl MemtableState {
             .sum::<u64>();
 
         mutable_bytes.saturating_add(immutable_bytes)
+    }
+
+    pub(super) fn pending_flush_bytes_by_table(&self) -> BTreeMap<TableId, u64> {
+        let mut backlog = self.mutable.pending_flush_bytes_by_table();
+        for immutable in &self.immutables {
+            if !matches!(immutable.state, ImmutableMemtableFlushState::Queued) {
+                continue;
+            }
+            for (table_id, bytes) in immutable.memtable.pending_flush_bytes_by_table() {
+                backlog
+                    .entry(table_id)
+                    .and_modify(|current: &mut u64| *current = current.saturating_add(bytes))
+                    .or_insert(bytes);
+            }
+        }
+        backlog
     }
 
     pub(super) fn immutable_flush_backlog_by_table(&self) -> BTreeMap<TableId, u64> {
@@ -1253,6 +1302,36 @@ impl MemtableState {
         });
     }
 
+    pub(super) fn oldest_unflushed_at_for_table(&self, table_id: TableId) -> Option<Timestamp> {
+        self.mutable
+            .oldest_unflushed_at(table_id)
+            .into_iter()
+            .chain(
+                self.immutables
+                    .iter()
+                    .filter_map(|immutable| immutable.memtable.oldest_unflushed_at(table_id)),
+            )
+            .min()
+    }
+
+    pub(super) fn oldest_unflushed_at(&self) -> Option<Timestamp> {
+        self.mutable
+            .oldest_unflushed_at_all_tables()
+            .into_iter()
+            .chain(
+                self.immutables
+                    .iter()
+                    .filter_map(|immutable| immutable.memtable.oldest_unflushed_at_all_tables()),
+            )
+            .min()
+    }
+
+    pub(super) fn restamp_oldest_unflushed_at(&mut self, now: Timestamp) {
+        self.mutable.restamp_oldest_unflushed_at(now);
+        for immutable in &mut self.immutables {
+            immutable.memtable.restamp_oldest_unflushed_at(now);
+        }
+    }
     pub(super) fn table_watermarks(&self) -> BTreeMap<TableId, SequenceNumber> {
         let mut watermarks = BTreeMap::new();
         self.mutable.record_table_watermarks(&mut watermarks);
