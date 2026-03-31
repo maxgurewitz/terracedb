@@ -20,6 +20,15 @@ fn row(name: &str, primary: u64, tie_break: u64, bytes: u64) -> CurrentStateOrac
     )
 }
 
+fn row_without_primary(name: &str, tie_break: u64, bytes: u64) -> CurrentStateOracleRow {
+    CurrentStateOracleRow::new(
+        name.as_bytes().to_vec(),
+        None,
+        Some(format!("{tie_break:03}").into_bytes()),
+        bytes,
+    )
+}
+
 fn decode_keys(keys: &[Vec<u8>]) -> Vec<String> {
     keys.iter()
         .map(|key| String::from_utf8(key.clone()).expect("simulation keys should be utf-8"))
@@ -93,6 +102,29 @@ fn run_threshold_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulation
 
     SeededSimulationRunner::new(seed).run_with(move |_context| async move {
         Ok(run_current_state_simulation(&scenario).expect("threshold simulation should succeed"))
+    })
+}
+
+fn run_threshold_missing_key_simulation(
+    seed: u64,
+) -> turmoil::Result<CurrentStateSimulationOutcome> {
+    let scenario = CurrentStateSimulationScenario {
+        initial_contract: threshold_contract(1, 50),
+        operations: vec![
+            CurrentStateSimulationOperation::Upsert(row_without_primary("alpha", 1, 12)),
+            CurrentStateSimulationOperation::Upsert(row("bravo", 40, 2, 14)),
+            CurrentStateSimulationOperation::Restart,
+            CurrentStateSimulationOperation::Upsert(row("bravo", 90, 2, 16)),
+            CurrentStateSimulationOperation::ReviseContract {
+                contract: threshold_contract(2, 95),
+            },
+            CurrentStateSimulationOperation::Upsert(row("charlie", 100, 3, 18)),
+        ],
+    };
+
+    SeededSimulationRunner::new(seed).run_with(move |_context| async move {
+        Ok(run_current_state_simulation(&scenario)
+            .expect("threshold missing-key simulation should succeed"))
     })
 }
 
@@ -170,6 +202,34 @@ fn rank_retention_simulation_is_deterministic_through_tie_storms_and_restart() -
             reason: CurrentStateDerivedOnlyReason::ProjectionOwnedWithoutPhysicalReclaim,
         }]
     );
+
+    Ok(())
+}
+
+#[test]
+fn threshold_retention_simulation_keeps_missing_keys_out_of_reclaim() -> turmoil::Result {
+    let first = run_threshold_missing_key_simulation(0x5961)?;
+    let second = run_threshold_missing_key_simulation(0x5961)?;
+    assert_eq!(first, second);
+
+    let final_step = first
+        .steps
+        .last()
+        .expect("threshold missing-key simulation should have steps");
+    assert_eq!(
+        decode_keys(&final_step.evaluation.retained_row_keys),
+        vec!["alpha".to_string(), "charlie".to_string()]
+    );
+    assert_eq!(
+        decode_keys(&final_step.evaluation.non_retained_row_keys),
+        vec!["bravo".to_string()]
+    );
+    assert_eq!(
+        decode_keys(&final_step.evaluation.reclaimable_row_keys),
+        vec!["bravo".to_string()]
+    );
+    assert!(final_step.evaluation.deferred_row_keys.is_empty());
+    assert_eq!(final_step.evaluation.stats.policy_revision, 2);
 
     Ok(())
 }
