@@ -1336,6 +1336,17 @@ Each work item may carry both:
 
 These two concepts are intentionally related but separate. Moving work between domains or changing domain budgets may affect latency, throughput, and backlog behavior, but must not change correctness semantics such as commit ordering, visibility, durability guarantees, or recovery results. Simple single-DB embeddings can ignore this entirely and rely on the built-in defaults; colocated multi-DB or future shard-aware embeddings opt into explicit domain/resource configuration.
 
+For the colocated case, the current API surface is intentionally split into:
+
+- **placement/deployment shape**, via `ColocatedDeployment` presets such as `single_database`, `two_databases`, `primary_with_analytics`, and `shard_ready`, plus explicit `ColocatedDatabasePlacement` / `ColocatedSubsystemPlacement` overrides when a host needs reserved lanes or custom topology; and
+- **durability semantics**, via the `DurabilityClass` attached to each lane binding.
+
+This means a host can move a DB or subsystem between shared and reserved execution domains, or change its domain hierarchy entirely, without silently changing which durability path it uses. The common colocated flow is:
+
+1. Build one shared `ColocatedDeployment` for the process.
+2. Open each DB with `Db::builder().colocated_database(&deployment, "...")`.
+3. Inspect runtime decisions through `deployment.report()` or `db.execution_placement_report()`.
+
 ### Engine Responsibilities
 
 The engine:

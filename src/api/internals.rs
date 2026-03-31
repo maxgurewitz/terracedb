@@ -32,6 +32,7 @@ pub(super) const MAX_SCHEDULER_DEFER_CYCLES: u32 = 3;
 
 pub(super) struct DbInner {
     pub(super) config: DbConfig,
+    pub(super) execution_identity: String,
     pub(super) scheduler: Arc<dyn Scheduler>,
     pub(super) resource_manager: Arc<dyn crate::execution::ResourceManager>,
     pub(super) execution_profile: crate::execution::DbExecutionProfile,

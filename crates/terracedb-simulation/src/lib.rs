@@ -34,15 +34,19 @@ mod hybrid;
 pub use self::hybrid::*;
 #[allow(unused_imports)]
 pub use terracedb::{
-    ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec, ContentionClass, DbExecutionProfile,
-    DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot, DomainTaggedWork,
-    DurabilityClass, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget,
-    ExecutionDomainContentionSnapshot, ExecutionDomainInvariant, ExecutionDomainInvariantSet,
-    ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSnapshot,
-    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, ExecutionResourceKind,
-    ExecutionResourceUsage, InMemoryDomainBudgetOracle, InMemoryResourceManager,
-    PlacementAssignment, PlacementRequest, ResourceAdmissionDecision, ResourceManager,
-    ResourceManagerSnapshot, WorkPlacementRequest, WorkRuntimeTag,
+    ColocatedDatabasePlacement, ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec,
+    ColocatedDeployment, ColocatedDeploymentBuilder, ColocatedDeploymentError,
+    ColocatedDeploymentReport, ColocatedSubsystemPlacement, ContentionClass,
+    DbExecutionPlacementReport, DbExecutionProfile, DomainBudgetCharge, DomainBudgetOracle,
+    DomainBudgetSnapshot, DomainTaggedWork, DurabilityClass, ExecutionDomainBacklogSnapshot,
+    ExecutionDomainBudget, ExecutionDomainContentionSnapshot, ExecutionDomainInvariant,
+    ExecutionDomainInvariantSet, ExecutionDomainOwner, ExecutionDomainPath,
+    ExecutionDomainPlacement, ExecutionDomainSnapshot, ExecutionDomainSpec, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionPlacementDecision,
+    ExecutionResourceKind, ExecutionResourceUsage, InMemoryDomainBudgetOracle,
+    InMemoryResourceManager, PlacementAssignment, PlacementRequest, PlacementTarget,
+    ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot, WorkPlacementRequest,
+    WorkRuntimeTag,
 };
 
 const OBJECT_STORE_HOST: &str = "object-store";

@@ -95,6 +95,7 @@ pub struct DbDependencies {
     pub rng: Arc<dyn Rng>,
     pub(crate) resource_manager: Arc<dyn ResourceManager>,
     pub(crate) execution_profile: DbExecutionProfile,
+    pub(crate) execution_identity: Option<String>,
     pub(crate) failpoint_key: u64,
 }
 
@@ -116,6 +117,7 @@ impl DbDependencies {
             rng,
             resource_manager: Arc::new(InMemoryResourceManager::default()),
             execution_profile: DbExecutionProfile::default(),
+            execution_identity: None,
             failpoint_key,
         }
     }
@@ -130,12 +132,21 @@ impl DbDependencies {
         self
     }
 
+    pub fn with_execution_identity(mut self, execution_identity: impl Into<String>) -> Self {
+        self.execution_identity = Some(execution_identity.into());
+        self
+    }
+
     pub fn resource_manager(&self) -> Arc<dyn ResourceManager> {
         self.resource_manager.clone()
     }
 
     pub fn execution_profile(&self) -> &DbExecutionProfile {
         &self.execution_profile
+    }
+
+    pub fn execution_identity(&self) -> Option<&str> {
+        self.execution_identity.as_deref()
     }
 }
 
@@ -148,6 +159,7 @@ impl fmt::Debug for DbDependencies {
             .field("rng", &"<dyn Rng>")
             .field("resource_manager", &"<dyn ResourceManager>")
             .field("execution_profile", &self.execution_profile)
+            .field("execution_identity", &self.execution_identity)
             .finish()
     }
 }

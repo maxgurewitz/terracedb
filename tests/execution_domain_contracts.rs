@@ -3,14 +3,16 @@ use std::{collections::BTreeMap, sync::Arc};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use terracedb::{
-    CommitOptions, CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbSettings,
-    DomainBackgroundBudget, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork,
-    DurabilityClass, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget,
-    ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook, ExecutionDomainOwner,
-    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLaneBinding,
-    ExecutionResourceKind, ExecutionResourceUsage, InMemoryResourceManager, NoopScheduler,
-    PendingWork, PendingWorkType, ResourceManager, S3Location, ScanOptions, StubClock,
-    StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, Value,
+    ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement, CommitOptions,
+    CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbSettings, DomainBackgroundBudget,
+    DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork, DurabilityClass,
+    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainLifecycleEvent,
+    ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
+    ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding,
+    ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage,
+    InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType, ResourceManager,
+    S3Location, ScanOptions, StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig,
+    TableFormat, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -67,6 +69,19 @@ fn stub_components(resource_manager: Arc<dyn ResourceManager>) -> DbComponents {
     )
     .with_scheduler(Arc::new(NoopScheduler))
     .with_resource_manager(resource_manager)
+}
+
+fn shared_stub_components(
+    file_system: Arc<StubFileSystem>,
+    object_store: Arc<StubObjectStore>,
+) -> DbComponents {
+    DbComponents::new(
+        file_system,
+        object_store,
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(17)),
+    )
+    .with_scheduler(Arc::new(NoopScheduler))
 }
 
 fn process_budget() -> ExecutionDomainBudget {
@@ -567,6 +582,40 @@ async fn run_workload(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
     rows
 }
 
+async fn read_existing_rows(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let table = db.table("events");
+    let snapshot = db.snapshot().await;
+    let rows = snapshot
+        .scan(&table, b"a".to_vec(), b"z".to_vec(), ScanOptions::default())
+        .await
+        .expect("scan recovered logical result")
+        .map(|(key, value)| match value {
+            Value::Bytes(bytes) => (key, bytes),
+            Value::Record(_) => panic!("invariant test only uses byte values"),
+        })
+        .collect::<Vec<_>>()
+        .await;
+    snapshot.release();
+    rows
+}
+
+async fn open_deployed_db(
+    deployment: &ColocatedDeployment,
+    database: &str,
+    path: &str,
+    file_system: Arc<StubFileSystem>,
+    object_store: Arc<StubObjectStore>,
+) -> Db {
+    Db::builder()
+        .settings(tiered_settings(path))
+        .components(shared_stub_components(file_system, object_store))
+        .colocated_database(deployment, database)
+        .expect("bind builder to colocated deployment")
+        .open()
+        .await
+        .expect("open deployed db")
+}
+
 #[tokio::test]
 async fn colocated_databases_can_share_one_resource_manager_with_distinct_domain_assignments() {
     let manager: Arc<dyn ResourceManager> =
@@ -624,4 +673,244 @@ async fn changing_execution_domain_placement_does_not_change_logical_db_outcomes
             (b"c".to_vec(), b"v3".to_vec()),
         ]
     );
+}
+
+#[test]
+fn colocated_deployment_presets_publish_default_profiles_and_budgets() {
+    let single =
+        ColocatedDeployment::single_database(process_budget(), "primary").expect("single layout");
+    let single_report = single.report();
+    let primary = &single_report.databases["primary"];
+    assert_eq!(
+        primary.foreground.binding.domain,
+        ExecutionDomainPath::new(["process", "dbs", "primary", "foreground"])
+    );
+    assert_eq!(
+        primary.background.binding.domain,
+        ExecutionDomainPath::new(["process", "dbs", "primary", "background"])
+    );
+    let control = primary
+        .control_plane
+        .snapshot
+        .as_ref()
+        .expect("single preset should register control-plane domain");
+    assert_eq!(control.spec.placement, ExecutionDomainPlacement::Dedicated);
+    assert_eq!(control.effective_budget.cpu.worker_slots, Some(1));
+    assert_eq!(
+        control.spec.metadata.get("terracedb.execution.database"),
+        Some(&"primary".to_string())
+    );
+
+    let paired =
+        ColocatedDeployment::primary_with_analytics(process_budget(), "primary", "analytics")
+            .expect("primary+analytics layout");
+    let paired_report = paired.report();
+    assert_eq!(
+        paired_report.databases["primary"]
+            .foreground
+            .snapshot
+            .as_ref()
+            .expect("primary foreground")
+            .spec
+            .placement,
+        ExecutionDomainPlacement::SharedWeighted { weight: 3 }
+    );
+    assert_eq!(
+        paired_report.databases["analytics"]
+            .foreground
+            .snapshot
+            .as_ref()
+            .expect("analytics foreground")
+            .spec
+            .metadata
+            .get("terracedb.execution.role")
+            .map(String::as_str),
+        Some("analytics-helper")
+    );
+
+    let shard_ready =
+        ColocatedDeployment::shard_ready(process_budget(), "warehouse").expect("shard-ready");
+    assert_eq!(
+        shard_ready.report().databases["warehouse"]
+            .foreground
+            .binding
+            .domain,
+        ExecutionDomainPath::new(["process", "shards", "warehouse", "foreground"])
+    );
+}
+
+#[tokio::test]
+async fn single_db_defaults_stay_simple_without_explicit_deployment_setup() {
+    let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
+    let db = Db::builder()
+        .settings(tiered_settings("/execution-default-profile"))
+        .components(stub_components(resource_manager))
+        .open()
+        .await
+        .expect("open single db with defaults");
+
+    let report = db.execution_placement_report();
+    assert_eq!(report.database, "execution-default-profile");
+    assert_eq!(
+        report.foreground.binding.domain,
+        ExecutionDomainPath::new(["process", "db", "foreground"])
+    );
+    assert_eq!(
+        report.background.binding.domain,
+        ExecutionDomainPath::new(["process", "db", "background"])
+    );
+    assert_eq!(
+        report.control_plane.binding.domain,
+        ExecutionDomainPath::new(["process", "control"])
+    );
+    assert_eq!(
+        report
+            .control_plane
+            .snapshot
+            .as_ref()
+            .expect("default control-plane domain")
+            .spec
+            .metadata
+            .get("reserved")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn colocated_deployment_builder_supports_multi_db_open_and_recovery() {
+    let deployment =
+        ColocatedDeployment::primary_with_analytics(process_budget(), "primary", "analytics")
+            .expect("declare colocated deployment");
+    let deployment_manager = deployment.resource_manager();
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+
+    let primary = open_deployed_db(
+        &deployment,
+        "primary",
+        "/execution-deployment-primary",
+        file_system.clone(),
+        object_store.clone(),
+    )
+    .await;
+    let analytics = open_deployed_db(
+        &deployment,
+        "analytics",
+        "/execution-deployment-analytics",
+        file_system.clone(),
+        object_store.clone(),
+    )
+    .await;
+
+    let primary_rows = run_workload(&primary).await;
+    let analytics_rows = run_workload(&analytics).await;
+    assert_eq!(primary_rows, analytics_rows);
+
+    drop(primary);
+    drop(analytics);
+
+    let reopened_primary = open_deployed_db(
+        &deployment,
+        "primary",
+        "/execution-deployment-primary",
+        file_system.clone(),
+        object_store.clone(),
+    )
+    .await;
+    let reopened_analytics = open_deployed_db(
+        &deployment,
+        "analytics",
+        "/execution-deployment-analytics",
+        file_system,
+        object_store,
+    )
+    .await;
+
+    assert!(Arc::ptr_eq(
+        &reopened_primary.resource_manager(),
+        &deployment_manager
+    ));
+    assert!(Arc::ptr_eq(
+        &reopened_analytics.resource_manager(),
+        &deployment_manager
+    ));
+    assert_eq!(read_existing_rows(&reopened_primary).await, primary_rows);
+    assert_eq!(
+        read_existing_rows(&reopened_analytics).await,
+        analytics_rows
+    );
+    assert_ne!(
+        reopened_primary
+            .execution_placement_report()
+            .foreground
+            .binding
+            .domain,
+        reopened_analytics
+            .execution_placement_report()
+            .foreground
+            .binding
+            .domain
+    );
+}
+
+#[tokio::test]
+async fn placement_reports_include_attached_subsystems_and_match_runtime_topology() {
+    let subsystem_path =
+        ExecutionDomainPath::new(["process", "dbs", "primary", "subsystems", "projection"]);
+    let deployment = ColocatedDeployment::builder(process_budget())
+        .with_database(ColocatedDatabasePlacement::shared("primary"))
+        .expect("declare primary db")
+        .with_subsystem(ColocatedSubsystemPlacement::database_local(
+            "primary",
+            "projection",
+            ExecutionLane::UserBackground,
+            ExecutionLanePlacementConfig::shared(subsystem_path.clone(), DurabilityClass::UserData),
+        ))
+        .expect("declare projection subsystem")
+        .build();
+    let deployment_report = deployment.report();
+    let primary = &deployment_report.databases["primary"];
+    assert_eq!(primary.attached_subsystems.len(), 1);
+    let subsystem_snapshot = primary
+        .attached_subsystems
+        .values()
+        .next()
+        .expect("projection subsystem should be reported");
+    assert_eq!(
+        subsystem_snapshot
+            .spec
+            .metadata
+            .get("terracedb.execution.subsystem")
+            .map(String::as_str),
+        Some("projection")
+    );
+    assert!(primary.domain_topology.contains_key(&subsystem_path));
+
+    let db = open_deployed_db(
+        &deployment,
+        "primary",
+        "/execution-deployment-subsystem",
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+    )
+    .await;
+    let runtime_report = db.execution_placement_report();
+    assert_eq!(
+        runtime_report.foreground.binding,
+        primary.foreground.binding
+    );
+    assert_eq!(
+        runtime_report.background.binding,
+        primary.background.binding
+    );
+    assert_eq!(
+        runtime_report.control_plane.binding,
+        primary.control_plane.binding
+    );
+    assert_eq!(
+        runtime_report.attached_subsystems,
+        primary.attached_subsystems
+    );
+    assert!(runtime_report.domain_topology.contains_key(&subsystem_path));
 }

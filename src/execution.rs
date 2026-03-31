@@ -456,6 +456,61 @@ impl ExecutionLaneBinding {
     }
 }
 
+pub fn execution_lane_name(lane: ExecutionLane) -> &'static str {
+    match lane {
+        ExecutionLane::UserForeground => "user-foreground",
+        ExecutionLane::UserBackground => "user-background",
+        ExecutionLane::ControlPlane => "control-plane",
+    }
+}
+
+pub fn durability_class_metadata_value(durability_class: &DurabilityClass) -> String {
+    match durability_class {
+        DurabilityClass::UserData => "user-data".to_string(),
+        DurabilityClass::ControlPlane => "control-plane".to_string(),
+        DurabilityClass::Deferred => "deferred".to_string(),
+        DurabilityClass::RemotePrimary => "remote-primary".to_string(),
+        DurabilityClass::Custom(name) => format!("custom:{name}"),
+    }
+}
+
+pub fn durability_class_from_metadata_value(value: &str) -> DurabilityClass {
+    match value {
+        "user-data" => DurabilityClass::UserData,
+        "control-plane" => DurabilityClass::ControlPlane,
+        "deferred" => DurabilityClass::Deferred,
+        "remote-primary" => DurabilityClass::RemotePrimary,
+        custom => {
+            let name = custom.strip_prefix("custom:").unwrap_or(custom).to_string();
+            DurabilityClass::Custom(name)
+        }
+    }
+}
+
+pub fn reserved_control_plane_budget() -> ExecutionDomainBudget {
+    ExecutionDomainBudget {
+        cpu: DomainCpuBudget {
+            worker_slots: Some(1),
+            weight: Some(1),
+        },
+        memory: DomainMemoryBudget {
+            total_bytes: Some(64 * 1024),
+            cache_bytes: None,
+            mutable_bytes: Some(64 * 1024),
+        },
+        io: DomainIoBudget {
+            local_concurrency: Some(1),
+            local_bytes_per_second: Some(256 * 1024),
+            remote_concurrency: Some(1),
+            remote_bytes_per_second: Some(256 * 1024),
+        },
+        background: DomainBackgroundBudget {
+            task_slots: Some(1),
+            max_in_flight_bytes: Some(256 * 1024),
+        },
+    }
+}
+
 /// Default execution and durability bindings for one database runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbExecutionProfile {
@@ -617,6 +672,7 @@ impl ExecutionDomainInvariantSet {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementRequest {
     pub owner: ExecutionDomainOwner,
+    pub lane: ExecutionLane,
     pub preferred_domain: ExecutionDomainPath,
     pub requested_budget: ExecutionDomainBudget,
     pub placement: ExecutionDomainPlacement,
@@ -626,6 +682,7 @@ pub struct PlacementRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementAssignment {
     pub owner: ExecutionDomainOwner,
+    pub lane: ExecutionLane,
     pub domain: ExecutionDomainPath,
     pub placement: ExecutionDomainPlacement,
     pub default_durability_class: DurabilityClass,
@@ -656,6 +713,7 @@ impl PlacementPolicy for PreferRequestedDomainPolicy {
     ) -> PlacementAssignment {
         PlacementAssignment {
             owner: request.owner.clone(),
+            lane: request.lane,
             domain: request.preferred_domain.clone(),
             placement: request.placement,
             default_durability_class: request.default_durability_class.clone(),
@@ -666,6 +724,766 @@ impl PlacementPolicy for PreferRequestedDomainPolicy {
 impl fmt::Debug for PreferRequestedDomainPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PreferRequestedDomainPolicy")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlacementTarget {
+    pub owner: ExecutionDomainOwner,
+    pub lane: ExecutionLane,
+}
+
+impl PlacementTarget {
+    pub fn new(owner: ExecutionDomainOwner, lane: ExecutionLane) -> Self {
+        Self { owner, lane }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionLanePlacementConfig {
+    pub binding: ExecutionLaneBinding,
+    pub budget: ExecutionDomainBudget,
+    pub placement: ExecutionDomainPlacement,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl ExecutionLanePlacementConfig {
+    pub fn shared(domain: ExecutionDomainPath, durability_class: DurabilityClass) -> Self {
+        Self::shared_weighted(domain, durability_class, 1)
+    }
+
+    pub fn shared_weighted(
+        domain: ExecutionDomainPath,
+        durability_class: DurabilityClass,
+        weight: u32,
+    ) -> Self {
+        Self {
+            binding: ExecutionLaneBinding::new(domain, durability_class),
+            budget: ExecutionDomainBudget::default(),
+            placement: ExecutionDomainPlacement::SharedWeighted {
+                weight: weight.max(1),
+            },
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn reserved(
+        domain: ExecutionDomainPath,
+        durability_class: DurabilityClass,
+        budget: ExecutionDomainBudget,
+    ) -> Self {
+        Self {
+            binding: ExecutionLaneBinding::new(domain, durability_class),
+            budget,
+            placement: ExecutionDomainPlacement::Dedicated,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_budget(mut self, budget: ExecutionDomainBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColocatedDatabasePlacement {
+    pub name: String,
+    pub foreground: ExecutionLanePlacementConfig,
+    pub background: ExecutionLanePlacementConfig,
+    pub control_plane: ExecutionLanePlacementConfig,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl ColocatedDatabasePlacement {
+    pub fn new(
+        name: impl Into<String>,
+        foreground: ExecutionLanePlacementConfig,
+        background: ExecutionLanePlacementConfig,
+        control_plane: ExecutionLanePlacementConfig,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            foreground,
+            background,
+            control_plane,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn shared(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let root = Self::database_root(&name);
+        Self::new(
+            name,
+            ExecutionLanePlacementConfig::shared(
+                root.child("foreground"),
+                DurabilityClass::UserData,
+            ),
+            ExecutionLanePlacementConfig::shared(
+                root.child("background"),
+                DurabilityClass::UserData,
+            ),
+            ExecutionLanePlacementConfig::reserved(
+                root.child("control"),
+                DurabilityClass::ControlPlane,
+                reserved_control_plane_budget(),
+            ),
+        )
+    }
+
+    pub fn analytics_helper(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let mut placement = Self::shared(name);
+        placement.foreground.placement = ExecutionDomainPlacement::SharedWeighted { weight: 1 };
+        placement.background.placement = ExecutionDomainPlacement::SharedWeighted { weight: 1 };
+        placement.metadata.insert(
+            "terracedb.execution.role".to_string(),
+            "analytics-helper".to_string(),
+        );
+        placement
+    }
+
+    pub fn shard_ready(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let root = ExecutionDomainPath::new(["process", "shards", name.as_str()]);
+        let mut placement = Self::new(
+            name,
+            ExecutionLanePlacementConfig::shared(
+                root.child("foreground"),
+                DurabilityClass::UserData,
+            ),
+            ExecutionLanePlacementConfig::shared(
+                root.child("background"),
+                DurabilityClass::UserData,
+            ),
+            ExecutionLanePlacementConfig::reserved(
+                root.child("control"),
+                DurabilityClass::ControlPlane,
+                reserved_control_plane_budget(),
+            ),
+        );
+        placement.metadata.insert(
+            "terracedb.execution.layout".to_string(),
+            "shard-ready".to_string(),
+        );
+        placement
+    }
+
+    pub fn execution_profile(&self) -> DbExecutionProfile {
+        DbExecutionProfile {
+            foreground: self.foreground.binding.clone(),
+            background: self.background.binding.clone(),
+            control_plane: self.control_plane.binding.clone(),
+        }
+    }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn database_root(name: &str) -> ExecutionDomainPath {
+        ExecutionDomainPath::new(["process", "dbs", name])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColocatedSubsystemPlacement {
+    pub database: Option<String>,
+    pub name: String,
+    pub lane: ExecutionLane,
+    pub placement: ExecutionLanePlacementConfig,
+}
+
+impl ColocatedSubsystemPlacement {
+    pub fn database_local(
+        database: impl Into<String>,
+        name: impl Into<String>,
+        lane: ExecutionLane,
+        placement: ExecutionLanePlacementConfig,
+    ) -> Self {
+        Self {
+            database: Some(database.into()),
+            name: name.into(),
+            lane,
+            placement,
+        }
+    }
+
+    pub fn process_local(
+        name: impl Into<String>,
+        lane: ExecutionLane,
+        placement: ExecutionLanePlacementConfig,
+    ) -> Self {
+        Self {
+            database: None,
+            name: name.into(),
+            lane,
+            placement,
+        }
+    }
+
+    pub fn target(&self) -> PlacementTarget {
+        PlacementTarget::new(
+            ExecutionDomainOwner::Subsystem {
+                database: self.database.clone(),
+                name: self.name.clone(),
+            },
+            self.lane,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionPlacementDecision {
+    pub owner: ExecutionDomainOwner,
+    pub lane: ExecutionLane,
+    pub binding: ExecutionLaneBinding,
+    pub snapshot: Option<ExecutionDomainSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbExecutionPlacementReport {
+    pub database: String,
+    pub placement_policy_name: String,
+    pub foreground: ExecutionPlacementDecision,
+    pub background: ExecutionPlacementDecision,
+    pub control_plane: ExecutionPlacementDecision,
+    pub attached_subsystems: BTreeMap<String, ExecutionDomainSnapshot>,
+    pub domain_topology: BTreeMap<ExecutionDomainPath, ExecutionDomainSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColocatedDeploymentReport {
+    pub placement_policy_name: String,
+    pub process_budget: ExecutionDomainBudget,
+    pub databases: BTreeMap<String, DbExecutionPlacementReport>,
+    pub process_subsystems: BTreeMap<String, ExecutionDomainSnapshot>,
+    pub domain_topology: BTreeMap<ExecutionDomainPath, ExecutionDomainSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColocatedDeploymentError {
+    DuplicateDatabase {
+        name: String,
+    },
+    DuplicateSubsystem {
+        name: String,
+        database: Option<String>,
+    },
+    EmptyDatabaseName,
+}
+
+impl fmt::Display for ColocatedDeploymentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateDatabase { name } => {
+                write!(f, "database placement '{name}' was declared more than once")
+            }
+            Self::DuplicateSubsystem { name, database } => match database {
+                Some(database) => write!(
+                    f,
+                    "subsystem placement '{database}/{name}' was declared more than once"
+                ),
+                None => write!(
+                    f,
+                    "process subsystem placement '{name}' was declared more than once"
+                ),
+            },
+            Self::EmptyDatabaseName => f.write_str("database placement names cannot be empty"),
+        }
+    }
+}
+
+impl std::error::Error for ColocatedDeploymentError {}
+
+#[derive(Clone)]
+pub struct ColocatedDeploymentPlacementPolicy {
+    assignments: BTreeMap<PlacementTarget, PlacementAssignment>,
+}
+
+impl ColocatedDeploymentPlacementPolicy {
+    fn new(assignments: BTreeMap<PlacementTarget, PlacementAssignment>) -> Self {
+        Self { assignments }
+    }
+}
+
+impl PlacementPolicy for ColocatedDeploymentPlacementPolicy {
+    fn name(&self) -> &'static str {
+        "colocated-deployment"
+    }
+
+    fn assign(
+        &self,
+        request: &PlacementRequest,
+        _snapshot: &ResourceManagerSnapshot,
+    ) -> PlacementAssignment {
+        self.assignments
+            .get(&PlacementTarget::new(request.owner.clone(), request.lane))
+            .cloned()
+            .unwrap_or_else(|| PlacementAssignment {
+                owner: request.owner.clone(),
+                lane: request.lane,
+                domain: request.preferred_domain.clone(),
+                placement: request.placement,
+                default_durability_class: request.default_durability_class.clone(),
+            })
+    }
+}
+
+impl fmt::Debug for ColocatedDeploymentPlacementPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ColocatedDeploymentPlacementPolicy")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ColocatedDeploymentBuilder {
+    process_budget: ExecutionDomainBudget,
+    databases: BTreeMap<String, ColocatedDatabasePlacement>,
+    subsystems: BTreeMap<PlacementTarget, ColocatedSubsystemPlacement>,
+}
+
+impl ColocatedDeploymentBuilder {
+    pub fn new(process_budget: ExecutionDomainBudget) -> Self {
+        Self {
+            process_budget,
+            databases: BTreeMap::new(),
+            subsystems: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_database(
+        mut self,
+        placement: ColocatedDatabasePlacement,
+    ) -> Result<Self, ColocatedDeploymentError> {
+        if placement.name.is_empty() {
+            return Err(ColocatedDeploymentError::EmptyDatabaseName);
+        }
+        let duplicate_name = placement.name.clone();
+        if self
+            .databases
+            .insert(duplicate_name.clone(), placement)
+            .is_some()
+        {
+            return Err(ColocatedDeploymentError::DuplicateDatabase {
+                name: duplicate_name,
+            });
+        }
+        Ok(self)
+    }
+
+    pub fn with_subsystem(
+        mut self,
+        placement: ColocatedSubsystemPlacement,
+    ) -> Result<Self, ColocatedDeploymentError> {
+        let target = placement.target();
+        if self.subsystems.insert(target.clone(), placement).is_some() {
+            return Err(ColocatedDeploymentError::DuplicateSubsystem {
+                name: match target.owner {
+                    ExecutionDomainOwner::Subsystem { ref name, .. } => name.clone(),
+                    _ => unreachable!("subsystem targets always use subsystem owners"),
+                },
+                database: match target.owner {
+                    ExecutionDomainOwner::Subsystem { ref database, .. } => database.clone(),
+                    _ => unreachable!("subsystem targets always use subsystem owners"),
+                },
+            });
+        }
+        Ok(self)
+    }
+
+    pub fn build(self) -> ColocatedDeployment {
+        ColocatedDeployment::from_builder(self)
+    }
+}
+
+#[derive(Clone)]
+pub struct ColocatedDeployment {
+    resource_manager: Arc<dyn ResourceManager>,
+    databases: BTreeMap<String, ColocatedDatabasePlacement>,
+    subsystems: BTreeMap<PlacementTarget, ColocatedSubsystemPlacement>,
+}
+
+impl ColocatedDeployment {
+    pub fn builder(process_budget: ExecutionDomainBudget) -> ColocatedDeploymentBuilder {
+        ColocatedDeploymentBuilder::new(process_budget)
+    }
+
+    pub fn single_database(
+        process_budget: ExecutionDomainBudget,
+        name: impl Into<String>,
+    ) -> Result<Self, ColocatedDeploymentError> {
+        Ok(Self::builder(process_budget)
+            .with_database(ColocatedDatabasePlacement::shared(name))?
+            .build())
+    }
+
+    pub fn two_databases(
+        process_budget: ExecutionDomainBudget,
+        left: impl Into<String>,
+        right: impl Into<String>,
+    ) -> Result<Self, ColocatedDeploymentError> {
+        Ok(Self::builder(process_budget)
+            .with_database(ColocatedDatabasePlacement::shared(left))?
+            .with_database(ColocatedDatabasePlacement::shared(right))?
+            .build())
+    }
+
+    pub fn primary_with_analytics(
+        process_budget: ExecutionDomainBudget,
+        primary: impl Into<String>,
+        analytics: impl Into<String>,
+    ) -> Result<Self, ColocatedDeploymentError> {
+        let primary_name = primary.into();
+        let analytics_name = analytics.into();
+        let mut primary = ColocatedDatabasePlacement::shared(primary_name.clone());
+        primary.foreground.placement = ExecutionDomainPlacement::SharedWeighted { weight: 3 };
+        primary.background.placement = ExecutionDomainPlacement::SharedWeighted { weight: 2 };
+        primary = primary.with_metadata("terracedb.execution.role", "primary");
+
+        let analytics = ColocatedDatabasePlacement::analytics_helper(analytics_name);
+
+        Ok(Self::builder(process_budget)
+            .with_database(primary)?
+            .with_database(analytics)?
+            .build())
+    }
+
+    pub fn shard_ready(
+        process_budget: ExecutionDomainBudget,
+        name: impl Into<String>,
+    ) -> Result<Self, ColocatedDeploymentError> {
+        Ok(Self::builder(process_budget)
+            .with_database(ColocatedDatabasePlacement::shard_ready(name))?
+            .build())
+    }
+
+    fn from_builder(builder: ColocatedDeploymentBuilder) -> Self {
+        let assignments = build_colocated_assignments(&builder.databases, &builder.subsystems);
+        let resource_manager: Arc<dyn ResourceManager> = Arc::new(
+            InMemoryResourceManager::new(builder.process_budget).with_placement_policy(Arc::new(
+                ColocatedDeploymentPlacementPolicy::new(assignments),
+            )),
+        );
+        register_colocated_domains(&resource_manager, &builder.databases, &builder.subsystems);
+        Self {
+            resource_manager,
+            databases: builder.databases,
+            subsystems: builder.subsystems,
+        }
+    }
+
+    pub fn resource_manager(&self) -> Arc<dyn ResourceManager> {
+        self.resource_manager.clone()
+    }
+
+    pub fn database_names(&self) -> Vec<String> {
+        self.databases.keys().cloned().collect()
+    }
+
+    pub fn execution_profile(&self, database: &str) -> Option<DbExecutionProfile> {
+        self.databases
+            .get(database)
+            .map(ColocatedDatabasePlacement::execution_profile)
+    }
+
+    pub fn report(&self) -> ColocatedDeploymentReport {
+        let snapshot = self.resource_manager.snapshot();
+        ColocatedDeploymentReport {
+            placement_policy_name: snapshot.placement_policy_name.clone(),
+            process_budget: snapshot.process_budget,
+            databases: self
+                .databases
+                .iter()
+                .map(|(database, placement)| {
+                    (
+                        database.clone(),
+                        build_db_execution_placement_report(
+                            &snapshot,
+                            database,
+                            &placement.execution_profile(),
+                        ),
+                    )
+                })
+                .collect(),
+            process_subsystems: snapshot
+                .domains
+                .iter()
+                .filter_map(|(path, snapshot)| match &snapshot.spec.owner {
+                    ExecutionDomainOwner::Subsystem {
+                        database: None,
+                        name,
+                    } => Some((format!("{name}:{}", path.as_string()), snapshot.clone())),
+                    _ => None,
+                })
+                .collect(),
+            domain_topology: snapshot.domains,
+        }
+    }
+}
+
+impl fmt::Debug for ColocatedDeployment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColocatedDeployment")
+            .field("resource_manager", &"<dyn ResourceManager>")
+            .field("databases", &self.databases.keys().collect::<Vec<_>>())
+            .field("subsystems", &self.subsystems.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+fn build_colocated_assignments(
+    databases: &BTreeMap<String, ColocatedDatabasePlacement>,
+    subsystems: &BTreeMap<PlacementTarget, ColocatedSubsystemPlacement>,
+) -> BTreeMap<PlacementTarget, PlacementAssignment> {
+    let mut assignments = BTreeMap::new();
+
+    for (database, placement) in databases {
+        for (lane, lane_placement) in [
+            (ExecutionLane::UserForeground, &placement.foreground),
+            (ExecutionLane::UserBackground, &placement.background),
+        ] {
+            let owner = ExecutionDomainOwner::Database {
+                name: database.clone(),
+            };
+            assignments.insert(
+                PlacementTarget::new(owner.clone(), lane),
+                PlacementAssignment {
+                    owner,
+                    lane,
+                    domain: lane_placement.binding.domain.clone(),
+                    placement: lane_placement.placement,
+                    default_durability_class: lane_placement.binding.durability_class.clone(),
+                },
+            );
+        }
+
+        let owner = ExecutionDomainOwner::Subsystem {
+            database: Some(database.clone()),
+            name: "control-plane".to_string(),
+        };
+        assignments.insert(
+            PlacementTarget::new(owner.clone(), ExecutionLane::ControlPlane),
+            PlacementAssignment {
+                owner,
+                lane: ExecutionLane::ControlPlane,
+                domain: placement.control_plane.binding.domain.clone(),
+                placement: placement.control_plane.placement,
+                default_durability_class: placement.control_plane.binding.durability_class.clone(),
+            },
+        );
+    }
+
+    for (target, placement) in subsystems {
+        assignments.insert(
+            target.clone(),
+            PlacementAssignment {
+                owner: target.owner.clone(),
+                lane: target.lane,
+                domain: placement.placement.binding.domain.clone(),
+                placement: placement.placement.placement,
+                default_durability_class: placement.placement.binding.durability_class.clone(),
+            },
+        );
+    }
+
+    assignments
+}
+
+fn register_colocated_domains(
+    resource_manager: &Arc<dyn ResourceManager>,
+    databases: &BTreeMap<String, ColocatedDatabasePlacement>,
+    subsystems: &BTreeMap<PlacementTarget, ColocatedSubsystemPlacement>,
+) {
+    for (database, placement) in databases {
+        for (lane, owner, lane_placement) in [
+            (
+                ExecutionLane::UserForeground,
+                ExecutionDomainOwner::Database {
+                    name: database.clone(),
+                },
+                &placement.foreground,
+            ),
+            (
+                ExecutionLane::UserBackground,
+                ExecutionDomainOwner::Database {
+                    name: database.clone(),
+                },
+                &placement.background,
+            ),
+            (
+                ExecutionLane::ControlPlane,
+                ExecutionDomainOwner::Subsystem {
+                    database: Some(database.clone()),
+                    name: "control-plane".to_string(),
+                },
+                &placement.control_plane,
+            ),
+        ] {
+            let mut metadata = placement.metadata.clone();
+            metadata.extend(lane_placement.metadata.clone());
+            metadata.insert(
+                "terracedb.execution.lane".to_string(),
+                execution_lane_name(lane).to_string(),
+            );
+            metadata.insert("terracedb.execution.database".to_string(), database.clone());
+            metadata.insert(
+                "terracedb.execution.durability".to_string(),
+                durability_class_metadata_value(&lane_placement.binding.durability_class),
+            );
+            if lane == ExecutionLane::ControlPlane {
+                metadata.insert("reserved".to_string(), "true".to_string());
+            }
+            resource_manager.register_domain(ExecutionDomainSpec {
+                path: lane_placement.binding.domain.clone(),
+                owner,
+                budget: lane_placement.budget,
+                placement: lane_placement.placement,
+                metadata,
+            });
+        }
+    }
+
+    for placement in subsystems.values() {
+        let mut metadata = placement.placement.metadata.clone();
+        metadata.insert(
+            "terracedb.execution.lane".to_string(),
+            execution_lane_name(placement.lane).to_string(),
+        );
+        metadata.insert(
+            "terracedb.execution.durability".to_string(),
+            durability_class_metadata_value(&placement.placement.binding.durability_class),
+        );
+        if let Some(database) = &placement.database {
+            metadata.insert("terracedb.execution.database".to_string(), database.clone());
+        }
+        metadata.insert(
+            "terracedb.execution.subsystem".to_string(),
+            placement.name.clone(),
+        );
+        resource_manager.register_domain(ExecutionDomainSpec {
+            path: placement.placement.binding.domain.clone(),
+            owner: ExecutionDomainOwner::Subsystem {
+                database: placement.database.clone(),
+                name: placement.name.clone(),
+            },
+            budget: placement.placement.budget,
+            placement: placement.placement.placement,
+            metadata,
+        });
+    }
+}
+
+pub fn build_db_execution_placement_report(
+    snapshot: &ResourceManagerSnapshot,
+    database: &str,
+    execution_profile: &DbExecutionProfile,
+) -> DbExecutionPlacementReport {
+    let foreground = build_execution_placement_decision(
+        snapshot,
+        ExecutionDomainOwner::Database {
+            name: database.to_string(),
+        },
+        ExecutionLane::UserForeground,
+        execution_profile.foreground.clone(),
+    );
+    let background = build_execution_placement_decision(
+        snapshot,
+        ExecutionDomainOwner::Database {
+            name: database.to_string(),
+        },
+        ExecutionLane::UserBackground,
+        execution_profile.background.clone(),
+    );
+    let control_plane = build_execution_placement_decision(
+        snapshot,
+        ExecutionDomainOwner::Subsystem {
+            database: Some(database.to_string()),
+            name: "control-plane".to_string(),
+        },
+        ExecutionLane::ControlPlane,
+        execution_profile.control_plane.clone(),
+    );
+
+    let relevant_roots = [
+        foreground.binding.domain.clone(),
+        background.binding.domain.clone(),
+        control_plane.binding.domain.clone(),
+    ];
+    let attached_subsystem_entries = snapshot
+        .domains
+        .iter()
+        .filter_map(
+            |(path, domain_snapshot)| match &domain_snapshot.spec.owner {
+                ExecutionDomainOwner::Subsystem {
+                    database: Some(owner_database),
+                    name,
+                } if owner_database == database && name != "control-plane" => Some((
+                    path.clone(),
+                    format!("{name}@{}", path.as_string()),
+                    domain_snapshot.clone(),
+                )),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    let attached_subsystems = attached_subsystem_entries
+        .iter()
+        .map(|(_, key, snapshot)| (key.clone(), snapshot.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut included_paths = BTreeSet::new();
+    for root in &relevant_roots {
+        included_paths.extend(root.lineage());
+    }
+    for (path, _, _) in &attached_subsystem_entries {
+        included_paths.extend(path.lineage());
+    }
+
+    let domain_topology = snapshot
+        .domains
+        .iter()
+        .filter(|(path, _)| {
+            included_paths.contains(*path)
+                || relevant_roots
+                    .iter()
+                    .any(|root| path.is_same_or_descendant_of(root))
+                || attached_subsystem_entries
+                    .iter()
+                    .any(|(root, _, _)| path.is_same_or_descendant_of(root))
+        })
+        .map(|(path, snapshot)| (path.clone(), snapshot.clone()))
+        .collect();
+
+    DbExecutionPlacementReport {
+        database: database.to_string(),
+        placement_policy_name: snapshot.placement_policy_name.clone(),
+        foreground,
+        background,
+        control_plane,
+        attached_subsystems,
+        domain_topology,
+    }
+}
+
+fn build_execution_placement_decision(
+    snapshot: &ResourceManagerSnapshot,
+    owner: ExecutionDomainOwner,
+    lane: ExecutionLane,
+    binding: ExecutionLaneBinding,
+) -> ExecutionPlacementDecision {
+    ExecutionPlacementDecision {
+        owner,
+        lane,
+        snapshot: snapshot.domains.get(&binding.domain).cloned(),
+        binding,
     }
 }
 
@@ -1271,7 +2089,11 @@ impl ResourceManager for InMemoryResourceManager {
             let entry = domains
                 .get_mut(&spec.path)
                 .expect("domain must exist after ensuring hierarchy");
-            entry.spec = Self::merge_spec(entry.spec.clone(), spec);
+            entry.spec = if entry.explicit {
+                Self::merge_spec(entry.spec.clone(), spec)
+            } else {
+                spec
+            };
             entry.state = ExecutionDomainState::Active;
             entry.explicit = true;
             let path = entry.spec.path.clone();
@@ -1297,7 +2119,11 @@ impl ResourceManager for InMemoryResourceManager {
             let entry = domains
                 .get_mut(&spec.path)
                 .expect("domain must exist after ensuring hierarchy");
-            entry.spec = Self::merge_spec(entry.spec.clone(), spec);
+            entry.spec = if entry.explicit {
+                Self::merge_spec(entry.spec.clone(), spec)
+            } else {
+                spec
+            };
             entry.state = ExecutionDomainState::Active;
             entry.explicit = true;
             let path = entry.spec.path.clone();
