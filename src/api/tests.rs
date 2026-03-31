@@ -565,6 +565,45 @@ impl Scheduler for TableRateLimitScheduler {
     }
 }
 
+#[derive(Debug)]
+struct DomainMutableBudgetRateLimitScheduler {
+    minimum_rate: u64,
+}
+
+impl Scheduler for DomainMutableBudgetRateLimitScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_decision_in_domain(
+        &self,
+        _table: &crate::Table,
+        _stats: &TableStats,
+        _signals: &crate::AdmissionSignals,
+        _tag: &crate::WorkRuntimeTag,
+        domain_budget: Option<&crate::ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        let rate = domain_budget
+            .and_then(|budget| budget.memory.mutable_bytes)
+            .unwrap_or(self.minimum_rate)
+            .max(self.minimum_rate);
+        ThrottleDecision {
+            throttle: true,
+            max_write_bytes_per_second: Some(rate),
+            stall: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct TinyCompactionBudgetScheduler;
 
@@ -2154,6 +2193,94 @@ async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
     assert_eq!(
         write.await.expect("join write task"),
         SequenceNumber::new(1)
+    );
+}
+
+#[tokio::test]
+async fn forced_flush_guardrails_still_honor_domain_rate_limit_delay() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let execution_identity = "guardrail-domain-rate-limit";
+    let profile = execution_profile_with_prefix("guardrail-domain-rate-limit");
+    let resource_manager: Arc<dyn crate::ResourceManager> =
+        Arc::new(crate::InMemoryResourceManager::default());
+    resource_manager.register_domain(crate::ExecutionDomainSpec {
+        path: profile.foreground.domain.clone(),
+        owner: crate::ExecutionDomainOwner::Database {
+            name: execution_identity.to_string(),
+        },
+        budget: crate::ExecutionDomainBudget {
+            memory: crate::DomainMemoryBudget {
+                mutable_bytes: Some(32),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        placement: crate::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+        metadata: BTreeMap::new(),
+    });
+
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/forced-flush-guardrail-domain-rate-limit",
+            Arc::new(DomainMutableBudgetRateLimitScheduler { minimum_rate: 16 }),
+        ),
+        dependencies_with_clock(file_system, object_store, clock.clone())
+            .with_resource_manager(resource_manager)
+            .with_execution_profile(profile.clone())
+            .with_execution_identity(execution_identity),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    let write_table = table.clone();
+    let write = tokio::spawn(async move {
+        write_table
+            .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 128]))
+            .await
+            .expect("write should complete after the simulated delay")
+    });
+
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !write.is_finished(),
+        "oversized write should still be waiting on the simulated clock"
+    );
+
+    clock.advance(Duration::from_millis(350));
+    tokio::task::yield_now().await;
+    assert!(
+        !write.is_finished(),
+        "hard flush guardrails should not bypass explicit domain throttling"
+    );
+
+    let elapsed =
+        advance_clock_until_task_finishes(clock.as_ref(), &write, Duration::from_millis(250), 32)
+            .await
+            + 350;
+    assert_eq!(
+        write.await.expect("join write task"),
+        SequenceNumber::new(1)
+    );
+    assert!(
+        elapsed >= 5_000,
+        "write should preserve the modeled delay even after a force-triggered flush: elapsed={elapsed}ms"
+    );
+    assert!(db.scheduler_observability_snapshot().forced_flushes >= 1);
+    assert!(
+        db.scheduler_observability_snapshot()
+            .throttled_writes_by_domain
+            .get(&profile.foreground.domain)
+            .copied()
+            .unwrap_or_default()
+            > 0
     );
 }
 

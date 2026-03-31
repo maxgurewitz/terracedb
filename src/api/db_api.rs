@@ -1831,6 +1831,14 @@ impl Db {
                     continue;
                 }
                 if must_stall {
+                    // Oversized writes can still trip a hard guardrail after
+                    // maintenance has already exhausted the relievable
+                    // pressure. Preserve any explicit scheduler backoff before
+                    // allowing the write through so domain throttles still
+                    // apply in those cases.
+                    if max_delay > Duration::ZERO {
+                        self.inner.dependencies.clock.sleep(max_delay).await;
+                    }
                     break;
                 }
             }
