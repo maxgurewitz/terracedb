@@ -1133,6 +1133,191 @@ impl Db {
         }
     }
 
+    fn pressure_budget(&self, domain_budget: Option<ExecutionDomainBudget>) -> PressureBudget {
+        PressureBudget {
+            mutable_soft_limit_bytes: None,
+            mutable_hard_limit_bytes: domain_budget
+                .and_then(|budget| budget.memory.mutable_bytes)
+                .or_else(|| self.memtable_budget_bytes()),
+            unified_log_soft_limit_bytes: None,
+            unified_log_hard_limit_bytes: None,
+        }
+    }
+
+    fn total_pressure_bytes(memtables: &MemtableState) -> PressureBytes {
+        let mutable_dirty_bytes = memtables.mutable.total_pending_flush_bytes();
+        let immutable_queued_bytes = memtables
+            .immutables
+            .iter()
+            .map(|immutable| immutable.memtable.total_pending_flush_bytes())
+            .sum::<u64>();
+
+        PressureBytes {
+            mutable_dirty_bytes,
+            immutable_queued_bytes,
+            immutable_flushing_bytes: 0,
+            unified_log_pinned_bytes: mutable_dirty_bytes.saturating_add(immutable_queued_bytes),
+        }
+    }
+
+    fn table_pressure_bytes(memtables: &MemtableState, table_id: TableId) -> PressureBytes {
+        let mutable_dirty_bytes = memtables.mutable.pending_flush_bytes(table_id);
+        let immutable_queued_bytes = memtables
+            .immutables
+            .iter()
+            .map(|immutable| immutable.memtable.pending_flush_bytes(table_id))
+            .sum::<u64>();
+
+        PressureBytes {
+            mutable_dirty_bytes,
+            immutable_queued_bytes,
+            immutable_flushing_bytes: 0,
+            unified_log_pinned_bytes: mutable_dirty_bytes.saturating_add(immutable_queued_bytes),
+        }
+    }
+
+    fn domain_tracks_db_pressure(&self, path: &ExecutionDomainPath) -> bool {
+        [
+            &self.execution_profile().foreground.domain,
+            &self.execution_profile().background.domain,
+        ]
+        .into_iter()
+        .any(|configured| {
+            configured.is_same_or_descendant_of(path) || path.is_same_or_descendant_of(configured)
+        })
+    }
+
+    pub async fn process_pressure_stats(&self) -> PressureStats {
+        let total = Self::total_pressure_bytes(&self.memtables_read());
+        PressureStats {
+            scope: PressureScope::Process,
+            local: total,
+            domain_total: Some(total),
+            process_total: Some(total),
+            oldest_unflushed_age: None,
+            budget: self.pressure_budget(None),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub async fn domain_pressure_stats(&self, path: &ExecutionDomainPath) -> PressureStats {
+        let total = Self::total_pressure_bytes(&self.memtables_read());
+        let local = self
+            .domain_tracks_db_pressure(path)
+            .then_some(total)
+            .unwrap_or_default();
+
+        PressureStats {
+            scope: PressureScope::Domain(path.clone()),
+            local,
+            domain_total: Some(local),
+            process_total: Some(total),
+            oldest_unflushed_age: None,
+            budget: self.pressure_budget(self.execution_domain_budget(path)),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub async fn table_pressure_stats(&self, table: &Table) -> PressureStats {
+        let memtables = self.memtables_read();
+        let total = Self::total_pressure_bytes(&memtables);
+        let local = table
+            .resolve_id()
+            .map(|table_id| Self::table_pressure_bytes(&memtables, table_id))
+            .unwrap_or_default();
+
+        PressureStats {
+            scope: PressureScope::Table(table.name().to_string()),
+            local,
+            domain_total: None,
+            process_total: Some(total),
+            oldest_unflushed_age: None,
+            budget: self.pressure_budget(None),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub async fn pending_flush_pressure_candidates(
+        &self,
+    ) -> Vec<DomainTaggedWork<FlushPressureCandidate>> {
+        let mut candidates = Vec::new();
+        for candidate in self.pending_flush_candidates() {
+            let Some(table) = self.try_table(candidate.pending.table.clone()) else {
+                continue;
+            };
+            let estimated_bytes = candidate.pending.estimated_bytes;
+            let mut pressure = self.table_pressure_stats(&table).await;
+            let domain = self.domain_pressure_stats(&candidate.tag.domain).await;
+            pressure.domain_total = Some(domain.local);
+            pressure.budget =
+                self.pressure_budget(self.execution_domain_budget(&candidate.tag.domain));
+            candidates.push(DomainTaggedWork::new(
+                FlushPressureCandidate {
+                    work: candidate.pending,
+                    pressure,
+                    estimated_relief: PressureBytes {
+                        immutable_queued_bytes: estimated_bytes,
+                        unified_log_pinned_bytes: estimated_bytes,
+                        ..PressureBytes::default()
+                    },
+                    metadata: BTreeMap::new(),
+                },
+                candidate.tag,
+            ));
+        }
+        candidates
+    }
+
+    pub async fn write_admission_signals(
+        &self,
+        table: &Table,
+        batch_write_bytes: u64,
+    ) -> AdmissionSignals {
+        let tag = self.tag_user_foreground_work(()).tag;
+        let stats = self.table_stats(table).await;
+        let domain_budget = self.execution_domain_budget(&tag.domain);
+        self.write_admission_signals_for_context(
+            table,
+            &stats,
+            batch_write_bytes,
+            &tag,
+            domain_budget,
+        )
+        .await
+    }
+
+    pub(super) async fn write_admission_signals_for_context(
+        &self,
+        table: &Table,
+        stats: &TableStats,
+        batch_write_bytes: u64,
+        runtime_tag: &WorkRuntimeTag,
+        domain_budget: Option<ExecutionDomainBudget>,
+    ) -> AdmissionSignals {
+        let mut pressure = self.table_pressure_stats(table).await;
+        let domain = self.domain_pressure_stats(&runtime_tag.domain).await;
+        pressure.domain_total = Some(domain.local);
+        pressure.budget = self.pressure_budget(domain_budget);
+
+        AdmissionSignals {
+            table: table.name().to_string(),
+            runtime_tag: runtime_tag.clone(),
+            domain_budget,
+            pressure,
+            batch_write_bytes,
+            l0_sstable_count: stats.l0_sstable_count,
+            immutable_memtable_count: stats.immutable_memtable_count,
+            compaction_debt_bytes: stats.compaction_debt,
+            correctness: AdmissionCorrectnessContext {
+                durable_sequence: self.current_durable_sequence(),
+                visible_sequence: self.current_sequence(),
+                commit_log_recovery_floor_sequence: stats.commit_log_recovery_floor_sequence,
+                commit_log_gc_floor_sequence: stats.commit_log_gc_floor_sequence,
+            },
+            metadata: BTreeMap::new(),
+        }
+    }
+
     pub async fn pending_work(&self) -> Vec<PendingWork> {
         self.pending_work_candidates()
             .into_iter()
@@ -1204,16 +1389,26 @@ impl Db {
 
             for table in &touched_tables {
                 let stats = self.table_stats(table).await;
-                let decision = self.inner.scheduler.should_throttle_in_domain(
-                    table,
-                    &stats,
-                    &foreground_tag,
-                    foreground_budget.as_ref(),
-                );
                 let table_bytes = table
                     .id()
                     .and_then(|table_id| batch_bytes_by_table.get(&table_id).copied())
                     .unwrap_or(total_batch_bytes);
+                let signals = self
+                    .write_admission_signals_for_context(
+                        table,
+                        &stats,
+                        table_bytes,
+                        &foreground_tag,
+                        foreground_budget,
+                    )
+                    .await;
+                let decision = self.inner.scheduler.admission_decision_in_domain(
+                    table,
+                    &stats,
+                    &signals,
+                    &foreground_tag,
+                    foreground_budget.as_ref(),
+                );
 
                 if let Some(rate) = decision.max_write_bytes_per_second {
                     max_delay = max_delay.max(Self::throttle_delay(table_bytes, rate));

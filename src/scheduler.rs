@@ -10,6 +10,7 @@ use crate::{
         ExecutionDomainPath, ExecutionLane, WorkRuntimeTag,
     },
     ids::SequenceNumber,
+    pressure::{AdmissionSignals, FlushPressureCandidate},
 };
 
 pub const DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT: u32 = 3;
@@ -36,6 +37,34 @@ pub trait Scheduler: Send + Sync {
         _domain_budget: Option<&ExecutionDomainBudget>,
     ) -> ThrottleDecision {
         self.should_throttle(table, stats)
+    }
+    fn on_flush_pressure_available(
+        &self,
+        candidates: &[DomainTaggedWork<FlushPressureCandidate>],
+    ) -> Vec<ScheduleDecision> {
+        let untagged = candidates
+            .iter()
+            .map(|item| DomainTaggedWork::new(item.work.work.clone(), item.tag.clone()))
+            .collect::<Vec<_>>();
+        self.on_domain_work_available(&untagged)
+    }
+    fn admission_decision(
+        &self,
+        table: &Table,
+        stats: &TableStats,
+        _signals: &AdmissionSignals,
+    ) -> ThrottleDecision {
+        self.should_throttle(table, stats)
+    }
+    fn admission_decision_in_domain(
+        &self,
+        table: &Table,
+        stats: &TableStats,
+        _signals: &AdmissionSignals,
+        tag: &WorkRuntimeTag,
+        domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        self.should_throttle_in_domain(table, stats, tag, domain_budget)
     }
     fn work_budget(&self, _work: &PendingWork, _stats: &TableStats) -> PendingWorkBudget {
         PendingWorkBudget::default()

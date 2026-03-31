@@ -10,9 +10,10 @@ use terracedb::{
     ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
     ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding,
     ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage,
-    InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType, ResourceManager,
-    S3Location, ScanOptions, ShardReadyPlacementLayout, StubClock, StubFileSystem, StubObjectStore,
-    StubRng, TableConfig, TableFormat, Value,
+    InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType, PressureScope,
+    ResourceManager, S3Location, ScanOptions, Scheduler, ShardReadyPlacementLayout, StubClock,
+    StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TableStats,
+    ThrottleDecision, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -61,13 +62,20 @@ fn execution_profile(prefix: &str) -> DbExecutionProfile {
 }
 
 fn stub_components(resource_manager: Arc<dyn ResourceManager>) -> DbComponents {
+    stub_components_with_scheduler(resource_manager, Arc::new(NoopScheduler))
+}
+
+fn stub_components_with_scheduler(
+    resource_manager: Arc<dyn ResourceManager>,
+    scheduler: Arc<dyn Scheduler>,
+) -> DbComponents {
     DbComponents::new(
         Arc::new(StubFileSystem::default()),
         Arc::new(StubObjectStore::default()),
         Arc::new(StubClock::default()),
         Arc::new(StubRng::seeded(17)),
     )
-    .with_scheduler(Arc::new(NoopScheduler))
+    .with_scheduler(scheduler)
     .with_resource_manager(resource_manager)
 }
 
@@ -160,6 +168,44 @@ impl ExecutionDomainLifecycleHook for RecordingLifecycleHook {
         event: ExecutionDomainLifecycleEvent,
     ) {
         self.events.lock().push(event);
+    }
+}
+
+#[derive(Debug)]
+struct PressureThresholdScheduler {
+    threshold_bytes: u64,
+}
+
+impl Scheduler for PressureThresholdScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<terracedb::ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_decision_in_domain(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+        signals: &terracedb::AdmissionSignals,
+        _tag: &terracedb::WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        let projected_bytes = signals
+            .pressure
+            .local
+            .mutable_dirty_bytes
+            .saturating_add(signals.batch_write_bytes);
+        if projected_bytes >= self.threshold_bytes {
+            return ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: None,
+                stall: false,
+            };
+        }
+        ThrottleDecision::default()
     }
 }
 
@@ -307,6 +353,177 @@ async fn fake_runtimes_can_tag_work_and_account_domain_budgets_hierarchically() 
         .expect("root process domain should aggregate descendants");
     assert_eq!(process_budget.total.cpu_millis, 7);
     assert_eq!(process_budget.total.remote_io_bytes, 64);
+}
+
+#[tokio::test]
+async fn pressure_contracts_compose_with_builder_scheduler_and_public_db_apis() {
+    let profile = execution_profile("pressure-compose");
+    let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
+
+    let db = Db::builder()
+        .settings(
+            tiered_settings("/execution-pressure-compose").with_execution_profile(profile.clone()),
+        )
+        .components(stub_components(resource_manager))
+        .open()
+        .await
+        .expect("open db with pressure contracts");
+
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create pressure table");
+    table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write pressure seed");
+
+    let process = db.process_pressure_stats().await;
+    assert!(matches!(process.scope, PressureScope::Process));
+    assert!(process.local.mutable_dirty_bytes > 0);
+    assert_eq!(process.process_total, Some(process.local));
+
+    let domain = db.domain_pressure_stats(&profile.foreground.domain).await;
+    assert!(matches!(domain.scope, PressureScope::Domain(_)));
+    assert_eq!(
+        domain.local.mutable_dirty_bytes,
+        process.local.mutable_dirty_bytes
+    );
+
+    let table_pressure = db.table_pressure_stats(&table).await;
+    match &table_pressure.scope {
+        PressureScope::Table(name) => assert_eq!(name, "events"),
+        other => panic!("expected table pressure scope, got {other:?}"),
+    }
+    assert!(table_pressure.local.mutable_dirty_bytes > 0);
+    assert_eq!(table_pressure.process_total, Some(process.local));
+
+    let signals = db.write_admission_signals(&table, 64).await;
+    assert_eq!(signals.table, "events");
+    assert_eq!(signals.runtime_tag.domain, profile.foreground.domain);
+    assert_eq!(
+        signals.pressure.local.mutable_dirty_bytes,
+        table_pressure.local.mutable_dirty_bytes
+    );
+    assert_eq!(
+        signals.domain_budget,
+        db.resource_manager_snapshot()
+            .domains
+            .get(&profile.foreground.domain)
+            .map(|snapshot| snapshot.spec.budget)
+    );
+
+    let flush_candidates = db.pending_flush_pressure_candidates().await;
+    assert!(flush_candidates.is_empty());
+    assert!(
+        NoopScheduler
+            .on_flush_pressure_available(&flush_candidates)
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn pressure_stats_reconstruct_deterministically_after_reopen() {
+    let profile = execution_profile("pressure-reopen");
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
+    let config =
+        tiered_settings("/execution-pressure-reopen").with_execution_profile(profile.clone());
+
+    let open_components = || {
+        DbComponents::new(
+            file_system.clone(),
+            object_store.clone(),
+            Arc::new(StubClock::default()),
+            Arc::new(StubRng::seeded(17)),
+        )
+        .with_scheduler(Arc::new(NoopScheduler))
+        .with_resource_manager(resource_manager.clone())
+    };
+
+    let db = Db::builder()
+        .settings(config.clone())
+        .components(open_components())
+        .open()
+        .await
+        .expect("open initial pressure db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create pressure table");
+    table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write unflushed value");
+
+    let before_pressure = db.table_pressure_stats(&table).await;
+    let before_signals = db.write_admission_signals(&table, 128).await;
+    drop(db);
+
+    let reopened = Db::builder()
+        .settings(config)
+        .components(open_components())
+        .open()
+        .await
+        .expect("reopen pressure db");
+    let reopened_table = reopened.table("events");
+    let after_pressure = reopened.table_pressure_stats(&reopened_table).await;
+    let after_signals = reopened.write_admission_signals(&reopened_table, 128).await;
+
+    assert_eq!(before_pressure, after_pressure);
+    assert_eq!(before_signals.pressure, after_signals.pressure);
+    assert_eq!(before_signals.domain_budget, after_signals.domain_budget);
+}
+
+#[tokio::test]
+async fn pressure_thresholds_change_admission_observability_not_logical_results() {
+    async fn run_with_threshold(
+        path: &str,
+        threshold_bytes: u64,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, u64) {
+        let scheduler: Arc<dyn Scheduler> =
+            Arc::new(PressureThresholdScheduler { threshold_bytes });
+        let resource_manager: Arc<dyn ResourceManager> =
+            Arc::new(InMemoryResourceManager::default());
+        let db = Db::builder()
+            .settings(tiered_settings(path))
+            .components(stub_components_with_scheduler(resource_manager, scheduler))
+            .open()
+            .await
+            .expect("open threshold db");
+        let table = db
+            .create_table(row_table_config("events"))
+            .await
+            .expect("create threshold table");
+
+        for index in 0..3 {
+            table
+                .write(
+                    format!("k{index}").into_bytes(),
+                    Value::bytes(format!("v{index}")),
+                )
+                .await
+                .expect("commit threshold write");
+        }
+
+        let throttled = db
+            .scheduler_observability_snapshot()
+            .throttled_writes_by_domain
+            .values()
+            .copied()
+            .sum::<u64>();
+        db.flush().await.expect("flush threshold workload");
+        (read_existing_rows(&db).await, throttled)
+    }
+
+    let (aggressive_rows, aggressive_throttled) =
+        run_with_threshold("/execution-pressure-aggressive", 1).await;
+    let (relaxed_rows, relaxed_throttled) =
+        run_with_threshold("/execution-pressure-relaxed", u64::MAX).await;
+
+    assert_eq!(aggressive_rows, relaxed_rows);
+    assert!(aggressive_throttled > relaxed_throttled);
 }
 
 #[test]

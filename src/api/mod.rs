@@ -48,6 +48,10 @@ use crate::{
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, OpenOptions},
     metadata_flatbuffers as metadata_fb,
+    pressure::{
+        AdmissionCorrectnessContext, AdmissionSignals, FlushPressureCandidate, PressureBudget,
+        PressureBytes, PressureScope, PressureStats,
+    },
     remote::{ObjectKeyLayout, RemoteCache, StorageSource, UnifiedStorage},
     scheduler::{
         DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkBudget,

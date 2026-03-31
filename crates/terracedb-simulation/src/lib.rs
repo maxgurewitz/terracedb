@@ -29,9 +29,12 @@ use terracedb::{
 };
 
 mod hybrid;
+mod pressure;
 
 #[allow(unused_imports)]
 pub use self::hybrid::*;
+#[allow(unused_imports)]
+pub use self::pressure::*;
 #[allow(unused_imports)]
 pub use terracedb::{
     ColocatedDatabasePlacement, ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec,

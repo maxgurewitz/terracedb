@@ -1844,6 +1844,49 @@ async fn pending_work_reports_flush_and_compaction_backlog() {
 }
 
 #[tokio::test]
+async fn pending_flush_pressure_candidates_surface_relief_estimates() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/scheduler-pending-flush-pressure"),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write first value");
+    db.memtables_write().rotate_mutable();
+
+    let candidates = db.pending_flush_pressure_candidates().await;
+    assert_eq!(candidates.len(), 1);
+    let candidate = &candidates[0];
+
+    assert_eq!(candidate.work.work.work_type, PendingWorkType::Flush);
+    assert_eq!(candidate.work.work.table, "events");
+    assert_eq!(
+        candidate.tag.domain,
+        db.execution_profile().background.domain
+    );
+    assert_eq!(candidate.work.pressure.local.mutable_dirty_bytes, 0);
+    assert!(candidate.work.pressure.local.immutable_queued_bytes > 0);
+    assert_eq!(
+        candidate.work.estimated_relief.immutable_queued_bytes,
+        candidate.work.work.estimated_bytes
+    );
+    assert_eq!(
+        candidate.work.estimated_relief.unified_log_pinned_bytes,
+        candidate.work.work.estimated_bytes
+    );
+}
+
+#[tokio::test]
 async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
