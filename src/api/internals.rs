@@ -24,7 +24,8 @@ pub(super) const LEVELED_L0_COMPACTION_TRIGGER: usize = 2;
 pub(super) const TIERED_LEVEL_RUN_COMPACTION_TRIGGER: usize = 3;
 pub(super) const FIFO_MAX_LIVE_SSTABLES: usize = 2;
 pub(super) const ROW_SSTABLE_FORMAT_VERSION: u32 = 1;
-pub(super) const COLUMNAR_SSTABLE_FORMAT_VERSION: u32 = 1;
+pub(super) const COLUMNAR_SSTABLE_V1_FORMAT_VERSION: u32 = 1;
+pub(super) const COLUMNAR_SSTABLE_FORMAT_VERSION: u32 = 2;
 pub(super) const COLUMNAR_SSTABLE_MAGIC: &[u8; 8] = b"TDBCOL1\n";
 pub(super) const MVCC_KEY_SEPARATOR: u8 = 0;
 pub(super) const DEFAULT_MAX_MERGE_OPERAND_CHAIN_LENGTH: usize = 8;
@@ -873,6 +874,8 @@ pub(super) enum ColumnEncoding {
 #[serde(rename_all = "lowercase")]
 pub(super) enum ColumnCompression {
     None,
+    Lz4,
+    Zstd,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -909,6 +912,8 @@ pub(super) struct PersistedColumnarSstableFooter {
     pub(super) tombstone_bitmap: ColumnarBlockLocation,
     pub(super) row_kind_column: ColumnarBlockLocation,
     pub(super) columns: Vec<PersistedColumnarColumnFooter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) v2: Option<crate::hybrid::ColumnarV2Footer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
 }

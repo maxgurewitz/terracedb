@@ -35,6 +35,42 @@ pub struct HybridStagedScanExpectation {
     pub survivors: HybridReadRows,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HybridColumnarPartVersion {
+    V1JsonBlocks,
+    V2TypedSubstreams,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HybridSubstreamCodec {
+    None,
+    Lz4,
+    Zstd,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridDecodeField {
+    pub field_id: FieldId,
+    pub field_type: terracedb::FieldType,
+    pub nullable: bool,
+    pub has_default: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridDecodeMetadata {
+    pub schema_version: u32,
+    pub fields: Vec<HybridDecodeField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HybridColumnarReadExpectation {
+    pub part_version: HybridColumnarPartVersion,
+    pub projection: RowProjection,
+    pub rows: HybridReadRows,
+    pub decode_metadata: Option<HybridDecodeMetadata>,
+    pub codecs: Vec<HybridSubstreamCodec>,
+}
+
 impl HybridTableSpec {
     pub fn row(name: impl Into<String>) -> Self {
         Self {
@@ -313,6 +349,92 @@ impl HybridReadOracle {
             plan,
             selection,
             survivors,
+        })
+    }
+
+    pub fn compact_decode_metadata(
+        &self,
+        table: &str,
+    ) -> Result<Option<HybridDecodeMetadata>, HybridReadOracleError> {
+        let spec = self.ensure_table_known(table)?;
+        Ok(spec.schema.as_ref().map(|schema| HybridDecodeMetadata {
+            schema_version: schema.version,
+            fields: schema
+                .fields
+                .iter()
+                .map(|field| HybridDecodeField {
+                    field_id: field.id,
+                    field_type: field.field_type,
+                    nullable: field.nullable,
+                    has_default: field.default.is_some(),
+                })
+                .collect(),
+        }))
+    }
+
+    pub fn validate_decode_metadata(
+        &self,
+        table: &str,
+        metadata: &HybridDecodeMetadata,
+    ) -> Result<(), HybridReadOracleError> {
+        let expected = self.compact_decode_metadata(table)?.ok_or_else(|| {
+            HybridReadOracleError::DecodeMetadataUnavailable {
+                table: table.to_string(),
+            }
+        })?;
+        if expected.schema_version != metadata.schema_version {
+            return Err(HybridReadOracleError::DecodeMetadataMismatch {
+                table: table.to_string(),
+                reason: format!(
+                    "schema version {} did not match expected {}",
+                    metadata.schema_version, expected.schema_version
+                ),
+            });
+        }
+        if expected.fields.len() != metadata.fields.len() {
+            return Err(HybridReadOracleError::DecodeMetadataMismatch {
+                table: table.to_string(),
+                reason: format!(
+                    "field count {} did not match expected {}",
+                    metadata.fields.len(),
+                    expected.fields.len()
+                ),
+            });
+        }
+        for (actual, expected) in metadata.fields.iter().zip(expected.fields.iter()) {
+            if actual != expected {
+                return Err(HybridReadOracleError::DecodeMetadataMismatch {
+                    table: table.to_string(),
+                    reason: format!(
+                        "field {} metadata did not match expected layout",
+                        actual.field_id.get()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read_expectation(
+        &self,
+        table: &str,
+        sequence: SequenceNumber,
+        projection: &RowProjection,
+        part_version: HybridColumnarPartVersion,
+    ) -> Result<HybridColumnarReadExpectation, HybridReadOracleError> {
+        Ok(HybridColumnarReadExpectation {
+            part_version,
+            projection: projection.clone(),
+            rows: self.scan(table, sequence, projection)?,
+            decode_metadata: self.compact_decode_metadata(table)?,
+            codecs: match part_version {
+                HybridColumnarPartVersion::V1JsonBlocks => Vec::new(),
+                HybridColumnarPartVersion::V2TypedSubstreams => vec![
+                    HybridSubstreamCodec::None,
+                    HybridSubstreamCodec::Lz4,
+                    HybridSubstreamCodec::Zstd,
+                ],
+            },
         })
     }
 
@@ -729,6 +851,8 @@ pub enum HybridReadWorkloadOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HybridReadCutPoint {
     V2SstableWriteBeforeFooterPublish,
+    V2CodecSubstreamWrite,
+    V2FooterPublish,
     PartDigestPublish,
     RemoteCacheSegmentAdmission,
     RemoteCacheBackgroundCompletion,
@@ -742,8 +866,10 @@ pub enum HybridReadCutPoint {
 }
 
 impl HybridReadCutPoint {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::V2SstableWriteBeforeFooterPublish,
+        Self::V2CodecSubstreamWrite,
+        Self::V2FooterPublish,
         Self::PartDigestPublish,
         Self::RemoteCacheSegmentAdmission,
         Self::RemoteCacheBackgroundCompletion,
@@ -979,6 +1105,10 @@ pub enum HybridReadOracleError {
         previous: SequenceNumber,
         next: SequenceNumber,
     },
+    #[error("hybrid oracle table {table} does not expose compact decode metadata")]
+    DecodeMetadataUnavailable { table: String },
+    #[error("hybrid oracle decode metadata mismatch for {table}: {reason}")]
+    DecodeMetadataMismatch { table: String, reason: String },
     #[error("row-format table unexpectedly produced record values")]
     UnexpectedRecord,
     #[error("columnar-format table unexpectedly produced byte values")]
@@ -1251,6 +1381,89 @@ mod tests {
         assert!(staged.plan.needs_late_materialization());
         assert_eq!(staged.selection.selected, vec![false, true, true]);
         assert_eq!(staged.survivors.len(), 2);
+    }
+
+    #[test]
+    fn hybrid_read_oracle_tracks_v1_and_v2_expectations() {
+        let mut oracle =
+            HybridReadOracle::new(&[HybridTableSpec::columnar("metrics", metric_schema())]);
+        oracle
+            .apply(
+                SequenceNumber::new(1),
+                HybridReadMutation::Put {
+                    table: "metrics".to_string(),
+                    key: b"user:1".to_vec(),
+                    value: metric_record("alice", 3),
+                },
+            )
+            .expect("apply metric row");
+
+        let projection = RowProjection::Fields(vec![FieldId::new(2)]);
+        let v1 = oracle
+            .read_expectation(
+                "metrics",
+                SequenceNumber::new(1),
+                &projection,
+                HybridColumnarPartVersion::V1JsonBlocks,
+            )
+            .expect("build v1 expectation");
+        let v2 = oracle
+            .read_expectation(
+                "metrics",
+                SequenceNumber::new(1),
+                &projection,
+                HybridColumnarPartVersion::V2TypedSubstreams,
+            )
+            .expect("build v2 expectation");
+
+        assert_eq!(v1.rows, v2.rows);
+        assert_eq!(
+            v2.decode_metadata,
+            Some(HybridDecodeMetadata {
+                schema_version: 1,
+                fields: vec![
+                    HybridDecodeField {
+                        field_id: FieldId::new(1),
+                        field_type: FieldType::String,
+                        nullable: false,
+                        has_default: false,
+                    },
+                    HybridDecodeField {
+                        field_id: FieldId::new(2),
+                        field_type: FieldType::Int64,
+                        nullable: false,
+                        has_default: true,
+                    },
+                ],
+            })
+        );
+        assert_eq!(
+            v2.codecs,
+            vec![
+                HybridSubstreamCodec::None,
+                HybridSubstreamCodec::Lz4,
+                HybridSubstreamCodec::Zstd,
+            ]
+        );
+    }
+
+    #[test]
+    fn hybrid_read_oracle_rejects_decode_metadata_mismatch() {
+        let oracle =
+            HybridReadOracle::new(&[HybridTableSpec::columnar("metrics", metric_schema())]);
+        let mut metadata = oracle
+            .compact_decode_metadata("metrics")
+            .expect("decode metadata lookup")
+            .expect("columnar metadata");
+        metadata.fields[1].field_type = FieldType::Bool;
+
+        assert_eq!(
+            oracle.validate_decode_metadata("metrics", &metadata),
+            Err(HybridReadOracleError::DecodeMetadataMismatch {
+                table: "metrics".to_string(),
+                reason: "field 2 metadata did not match expected layout".to_string(),
+            })
+        );
     }
 
     #[test]

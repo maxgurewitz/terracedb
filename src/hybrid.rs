@@ -178,12 +178,15 @@ pub enum ColumnarV2Encoding {
 #[serde(rename_all = "snake_case")]
 pub enum ColumnarV2Compression {
     None,
+    Lz4,
+    Zstd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnarV2SubstreamKind {
-    KeyIndex,
+    KeyOffsets,
+    KeyData,
     Sequence,
     TombstoneBitmap,
     RowKind,
@@ -196,6 +199,21 @@ pub enum ColumnarV2SubstreamKind {
     BytesOffsets,
     BytesData,
     BoolValues,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarV2DecodeField {
+    pub field_id: FieldId,
+    #[serde(rename = "type")]
+    pub field_type: FieldType,
+    pub nullable: bool,
+    pub has_default: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarV2DecodeMetadata {
+    pub schema_version: u32,
+    pub fields: Vec<ColumnarV2DecodeField>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +360,7 @@ pub struct ColumnarV2Footer {
     pub schema_version: u32,
     pub row_count: u64,
     pub data_range: ByteRange,
+    pub decode_metadata: ColumnarV2DecodeMetadata,
     pub substreams: Vec<ColumnarV2SubstreamRef>,
     pub marks: Vec<ColumnarV2Mark>,
     pub synopsis: ColumnarSynopsisSidecar,
@@ -1172,6 +1191,23 @@ mod tests {
             schema_version: 3,
             row_count: 2,
             data_range: ByteRange::new(8, 64),
+            decode_metadata: ColumnarV2DecodeMetadata {
+                schema_version: 3,
+                fields: vec![
+                    ColumnarV2DecodeField {
+                        field_id: FieldId::new(1),
+                        field_type: FieldType::String,
+                        nullable: false,
+                        has_default: false,
+                    },
+                    ColumnarV2DecodeField {
+                        field_id: FieldId::new(2),
+                        field_type: FieldType::Int64,
+                        nullable: false,
+                        has_default: true,
+                    },
+                ],
+            },
             substreams: vec![ColumnarV2SubstreamRef {
                 ordinal: 0,
                 field_id: Some(FieldId::new(1)),
@@ -1288,6 +1324,34 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<CompactPartDigest>(&encoded_digest).expect("decode digest"),
             digest
+        );
+    }
+
+    #[test]
+    fn columnar_v2_decode_metadata_round_trip() {
+        let metadata = ColumnarV2DecodeMetadata {
+            schema_version: 4,
+            fields: vec![
+                ColumnarV2DecodeField {
+                    field_id: FieldId::new(1),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    has_default: false,
+                },
+                ColumnarV2DecodeField {
+                    field_id: FieldId::new(2),
+                    field_type: FieldType::Bool,
+                    nullable: true,
+                    has_default: true,
+                },
+            ],
+        };
+
+        let encoded = serde_json::to_vec(&metadata).expect("encode decode metadata");
+        assert_eq!(
+            serde_json::from_slice::<ColumnarV2DecodeMetadata>(&encoded)
+                .expect("decode decode metadata"),
+            metadata
         );
     }
 

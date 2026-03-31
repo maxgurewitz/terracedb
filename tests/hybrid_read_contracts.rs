@@ -3,19 +3,19 @@ use std::{collections::BTreeMap, sync::Arc};
 use futures::StreamExt;
 use terracedb::{
     BaseZoneMapPruner, ByteRange, ColumnarFooterPageDirectoryLoader, ColumnarGranuleSynopsis,
-    ColumnarSequenceBounds, ColumnarSynopsisSidecar, ColumnarV2Compression, ColumnarV2Encoding,
-    ColumnarV2Footer, ColumnarV2FormatTag, ColumnarV2GranuleRef, ColumnarV2Header, ColumnarV2Mark,
-    ColumnarV2MarkOffset, ColumnarV2PageDirectory, ColumnarV2PageRef, ColumnarV2SubstreamKind,
-    ColumnarV2SubstreamRef, CompactPartDigest, CompactToWidePromotionCandidate,
-    CompactToWidePromotionDecision, CompactToWidePromotionPolicy, Db, DbConfig, DbDependencies,
-    FieldDefinition, FieldId, FieldType, FieldValue, HybridKeyRange, HybridPartDescriptor,
-    HybridSynopsisPruner, InMemoryRawByteSegmentCache, LateMaterializationPlan,
-    PartDigestAlgorithm, PartRepairController, ProjectionSidecarDescriptor, RawByteSegmentCache,
-    RepairState, RowProjection, S3Location, ScanOptions, SchemaDefinition,
-    SkipIndexSidecarDescriptor, SsdConfig, StorageConfig, StorageSource, StubClock,
-    StubColumnarFooterPageDirectoryLoader, StubFileSystem, StubObjectStore,
-    StubPartRepairController, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Value, ZoneMapPredicate, ZoneMapSynopsis,
+    ColumnarSequenceBounds, ColumnarSynopsisSidecar, ColumnarV2Compression, ColumnarV2DecodeField,
+    ColumnarV2DecodeMetadata, ColumnarV2Encoding, ColumnarV2Footer, ColumnarV2FormatTag,
+    ColumnarV2GranuleRef, ColumnarV2Header, ColumnarV2Mark, ColumnarV2MarkOffset,
+    ColumnarV2PageDirectory, ColumnarV2PageRef, ColumnarV2SubstreamKind, ColumnarV2SubstreamRef,
+    CompactPartDigest, CompactToWidePromotionCandidate, CompactToWidePromotionDecision,
+    CompactToWidePromotionPolicy, Db, DbConfig, DbDependencies, FieldDefinition, FieldId,
+    FieldType, FieldValue, HybridKeyRange, HybridPartDescriptor, HybridSynopsisPruner,
+    InMemoryRawByteSegmentCache, LateMaterializationPlan, PartDigestAlgorithm,
+    PartRepairController, ProjectionSidecarDescriptor, RawByteSegmentCache, RepairState,
+    RowProjection, S3Location, ScanOptions, SchemaDefinition, SkipIndexSidecarDescriptor,
+    SsdConfig, StorageConfig, StorageSource, StubClock, StubColumnarFooterPageDirectoryLoader,
+    StubFileSystem, StubObjectStore, StubPartRepairController, StubRng, TableConfig, TableFormat,
+    TieredDurabilityMode, TieredStorageConfig, Value, ZoneMapPredicate, ZoneMapSynopsis,
 };
 use terracedb_projections::{PROJECTION_CURSOR_TABLE_NAME, ProjectionRuntime};
 use terracedb_simulation::{
@@ -148,6 +148,15 @@ fn sample_loader() -> StubColumnarFooterPageDirectoryLoader {
             schema_version: 1,
             row_count: 2,
             data_range: ByteRange::new(8, 64),
+            decode_metadata: ColumnarV2DecodeMetadata {
+                schema_version: 1,
+                fields: vec![ColumnarV2DecodeField {
+                    field_id: FieldId::new(2),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    has_default: true,
+                }],
+            },
             substreams: vec![ColumnarV2SubstreamRef {
                 ordinal: 0,
                 field_id: Some(FieldId::new(2)),
