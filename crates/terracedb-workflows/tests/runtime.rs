@@ -6,7 +6,6 @@ use std::{
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use tokio::sync::Notify;
 use terracedb::{
     ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor,
     ObjectStoreFailure, ObjectStoreOperation, OutboxEntry, ScanOptions, SequenceNumber,
@@ -34,6 +33,7 @@ use terracedb_workflows::{
     WorkflowSourceResumePoint, WorkflowStateMutation, WorkflowTables, WorkflowTimerCommand,
     failpoints::names as workflow_failpoint_names,
 };
+use tokio::sync::Notify;
 
 const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(600);
 const WORKFLOW_TIMER_SIMULATION_DURATION: Duration = Duration::from_millis(1_200);
@@ -1341,14 +1341,12 @@ fn workflow_current_durable_bootstrap_skips_history_and_processes_new_events() -
                         let source = source_for_wait.clone();
                         Box::pin(async move {
                             let progress = stack.runtime.load_source_progress(&source).await?;
-                            Ok(
-                                progress.origin()
-                                    == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
-                                    && progress.resume_point()
-                                        == WorkflowSourceResumePoint::DurableSequenceFence {
-                                            sequence: durable_before_start,
-                                        },
-                            )
+                            Ok(progress.origin()
+                                == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
+                                && progress.resume_point()
+                                    == WorkflowSourceResumePoint::DurableSequenceFence {
+                                        sequence: durable_before_start,
+                                    })
                         })
                     },
                 )
@@ -1439,7 +1437,11 @@ async fn workflow_fail_closed_recovery_surfaces_snapshot_too_old_without_fast_fo
         .source_progress_table()
         .write(
             source.name().as_bytes().to_vec(),
-            Value::bytes(stale_progress.encode().expect("encode stale source progress")),
+            Value::bytes(
+                stale_progress
+                    .encode()
+                    .expect("encode stale source progress"),
+            ),
         )
         .await
         .expect("persist stale workflow source progress");
@@ -1534,7 +1536,10 @@ async fn workflow_restart_resumes_local_inbox_before_source_bootstrap() {
     .await
     .expect("open restarted workflow runtime");
 
-    let handle = runtime.start().await.expect("start restarted workflow runtime");
+    let handle = runtime
+        .start()
+        .await
+        .expect("start restarted workflow runtime");
     tokio::time::timeout(Duration::from_secs(1), control.callback_entered.notified())
         .await
         .expect("callback should begin during local durable resume");

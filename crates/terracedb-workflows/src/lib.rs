@@ -173,8 +173,6 @@ pub enum WorkflowError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
-    CheckpointStore(#[from] WorkflowCheckpointStoreError),
-    #[error(transparent)]
     TransactionCommit(#[from] TransactionCommitError),
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
@@ -214,7 +212,6 @@ impl WorkflowError {
             Self::CreateTable(_)
             | Self::Read(_)
             | Self::Storage(_)
-            | Self::CheckpointStore(_)
             | Self::TransactionCommit(_)
             | Self::Join(_)
             | Self::EmptyName
@@ -620,9 +617,9 @@ impl WorkflowSourceProgressOrigin {
     pub fn attach_mode(self) -> Option<WorkflowSourceAttachMode> {
         match self {
             Self::DurableCursor => None,
-            Self::BeginningBootstrap
-            | Self::CheckpointRestore
-            | Self::ReplayFromHistory => Some(WorkflowSourceAttachMode::Historical),
+            Self::BeginningBootstrap | Self::CheckpointRestore | Self::ReplayFromHistory => {
+                Some(WorkflowSourceAttachMode::Historical)
+            }
             Self::CurrentDurableBootstrap | Self::FastForwardToCurrentDurable => {
                 Some(WorkflowSourceAttachMode::LiveOnly)
             }
@@ -2333,14 +2330,12 @@ where
     let checkpoint_progress = load_checkpoint_source_progress(runtime, source).await?;
     let checkpoint_available = checkpoint_progress.is_some();
     let resolution = match event {
-        WorkflowHistoricalEvent::FirstAttach => source.initial_resolution(
-            checkpoint_available,
-            current_durable_sequence,
-        ),
-        WorkflowHistoricalEvent::SnapshotTooOld => source.recovery_resolution(
-            checkpoint_available,
-            current_durable_sequence,
-        ),
+        WorkflowHistoricalEvent::FirstAttach => {
+            source.initial_resolution(checkpoint_available, current_durable_sequence)
+        }
+        WorkflowHistoricalEvent::SnapshotTooOld => {
+            source.recovery_resolution(checkpoint_available, current_durable_sequence)
+        }
     };
     let span = tracing::info_span!("terracedb.workflow.source_resolution");
     apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, None);
@@ -2489,7 +2484,11 @@ where
     let Some(checkpoint_store) = runtime.checkpoint_store.as_ref() else {
         return Ok(None);
     };
-    let Some(manifest) = checkpoint_store.load_latest_manifest(&runtime.name).await? else {
+    let Some(manifest) = checkpoint_store
+        .load_latest_manifest(&runtime.name)
+        .await
+        .map_err(|error| checkpoint_store_error(&runtime.name, error))?
+    else {
         return Ok(None);
     };
     Ok(manifest.source_frontier.get(source.table().name()).copied())
@@ -2545,7 +2544,9 @@ where
     }
 }
 
-async fn has_durable_inbox_entries<H>(runtime: &WorkflowRuntimeInner<H>) -> Result<bool, WorkflowError>
+async fn has_durable_inbox_entries<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+) -> Result<bool, WorkflowError>
 where
     H: WorkflowHandler + 'static,
 {
@@ -2639,23 +2640,21 @@ async fn run_source_admission_loop<H>(
 where
     H: WorkflowHandler + 'static,
 {
-    let mut progress = match read_workflow_source_progress(
-        runtime.tables.source_progress_table(),
-        source.table(),
-    )
-    .await?
-    {
-        Some(progress) => progress,
-        None => {
-            resolve_workflow_source_progress(
-                runtime.as_ref(),
-                &source,
-                WorkflowHistoricalEvent::FirstAttach,
-                None,
-            )
+    let mut progress =
+        match read_workflow_source_progress(runtime.tables.source_progress_table(), source.table())
             .await?
-        }
-    };
+        {
+            Some(progress) => progress,
+            None => {
+                resolve_workflow_source_progress(
+                    runtime.as_ref(),
+                    &source,
+                    WorkflowHistoricalEvent::FirstAttach,
+                    None,
+                )
+                .await?
+            }
+        };
     let mut durable_wakes = runtime.db.subscribe_durable(source.table());
 
     loop {

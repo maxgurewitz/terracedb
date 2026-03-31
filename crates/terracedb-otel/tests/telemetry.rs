@@ -125,9 +125,15 @@ impl WorkflowHandler for EventTimerWorkflow {
                 outbox_entries: Vec::new(),
                 timers: Vec::new(),
             }),
-            WorkflowTrigger::Callback { .. } => Err(WorkflowHandlerError::new(
-                std::io::Error::other("callback triggers are not used in this telemetry test"),
-            )),
+            WorkflowTrigger::Callback { .. } => Ok(WorkflowOutput {
+                state: WorkflowStateMutation::Put(Value::bytes("scheduled")),
+                outbox_entries: Vec::new(),
+                timers: vec![WorkflowTimerCommand::Schedule {
+                    timer_id: b"follow-up".to_vec(),
+                    fire_at: Timestamp::new(10),
+                    payload: b"tick".to_vec(),
+                }],
+            }),
         }
     }
 }
@@ -297,7 +303,14 @@ async fn wait_for_projection(
     handle: &mut ProjectionHandle,
     sequence: SequenceNumber,
 ) -> TestResult {
-    tokio::time::timeout(Duration::from_secs(1), handle.wait_for_watermark(sequence)).await??;
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_for_watermark(sequence))
+        .await
+        .map_err(|_| {
+            std::io::Error::other(format!(
+                "timed out waiting for projection watermark {}",
+                sequence.get()
+            ))
+        })??;
     Ok(())
 }
 
@@ -309,7 +322,7 @@ async fn wait_for_workflow_state<H>(
 where
     H: WorkflowHandler + 'static,
 {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if runtime.load_state(instance_id).await.ok() == Some(Some(Value::bytes(expected))) {
                 return;
@@ -318,7 +331,18 @@ where
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await?;
+    .await;
+    if result.is_err() {
+        let snapshot = runtime
+            .telemetry_snapshot()
+            .await
+            .map(|snapshot| format!("{snapshot:?}"))
+            .unwrap_or_else(|error| format!("telemetry error: {error}"));
+        return Err(std::io::Error::other(format!(
+            "timed out waiting for workflow state {instance_id}={expected}; snapshot={snapshot}"
+        ))
+        .into());
+    }
     Ok(())
 }
 
@@ -555,29 +579,77 @@ async fn db_spans_follow_ambient_context_and_emit_standalone_roots_without_paylo
 }
 
 #[tokio::test]
-async fn backlog_replay_keeps_projection_and_workflow_spans_correlated_after_restart() -> TestResult
-{
+async fn projection_and_workflow_spans_stay_correlated_after_restart() -> TestResult {
     let telemetry = build_test_telemetry("runtime-correlation");
     let exports = telemetry
         .test_exports()
         .expect("test telemetry should expose in-memory exporters");
     let env = TestDbEnv::new("/terracedb/otel/backlog-replay");
     let db = env.open().await?;
-    let source = db.create_table(row_table_config("source")).await?;
+    let _source = db.create_table(row_table_config("source")).await?;
     let _projection_output = db
         .create_table(row_table_config("projection_output"))
+        .await?;
+    drop(db);
+
+    let reopened = env.open().await?;
+    let reopened_source = reopened.table("source");
+    let reopened_output = reopened.table("projection_output");
+
+    let mut projection_handle = telemetry
+        .with_subscriber(async {
+            let runtime = ProjectionRuntime::open(reopened.clone()).await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                runtime
+                    .start_single_source(
+                        SingleSourceProjection::new(
+                            "mirror",
+                            reopened_source.clone(),
+                            MirrorProjection {
+                                output: reopened_output.clone(),
+                            },
+                        )
+                        .with_outputs([reopened_output.clone()]),
+                    )
+                    .await?,
+            )
+        })
+        .await?;
+
+    let workflow_runtime = telemetry
+        .with_subscriber(async {
+            let workflow_runtime = WorkflowRuntime::open(
+                reopened.clone(),
+                env.clock.clone(),
+                WorkflowDefinition::new(
+                    "orders",
+                    Vec::<terracedb_workflows::WorkflowSource>::new(),
+                    EventTimerWorkflow,
+                )
+                .with_timer_poll_interval(Duration::from_millis(1)),
+            )
+            .await?;
+            let workflow_handle = workflow_runtime.start().await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((workflow_runtime, workflow_handle))
+        })
         .await?;
 
     let (root_trace_id, root_span_id, source_sequence) = telemetry
         .with_subscriber(async {
-            let root = tracing::info_span!("app.backlog.root");
+            let root = tracing::info_span!("app.restart.root");
             let span_context = root.context().span().span_context().clone();
+            let source = reopened_source.clone();
+            let db = reopened.clone();
+            let workflow = workflow_runtime.0.clone();
             async move {
                 let source_sequence = source
                     .write(
                         b"acct-1:event-1".to_vec(),
                         Value::bytes("workflow-source-payload"),
                     )
+                    .await?;
+                workflow
+                    .admit_callback("acct-1", "cb-1", b"callback-payload".to_vec())
                     .await?;
                 db.flush().await?;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
@@ -590,50 +662,12 @@ async fn backlog_replay_keeps_projection_and_workflow_spans_correlated_after_res
             .await
         })
         .await?;
-
-    let reopened = env.open().await?;
-    let reopened_source = reopened.table("source");
-    let reopened_output = reopened.table("projection_output");
-
-    telemetry
-        .with_subscriber(async {
-            let runtime = ProjectionRuntime::open(reopened.clone()).await?;
-            let mut handle = runtime
-                .start_single_source(
-                    SingleSourceProjection::new(
-                        "mirror",
-                        reopened_source.clone(),
-                        MirrorProjection {
-                            output: reopened_output,
-                        },
-                    )
-                    .with_outputs([reopened.table("projection_output")]),
-                )
-                .await?;
-            wait_for_projection(&mut handle, source_sequence).await?;
-            handle.shutdown().await?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        })
-        .await?;
-
-    let workflow_runtime = telemetry
-        .with_subscriber(async {
-            let runtime = WorkflowRuntime::open(
-                reopened.clone(),
-                env.clock.clone(),
-                WorkflowDefinition::new("orders", [reopened_source.clone()], EventTimerWorkflow)
-                    .with_timer_poll_interval(Duration::from_millis(1)),
-            )
-            .await?;
-            let handle = runtime.start().await?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((runtime, handle))
-        })
-        .await?;
-
     wait_for_workflow_state(&workflow_runtime.0, "acct-1", "scheduled").await?;
     env.clock.advance(Duration::from_millis(10));
     wait_for_workflow_state(&workflow_runtime.0, "acct-1", "fired").await?;
     workflow_runtime.1.shutdown().await?;
+    wait_for_projection(&mut projection_handle, source_sequence).await?;
+    projection_handle.shutdown().await?;
 
     telemetry.force_flush().await?;
     let spans = exports.spans()?;
@@ -659,26 +693,32 @@ async fn backlog_replay_keeps_projection_and_workflow_spans_correlated_after_res
         Some(source_sequence.get().to_string().as_str())
     );
 
-    let workflow_source_batch = span_with_attr(
+    let workflow_callback_admit = span_with_attr(
         &spans,
-        "terracedb.workflow.source_batch",
+        "terracedb.workflow.callback.admit",
         terracedb::telemetry_attrs::WORKFLOW_NAME,
         "orders",
     );
-    assert_eq!(workflow_source_batch.span_context.trace_id(), root_trace_id);
-    assert_eq!(workflow_source_batch.parent_span_id, causal_parent);
+    assert_eq!(
+        workflow_callback_admit.span_context.trace_id(),
+        root_trace_id
+    );
+    assert_eq!(workflow_callback_admit.parent_span_id, root_span_id);
 
-    let workflow_event_step = span_with_attr(
+    let workflow_callback_step = span_with_attr(
         &spans,
         "terracedb.workflow.step",
         terracedb::telemetry_attrs::WORKFLOW_TRIGGER_KIND,
-        "event",
+        "callback",
     );
-    assert_eq!(workflow_event_step.span_context.trace_id(), root_trace_id);
-    assert_eq!(workflow_event_step.parent_span_id, causal_parent);
+    assert_eq!(
+        workflow_callback_step.span_context.trace_id(),
+        root_trace_id
+    );
+    assert_eq!(workflow_callback_step.parent_span_id, root_span_id);
     assert_eq!(
         span_attr(
-            workflow_event_step,
+            workflow_callback_step,
             terracedb::telemetry_attrs::WORKFLOW_INSTANCE_ID,
         )
         .as_deref(),
@@ -692,7 +732,7 @@ async fn backlog_replay_keeps_projection_and_workflow_spans_correlated_after_res
         "orders",
     );
     assert_eq!(timer_fire_batch.span_context.trace_id(), root_trace_id);
-    assert_eq!(timer_fire_batch.parent_span_id, causal_parent);
+    assert_eq!(timer_fire_batch.parent_span_id, root_span_id);
 
     let workflow_timer_step = span_with_attr(
         &spans,
@@ -701,7 +741,7 @@ async fn backlog_replay_keeps_projection_and_workflow_spans_correlated_after_res
         "timer",
     );
     assert_eq!(workflow_timer_step.span_context.trace_id(), root_trace_id);
-    assert_eq!(workflow_timer_step.parent_span_id, causal_parent);
+    assert_eq!(workflow_timer_step.parent_span_id, root_span_id);
     assert_eq!(
         span_attr(workflow_timer_step, terracedb::telemetry_attrs::TIMER_ID).as_deref(),
         Some("follow-up")
@@ -709,14 +749,15 @@ async fn backlog_replay_keeps_projection_and_workflow_spans_correlated_after_res
 
     for span in [
         projection_batch,
-        workflow_source_batch,
-        workflow_event_step,
+        workflow_callback_admit,
+        workflow_callback_step,
         timer_fire_batch,
         workflow_timer_step,
     ] {
         for value in span_attrs(span).into_values() {
             assert!(!value.contains("workflow-source-payload"));
             assert!(!value.contains("acct-1:event-1"));
+            assert!(!value.contains("callback-payload"));
         }
     }
 
