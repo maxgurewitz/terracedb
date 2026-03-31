@@ -2299,6 +2299,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-example-order-watch"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-debezium",
+ "terracedb-kafka",
+ "terracedb-projections",
+ "terracedb-records",
+ "terracedb-simulation",
+ "terracedb-workflows",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-example-retention-api"
 version = "0.1.0"
 dependencies = [
