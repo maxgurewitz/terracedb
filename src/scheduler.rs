@@ -328,6 +328,101 @@ impl Scheduler for RoundRobinScheduler {
             .collect()
     }
 
+    fn on_flush_pressure_available(
+        &self,
+        candidates: &[DomainTaggedWork<FlushPressureCandidate>],
+    ) -> Vec<ScheduleDecision> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ordered = candidates.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            crate::pressure::flush_candidate_priority_key(&right.work)
+                .cmp(&crate::pressure::flush_candidate_priority_key(&left.work))
+                .then_with(|| left.tag.domain.cmp(&right.tag.domain))
+                .then_with(|| left.work.work.table.cmp(&right.work.work.table))
+                .then_with(|| left.work.work.id.cmp(&right.work.work.id))
+        });
+
+        let top_priority = crate::pressure::flush_candidate_priority_key(&ordered[0].work);
+        let top_priority_work = ordered
+            .into_iter()
+            .filter(|candidate| {
+                crate::pressure::flush_candidate_priority_key(&candidate.work) == top_priority
+            })
+            .collect::<Vec<_>>();
+
+        let mut domains = top_priority_work
+            .iter()
+            .map(|candidate| candidate.tag.domain.clone())
+            .collect::<Vec<_>>();
+        domains.sort_unstable();
+        domains.dedup();
+
+        let selected_domain = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("round-robin scheduler mutex should not be poisoned");
+            let next_index = state
+                .last_domain
+                .as_ref()
+                .and_then(|last| domains.iter().position(|domain| domain > last))
+                .unwrap_or(0);
+            let domain = domains[next_index].clone();
+            state.last_domain = Some(domain.clone());
+            domain
+        };
+
+        let mut tables = top_priority_work
+            .iter()
+            .filter(|candidate| candidate.tag.domain == selected_domain)
+            .map(|candidate| candidate.work.work.table.as_str())
+            .collect::<Vec<_>>();
+        tables.sort_unstable();
+        tables.dedup();
+
+        let selected_table = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("round-robin scheduler mutex should not be poisoned");
+            let next_index = state
+                .last_table_by_domain
+                .get(&selected_domain)
+                .and_then(|last| tables.iter().position(|table| *table > last.as_str()))
+                .unwrap_or(0);
+            let table = tables[next_index].to_string();
+            state
+                .last_table_by_domain
+                .insert(selected_domain.clone(), table.clone());
+            table
+        };
+
+        let selected_work_id = top_priority_work
+            .into_iter()
+            .filter(|candidate| {
+                candidate.tag.domain == selected_domain
+                    && candidate.work.work.table == selected_table
+            })
+            .min_by(|left, right| left.work.work.id.cmp(&right.work.work.id))
+            .map(|candidate| candidate.work.work.id.clone())
+            .expect("top-priority flush work should contain at least one item");
+
+        candidates
+            .iter()
+            .map(|candidate| ScheduleDecision {
+                work_id: candidate.work.work.id.clone(),
+                action: if candidate.work.work.id == selected_work_id {
+                    ScheduleAction::Execute
+                } else {
+                    ScheduleAction::Defer
+                },
+            })
+            .collect()
+    }
+
     fn should_throttle(&self, _table: &Table, stats: &TableStats) -> ThrottleDecision {
         if let Some(retention) = stats.current_state_retention.as_ref()
             && retention.coordination.backpressure.throttle_writes
@@ -515,7 +610,8 @@ mod tests {
         CurrentStateRetentionCoordinationStats, CurrentStateRetentionEvaluationCost,
         CurrentStateRetentionMembershipChanges, CurrentStateRetentionStats,
         CurrentStateRetentionStatus, Db, DbConfig, DbDependencies, DomainTaggedWork,
-        ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane, S3Location, SsdConfig,
+        ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane, FlushPressureCandidate,
+        PressureBudget, PressureBytes, PressureScope, PressureStats, S3Location, SsdConfig,
         StorageConfig, StubClock, StubFileSystem, StubObjectStore, StubRng, Table,
         TieredDurabilityMode, TieredStorageConfig,
     };
@@ -585,6 +681,57 @@ mod tests {
         }
     }
 
+    fn flush_candidate(
+        table: &str,
+        score: u64,
+        forced: bool,
+    ) -> DomainTaggedWork<FlushPressureCandidate> {
+        let tag = default_scheduler_work_tag();
+        let mut metadata = BTreeMap::from([(
+            crate::pressure::FLUSH_SCORE_METADATA_KEY.to_string(),
+            json!(score),
+        )]);
+        if forced {
+            metadata.insert(
+                crate::pressure::FLUSH_FORCE_REASON_METADATA_KEY.to_string(),
+                json!("dirty-byte pressure"),
+            );
+        }
+
+        DomainTaggedWork::new(
+            FlushPressureCandidate {
+                work: PendingWork {
+                    id: format!("flush:{table}"),
+                    work_type: PendingWorkType::Flush,
+                    table: table.to_string(),
+                    level: None,
+                    estimated_bytes: 64,
+                },
+                pressure: PressureStats {
+                    scope: PressureScope::Table(table.to_string()),
+                    local: PressureBytes {
+                        mutable_dirty_bytes: 64,
+                        unified_log_pinned_bytes: 64,
+                        ..PressureBytes::default()
+                    },
+                    budget: PressureBudget {
+                        mutable_hard_limit_bytes: Some(128),
+                        unified_log_hard_limit_bytes: Some(128),
+                        ..PressureBudget::default()
+                    },
+                    ..PressureStats::default()
+                },
+                estimated_relief: PressureBytes {
+                    mutable_dirty_bytes: 64,
+                    unified_log_pinned_bytes: 64,
+                    ..PressureBytes::default()
+                },
+                metadata,
+            },
+            tag,
+        )
+    }
+
     #[test]
     fn round_robin_scheduler_prioritizes_flush_and_rotates_tables() {
         let scheduler = RoundRobinScheduler::default();
@@ -625,6 +772,26 @@ mod tests {
             .find(|decision| decision.action == ScheduleAction::Execute)
             .expect("one work item should be selected");
         assert_eq!(second_executed.work_id, "flush:metrics");
+    }
+
+    #[test]
+    fn round_robin_scheduler_prefers_higher_pressure_flush_candidates() {
+        let scheduler = RoundRobinScheduler::default();
+        let candidates = vec![
+            flush_candidate("alpha", 512, false),
+            flush_candidate("beta", 4_096, false),
+            flush_candidate("gamma", 1_024, true),
+        ];
+
+        let decisions = scheduler.on_flush_pressure_available(&candidates);
+        let executed = decisions
+            .iter()
+            .find(|decision| decision.action == ScheduleAction::Execute)
+            .expect("one flush candidate should be selected");
+        assert_eq!(
+            executed.work_id, "flush:gamma",
+            "forced flush candidates should outrank ordinary scored flushes"
+        );
     }
 
     #[test]

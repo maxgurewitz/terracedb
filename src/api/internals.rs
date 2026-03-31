@@ -1,4 +1,5 @@
 use super::*;
+use crate::Timestamp;
 
 pub(super) const CATALOG_FORMAT_VERSION: u32 = 1;
 pub(super) const CATALOG_READ_CHUNK_LEN: usize = 8 * 1024;
@@ -2070,7 +2071,9 @@ impl CommitRuntime {
         };
         for record in records {
             recovered.max_sequence = recovered.max_sequence.max(record.sequence());
-            recovered.memtables.apply_recovered_record(&record);
+            recovered
+                .memtables
+                .apply_recovered_record(&record, Timestamp::new(0));
         }
 
         Ok(recovered)

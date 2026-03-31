@@ -106,7 +106,8 @@ impl Db {
                 .unwrap_or(0)
                 .saturating_add(1)
                 .max(1);
-            let memtables = recovered_commit_log.memtables;
+            let mut memtables = recovered_commit_log.memtables;
+            memtables.restamp_oldest_unflushed_at(dependencies.clock.now());
             let sstables = SstableState {
                 manifest_generation: loaded_manifest.generation,
                 last_flushed_sequence: loaded_manifest.last_flushed_sequence,
