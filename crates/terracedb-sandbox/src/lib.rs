@@ -23,11 +23,15 @@ pub use capabilities::{
     DeterministicCapabilityRegistry, SandboxCapability, SandboxCapabilityMethod,
     SandboxCapabilityModule, StaticCapabilityRegistry,
 };
-pub use disk::{ConflictEntry, ConflictReport, EjectMode, EjectRequest, HoistMode, HoistRequest};
+pub use disk::{
+    ConflictEntry, ConflictReport, EjectMode, EjectReport, EjectRequest, HoistMode, HoistReport,
+    HoistRequest,
+};
 pub use error::SandboxError;
 pub use fs::{SandboxFilesystemShim, VfsSandboxFilesystemShim};
 pub use git::{
     DeterministicGitWorkspaceManager, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest,
+    HostGitWorkspaceManager,
 };
 pub use loader::{
     HOST_CAPABILITY_PREFIX, LoadedSandboxModule, SANDBOX_BASH_LIBRARY_SPECIFIER,
@@ -69,6 +73,11 @@ pub use typescript::{
     TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
 };
 pub use view::{
-    DeterministicReadonlyViewProvider, READONLY_VIEW_URI_SCHEME, ReadonlyViewCut,
-    ReadonlyViewHandle, ReadonlyViewLocation, ReadonlyViewProvider, ReadonlyViewRequest,
+    AuthenticatedReadonlyViewRemoteEndpoint, DeterministicReadonlyViewProvider,
+    LocalReadonlyViewBridge, READONLY_VIEW_URI_SCHEME, ReadonlyViewCut, ReadonlyViewDirectoryEntry,
+    ReadonlyViewHandle, ReadonlyViewLocation, ReadonlyViewNodeKind, ReadonlyViewProtocolRequest,
+    ReadonlyViewProtocolResponse, ReadonlyViewProtocolTransport, ReadonlyViewProvider,
+    ReadonlyViewReconnectRequest, ReadonlyViewRemoteEndpoint, ReadonlyViewRequest,
+    ReadonlyViewService, ReadonlyViewSessionRegistry, ReadonlyViewSessionSummary, ReadonlyViewStat,
+    RemoteReadonlyViewBridge, StaticReadonlyViewRegistry,
 };

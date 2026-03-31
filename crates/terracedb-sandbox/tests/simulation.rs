@@ -7,9 +7,11 @@ use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, Vol
 use terracedb_sandbox::{
     BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
     DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicTypeScriptService,
-    GitProvenance, PackageCompatibilityMode, PackageInstallRequest, ReadonlyViewCut,
-    ReadonlyViewRequest, ReopenSessionOptions, SandboxCapability, SandboxConfig, SandboxServices,
-    SandboxStore, TypeCheckRequest, TypeScriptService, read_package_install_manifest,
+    GitProvenance, LocalReadonlyViewBridge, PackageCompatibilityMode, PackageInstallRequest,
+    PullRequestRequest, ReadonlyViewCut, ReadonlyViewProtocolRequest, ReadonlyViewProtocolResponse,
+    ReadonlyViewProtocolTransport, ReadonlyViewRequest, ReopenSessionOptions, SandboxCapability,
+    SandboxConfig, SandboxServices, SandboxStore, StaticReadonlyViewRegistry, TypeCheckRequest,
+    TypeScriptService, read_package_install_manifest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +29,15 @@ struct SandboxSimulationCapture {
     branch: String,
     typescript_diagnostics: usize,
     bash_cwd: String,
+    pr_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadonlyViewSimulationCapture {
+    visible_entries: usize,
+    durable_entries_before_flush: usize,
+    durable_entries_after_flush: usize,
+    visible_bytes: Vec<u8>,
 }
 
 fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture> {
@@ -132,6 +143,7 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 })
                 .await
                 .expect("update provenance");
+            let pr = reopened_pr(&session).await;
             session
                 .close(terracedb_sandbox::CloseSessionOptions::default())
                 .await
@@ -201,6 +213,7 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                     .expect("branch should be set"),
                 typescript_diagnostics: diagnostics.diagnostics.len(),
                 bash_cwd: bash_report.cwd,
+                pr_url: pr.url,
             })
         })
 }
@@ -311,6 +324,20 @@ fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulation
         })
 }
 
+async fn reopened_pr(
+    session: &terracedb_sandbox::SandboxSession,
+) -> terracedb_sandbox::PullRequestReport {
+    session
+        .create_pull_request(PullRequestRequest {
+            title: "Simulated PR".to_string(),
+            body: "Body".to_string(),
+            head_branch: "sandbox/sim".to_string(),
+            base_branch: "main".to_string(),
+        })
+        .await
+        .expect("create pull request")
+}
+
 #[test]
 fn seeded_stub_sandbox_replays_open_reopen_close_and_metadata_updates() -> turmoil::Result {
     let first = run_sandbox_simulation(0x1234)?;
@@ -341,6 +368,11 @@ fn seeded_stub_sandbox_replays_open_reopen_close_and_metadata_updates() -> turmo
     assert_eq!(first.replayed_cache_hits, vec!["lodash", "zod"]);
     assert_eq!(first.manifest_packages, vec!["lodash", "zod"]);
     assert!(first.materialized);
+    assert!(
+        first.tool_names.contains(&"sandbox.pr.create".to_string()),
+        "pr export should be recorded deterministically"
+    );
+    assert!(first.pr_url.contains("example.invalid"));
     assert!(first.revision >= 4);
     assert_eq!(first.typescript_diagnostics, 1);
     assert_eq!(first.bash_cwd, "/workspace/scratch");
@@ -383,5 +415,158 @@ fn seeded_runtime_execution_replays_module_graph_and_capability_calls() -> turmo
         })
     );
     assert!(first.cache_entries >= 2);
+    Ok(())
+}
+
+fn run_readonly_view_protocol_simulation(
+    seed: u64,
+) -> turmoil::Result<ReadonlyViewSimulationCapture> {
+    SeededSimulationRunner::new(seed)
+        .with_simulation_duration(Duration::from_millis(50))
+        .run_with(move |context| async move {
+            let vfs = InMemoryVfsStore::new(context.clock(), context.rng());
+            let sandbox = DefaultSandboxStore::new(
+                std::sync::Arc::new(vfs.clone()),
+                context.clock(),
+                SandboxServices::deterministic(),
+            );
+            let base_volume_id = VolumeId::new(0x7200 + seed as u128);
+            let session_volume_id = VolumeId::new(0x7300 + seed as u128);
+
+            let base = vfs
+                .open_volume(
+                    VolumeConfig::new(base_volume_id)
+                        .with_chunk_size(4096)
+                        .with_create_if_missing(true),
+                )
+                .await
+                .expect("open base volume");
+            base.fs()
+                .write_file(
+                    "/workspace/base.txt",
+                    b"base".to_vec(),
+                    CreateOptions {
+                        create_parents: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed base");
+
+            let session = sandbox
+                .open_session(
+                    SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096),
+                )
+                .await
+                .expect("open session");
+            session.flush().await.expect("flush base");
+            session
+                .filesystem()
+                .write_file(
+                    "/workspace/visible.txt",
+                    format!("visible-{seed:x}").into_bytes(),
+                    CreateOptions {
+                        create_parents: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write visible file");
+
+            let registry = std::sync::Arc::new(StaticReadonlyViewRegistry::new([session.clone()]));
+            let service =
+                std::sync::Arc::new(terracedb_sandbox::ReadonlyViewService::new(registry));
+            let bridge = LocalReadonlyViewBridge::new(service);
+
+            let visible = bridge
+                .send(ReadonlyViewProtocolRequest::ReadDir {
+                    location: terracedb_sandbox::ReadonlyViewLocation {
+                        session_volume_id,
+                        cut: ReadonlyViewCut::Visible,
+                        path: "/workspace".to_string(),
+                    },
+                })
+                .await
+                .expect("read visible dir");
+            let ReadonlyViewProtocolResponse::Directory {
+                entries: visible_entries,
+            } = visible
+            else {
+                panic!("expected directory response");
+            };
+            let visible_file = visible_entries
+                .iter()
+                .find(|entry| entry.name == "visible.txt")
+                .expect("visible entry");
+
+            let visible_bytes = bridge
+                .send(ReadonlyViewProtocolRequest::ReadFile {
+                    location: visible_file.location.clone(),
+                })
+                .await
+                .expect("read visible file");
+            let ReadonlyViewProtocolResponse::File { bytes } = visible_bytes else {
+                panic!("expected file response");
+            };
+
+            let durable_before = bridge
+                .send(ReadonlyViewProtocolRequest::ReadDir {
+                    location: terracedb_sandbox::ReadonlyViewLocation {
+                        session_volume_id,
+                        cut: ReadonlyViewCut::Durable,
+                        path: "/workspace".to_string(),
+                    },
+                })
+                .await
+                .expect("read durable dir before flush");
+            let ReadonlyViewProtocolResponse::Directory {
+                entries: durable_before_entries,
+            } = durable_before
+            else {
+                panic!("expected directory response");
+            };
+
+            session.flush().await.expect("flush visible state");
+
+            let durable_after = bridge
+                .send(ReadonlyViewProtocolRequest::ReadDir {
+                    location: terracedb_sandbox::ReadonlyViewLocation {
+                        session_volume_id,
+                        cut: ReadonlyViewCut::Durable,
+                        path: "/workspace".to_string(),
+                    },
+                })
+                .await
+                .expect("read durable dir after flush");
+            let ReadonlyViewProtocolResponse::Directory {
+                entries: durable_after_entries,
+            } = durable_after
+            else {
+                panic!("expected directory response");
+            };
+
+            Ok(ReadonlyViewSimulationCapture {
+                visible_entries: visible_entries.len(),
+                durable_entries_before_flush: durable_before_entries.len(),
+                durable_entries_after_flush: durable_after_entries.len(),
+                visible_bytes: bytes.expect("visible bytes"),
+            })
+        })
+}
+
+#[test]
+fn seeded_readonly_view_protocol_replays_visible_and_durable_snapshot_semantics() -> turmoil::Result
+{
+    let first = run_readonly_view_protocol_simulation(0x5678)?;
+    let second = run_readonly_view_protocol_simulation(0x5678)?;
+    assert_eq!(first, second);
+    assert!(first.visible_entries >= 2);
+    assert_eq!(first.durable_entries_before_flush, 1);
+    assert_eq!(first.durable_entries_after_flush, 2);
+    assert!(
+        String::from_utf8(first.visible_bytes)
+            .expect("utf8")
+            .starts_with("visible-")
+    );
     Ok(())
 }

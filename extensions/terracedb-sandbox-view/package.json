@@ -1,0 +1,94 @@
+{
+  "name": "terracedb-sandbox-view",
+  "displayName": "Terrace Sandbox View",
+  "description": "Read-only VS Code and Cursor explorer for TerraceDB sandbox sessions.",
+  "version": "0.0.1",
+  "publisher": "terracedb",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "terracedb",
+    "sandbox",
+    "vscode",
+    "cursor",
+    "readonly"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onView:terracedbSandboxExplorer",
+    "onCommand:terracedbSandbox.connectLocal",
+    "onCommand:terracedbSandbox.connectRemote",
+    "onCommand:terracedbSandbox.refresh",
+    "onCommand:terracedbSandbox.reconnect",
+    "onCommand:terracedbSandbox.disconnect"
+  ],
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "terracedbSandboxExplorer",
+          "name": "Terrace Sandbox"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "terracedbSandbox.connectLocal",
+        "title": "Terrace Sandbox: Connect Local Bridge"
+      },
+      {
+        "command": "terracedbSandbox.connectRemote",
+        "title": "Terrace Sandbox: Connect Remote Endpoint"
+      },
+      {
+        "command": "terracedbSandbox.refresh",
+        "title": "Terrace Sandbox: Refresh"
+      },
+      {
+        "command": "terracedbSandbox.reconnect",
+        "title": "Terrace Sandbox: Reconnect"
+      },
+      {
+        "command": "terracedbSandbox.disconnect",
+        "title": "Terrace Sandbox: Disconnect"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "terracedbSandbox.connectLocal",
+          "when": "view == terracedbSandboxExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "terracedbSandbox.connectRemote",
+          "when": "view == terracedbSandboxExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "terracedbSandbox.refresh",
+          "when": "view == terracedbSandboxExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "terracedbSandbox.reconnect",
+          "when": "view == terracedbSandboxExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "terracedbSandbox.disconnect",
+          "when": "view == terracedbSandboxExplorer",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test ./test/**/*.test.js"
+  }
+}
