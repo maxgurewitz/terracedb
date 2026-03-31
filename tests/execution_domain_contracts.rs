@@ -212,6 +212,25 @@ fn process_budget() -> ExecutionDomainBudget {
     }
 }
 
+async fn await_resource_manager_snapshot<F>(
+    subscription: &mut terracedb::ResourceManagerSubscription,
+    predicate: F,
+) -> terracedb::ResourceManagerSnapshot
+where
+    F: Fn(&terracedb::ResourceManagerSnapshot) -> bool,
+{
+    loop {
+        let snapshot = subscription.current();
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        subscription
+            .changed()
+            .await
+            .expect("resource manager snapshot update");
+    }
+}
+
 fn shared_spec(
     path: ExecutionDomainPath,
     owner: ExecutionDomainOwner,
@@ -2671,6 +2690,102 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         0
     );
     assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
+}
+
+#[tokio::test]
+async fn db_lane_backlog_subscription_observes_transition_edges() {
+    let deployment =
+        ColocatedDeployment::single_database(process_budget(), "primary").expect("single layout");
+    let db = open_deployed_db(
+        &deployment,
+        "primary",
+        "/execution-lane-helpers-subscription",
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+    )
+    .await;
+
+    let background_path = db
+        .execution_lane_binding(ExecutionLane::UserBackground)
+        .domain
+        .clone();
+    let mut updates = db.subscribe_resource_manager();
+
+    assert_eq!(
+        updates.current().domains[&background_path].backlog.queued_work_items,
+        0
+    );
+    assert_eq!(
+        updates.current().domains[&background_path].backlog.queued_bytes,
+        0
+    );
+
+    {
+        let _backlog = db.set_lane_backlog(
+            ExecutionLane::UserBackground,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 2,
+                queued_bytes: 64,
+            },
+        );
+        let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 2
+                && snapshot.domains[&background_path].backlog.queued_bytes == 64
+        })
+        .await;
+        assert_eq!(
+            snapshot.domains[&background_path].backlog.queued_work_items,
+            2
+        );
+        assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 64);
+        assert_eq!(
+            db.resource_manager_snapshot().domains[&background_path].backlog,
+            snapshot.domains[&background_path].backlog
+        );
+    }
+
+    let snapshot = updates.current();
+    assert_eq!(
+        snapshot.domains[&background_path].backlog.queued_work_items,
+        0
+    );
+    assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
+
+    let queued = db
+        .with_lane_backlog_async(
+            ExecutionLane::UserBackground,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 4,
+                queued_bytes: 128,
+            },
+            || async {
+                let snapshot = updates.current();
+                assert_eq!(
+                    snapshot.domains[&background_path].backlog.queued_work_items,
+                    4
+                );
+                assert_eq!(
+                    snapshot.domains[&background_path].backlog.queued_bytes,
+                    128
+                );
+                snapshot.domains[&background_path].backlog
+            },
+        )
+        .await;
+    assert_eq!(queued.queued_work_items, 4);
+    assert_eq!(queued.queued_bytes, 128);
+
+    let cleared = await_resource_manager_snapshot(&mut updates, |snapshot| {
+        snapshot.domains[&background_path].backlog.queued_work_items == 0
+            && snapshot.domains[&background_path].backlog.queued_bytes == 0
+    })
+    .await;
+    assert_eq!(cleared.domains[&background_path].backlog.queued_work_items, 0);
+    assert_eq!(cleared.domains[&background_path].backlog.queued_bytes, 0);
+    assert_eq!(
+        db.resource_manager_snapshot().domains[&background_path].backlog,
+        cleared.domains[&background_path].backlog
+    );
 }
 
 #[tokio::test]

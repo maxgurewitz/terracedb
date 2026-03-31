@@ -99,8 +99,8 @@ pub use execution::{
     ExecutionResourceUsage, ExecutionUsageLease, ExecutionUsageReleaseError,
     InMemoryDomainBudgetOracle, InMemoryResourceManager, PlacementAssignment, PlacementPolicy,
     PlacementRequest, PlacementTarget, PreferRequestedDomainPolicy, ResourceAdmissionDecision,
-    ResourceManager, ResourceManagerSnapshot, ShardReadyPlacementLayout, WorkPlacementRequest,
-    WorkRuntimeTag,
+    ResourceManager, ResourceManagerSnapshot, ResourceManagerSubscription,
+    ShardReadyPlacementLayout, WorkPlacementRequest, WorkRuntimeTag,
 };
 #[doc(hidden)]
 pub use failpoints::{

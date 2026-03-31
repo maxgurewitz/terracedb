@@ -3,7 +3,7 @@ use crate::execution::{
     DbExecutionProfile, DomainTaggedWork, ExecutionBacklogGuard, ExecutionDomainBudget,
     ExecutionDomainOwner, ExecutionDomainPath, ExecutionLane, ExecutionResourceUsage,
     ExecutionUsageLease, ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot,
-    WorkRuntimeTag,
+    ResourceManagerSubscription, WorkRuntimeTag,
 };
 use crate::{
     AdmissionObservationReceiver, SchedulerObservabilitySubscription, Timestamp, ZoneMapPredicate,
@@ -632,6 +632,11 @@ impl Db {
     /// Returns a snapshot of the full colocated resource manager state.
     pub fn resource_manager_snapshot(&self) -> ResourceManagerSnapshot {
         self.inner.resource_manager.snapshot()
+    }
+
+    /// Subscribes to updates of the full colocated resource manager state.
+    pub fn subscribe_resource_manager(&self) -> ResourceManagerSubscription {
+        self.inner.resource_manager.subscribe()
     }
 
     /// Returns a placement report for this database and any attached subsystems.

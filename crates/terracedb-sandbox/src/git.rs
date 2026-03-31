@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
@@ -10,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use terracedb_vfs::JsonValue;
 
 use crate::{SandboxError, SandboxSession};
+
+static EXPORT_WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitWorkspaceRequest {
@@ -235,9 +238,16 @@ impl GitWorkspaceManager for HostGitWorkspaceManager {
 
 pub(crate) fn default_export_workspace_path(session_id: &str, branch_name: &str) -> PathBuf {
     let branch = sanitize_label(branch_name);
-    let path = std::env::temp_dir().join(format!("terracedb-sandbox-{session_id}-{branch}"));
-    let _ = fs::remove_dir_all(&path);
-    path
+    loop {
+        let unique_suffix = EXPORT_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "terracedb-sandbox-{session_id}-{branch}-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        if !path.exists() {
+            return path;
+        }
+    }
 }
 
 pub(crate) fn finalize_git_export(
@@ -392,4 +402,21 @@ fn git_command(repo_root: &Path) -> Command {
         command.env_remove(key);
     }
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_export_workspace_path;
+
+    #[test]
+    fn default_export_workspace_path_allocates_unique_paths() {
+        let first = default_export_workspace_path("session", "feature/branch");
+        let second = default_export_workspace_path("session", "feature/branch");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(std::env::temp_dir()));
+        assert!(second.starts_with(std::env::temp_dir()));
+        assert!(first.to_string_lossy().contains("feature-branch"));
+        assert!(second.to_string_lossy().contains("feature-branch"));
+    }
 }

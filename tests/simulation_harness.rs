@@ -560,6 +560,25 @@ where
     }
 }
 
+async fn next_resource_manager_snapshot<F>(
+    updates: &mut terracedb::ResourceManagerSubscription,
+    predicate: F,
+) -> terracedb::ResourceManagerSnapshot
+where
+    F: Fn(&terracedb::ResourceManagerSnapshot) -> bool,
+{
+    loop {
+        let snapshot = updates.current();
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        updates
+            .changed()
+            .await
+            .expect("resource manager update");
+    }
+}
+
 async fn next_admission_observation<F>(
     updates: &mut terracedb::AdmissionObservationReceiver,
     predicate: F,
@@ -3065,6 +3084,66 @@ fn simulation_scheduler_observability_subscription_observes_rate_limited_write_w
                 table.read(b"in-flight".to_vec()).await?,
                 Some(Value::Bytes(vec![b'x'; 256]))
             );
+
+            Ok(())
+        })
+}
+
+#[test]
+fn simulation_resource_manager_subscription_tracks_backlog_transitions() -> turmoil::Result {
+    SeededSimulationRunner::new(0x8185)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16b-resource-manager-subscription",
+                    Arc::new(RoundRobinScheduler::default()),
+                    1024 * 1024,
+                ))
+                .await?;
+            let background_path = db.execution_profile().background.domain.clone();
+            let mut updates = db.subscribe_resource_manager();
+
+            {
+                let _backlog = db.set_lane_backlog(
+                    ExecutionLane::UserBackground,
+                    ExecutionDomainBacklogSnapshot {
+                        queued_work_items: 2,
+                        queued_bytes: 64,
+                    },
+                );
+                let queued = next_resource_manager_snapshot(&mut updates, |snapshot| {
+                    snapshot
+                        .domains
+                        .get(&background_path)
+                        .is_some_and(|domain| {
+                            domain.backlog.queued_work_items == 2
+                                && domain.backlog.queued_bytes == 64
+                        })
+                })
+                .await;
+                assert_eq!(
+                    queued.domains[&background_path].backlog.queued_work_items,
+                    2
+                );
+                assert_eq!(queued.domains[&background_path].backlog.queued_bytes, 64);
+            }
+
+            let cleared = next_resource_manager_snapshot(&mut updates, |snapshot| {
+                snapshot
+                    .domains
+                    .get(&background_path)
+                    .is_some_and(|domain| {
+                        domain.backlog.queued_work_items == 0
+                            && domain.backlog.queued_bytes == 0
+                    })
+            })
+            .await;
+            assert_eq!(
+                cleared.domains[&background_path].backlog.queued_work_items,
+                0
+            );
+            assert_eq!(cleared.domains[&background_path].backlog.queued_bytes, 0);
 
             Ok(())
         })

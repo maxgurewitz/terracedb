@@ -136,6 +136,7 @@ pub use self::schema::*;
 pub use self::snapshot::Snapshot;
 pub use self::table::Table;
 pub use self::watermark::{WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate};
+pub use crate::execution::ResourceManagerSubscription;
 
 use self::internals::*;
 use self::memtable::*;

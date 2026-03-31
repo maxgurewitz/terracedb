@@ -14,8 +14,10 @@ use std::{
     sync::Arc,
 };
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::scheduler::PendingWorkType;
 
@@ -2006,6 +2008,8 @@ pub trait ResourceManager: Send + Sync {
     fn register_lifecycle_hook(&self, hook: Arc<dyn ExecutionDomainLifecycleHook>);
     /// Returns a snapshot of the full manager state.
     fn snapshot(&self) -> ResourceManagerSnapshot;
+    /// Subscribes to published resource-manager snapshots.
+    fn subscribe(&self) -> ResourceManagerSubscription;
     /// Resolves placement for one owner/lane request.
     fn assign(&self, request: PlacementRequest) -> PlacementAssignment;
     /// Builds a runtime tag for work after placement.
@@ -2041,6 +2045,42 @@ pub trait ResourceManager: Send + Sync {
     ) -> ExecutionDomainSnapshot;
 }
 
+/// Subscription to published resource-manager snapshots.
+#[derive(Debug)]
+pub struct ResourceManagerSubscription {
+    inner: watch::Receiver<Arc<ResourceManagerSnapshot>>,
+}
+
+impl ResourceManagerSubscription {
+    pub(crate) fn new(inner: watch::Receiver<Arc<ResourceManagerSnapshot>>) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the latest published snapshot.
+    pub fn current(&self) -> ResourceManagerSnapshot {
+        self.inner.borrow().as_ref().clone()
+    }
+
+    /// Waits for the next published snapshot.
+    pub async fn changed(
+        &mut self,
+    ) -> Result<ResourceManagerSnapshot, crate::SubscriptionClosed> {
+        self.inner
+            .changed()
+            .await
+            .map_err(|_| crate::SubscriptionClosed)?;
+        Ok(self.current())
+    }
+}
+
+impl Clone for ResourceManagerSubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DomainRuntimeRecord {
     spec: ExecutionDomainSpec,
@@ -2065,6 +2105,8 @@ pub struct InMemoryResourceManager {
     placement_policy: Arc<dyn PlacementPolicy>,
     domains: Mutex<BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>>,
     hooks: Mutex<Vec<Arc<dyn ExecutionDomainLifecycleHook>>>,
+    latest_snapshot: ArcSwap<ResourceManagerSnapshot>,
+    published_snapshot: watch::Sender<Arc<ResourceManagerSnapshot>>,
 }
 
 impl Default for InMemoryResourceManager {
@@ -2075,22 +2117,40 @@ impl Default for InMemoryResourceManager {
 
 impl InMemoryResourceManager {
     pub fn new(process_budget: ExecutionDomainBudget) -> Self {
+        let placement_policy = Arc::new(PreferRequestedDomainPolicy);
+        let initial_snapshot = ResourceManagerSnapshot {
+            process_budget,
+            placement_policy_name: placement_policy.name().to_string(),
+            invariants: ExecutionDomainInvariantSet::default(),
+            domains: BTreeMap::new(),
+        };
+        let (published_snapshot, _receiver) = watch::channel(Arc::new(initial_snapshot.clone()));
         Self {
             process_budget,
             invariants: ExecutionDomainInvariantSet::default(),
-            placement_policy: Arc::new(PreferRequestedDomainPolicy),
+            placement_policy,
             domains: Mutex::new(BTreeMap::new()),
             hooks: Mutex::new(Vec::new()),
+            latest_snapshot: ArcSwap::from_pointee(initial_snapshot),
+            published_snapshot,
         }
     }
 
     pub fn with_placement_policy(mut self, placement_policy: Arc<dyn PlacementPolicy>) -> Self {
         self.placement_policy = placement_policy;
+        {
+            let domains = self.domains.lock();
+            self.publish_locked(&domains);
+        }
         self
     }
 
     pub fn with_invariants(mut self, invariants: ExecutionDomainInvariantSet) -> Self {
         self.invariants = invariants;
+        {
+            let domains = self.domains.lock();
+            self.publish_locked(&domains);
+        }
         self
     }
 
@@ -2217,6 +2277,13 @@ impl InMemoryResourceManager {
         for hook in hooks {
             hook.on_event(snapshot, event);
         }
+    }
+
+    fn publish_locked(&self, domains: &BTreeMap<ExecutionDomainPath, DomainRuntimeRecord>) {
+        let snapshot = self.build_snapshot_locked(domains);
+        let snapshot = Arc::new(snapshot);
+        self.latest_snapshot.store(snapshot.clone());
+        self.published_snapshot.send_replace(snapshot);
     }
 
     fn aggregate_usage(
@@ -2608,6 +2675,7 @@ impl ResourceManager for InMemoryResourceManager {
             entry.explicit = true;
             let path = entry.spec.path.clone();
             let snapshot = self.domain_snapshot_locked(&domains, &path);
+            self.publish_locked(&domains);
             (snapshot, event)
         };
         self.notify(&snapshot, event);
@@ -2634,6 +2702,7 @@ impl ResourceManager for InMemoryResourceManager {
             entry.state = ExecutionDomainState::Active;
             entry.explicit = true;
             let snapshot = self.domain_snapshot_locked(&domains, &path);
+            self.publish_locked(&domains);
             (snapshot, event)
         };
         self.notify(&snapshot, event);
@@ -2647,7 +2716,9 @@ impl ResourceManager for InMemoryResourceManager {
                 return;
             };
             entry.state = ExecutionDomainState::Retired;
-            self.domain_snapshot_locked(&domains, path)
+            let snapshot = self.domain_snapshot_locked(&domains, path);
+            self.publish_locked(&domains);
+            snapshot
         };
         self.notify(&snapshot, ExecutionDomainLifecycleEvent::Retired);
     }
@@ -2657,8 +2728,11 @@ impl ResourceManager for InMemoryResourceManager {
     }
 
     fn snapshot(&self) -> ResourceManagerSnapshot {
-        let domains = self.domains.lock();
-        self.build_snapshot_locked(&domains)
+        self.latest_snapshot.load_full().as_ref().clone()
+    }
+
+    fn subscribe(&self) -> ResourceManagerSubscription {
+        ResourceManagerSubscription::new(self.published_snapshot.subscribe())
     }
 
     fn assign(&self, request: PlacementRequest) -> PlacementAssignment {
@@ -2715,6 +2789,7 @@ impl ResourceManager for InMemoryResourceManager {
                 .expect("domain must exist before applying usage");
             entry.direct_usage.saturating_add_assign(usage);
             let snapshot = self.domain_snapshot_locked(&domains, path);
+            self.publish_locked(&domains);
             return ResourceAdmissionDecision {
                 admitted: true,
                 borrowed_shared_capacity,
@@ -2730,6 +2805,7 @@ impl ResourceManager for InMemoryResourceManager {
             .expect("domain must exist before recording contention");
         entry.contention.record_blocked(&blocked_by);
         let snapshot = self.domain_snapshot_locked(&domains, path);
+        self.publish_locked(&domains);
         ResourceAdmissionDecision {
             admitted: false,
             borrowed_shared_capacity: false,
@@ -2757,7 +2833,9 @@ impl ResourceManager for InMemoryResourceManager {
             ));
         }
         entry.direct_usage.saturating_sub_assign(usage);
-        Ok(self.domain_snapshot_locked(&domains, path))
+        let snapshot = self.domain_snapshot_locked(&domains, path);
+        self.publish_locked(&domains);
+        Ok(snapshot)
     }
 
     fn release(
@@ -2788,7 +2866,9 @@ impl ResourceManager for InMemoryResourceManager {
             .get_mut(path)
             .expect("domain must exist before updating backlog");
         entry.backlog = backlog;
-        self.domain_snapshot_locked(&domains, path)
+        let snapshot = self.domain_snapshot_locked(&domains, path);
+        self.publish_locked(&domains);
+        snapshot
     }
 }
 
@@ -2917,5 +2997,44 @@ fn limit_u64_to_u32_option(limit: u64) -> Option<u32> {
         None
     } else {
         Some(limit.min(u64::from(u32::MAX)) as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resource_manager_subscription_tracks_backlog_updates() {
+        let manager = InMemoryResourceManager::default();
+        let path = ExecutionDomainPath::root("process").child("db");
+        ResourceManager::register_domain(
+            &manager,
+            ExecutionDomainSpec {
+                path: path.clone(),
+                owner: ExecutionDomainOwner::Database {
+                    name: "db".to_string(),
+                },
+                budget: ExecutionDomainBudget::default(),
+                placement: ExecutionDomainPlacement::default(),
+                metadata: BTreeMap::new(),
+            },
+        );
+
+        let mut subscription = ResourceManager::subscribe(&manager);
+        let current = subscription.current();
+        assert!(current.domains.contains_key(&path));
+        assert_eq!(current.domains[&path].backlog, ExecutionDomainBacklogSnapshot::default());
+
+        let backlog = ExecutionDomainBacklogSnapshot {
+            queued_work_items: 3,
+            queued_bytes: 96,
+        };
+        let updated = ResourceManager::set_backlog(&manager, &path, backlog);
+        assert_eq!(updated.backlog, backlog);
+
+        let published = subscription.changed().await.expect("resource manager snapshot");
+        assert_eq!(published.domains[&path].backlog, backlog);
+        assert_eq!(published, manager.snapshot());
     }
 }
