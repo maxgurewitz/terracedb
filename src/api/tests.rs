@@ -973,6 +973,12 @@ fn tiered_config_with_hybrid_read(
     config
 }
 
+fn tiered_config_with_compact_to_wide(path: &str) -> DbConfig {
+    let mut config = tiered_config(path);
+    config.hybrid_read.compact_to_wide_promotion_enabled = true;
+    config
+}
+
 fn with_hybrid_features(
     mut config: TableConfig,
     features: crate::HybridTableFeatures,
@@ -981,6 +987,29 @@ fn with_hybrid_features(
         crate::HYBRID_TABLE_FEATURES_METADATA_KEY.to_string(),
         serde_json::to_value(features).expect("serialize hybrid table features"),
     );
+    config
+}
+
+fn with_compact_to_wide_promotion(
+    mut config: TableConfig,
+    promotion: crate::HybridCompactToWidePromotionConfig,
+) -> TableConfig {
+    config.metadata.insert(
+        crate::HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY.to_string(),
+        serde_json::to_value(promotion).expect("serialize compact-to-wide promotion config"),
+    );
+    config
+}
+
+fn compact_to_wide_table_config(name: &str, max_compact_rows: usize) -> TableConfig {
+    let mut config = with_compact_to_wide_promotion(
+        columnar_table_config(name),
+        crate::HybridCompactToWidePromotionConfig {
+            max_compact_rows,
+            ..Default::default()
+        },
+    );
+    config.compaction_strategy = CompactionStrategy::Leveled;
     config
 }
 
@@ -4978,6 +5007,414 @@ async fn part_repair_controller_repairs_projection_sidecars_after_manual_quarant
             .await
             .expect("read quarantine marker after repair")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn compact_to_wide_stays_disabled_until_the_global_flag_is_enabled() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(
+        tiered_config("/compact-to-wide-default-off"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = compact_to_wide_table_config("metrics", 4);
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    table
+        .write(
+            b"user:1".to_vec(),
+            Value::named_record(
+                &schema,
+                [
+                    ("user_id", FieldValue::String("alpha".to_string())),
+                    ("count", FieldValue::Int64(1)),
+                ],
+            )
+            .expect("encode row"),
+        )
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush row");
+
+    let live = db.sstables_read().live.clone();
+    assert_eq!(live.len(), 1);
+    assert!(
+        live[0].is_columnar(),
+        "per-table opt-in alone must not change the default engine profile",
+    );
+
+    let reopened = Db::open(tiered_config("/compact-to-wide-default-off"), dependencies)
+        .await
+        .expect("reopen db");
+    assert!(reopened.sstables_read().live[0].is_columnar());
+}
+
+#[tokio::test]
+async fn compact_to_wide_keeps_point_read_heavy_compaction_outputs_compact() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(
+        tiered_config_with_compact_to_wide("/compact-to-wide-point-heavy"),
+        dependencies,
+    )
+    .await
+    .expect("open db");
+    let config = compact_to_wide_table_config("metrics", 4);
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    for (key, user_id, count) in [
+        (b"user:1".to_vec(), "alpha", 1),
+        (b"user:2".to_vec(), "bravo", 2),
+    ] {
+        table
+            .write(
+                key,
+                Value::named_record(
+                    &schema,
+                    [
+                        ("user_id", FieldValue::String(user_id.to_string())),
+                        ("count", FieldValue::Int64(count)),
+                    ],
+                )
+                .expect("encode point-heavy row"),
+            )
+            .await
+            .expect("write row");
+        db.flush().await.expect("flush compact row");
+    }
+
+    for key in [b"user:1".to_vec(), b"user:2".to_vec(), b"user:1".to_vec()] {
+        assert!(table.read(key).await.expect("point read").is_some());
+    }
+
+    assert!(db.run_next_compaction().await.expect("run compaction"));
+    let live = db.sstables_read().live.clone();
+    assert_eq!(live.len(), 1);
+    assert!(
+        !live[0].is_columnar(),
+        "point-read-heavy compact segments should stay hot and resident after compaction",
+    );
+}
+
+#[tokio::test]
+async fn compact_to_wide_promotes_scan_heavy_data_and_supports_mixed_hot_and_cold_reads() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(
+        tiered_config_with_compact_to_wide("/compact-to-wide-mixed"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = compact_to_wide_table_config("metrics", 4);
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    for (key, user_id, count) in [
+        (b"user:1".to_vec(), "alpha", 1),
+        (b"user:2".to_vec(), "bravo", 2),
+    ] {
+        table
+            .write(
+                key,
+                Value::named_record(
+                    &schema,
+                    [
+                        ("user_id", FieldValue::String(user_id.to_string())),
+                        ("count", FieldValue::Int64(count)),
+                    ],
+                )
+                .expect("encode scan-heavy row"),
+            )
+            .await
+            .expect("write row");
+        db.flush().await.expect("flush compact row");
+    }
+
+    for _ in 0..3 {
+        let projected = collect_rows(
+            table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["count".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("projected scan"),
+        )
+        .await;
+        assert_eq!(projected.len(), 2);
+    }
+
+    assert!(
+        db.run_next_compaction()
+            .await
+            .expect("run promotion compaction")
+    );
+    assert_eq!(
+        db.sstables_read()
+            .live
+            .iter()
+            .filter(|sstable| sstable.is_columnar())
+            .count(),
+        1,
+        "scan-heavy compact inputs should promote to one wide columnar part",
+    );
+
+    table
+        .write(
+            b"user:3".to_vec(),
+            Value::named_record(
+                &schema,
+                [
+                    ("user_id", FieldValue::String("charlie".to_string())),
+                    ("count", FieldValue::Int64(3)),
+                ],
+            )
+            .expect("encode hot row"),
+        )
+        .await
+        .expect("write hot row");
+    db.flush().await.expect("flush hot row");
+
+    let live = db.sstables_read().live.clone();
+    assert_eq!(live.len(), 2);
+    assert_eq!(
+        live.iter().filter(|sstable| sstable.is_columnar()).count(),
+        1,
+    );
+    assert_eq!(
+        live.iter().filter(|sstable| !sstable.is_columnar()).count(),
+        1,
+    );
+
+    let expected_projection = vec![
+        (
+            b"user:1".to_vec(),
+            Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(1))])),
+        ),
+        (
+            b"user:2".to_vec(),
+            Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(2))])),
+        ),
+        (
+            b"user:3".to_vec(),
+            Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(3))])),
+        ),
+    ];
+    assert_eq!(
+        collect_rows(
+            table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["count".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("mixed projected scan"),
+        )
+        .await,
+        expected_projection,
+    );
+    assert_eq!(
+        table.read(b"user:3".to_vec()).await.expect("read hot key"),
+        Some(
+            Value::named_record(
+                &schema,
+                [
+                    ("user_id", FieldValue::String("charlie".to_string())),
+                    ("count", FieldValue::Int64(3)),
+                ],
+            )
+            .expect("encode expected hot row"),
+        ),
+    );
+
+    let reopened = Db::open(
+        tiered_config_with_compact_to_wide("/compact-to-wide-mixed"),
+        dependencies,
+    )
+    .await
+    .expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    assert_eq!(
+        reopened
+            .sstables_read()
+            .live
+            .iter()
+            .filter(|sstable| sstable.is_columnar())
+            .count(),
+        1,
+    );
+    assert_eq!(
+        reopened
+            .sstables_read()
+            .live
+            .iter()
+            .filter(|sstable| !sstable.is_columnar())
+            .count(),
+        1,
+    );
+    assert_eq!(
+        collect_rows(
+            reopened_table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["count".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("reopened mixed projected scan"),
+        )
+        .await,
+        expected_projection,
+    );
+}
+
+#[tokio::test]
+async fn compact_to_wide_promotion_output_without_manifest_switch_recovers_compact_inputs() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+
+    let db = Db::open(
+        tiered_config_with_compact_to_wide("/compact-to-wide-manifest-before-switch"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let config = compact_to_wide_table_config("metrics", 4);
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    for (key, user_id, count) in [
+        (b"user:1".to_vec(), "alpha", 1),
+        (b"user:2".to_vec(), "bravo", 2),
+    ] {
+        table
+            .write(
+                key,
+                Value::named_record(
+                    &schema,
+                    [
+                        ("user_id", FieldValue::String(user_id.to_string())),
+                        ("count", FieldValue::Int64(count)),
+                    ],
+                )
+                .expect("encode row"),
+            )
+            .await
+            .expect("write row");
+        db.flush().await.expect("flush compact row");
+    }
+
+    for _ in 0..3 {
+        let _ = collect_rows(
+            table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["count".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("projected scan"),
+        )
+        .await;
+    }
+
+    let prior_generation = db.sstables_read().manifest_generation;
+    let next_generation = ManifestId::new(prior_generation.get().saturating_add(1));
+    let manifest_temp_path = format!(
+        "{}{}",
+        Db::local_manifest_path("/compact-to-wide-manifest-before-switch", next_generation),
+        LOCAL_MANIFEST_TEMP_SUFFIX
+    );
+    file_system.inject_failure(FileSystemFailure::for_target(
+        FileSystemOperation::Rename,
+        manifest_temp_path,
+        StorageError::io("simulated compact-to-wide manifest rename failure"),
+    ));
+
+    let error = db
+        .run_next_compaction()
+        .await
+        .expect_err("promotion compaction should fail before manifest switch");
+    assert!(
+        error
+            .message()
+            .contains("simulated compact-to-wide manifest rename failure")
+    );
+
+    file_system.crash();
+    let reopened = Db::open(
+        tiered_config_with_compact_to_wide("/compact-to-wide-manifest-before-switch"),
+        dependencies,
+    )
+    .await
+    .expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+
+    assert_eq!(
+        reopened.sstables_read().manifest_generation,
+        prior_generation,
+    );
+    assert_eq!(reopened.sstables_read().live.len(), 2);
+    assert!(
+        reopened
+            .sstables_read()
+            .live
+            .iter()
+            .all(|sstable| !sstable.is_columnar()),
+        "failed promotion must leave only the original compact inputs visible",
+    );
+    assert_eq!(
+        collect_rows(
+            reopened_table
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        columns: Some(vec!["count".to_string()]),
+                        ..ScanOptions::default()
+                    },
+                )
+                .await
+                .expect("scan reopened rows"),
+        )
+        .await,
+        vec![
+            (
+                b"user:1".to_vec(),
+                Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(1))])),
+            ),
+            (
+                b"user:2".to_vec(),
+                Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(2))])),
+            ),
+        ],
     );
 }
 

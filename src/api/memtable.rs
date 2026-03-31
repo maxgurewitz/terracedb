@@ -278,7 +278,7 @@ impl ResidentRowSstable {
         })?;
         let location = self.meta.storage_descriptor();
         let footer = columnar_read_context
-            .footer_from_source(&self.meta, &columnar.source, location, access)
+            .footer_from_source(&self.meta, &columnar.source, location, access, true)
             .await?;
         Db::validate_loaded_columnar_footer(
             location,

@@ -6,6 +6,12 @@ type ColumnarSubstreamDescriptor = (
     crate::ColumnarSubstreamKind,
 );
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnarOutputLayout {
+    Compact,
+    Wide,
+}
+
 impl ColumnarReadContext {
     pub(super) fn cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
         let mut usage = self
@@ -101,14 +107,14 @@ impl ColumnarReadContext {
         Ok(bytes)
     }
 
-    pub(super) async fn read_range(
+    async fn read_range_with_policy(
         &self,
         source: &StorageSource,
         range: std::ops::Range<u64>,
         access: ColumnarReadAccessPattern,
         artifact: ColumnarReadArtifact,
+        policy: ColumnarCachePolicy,
     ) -> Result<Vec<u8>, StorageError> {
-        let policy = self.cache_policy(source, access, artifact);
         if let StorageSource::RemoteObject { key } = source
             && policy.use_raw_byte_cache
             && let Some(cache) = &self.remote_cache
@@ -155,6 +161,18 @@ impl ColumnarReadContext {
                 .await?;
         }
         Ok(bytes)
+    }
+
+    pub(super) async fn read_range(
+        &self,
+        source: &StorageSource,
+        range: std::ops::Range<u64>,
+        access: ColumnarReadAccessPattern,
+        artifact: ColumnarReadArtifact,
+    ) -> Result<Vec<u8>, StorageError> {
+        let policy = self.cache_policy(source, access, artifact);
+        self.read_range_with_policy(source, range, access, artifact, policy)
+            .await
     }
 
     async fn admit_raw_byte_cache_range(
@@ -226,9 +244,13 @@ impl ColumnarReadContext {
         source: &StorageSource,
         location: &str,
         access: ColumnarReadAccessPattern,
+        populate_raw_byte_cache: bool,
     ) -> Result<CachedColumnarFooter, StorageError> {
         let identity = meta.columnar_identity();
-        let policy = self.cache_policy(source, access, ColumnarReadArtifact::Footer);
+        let mut policy = self.cache_policy(source, access, ColumnarReadArtifact::Footer);
+        if !populate_raw_byte_cache {
+            policy.populate_raw_byte_cache = false;
+        }
         if policy.use_decoded_cache
             && let Some(cached) = self.decoded_cache.footer(&identity)
         {
@@ -246,11 +268,12 @@ impl ColumnarReadContext {
             .length
             .saturating_sub((COLUMNAR_SSTABLE_MAGIC.len() + std::mem::size_of::<u64>()) as u64);
         let trailer = self
-            .read_range(
+            .read_range_with_policy(
                 source,
                 trailer_start..meta.length,
                 access,
                 ColumnarReadArtifact::Footer,
+                policy,
             )
             .await?;
         let footer_len = u64::from_le_bytes(
@@ -274,11 +297,12 @@ impl ColumnarReadContext {
             ))
         })?;
         let footer_bytes = self
-            .read_range(
+            .read_range_with_policy(
                 source,
                 footer_start_u64..trailer_start,
                 access,
                 ColumnarReadArtifact::Footer,
+                policy,
             )
             .await?;
         let footer = Arc::new(serde_json::from_slice(&footer_bytes).map_err(|error| {
@@ -939,7 +963,13 @@ impl Db {
         };
         let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
         let footer = columnar_read_context
-            .footer_from_source(&meta, source, location, ColumnarReadAccessPattern::Point)
+            .footer_from_source(
+                &meta,
+                source,
+                location,
+                ColumnarReadAccessPattern::Point,
+                true,
+            )
             .await?;
         Ok(((*footer.footer).clone(), footer.footer_start))
     }
@@ -1133,7 +1163,13 @@ impl Db {
             )));
         }
         let footer = columnar_read_context
-            .footer_from_source(meta, &source, location, ColumnarReadAccessPattern::Point)
+            .footer_from_source(
+                meta,
+                &source,
+                location,
+                ColumnarReadAccessPattern::Point,
+                false,
+            )
             .await?;
         Self::validate_loaded_columnar_footer(
             location,
@@ -2518,13 +2554,14 @@ impl Db {
                     .await
                 }
                 TableFormat::Columnar => {
-                    self.write_columnar_sstable(
+                    self.write_columnar_table_output(
                         &path,
                         0,
                         local_id,
                         &stored,
                         rows,
                         Some(applied_generation),
+                        &[],
                     )
                     .await
                 }
@@ -2589,13 +2626,14 @@ impl Db {
                     .await
                 }
                 TableFormat::Columnar => {
-                    self.write_columnar_sstable_remote(
+                    self.write_columnar_table_output_remote(
                         &object_key,
                         0,
                         local_id,
                         &stored,
                         rows,
                         Some(applied_generation),
+                        &[],
                     )
                     .await
                 }
@@ -3512,6 +3550,105 @@ impl Db {
         }
 
         Ok(encoded)
+    }
+
+    fn choose_columnar_output_layout(
+        &self,
+        stored: &StoredTable,
+        level: u32,
+        local_id: &str,
+        rows: &[SstableRow],
+        inputs: &[ResidentRowSstable],
+    ) -> Result<ColumnarOutputLayout, StorageError> {
+        let Some(config) = self.compact_to_wide_promotion_config_for_table(stored)? else {
+            return Ok(ColumnarOutputLayout::Wide);
+        };
+        if inputs.iter().any(ResidentRowSstable::is_columnar) {
+            return Ok(ColumnarOutputLayout::Wide);
+        }
+        if rows.len() > config.max_compact_rows {
+            return Ok(ColumnarOutputLayout::Wide);
+        }
+        if level < config.promote_on_compaction_to_level {
+            return Ok(ColumnarOutputLayout::Compact);
+        }
+        if inputs.is_empty() {
+            return Ok(ColumnarOutputLayout::Wide);
+        }
+
+        let decision = ConservativeCompactToWidePolicy { enabled: true }
+            .decide(&self.compact_to_wide_candidate(stored.id, local_id, rows.len(), inputs));
+        Ok(match decision {
+            CompactToWidePromotionDecision::KeepCompact => ColumnarOutputLayout::Compact,
+            CompactToWidePromotionDecision::PromoteWide => ColumnarOutputLayout::Wide,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn write_columnar_table_output(
+        &self,
+        path: &str,
+        level: u32,
+        local_id: String,
+        stored: &StoredTable,
+        rows: Vec<SstableRow>,
+        applied_generation: Option<ManifestId>,
+        inputs: &[ResidentRowSstable],
+    ) -> Result<ResidentRowSstable, StorageError> {
+        match self.choose_columnar_output_layout(stored, level, &local_id, &rows, inputs)? {
+            ColumnarOutputLayout::Compact => {
+                self.write_row_sstable(
+                    path,
+                    stored.id,
+                    level,
+                    local_id,
+                    rows,
+                    stored.config.bloom_filter_bits_per_key,
+                )
+                .await
+            }
+            ColumnarOutputLayout::Wide => {
+                self.write_columnar_sstable(path, level, local_id, stored, rows, applied_generation)
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn write_columnar_table_output_remote(
+        &self,
+        object_key: &str,
+        level: u32,
+        local_id: String,
+        stored: &StoredTable,
+        rows: Vec<SstableRow>,
+        applied_generation: Option<ManifestId>,
+        inputs: &[ResidentRowSstable],
+    ) -> Result<ResidentRowSstable, StorageError> {
+        match self.choose_columnar_output_layout(stored, level, &local_id, &rows, inputs)? {
+            ColumnarOutputLayout::Compact => {
+                self.write_row_sstable_remote(
+                    object_key,
+                    stored.id,
+                    level,
+                    local_id,
+                    rows,
+                    stored.config.bloom_filter_bits_per_key,
+                )
+                .await
+            }
+            ColumnarOutputLayout::Wide => {
+                self.write_columnar_sstable_remote(
+                    object_key,
+                    level,
+                    local_id,
+                    stored,
+                    rows,
+                    applied_generation,
+                )
+                .await
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

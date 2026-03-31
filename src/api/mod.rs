@@ -38,7 +38,10 @@ use crate::{
     hybrid::{
         COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION,
         COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION, CompactPartDigest,
-        HYBRID_TABLE_FEATURES_METADATA_KEY, HybridPartDescriptor, HybridSkipIndexFamily,
+        CompactToWidePromotionCandidate, CompactToWidePromotionDecision,
+        CompactToWidePromotionPolicy, ConservativeCompactToWidePolicy,
+        HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY, HYBRID_TABLE_FEATURES_METADATA_KEY,
+        HybridCompactToWidePromotionConfig, HybridPartDescriptor, HybridSkipIndexFamily,
         HybridTableFeatures, PartDigestAlgorithm, PartRepairController, RepairState,
         SkipIndexProbe, SkipIndexProbeResult,
     },

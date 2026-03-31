@@ -110,6 +110,7 @@ impl Db {
                     work_deferrals: Mutex::new(BTreeMap::new()),
                     pending_work_budget_state: Mutex::new(PendingWorkBudgetState::default()),
                     scheduler_observability: SchedulerObservabilityStats::default(),
+                    compact_to_wide_stats: Mutex::new(BTreeMap::new()),
                 }),
             };
             db.prune_commit_log(true)
@@ -223,8 +224,38 @@ impl Db {
         })
     }
 
+    pub(super) fn compact_to_wide_promotion_config(
+        metadata: &TableMetadata,
+    ) -> Result<Option<HybridCompactToWidePromotionConfig>, StorageError> {
+        let Some(value) = metadata
+            .get(HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        serde_json::from_value(value).map(Some).map_err(|error| {
+            StorageError::unsupported(format!(
+                "invalid {} table metadata: {error}",
+                HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY
+            ))
+        })
+    }
+
     pub(super) fn validate_hybrid_table_features(config: &TableConfig) -> Result<(), StorageError> {
         let features = Self::hybrid_table_features(&config.metadata)?;
+        let promotion = Self::compact_to_wide_promotion_config(&config.metadata)?;
+        if let Some(promotion) = promotion.as_ref() {
+            if config.format != TableFormat::Columnar {
+                return Err(StorageError::unsupported(
+                    "compact-to-wide promotion requires a columnar table",
+                ));
+            }
+            if promotion.max_compact_rows == 0 {
+                return Err(StorageError::unsupported(
+                    "compact-to-wide promotion requires max_compact_rows > 0",
+                ));
+            }
+        }
         if features.skip_indexes.is_empty() && features.projection_sidecars.is_empty() {
             return Ok(());
         }
@@ -764,7 +795,7 @@ impl Db {
                     dependencies.file_system.clone(),
                     root,
                     crate::remote::RemoteCacheConfig {
-                        max_bytes: config.raw_segment_cache_bytes,
+                        max_bytes: hybrid_read.raw_segment_cache_bytes,
                         ..Default::default()
                     },
                 )

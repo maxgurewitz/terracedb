@@ -26,6 +26,7 @@ pub const COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION: u32 =
     COLUMNAR_PROJECTION_SIDECAR_FORMAT_VERSION;
 pub const COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION: u32 = COLUMNAR_COMPACT_DIGEST_FORMAT_VERSION;
 pub const HYBRID_TABLE_FEATURES_METADATA_KEY: &str = "terracedb.hybrid";
+pub const HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY: &str = "terracedb.hybrid.compact_to_wide";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HybridReadConfig {
@@ -71,6 +72,32 @@ impl HybridReadConfig {
             return Err("zone maps are part of the columnar base format".to_string());
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridCompactToWidePromotionConfig {
+    #[serde(default = "default_compact_to_wide_promote_on_compaction_to_level")]
+    pub promote_on_compaction_to_level: u32,
+    #[serde(default = "default_compact_to_wide_max_compact_rows")]
+    pub max_compact_rows: usize,
+}
+
+const fn default_compact_to_wide_promote_on_compaction_to_level() -> u32 {
+    1
+}
+
+const fn default_compact_to_wide_max_compact_rows() -> usize {
+    64
+}
+
+impl Default for HybridCompactToWidePromotionConfig {
+    fn default() -> Self {
+        Self {
+            promote_on_compaction_to_level: default_compact_to_wide_promote_on_compaction_to_level(
+            ),
+            max_compact_rows: default_compact_to_wide_max_compact_rows(),
+        }
     }
 }
 
