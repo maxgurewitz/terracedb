@@ -12,11 +12,11 @@ use crate::{
     StorageSource, TableId,
 };
 
-pub const COLUMNAR_V2_BASE_PART_FORMAT_VERSION: u32 = 2;
-pub const COLUMNAR_V2_SYNOPSIS_SIDECAR_FORMAT_VERSION: u32 = 1;
-pub const COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION: u32 = 1;
-pub const COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION: u32 = 1;
-pub const COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION: u32 = 1;
+pub const COLUMNAR_BASE_PART_FORMAT_VERSION: u32 = 1;
+pub const COLUMNAR_SYNOPSIS_SIDECAR_FORMAT_VERSION: u32 = 1;
+pub const COLUMNAR_SKIP_INDEX_SIDECAR_FORMAT_VERSION: u32 = 1;
+pub const COLUMNAR_PROJECTION_SIDECAR_FORMAT_VERSION: u32 = 1;
+pub const COLUMNAR_COMPACT_DIGEST_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HybridReadConfig {
@@ -59,7 +59,7 @@ impl HybridReadConfig {
             return Err("hybrid read config requires decoded_column_cache_entries > 0".to_string());
         }
         if !self.zone_maps_in_base_part {
-            return Err("zone maps are part of the columnar-v2 base format".to_string());
+            return Err("zone maps are part of the columnar base format".to_string());
         }
         Ok(())
     }
@@ -105,7 +105,7 @@ impl ByteRange {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ColumnarV2ArtifactKind {
+pub enum ColumnarArtifactKind {
     BasePart,
     SynopsisSidecar,
     SkipIndexSidecar,
@@ -114,76 +114,79 @@ pub enum ColumnarV2ArtifactKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2FormatTag {
-    pub kind: ColumnarV2ArtifactKind,
+pub struct ColumnarFormatTag {
+    pub kind: ColumnarArtifactKind,
     pub format_version: u32,
     pub min_reader_version: u32,
     pub max_writer_version: u32,
 }
 
-impl ColumnarV2FormatTag {
+impl ColumnarFormatTag {
     pub const fn base_part() -> Self {
         Self {
-            kind: ColumnarV2ArtifactKind::BasePart,
-            format_version: COLUMNAR_V2_BASE_PART_FORMAT_VERSION,
-            min_reader_version: COLUMNAR_V2_BASE_PART_FORMAT_VERSION,
-            max_writer_version: COLUMNAR_V2_BASE_PART_FORMAT_VERSION,
+            kind: ColumnarArtifactKind::BasePart,
+            format_version: COLUMNAR_BASE_PART_FORMAT_VERSION,
+            min_reader_version: COLUMNAR_BASE_PART_FORMAT_VERSION,
+            max_writer_version: COLUMNAR_BASE_PART_FORMAT_VERSION,
         }
     }
 
     pub const fn synopsis_sidecar() -> Self {
         Self {
-            kind: ColumnarV2ArtifactKind::SynopsisSidecar,
-            format_version: COLUMNAR_V2_SYNOPSIS_SIDECAR_FORMAT_VERSION,
-            min_reader_version: COLUMNAR_V2_SYNOPSIS_SIDECAR_FORMAT_VERSION,
-            max_writer_version: COLUMNAR_V2_SYNOPSIS_SIDECAR_FORMAT_VERSION,
+            kind: ColumnarArtifactKind::SynopsisSidecar,
+            format_version: COLUMNAR_SYNOPSIS_SIDECAR_FORMAT_VERSION,
+            min_reader_version: COLUMNAR_SYNOPSIS_SIDECAR_FORMAT_VERSION,
+            max_writer_version: COLUMNAR_SYNOPSIS_SIDECAR_FORMAT_VERSION,
         }
     }
 
     pub const fn skip_index_sidecar() -> Self {
         Self {
-            kind: ColumnarV2ArtifactKind::SkipIndexSidecar,
-            format_version: COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
-            min_reader_version: COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
-            max_writer_version: COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
+            kind: ColumnarArtifactKind::SkipIndexSidecar,
+            format_version: COLUMNAR_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
+            min_reader_version: COLUMNAR_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
+            max_writer_version: COLUMNAR_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
         }
     }
 
     pub const fn projection_sidecar() -> Self {
         Self {
-            kind: ColumnarV2ArtifactKind::ProjectionSidecar,
-            format_version: COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION,
-            min_reader_version: COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION,
-            max_writer_version: COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION,
+            kind: ColumnarArtifactKind::ProjectionSidecar,
+            format_version: COLUMNAR_PROJECTION_SIDECAR_FORMAT_VERSION,
+            min_reader_version: COLUMNAR_PROJECTION_SIDECAR_FORMAT_VERSION,
+            max_writer_version: COLUMNAR_PROJECTION_SIDECAR_FORMAT_VERSION,
         }
     }
 
     pub const fn compact_digest() -> Self {
         Self {
-            kind: ColumnarV2ArtifactKind::CompactDigest,
-            format_version: COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION,
-            min_reader_version: COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION,
-            max_writer_version: COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION,
+            kind: ColumnarArtifactKind::CompactDigest,
+            format_version: COLUMNAR_COMPACT_DIGEST_FORMAT_VERSION,
+            min_reader_version: COLUMNAR_COMPACT_DIGEST_FORMAT_VERSION,
+            max_writer_version: COLUMNAR_COMPACT_DIGEST_FORMAT_VERSION,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ColumnarV2Encoding {
+pub enum ColumnarEncoding {
     Plain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ColumnarV2Compression {
+pub enum ColumnarCompression {
     None,
+    Lz4,
+    Zstd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ColumnarV2SubstreamKind {
-    KeyIndex,
+pub enum ColumnarSubstreamKind {
+    KeyOffsets,
+    KeyData,
     Sequence,
     TombstoneBitmap,
     RowKind,
@@ -199,29 +202,44 @@ pub enum ColumnarV2SubstreamKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2SubstreamRef {
+pub struct ColumnarDecodeField {
+    pub field_id: FieldId,
+    #[serde(rename = "type")]
+    pub field_type: FieldType,
+    pub nullable: bool,
+    pub has_default: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarDecodeMetadata {
+    pub schema_version: u32,
+    pub fields: Vec<ColumnarDecodeField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarSubstreamRef {
     pub ordinal: u32,
     pub field_id: Option<FieldId>,
     pub field_type: Option<FieldType>,
-    pub kind: ColumnarV2SubstreamKind,
-    pub encoding: ColumnarV2Encoding,
-    pub compression: ColumnarV2Compression,
+    pub kind: ColumnarSubstreamKind,
+    pub encoding: ColumnarEncoding,
+    pub compression: ColumnarCompression,
     pub range: ByteRange,
     pub checksum: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2MarkOffset {
+pub struct ColumnarMarkOffset {
     pub substream_ordinal: u32,
     pub offset: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2Mark {
+pub struct ColumnarMark {
     pub granule_index: u32,
     pub page_index: u32,
     pub row_ordinal: u64,
-    pub offsets: Vec<ColumnarV2MarkOffset>,
+    pub offsets: Vec<ColumnarMarkOffset>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -241,7 +259,7 @@ pub struct ColumnarGranuleSynopsis {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ColumnarSynopsisSidecar {
-    pub format_tag: ColumnarV2FormatTag,
+    pub format_tag: ColumnarFormatTag,
     pub part_local_id: String,
     pub granules: Vec<ColumnarGranuleSynopsis>,
     pub checksum: u32,
@@ -249,7 +267,7 @@ pub struct ColumnarSynopsisSidecar {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkipIndexSidecarDescriptor {
-    pub format_tag: ColumnarV2FormatTag,
+    pub format_tag: ColumnarFormatTag,
     pub part_local_id: String,
     pub index_name: String,
     pub checksum: u32,
@@ -257,7 +275,7 @@ pub struct SkipIndexSidecarDescriptor {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionSidecarDescriptor {
-    pub format_tag: ColumnarV2FormatTag,
+    pub format_tag: ColumnarFormatTag,
     pub part_local_id: String,
     pub projection_name: String,
     pub projected_fields: Vec<FieldId>,
@@ -279,15 +297,15 @@ pub enum PartDigestAlgorithm {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactPartDigest {
-    pub format_tag: ColumnarV2FormatTag,
+    pub format_tag: ColumnarFormatTag,
     pub algorithm: PartDigestAlgorithm,
     pub logical_bytes: u64,
     pub digest_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2Header {
-    pub format_tag: ColumnarV2FormatTag,
+pub struct ColumnarHeader {
+    pub format_tag: ColumnarFormatTag,
     pub table_id: TableId,
     pub local_id: String,
     pub schema_version: u32,
@@ -307,7 +325,7 @@ impl ColumnarSequenceBounds {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2GranuleRef {
+pub struct ColumnarGranuleRef {
     pub granule_index: u32,
     pub first_key: Key,
     pub row_range: ByteRange,
@@ -317,7 +335,7 @@ pub struct ColumnarV2GranuleRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2PageRef {
+pub struct ColumnarPageRef {
     pub granule_index: u32,
     pub substream_ordinal: u32,
     pub page_ordinal: u32,
@@ -329,21 +347,22 @@ pub struct ColumnarV2PageRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnarV2PageDirectory {
-    pub granules: Vec<ColumnarV2GranuleRef>,
-    pub pages: Vec<ColumnarV2PageRef>,
+pub struct ColumnarPageDirectory {
+    pub granules: Vec<ColumnarGranuleRef>,
+    pub pages: Vec<ColumnarPageRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ColumnarV2Footer {
-    pub format_tag: ColumnarV2FormatTag,
+pub struct ColumnarFooter {
+    pub format_tag: ColumnarFormatTag,
     pub table_id: TableId,
     pub local_id: String,
     pub schema_version: u32,
     pub row_count: u64,
     pub data_range: ByteRange,
-    pub substreams: Vec<ColumnarV2SubstreamRef>,
-    pub marks: Vec<ColumnarV2Mark>,
+    pub decode_metadata: ColumnarDecodeMetadata,
+    pub substreams: Vec<ColumnarSubstreamRef>,
+    pub marks: Vec<ColumnarMark>,
     pub synopsis: ColumnarSynopsisSidecar,
     pub optional_sidecars: Vec<ColumnarOptionalSidecar>,
     pub digests: Vec<CompactPartDigest>,
@@ -394,8 +413,8 @@ pub enum ZoneMapPredicate {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnarGranuleSelection {
-    pub granule: ColumnarV2GranuleRef,
-    pub pages: Vec<ColumnarV2PageRef>,
+    pub granule: ColumnarGranuleRef,
+    pub pages: Vec<ColumnarPageRef>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,7 +437,7 @@ pub struct ColumnarPruningOutcome {
 pub trait HybridSynopsisPruner: Send + Sync {
     fn prune(
         &self,
-        page_directory: &ColumnarV2PageDirectory,
+        page_directory: &ColumnarPageDirectory,
         synopsis: &ColumnarSynopsisSidecar,
         key_range: &HybridKeyRange,
         predicate: &ZoneMapPredicate,
@@ -431,7 +450,7 @@ pub struct BaseZoneMapPruner;
 impl HybridSynopsisPruner for BaseZoneMapPruner {
     fn prune(
         &self,
-        page_directory: &ColumnarV2PageDirectory,
+        page_directory: &ColumnarPageDirectory,
         synopsis: &ColumnarSynopsisSidecar,
         key_range: &HybridKeyRange,
         predicate: &ZoneMapPredicate,
@@ -491,8 +510,8 @@ impl ColumnarSynopsisSidecar {
     }
 }
 
-impl ColumnarV2PageDirectory {
-    pub fn pages_for_granule(&self, granule_index: u32) -> Vec<ColumnarV2PageRef> {
+impl ColumnarPageDirectory {
+    pub fn pages_for_granule(&self, granule_index: u32) -> Vec<ColumnarPageRef> {
         self.pages
             .iter()
             .filter(|page| page.granule_index == granule_index)
@@ -584,18 +603,18 @@ pub trait ColumnarFooterPageDirectoryLoader: Send + Sync {
     async fn load_header(
         &self,
         source: &StorageSource,
-    ) -> Result<Arc<ColumnarV2Header>, StorageError>;
+    ) -> Result<Arc<ColumnarHeader>, StorageError>;
 
     async fn load_footer(
         &self,
         source: &StorageSource,
-    ) -> Result<Arc<ColumnarV2Footer>, StorageError>;
+    ) -> Result<Arc<ColumnarFooter>, StorageError>;
 
     async fn load_page_directory(
         &self,
         source: &StorageSource,
-        footer: &ColumnarV2Footer,
-    ) -> Result<Arc<ColumnarV2PageDirectory>, StorageError>;
+        footer: &ColumnarFooter,
+    ) -> Result<Arc<ColumnarPageDirectory>, StorageError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -845,7 +864,7 @@ pub struct HybridPartDescriptor {
     pub table_id: TableId,
     pub local_id: String,
     pub source: StorageSource,
-    pub format_tag: ColumnarV2FormatTag,
+    pub format_tag: ColumnarFormatTag,
     pub digests: Vec<CompactPartDigest>,
 }
 
@@ -909,16 +928,16 @@ impl HybridRuntimeContext {
 
 #[derive(Clone, Debug)]
 pub struct StubColumnarFooterPageDirectoryLoader {
-    header: Arc<ColumnarV2Header>,
-    footer: Arc<ColumnarV2Footer>,
-    page_directory: Arc<ColumnarV2PageDirectory>,
+    header: Arc<ColumnarHeader>,
+    footer: Arc<ColumnarFooter>,
+    page_directory: Arc<ColumnarPageDirectory>,
 }
 
 impl StubColumnarFooterPageDirectoryLoader {
     pub fn new(
-        header: ColumnarV2Header,
-        footer: ColumnarV2Footer,
-        page_directory: ColumnarV2PageDirectory,
+        header: ColumnarHeader,
+        footer: ColumnarFooter,
+        page_directory: ColumnarPageDirectory,
     ) -> Self {
         Self {
             header: Arc::new(header),
@@ -933,22 +952,22 @@ impl ColumnarFooterPageDirectoryLoader for StubColumnarFooterPageDirectoryLoader
     async fn load_header(
         &self,
         _source: &StorageSource,
-    ) -> Result<Arc<ColumnarV2Header>, StorageError> {
+    ) -> Result<Arc<ColumnarHeader>, StorageError> {
         Ok(self.header.clone())
     }
 
     async fn load_footer(
         &self,
         _source: &StorageSource,
-    ) -> Result<Arc<ColumnarV2Footer>, StorageError> {
+    ) -> Result<Arc<ColumnarFooter>, StorageError> {
         Ok(self.footer.clone())
     }
 
     async fn load_page_directory(
         &self,
         _source: &StorageSource,
-        _footer: &ColumnarV2Footer,
-    ) -> Result<Arc<ColumnarV2PageDirectory>, StorageError> {
+        _footer: &ColumnarFooter,
+    ) -> Result<Arc<ColumnarPageDirectory>, StorageError> {
         Ok(self.page_directory.clone())
     }
 }
@@ -1147,16 +1166,16 @@ mod tests {
 
     fn sample_digest() -> CompactPartDigest {
         CompactPartDigest {
-            format_tag: ColumnarV2FormatTag::compact_digest(),
+            format_tag: ColumnarFormatTag::compact_digest(),
             algorithm: PartDigestAlgorithm::Crc32,
             logical_bytes: 128,
             digest_bytes: vec![0xaa, 0xbb, 0xcc, 0xdd],
         }
     }
 
-    fn sample_header() -> ColumnarV2Header {
-        ColumnarV2Header {
-            format_tag: ColumnarV2FormatTag::base_part(),
+    fn sample_header() -> ColumnarHeader {
+        ColumnarHeader {
+            format_tag: ColumnarFormatTag::base_part(),
             table_id: TableId::new(7),
             local_id: "SST-000777".to_string(),
             schema_version: 3,
@@ -1164,35 +1183,52 @@ mod tests {
         }
     }
 
-    fn sample_footer() -> ColumnarV2Footer {
-        ColumnarV2Footer {
-            format_tag: ColumnarV2FormatTag::base_part(),
+    fn sample_footer() -> ColumnarFooter {
+        ColumnarFooter {
+            format_tag: ColumnarFormatTag::base_part(),
             table_id: TableId::new(7),
             local_id: "SST-000777".to_string(),
             schema_version: 3,
             row_count: 2,
             data_range: ByteRange::new(8, 64),
-            substreams: vec![ColumnarV2SubstreamRef {
+            decode_metadata: ColumnarDecodeMetadata {
+                schema_version: 3,
+                fields: vec![
+                    ColumnarDecodeField {
+                        field_id: FieldId::new(1),
+                        field_type: FieldType::String,
+                        nullable: false,
+                        has_default: false,
+                    },
+                    ColumnarDecodeField {
+                        field_id: FieldId::new(2),
+                        field_type: FieldType::Int64,
+                        nullable: false,
+                        has_default: true,
+                    },
+                ],
+            },
+            substreams: vec![ColumnarSubstreamRef {
                 ordinal: 0,
                 field_id: Some(FieldId::new(1)),
                 field_type: Some(FieldType::String),
-                kind: ColumnarV2SubstreamKind::StringData,
-                encoding: ColumnarV2Encoding::Plain,
-                compression: ColumnarV2Compression::None,
+                kind: ColumnarSubstreamKind::StringData,
+                encoding: ColumnarEncoding::Plain,
+                compression: ColumnarCompression::None,
                 range: ByteRange::new(8, 32),
                 checksum: 11,
             }],
-            marks: vec![ColumnarV2Mark {
+            marks: vec![ColumnarMark {
                 granule_index: 0,
                 page_index: 0,
                 row_ordinal: 0,
-                offsets: vec![ColumnarV2MarkOffset {
+                offsets: vec![ColumnarMarkOffset {
                     substream_ordinal: 0,
                     offset: 8,
                 }],
             }],
             synopsis: ColumnarSynopsisSidecar {
-                format_tag: ColumnarV2FormatTag::synopsis_sidecar(),
+                format_tag: ColumnarFormatTag::synopsis_sidecar(),
                 part_local_id: "SST-000777".to_string(),
                 granules: vec![ColumnarGranuleSynopsis {
                     granule_index: 0,
@@ -1208,13 +1244,13 @@ mod tests {
             },
             optional_sidecars: vec![
                 ColumnarOptionalSidecar::SkipIndex(SkipIndexSidecarDescriptor {
-                    format_tag: ColumnarV2FormatTag::skip_index_sidecar(),
+                    format_tag: ColumnarFormatTag::skip_index_sidecar(),
                     part_local_id: "SST-000777".to_string(),
                     index_name: "count_gt_zero".to_string(),
                     checksum: 33,
                 }),
                 ColumnarOptionalSidecar::Projection(ProjectionSidecarDescriptor {
-                    format_tag: ColumnarV2FormatTag::projection_sidecar(),
+                    format_tag: ColumnarFormatTag::projection_sidecar(),
                     part_local_id: "SST-000777".to_string(),
                     projection_name: "metric_only".to_string(),
                     projected_fields: vec![FieldId::new(1)],
@@ -1225,9 +1261,9 @@ mod tests {
         }
     }
 
-    fn sample_page_directory() -> ColumnarV2PageDirectory {
-        ColumnarV2PageDirectory {
-            granules: vec![ColumnarV2GranuleRef {
+    fn sample_page_directory() -> ColumnarPageDirectory {
+        ColumnarPageDirectory {
+            granules: vec![ColumnarGranuleRef {
                 granule_index: 0,
                 first_key: b"user:1".to_vec(),
                 row_range: ByteRange::new(0, 2),
@@ -1238,7 +1274,7 @@ mod tests {
                 },
                 has_tombstones: false,
             }],
-            pages: vec![ColumnarV2PageRef {
+            pages: vec![ColumnarPageRef {
                 granule_index: 0,
                 substream_ordinal: 0,
                 page_ordinal: 0,
@@ -1268,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn columnar_v2_metadata_shapes_round_trip() {
+    fn columnar_metadata_shapes_round_trip() {
         let header = sample_header();
         let footer = sample_footer();
         let digest = sample_digest();
@@ -1278,16 +1314,44 @@ mod tests {
         let encoded_digest = serde_json::to_vec(&digest).expect("encode digest");
 
         assert_eq!(
-            serde_json::from_slice::<ColumnarV2Header>(&encoded_header).expect("decode header"),
+            serde_json::from_slice::<ColumnarHeader>(&encoded_header).expect("decode header"),
             header
         );
         assert_eq!(
-            serde_json::from_slice::<ColumnarV2Footer>(&encoded_footer).expect("decode footer"),
+            serde_json::from_slice::<ColumnarFooter>(&encoded_footer).expect("decode footer"),
             footer
         );
         assert_eq!(
             serde_json::from_slice::<CompactPartDigest>(&encoded_digest).expect("decode digest"),
             digest
+        );
+    }
+
+    #[test]
+    fn columnar_decode_metadata_round_trip() {
+        let metadata = ColumnarDecodeMetadata {
+            schema_version: 4,
+            fields: vec![
+                ColumnarDecodeField {
+                    field_id: FieldId::new(1),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    has_default: false,
+                },
+                ColumnarDecodeField {
+                    field_id: FieldId::new(2),
+                    field_type: FieldType::Bool,
+                    nullable: true,
+                    has_default: true,
+                },
+            ],
+        };
+
+        let encoded = serde_json::to_vec(&metadata).expect("encode decode metadata");
+        assert_eq!(
+            serde_json::from_slice::<ColumnarDecodeMetadata>(&encoded)
+                .expect("decode decode metadata"),
+            metadata
         );
     }
 
@@ -1358,7 +1422,7 @@ mod tests {
             table_id: TableId::new(7),
             local_id: "SST-000777".to_string(),
             source,
-            format_tag: ColumnarV2FormatTag::base_part(),
+            format_tag: ColumnarFormatTag::base_part(),
             digests: vec![sample_digest()],
         };
         assert_eq!(
@@ -1399,9 +1463,9 @@ mod tests {
 
     #[test]
     fn page_directory_prunes_granules_with_key_ranges_and_zone_maps() {
-        let page_directory = ColumnarV2PageDirectory {
+        let page_directory = ColumnarPageDirectory {
             granules: vec![
-                ColumnarV2GranuleRef {
+                ColumnarGranuleRef {
                     granule_index: 0,
                     first_key: b"user:1".to_vec(),
                     row_range: ByteRange::new(0, 2),
@@ -1412,7 +1476,7 @@ mod tests {
                     },
                     has_tombstones: false,
                 },
-                ColumnarV2GranuleRef {
+                ColumnarGranuleRef {
                     granule_index: 1,
                     first_key: b"user:3".to_vec(),
                     row_range: ByteRange::new(2, 4),
@@ -1425,7 +1489,7 @@ mod tests {
                 },
             ],
             pages: vec![
-                ColumnarV2PageRef {
+                ColumnarPageRef {
                     granule_index: 0,
                     substream_ordinal: 0,
                     page_ordinal: 0,
@@ -1438,7 +1502,7 @@ mod tests {
                     },
                     has_tombstones: false,
                 },
-                ColumnarV2PageRef {
+                ColumnarPageRef {
                     granule_index: 1,
                     substream_ordinal: 0,
                     page_ordinal: 1,
@@ -1454,7 +1518,7 @@ mod tests {
             ],
         };
         let synopsis = ColumnarSynopsisSidecar {
-            format_tag: ColumnarV2FormatTag::synopsis_sidecar(),
+            format_tag: ColumnarFormatTag::synopsis_sidecar(),
             part_local_id: "SST-000777".to_string(),
             granules: vec![
                 ColumnarGranuleSynopsis {

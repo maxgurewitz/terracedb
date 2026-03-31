@@ -27,7 +27,7 @@ use crate::{
     DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
     FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
     NoopScheduler, ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation,
-    PendingWork, PendingWorkBudget, PendingWorkType, ReadError, Rng, S3Location,
+    OpenError, PendingWork, PendingWorkBudget, PendingWorkType, ReadError, Rng, S3Location,
     S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SegmentId,
     SequenceNumber, SsdConfig, StorageConfig, StorageError, StorageErrorKind, StubClock,
     StubObjectStore, StubRng, Table, TableConfig, TableFormat, TableId, TableStats,
@@ -3804,6 +3804,41 @@ async fn columnar_sstables_round_trip_all_supported_field_types_and_tombstones()
             FieldType::Bool,
         ]
     );
+    let layout = &footer.layout;
+    assert_eq!(layout.decode_metadata.schema_version, schema.version);
+    assert_eq!(
+        layout
+            .decode_metadata
+            .fields
+            .iter()
+            .map(|field| field.field_type)
+            .collect::<Vec<_>>(),
+        vec![
+            FieldType::String,
+            FieldType::Int64,
+            FieldType::Float64,
+            FieldType::Bytes,
+            FieldType::Bool,
+        ]
+    );
+    assert!(
+        layout
+            .substreams
+            .iter()
+            .any(|substream| substream.compression == crate::ColumnarCompression::None)
+    );
+    assert!(
+        layout
+            .substreams
+            .iter()
+            .any(|substream| substream.compression == crate::ColumnarCompression::Lz4)
+    );
+    assert!(
+        layout
+            .substreams
+            .iter()
+            .any(|substream| substream.compression == crate::ColumnarCompression::Zstd)
+    );
 
     let reopened = Db::open(tiered_config("/columnar-all-types"), dependencies)
         .await
@@ -3830,6 +3865,112 @@ async fn columnar_sstables_round_trip_all_supported_field_types_and_tombstones()
             .expect("read tombstoned record"),
         None
     );
+}
+
+#[tokio::test]
+async fn columnar_decode_metadata_mismatch_fails_closed_on_reopen() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+
+    let config = columnar_table_config("metrics");
+    let schema = config.schema.clone().expect("columnar schema");
+    let db = Db::open(
+        tiered_config("/columnar-decode-metadata-mismatch"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(config)
+        .await
+        .expect("create columnar table");
+
+    table
+        .write(
+            b"user:1".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("user_id", FieldValue::String("alice".to_string())),
+                    ("count", FieldValue::Int64(7)),
+                ],
+            )
+            .expect("encode row"),
+        )
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush columnar sstable");
+
+    let live = db
+        .sstables_read()
+        .live
+        .first()
+        .cloned()
+        .expect("live columnar sstable");
+    let file_bytes = read_path(&dependencies, &live.meta.file_path)
+        .await
+        .expect("read columnar sstable");
+    let (mut footer, footer_start) =
+        Db::columnar_footer_from_bytes(&live.meta.file_path, &file_bytes).expect("decode footer");
+    let layout = &mut footer.layout;
+    let decode_field = layout
+        .decode_metadata
+        .fields
+        .iter_mut()
+        .find(|field| field.field_id == FieldId::new(2))
+        .expect("count decode field");
+    decode_field.field_type = FieldType::Bytes;
+
+    let footer_len_offset =
+        file_bytes.len() - COLUMNAR_SSTABLE_MAGIC.len() - std::mem::size_of::<u64>();
+    let original_footer_len = footer_len_offset - footer_start;
+    let footer_bytes = serde_json::to_vec(&footer).expect("encode corrupted footer");
+    assert_eq!(footer_bytes.len(), original_footer_len);
+
+    let mut corrupted_file = file_bytes[..footer_start].to_vec();
+    corrupted_file.extend_from_slice(&footer_bytes);
+    corrupted_file.extend_from_slice(&(footer_bytes.len() as u64).to_le_bytes());
+    corrupted_file.extend_from_slice(COLUMNAR_SSTABLE_MAGIC);
+    assert_eq!(corrupted_file.len(), file_bytes.len());
+
+    let handle = file_system
+        .open(
+            &live.meta.file_path,
+            crate::OpenOptions {
+                create: true,
+                read: true,
+                write: true,
+                truncate: true,
+                append: false,
+            },
+        )
+        .await
+        .expect("open corrupted footer path");
+    file_system
+        .write_at(&handle, 0, &corrupted_file)
+        .await
+        .expect("rewrite corrupted footer");
+    file_system
+        .sync(&handle)
+        .await
+        .expect("sync corrupted footer");
+
+    match Db::open(
+        tiered_config("/columnar-decode-metadata-mismatch"),
+        dependencies,
+    )
+    .await
+    {
+        Err(OpenError::Storage(error)) => {
+            assert!(
+                error
+                    .message()
+                    .contains("decode metadata type for field 2 does not match the column footer")
+            );
+        }
+        other => panic!("expected storage open error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

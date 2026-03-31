@@ -2,20 +2,20 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use futures::StreamExt;
 use terracedb::{
-    BaseZoneMapPruner, ByteRange, ColumnarFooterPageDirectoryLoader, ColumnarGranuleSynopsis,
-    ColumnarSequenceBounds, ColumnarSynopsisSidecar, ColumnarV2Compression, ColumnarV2Encoding,
-    ColumnarV2Footer, ColumnarV2FormatTag, ColumnarV2GranuleRef, ColumnarV2Header, ColumnarV2Mark,
-    ColumnarV2MarkOffset, ColumnarV2PageDirectory, ColumnarV2PageRef, ColumnarV2SubstreamKind,
-    ColumnarV2SubstreamRef, CompactPartDigest, CompactToWidePromotionCandidate,
-    CompactToWidePromotionDecision, CompactToWidePromotionPolicy, Db, DbConfig, DbDependencies,
-    FieldDefinition, FieldId, FieldType, FieldValue, HybridKeyRange, HybridPartDescriptor,
-    HybridSynopsisPruner, InMemoryRawByteSegmentCache, LateMaterializationPlan,
-    PartDigestAlgorithm, PartRepairController, ProjectionSidecarDescriptor, RawByteSegmentCache,
-    RepairState, RowProjection, S3Location, ScanOptions, SchemaDefinition,
-    SkipIndexSidecarDescriptor, SsdConfig, StorageConfig, StorageSource, StubClock,
-    StubColumnarFooterPageDirectoryLoader, StubFileSystem, StubObjectStore,
-    StubPartRepairController, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Value, ZoneMapPredicate, ZoneMapSynopsis,
+    BaseZoneMapPruner, ByteRange, ColumnarCompression, ColumnarDecodeField, ColumnarDecodeMetadata,
+    ColumnarEncoding, ColumnarFooter, ColumnarFooterPageDirectoryLoader, ColumnarFormatTag,
+    ColumnarGranuleRef, ColumnarGranuleSynopsis, ColumnarHeader, ColumnarMark, ColumnarMarkOffset,
+    ColumnarPageDirectory, ColumnarPageRef, ColumnarSequenceBounds, ColumnarSubstreamKind,
+    ColumnarSubstreamRef, ColumnarSynopsisSidecar, CompactPartDigest,
+    CompactToWidePromotionCandidate, CompactToWidePromotionDecision, CompactToWidePromotionPolicy,
+    Db, DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, HybridKeyRange,
+    HybridPartDescriptor, HybridSynopsisPruner, InMemoryRawByteSegmentCache,
+    LateMaterializationPlan, PartDigestAlgorithm, PartRepairController,
+    ProjectionSidecarDescriptor, RawByteSegmentCache, RepairState, RowProjection, S3Location,
+    ScanOptions, SchemaDefinition, SkipIndexSidecarDescriptor, SsdConfig, StorageConfig,
+    StorageSource, StubClock, StubColumnarFooterPageDirectoryLoader, StubFileSystem,
+    StubObjectStore, StubPartRepairController, StubRng, TableConfig, TableFormat,
+    TieredDurabilityMode, TieredStorageConfig, Value, ZoneMapPredicate, ZoneMapSynopsis,
 };
 use terracedb_projections::{PROJECTION_CURSOR_TABLE_NAME, ProjectionRuntime};
 use terracedb_simulation::{
@@ -125,7 +125,7 @@ fn metric_record(user_id: &str, count: i64, active: Option<bool>) -> Value {
 
 fn sample_digest() -> CompactPartDigest {
     CompactPartDigest {
-        format_tag: ColumnarV2FormatTag::compact_digest(),
+        format_tag: ColumnarFormatTag::compact_digest(),
         algorithm: PartDigestAlgorithm::Crc32,
         logical_bytes: 96,
         digest_bytes: vec![0xde, 0xad, 0xbe, 0xef],
@@ -134,41 +134,50 @@ fn sample_digest() -> CompactPartDigest {
 
 fn sample_loader() -> StubColumnarFooterPageDirectoryLoader {
     StubColumnarFooterPageDirectoryLoader::new(
-        ColumnarV2Header {
-            format_tag: ColumnarV2FormatTag::base_part(),
+        ColumnarHeader {
+            format_tag: ColumnarFormatTag::base_part(),
             table_id: terracedb::TableId::new(9),
             local_id: "SST-000009".to_string(),
             schema_version: 1,
             part_digest: sample_digest(),
         },
-        ColumnarV2Footer {
-            format_tag: ColumnarV2FormatTag::base_part(),
+        ColumnarFooter {
+            format_tag: ColumnarFormatTag::base_part(),
             table_id: terracedb::TableId::new(9),
             local_id: "SST-000009".to_string(),
             schema_version: 1,
             row_count: 2,
             data_range: ByteRange::new(8, 64),
-            substreams: vec![ColumnarV2SubstreamRef {
+            decode_metadata: ColumnarDecodeMetadata {
+                schema_version: 1,
+                fields: vec![ColumnarDecodeField {
+                    field_id: FieldId::new(2),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    has_default: true,
+                }],
+            },
+            substreams: vec![ColumnarSubstreamRef {
                 ordinal: 0,
                 field_id: Some(FieldId::new(2)),
                 field_type: Some(FieldType::Int64),
-                kind: ColumnarV2SubstreamKind::Int64Values,
-                encoding: ColumnarV2Encoding::Plain,
-                compression: ColumnarV2Compression::None,
+                kind: ColumnarSubstreamKind::Int64Values,
+                encoding: ColumnarEncoding::Plain,
+                compression: ColumnarCompression::None,
                 range: ByteRange::new(8, 24),
                 checksum: 7,
             }],
-            marks: vec![ColumnarV2Mark {
+            marks: vec![ColumnarMark {
                 granule_index: 0,
                 page_index: 0,
                 row_ordinal: 0,
-                offsets: vec![ColumnarV2MarkOffset {
+                offsets: vec![ColumnarMarkOffset {
                     substream_ordinal: 0,
                     offset: 8,
                 }],
             }],
             synopsis: ColumnarSynopsisSidecar {
-                format_tag: ColumnarV2FormatTag::synopsis_sidecar(),
+                format_tag: ColumnarFormatTag::synopsis_sidecar(),
                 part_local_id: "SST-000009".to_string(),
                 granules: vec![ColumnarGranuleSynopsis {
                     granule_index: 0,
@@ -184,13 +193,13 @@ fn sample_loader() -> StubColumnarFooterPageDirectoryLoader {
             },
             optional_sidecars: vec![
                 terracedb::ColumnarOptionalSidecar::SkipIndex(SkipIndexSidecarDescriptor {
-                    format_tag: ColumnarV2FormatTag::skip_index_sidecar(),
+                    format_tag: ColumnarFormatTag::skip_index_sidecar(),
                     part_local_id: "SST-000009".to_string(),
                     index_name: "count_ge_5".to_string(),
                     checksum: 12,
                 }),
                 terracedb::ColumnarOptionalSidecar::Projection(ProjectionSidecarDescriptor {
-                    format_tag: ColumnarV2FormatTag::projection_sidecar(),
+                    format_tag: ColumnarFormatTag::projection_sidecar(),
                     part_local_id: "SST-000009".to_string(),
                     projection_name: "count_only".to_string(),
                     projected_fields: vec![FieldId::new(2)],
@@ -199,8 +208,8 @@ fn sample_loader() -> StubColumnarFooterPageDirectoryLoader {
             ],
             digests: vec![sample_digest()],
         },
-        ColumnarV2PageDirectory {
-            granules: vec![ColumnarV2GranuleRef {
+        ColumnarPageDirectory {
+            granules: vec![ColumnarGranuleRef {
                 granule_index: 0,
                 first_key: b"user:1".to_vec(),
                 row_range: ByteRange::new(0, 2),
@@ -211,7 +220,7 @@ fn sample_loader() -> StubColumnarFooterPageDirectoryLoader {
                 },
                 has_tombstones: false,
             }],
-            pages: vec![ColumnarV2PageRef {
+            pages: vec![ColumnarPageRef {
                 granule_index: 0,
                 substream_ordinal: 0,
                 page_ordinal: 0,

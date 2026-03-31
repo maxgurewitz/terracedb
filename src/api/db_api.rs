@@ -1837,7 +1837,7 @@ impl Db {
         key: &[u8],
     ) -> StorageError {
         StorageError::unsupported(format!(
-            "columnar table {} does not support historical overwritten-key reads in v1 (key {:?})",
+            "columnar table {} does not support historical overwritten-key reads yet (key {:?})",
             table.config.name, key
         ))
     }

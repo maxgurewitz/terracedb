@@ -35,6 +35,7 @@ crc32fast = "1.5.0"
 flatbuffers = "25.12.19"
 futures = "0.3.31"
 getrandom = "0.4.2"
+lz4_flex = "0.11.5"
 object_store = { version = "0.13.2", default-features = false, features = ["fs"] }
 parking_lot = "0.12.5"
 rand = "0.10"
@@ -48,6 +49,7 @@ tracing-opentelemetry = "0.32.0"
 uuid = "1.23.0"
 walkdir = "2.5.0"
 opentelemetry = { version = "0.31.0", default-features = false, features = ["trace"] }
+zstd = "0.13.3"
 
 [dev-dependencies]
 insta = { workspace = true }

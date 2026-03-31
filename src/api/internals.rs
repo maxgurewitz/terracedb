@@ -674,7 +674,7 @@ impl DecodedColumnarCache {
             .footers
             .read()
             .values()
-            .map(|footer| estimate_cached_footer_bytes(footer))
+            .map(estimate_cached_footer_bytes)
             .sum::<u64>();
         let key_index_bytes = self
             .key_indexes
@@ -873,6 +873,8 @@ pub(super) enum ColumnEncoding {
 #[serde(rename_all = "lowercase")]
 pub(super) enum ColumnCompression {
     None,
+    Lz4,
+    Zstd,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -909,30 +911,9 @@ pub(super) struct PersistedColumnarSstableFooter {
     pub(super) tombstone_bitmap: ColumnarBlockLocation,
     pub(super) row_kind_column: ColumnarBlockLocation,
     pub(super) columns: Vec<PersistedColumnarColumnFooter>,
+    pub(super) layout: crate::hybrid::ColumnarFooter,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(super) struct PersistedNullableColumn<T> {
-    pub(super) present_bitmap: Vec<bool>,
-    pub(super) values: Vec<T>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(super) struct PersistedFloat64Column {
-    pub(super) present_bitmap: Vec<bool>,
-    pub(super) values_bits: Vec<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub(super) enum PersistedColumnBlock {
-    Int64(PersistedNullableColumn<i64>),
-    Float64(PersistedFloat64Column),
-    String(PersistedNullableColumn<String>),
-    Bytes(PersistedNullableColumn<Vec<u8>>),
-    Bool(PersistedNullableColumn<bool>),
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
