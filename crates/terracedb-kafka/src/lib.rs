@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, error::Error as StdError};
+use std::{
+    collections::BTreeMap,
+    error::Error as StdError,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use terracedb::{
@@ -353,6 +357,256 @@ pub trait KafkaBroker: Send + Sync {
         next_offset: KafkaOffset,
         max_records: usize,
     ) -> Result<KafkaFetchedBatch, Self::Error>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeterministicKafkaFetchResponse {
+    Batch(KafkaFetchedBatch),
+    Failure { message: String },
+}
+
+impl DeterministicKafkaFetchResponse {
+    pub fn batch(batch: KafkaFetchedBatch) -> Self {
+        Self::Batch(batch)
+    }
+
+    pub fn empty(high_watermark: Option<KafkaOffset>) -> Self {
+        Self::Batch(KafkaFetchedBatch::empty(high_watermark))
+    }
+
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self::Failure {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeterministicKafkaPartitionScript {
+    pub earliest_offset: KafkaOffset,
+    pub latest_offset: KafkaOffset,
+    fetch_responses: BTreeMap<KafkaOffset, Vec<DeterministicKafkaFetchResponse>>,
+}
+
+impl DeterministicKafkaPartitionScript {
+    pub fn new(earliest_offset: KafkaOffset, latest_offset: KafkaOffset) -> Self {
+        Self {
+            earliest_offset,
+            latest_offset,
+            fetch_responses: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_fetch_responses<I>(mut self, requested_offset: KafkaOffset, responses: I) -> Self
+    where
+        I: IntoIterator<Item = DeterministicKafkaFetchResponse>,
+    {
+        let responses = responses.into_iter().collect::<Vec<_>>();
+        if !responses.is_empty() {
+            self.fetch_responses.insert(requested_offset, responses);
+        }
+        self
+    }
+
+    fn response_for(
+        &self,
+        requested_offset: KafkaOffset,
+        attempt: usize,
+    ) -> DeterministicKafkaFetchResponse {
+        self.fetch_responses
+            .get(&requested_offset)
+            .and_then(|responses| responses.get(attempt).or_else(|| responses.last()))
+            .cloned()
+            .unwrap_or_else(|| DeterministicKafkaFetchResponse::empty(Some(self.latest_offset)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DeterministicKafkaFetchKey {
+    topic_partition: KafkaTopicPartition,
+    requested_offset: KafkaOffset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeterministicKafkaFetchOutcome {
+    Batch {
+        record_offsets: Vec<KafkaOffset>,
+        high_watermark: Option<KafkaOffset>,
+    },
+    Failure {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeterministicKafkaBrokerTraceEvent {
+    ResolveOffset {
+        claim: KafkaPartitionClaim,
+        policy: KafkaBootstrapPolicy,
+        resolved_offset: KafkaOffset,
+    },
+    FetchBatch {
+        claim: KafkaPartitionClaim,
+        requested_offset: KafkaOffset,
+        max_records: usize,
+        outcome: DeterministicKafkaFetchOutcome,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicKafkaBroker {
+    partitions: Arc<BTreeMap<KafkaTopicPartition, DeterministicKafkaPartitionScript>>,
+    fetch_attempts: Arc<Mutex<BTreeMap<DeterministicKafkaFetchKey, usize>>>,
+    trace: Arc<Mutex<Vec<DeterministicKafkaBrokerTraceEvent>>>,
+}
+
+impl DeterministicKafkaBroker {
+    pub fn new<I>(bindings: I) -> Self
+    where
+        I: IntoIterator<Item = (KafkaTopicPartition, DeterministicKafkaPartitionScript)>,
+    {
+        Self {
+            partitions: Arc::new(bindings.into_iter().collect()),
+            fetch_attempts: Arc::new(Mutex::new(BTreeMap::new())),
+            trace: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn trace(&self) -> Vec<DeterministicKafkaBrokerTraceEvent> {
+        self.trace
+            .lock()
+            .expect("deterministic kafka broker trace lock should not be poisoned")
+            .clone()
+    }
+
+    fn partition_script(
+        &self,
+        topic_partition: &KafkaTopicPartition,
+    ) -> Result<&DeterministicKafkaPartitionScript, DeterministicKafkaBrokerError> {
+        self.partitions.get(topic_partition).ok_or_else(|| {
+            DeterministicKafkaBrokerError::MissingPartition {
+                topic: topic_partition.topic.clone(),
+                partition: topic_partition.partition.get(),
+            }
+        })
+    }
+
+    fn next_attempt(
+        &self,
+        topic_partition: &KafkaTopicPartition,
+        requested_offset: KafkaOffset,
+    ) -> usize {
+        let mut attempts = self
+            .fetch_attempts
+            .lock()
+            .expect("deterministic kafka broker attempt lock should not be poisoned");
+        let entry = attempts
+            .entry(DeterministicKafkaFetchKey {
+                topic_partition: topic_partition.clone(),
+                requested_offset,
+            })
+            .or_insert(0);
+        let attempt = *entry;
+        *entry = attempt.saturating_add(1);
+        attempt
+    }
+
+    fn push_trace(&self, event: DeterministicKafkaBrokerTraceEvent) {
+        self.trace
+            .lock()
+            .expect("deterministic kafka broker trace lock should not be poisoned")
+            .push(event);
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DeterministicKafkaBrokerError {
+    #[error("no deterministic broker script was configured for {topic}[{partition}]")]
+    MissingPartition { topic: String, partition: u32 },
+    #[error(
+        "deterministic broker fetch failure for {topic}[{partition}] at offset {requested_offset}: {message}"
+    )]
+    FetchFailure {
+        topic: String,
+        partition: u32,
+        requested_offset: u64,
+        message: String,
+    },
+}
+
+#[async_trait]
+impl KafkaBroker for DeterministicKafkaBroker {
+    type Error = DeterministicKafkaBrokerError;
+
+    async fn resolve_offset(
+        &self,
+        claim: &KafkaPartitionClaim,
+        policy: KafkaBootstrapPolicy,
+    ) -> Result<KafkaOffset, Self::Error> {
+        let script = self.partition_script(&claim.source.topic_partition)?;
+        let resolved_offset = match policy {
+            KafkaBootstrapPolicy::Earliest => script.earliest_offset,
+            KafkaBootstrapPolicy::Latest => script.latest_offset,
+        };
+        self.push_trace(DeterministicKafkaBrokerTraceEvent::ResolveOffset {
+            claim: claim.clone(),
+            policy,
+            resolved_offset,
+        });
+        Ok(resolved_offset)
+    }
+
+    async fn fetch_batch(
+        &self,
+        claim: &KafkaPartitionClaim,
+        requested_offset: KafkaOffset,
+        max_records: usize,
+    ) -> Result<KafkaFetchedBatch, Self::Error> {
+        let script = self.partition_script(&claim.source.topic_partition)?;
+        let attempt = self.next_attempt(&claim.source.topic_partition, requested_offset);
+        let response = script.response_for(requested_offset, attempt);
+
+        match response {
+            DeterministicKafkaFetchResponse::Batch(batch) => {
+                let records = batch
+                    .records
+                    .into_iter()
+                    .take(max_records.max(1))
+                    .collect::<Vec<_>>();
+                let fetched = KafkaFetchedBatch::new(records, batch.high_watermark);
+                self.push_trace(DeterministicKafkaBrokerTraceEvent::FetchBatch {
+                    claim: claim.clone(),
+                    requested_offset,
+                    max_records,
+                    outcome: DeterministicKafkaFetchOutcome::Batch {
+                        record_offsets: fetched
+                            .records
+                            .iter()
+                            .map(|record| record.offset)
+                            .collect(),
+                        high_watermark: fetched.high_watermark,
+                    },
+                });
+                Ok(fetched)
+            }
+            DeterministicKafkaFetchResponse::Failure { message } => {
+                self.push_trace(DeterministicKafkaBrokerTraceEvent::FetchBatch {
+                    claim: claim.clone(),
+                    requested_offset,
+                    max_records,
+                    outcome: DeterministicKafkaFetchOutcome::Failure {
+                        message: message.clone(),
+                    },
+                });
+                Err(DeterministicKafkaBrokerError::FetchFailure {
+                    topic: claim.source.topic_partition.topic.clone(),
+                    partition: claim.source.topic_partition.partition.get(),
+                    requested_offset: requested_offset.get(),
+                    message,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
