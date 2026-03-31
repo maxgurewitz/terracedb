@@ -4494,6 +4494,80 @@ For example, a subject may receive a `db.table.v1` binding scoped to:
 
 Even when a subject is trusted enough to run arbitrary draft query code, that code should still call versioned host capabilities such as `db.query.v1` rather than touching engine objects directly. This preserves one policy enforcement surface for employee sandboxes, reviewed procedures, and external adapters.
 
+### Row-Level Permissions Above the Query Capability Layer
+
+Row-level permissions should remain a capability-layer concern rather than an engine feature. The engine continues to offer tables, snapshots, scans, and OCC commits; the host-side capability layer decides which rows a caller may observe or mutate. This keeps the enforcement point aligned with the existing capability model instead of introducing a second permission system below the sandbox/runtime stack.
+
+The recommended shape is an explicit caller context plus a versioned row-scope policy attached to a binding:
+
+```typescript
+interface PolicyContext {
+  subjectId: string
+  tenantId?: string
+  groupIds?: string[]
+  attributes?: Record<string, JsonValue>
+}
+
+type RowScopePolicy =
+  | { kind: "key_prefix", prefixTemplate: KeyTemplate }
+  | { kind: "typed_row_predicate", predicate: RowPredicateRef }
+  | { kind: "visibility_index", indexTable: string, subjectKey: "subject" | "tenant" | "group" }
+  | { kind: "procedure_only" }
+```
+
+The important rule is that the host resolves `PolicyContext` and `RowScopePolicy`; guest code may invoke the bound capability, but it must not be able to choose a broader row scope from inside the sandbox.
+
+Recommended version-1 policy kinds:
+
+- **key-prefix scope**
+  Best fit for Terracedb's native primitives. A binding may rewrite or validate keys and prefixes so the guest can only touch rows under a deterministic prefix such as `tenant/{tenant_id}/...` or `user/{subject_id}/...`.
+- **typed row predicate**
+  A host-owned, deterministic predicate over decoded row values plus `PolicyContext`, for example `row.tenant_id == ctx.tenantId` or `row.owner_id == ctx.subjectId`. This is useful when the row key alone is not sufficient, but it should remain limited to query shapes the host can bound and evaluate predictably.
+- **visibility index**
+  For ACL-like sharing, collaborative documents, or relationship-driven visibility, request-time filtering should generally not degenerate into unbounded scans plus ad hoc row inspection. Instead, the application should read through projected visibility tables such as `visible_by_subject/{subject_id}/{row_id}` or `visible_by_group/{group_id}/{row_id}` and then fetch the referenced rows.
+- **procedure only**
+  Some access patterns are not safely expressible as direct draft-query bindings, for example complex multi-table joins, aggregates that would leak existence, or queries whose safe plan depends on application-specific reasoning. Those should fail closed at the raw capability layer and be exposed only through reviewed procedures.
+
+Read-path rules should remain explicit:
+
+- Point reads may use key-prefix validation, key rewriting, or read-then-predicate-check depending on the policy kind.
+- Prefix scans are acceptable when the host can derive a bounded candidate set from the policy, for example a scoped primary-key prefix or a projected visibility index prefix.
+- Queries that would require an unbounded scan of unrelated rows should be denied by `db.query.v1` rather than silently running an expensive post-filtered plan.
+- Budgets should charge for candidate rows scanned as well as rows returned, so a heavily filtered query cannot hide a pathological access pattern behind a small result set.
+- Where low-leakage behavior matters, "not visible" should normally surface as "not found" or "not present in scan output" rather than as a distinct permission error per row.
+
+Write-path rules should also be host-enforced and OCC-compatible:
+
+1. Read the current row, if any, at a snapshot.
+2. Evaluate the caller's permission against both the current row and the candidate next row.
+3. Reject scope-escaping writes such as changing `tenant_id`, `owner_id`, or key prefixes in ways the binding would not have allowed as a fresh insert.
+4. Add the preimage to the read set and commit through the normal OCC path.
+
+This preserves one correctness model: row-level permissions change which reads and writes are admitted, not how commit ordering, durability, or conflict detection work.
+
+#### Projection Helpers for Visibility Indexes
+
+ACL-like row visibility should be supported by reusable projection helpers rather than forcing every application to hand-roll the same pattern. A helper in `terracedb-projections` should be able to materialize visibility indexes such as:
+
+- `visible_by_subject/{subject_id}/{row_id} -> ()`
+- `visible_by_tenant/{tenant_id}/{row_id} -> ()`
+- `visible_by_group/{group_id}/{row_id} -> ()`
+
+The helper should own:
+
+- deterministic expansion from source rows and companion membership state into index rows,
+- membership transitions such as `false -> true` and `true -> false`,
+- optional emission of narrowed or redacted read mirrors alongside the membership index, and
+- explicit rebuild/recompute rules from declared authoritative sources.
+
+This keeps request-time authorization simple:
+
+- direct `db.table.v1` bindings for straightforward tenant- or owner-scoped tables,
+- `db.query.v1` over projected visibility indexes for relationship-driven sharing, and
+- reviewed procedures for queries that still cannot be bounded safely.
+
+The design goal is the same as the Debezium filtering model elsewhere in this architecture: row filtering should be deterministic over declared context and structured row data, not ambient application callbacks or hidden side channels. That makes row-scope behavior auditable, replayable in simulation, and reusable across draft sandboxes, published procedures, and MCP-facing access.
+
 ### Execution Domains for Sandbox Workloads
 
 Capability policy and execution-domain policy should be treated as complementary but separate:
