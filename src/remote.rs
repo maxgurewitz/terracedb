@@ -202,6 +202,29 @@ impl ObjectKeyLayout {
         self.key("backup/")
     }
 
+    pub fn control_prefix(&self) -> String {
+        self.key("control/")
+    }
+
+    pub fn control_catalog(&self) -> String {
+        self.key("control/catalog/CATALOG.json")
+    }
+
+    pub fn control_manifest_prefix(&self) -> String {
+        self.key("control/manifest/")
+    }
+
+    pub fn control_manifest(&self, generation: ManifestId) -> String {
+        self.key(&format!(
+            "control/manifest/MANIFEST-{:06}",
+            generation.get()
+        ))
+    }
+
+    pub fn control_manifest_latest(&self) -> String {
+        self.key("control/manifest/latest")
+    }
+
     pub fn backup_catalog(&self) -> String {
         self.key("backup/catalog/CATALOG.json")
     }
@@ -1886,6 +1909,19 @@ mod tests {
         });
 
         assert_eq!(layout.backup_prefix(), "tenant-a/db-01/backup");
+        assert_eq!(layout.control_prefix(), "tenant-a/db-01/control");
+        assert_eq!(
+            layout.control_catalog(),
+            "tenant-a/db-01/control/catalog/CATALOG.json"
+        );
+        assert_eq!(
+            layout.control_manifest(ManifestId::new(7)),
+            "tenant-a/db-01/control/manifest/MANIFEST-000007"
+        );
+        assert_eq!(
+            layout.control_manifest_latest(),
+            "tenant-a/db-01/control/manifest/latest"
+        );
         assert_eq!(
             layout.backup_catalog(),
             "tenant-a/db-01/backup/catalog/CATALOG.json"

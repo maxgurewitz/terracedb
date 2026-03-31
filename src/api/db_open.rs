@@ -30,6 +30,11 @@ impl Db {
                 &db_name,
                 &execution_profile,
             );
+            Self::ensure_control_plane_domain_registered(
+                &resource_manager,
+                &execution_profile,
+                &db_name,
+            );
             if let StorageConfig::Tiered(tiered) = &config.storage {
                 Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
             }
@@ -210,10 +215,6 @@ impl Db {
         let user_owner = crate::execution::ExecutionDomainOwner::Database {
             name: db_name.to_string(),
         };
-        let control_owner = crate::execution::ExecutionDomainOwner::Subsystem {
-            database: Some(db_name.to_string()),
-            name: "control-plane".to_string(),
-        };
 
         for (binding, owner, lane_key) in [
             (
@@ -225,11 +226,6 @@ impl Db {
                 &execution_profile.background,
                 user_owner.clone(),
                 "user-background",
-            ),
-            (
-                &execution_profile.control_plane,
-                control_owner,
-                "control-plane",
             ),
         ] {
             resource_manager.register_domain(crate::execution::ExecutionDomainSpec {
@@ -259,6 +255,90 @@ impl Db {
             crate::execution::DurabilityClass::RemotePrimary => "remote-primary",
             crate::execution::DurabilityClass::Custom(_) => "custom",
         }
+    }
+
+    fn reserved_control_plane_budget() -> crate::execution::ExecutionDomainBudget {
+        crate::execution::ExecutionDomainBudget {
+            cpu: crate::execution::DomainCpuBudget {
+                worker_slots: Some(1),
+                weight: Some(1),
+            },
+            memory: crate::execution::DomainMemoryBudget {
+                total_bytes: Some(64 * 1024),
+                cache_bytes: None,
+                mutable_bytes: Some(64 * 1024),
+            },
+            io: crate::execution::DomainIoBudget {
+                local_concurrency: Some(1),
+                local_bytes_per_second: Some(256 * 1024),
+                remote_concurrency: Some(1),
+                remote_bytes_per_second: Some(256 * 1024),
+            },
+            background: crate::execution::DomainBackgroundBudget {
+                task_slots: Some(1),
+                max_in_flight_bytes: Some(256 * 1024),
+            },
+        }
+    }
+
+    fn ensure_control_plane_domain_registered(
+        resource_manager: &Arc<dyn crate::execution::ResourceManager>,
+        execution_profile: &crate::execution::DbExecutionProfile,
+        db_name: &str,
+    ) {
+        let path = execution_profile.control_plane.domain.clone();
+        if resource_manager.snapshot().domains.contains_key(&path) {
+            return;
+        }
+
+        resource_manager.register_domain(crate::execution::ExecutionDomainSpec {
+            path,
+            owner: crate::execution::ExecutionDomainOwner::ProcessControl,
+            budget: Self::reserved_control_plane_budget(),
+            placement: crate::execution::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+            metadata: BTreeMap::from([
+                ("reserved".to_string(), "true".to_string()),
+                (
+                    "durability_class".to_string(),
+                    Self::durability_class_name(&execution_profile.control_plane.durability_class)
+                        .to_string(),
+                ),
+                ("db_name".to_string(), db_name.to_string()),
+                (
+                    "terracedb.execution.lane.control-plane".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "terracedb.execution.durability".to_string(),
+                    Self::durability_class_name(&execution_profile.control_plane.durability_class)
+                        .to_string(),
+                ),
+            ]),
+        });
+    }
+
+    fn control_plane_error(label: &str, detail: impl Into<String>) -> StorageError {
+        StorageError::corruption(format!(
+            "control-plane {label}: {}; repair by restoring or regenerating a single authoritative control-plane copy before reopening",
+            detail.into()
+        ))
+    }
+
+    fn annotate_control_plane_error(label: &str, error: StorageError) -> StorageError {
+        StorageError::new(
+            error.kind(),
+            format!(
+                "control-plane {label}: {}; repair by restoring or regenerating a single authoritative control-plane copy before reopening",
+                error.message()
+            ),
+        )
+    }
+
+    fn control_plane_mismatch(label: &str, primary: &str, legacy: &str) -> StorageError {
+        Self::control_plane_error(
+            label,
+            format!("durability lane mismatch between {primary} and legacy {legacy}"),
+        )
     }
 
     pub(super) fn validate_storage_config(storage: &StorageConfig) -> Result<(), OpenError> {
@@ -607,6 +687,7 @@ impl Db {
             }
             StorageConfig::S3Primary(config) => CatalogLocation::ObjectStore {
                 key: Self::join_object_key(&config.s3.prefix, OBJECT_CATALOG_RELATIVE_KEY),
+                legacy_key: Some(Self::remote_object_layout(config).backup_catalog()),
             },
         }
     }
@@ -696,17 +777,33 @@ impl Db {
                     Err(error) => return Err(OpenError::Storage(error)),
                 }
             }
-            CatalogLocation::ObjectStore { key } => {
-                match dependencies.object_store.get(key).await {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) if error.kind() == StorageErrorKind::NotFound => None,
-                    Err(error) => return Err(OpenError::Storage(error)),
+            CatalogLocation::ObjectStore { key, legacy_key } => {
+                let primary = read_optional_remote_object(dependencies, key).await?;
+                let legacy = match legacy_key {
+                    Some(legacy_key) => {
+                        read_optional_remote_object(dependencies, legacy_key).await?
+                    }
+                    None => None,
+                };
+                if let (Some(primary), Some(legacy)) = (&primary, &legacy)
+                    && primary != legacy
+                {
+                    return Err(OpenError::Storage(Self::control_plane_mismatch(
+                        "catalog",
+                        key,
+                        legacy_key
+                            .as_deref()
+                            .expect("legacy key should exist when comparing copies"),
+                    )));
                 }
+                primary.or(legacy)
             }
         };
 
         match bytes {
-            Some(bytes) => Self::decode_catalog(&bytes).map_err(OpenError::Storage),
+            Some(bytes) => Self::decode_catalog(&bytes).map_err(|error| {
+                OpenError::Storage(Self::annotate_control_plane_error("catalog", error))
+            }),
             None => Ok(PersistedCatalog::default()),
         }
     }
@@ -721,7 +818,7 @@ impl Db {
             CatalogLocation::LocalFile { path, temp_path } => {
                 self.persist_catalog_file(path, temp_path, &payload).await?
             }
-            CatalogLocation::ObjectStore { key } => {
+            CatalogLocation::ObjectStore { key, .. } => {
                 self.inner
                     .dependencies
                     .object_store
@@ -1046,9 +1143,10 @@ impl Db {
                     }
                 }
                 Err(error) => {
-                    last_error = Some(StorageError::corruption(format!(
-                        "decode CURRENT pointer failed: {error}"
-                    )));
+                    last_error = Some(Self::control_plane_error(
+                        "local manifest latest pointer",
+                        format!("decode CURRENT pointer failed: {error}"),
+                    ));
                 }
             }
         }
@@ -1079,13 +1177,18 @@ impl Db {
             .await
             {
                 Ok(manifest) => return Ok(manifest),
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    last_error = Some(Self::annotate_control_plane_error("local manifest", error))
+                }
             }
         }
 
         if saw_manifest {
             Err(OpenError::Storage(last_error.unwrap_or_else(|| {
-                StorageError::corruption("no valid manifest generation found")
+                Self::control_plane_error(
+                    "local manifest",
+                    "recovery found no valid manifest generation",
+                )
             })))
         } else {
             Ok(LoadedManifest::default())
@@ -1104,11 +1207,11 @@ impl Db {
         config: &S3PrimaryStorageConfig,
         generation: ManifestId,
     ) -> String {
-        Self::remote_object_layout(config).backup_manifest(generation)
+        Self::remote_object_layout(config).control_manifest(generation)
     }
 
     pub(super) fn remote_manifest_latest_key(config: &S3PrimaryStorageConfig) -> String {
-        Self::remote_object_layout(config).backup_manifest_latest()
+        Self::remote_object_layout(config).control_manifest_latest()
     }
 
     pub(super) fn remote_commit_log_segment_key(
@@ -1151,47 +1254,95 @@ impl Db {
         };
         Self::loaded_manifest_from_remote_file(dependencies, columnar_read_context, &key, file)
             .await
-            .map_err(OpenError::Storage)
+            .map_err(|error| {
+                OpenError::Storage(Self::annotate_control_plane_error("remote manifest", error))
+            })
     }
 
     pub(super) async fn load_remote_manifest_file_from_layout(
         layout: &ObjectKeyLayout,
         dependencies: &DbDependencies,
     ) -> Result<Option<(String, PersistedRemoteManifestFile)>, OpenError> {
-        let latest_key = layout.backup_manifest_latest();
-        let manifest_prefix = layout.backup_manifest_prefix();
+        let latest_key = layout.control_manifest_latest();
+        let manifest_prefix = layout.control_manifest_prefix();
+        let legacy_latest_key = layout.backup_manifest_latest();
+        let legacy_manifest_prefix = layout.backup_manifest_prefix();
         let mut candidates = Vec::new();
         let mut last_error = None;
 
-        match dependencies.object_store.get(&latest_key).await {
-            Ok(pointer) => match String::from_utf8(pointer) {
+        let primary_pointer = match read_optional_remote_object(dependencies, &latest_key).await? {
+            Some(pointer) => match String::from_utf8(pointer) {
                 Ok(pointer) => {
                     let pointer = pointer.trim();
-                    if !pointer.is_empty() {
-                        candidates.push(pointer.to_string());
-                    }
+                    (!pointer.is_empty()).then(|| pointer.to_string())
                 }
                 Err(error) => {
-                    last_error = Some(StorageError::corruption(format!(
-                        "decode remote latest pointer failed: {error}"
+                    return Err(OpenError::Storage(Self::control_plane_error(
+                        "remote manifest latest pointer",
+                        format!("decode pointer failed: {error}"),
                     )));
                 }
             },
-            Err(error) if error.kind() == StorageErrorKind::NotFound => {}
-            Err(error) => last_error = Some(error),
+            None => None,
+        };
+        let legacy_pointer =
+            match read_optional_remote_object(dependencies, &legacy_latest_key).await? {
+                Some(pointer) => match String::from_utf8(pointer) {
+                    Ok(pointer) => {
+                        let pointer = pointer.trim();
+                        (!pointer.is_empty()).then(|| pointer.to_string())
+                    }
+                    Err(error) => {
+                        last_error = Some(Self::control_plane_error(
+                            "legacy remote manifest latest pointer",
+                            format!("decode pointer failed: {error}"),
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            };
+        if let (Some(primary_pointer), Some(legacy_pointer)) = (&primary_pointer, &legacy_pointer)
+            && primary_pointer != legacy_pointer
+        {
+            return Err(OpenError::Storage(Self::control_plane_mismatch(
+                "remote manifest latest pointer",
+                &latest_key,
+                &legacy_latest_key,
+            )));
         }
 
         let _ = dependencies
             .__failpoint_registry()
             .trigger(
                 crate::failpoints::names::DB_REMOTE_MANIFEST_RECOVERY_AFTER_POINTER_READ,
-                BTreeMap::from([("candidate_count".to_string(), candidates.len().to_string())]),
+                BTreeMap::from([(
+                    "candidate_count".to_string(),
+                    usize::from(primary_pointer.is_some() || legacy_pointer.is_some()).to_string(),
+                )]),
             )
             .await
             .map_err(OpenError::Storage)?;
 
         let mut listed = dependencies.object_store.list(&manifest_prefix).await?;
         listed.retain(|key| key != &latest_key && Self::parse_manifest_generation(key).is_some());
+        let control_plane_lane_present = primary_pointer.is_some() || !listed.is_empty();
+        if !control_plane_lane_present {
+            listed = dependencies
+                .object_store
+                .list(&legacy_manifest_prefix)
+                .await?;
+            listed.retain(|key| {
+                key != &legacy_latest_key && Self::parse_manifest_generation(key).is_some()
+            });
+        }
+        if control_plane_lane_present {
+            if let Some(pointer) = primary_pointer.as_ref() {
+                candidates.push(pointer.clone());
+            }
+        } else if let Some(pointer) = legacy_pointer.as_ref() {
+            candidates.push(pointer.clone());
+        }
         listed.sort_by_key(|key| {
             std::cmp::Reverse(
                 Self::parse_manifest_generation(key)
@@ -1216,7 +1367,10 @@ impl Db {
 
         if saw_manifest {
             Err(OpenError::Storage(last_error.unwrap_or_else(|| {
-                StorageError::corruption("no valid remote manifest generation found")
+                Self::control_plane_error(
+                    "remote manifest",
+                    "recovery found no valid manifest generation",
+                )
             })))
         } else {
             Ok(None)

@@ -5,7 +5,7 @@ pub(super) const CATALOG_READ_CHUNK_LEN: usize = 8 * 1024;
 pub(super) const LOCAL_CATALOG_RELATIVE_PATH: &str = "catalog/CATALOG.json";
 pub(super) const LOCAL_CATALOG_TEMP_SUFFIX: &str = ".tmp";
 pub(super) const LOCAL_COMMIT_LOG_RELATIVE_DIR: &str = "commitlog";
-pub(super) const OBJECT_CATALOG_RELATIVE_KEY: &str = "catalog/CATALOG.json";
+pub(super) const OBJECT_CATALOG_RELATIVE_KEY: &str = "control/catalog/CATALOG.json";
 pub(super) const LOCAL_CURRENT_RELATIVE_PATH: &str = "CURRENT";
 pub(super) const LOCAL_MANIFEST_DIR_RELATIVE_PATH: &str = "manifest";
 pub(super) const LOCAL_MANIFEST_TEMP_SUFFIX: &str = ".tmp";
@@ -74,8 +74,14 @@ pub(super) struct StoredTable {
 
 #[derive(Clone, Debug)]
 pub(super) enum CatalogLocation {
-    LocalFile { path: String, temp_path: String },
-    ObjectStore { key: String },
+    LocalFile {
+        path: String,
+        temp_path: String,
+    },
+    ObjectStore {
+        key: String,
+        legacy_key: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
