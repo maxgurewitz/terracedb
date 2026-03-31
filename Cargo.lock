@@ -2407,6 +2407,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "terracedb",
+ "terracedb-projections",
  "terracedb-simulation",
  "thiserror 2.0.18",
  "tokio",

@@ -13,11 +13,11 @@ pub use activity::{
 pub use catalog::TerracedbBlobCollection;
 pub use collection::{
     BLOB_COLLECTION_SEMANTICS, BlobCollection, BlobCollectionConfig, BlobDeleteSemantics,
-    BlobGcOptions, BlobGcResult, BlobHandle, BlobIndexDurability, BlobIndexState,
-    BlobLibraryConfig, BlobLocator, BlobMetadata, BlobMissingObjectSemantics,
+    BlobExtractedTextQuery, BlobGcOptions, BlobGcResult, BlobHandle, BlobIndexDurability,
+    BlobIndexState, BlobLibraryConfig, BlobLocator, BlobMetadata, BlobMissingObjectSemantics,
     BlobObjectReclamation, BlobPublishOrdering, BlobQuery, BlobReadOptions, BlobReadResult,
-    BlobSearchRow, BlobSearchStream, BlobSemantics, BlobWrite, BlobWriteData,
-    InMemoryBlobCollection,
+    BlobSearchRow, BlobSearchStream, BlobSemantics, BlobTextExtractionConfig, BlobWrite,
+    BlobWriteData, InMemoryBlobCollection, PLAIN_TEXT_EXTRACTOR_NAME,
 };
 pub use error::{
     BlobContractError, BlobError, BlobStoreError, BlobStoreOperation, BlobStoreRecoveryHint,
