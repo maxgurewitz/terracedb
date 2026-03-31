@@ -17,6 +17,15 @@ pub const COLUMNAR_SYNOPSIS_SIDECAR_FORMAT_VERSION: u32 = 1;
 pub const COLUMNAR_SKIP_INDEX_SIDECAR_FORMAT_VERSION: u32 = 1;
 pub const COLUMNAR_PROJECTION_SIDECAR_FORMAT_VERSION: u32 = 1;
 pub const COLUMNAR_COMPACT_DIGEST_FORMAT_VERSION: u32 = 1;
+pub const COLUMNAR_V2_BASE_PART_FORMAT_VERSION: u32 = COLUMNAR_BASE_PART_FORMAT_VERSION;
+pub const COLUMNAR_V2_SYNOPSIS_SIDECAR_FORMAT_VERSION: u32 =
+    COLUMNAR_SYNOPSIS_SIDECAR_FORMAT_VERSION;
+pub const COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION: u32 =
+    COLUMNAR_SKIP_INDEX_SIDECAR_FORMAT_VERSION;
+pub const COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION: u32 =
+    COLUMNAR_PROJECTION_SIDECAR_FORMAT_VERSION;
+pub const COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION: u32 = COLUMNAR_COMPACT_DIGEST_FORMAT_VERSION;
+pub const HYBRID_TABLE_FEATURES_METADATA_KEY: &str = "terracedb.hybrid";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HybridReadConfig {
@@ -63,6 +72,56 @@ impl HybridReadConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HybridTableFeatures {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_indexes: Vec<HybridSkipIndexConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection_sidecars: Vec<HybridProjectionSidecarConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HybridSkipIndexConfig {
+    pub name: String,
+    pub family: HybridSkipIndexFamily,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default = "default_skip_index_max_values")]
+    pub max_values: usize,
+}
+
+const fn default_skip_index_max_values() -> usize {
+    64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HybridSkipIndexFamily {
+    UserKeyBloom,
+    FieldValueBloom,
+    BoundedSet,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridProjectionSidecarConfig {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SkipIndexProbe {
+    Key(Key),
+    FieldEquals { field: String, value: FieldValue },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipIndexProbeResult {
+    pub local_id: String,
+    pub used_indexes: Vec<String>,
+    pub may_match: bool,
+    pub fallback_to_base: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -367,6 +426,19 @@ pub struct ColumnarFooter {
     pub optional_sidecars: Vec<ColumnarOptionalSidecar>,
     pub digests: Vec<CompactPartDigest>,
 }
+
+pub type ColumnarV2ArtifactKind = ColumnarArtifactKind;
+pub type ColumnarV2FormatTag = ColumnarFormatTag;
+pub type ColumnarV2Encoding = ColumnarEncoding;
+pub type ColumnarV2Compression = ColumnarCompression;
+pub type ColumnarV2SubstreamKind = ColumnarSubstreamKind;
+pub type ColumnarV2SubstreamRef = ColumnarSubstreamRef;
+pub type ColumnarV2MarkOffset = ColumnarMarkOffset;
+pub type ColumnarV2Mark = ColumnarMark;
+pub type ColumnarV2Header = ColumnarHeader;
+pub type ColumnarV2PageRef = ColumnarPageRef;
+pub type ColumnarV2PageDirectory = ColumnarPageDirectory;
+pub type ColumnarV2Footer = ColumnarFooter;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HybridKeyRange {

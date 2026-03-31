@@ -144,6 +144,16 @@ impl Table {
         Ok(Box::pin(stream::iter(rows)))
     }
 
+    pub async fn probe_skip_indexes(
+        &self,
+        probe: crate::SkipIndexProbe,
+    ) -> Result<Vec<crate::SkipIndexProbeResult>, ReadError> {
+        let table_id = self
+            .resolve_id()
+            .ok_or_else(|| Db::missing_table_error(self.name()))?;
+        self.db.probe_skip_indexes(table_id, &probe).await
+    }
+
     pub(super) fn resolve_id(&self) -> Option<TableId> {
         self.db.resolve_table_id(self)
     }

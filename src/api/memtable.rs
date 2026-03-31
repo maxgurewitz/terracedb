@@ -280,7 +280,12 @@ impl ResidentRowSstable {
         let footer = columnar_read_context
             .footer_from_source(&self.meta, &columnar.source, location, access)
             .await?;
-        Db::validate_loaded_columnar_footer(location, &self.meta, footer.footer.as_ref())?;
+        Db::validate_loaded_columnar_footer(
+            location,
+            &self.meta,
+            footer.footer.as_ref(),
+            footer.footer.applied_generation.unwrap_or_default(),
+        )?;
 
         let row_count = usize::try_from(footer.footer.row_count).map_err(|_| {
             StorageError::corruption(format!(
@@ -317,6 +322,260 @@ impl ResidentRowSstable {
             sequences,
             tombstones,
             row_kinds,
+        })
+    }
+
+    async fn load_projection_sidecar(
+        &self,
+        columnar_read_context: &ColumnarReadContext,
+        metadata: &LoadedColumnarMetadata,
+        projection: &ColumnProjection,
+    ) -> Result<Option<PersistedProjectionSidecarBody>, StorageError> {
+        if !columnar_read_context.projection_sidecars_enabled {
+            return Ok(None);
+        }
+        let columnar = self.columnar.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {} is missing a storage source",
+                self.meta.storage_descriptor()
+            ))
+        })?;
+        let Some(descriptor) = metadata
+            .footer
+            .optional_sidecars
+            .iter()
+            .find_map(|descriptor| match descriptor {
+                PersistedOptionalSidecarDescriptor::Projection(descriptor)
+                    if Db::sidecar_projection_matches(&descriptor.projected_fields, projection) =>
+                {
+                    Some(descriptor)
+                }
+                PersistedOptionalSidecarDescriptor::Projection(_) => None,
+                PersistedOptionalSidecarDescriptor::SkipIndex(_) => None,
+            })
+        else {
+            return Ok(None);
+        };
+
+        let source = Db::sibling_source(&columnar.source, &descriptor.file_name);
+        if let Some(marker) =
+            Db::read_quarantine_marker(&columnar_read_context.dependencies, &source).await?
+        {
+            return Err(StorageError::corruption(format!(
+                "projection sidecar {} is quarantined: {}",
+                descriptor.projection_name, marker.reason
+            )));
+        }
+        let Some(bytes) =
+            Db::read_optional_source(&columnar_read_context.dependencies, &source).await?
+        else {
+            return Ok(None);
+        };
+        let file: PersistedProjectionSidecarFile =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                StorageError::corruption(format!(
+                    "decode projection sidecar {} failed: {error}",
+                    descriptor.projection_name
+                ))
+            })?;
+        let body_bytes = serde_json::to_vec(&file.body).map_err(|error| {
+            StorageError::corruption(format!(
+                "encode projection sidecar {} body failed: {error}",
+                descriptor.projection_name
+            ))
+        })?;
+        if checksum32(&body_bytes) != file.checksum || file.checksum != descriptor.checksum {
+            return Err(StorageError::corruption(format!(
+                "projection sidecar {} checksum mismatch",
+                descriptor.projection_name
+            )));
+        }
+        let digest_input = Db::projection_sidecar_digest_input(&file.body)?;
+        Db::validate_compact_digest(
+            &file.body.digest,
+            crate::ColumnarV2FormatTag::projection_sidecar(),
+            &digest_input,
+        )?;
+        if file.body.format_version != COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION
+            || file.body.table_id != self.meta.table_id
+            || file.body.local_id != self.meta.local_id
+            || file.body.schema_version != metadata.footer.schema_version
+            || file.body.row_count != metadata.footer.row_count
+            || file.body.projected_fields != descriptor.projected_fields
+            || file.body.applied_generation != metadata.footer.applied_generation
+        {
+            return Err(StorageError::corruption(format!(
+                "projection sidecar {} does not match its base SSTable",
+                descriptor.projection_name
+            )));
+        }
+        Ok(Some(file.body))
+    }
+
+    async fn load_skip_index_sidecar(
+        &self,
+        columnar_read_context: &ColumnarReadContext,
+        metadata: &LoadedColumnarMetadata,
+        descriptor: &PersistedSkipIndexSidecarDescriptor,
+    ) -> Result<Option<PersistedSkipIndexSidecarBody>, StorageError> {
+        let columnar = self.columnar.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "columnar SSTable {} is missing a storage source",
+                self.meta.storage_descriptor()
+            ))
+        })?;
+        let source = Db::sibling_source(&columnar.source, &descriptor.file_name);
+        if let Some(marker) =
+            Db::read_quarantine_marker(&columnar_read_context.dependencies, &source).await?
+        {
+            return Err(StorageError::corruption(format!(
+                "skip-index sidecar {} is quarantined: {}",
+                descriptor.index_name, marker.reason
+            )));
+        }
+        let Some(bytes) =
+            Db::read_optional_source(&columnar_read_context.dependencies, &source).await?
+        else {
+            return Ok(None);
+        };
+        let file: PersistedSkipIndexSidecarFile =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                StorageError::corruption(format!(
+                    "decode skip-index sidecar {} failed: {error}",
+                    descriptor.index_name
+                ))
+            })?;
+        let body_bytes = serde_json::to_vec(&file.body).map_err(|error| {
+            StorageError::corruption(format!(
+                "encode skip-index sidecar {} body failed: {error}",
+                descriptor.index_name
+            ))
+        })?;
+        if checksum32(&body_bytes) != file.checksum || file.checksum != descriptor.checksum {
+            return Err(StorageError::corruption(format!(
+                "skip-index sidecar {} checksum mismatch",
+                descriptor.index_name
+            )));
+        }
+        let digest_input = Db::skip_index_sidecar_digest_input(&file.body)?;
+        Db::validate_compact_digest(
+            &file.body.digest,
+            crate::ColumnarV2FormatTag::skip_index_sidecar(),
+            &digest_input,
+        )?;
+        if file.body.format_version != COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION
+            || file.body.table_id != self.meta.table_id
+            || file.body.local_id != self.meta.local_id
+            || file.body.schema_version != metadata.footer.schema_version
+            || file.body.row_count != metadata.footer.row_count
+            || file.body.family != descriptor.family
+            || file.body.field_id != descriptor.field_id
+            || file.body.applied_generation != metadata.footer.applied_generation
+        {
+            return Err(StorageError::corruption(format!(
+                "skip-index sidecar {} does not match its base SSTable",
+                descriptor.index_name
+            )));
+        }
+        Ok(Some(file.body))
+    }
+
+    fn skip_index_payload_may_match(
+        payload: &PersistedSkipIndexSidecarPayload,
+        probe: &SkipIndexProbe,
+    ) -> Result<bool, StorageError> {
+        match (payload, probe) {
+            (
+                PersistedSkipIndexSidecarPayload::UserKeyBloom { filter },
+                SkipIndexProbe::Key(key),
+            ) => Ok(filter.may_contain(key)),
+            (
+                PersistedSkipIndexSidecarPayload::FieldValueBloom { filter },
+                SkipIndexProbe::FieldEquals { value, .. },
+            ) => Ok(filter.may_contain(&Db::encoded_field_value_bytes(value)?)),
+            (
+                PersistedSkipIndexSidecarPayload::BoundedSet { values, saturated },
+                SkipIndexProbe::FieldEquals { value, .. },
+            ) => Ok(*saturated || values.iter().any(|candidate| candidate == value)),
+            _ => Ok(true),
+        }
+    }
+
+    pub(super) async fn probe_skip_indexes_columnar(
+        &self,
+        columnar_read_context: &ColumnarReadContext,
+        probe: &SkipIndexProbe,
+        probe_field_id: Option<FieldId>,
+    ) -> Result<SkipIndexProbeResult, StorageError> {
+        if !columnar_read_context.skip_indexes_enabled {
+            return Ok(SkipIndexProbeResult {
+                local_id: self.meta.local_id.clone(),
+                used_indexes: Vec::new(),
+                may_match: true,
+                fallback_to_base: false,
+            });
+        }
+        let metadata = self
+            .load_columnar_metadata(columnar_read_context, ColumnarReadAccessPattern::Point)
+            .await?;
+        let mut used_indexes = Vec::new();
+        let mut may_match = true;
+        let mut fallback_to_base = false;
+
+        for descriptor in metadata
+            .footer
+            .optional_sidecars
+            .iter()
+            .filter_map(|descriptor| match descriptor {
+                PersistedOptionalSidecarDescriptor::SkipIndex(descriptor) => Some(descriptor),
+                PersistedOptionalSidecarDescriptor::Projection(_) => None,
+            })
+        {
+            let relevant = match (descriptor.family, probe) {
+                (HybridSkipIndexFamily::UserKeyBloom, SkipIndexProbe::Key(_)) => true,
+                (
+                    HybridSkipIndexFamily::FieldValueBloom | HybridSkipIndexFamily::BoundedSet,
+                    SkipIndexProbe::FieldEquals { .. },
+                ) => descriptor.field_id == probe_field_id,
+                _ => false,
+            };
+            if !relevant {
+                continue;
+            }
+
+            match self
+                .load_skip_index_sidecar(columnar_read_context, &metadata, descriptor)
+                .await
+            {
+                Ok(Some(body)) => {
+                    used_indexes.push(descriptor.index_name.clone());
+                    if !Self::skip_index_payload_may_match(&body.payload, probe)? {
+                        may_match = false;
+                    }
+                }
+                Ok(None) => fallback_to_base = true,
+                Err(error) => {
+                    fallback_to_base = true;
+                    let columnar = self.columnar.as_ref().expect("columnar source present");
+                    let source = Db::sibling_source(&columnar.source, &descriptor.file_name);
+                    let _ = Db::quarantine_artifact(
+                        &columnar_read_context.dependencies,
+                        &columnar_read_context.dependencies.rng,
+                        &source,
+                        &self.meta.local_id,
+                        error.message(),
+                        columnar_read_context.dependencies.clock.now().get(),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        Ok(SkipIndexProbeResult {
+            local_id: self.meta.local_id.clone(),
+            used_indexes,
+            may_match,
+            fallback_to_base,
         })
     }
 
@@ -443,6 +702,73 @@ impl ResidentRowSstable {
             .await?;
         let location = self.meta.storage_descriptor();
         let row_count = metadata.key_index.len();
+        match self
+            .load_projection_sidecar(columnar_read_context, &metadata, projection)
+            .await
+        {
+            Ok(Some(sidecar)) => {
+                let mut materialized = BTreeMap::new();
+                for &row_index in row_indexes {
+                    let row_kind = Db::normalized_columnar_row_kind(
+                        location,
+                        row_index,
+                        metadata.tombstones[row_index],
+                        metadata.row_kinds[row_index],
+                    )?;
+                    if row_kind == ChangeKind::Delete {
+                        return Err(StorageError::corruption(format!(
+                            "columnar SSTable {location} delete row {row_index} was requested for materialization",
+                        )));
+                    }
+                    let value = sidecar.rows.get(row_index).cloned().ok_or_else(|| {
+                        StorageError::corruption(format!(
+                            "projection sidecar {} omitted row {}",
+                            sidecar.projection_name, row_index
+                        ))
+                    })?;
+                    let Some(value) = value else {
+                        return Err(StorageError::corruption(format!(
+                            "projection sidecar {} stored delete row {} for materialization",
+                            sidecar.projection_name, row_index
+                        )));
+                    };
+                    materialized.insert(row_index, value);
+                }
+                return Ok(materialized);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(columnar) = &self.columnar {
+                    let source = metadata
+                        .footer
+                        .optional_sidecars
+                        .iter()
+                        .find_map(|descriptor| match descriptor {
+                            PersistedOptionalSidecarDescriptor::Projection(descriptor)
+                                if Db::sidecar_projection_matches(
+                                    &descriptor.projected_fields,
+                                    projection,
+                                ) =>
+                            {
+                                Some(Db::sibling_source(&columnar.source, &descriptor.file_name))
+                            }
+                            PersistedOptionalSidecarDescriptor::Projection(_) => None,
+                            PersistedOptionalSidecarDescriptor::SkipIndex(_) => None,
+                        });
+                    if let Some(source) = source {
+                        let _ = Db::quarantine_artifact(
+                            &columnar_read_context.dependencies,
+                            &columnar_read_context.dependencies.rng,
+                            &source,
+                            &self.meta.local_id,
+                            error.message(),
+                            columnar_read_context.dependencies.clock.now().get(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
         let columns_by_field = metadata
             .footer
             .columns
