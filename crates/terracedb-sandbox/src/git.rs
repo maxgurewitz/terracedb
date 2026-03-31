@@ -64,6 +64,14 @@ impl GitWorkspaceManager for DeterministicGitWorkspaceManager {
         session: &SandboxSession,
         request: GitWorkspaceRequest,
     ) -> Result<GitWorkspaceReport, SandboxError> {
+        let info = session.info().await;
+        let provenance = info.provenance.git.clone();
+        let base_ref = provenance
+            .as_ref()
+            .and_then(|git| git.head_commit.clone())
+            .or_else(|| request.base_branch.clone())
+            .or_else(|| provenance.as_ref().and_then(|git| git.branch.clone()))
+            .unwrap_or_else(|| "HEAD".to_string());
         Ok(GitWorkspaceReport {
             manager: self.name.clone(),
             branch_name: request.branch_name.clone(),
@@ -71,12 +79,35 @@ impl GitWorkspaceManager for DeterministicGitWorkspaceManager {
             metadata: BTreeMap::from([
                 (
                     "session_volume_id".to_string(),
-                    JsonValue::from(session.info().await.session_volume_id.to_string()),
+                    JsonValue::from(info.session_volume_id.to_string()),
                 ),
                 (
                     "base_branch".to_string(),
                     request
                         .base_branch
+                        .map(JsonValue::from)
+                        .unwrap_or(JsonValue::Null),
+                ),
+                ("base_ref".to_string(), JsonValue::from(base_ref)),
+                (
+                    "repo_root".to_string(),
+                    provenance
+                        .as_ref()
+                        .map(|git| JsonValue::from(git.repo_root.clone()))
+                        .unwrap_or(JsonValue::Null),
+                ),
+                (
+                    "head_commit".to_string(),
+                    provenance
+                        .as_ref()
+                        .and_then(|git| git.head_commit.clone())
+                        .map(JsonValue::from)
+                        .unwrap_or(JsonValue::Null),
+                ),
+                (
+                    "remote_url".to_string(),
+                    provenance
+                        .and_then(|git| git.remote_url)
                         .map(JsonValue::from)
                         .unwrap_or(JsonValue::Null),
                 ),
