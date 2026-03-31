@@ -659,6 +659,7 @@ impl Db {
             commit_log_recovery_floor_sequence: recovery_floor_sequence,
             commit_log_gc_floor_sequence,
             change_feed_pins_commit_log_gc,
+            current_state_retention: None,
             metadata,
         }
     }

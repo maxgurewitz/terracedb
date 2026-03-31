@@ -16,8 +16,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use turmoil::net::{TcpListener, TcpStream};
 
 use terracedb::{
-    ChangeKind, Clock, CommitError, CompactionFilterRef, CompactionStrategy, Db, DbConfig,
-    DbDependencies, DeterministicRng, FileHandle, FileSystem, FileSystemFailure,
+    ChangeKind, Clock, CommitError, CompactionFilterRef, CompactionStrategy,
+    CurrentStateOracleMutation, CurrentStateOracleRow, CurrentStateRetentionContract,
+    CurrentStateRetentionError, CurrentStateRetentionEvaluation, CurrentStateRetentionOracle, Db,
+    DbConfig, DbDependencies, DeterministicRng, FileHandle, FileSystem, FileSystemFailure,
     FileSystemOperation, FlushError, Key, KvStream, LogCursor, MergeOperator, MergeOperatorRef,
     ObjectStore, ObjectStoreOperation, OpenError, OpenOptions, ReadError, Rng, S3Location,
     ScanOptions, SequenceNumber, SimulatedFileSystem, SsdConfig, StorageConfig, StorageError,
@@ -1776,6 +1778,84 @@ fn decode_oracle_value(table: &str, key: &[u8], value: Value) -> Result<Vec<u8>,
             key: key.to_vec(),
         }),
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateSimulationScenario {
+    pub initial_contract: CurrentStateRetentionContract,
+    pub operations: Vec<CurrentStateSimulationOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CurrentStateSimulationOperation {
+    Upsert(CurrentStateOracleRow),
+    Delete {
+        row_key: Vec<u8>,
+    },
+    ReviseContract {
+        contract: CurrentStateRetentionContract,
+    },
+    PinSnapshotRows {
+        row_keys: Vec<Vec<u8>>,
+    },
+    ClearSnapshotPins,
+    Restart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrentStateSimulationStep {
+    pub operation: CurrentStateSimulationOperation,
+    pub evaluation: CurrentStateRetentionEvaluation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrentStateSimulationOutcome {
+    pub steps: Vec<CurrentStateSimulationStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum CurrentStateSimulationError {
+    #[error(transparent)]
+    Retention(#[from] CurrentStateRetentionError),
+}
+
+pub fn run_current_state_simulation(
+    scenario: &CurrentStateSimulationScenario,
+) -> Result<CurrentStateSimulationOutcome, CurrentStateSimulationError> {
+    let mut oracle = CurrentStateRetentionOracle::new(scenario.initial_contract.clone());
+    let mut steps = Vec::with_capacity(scenario.operations.len());
+
+    for operation in &scenario.operations {
+        match operation {
+            CurrentStateSimulationOperation::Upsert(row) => {
+                oracle.apply(CurrentStateOracleMutation::Upsert(row.clone()));
+            }
+            CurrentStateSimulationOperation::Delete { row_key } => {
+                oracle.apply(CurrentStateOracleMutation::Delete {
+                    row_key: row_key.clone(),
+                });
+            }
+            CurrentStateSimulationOperation::ReviseContract { contract } => {
+                oracle.set_contract(contract.clone());
+            }
+            CurrentStateSimulationOperation::PinSnapshotRows { row_keys } => {
+                oracle.set_snapshot_pins(row_keys.clone());
+            }
+            CurrentStateSimulationOperation::ClearSnapshotPins => {
+                oracle.clear_snapshot_pins();
+            }
+            CurrentStateSimulationOperation::Restart => {
+                oracle = CurrentStateRetentionOracle::from_snapshot(oracle.snapshot());
+            }
+        }
+
+        steps.push(CurrentStateSimulationStep {
+            operation: operation.clone(),
+            evaluation: oracle.evaluate()?,
+        });
+    }
+
+    Ok(CurrentStateSimulationOutcome { steps })
 }
 
 pub struct SeededSimulationRunner {

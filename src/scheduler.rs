@@ -2,7 +2,7 @@ use std::{fmt, sync::Mutex};
 
 use serde_json::Value as JsonValue;
 
-use crate::{api::Table, ids::SequenceNumber};
+use crate::{api::Table, current_state::CurrentStateRetentionStats, ids::SequenceNumber};
 
 pub const DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT: u32 = 3;
 pub const DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT: u32 = 4;
@@ -69,6 +69,7 @@ pub struct TableStats {
     pub commit_log_recovery_floor_sequence: SequenceNumber,
     pub commit_log_gc_floor_sequence: SequenceNumber,
     pub change_feed_pins_commit_log_gc: bool,
+    pub current_state_retention: Option<CurrentStateRetentionStats>,
     pub metadata: std::collections::BTreeMap<String, JsonValue>,
 }
 
