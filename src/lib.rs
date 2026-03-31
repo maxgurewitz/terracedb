@@ -13,6 +13,7 @@ pub mod hybrid;
 pub mod ids;
 pub mod io;
 mod metadata_flatbuffers;
+pub mod pressure;
 pub mod remote;
 pub mod scheduler;
 #[cfg(test)]
@@ -137,6 +138,10 @@ pub use ids::{
 pub use io::{
     Clock, DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOptions, Rng,
     StandardObjectPath, StandardObjectStore, StandardObjectStoreExt,
+};
+pub use pressure::{
+    AdmissionCorrectnessContext, AdmissionSignals, FlushPressureCandidate, PressureBudget,
+    PressureBytes, PressureScope, PressureStats,
 };
 pub use remote::{
     CacheSpan, ObjectKeyLayout, RemoteCache, RemoteOperation, RemoteRecoveryHint,
