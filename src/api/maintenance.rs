@@ -1139,6 +1139,7 @@ impl Db {
         level: u32,
         rows: Vec<SstableRow>,
         applied_generation: ManifestId,
+        inputs: &[ResidentRowSstable],
     ) -> Result<Vec<ResidentRowSstable>, StorageError> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -1181,13 +1182,14 @@ impl Db {
                     .await?
                 }
                 TableFormat::Columnar => {
-                    self.write_columnar_sstable(
+                    self.write_columnar_table_output(
                         &path,
                         level,
                         local_id,
                         table,
                         rows[start..end].to_vec(),
                         Some(applied_generation),
+                        inputs,
                     )
                     .await?
                 }
@@ -1419,6 +1421,7 @@ impl Db {
                 sstables.manifest_generation = next_generation;
                 sstables.live = new_live;
             }
+            self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
             let state = self.sstables_read().clone();
             let _ = self
                 .sync_tiered_backup_manifest(
@@ -1542,6 +1545,7 @@ impl Db {
                                 .map(|row| row.row)
                                 .collect::<Vec<_>>(),
                             next_generation,
+                            &inputs,
                         )
                         .await?;
 
@@ -1576,6 +1580,7 @@ impl Db {
                 sstables.manifest_generation = next_generation;
                 sstables.live = new_live;
             }
+            self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
             let state = self.sstables_read().clone();
             let _ = self
                 .sync_tiered_backup_manifest(

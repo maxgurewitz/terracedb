@@ -61,6 +61,7 @@ pub(super) struct DbInner {
     pub(super) work_deferrals: Mutex<BTreeMap<String, u32>>,
     pub(super) pending_work_budget_state: Mutex<PendingWorkBudgetState>,
     pub(super) scheduler_observability: SchedulerObservabilityStats,
+    pub(super) compact_to_wide_stats: Mutex<BTreeMap<CompactToWideStatsKey, CompactToWideStats>>,
 }
 
 #[derive(Clone)]
@@ -246,6 +247,19 @@ pub(super) struct SchedulerObservabilityStats {
     pub(super) budget_blocked_executions: AtomicU64,
     pub(super) background_delay_events: AtomicU64,
     pub(super) background_delay_millis: AtomicU64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct CompactToWideStatsKey {
+    pub(super) table_id: TableId,
+    pub(super) local_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CompactToWideStats {
+    pub(super) projected_read_count: u64,
+    pub(super) full_row_read_count: u64,
+    pub(super) projected_bytes_read: u64,
 }
 
 #[derive(Default)]

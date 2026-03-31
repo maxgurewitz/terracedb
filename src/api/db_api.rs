@@ -366,6 +366,7 @@ impl Db {
                                     .unwrap_or_default(),
                             );
                         *self.sstables_write() = sstable_state;
+                        self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
                     }
 
                     let backup_result = if flushed_count > 0 {
@@ -496,6 +497,7 @@ impl Db {
                     sstable_state.manifest_generation = next_generation;
                     sstable_state.last_flushed_sequence = flushed_through;
                     *self.sstables_write() = sstable_state;
+                    self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
                 }
             }
 
@@ -1762,6 +1764,132 @@ impl Db {
         Ok(result.rows)
     }
 
+    pub(super) fn compact_to_wide_promotion_config_for_table(
+        &self,
+        table: &StoredTable,
+    ) -> Result<Option<HybridCompactToWidePromotionConfig>, StorageError> {
+        if table.config.format != TableFormat::Columnar
+            || !self
+                .inner
+                .config
+                .hybrid_read
+                .compact_to_wide_promotion_enabled
+        {
+            return Ok(None);
+        }
+        Self::compact_to_wide_promotion_config(&table.config.metadata)
+    }
+
+    pub(super) fn projection_is_full_for_table(
+        table: &StoredTable,
+        projection: &ColumnProjection,
+    ) -> Result<bool, StorageError> {
+        let Some(schema) = table.config.schema.as_ref() else {
+            return Ok(true);
+        };
+        if projection.fields.len() != schema.fields.len() {
+            return Ok(false);
+        }
+
+        let expected = schema
+            .fields
+            .iter()
+            .map(|field| field.id)
+            .collect::<BTreeSet<_>>();
+        let actual = projection
+            .fields
+            .iter()
+            .map(|field| field.id)
+            .collect::<BTreeSet<_>>();
+        Ok(expected == actual)
+    }
+
+    pub(super) fn record_compact_to_wide_reads(
+        &self,
+        table: &StoredTable,
+        local_ids: &BTreeSet<String>,
+        projection: &ColumnProjection,
+        value: &Value,
+    ) -> Result<(), StorageError> {
+        if local_ids.is_empty()
+            || self
+                .compact_to_wide_promotion_config_for_table(table)?
+                .is_none()
+        {
+            return Ok(());
+        }
+
+        let full_row = Self::projection_is_full_for_table(table, projection)?;
+        let projected_bytes = if full_row {
+            0
+        } else {
+            value_size_bytes(value) as u64
+        };
+        let mut stats = mutex_lock(&self.inner.compact_to_wide_stats);
+        for local_id in local_ids {
+            let entry = stats
+                .entry(CompactToWideStatsKey {
+                    table_id: table.id,
+                    local_id: local_id.clone(),
+                })
+                .or_default();
+            if full_row {
+                entry.full_row_read_count = entry.full_row_read_count.saturating_add(1);
+            } else {
+                entry.projected_read_count = entry.projected_read_count.saturating_add(1);
+                entry.projected_bytes_read =
+                    entry.projected_bytes_read.saturating_add(projected_bytes);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn compact_to_wide_candidate(
+        &self,
+        table_id: TableId,
+        local_id: &str,
+        row_count: usize,
+        inputs: &[ResidentRowSstable],
+    ) -> CompactToWidePromotionCandidate {
+        let stats = mutex_lock(&self.inner.compact_to_wide_stats);
+        let mut projected_read_count = 0_u64;
+        let mut full_row_read_count = 0_u64;
+        let mut projected_bytes_read = 0_u64;
+        for input in inputs {
+            let Some(part_stats) = stats.get(&CompactToWideStatsKey {
+                table_id,
+                local_id: input.meta.local_id.clone(),
+            }) else {
+                continue;
+            };
+            projected_read_count =
+                projected_read_count.saturating_add(part_stats.projected_read_count);
+            full_row_read_count =
+                full_row_read_count.saturating_add(part_stats.full_row_read_count);
+            projected_bytes_read =
+                projected_bytes_read.saturating_add(part_stats.projected_bytes_read);
+        }
+        CompactToWidePromotionCandidate {
+            table_id,
+            local_id: local_id.to_string(),
+            row_count: row_count as u64,
+            projected_read_count,
+            full_row_read_count,
+            projected_bytes_read,
+        }
+    }
+
+    pub(super) fn retain_compact_to_wide_stats_for_live(&self, live: &[ResidentRowSstable]) {
+        let live_keys = live
+            .iter()
+            .map(|sstable| CompactToWideStatsKey {
+                table_id: sstable.meta.table_id,
+                local_id: sstable.meta.local_id.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        mutex_lock(&self.inner.compact_to_wide_stats).retain(|key, _| live_keys.contains(key));
+    }
+
     pub(super) fn resolve_scan_projection(
         table: &StoredTable,
         requested_columns: Option<&[String]>,
@@ -1881,41 +2009,60 @@ impl Db {
         memtables.collect_visible_rows(table.id, key, sequence, &mut mem_rows);
 
         let mut sstables_by_local_id = BTreeMap::new();
+        let mut hot_rows = Vec::new();
         let mut columnar_rows = Vec::new();
         for sstable in sstables
             .live
             .iter()
-            .filter(|sstable| sstable.meta.table_id == table.id && sstable.is_columnar())
+            .filter(|sstable| sstable.meta.table_id == table.id)
         {
-            sstables_by_local_id.insert(sstable.meta.local_id.clone(), sstable.clone());
-            columnar_rows.extend(
-                sstable
-                    .collect_visible_row_refs_for_key_columnar(
-                        &self.inner.columnar_read_context,
-                        key,
-                        sequence,
-                    )
-                    .await?,
+            if sstable.is_columnar() {
+                sstables_by_local_id.insert(sstable.meta.local_id.clone(), sstable.clone());
+                columnar_rows.extend(
+                    sstable
+                        .collect_visible_row_refs_for_key_columnar(
+                            &self.inner.columnar_read_context,
+                            key,
+                            sequence,
+                        )
+                        .await?,
+                );
+                continue;
+            }
+
+            let mut rows = Vec::new();
+            sstable.collect_visible_rows(key, sequence, &mut rows);
+            hot_rows.extend(
+                rows.into_iter()
+                    .map(|row| (sstable.meta.local_id.clone(), row)),
             );
         }
 
         enum VisibleCandidate {
             Memtable(SstableRow),
+            HotRow { local_id: String, row: SstableRow },
             Columnar(ColumnarRowRef),
         }
 
         let mut candidates = mem_rows
             .into_iter()
             .map(VisibleCandidate::Memtable)
+            .chain(
+                hot_rows
+                    .into_iter()
+                    .map(|(local_id, row)| VisibleCandidate::HotRow { local_id, row }),
+            )
             .chain(columnar_rows.into_iter().map(VisibleCandidate::Columnar))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
             let (left_sequence, left_kind) = match left {
                 VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
+                VisibleCandidate::HotRow { row, .. } => (row.sequence, row.kind),
                 VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
             };
             let (right_sequence, right_kind) = match right {
                 VisibleCandidate::Memtable(row) => (row.sequence, row.kind),
+                VisibleCandidate::HotRow { row, .. } => (row.sequence, row.kind),
                 VisibleCandidate::Columnar(row) => (row.sequence, row.kind),
             };
             right_sequence.cmp(&left_sequence).then_with(|| {
@@ -1931,6 +2078,7 @@ impl Db {
         };
         let head_sequence = match head {
             VisibleCandidate::Memtable(row) => row.sequence,
+            VisibleCandidate::HotRow { row, .. } => row.sequence,
             VisibleCandidate::Columnar(row) => row.sequence,
         };
 
@@ -1947,6 +2095,33 @@ impl Db {
                             projection,
                             ChangeKind::Put,
                         )?),
+                        collapse: None,
+                    });
+                }
+                ChangeKind::Delete => {
+                    return Ok(VisibleValueResolution {
+                        value: None,
+                        collapse: None,
+                    });
+                }
+                ChangeKind::Merge => {}
+            },
+            VisibleCandidate::HotRow { local_id, row } => match row.kind {
+                ChangeKind::Put => {
+                    let value = row
+                        .value
+                        .as_ref()
+                        .ok_or_else(|| StorageError::corruption("put row is missing a value"))?;
+                    let projected =
+                        Self::project_columnar_value(value, projection, ChangeKind::Put)?;
+                    self.record_compact_to_wide_reads(
+                        table,
+                        &BTreeSet::from([local_id.clone()]),
+                        projection,
+                        &projected,
+                    )?;
+                    return Ok(VisibleValueResolution {
+                        value: Some(projected),
                         collapse: None,
                     });
                 }
@@ -2005,6 +2180,11 @@ impl Db {
                         break;
                     }
                 }
+                VisibleCandidate::HotRow { row, .. } => {
+                    if matches!(row.kind, ChangeKind::Put | ChangeKind::Delete) {
+                        break;
+                    }
+                }
                 VisibleCandidate::Columnar(row) => {
                     if row.kind != ChangeKind::Delete {
                         needed_by_sstable
@@ -2042,6 +2222,7 @@ impl Db {
 
         let mut operands = Vec::new();
         let mut existing_owned = None;
+        let mut touched_hot_local_ids = BTreeSet::new();
         for candidate in &candidates {
             match candidate {
                 VisibleCandidate::Memtable(row) => match row.kind {
@@ -2053,6 +2234,30 @@ impl Db {
                         ChangeKind::Merge,
                     )?),
                     ChangeKind::Put => {
+                        existing_owned = Some(Self::project_columnar_value(
+                            row.value.as_ref().ok_or_else(|| {
+                                StorageError::corruption("put row is missing a value")
+                            })?,
+                            &full_projection,
+                            ChangeKind::Put,
+                        )?);
+                        break;
+                    }
+                    ChangeKind::Delete => break,
+                },
+                VisibleCandidate::HotRow { local_id, row } => match row.kind {
+                    ChangeKind::Merge => {
+                        touched_hot_local_ids.insert(local_id.clone());
+                        operands.push(Self::project_columnar_value(
+                            row.value.as_ref().ok_or_else(|| {
+                                StorageError::corruption("merge row is missing an operand value")
+                            })?,
+                            &full_projection,
+                            ChangeKind::Merge,
+                        )?);
+                    }
+                    ChangeKind::Put => {
+                        touched_hot_local_ids.insert(local_id.clone());
                         existing_owned = Some(Self::project_columnar_value(
                             row.value.as_ref().ok_or_else(|| {
                                 StorageError::corruption("put row is missing a value")
@@ -2096,13 +2301,11 @@ impl Db {
                     value: full_value.clone(),
                 }
             });
+        let projected = Self::project_columnar_value(&full_value, projection, ChangeKind::Put)?;
+        self.record_compact_to_wide_reads(table, &touched_hot_local_ids, projection, &projected)?;
 
         Ok(VisibleValueResolution {
-            value: Some(Self::project_columnar_value(
-                &full_value,
-                projection,
-                ChangeKind::Put,
-            )?),
+            value: Some(projected),
             collapse,
         })
     }
@@ -2129,20 +2332,27 @@ impl Db {
         let current_sequence = self.current_sequence();
 
         let mut persisted_version_count = 0_usize;
-        for sstable in sstables
-            .live
-            .iter()
-            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
-        {
-            if sequence < current_sequence {
-                persisted_version_count += sstable
-                    .collect_visible_row_refs_for_key_columnar(
-                        &self.inner.columnar_read_context,
-                        key,
-                        current_sequence,
-                    )
-                    .await?
-                    .len();
+        if sequence < current_sequence {
+            for sstable in sstables
+                .live
+                .iter()
+                .filter(|sstable| sstable.meta.table_id == table_id)
+            {
+                if sstable.is_columnar() {
+                    persisted_version_count += sstable
+                        .collect_visible_row_refs_for_key_columnar(
+                            &self.inner.columnar_read_context,
+                            key,
+                            current_sequence,
+                        )
+                        .await?
+                        .len();
+                    continue;
+                }
+
+                let mut hot_rows = Vec::new();
+                sstable.collect_visible_rows(key, current_sequence, &mut hot_rows);
+                persisted_version_count += hot_rows.len();
             }
         }
 
@@ -2201,20 +2411,37 @@ impl Db {
         for sstable in sstables
             .live
             .iter()
-            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
+            .filter(|sstable| sstable.meta.table_id == table_id)
         {
-            for row in sstable
-                .collect_scan_row_refs_columnar(
-                    &self.inner.columnar_read_context,
-                    &matcher,
+            if sstable.is_columnar() {
+                for row in sstable
+                    .collect_scan_row_refs_columnar(
+                        &self.inner.columnar_read_context,
+                        &matcher,
+                        if sequence < current_sequence {
+                            current_sequence
+                        } else {
+                            sequence
+                        },
+                    )
+                    .await?
+                {
                     if sequence < current_sequence {
-                        current_sequence
-                    } else {
-                        sequence
-                    },
-                )
-                .await?
-            {
+                        *persisted_versions_by_key
+                            .entry(row.key.clone())
+                            .or_default() += 1;
+                    }
+                    if row.sequence <= sequence {
+                        keys.insert(row.key.clone());
+                    }
+                }
+                continue;
+            }
+
+            for row in &sstable.rows {
+                if !matcher.matches(&row.key) {
+                    continue;
+                }
                 if sequence < current_sequence {
                     *persisted_versions_by_key
                         .entry(row.key.clone())
@@ -2314,8 +2541,17 @@ impl Db {
         let mut results = Vec::new();
         for sstable in live
             .iter()
-            .filter(|sstable| sstable.meta.table_id == table_id && sstable.is_columnar())
+            .filter(|sstable| sstable.meta.table_id == table_id)
         {
+            if !sstable.is_columnar() {
+                results.push(SkipIndexProbeResult {
+                    local_id: sstable.meta.local_id.clone(),
+                    used_indexes: Vec::new(),
+                    may_match: true,
+                    fallback_to_base: true,
+                });
+                continue;
+            }
             if !self.inner.config.hybrid_read.skip_indexes_enabled {
                 results.push(SkipIndexProbeResult {
                     local_id: sstable.meta.local_id.clone(),
