@@ -28,7 +28,10 @@ impl Snapshot {
         end: Key,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        table.scan_at(start, end, self.sequence(), opts).await
+        Ok(table
+            .scan_at_with_execution(start, end, self.sequence(), opts)
+            .await?
+            .0)
     }
 
     pub async fn scan_prefix(
@@ -37,7 +40,33 @@ impl Snapshot {
         prefix: KeyPrefix,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        table.scan_prefix_at(prefix, self.sequence(), opts).await
+        Ok(table
+            .scan_prefix_at_with_execution(prefix, self.sequence(), opts)
+            .await?
+            .0)
+    }
+
+    pub async fn scan_with_execution(
+        &self,
+        table: &Table,
+        start: Key,
+        end: Key,
+        opts: ScanOptions,
+    ) -> Result<(KvStream, ScanExecution), ReadError> {
+        table
+            .scan_at_with_execution(start, end, self.sequence(), opts)
+            .await
+    }
+
+    pub async fn scan_prefix_with_execution(
+        &self,
+        table: &Table,
+        prefix: KeyPrefix,
+        opts: ScanOptions,
+    ) -> Result<(KvStream, ScanExecution), ReadError> {
+        table
+            .scan_prefix_at_with_execution(prefix, self.sequence(), opts)
+            .await
     }
 
     pub fn release(&self) {

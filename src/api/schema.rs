@@ -47,6 +47,18 @@ impl SchemaDefinition {
         SchemaValidation::new(self).map(|_| ())
     }
 
+    pub fn field(&self, name: &str) -> Option<&FieldDefinition> {
+        self.fields.iter().find(|field| field.name == name)
+    }
+
+    pub fn field_by_id(&self, field_id: FieldId) -> Option<&FieldDefinition> {
+        self.fields.iter().find(|field| field.id == field_id)
+    }
+
+    pub fn field_id(&self, name: &str) -> Option<FieldId> {
+        self.field(name).map(|field| field.id)
+    }
+
     pub fn validate_successor(&self, successor: &Self) -> Result<(), StorageError> {
         let current = SchemaValidation::new(self)?;
         let next = SchemaValidation::new(successor)?;
@@ -135,6 +147,48 @@ impl FieldType {
             Self::Bytes => "bytes",
             Self::Bool => "bool",
         }
+    }
+}
+
+impl From<i64> for FieldValue {
+    fn from(value: i64) -> Self {
+        Self::Int64(value)
+    }
+}
+
+impl From<f64> for FieldValue {
+    fn from(value: f64) -> Self {
+        Self::Float64(value)
+    }
+}
+
+impl From<String> for FieldValue {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for FieldValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<Vec<u8>> for FieldValue {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+impl From<&[u8]> for FieldValue {
+    fn from(value: &[u8]) -> Self {
+        Self::Bytes(value.to_vec())
+    }
+}
+
+impl From<bool> for FieldValue {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
     }
 }
 

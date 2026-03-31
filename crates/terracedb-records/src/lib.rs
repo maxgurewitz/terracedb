@@ -34,14 +34,15 @@ use std::{
 use futures::{Stream, StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
 use terracedb::{
-    Db, Key, KvStream, ReadError, ScanOptions, SequenceNumber, Table, Transaction,
-    TransactionCommitError, Value, WriteError,
+    ColumnarRecord, Db, Key, KvStream, ReadError, ScanExecution, ScanOptions, SchemaDefinition,
+    SequenceNumber, Table, Transaction, TransactionCommitError, Value, WriteError,
 };
 use thiserror::Error;
 
 type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
 pub type RecordStream<K, V> = Pin<Box<dyn Stream<Item = (K, V)> + Send + 'static>>;
+pub type ProjectionStream<V> = Pin<Box<dyn Stream<Item = V> + Send + 'static>>;
 
 /// Typed key codec used by [`RecordTable`] and [`RecordTransaction`].
 pub trait KeyCodec<K>: Clone + Send + Sync + 'static {
@@ -59,6 +60,20 @@ pub trait ValueCodec<V>: Clone + Send + Sync + 'static {
     fn encode_value(&self, value: &V) -> Result<Value, RecordCodecError>;
 
     fn decode_value(&self, value: &Value) -> Result<V, RecordCodecError>;
+}
+
+/// Typed codec for structured columnar records.
+pub trait ColumnarRecordCodec<V>: Clone + Send + Sync + 'static {
+    fn encode_record(&self, value: &V) -> Result<ColumnarRecord, RecordCodecError>;
+
+    fn decode_record(&self, record: &ColumnarRecord) -> Result<V, RecordCodecError>;
+}
+
+/// Typed decoder for projected columnar scans.
+pub trait ColumnarProjection<K, V>: Clone + Send + Sync + 'static {
+    fn columns(&self) -> Vec<String>;
+
+    fn decode_projection(&self, key: &K, record: &ColumnarRecord) -> Result<V, RecordCodecError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,6 +403,328 @@ where
     fn decode_value(&self, value: &Value) -> Result<V, RecordCodecError> {
         serde_json::from_slice(expect_bytes(value, CodecTarget::Value)?)
             .map_err(RecordCodecError::decode_value)
+    }
+}
+
+/// Typed wrapper over a Terracedb columnar [`Table`].
+#[derive(Clone, Debug)]
+pub struct ColumnarTable<K, V, KC, VC> {
+    table: Table,
+    schema: SchemaDefinition,
+    key_codec: KC,
+    value_codec: VC,
+    marker: PhantomData<fn() -> (K, V)>,
+}
+
+impl<K, V, KC, VC> ColumnarTable<K, V, KC, VC> {
+    pub fn with_codecs(
+        table: Table,
+        schema: SchemaDefinition,
+        key_codec: KC,
+        value_codec: VC,
+    ) -> Self {
+        Self {
+            table,
+            schema,
+            key_codec,
+            value_codec,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    pub fn schema(&self) -> &SchemaDefinition {
+        &self.schema
+    }
+
+    pub fn key_codec(&self) -> &KC {
+        &self.key_codec
+    }
+
+    pub fn value_codec(&self) -> &VC {
+        &self.value_codec
+    }
+
+    pub fn into_inner(self) -> Table {
+        self.table
+    }
+}
+
+impl<K, V, KC, VC> ColumnarTable<K, V, KC, VC>
+where
+    KC: KeyCodec<K>,
+    VC: ColumnarRecordCodec<V>,
+    K: Send + 'static,
+    V: Send + 'static,
+{
+    fn encode_key(&self, key: &K) -> Result<Key, RecordCodecError> {
+        self.key_codec.encode_key(key)
+    }
+
+    fn encode_prefix(&self, prefix: &K) -> Result<Key, RecordCodecError> {
+        self.key_codec.encode_prefix(prefix)
+    }
+
+    fn decode_key(&self, key: &[u8]) -> Result<K, RecordCodecError> {
+        self.key_codec.decode_key(key)
+    }
+
+    fn encode_value(&self, value: &V) -> Result<Value, RecordCodecError> {
+        let record = self.value_codec.encode_record(value)?;
+        self.schema
+            .normalize_record(&record)
+            .map(Value::record)
+            .map_err(RecordCodecError::validate_value)
+    }
+
+    fn decode_value(&self, value: &Value) -> Result<V, RecordCodecError> {
+        self.value_codec
+            .decode_record(expect_record(value, CodecTarget::Value)?)
+    }
+
+    pub async fn read(&self, key: &K) -> Result<Option<V>, RecordReadError> {
+        let raw_key = self.encode_key(key)?;
+        let value = self.table.read(raw_key).await?;
+        value
+            .map(|value| self.decode_value(&value))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn read_in(
+        &self,
+        tx: &mut Transaction,
+        key: &K,
+    ) -> Result<Option<V>, RecordReadError> {
+        let raw_key = self.encode_key(key)?;
+        let value = tx.read(self.table(), raw_key).await?;
+        value
+            .map(|value| self.decode_value(&value))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn write(&self, key: &K, value: &V) -> Result<SequenceNumber, RecordWriteError> {
+        let raw_key = self.encode_key(key)?;
+        let raw_value = self.encode_value(value)?;
+        self.table
+            .write(raw_key, raw_value)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub fn write_in(
+        &self,
+        tx: &mut Transaction,
+        key: &K,
+        value: &V,
+    ) -> Result<(), RecordWriteError> {
+        let raw_key = self.encode_key(key)?;
+        let raw_value = self.encode_value(value)?;
+        tx.write(self.table(), raw_key, raw_value);
+        Ok(())
+    }
+
+    pub async fn delete(&self, key: &K) -> Result<SequenceNumber, RecordWriteError> {
+        let raw_key = self.encode_key(key)?;
+        self.table.delete(raw_key).await.map_err(Into::into)
+    }
+
+    pub fn delete_in(&self, tx: &mut Transaction, key: &K) -> Result<(), RecordWriteError> {
+        let raw_key = self.encode_key(key)?;
+        tx.delete(self.table(), raw_key);
+        Ok(())
+    }
+
+    pub async fn scan(
+        &self,
+        start: &K,
+        end: &K,
+        opts: ScanOptions,
+    ) -> Result<RecordStream<K, V>, RecordReadError> {
+        Ok(self.scan_with_execution(start, end, opts).await?.0)
+    }
+
+    pub async fn scan_with_execution(
+        &self,
+        start: &K,
+        end: &K,
+        opts: ScanOptions,
+    ) -> Result<(RecordStream<K, V>, ScanExecution), RecordReadError> {
+        let raw_start = self.encode_key(start)?;
+        let raw_end = self.encode_key(end)?;
+        let (stream, execution) = self
+            .table
+            .scan_with_execution(raw_start, raw_end, opts)
+            .await?;
+        Ok((
+            self.decode_stream(stream)
+                .await
+                .map_err(RecordReadError::from)?,
+            execution,
+        ))
+    }
+
+    pub async fn scan_prefix(
+        &self,
+        prefix: &K,
+        opts: ScanOptions,
+    ) -> Result<RecordStream<K, V>, RecordReadError> {
+        Ok(self.scan_prefix_with_execution(prefix, opts).await?.0)
+    }
+
+    pub async fn scan_prefix_with_execution(
+        &self,
+        prefix: &K,
+        opts: ScanOptions,
+    ) -> Result<(RecordStream<K, V>, ScanExecution), RecordReadError> {
+        let raw_prefix = self.encode_prefix(prefix)?;
+        let (stream, execution) = self
+            .table
+            .scan_prefix_with_execution(raw_prefix, opts)
+            .await?;
+        Ok((
+            self.decode_stream(stream)
+                .await
+                .map_err(RecordReadError::from)?,
+            execution,
+        ))
+    }
+
+    pub async fn scan_all(&self, opts: ScanOptions) -> Result<RecordStream<K, V>, RecordReadError> {
+        Ok(self.scan_all_with_execution(opts).await?.0)
+    }
+
+    pub async fn scan_all_with_execution(
+        &self,
+        opts: ScanOptions,
+    ) -> Result<(RecordStream<K, V>, ScanExecution), RecordReadError> {
+        let (stream, execution) = self
+            .table
+            .scan_with_execution(Vec::new(), vec![0xff], opts)
+            .await?;
+        Ok((
+            self.decode_stream(stream)
+                .await
+                .map_err(RecordReadError::from)?,
+            execution,
+        ))
+    }
+
+    pub async fn scan_projected<P, PC>(
+        &self,
+        start: &K,
+        end: &K,
+        projection: &PC,
+        opts: ScanOptions,
+    ) -> Result<ProjectionStream<P>, RecordReadError>
+    where
+        PC: ColumnarProjection<K, P>,
+        P: Send + 'static,
+    {
+        Ok(self
+            .scan_projected_with_execution(start, end, projection, opts)
+            .await?
+            .0)
+    }
+
+    pub async fn scan_projected_with_execution<P, PC>(
+        &self,
+        start: &K,
+        end: &K,
+        projection: &PC,
+        mut opts: ScanOptions,
+    ) -> Result<(ProjectionStream<P>, ScanExecution), RecordReadError>
+    where
+        PC: ColumnarProjection<K, P>,
+        P: Send + 'static,
+    {
+        opts.columns = Some(projection.columns());
+        let raw_start = self.encode_key(start)?;
+        let raw_end = self.encode_key(end)?;
+        let (stream, execution) = self
+            .table
+            .scan_with_execution(raw_start, raw_end, opts)
+            .await?;
+        Ok((
+            self.decode_projected_stream(stream, projection.clone())
+                .await
+                .map_err(RecordReadError::from)?,
+            execution,
+        ))
+    }
+
+    pub async fn scan_projected_prefix<P, PC>(
+        &self,
+        prefix: &K,
+        projection: &PC,
+        opts: ScanOptions,
+    ) -> Result<ProjectionStream<P>, RecordReadError>
+    where
+        PC: ColumnarProjection<K, P>,
+        P: Send + 'static,
+    {
+        Ok(self
+            .scan_projected_prefix_with_execution(prefix, projection, opts)
+            .await?
+            .0)
+    }
+
+    pub async fn scan_projected_prefix_with_execution<P, PC>(
+        &self,
+        prefix: &K,
+        projection: &PC,
+        mut opts: ScanOptions,
+    ) -> Result<(ProjectionStream<P>, ScanExecution), RecordReadError>
+    where
+        PC: ColumnarProjection<K, P>,
+        P: Send + 'static,
+    {
+        opts.columns = Some(projection.columns());
+        let raw_prefix = self.encode_prefix(prefix)?;
+        let (stream, execution) = self
+            .table
+            .scan_prefix_with_execution(raw_prefix, opts)
+            .await?;
+        Ok((
+            self.decode_projected_stream(stream, projection.clone())
+                .await
+                .map_err(RecordReadError::from)?,
+            execution,
+        ))
+    }
+
+    async fn decode_stream(
+        &self,
+        mut stream: KvStream,
+    ) -> Result<RecordStream<K, V>, RecordCodecError> {
+        let mut rows = Vec::new();
+        while let Some((key, value)) = stream.next().await {
+            rows.push((self.decode_key(&key)?, self.decode_value(&value)?));
+        }
+        Ok(Box::pin(stream::iter(rows)))
+    }
+
+    async fn decode_projected_stream<P, PC>(
+        &self,
+        mut stream: KvStream,
+        projection: PC,
+    ) -> Result<ProjectionStream<P>, RecordCodecError>
+    where
+        PC: ColumnarProjection<K, P>,
+        P: Send + 'static,
+    {
+        let mut rows = Vec::new();
+        while let Some((key, value)) = stream.next().await {
+            let decoded_key = self.decode_key(&key)?;
+            let projected = projection
+                .decode_projection(&decoded_key, expect_record(&value, CodecTarget::Value)?)?;
+            rows.push(projected);
+        }
+        Ok(Box::pin(stream::iter(rows)))
     }
 }
 
@@ -1047,6 +1384,16 @@ fn expect_bytes(value: &Value, target: CodecTarget) -> Result<&[u8], RecordCodec
     match value {
         Value::Bytes(bytes) => Ok(bytes),
         Value::Record(_) => Err(match target {
+            CodecTarget::Key => RecordCodecError::decode_key(UnexpectedValueKindError),
+            CodecTarget::Value => RecordCodecError::decode_value(UnexpectedValueKindError),
+        }),
+    }
+}
+
+fn expect_record(value: &Value, target: CodecTarget) -> Result<&ColumnarRecord, RecordCodecError> {
+    match value {
+        Value::Record(record) => Ok(record),
+        Value::Bytes(_) => Err(match target {
             CodecTarget::Key => RecordCodecError::decode_key(UnexpectedValueKindError),
             CodecTarget::Value => RecordCodecError::decode_value(UnexpectedValueKindError),
         }),

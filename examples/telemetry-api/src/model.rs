@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use terracedb::ScanExecution;
 
 pub const TEMPERATURE_C_FIELD_NAME: &str = "temperature_c";
 pub const HUMIDITY_PCT_FIELD_NAME: &str = "humidity_pct";
@@ -131,6 +132,7 @@ pub struct DeviceStateRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngestReadingsResponse {
+    pub received_readings: usize,
     pub accepted_readings: usize,
     pub updated_devices: Vec<DeviceStateRecord>,
 }
@@ -153,6 +155,8 @@ pub struct TelemetryScanResponse {
     pub columns: Vec<TelemetryColumn>,
     pub only_alerts: bool,
     pub rows: Vec<TelemetryScanRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ScanExecution>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -174,6 +178,8 @@ pub struct TelemetryScanQuery {
     pub columns: Option<String>,
     #[serde(default)]
     pub only_alerts: bool,
+    #[serde(default)]
+    pub debug: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

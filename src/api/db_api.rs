@@ -1,9 +1,406 @@
 use super::*;
 
+use crate::ZoneMapPredicate;
 use crate::execution::{
     DbExecutionProfile, DomainTaggedWork, ExecutionDomainOwner, ExecutionLane, ResourceManager,
     ResourceManagerSnapshot,
 };
+
+#[derive(Clone, Debug)]
+struct ResolvedScanPredicate {
+    clauses: Vec<ResolvedScanClause>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedScanClause {
+    FieldEquals {
+        field: FieldDefinition,
+        value: FieldValue,
+    },
+    Int64AtLeast {
+        field: FieldDefinition,
+        value: i64,
+    },
+    BoolEquals {
+        field: FieldDefinition,
+        value: bool,
+    },
+}
+
+#[derive(Default)]
+struct ColumnarScanExecutionState {
+    sstables_considered: usize,
+    sstables_pruned_by_skip_index: usize,
+    sstables_pruned_by_zone_map: usize,
+    rows_evaluated: usize,
+    rows_returned: usize,
+    parts: BTreeMap<String, ColumnarScanPartExecution>,
+}
+
+impl ResolvedScanPredicate {
+    fn resolve(
+        table: &StoredTable,
+        predicate: Option<&ScanPredicate>,
+    ) -> Result<Option<Self>, StorageError> {
+        let Some(predicate) = predicate else {
+            return Ok(None);
+        };
+        let schema = table.config.schema.as_ref().ok_or_else(|| {
+            StorageError::unsupported(format!(
+                "scan predicates require a columnar table with a schema (got {})",
+                table.config.name
+            ))
+        })?;
+        let validation = SchemaValidation::new(schema)?;
+        let mut clauses = Vec::new();
+        Self::flatten(predicate, table, &validation, &mut clauses)?;
+        if clauses.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Self { clauses }))
+        }
+    }
+
+    fn flatten(
+        predicate: &ScanPredicate,
+        table: &StoredTable,
+        validation: &SchemaValidation<'_>,
+        clauses: &mut Vec<ResolvedScanClause>,
+    ) -> Result<(), StorageError> {
+        match predicate {
+            ScanPredicate::AlwaysTrue => Ok(()),
+            ScanPredicate::All { predicates } => {
+                for predicate in predicates {
+                    Self::flatten(predicate, table, validation, clauses)?;
+                }
+                Ok(())
+            }
+            ScanPredicate::FieldEquals { field, value } => {
+                let field = Self::resolve_field(table, validation, field)?;
+                Self::validate_field_value(&field, value)?;
+                clauses.push(ResolvedScanClause::FieldEquals {
+                    field,
+                    value: value.clone(),
+                });
+                Ok(())
+            }
+            ScanPredicate::Int64AtLeast { field, value } => {
+                let field = Self::resolve_field(table, validation, field)?;
+                if field.field_type != FieldType::Int64 {
+                    return Err(StorageError::unsupported(format!(
+                        "scan predicate {} >= requires int64 field {} on table {}",
+                        value, field.name, table.config.name
+                    )));
+                }
+                clauses.push(ResolvedScanClause::Int64AtLeast {
+                    field,
+                    value: *value,
+                });
+                Ok(())
+            }
+            ScanPredicate::BoolEquals { field, value } => {
+                let field = Self::resolve_field(table, validation, field)?;
+                if field.field_type != FieldType::Bool {
+                    return Err(StorageError::unsupported(format!(
+                        "scan predicate bool_equals requires bool field {} on table {}",
+                        field.name, table.config.name
+                    )));
+                }
+                clauses.push(ResolvedScanClause::BoolEquals {
+                    field,
+                    value: *value,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn resolve_field(
+        table: &StoredTable,
+        validation: &SchemaValidation<'_>,
+        field_name: &str,
+    ) -> Result<FieldDefinition, StorageError> {
+        let field_id = validation
+            .field_ids_by_name
+            .get(field_name)
+            .copied()
+            .ok_or_else(|| {
+                StorageError::unsupported(format!(
+                    "columnar table {} does not contain column {}",
+                    table.config.name, field_name
+                ))
+            })?;
+        validation
+            .fields_by_id
+            .get(&field_id)
+            .map(|field| (*field).clone())
+            .ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "columnar table {} schema is missing field id {}",
+                    table.config.name,
+                    field_id.get()
+                ))
+            })
+    }
+
+    fn validate_field_value(
+        field: &FieldDefinition,
+        value: &FieldValue,
+    ) -> Result<(), StorageError> {
+        match value {
+            FieldValue::Null if field.nullable => Ok(()),
+            FieldValue::Null => Err(StorageError::unsupported(format!(
+                "field {} is not nullable",
+                field.name
+            ))),
+            FieldValue::Int64(_) if field.field_type == FieldType::Int64 => Ok(()),
+            FieldValue::Float64(_) if field.field_type == FieldType::Float64 => Ok(()),
+            FieldValue::String(_) if field.field_type == FieldType::String => Ok(()),
+            FieldValue::Bytes(_) if field.field_type == FieldType::Bytes => Ok(()),
+            FieldValue::Bool(_) if field.field_type == FieldType::Bool => Ok(()),
+            _ => Err(StorageError::unsupported(format!(
+                "scan predicate value type does not match field {} ({})",
+                field.name,
+                field.field_type.as_str()
+            ))),
+        }
+    }
+
+    fn projection_fields(&self, schema: &SchemaDefinition) -> Vec<FieldDefinition> {
+        let ids = self
+            .clauses
+            .iter()
+            .map(ResolvedScanClause::field_id)
+            .collect::<BTreeSet<_>>();
+        schema
+            .fields
+            .iter()
+            .filter(|field| ids.contains(&field.id))
+            .cloned()
+            .collect()
+    }
+
+    fn skip_index_probes(&self) -> Vec<SkipIndexProbe> {
+        self.clauses
+            .iter()
+            .filter_map(|clause| match clause {
+                ResolvedScanClause::FieldEquals { field, value } => {
+                    Some(SkipIndexProbe::FieldEquals {
+                        field: field.name.clone(),
+                        value: value.clone(),
+                    })
+                }
+                ResolvedScanClause::BoolEquals { field, value } => {
+                    Some(SkipIndexProbe::FieldEquals {
+                        field: field.name.clone(),
+                        value: FieldValue::Bool(*value),
+                    })
+                }
+                ResolvedScanClause::Int64AtLeast { .. } => None,
+            })
+            .collect()
+    }
+
+    fn configured_projection_sidecar_matches(
+        config: &crate::HybridProjectionSidecarConfig,
+        projection: &ColumnProjection,
+    ) -> bool {
+        let mut left = config.fields.clone();
+        left.sort();
+        let mut right = projection
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        right.sort();
+        left == right
+    }
+
+    fn may_match_part(&self, footer: &PersistedColumnarSstableFooter) -> bool {
+        if footer.layout.synopsis.granules.is_empty() {
+            return true;
+        }
+        footer.layout.synopsis.granules.iter().any(|granule| {
+            self.clauses.iter().all(|clause| {
+                let predicate = clause.zone_map_predicate();
+                granule
+                    .zone_maps
+                    .iter()
+                    .all(|zone_map| zone_map.may_match(&predicate))
+            })
+        })
+    }
+
+    fn matches(&self, value: &Value) -> Result<bool, StorageError> {
+        let Value::Record(record) = value else {
+            return Err(StorageError::unsupported(
+                "scan predicates currently require columnar record values",
+            ));
+        };
+        for clause in &self.clauses {
+            if !clause.matches(record)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl ResolvedScanClause {
+    fn field_id(&self) -> FieldId {
+        match self {
+            Self::FieldEquals { field, .. }
+            | Self::Int64AtLeast { field, .. }
+            | Self::BoolEquals { field, .. } => field.id,
+        }
+    }
+
+    fn zone_map_predicate(&self) -> ZoneMapPredicate {
+        match self {
+            Self::FieldEquals { field, value } => ZoneMapPredicate::FieldEquals {
+                field_id: field.id,
+                value: value.clone(),
+            },
+            Self::Int64AtLeast { field, value } => ZoneMapPredicate::Int64AtLeast {
+                field_id: field.id,
+                value: *value,
+            },
+            Self::BoolEquals { field, value } => ZoneMapPredicate::BoolEquals {
+                field_id: field.id,
+                value: *value,
+            },
+        }
+    }
+
+    fn matches(&self, record: &ColumnarRecord) -> Result<bool, StorageError> {
+        let actual = record.get(&self.field_id()).ok_or_else(|| {
+            StorageError::corruption(format!(
+                "predicate field {} is missing from a materialized row",
+                self.field_id().get()
+            ))
+        })?;
+        match self {
+            Self::FieldEquals { value, .. } => Ok(actual == value),
+            Self::Int64AtLeast { value, .. } => match actual {
+                FieldValue::Int64(actual) => Ok(*actual >= *value),
+                FieldValue::Null => Ok(false),
+                other => Err(StorageError::corruption(format!(
+                    "int64 scan predicate evaluated against unexpected value {other:?}"
+                ))),
+            },
+            Self::BoolEquals { value, .. } => match actual {
+                FieldValue::Bool(actual) => Ok(*actual == *value),
+                FieldValue::Null => Ok(false),
+                other => Err(StorageError::corruption(format!(
+                    "bool scan predicate evaluated against unexpected value {other:?}"
+                ))),
+            },
+        }
+    }
+}
+
+impl ColumnarScanExecutionState {
+    fn observe_sstable(&mut self, local_id: &str) {
+        self.sstables_considered = self.sstables_considered.saturating_add(1);
+        self.parts
+            .entry(local_id.to_string())
+            .or_insert_with(|| ColumnarScanPartExecution {
+                local_id: local_id.to_string(),
+                ..ColumnarScanPartExecution::default()
+            });
+    }
+
+    fn observe_skip_probe(&mut self, result: &SkipIndexProbeResult) {
+        let entry = self
+            .parts
+            .entry(result.local_id.clone())
+            .or_insert_with(|| ColumnarScanPartExecution {
+                local_id: result.local_id.clone(),
+                ..ColumnarScanPartExecution::default()
+            });
+        for index in &result.used_indexes {
+            if !entry.skip_indexes_used.contains(index) {
+                entry.skip_indexes_used.push(index.clone());
+            }
+        }
+        entry.skip_index_fallback_to_base |= result.fallback_to_base;
+        if !result.may_match && !entry.skip_index_pruned {
+            entry.skip_index_pruned = true;
+            self.sstables_pruned_by_skip_index =
+                self.sstables_pruned_by_skip_index.saturating_add(1);
+        }
+    }
+
+    fn mark_zone_map_pruned(&mut self, local_id: &str) {
+        let entry =
+            self.parts
+                .entry(local_id.to_string())
+                .or_insert_with(|| ColumnarScanPartExecution {
+                    local_id: local_id.to_string(),
+                    ..ColumnarScanPartExecution::default()
+                });
+        if !entry.zone_map_pruned {
+            entry.zone_map_pruned = true;
+            self.sstables_pruned_by_zone_map = self.sstables_pruned_by_zone_map.saturating_add(1);
+        }
+    }
+
+    fn observe_materialization(
+        &mut self,
+        local_id: &str,
+        source: ScanMaterializationSource,
+        rows_materialized: usize,
+    ) {
+        let entry =
+            self.parts
+                .entry(local_id.to_string())
+                .or_insert_with(|| ColumnarScanPartExecution {
+                    local_id: local_id.to_string(),
+                    ..ColumnarScanPartExecution::default()
+                });
+        entry.rows_materialized = entry.rows_materialized.saturating_add(rows_materialized);
+        match source {
+            ScanMaterializationSource::BasePart => {
+                entry.base_part_reads = entry.base_part_reads.saturating_add(1);
+            }
+            ScanMaterializationSource::ProjectionSidecar => {
+                entry.projection_sidecar_reads = entry.projection_sidecar_reads.saturating_add(1);
+            }
+            ScanMaterializationSource::ProjectionFallbackToBase => {
+                entry.projection_fallback_reads = entry.projection_fallback_reads.saturating_add(1);
+                entry.base_part_reads = entry.base_part_reads.saturating_add(1);
+            }
+        }
+    }
+
+    fn finalize(self) -> ColumnarScanExecution {
+        let mut parts = self.parts.into_values().collect::<Vec<_>>();
+        parts.sort_by(|left, right| left.local_id.cmp(&right.local_id));
+        ColumnarScanExecution {
+            sstables_considered: self.sstables_considered,
+            sstables_pruned_by_skip_index: self.sstables_pruned_by_skip_index,
+            sstables_pruned_by_zone_map: self.sstables_pruned_by_zone_map,
+            rows_evaluated: self.rows_evaluated,
+            rows_returned: self.rows_returned,
+            parts,
+        }
+    }
+}
+
+fn scan_predicate_is_noop(predicate: Option<&ScanPredicate>) -> bool {
+    let Some(predicate) = predicate else {
+        return true;
+    };
+    match predicate {
+        ScanPredicate::AlwaysTrue => true,
+        ScanPredicate::All { predicates } => predicates
+            .iter()
+            .all(|predicate| scan_predicate_is_noop(Some(predicate))),
+        ScanPredicate::FieldEquals { .. }
+        | ScanPredicate::Int64AtLeast { .. }
+        | ScanPredicate::BoolEquals { .. } => false,
+    }
+}
 
 impl Db {
     /// Returns a synchronous handle lookup for an already-created table.
@@ -1806,6 +2203,8 @@ impl Db {
         Ok(resolution.value)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(super) fn scan_visible_row(
         &self,
         table_id: TableId,
@@ -1813,6 +2212,23 @@ impl Db {
         matcher: KeyMatcher<'_>,
         opts: &ScanOptions,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
+        Ok(self
+            .scan_visible_row_with_execution(table_id, sequence, matcher, opts)?
+            .0)
+    }
+
+    pub(super) fn scan_visible_row_with_execution(
+        &self,
+        table_id: TableId,
+        sequence: SequenceNumber,
+        matcher: KeyMatcher<'_>,
+        opts: &ScanOptions,
+    ) -> Result<(Vec<(Key, Value)>, ScanExecution), StorageError> {
+        if !scan_predicate_is_noop(opts.predicate.as_ref()) {
+            return Err(StorageError::unsupported(
+                "scan predicates currently require a columnar table",
+            ));
+        }
         let result = {
             let tables = self.tables_read();
             let memtables = self.memtables_read();
@@ -1826,7 +2242,14 @@ impl Db {
             self.force_collapse_merge_chain(table_id, &key, collapse);
         }
 
-        Ok(result.rows)
+        let execution = ScanExecution {
+            rows_returned: result.rows.len(),
+            row: Some(RowScanExecution {
+                visited_key_groups: result.visited_key_groups,
+            }),
+            columnar: None,
+        };
+        Ok((result.rows, execution))
     }
 
     pub(super) fn compact_to_wide_promotion_config_for_table(
@@ -1998,6 +2421,30 @@ impl Db {
         Ok(Some(ColumnProjection { fields }))
     }
 
+    pub(super) fn column_projection_from_fields(fields: Vec<FieldDefinition>) -> ColumnProjection {
+        ColumnProjection { fields }
+    }
+
+    pub(super) fn merge_projected_columnar_values(
+        primary: Value,
+        late: Value,
+    ) -> Result<Value, StorageError> {
+        let Value::Record(mut primary) = primary else {
+            return Err(StorageError::corruption(
+                "late materialization requires projected record values",
+            ));
+        };
+        let Value::Record(late) = late else {
+            return Err(StorageError::corruption(
+                "late materialization requires projected record values",
+            ));
+        };
+        for (field_id, value) in late {
+            primary.insert(field_id, value);
+        }
+        Ok(Value::Record(primary))
+    }
+
     pub(super) fn missing_columnar_projection_value(
         field: &FieldDefinition,
         kind: ChangeKind,
@@ -2042,7 +2489,7 @@ impl Db {
     }
 
     pub(super) fn materialized_columnar_value(
-        materialized_by_sstable: &BTreeMap<String, BTreeMap<usize, Value>>,
+        materialized_by_sstable: &BTreeMap<String, ColumnarMaterialization>,
         row: &ColumnarRowRef,
     ) -> Result<Value, StorageError> {
         let values = materialized_by_sstable.get(&row.local_id).ok_or_else(|| {
@@ -2051,7 +2498,7 @@ impl Db {
                 row.local_id
             ))
         })?;
-        values.get(&row.row_index).cloned().ok_or_else(|| {
+        values.rows.get(&row.row_index).cloned().ok_or_else(|| {
             StorageError::corruption(format!(
                 "columnar SSTable {} row {} was not materialized",
                 row.local_id, row.row_index
@@ -2069,7 +2516,13 @@ impl Db {
         sequence: SequenceNumber,
         projection: &ColumnProjection,
         access: ColumnarReadAccessPattern,
-    ) -> Result<VisibleValueResolution, StorageError> {
+    ) -> Result<
+        (
+            VisibleValueResolution,
+            Vec<(String, ScanMaterializationSource, usize)>,
+        ),
+        StorageError,
+    > {
         let mut mem_rows = Vec::new();
         memtables.collect_visible_rows(table.id, key, sequence, &mut mem_rows);
 
@@ -2136,10 +2589,13 @@ impl Db {
         });
 
         let Some(head) = candidates.first() else {
-            return Ok(VisibleValueResolution {
-                value: None,
-                collapse: None,
-            });
+            return Ok((
+                VisibleValueResolution {
+                    value: None,
+                    collapse: None,
+                },
+                Vec::new(),
+            ));
         };
         let head_sequence = match head {
             VisibleCandidate::Memtable(row) => row.sequence,
@@ -2154,20 +2610,26 @@ impl Db {
                         .value
                         .as_ref()
                         .ok_or_else(|| StorageError::corruption("put row is missing a value"))?;
-                    return Ok(VisibleValueResolution {
-                        value: Some(Self::project_columnar_value(
-                            value,
-                            projection,
-                            ChangeKind::Put,
-                        )?),
-                        collapse: None,
-                    });
+                    return Ok((
+                        VisibleValueResolution {
+                            value: Some(Self::project_columnar_value(
+                                value,
+                                projection,
+                                ChangeKind::Put,
+                            )?),
+                            collapse: None,
+                        },
+                        Vec::new(),
+                    ));
                 }
                 ChangeKind::Delete => {
-                    return Ok(VisibleValueResolution {
-                        value: None,
-                        collapse: None,
-                    });
+                    return Ok((
+                        VisibleValueResolution {
+                            value: None,
+                            collapse: None,
+                        },
+                        Vec::new(),
+                    ));
                 }
                 ChangeKind::Merge => {}
             },
@@ -2185,16 +2647,22 @@ impl Db {
                         projection,
                         &projected,
                     )?;
-                    return Ok(VisibleValueResolution {
-                        value: Some(projected),
-                        collapse: None,
-                    });
+                    return Ok((
+                        VisibleValueResolution {
+                            value: Some(projected),
+                            collapse: None,
+                        },
+                        Vec::new(),
+                    ));
                 }
                 ChangeKind::Delete => {
-                    return Ok(VisibleValueResolution {
-                        value: None,
-                        collapse: None,
-                    });
+                    return Ok((
+                        VisibleValueResolution {
+                            value: None,
+                            collapse: None,
+                        },
+                        Vec::new(),
+                    ));
                 }
                 ChangeKind::Merge => {}
             },
@@ -2214,16 +2682,22 @@ impl Db {
                             access,
                         )
                         .await?;
-                    return Ok(VisibleValueResolution {
-                        value: values.get(&row.row_index).cloned(),
-                        collapse: None,
-                    });
+                    return Ok((
+                        VisibleValueResolution {
+                            value: values.rows.get(&row.row_index).cloned(),
+                            collapse: None,
+                        },
+                        vec![(row.local_id.clone(), values.source, values.rows.len())],
+                    ));
                 }
                 ChangeKind::Delete => {
-                    return Ok(VisibleValueResolution {
-                        value: None,
-                        collapse: None,
-                    });
+                    return Ok((
+                        VisibleValueResolution {
+                            value: None,
+                            collapse: None,
+                        },
+                        Vec::new(),
+                    ));
                 }
                 ChangeKind::Merge => {}
             },
@@ -2264,7 +2738,8 @@ impl Db {
             }
         }
 
-        let mut materialized_by_sstable = BTreeMap::<String, BTreeMap<usize, Value>>::new();
+        let mut materialized_by_sstable = BTreeMap::<String, ColumnarMaterialization>::new();
+        let mut materialization_events = Vec::new();
         for (local_id, row_indexes) in needed_by_sstable {
             let sstable = sstables_by_local_id.get(&local_id).ok_or_else(|| {
                 StorageError::corruption(format!(
@@ -2272,17 +2747,20 @@ impl Db {
                     local_id
                 ))
             })?;
-            materialized_by_sstable.insert(
+            let materialized = sstable
+                .materialize_columnar_rows(
+                    &self.inner.columnar_read_context,
+                    &full_projection,
+                    &row_indexes,
+                    access,
+                )
+                .await?;
+            materialization_events.push((
                 local_id.clone(),
-                sstable
-                    .materialize_columnar_rows(
-                        &self.inner.columnar_read_context,
-                        &full_projection,
-                        &row_indexes,
-                        access,
-                    )
-                    .await?,
-            );
+                materialized.source,
+                materialized.rows.len(),
+            ));
+            materialized_by_sstable.insert(local_id.clone(), materialized);
         }
 
         let mut operands = Vec::new();
@@ -2369,10 +2847,13 @@ impl Db {
         let projected = Self::project_columnar_value(&full_value, projection, ChangeKind::Put)?;
         self.record_compact_to_wide_reads(table, &touched_hot_local_ids, projection, &projected)?;
 
-        Ok(VisibleValueResolution {
-            value: Some(projected),
-            collapse,
-        })
+        Ok((
+            VisibleValueResolution {
+                value: Some(projected),
+                collapse,
+            },
+            materialization_events,
+        ))
     }
 
     pub(super) async fn read_visible_value(
@@ -2424,7 +2905,7 @@ impl Db {
         if sequence < current_sequence && persisted_version_count > 1 {
             return Err(Self::columnar_overwritten_history_error(&table, key));
         }
-        let resolution = self
+        let (resolution, _materializations) = self
             .resolve_visible_value_columnar_with_state(
                 &table,
                 &memtables,
@@ -2442,6 +2923,8 @@ impl Db {
         Ok(resolution.value)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(super) async fn scan_visible(
         &self,
         table_id: TableId,
@@ -2449,25 +2932,105 @@ impl Db {
         matcher: KeyMatcher<'_>,
         opts: &ScanOptions,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
+        Ok(self
+            .scan_visible_with_execution(table_id, sequence, matcher, opts)
+            .await?
+            .0)
+    }
+
+    pub(super) async fn scan_visible_with_execution(
+        &self,
+        table_id: TableId,
+        sequence: SequenceNumber,
+        matcher: KeyMatcher<'_>,
+        opts: &ScanOptions,
+    ) -> Result<(Vec<(Key, Value)>, ScanExecution), StorageError> {
         let table = Self::stored_table_by_id(&self.tables_read(), table_id)
             .cloned()
             .ok_or_else(|| {
                 StorageError::not_found(format!("table id {} is not registered", table_id.get()))
             })?;
         if table.config.format == TableFormat::Row {
-            return self.scan_visible_row(table_id, sequence, matcher, opts);
+            return self.scan_visible_row_with_execution(table_id, sequence, matcher, opts);
         }
 
         let limit = opts.limit.unwrap_or(usize::MAX);
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((
+                Vec::new(),
+                ScanExecution {
+                    rows_returned: 0,
+                    row: None,
+                    columnar: Some(ColumnarScanExecution::default()),
+                },
+            ));
         }
 
-        let projection = Self::resolve_scan_projection(&table, opts.columns.as_deref())?
+        let schema = table
+            .config
+            .schema
+            .as_ref()
             .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
+        let final_projection = Self::resolve_scan_projection(&table, opts.columns.as_deref())?
+            .ok_or_else(|| StorageError::corruption("columnar table is missing a schema"))?;
+        let resolved_predicate = ResolvedScanPredicate::resolve(&table, opts.predicate.as_ref())?;
+        let predicate_projection = resolved_predicate
+            .as_ref()
+            .map(|predicate| {
+                Self::column_projection_from_fields(predicate.projection_fields(schema))
+            })
+            .unwrap_or_else(|| final_projection.clone());
+        let combined_projection = Self::column_projection_from_fields(
+            schema
+                .fields
+                .iter()
+                .filter(|field| {
+                    final_projection
+                        .fields
+                        .iter()
+                        .any(|candidate| candidate.id == field.id)
+                        || predicate_projection
+                            .fields
+                            .iter()
+                            .any(|candidate| candidate.id == field.id)
+                })
+                .cloned()
+                .collect(),
+        );
+        let use_combined_projection = resolved_predicate.is_some()
+            && Self::hybrid_table_features(&table.config.metadata)?
+                .projection_sidecars
+                .iter()
+                .any(|config| {
+                    ResolvedScanPredicate::configured_projection_sidecar_matches(
+                        config,
+                        &combined_projection,
+                    )
+                });
+        let predicate_field_ids = predicate_projection
+            .fields
+            .iter()
+            .map(|field| field.id)
+            .collect::<BTreeSet<_>>();
+        let late_projection = if use_combined_projection {
+            Self::column_projection_from_fields(Vec::new())
+        } else {
+            Self::column_projection_from_fields(
+                final_projection
+                    .fields
+                    .iter()
+                    .filter(|field| !predicate_field_ids.contains(&field.id))
+                    .cloned()
+                    .collect(),
+            )
+        };
+        let needs_late_materialization = resolved_predicate.is_some()
+            && !use_combined_projection
+            && !late_projection.fields.is_empty();
         let memtables = self.memtables_read().clone();
         let sstables = self.sstables_read().clone();
         let current_sequence = self.current_sequence();
+        let mut execution = ColumnarScanExecutionState::default();
 
         let mut keys = BTreeSet::new();
         memtables.collect_matching_keys(table_id, &matcher, &mut keys);
@@ -2479,23 +3042,64 @@ impl Db {
             .filter(|sstable| sstable.meta.table_id == table_id)
         {
             if sstable.is_columnar() {
-                for row in sstable
+                execution.observe_sstable(&sstable.meta.local_id);
+                let scan_sequence = if sequence < current_sequence {
+                    current_sequence
+                } else {
+                    sequence
+                };
+                let rows = sstable
                     .collect_scan_row_refs_columnar(
                         &self.inner.columnar_read_context,
                         &matcher,
-                        if sequence < current_sequence {
-                            current_sequence
-                        } else {
-                            sequence
-                        },
+                        scan_sequence,
                     )
-                    .await?
-                {
-                    if sequence < current_sequence {
+                    .await?;
+                if sequence < current_sequence {
+                    for row in &rows {
                         *persisted_versions_by_key
                             .entry(row.key.clone())
                             .or_default() += 1;
                     }
+                }
+
+                let mut pruned = false;
+                if let Some(predicate) = resolved_predicate.as_ref() {
+                    for probe in predicate.skip_index_probes() {
+                        let probe_field_id = match &probe {
+                            SkipIndexProbe::Key(_) => None,
+                            SkipIndexProbe::FieldEquals { field, .. } => schema.field_id(field),
+                        };
+                        let result = sstable
+                            .probe_skip_indexes_columnar(
+                                &self.inner.columnar_read_context,
+                                &probe,
+                                probe_field_id,
+                            )
+                            .await?;
+                        execution.observe_skip_probe(&result);
+                        if !result.may_match {
+                            pruned = true;
+                        }
+                    }
+                    if !pruned {
+                        let metadata = sstable
+                            .load_columnar_metadata(
+                                &self.inner.columnar_read_context,
+                                ColumnarReadAccessPattern::Scan,
+                            )
+                            .await?;
+                        if !predicate.may_match_part(metadata.footer.as_ref()) {
+                            execution.mark_zone_map_pruned(&sstable.meta.local_id);
+                            pruned = true;
+                        }
+                    }
+                }
+                if pruned {
+                    continue;
+                }
+
+                for row in rows {
                     if row.sequence <= sequence {
                         keys.insert(row.key.clone());
                     }
@@ -2534,30 +3138,81 @@ impl Db {
             {
                 return Err(Self::columnar_overwritten_history_error(&table, &key));
             }
-            let resolution = self
+            let active_projection = if use_combined_projection {
+                &combined_projection
+            } else if resolved_predicate.is_some() {
+                &predicate_projection
+            } else {
+                &final_projection
+            };
+            let (resolution, materializations) = self
                 .resolve_visible_value_columnar_with_state(
                     &table,
                     &memtables,
                     &sstables,
                     &key,
                     sequence,
-                    &projection,
+                    active_projection,
                     ColumnarReadAccessPattern::Scan,
                 )
                 .await?;
+            for (local_id, source, materialized_rows) in materializations {
+                execution.observe_materialization(&local_id, source, materialized_rows);
+            }
             if let Some(collapse) = resolution.collapse.clone() {
                 self.force_collapse_merge_chain(table_id, &key, collapse);
             }
-            let Some(value) = resolution.value else {
+            let Some(mut value) = resolution.value else {
                 continue;
             };
+            execution.rows_evaluated = execution.rows_evaluated.saturating_add(1);
+            if let Some(predicate) = resolved_predicate.as_ref()
+                && !predicate.matches(&value)?
+            {
+                continue;
+            }
+            if needs_late_materialization {
+                let (late_resolution, late_materializations) = self
+                    .resolve_visible_value_columnar_with_state(
+                        &table,
+                        &memtables,
+                        &sstables,
+                        &key,
+                        sequence,
+                        &late_projection,
+                        ColumnarReadAccessPattern::Scan,
+                    )
+                    .await?;
+                for (local_id, source, materialized_rows) in late_materializations {
+                    execution.observe_materialization(&local_id, source, materialized_rows);
+                }
+                if let Some(collapse) = late_resolution.collapse.clone() {
+                    self.force_collapse_merge_chain(table_id, &key, collapse);
+                }
+                let Some(late_value) = late_resolution.value else {
+                    return Err(StorageError::corruption(format!(
+                        "late materialization disappeared for key {:?}",
+                        key
+                    )));
+                };
+                value = Self::merge_projected_columnar_values(value, late_value)?;
+            }
+            if resolved_predicate.is_some() {
+                value = Self::project_columnar_value(&value, &final_projection, ChangeKind::Put)?;
+            }
             rows.push((key, value));
+            execution.rows_returned = execution.rows_returned.saturating_add(1);
             if rows.len() >= limit {
                 break;
             }
         }
 
-        Ok(rows)
+        let scan_execution = ScanExecution {
+            rows_returned: rows.len(),
+            row: None,
+            columnar: Some(execution.finalize()),
+        };
+        Ok((rows, scan_execution))
     }
 
     pub(super) async fn probe_skip_indexes(

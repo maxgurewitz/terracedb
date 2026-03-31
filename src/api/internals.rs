@@ -147,6 +147,12 @@ pub(super) struct LoadedColumnarMetadata {
     pub(super) row_kinds: Arc<Vec<ChangeKind>>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ColumnarMaterialization {
+    pub(super) rows: BTreeMap<usize, Value>,
+    pub(super) source: ScanMaterializationSource,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ColumnarReadAccessPattern {
     Point,

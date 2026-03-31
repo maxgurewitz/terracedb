@@ -176,6 +176,7 @@ fn happy_path_client_host(done: watch::Sender<bool>) -> SimulationHost {
                 )
                 .await?;
             assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(ingested.received_readings, readings.len());
             assert_eq!(ingested.accepted_readings, readings.len());
             assert_eq!(ingested.updated_devices.len(), 2);
 
@@ -218,6 +219,7 @@ fn happy_path_client_host(done: watch::Sender<bool>) -> SimulationHost {
                     ],
                     only_alerts: true,
                 })),
+                execution: None,
             };
             let (status, scan): (StatusCode, TelemetryScanResponse) = client
                 .request_json::<IngestReadingsRequest, TelemetryScanResponse>(
@@ -382,6 +384,7 @@ fn telemetry_api_simulation_restarts_cleanly_under_low_budgets_and_reuses_remote
                     window_end,
                     vec![TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
                     false,
+                    false,
                 )
                 .await
                 .map_err(boxed_error)?;
@@ -507,6 +510,7 @@ async fn accelerated_profile_matches_base_results_and_disabled_accelerants_do_no
             301,
             vec![TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
             true,
+            false,
         )
         .await?;
     let expected_summary = base_app
@@ -535,6 +539,7 @@ async fn accelerated_profile_matches_base_results_and_disabled_accelerants_do_no
             readings: readings.clone(),
         })
         .await?;
+    accel_db.flush().await?;
     for _ in 0..3 {
         let _ = accel_app
             .state()
@@ -543,6 +548,7 @@ async fn accelerated_profile_matches_base_results_and_disabled_accelerants_do_no
                 100,
                 301,
                 vec![TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
+                false,
                 false,
             )
             .await?;
@@ -557,6 +563,26 @@ async fn accelerated_profile_matches_base_results_and_disabled_accelerants_do_no
         })
         .await?;
     assert!(!probe.is_empty());
+    let debug_scan = accel_app
+        .state()
+        .scan_window(
+            "device-01",
+            100,
+            301,
+            vec![TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
+            true,
+            true,
+        )
+        .await?;
+    assert_eq!(debug_scan.rows, expected_scan.rows);
+    let execution = debug_scan
+        .execution
+        .expect("debug scan should include execution");
+    let columnar = execution
+        .columnar
+        .expect("telemetry history scan should report columnar execution");
+    assert_eq!(columnar.rows_returned, debug_scan.rows.len());
+    assert!(columnar.sstables_considered >= 1 || columnar.rows_evaluated >= debug_scan.rows.len());
     assert_eq!(
         accel_app
             .state()
@@ -566,6 +592,7 @@ async fn accelerated_profile_matches_base_results_and_disabled_accelerants_do_no
                 301,
                 vec![TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
                 true,
+                false,
             )
             .await?,
         expected_scan,
@@ -621,6 +648,7 @@ async fn accelerated_profile_matches_base_results_and_disabled_accelerants_do_no
                 301,
                 vec![TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
                 true,
+                false,
             )
             .await?,
         TelemetryScanResponse {
@@ -641,6 +669,7 @@ async fn accelerated_profile_matches_base_results_and_disabled_accelerants_do_no
                 ],
                 only_alerts: true,
             })),
+            execution: None,
         }
     );
     Ok(())
@@ -694,6 +723,7 @@ async fn missing_projection_sidecars_fall_back_to_base_results() -> Result<(), B
             301,
             vec![TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
             true,
+            false,
         )
         .await?;
     assert_eq!(

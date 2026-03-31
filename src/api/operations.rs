@@ -128,9 +128,113 @@ impl CommitOptions {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScanPredicate {
+    #[default]
+    AlwaysTrue,
+    All {
+        predicates: Vec<ScanPredicate>,
+    },
+    FieldEquals {
+        field: String,
+        value: FieldValue,
+    },
+    Int64AtLeast {
+        field: String,
+        value: i64,
+    },
+    BoolEquals {
+        field: String,
+        value: bool,
+    },
+}
+
+impl ScanPredicate {
+    pub fn all(predicates: impl IntoIterator<Item = Self>) -> Self {
+        let predicates = predicates
+            .into_iter()
+            .filter(|predicate| !matches!(predicate, Self::AlwaysTrue))
+            .collect::<Vec<_>>();
+        match predicates.len() {
+            0 => Self::AlwaysTrue,
+            1 => predicates.into_iter().next().expect("single predicate"),
+            _ => Self::All { predicates },
+        }
+    }
+
+    pub fn field_equals(field: impl Into<String>, value: impl Into<FieldValue>) -> Self {
+        Self::FieldEquals {
+            field: field.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn int64_at_least(field: impl Into<String>, value: i64) -> Self {
+        Self::Int64AtLeast {
+            field: field.into(),
+            value,
+        }
+    }
+
+    pub fn bool_equals(field: impl Into<String>, value: bool) -> Self {
+        Self::BoolEquals {
+            field: field.into(),
+            value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMaterializationSource {
+    #[default]
+    BasePart,
+    ProjectionSidecar,
+    ProjectionFallbackToBase,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarScanPartExecution {
+    pub local_id: String,
+    pub skip_indexes_used: Vec<String>,
+    pub skip_index_pruned: bool,
+    pub skip_index_fallback_to_base: bool,
+    pub zone_map_pruned: bool,
+    pub projection_sidecar_reads: usize,
+    pub projection_fallback_reads: usize,
+    pub base_part_reads: usize,
+    pub rows_materialized: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowScanExecution {
+    pub visited_key_groups: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarScanExecution {
+    pub sstables_considered: usize,
+    pub sstables_pruned_by_skip_index: usize,
+    pub sstables_pruned_by_zone_map: usize,
+    pub rows_evaluated: usize,
+    pub rows_returned: usize,
+    pub parts: Vec<ColumnarScanPartExecution>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanExecution {
+    pub rows_returned: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<RowScanExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columnar: Option<ColumnarScanExecution>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScanOptions {
     pub reverse: bool,
     pub limit: Option<usize>,
     pub columns: Option<Vec<String>>,
+    pub predicate: Option<ScanPredicate>,
 }

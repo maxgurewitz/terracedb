@@ -986,7 +986,7 @@ impl Db {
                 let value = if kind == ChangeKind::Delete {
                     None
                 } else {
-                    Some(values.get(&row_index).cloned().ok_or_else(|| {
+                    Some(values.rows.get(&row_index).cloned().ok_or_else(|| {
                         StorageError::corruption(format!(
                             "columnar SSTable {} row {} was not materialized for compaction",
                             location, row_index
@@ -1053,6 +1053,7 @@ impl Db {
                         ColumnarReadAccessPattern::Scan,
                     )
                     .await?
+                    .0
                 }
             };
             let value = resolved.value.ok_or_else(|| {

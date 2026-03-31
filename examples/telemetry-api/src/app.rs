@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io};
 
 use axum::{
     Json, Router,
@@ -12,16 +12,17 @@ use serde::Serialize;
 use thiserror::Error;
 
 use terracedb::{
-    CommitError, CompactionStrategy, CreateTableError, Db, DbBuilder, DbConfig, DbSettings,
-    FieldDefinition, FieldId, FieldType, FieldValue, HybridCompactToWidePromotionConfig,
-    HybridProjectionSidecarConfig, HybridReadConfig, HybridSkipIndexConfig, HybridSkipIndexFamily,
-    HybridTableFeatures, OpenError, ReadError, S3Location, ScanOptions, SchemaDefinition,
-    StorageError, Table, TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig,
-    Transaction, TransactionCommitError, Value,
+    ColumnarRecord, ColumnarTableConfigBuilder, CommitError, CompactionStrategy, CreateTableError,
+    Db, DbBuilder, DbConfig, DbSettings, FieldDefinition, FieldId, FieldType, FieldValue,
+    HybridCompactToWidePromotionConfig, HybridProfile, HybridProjectionSidecarConfig,
+    HybridReadConfig, HybridSkipIndexConfig, HybridSkipIndexFamily, HybridTableFeatures, OpenError,
+    ReadError, S3Location, ScanOptions, ScanPredicate, SchemaDefinition, StorageError, Table,
+    TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Transaction,
+    TransactionCommitError,
 };
 use terracedb_records::{
-    JsonValueCodec, RecordCodecError, RecordReadError, RecordTable, RecordWriteError,
-    Utf8StringCodec,
+    ColumnarProjection, ColumnarRecordCodec, ColumnarTable, JsonValueCodec, KeyCodec,
+    RecordCodecError, RecordReadError, RecordTable, RecordWriteError, Utf8StringCodec,
 };
 
 use crate::model::{
@@ -42,6 +43,149 @@ const ALERT_ACTIVE_FIELD_ID: FieldId = FieldId::new(4);
 
 type DeviceStateTable =
     RecordTable<String, DeviceStateRecord, Utf8StringCodec, JsonValueCodec<DeviceStateRecord>>;
+type SensorReadingsTable = ColumnarTable<
+    SensorReadingKey,
+    SensorReadingRecord,
+    SensorReadingKeyCodec,
+    SensorReadingRecordCodec,
+>;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SensorReadingKey {
+    device_id: String,
+    reading_at_ms: u64,
+}
+
+impl SensorReadingKey {
+    fn new(device_id: impl Into<String>, reading_at_ms: u64) -> Self {
+        Self {
+            device_id: device_id.into(),
+            reading_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SensorReadingRecord {
+    temperature_c: i64,
+    humidity_pct: i64,
+    battery_mv: i64,
+    alert_active: bool,
+}
+
+impl From<&IngestReading> for SensorReadingRecord {
+    fn from(reading: &IngestReading) -> Self {
+        Self {
+            temperature_c: reading.temperature_c,
+            humidity_pct: reading.humidity_pct,
+            battery_mv: reading.battery_mv,
+            alert_active: reading.alert_active,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SensorReadingKeyCodec;
+
+impl KeyCodec<SensorReadingKey> for SensorReadingKeyCodec {
+    fn encode_key(&self, key: &SensorReadingKey) -> Result<Vec<u8>, RecordCodecError> {
+        Ok(format!("device:{}:{:020}", key.device_id, key.reading_at_ms).into_bytes())
+    }
+
+    fn decode_key(&self, key: &[u8]) -> Result<SensorReadingKey, RecordCodecError> {
+        let key = std::str::from_utf8(key).map_err(RecordCodecError::decode_key)?;
+        let (prefix, timestamp) = key.rsplit_once(':').ok_or_else(|| {
+            RecordCodecError::decode_key(io::Error::other(format!(
+                "telemetry key {key} is missing a timestamp"
+            )))
+        })?;
+        let device_id = prefix.strip_prefix("device:").ok_or_else(|| {
+            RecordCodecError::decode_key(io::Error::other(format!(
+                "telemetry key {key} is missing the device prefix"
+            )))
+        })?;
+        Ok(SensorReadingKey {
+            device_id: device_id.to_string(),
+            reading_at_ms: timestamp.parse().map_err(RecordCodecError::decode_key)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SensorReadingRecordCodec;
+
+impl ColumnarRecordCodec<SensorReadingRecord> for SensorReadingRecordCodec {
+    fn encode_record(
+        &self,
+        value: &SensorReadingRecord,
+    ) -> Result<ColumnarRecord, RecordCodecError> {
+        Ok(BTreeMap::from([
+            (
+                TEMPERATURE_C_FIELD_ID,
+                FieldValue::Int64(value.temperature_c),
+            ),
+            (HUMIDITY_PCT_FIELD_ID, FieldValue::Int64(value.humidity_pct)),
+            (BATTERY_MV_FIELD_ID, FieldValue::Int64(value.battery_mv)),
+            (ALERT_ACTIVE_FIELD_ID, FieldValue::Bool(value.alert_active)),
+        ]))
+    }
+
+    fn decode_record(
+        &self,
+        record: &ColumnarRecord,
+    ) -> Result<SensorReadingRecord, RecordCodecError> {
+        Ok(SensorReadingRecord {
+            temperature_c: extract_i64(record, TEMPERATURE_C_FIELD_ID, TEMPERATURE_C_FIELD_NAME)?,
+            humidity_pct: extract_i64(record, HUMIDITY_PCT_FIELD_ID, HUMIDITY_PCT_FIELD_NAME)?,
+            battery_mv: extract_i64(record, BATTERY_MV_FIELD_ID, BATTERY_MV_FIELD_NAME)?,
+            alert_active: extract_bool(record, ALERT_ACTIVE_FIELD_ID, ALERT_ACTIVE_FIELD_NAME)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TelemetryScanProjection {
+    columns: Vec<TelemetryColumn>,
+}
+
+impl TelemetryScanProjection {
+    fn new(columns: Vec<TelemetryColumn>) -> Self {
+        Self { columns }
+    }
+}
+
+impl ColumnarProjection<SensorReadingKey, TelemetryScanRow> for TelemetryScanProjection {
+    fn columns(&self) -> Vec<String> {
+        self.columns
+            .iter()
+            .map(|column| column.as_str().to_string())
+            .collect()
+    }
+
+    fn decode_projection(
+        &self,
+        key: &SensorReadingKey,
+        record: &ColumnarRecord,
+    ) -> Result<TelemetryScanRow, RecordCodecError> {
+        let include = |column| self.columns.contains(&column);
+        Ok(TelemetryScanRow {
+            device_id: key.device_id.clone(),
+            reading_at_ms: key.reading_at_ms,
+            temperature_c: include(TelemetryColumn::TemperatureC)
+                .then(|| extract_i64(record, TEMPERATURE_C_FIELD_ID, TEMPERATURE_C_FIELD_NAME))
+                .transpose()?,
+            humidity_pct: include(TelemetryColumn::HumidityPct)
+                .then(|| extract_i64(record, HUMIDITY_PCT_FIELD_ID, HUMIDITY_PCT_FIELD_NAME))
+                .transpose()?,
+            battery_mv: include(TelemetryColumn::BatteryMv)
+                .then(|| extract_i64(record, BATTERY_MV_FIELD_ID, BATTERY_MV_FIELD_NAME))
+                .transpose()?,
+            alert_active: include(TelemetryColumn::AlertActive)
+                .then(|| extract_bool(record, ALERT_ACTIVE_FIELD_ID, ALERT_ACTIVE_FIELD_NAME))
+                .transpose()?,
+        })
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum TelemetryAppError {
@@ -112,112 +256,6 @@ impl IntoResponse for TelemetryApiError {
 }
 
 #[derive(Clone, Debug)]
-pub struct SensorReadingsTable {
-    table: Table,
-    schema: SchemaDefinition,
-}
-
-impl SensorReadingsTable {
-    pub fn table(&self) -> &Table {
-        &self.table
-    }
-
-    fn encode_key(&self, device_id: &str, reading_at_ms: u64) -> Vec<u8> {
-        format!("device:{device_id}:{reading_at_ms:020}").into_bytes()
-    }
-
-    fn window_bounds(&self, device_id: &str, start_ms: u64, end_ms: u64) -> (Vec<u8>, Vec<u8>) {
-        (
-            self.encode_key(device_id, start_ms),
-            self.encode_key(device_id, end_ms),
-        )
-    }
-
-    fn encode_value(&self, reading: &IngestReading) -> Result<Value, TelemetryAppError> {
-        Ok(Value::named_record(
-            &self.schema,
-            [
-                (
-                    TEMPERATURE_C_FIELD_NAME,
-                    FieldValue::Int64(reading.temperature_c),
-                ),
-                (
-                    HUMIDITY_PCT_FIELD_NAME,
-                    FieldValue::Int64(reading.humidity_pct),
-                ),
-                (BATTERY_MV_FIELD_NAME, FieldValue::Int64(reading.battery_mv)),
-                (
-                    ALERT_ACTIVE_FIELD_NAME,
-                    FieldValue::Bool(reading.alert_active),
-                ),
-            ],
-        )?)
-    }
-
-    async fn scan_window(
-        &self,
-        device_id: &str,
-        start_ms: u64,
-        end_ms: u64,
-        columns: &[TelemetryColumn],
-    ) -> Result<Vec<TelemetryScanRow>, TelemetryAppError> {
-        let (start, end) = self.window_bounds(device_id, start_ms, end_ms);
-        let mut stream = self
-            .table
-            .scan(
-                start,
-                end,
-                ScanOptions {
-                    columns: Some(
-                        columns
-                            .iter()
-                            .map(|column| column.as_str().to_string())
-                            .collect(),
-                    ),
-                    ..ScanOptions::default()
-                },
-            )
-            .await?;
-        let mut rows = Vec::new();
-        while let Some((key, value)) = stream.next().await {
-            rows.push(self.decode_projected_row(device_id, &key, &value, columns)?);
-        }
-        Ok(rows)
-    }
-
-    fn decode_projected_row(
-        &self,
-        device_id: &str,
-        key: &[u8],
-        value: &Value,
-        columns: &[TelemetryColumn],
-    ) -> Result<TelemetryScanRow, TelemetryAppError> {
-        let Value::Record(record) = value else {
-            return Err(TelemetryAppError::InvalidRecord(
-                "columnar telemetry rows must decode as records".to_string(),
-            ));
-        };
-        let include = |column| columns.contains(&column);
-        Ok(TelemetryScanRow {
-            device_id: device_id.to_string(),
-            reading_at_ms: decode_timestamp_from_key(key)?,
-            temperature_c: include(TelemetryColumn::TemperatureC)
-                .then(|| extract_i64(record, TEMPERATURE_C_FIELD_ID, TEMPERATURE_C_FIELD_NAME))
-                .transpose()?,
-            humidity_pct: include(TelemetryColumn::HumidityPct)
-                .then(|| extract_i64(record, HUMIDITY_PCT_FIELD_ID, HUMIDITY_PCT_FIELD_NAME))
-                .transpose()?,
-            battery_mv: include(TelemetryColumn::BatteryMv)
-                .then(|| extract_i64(record, BATTERY_MV_FIELD_ID, BATTERY_MV_FIELD_NAME))
-                .transpose()?,
-            alert_active: include(TelemetryColumn::AlertActive)
-                .then(|| extract_bool(record, ALERT_ACTIVE_FIELD_ID, ALERT_ACTIVE_FIELD_NAME))
-                .transpose()?,
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct TelemetryTables {
     device_state: DeviceStateTable,
     sensor_readings: SensorReadingsTable,
@@ -226,10 +264,6 @@ pub struct TelemetryTables {
 impl TelemetryTables {
     pub fn device_state(&self) -> &DeviceStateTable {
         &self.device_state
-    }
-
-    pub fn sensor_readings(&self) -> &SensorReadingsTable {
-        &self.sensor_readings
     }
 
     pub fn sensor_readings_raw(&self) -> &Table {
@@ -250,7 +284,7 @@ pub struct TelemetryApp {
 
 impl TelemetryApp {
     pub async fn open(db: Db, profile: TelemetryExampleProfile) -> Result<Self, TelemetryAppError> {
-        let tables = ensure_telemetry_tables(&db).await?;
+        let tables = ensure_telemetry_tables(&db, profile).await?;
         Ok(Self {
             state: TelemetryAppState {
                 db,
@@ -295,7 +329,8 @@ impl TelemetryAppState {
         &self,
         request: IngestReadingsRequest,
     ) -> Result<IngestReadingsResponse, TelemetryApiError> {
-        if request.readings.is_empty() {
+        let received_readings = request.readings.len();
+        if received_readings == 0 {
             return Err(TelemetryApiError::BadRequest(
                 "readings must contain at least one item".to_string(),
             ));
@@ -317,13 +352,14 @@ impl TelemetryAppState {
         let mut tx = Transaction::begin(&self.db).await;
         let mut updated_devices = BTreeMap::<String, DeviceStateRecord>::new();
         for ((device_id, _reading_at_ms), reading) in deduped {
-            tx.write(
-                self.tables.sensor_readings.table(),
-                self.tables
-                    .sensor_readings
-                    .encode_key(&device_id, reading.reading_at_ms),
-                self.tables.sensor_readings.encode_value(&reading)?,
-            );
+            self.tables
+                .sensor_readings
+                .write_in(
+                    &mut tx,
+                    &SensorReadingKey::new(device_id.clone(), reading.reading_at_ms),
+                    &SensorReadingRecord::from(&reading),
+                )
+                .map_err(TelemetryAppError::from)?;
 
             let existing = self
                 .tables
@@ -354,6 +390,7 @@ impl TelemetryAppState {
         tx.commit().await.map_err(TelemetryAppError::from)?;
 
         Ok(IngestReadingsResponse {
+            received_readings,
             accepted_readings,
             updated_devices: updated_devices.into_values().collect(),
         })
@@ -377,38 +414,29 @@ impl TelemetryAppState {
         end_ms: u64,
         columns: Vec<TelemetryColumn>,
         only_alerts: bool,
+        debug: bool,
     ) -> Result<TelemetryScanResponse, TelemetryApiError> {
         validate_window(start_ms, end_ms)?;
         let device_id = normalize_device_id(device_id)?;
         let response_columns = dedup_columns(columns);
-        let mut scan_columns = response_columns.clone();
-        if only_alerts && !scan_columns.contains(&TelemetryColumn::AlertActive) {
-            scan_columns.push(TelemetryColumn::AlertActive);
+        let projection = TelemetryScanProjection::new(response_columns.clone());
+        let mut scan_options = ScanOptions::default();
+        if only_alerts {
+            scan_options.predicate =
+                Some(ScanPredicate::bool_equals(ALERT_ACTIVE_FIELD_NAME, true));
         }
-
-        let rows = self
+        let start_key = SensorReadingKey::new(device_id.clone(), start_ms);
+        let end_key = SensorReadingKey::new(device_id.clone(), end_ms);
+        let (mut stream, execution) = self
             .tables
             .sensor_readings
-            .scan_window(&device_id, start_ms, end_ms, &scan_columns)
-            .await?
-            .into_iter()
-            .filter(|row| !only_alerts || row.alert_active == Some(true))
-            .map(|mut row| {
-                if !response_columns.contains(&TelemetryColumn::TemperatureC) {
-                    row.temperature_c = None;
-                }
-                if !response_columns.contains(&TelemetryColumn::HumidityPct) {
-                    row.humidity_pct = None;
-                }
-                if !response_columns.contains(&TelemetryColumn::BatteryMv) {
-                    row.battery_mv = None;
-                }
-                if !response_columns.contains(&TelemetryColumn::AlertActive) {
-                    row.alert_active = None;
-                }
-                row
-            })
-            .collect();
+            .scan_projected_with_execution(&start_key, &end_key, &projection, scan_options)
+            .await
+            .map_err(TelemetryAppError::from)?;
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row);
+        }
 
         Ok(TelemetryScanResponse {
             device_id,
@@ -417,6 +445,7 @@ impl TelemetryAppState {
             columns: response_columns,
             only_alerts,
             rows,
+            execution: debug.then_some(execution),
         })
     }
 
@@ -428,16 +457,25 @@ impl TelemetryAppState {
     ) -> Result<TelemetrySummaryResponse, TelemetryApiError> {
         validate_window(start_ms, end_ms)?;
         let device_id = normalize_device_id(device_id)?;
-        let rows = self
+        let projection = TelemetryScanProjection::new(vec![
+            TelemetryColumn::TemperatureC,
+            TelemetryColumn::AlertActive,
+        ]);
+        let (mut stream, _execution) = self
             .tables
             .sensor_readings
-            .scan_window(
-                &device_id,
-                start_ms,
-                end_ms,
-                &[TelemetryColumn::TemperatureC, TelemetryColumn::AlertActive],
+            .scan_projected_with_execution(
+                &SensorReadingKey::new(device_id.clone(), start_ms),
+                &SensorReadingKey::new(device_id.clone(), end_ms),
+                &projection,
+                ScanOptions::default(),
             )
-            .await?;
+            .await
+            .map_err(TelemetryAppError::from)?;
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row);
+        }
         let reading_count = rows.len();
         let alert_count = rows
             .iter()
@@ -499,7 +537,10 @@ pub fn telemetry_db_config(path: &str, prefix: &str, profile: TelemetryExamplePr
     }
 }
 
-pub async fn ensure_telemetry_tables(db: &Db) -> Result<TelemetryTables, TelemetryAppError> {
+pub async fn ensure_telemetry_tables(
+    db: &Db,
+    profile: TelemetryExampleProfile,
+) -> Result<TelemetryTables, TelemetryAppError> {
     let sensor_schema = telemetry_sensor_schema();
     Ok(TelemetryTables {
         device_state: RecordTable::with_codecs(
@@ -507,11 +548,16 @@ pub async fn ensure_telemetry_tables(db: &Db) -> Result<TelemetryTables, Telemet
             Utf8StringCodec,
             JsonValueCodec::new(),
         ),
-        sensor_readings: SensorReadingsTable {
-            table: ensure_table(db, sensor_readings_table_config(SENSOR_READINGS_TABLE_NAME))
-                .await?,
-            schema: sensor_schema,
-        },
+        sensor_readings: ColumnarTable::with_codecs(
+            ensure_table(
+                db,
+                sensor_readings_table_config(SENSOR_READINGS_TABLE_NAME, profile),
+            )
+            .await?,
+            sensor_schema,
+            SensorReadingKeyCodec,
+            SensorReadingRecordCodec,
+        ),
     })
 }
 
@@ -538,61 +584,30 @@ fn row_table_config(name: &str) -> TableConfig {
     }
 }
 
-fn sensor_readings_table_config(name: &str) -> TableConfig {
-    with_compact_to_wide_promotion(
-        with_hybrid_features(
-            TableConfig {
-                name: name.to_string(),
-                format: TableFormat::Columnar,
-                merge_operator: None,
-                max_merge_operand_chain_length: None,
-                compaction_filter: None,
-                bloom_filter_bits_per_key: Some(10),
-                history_retention_sequences: None,
-                compaction_strategy: CompactionStrategy::Leveled,
-                schema: Some(telemetry_sensor_schema()),
-                metadata: Default::default(),
-            },
-            HybridTableFeatures {
-                skip_indexes: vec![HybridSkipIndexConfig {
-                    name: "alert-active".to_string(),
-                    family: HybridSkipIndexFamily::FieldValueBloom,
-                    field: Some(ALERT_ACTIVE_FIELD_NAME.to_string()),
-                    max_values: 16,
-                }],
-                projection_sidecars: vec![HybridProjectionSidecarConfig {
-                    name: "temperature-alert-summary".to_string(),
-                    fields: vec![
-                        TEMPERATURE_C_FIELD_NAME.to_string(),
-                        ALERT_ACTIVE_FIELD_NAME.to_string(),
-                    ],
-                }],
-            },
-        ),
-        HybridCompactToWidePromotionConfig {
+fn sensor_readings_table_config(name: &str, profile: TelemetryExampleProfile) -> TableConfig {
+    ColumnarTableConfigBuilder::new(name, telemetry_sensor_schema())
+        .bloom_filter_bits_per_key(Some(10))
+        .compaction_strategy(CompactionStrategy::Leveled)
+        .hybrid_features(HybridTableFeatures {
+            skip_indexes: vec![HybridSkipIndexConfig {
+                name: "alert-active".to_string(),
+                family: HybridSkipIndexFamily::FieldValueBloom,
+                field: Some(ALERT_ACTIVE_FIELD_NAME.to_string()),
+                max_values: 16,
+            }],
+            projection_sidecars: vec![HybridProjectionSidecarConfig {
+                name: "temperature-alert-summary".to_string(),
+                fields: vec![
+                    TEMPERATURE_C_FIELD_NAME.to_string(),
+                    ALERT_ACTIVE_FIELD_NAME.to_string(),
+                ],
+            }],
+        })
+        .compact_to_wide_promotion(Some(HybridCompactToWidePromotionConfig {
             max_compact_rows: 8,
             ..HybridCompactToWidePromotionConfig::default()
-        },
-    )
-}
-
-fn with_hybrid_features(mut config: TableConfig, features: HybridTableFeatures) -> TableConfig {
-    config.metadata.insert(
-        terracedb::HYBRID_TABLE_FEATURES_METADATA_KEY.to_string(),
-        serde_json::to_value(features).expect("serialize telemetry hybrid features"),
-    );
-    config
-}
-
-fn with_compact_to_wide_promotion(
-    mut config: TableConfig,
-    promotion: HybridCompactToWidePromotionConfig,
-) -> TableConfig {
-    config.metadata.insert(
-        terracedb::HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY.to_string(),
-        serde_json::to_value(promotion).expect("serialize telemetry compact-to-wide config"),
-    );
-    config
+        }))
+        .build_for_profile(hybrid_profile(profile))
 }
 
 fn telemetry_sensor_schema() -> SchemaDefinition {
@@ -632,19 +647,18 @@ fn telemetry_sensor_schema() -> SchemaDefinition {
 }
 
 fn profile_hybrid_read_config(profile: TelemetryExampleProfile) -> HybridReadConfig {
-    let mut config = HybridReadConfig {
-        raw_segment_cache_bytes: 64 * 1024,
-        decoded_metadata_cache_entries: 32,
-        decoded_column_cache_entries: 64,
-        ..HybridReadConfig::default()
-    };
-    if matches!(profile, TelemetryExampleProfile::Accelerated) {
-        config.skip_indexes_enabled = true;
-        config.projection_sidecars_enabled = true;
-        config.aggressive_background_repair = true;
-        config.compact_to_wide_promotion_enabled = true;
-    }
+    let mut config = HybridReadConfig::for_profile(hybrid_profile(profile));
+    config.raw_segment_cache_bytes = 64 * 1024;
+    config.decoded_metadata_cache_entries = 32;
+    config.decoded_column_cache_entries = 64;
     config
+}
+
+fn hybrid_profile(profile: TelemetryExampleProfile) -> HybridProfile {
+    match profile {
+        TelemetryExampleProfile::Base => HybridProfile::Base,
+        TelemetryExampleProfile::Accelerated => HybridProfile::Accelerated,
+    }
 }
 
 fn normalize_device_id(value: &str) -> Result<String, TelemetryApiError> {
@@ -676,24 +690,16 @@ fn validate_window(start_ms: u64, end_ms: u64) -> Result<(), TelemetryApiError> 
     Ok(())
 }
 
-fn decode_timestamp_from_key(key: &[u8]) -> Result<u64, TelemetryAppError> {
-    let key = std::str::from_utf8(key)?;
-    let (_, timestamp) = key.rsplit_once(':').ok_or_else(|| {
-        TelemetryAppError::InvalidRecord(format!("telemetry key {key} is missing a timestamp"))
-    })?;
-    Ok(timestamp.parse()?)
-}
-
 fn extract_i64(
     record: &BTreeMap<FieldId, FieldValue>,
     field_id: FieldId,
     field_name: &str,
-) -> Result<i64, TelemetryAppError> {
+) -> Result<i64, RecordCodecError> {
     match record.get(&field_id) {
         Some(FieldValue::Int64(value)) => Ok(*value),
-        other => Err(TelemetryAppError::InvalidRecord(format!(
+        other => Err(RecordCodecError::decode_value(io::Error::other(format!(
             "field {field_name} was expected to be int64, got {other:?}"
-        ))),
+        )))),
     }
 }
 
@@ -701,12 +707,12 @@ fn extract_bool(
     record: &BTreeMap<FieldId, FieldValue>,
     field_id: FieldId,
     field_name: &str,
-) -> Result<bool, TelemetryAppError> {
+) -> Result<bool, RecordCodecError> {
     match record.get(&field_id) {
         Some(FieldValue::Bool(value)) => Ok(*value),
-        other => Err(TelemetryAppError::InvalidRecord(format!(
+        other => Err(RecordCodecError::decode_value(io::Error::other(format!(
             "field {field_name} was expected to be bool, got {other:?}"
-        ))),
+        )))),
     }
 }
 
@@ -745,6 +751,7 @@ async fn scan_readings(
                 query.end_ms,
                 columns,
                 query.only_alerts,
+                query.debug,
             )
             .await?,
     ))
