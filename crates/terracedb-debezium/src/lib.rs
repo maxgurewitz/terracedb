@@ -1,25 +1,30 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error as StdError,
     fmt,
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use terracedb::{Db, Key, Table, Transaction, Value};
+use terracedb::{
+    ChangeEntry, CreateTableError, Db, Key, SequenceNumber, Table, TableConfig, Transaction, Value,
+};
 use terracedb_kafka::{
     KafkaAppendOnlyTables, KafkaBatchHandler, KafkaMaterializationError, KafkaRecord,
     KafkaTopicPartition,
 };
-use terracedb_workflows::{
-    WorkflowSource, WorkflowSourceBootstrapPolicy, WorkflowSourceCapabilities,
-    WorkflowSourceConfig, WorkflowSourceRecoveryPolicy,
+use terracedb_projections::{
+    MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionHandlerError,
+    ProjectionSequenceRun, ProjectionTransaction, RecomputeStrategy,
 };
+use terracedb_workflows::{WorkflowSource, WorkflowSourceConfig};
 use thiserror::Error;
 
 const PRIMARY_KEY_FORMAT_VERSION: u8 = 1;
 const NORMALIZED_EVENT_FORMAT_VERSION: u8 = 1;
 const MIRROR_ROW_FORMAT_VERSION: u8 = 1;
+const DERIVED_TRANSITION_FORMAT_VERSION: u8 = 1;
 
 pub type DebeziumRow = BTreeMap<String, JsonValue>;
 
@@ -62,8 +67,73 @@ impl DebeziumEventKind {
 #[serde(rename_all = "kebab-case")]
 pub enum DebeziumSnapshotMarker {
     Initial,
+    First,
     Last,
+    LastInDataCollection,
     Incremental,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DebeziumSnapshotPhase {
+    Initial,
+    Incremental,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DebeziumSnapshotBoundary {
+    Middle,
+    FirstRecordInCollection,
+    LastRecordInCollection,
+    LastRecordInSnapshot,
+}
+
+impl DebeziumSnapshotMarker {
+    pub const fn phase(self) -> DebeziumSnapshotPhase {
+        match self {
+            Self::Initial | Self::First | Self::Last | Self::LastInDataCollection => {
+                DebeziumSnapshotPhase::Initial
+            }
+            Self::Incremental => DebeziumSnapshotPhase::Incremental,
+        }
+    }
+
+    pub const fn boundary(self) -> DebeziumSnapshotBoundary {
+        match self {
+            Self::Initial | Self::Incremental => DebeziumSnapshotBoundary::Middle,
+            Self::First => DebeziumSnapshotBoundary::FirstRecordInCollection,
+            Self::LastInDataCollection => DebeziumSnapshotBoundary::LastRecordInCollection,
+            Self::Last => DebeziumSnapshotBoundary::LastRecordInSnapshot,
+        }
+    }
+
+    pub const fn is_initial(self) -> bool {
+        matches!(self.phase(), DebeziumSnapshotPhase::Initial)
+    }
+
+    pub const fn is_incremental(self) -> bool {
+        matches!(self.phase(), DebeziumSnapshotPhase::Incremental)
+    }
+
+    pub const fn is_boundary(self) -> bool {
+        !matches!(self.boundary(), DebeziumSnapshotBoundary::Middle)
+    }
+
+    pub const fn ends_data_collection(self) -> bool {
+        matches!(
+            self.boundary(),
+            DebeziumSnapshotBoundary::LastRecordInCollection
+                | DebeziumSnapshotBoundary::LastRecordInSnapshot
+        )
+    }
+
+    pub const fn ends_snapshot(self) -> bool {
+        matches!(
+            self.boundary(),
+            DebeziumSnapshotBoundary::LastRecordInSnapshot
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -149,6 +219,83 @@ impl DebeziumPrimaryKey {
     pub fn decode(bytes: &[u8]) -> Result<Self, DebeziumCodecError> {
         decode_versioned_json(PRIMARY_KEY_FORMAT_VERSION, "primary key", bytes)
     }
+
+    pub fn field(&self, field: &str) -> Option<&JsonValue> {
+        self.fields.get(field)
+    }
+
+    pub fn require_string_or_number(&self, field: &str) -> Result<String, DebeziumDataError> {
+        match self.field(field) {
+            Some(JsonValue::String(text)) => Ok(text.clone()),
+            Some(JsonValue::Number(number)) => Ok(number.to_string()),
+            Some(other) => Err(DebeziumDataError::invalid_field(
+                "primary key",
+                field,
+                format!("expected string or number, found {other}"),
+            )),
+            None => Err(DebeziumDataError::missing_field("primary key", field)),
+        }
+    }
+}
+
+pub trait DebeziumRowExt {
+    fn field(&self, field: &str) -> Option<&JsonValue>;
+    fn require_field(&self, field: &str) -> Result<&JsonValue, DebeziumDataError>;
+    fn require_string(&self, field: &str) -> Result<&str, DebeziumDataError>;
+}
+
+impl DebeziumRowExt for DebeziumRow {
+    fn field(&self, field: &str) -> Option<&JsonValue> {
+        self.get(field)
+    }
+
+    fn require_field(&self, field: &str) -> Result<&JsonValue, DebeziumDataError> {
+        self.get(field)
+            .ok_or_else(|| DebeziumDataError::missing_field("row", field))
+    }
+
+    fn require_string(&self, field: &str) -> Result<&str, DebeziumDataError> {
+        match self.require_field(field)? {
+            JsonValue::String(text) => Ok(text),
+            other => Err(DebeziumDataError::invalid_field(
+                "row",
+                field,
+                format!("expected string, found {other}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DebeziumDataError {
+    #[error("debezium {context} is missing required field `{field}`")]
+    MissingField {
+        context: &'static str,
+        field: String,
+    },
+    #[error("debezium {context}.{field} has invalid type: {message}")]
+    InvalidField {
+        context: &'static str,
+        field: String,
+        message: String,
+    },
+}
+
+impl DebeziumDataError {
+    fn missing_field(context: &'static str, field: &str) -> Self {
+        Self::MissingField {
+            context,
+            field: field.to_string(),
+        }
+    }
+
+    fn invalid_field(context: &'static str, field: &str, message: String) -> Self {
+        Self::InvalidField {
+            context,
+            field: field.to_string(),
+            message,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -174,6 +321,19 @@ impl DebeziumEvent {
         self.snapshot.is_some()
     }
 
+    pub fn snapshot_phase(&self) -> Option<DebeziumSnapshotPhase> {
+        self.snapshot.map(DebeziumSnapshotMarker::phase)
+    }
+
+    pub fn snapshot_boundary(&self) -> Option<DebeziumSnapshotBoundary> {
+        self.snapshot.map(DebeziumSnapshotMarker::boundary)
+    }
+
+    pub fn is_incremental_snapshot(&self) -> bool {
+        self.snapshot
+            .is_some_and(DebeziumSnapshotMarker::is_incremental)
+    }
+
     pub fn is_tombstone(&self) -> bool {
         self.kind.is_tombstone()
     }
@@ -183,6 +343,17 @@ impl DebeziumEvent {
             DebeziumRowImage::Before => self.before.as_ref(),
             DebeziumRowImage::After => self.after.as_ref(),
         }
+    }
+
+    pub fn membership(&self, predicate: &DebeziumRowPredicate) -> DebeziumRowMembership {
+        predicate.membership(self)
+    }
+
+    pub fn derived_transition(
+        &self,
+        predicate: &DebeziumRowPredicate,
+    ) -> Option<DebeziumDerivedTransition> {
+        DebeziumWorkflowEventPolicy::SkipSnapshotsAndTombstones.derived_transition(self, predicate)
     }
 
     pub fn to_value(&self) -> Result<Value, DebeziumCodecError> {
@@ -222,6 +393,167 @@ impl DebeziumMirrorRow {
         let bytes = expect_bytes(value, "mirror row")?;
         decode_versioned_json(MIRROR_ROW_FORMAT_VERSION, "mirror row", bytes)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DebeziumDerivedTransitionKind {
+    Entered,
+    Exited,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DebeziumDerivedTransition {
+    pub source_table: DebeziumSourceTable,
+    pub primary_key: DebeziumPrimaryKey,
+    pub kind: DebeziumDerivedTransitionKind,
+    pub membership: DebeziumRowMembership,
+    pub kafka: DebeziumKafkaCoordinates,
+    pub transaction: Option<DebeziumTransactionMetadata>,
+}
+
+impl DebeziumDerivedTransition {
+    pub fn to_value(&self) -> Result<Value, DebeziumCodecError> {
+        Ok(Value::bytes(encode_versioned_json(
+            DERIVED_TRANSITION_FORMAT_VERSION,
+            "derived transition",
+            self,
+        )?))
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, DebeziumCodecError> {
+        let bytes = expect_bytes(value, "derived transition")?;
+        decode_versioned_json(
+            DERIVED_TRANSITION_FORMAT_VERSION,
+            "derived transition",
+            bytes,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DebeziumChangeEntry {
+    Event(DebeziumEvent),
+    MirrorRow(DebeziumMirrorRow),
+    MirrorDelete {
+        primary_key: DebeziumPrimaryKey,
+        sequence: SequenceNumber,
+    },
+}
+
+impl DebeziumChangeEntry {
+    pub fn decode(entry: &ChangeEntry) -> Result<Self, DebeziumChangeEntryError> {
+        let Some(value) = &entry.value else {
+            return Ok(Self::MirrorDelete {
+                primary_key: DebeziumPrimaryKey::decode(&entry.key)?,
+                sequence: entry.sequence,
+            });
+        };
+
+        if let Ok(event) = DebeziumEvent::from_value(value) {
+            return Ok(Self::Event(event));
+        }
+
+        if let Ok(row) = DebeziumMirrorRow::from_value(value) {
+            return Ok(Self::MirrorRow(row));
+        }
+
+        Err(DebeziumChangeEntryError::UnsupportedValue)
+    }
+
+    pub fn primary_key(&self) -> &DebeziumPrimaryKey {
+        match self {
+            Self::Event(event) => &event.primary_key,
+            Self::MirrorRow(row) => &row.primary_key,
+            Self::MirrorDelete { primary_key, .. } => primary_key,
+        }
+    }
+
+    pub fn kafka_coordinates(&self) -> Option<&DebeziumKafkaCoordinates> {
+        match self {
+            Self::Event(event) => Some(&event.kafka),
+            Self::MirrorRow(row) => Some(&row.kafka),
+            Self::MirrorDelete { .. } => None,
+        }
+    }
+
+    pub fn as_event(&self) -> Option<&DebeziumEvent> {
+        match self {
+            Self::Event(event) => Some(event),
+            Self::MirrorRow(_) | Self::MirrorDelete { .. } => None,
+        }
+    }
+
+    pub fn as_mirror_row(&self) -> Option<&DebeziumMirrorRow> {
+        match self {
+            Self::MirrorRow(row) => Some(row),
+            Self::Event(_) | Self::MirrorDelete { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DebeziumMirrorChange {
+    Upsert(DebeziumMirrorRow),
+    Delete {
+        primary_key: DebeziumPrimaryKey,
+        sequence: SequenceNumber,
+    },
+}
+
+impl DebeziumMirrorChange {
+    pub fn decode(entry: &ChangeEntry) -> Result<Self, DebeziumMirrorChangeError> {
+        match DebeziumChangeEntry::decode(entry)? {
+            DebeziumChangeEntry::MirrorRow(row) => Ok(Self::Upsert(row)),
+            DebeziumChangeEntry::MirrorDelete {
+                primary_key,
+                sequence,
+            } => Ok(Self::Delete {
+                primary_key,
+                sequence,
+            }),
+            DebeziumChangeEntry::Event(_) => Err(DebeziumMirrorChangeError::UnexpectedEvent),
+        }
+    }
+
+    pub fn primary_key(&self) -> &DebeziumPrimaryKey {
+        match self {
+            Self::Upsert(row) => &row.primary_key,
+            Self::Delete { primary_key, .. } => primary_key,
+        }
+    }
+
+    pub fn kafka_coordinates(&self) -> Option<&DebeziumKafkaCoordinates> {
+        match self {
+            Self::Upsert(row) => Some(&row.kafka),
+            Self::Delete { .. } => None,
+        }
+    }
+
+    pub fn as_row(&self) -> Option<&DebeziumMirrorRow> {
+        match self {
+            Self::Upsert(row) => Some(row),
+            Self::Delete { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DebeziumChangeEntryError {
+    #[error(transparent)]
+    Codec(#[from] DebeziumCodecError),
+    #[error("change entry value does not decode as a Debezium event or mirror row")]
+    UnsupportedValue,
+}
+
+#[derive(Debug, Error)]
+pub enum DebeziumMirrorChangeError {
+    #[error(transparent)]
+    ChangeEntry(#[from] DebeziumChangeEntryError),
+    #[error(
+        "change entry decodes as a replayable Debezium event instead of a current-state mirror row"
+    )]
+    UnexpectedEvent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,19 +773,42 @@ impl DebeziumWorkflowEventPolicy {
     pub fn prefers_derived_tables(self) -> bool {
         matches!(self, Self::DerivedTransitionTables)
     }
+
+    pub fn derived_transition(
+        self,
+        event: &DebeziumEvent,
+        predicate: &DebeziumRowPredicate,
+    ) -> Option<DebeziumDerivedTransition> {
+        if !self.accepts(event) {
+            return None;
+        }
+
+        let membership = predicate.membership(event);
+        let kind = if membership.entered() {
+            DebeziumDerivedTransitionKind::Entered
+        } else if membership.exited() {
+            DebeziumDerivedTransitionKind::Exited
+        } else {
+            return None;
+        };
+
+        Some(DebeziumDerivedTransition {
+            source_table: event.source_table.clone(),
+            primary_key: event.primary_key.clone(),
+            kind,
+            membership,
+            kafka: event.kafka.clone(),
+            transaction: event.transaction.clone(),
+        })
+    }
 }
 
 pub fn event_log_workflow_source_config() -> WorkflowSourceConfig {
-    WorkflowSourceConfig::default()
-        .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::Beginning)
-        .with_recovery_policy(WorkflowSourceRecoveryPolicy::ReplayFromHistory)
-        .with_capabilities(WorkflowSourceCapabilities::replayable_append_only())
+    WorkflowSourceConfig::historical_replayable_source()
 }
 
 pub fn mirror_workflow_source_config() -> WorkflowSourceConfig {
-    WorkflowSourceConfig::default()
-        .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CurrentDurable)
-        .with_recovery_policy(WorkflowSourceRecoveryPolicy::FailClosed)
+    WorkflowSourceConfig::live_only_current_state_source()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +870,42 @@ impl DebeziumPartitionedTableLayout {
         &self.current
     }
 
+    pub async fn create_tables(
+        &self,
+        db: &Db,
+        cdc_config: &TableConfig,
+        current_config: &TableConfig,
+    ) -> Result<(), CreateTableError> {
+        for table_name in self.cdc_table_names() {
+            let mut config = cdc_config.clone();
+            config.name = table_name;
+            db.create_table(config).await?;
+        }
+
+        let mut config = current_config.clone();
+        config.name = self.current.clone();
+        db.create_table(config).await?;
+        Ok(())
+    }
+
+    pub async fn ensure_tables(
+        &self,
+        db: &Db,
+        cdc_config: &TableConfig,
+        current_config: &TableConfig,
+    ) -> Result<(), CreateTableError> {
+        for table_name in self.cdc_table_names() {
+            let mut config = cdc_config.clone();
+            config.name = table_name;
+            db.ensure_table(config).await?;
+        }
+
+        let mut config = current_config.clone();
+        config.name = self.current.clone();
+        db.ensure_table(config).await?;
+        Ok(())
+    }
+
     pub fn projection_sources(&self, db: &Db) -> Vec<Table> {
         self.cdc_partitions
             .values()
@@ -533,6 +924,36 @@ impl DebeziumPartitionedTableLayout {
         WorkflowSource::new(db.table(self.current.clone()))
             .with_config(mirror_workflow_source_config())
     }
+}
+
+pub async fn create_layout_tables<'a, I>(
+    db: &Db,
+    layouts: I,
+    cdc_config: &TableConfig,
+    current_config: &TableConfig,
+) -> Result<(), CreateTableError>
+where
+    I: IntoIterator<Item = &'a DebeziumPartitionedTableLayout>,
+{
+    for layout in layouts {
+        layout.create_tables(db, cdc_config, current_config).await?;
+    }
+    Ok(())
+}
+
+pub async fn ensure_layout_tables<'a, I>(
+    db: &Db,
+    layouts: I,
+    cdc_config: &TableConfig,
+    current_config: &TableConfig,
+) -> Result<(), CreateTableError>
+where
+    I: IntoIterator<Item = &'a DebeziumPartitionedTableLayout>,
+{
+    for layout in layouts {
+        layout.ensure_tables(db, cdc_config, current_config).await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -691,6 +1112,29 @@ pub struct DebeziumMaterializer {
 }
 
 impl DebeziumMaterializer {
+    pub fn from_layouts<'a, I>(
+        db: &Db,
+        layouts: I,
+        mode: DebeziumMaterializationMode,
+    ) -> Result<Self, DebeziumMaterializationError>
+    where
+        I: IntoIterator<Item = &'a DebeziumPartitionedTableLayout>,
+    {
+        let layouts = layouts.into_iter().collect::<Vec<_>>();
+        match mode {
+            DebeziumMaterializationMode::EventLog => Ok(Self::event_log(
+                DebeziumEventLogTables::from_layouts(db, layouts.iter().copied())?,
+            )),
+            DebeziumMaterializationMode::Mirror => Ok(Self::mirror(
+                DebeziumMirrorTables::from_layouts(db, layouts.iter().copied())?,
+            )),
+            DebeziumMaterializationMode::Hybrid => Ok(Self::hybrid(
+                DebeziumEventLogTables::from_layouts(db, layouts.iter().copied())?,
+                DebeziumMirrorTables::from_layouts(db, layouts.iter().copied())?,
+            )),
+        }
+    }
+
     pub fn event_log(event_log: DebeziumEventLogTables) -> Self {
         Self {
             mode: DebeziumMaterializationMode::EventLog,
@@ -850,6 +1294,13 @@ pub struct PostgresDebeziumDecoder {
 impl PostgresDebeziumDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_layouts<'a, I>(layouts: I) -> Self
+    where
+        I: IntoIterator<Item = &'a DebeziumPartitionedTableLayout>,
+    {
+        Self::new().with_layouts(layouts)
     }
 
     pub fn with_topic_binding(
@@ -1016,6 +1467,101 @@ impl<D> DebeziumIngressHandler<D> {
 
     pub fn materializer(&self) -> &DebeziumMaterializer {
         &self.materializer
+    }
+}
+
+impl DebeziumIngressHandler<PostgresDebeziumDecoder> {
+    pub fn postgres<'a, I>(layouts: I, materializer: DebeziumMaterializer) -> Self
+    where
+        I: IntoIterator<Item = &'a DebeziumPartitionedTableLayout>,
+    {
+        Self::new(PostgresDebeziumDecoder::from_layouts(layouts), materializer)
+    }
+}
+
+pub trait DebeziumTransitionValueMapper: Send + Sync {
+    type Error: StdError + Send + Sync + 'static;
+
+    fn map_transition(&self, transition: &DebeziumDerivedTransition) -> Result<Value, Self::Error>;
+}
+
+impl<F, E> DebeziumTransitionValueMapper for F
+where
+    F: for<'a> Fn(&'a DebeziumDerivedTransition) -> Result<Value, E> + Send + Sync,
+    E: StdError + Send + Sync + 'static,
+{
+    type Error = E;
+
+    fn map_transition(&self, transition: &DebeziumDerivedTransition) -> Result<Value, Self::Error> {
+        self(transition)
+    }
+}
+
+pub struct DebeziumDerivedTransitionProjection<M> {
+    output: Table,
+    predicate: DebeziumRowPredicate,
+    policy: DebeziumWorkflowEventPolicy,
+    mapper: M,
+}
+
+impl<M> DebeziumDerivedTransitionProjection<M> {
+    pub fn new(output: Table, predicate: DebeziumRowPredicate, mapper: M) -> Self {
+        Self {
+            output,
+            predicate,
+            policy: DebeziumWorkflowEventPolicy::SkipSnapshotsAndTombstones,
+            mapper,
+        }
+    }
+
+    pub fn output(&self) -> &Table {
+        &self.output
+    }
+
+    pub fn into_multi_source(
+        self,
+        name: impl Into<String>,
+        sources: Vec<Table>,
+    ) -> MultiSourceProjection<Self> {
+        let output = self.output.clone();
+        MultiSourceProjection::new(name, sources, self)
+            .with_outputs([output])
+            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState)
+    }
+
+    pub fn with_event_policy(mut self, policy: DebeziumWorkflowEventPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+}
+
+#[async_trait]
+impl<M> MultiSourceProjectionHandler for DebeziumDerivedTransitionProjection<M>
+where
+    M: DebeziumTransitionValueMapper,
+{
+    async fn apply(
+        &self,
+        run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        for entry in run.entries() {
+            let decoded =
+                DebeziumChangeEntry::decode(entry).map_err(ProjectionHandlerError::new)?;
+            let Some(event) = decoded.as_event() else {
+                continue;
+            };
+            let Some(transition) = self.policy.derived_transition(event, &self.predicate) else {
+                continue;
+            };
+            let value = self
+                .mapper
+                .map_transition(&transition)
+                .map_err(ProjectionHandlerError::new)?;
+            tx.put(&self.output, run.source_scoped_entry_key(entry), value);
+        }
+        Ok(())
     }
 }
 
@@ -1358,7 +1904,9 @@ fn optional_snapshot(
         JsonValue::String(marker) => match marker.as_str() {
             "false" => Ok(None),
             "true" => Ok(Some(DebeziumSnapshotMarker::Initial)),
+            "first" => Ok(Some(DebeziumSnapshotMarker::First)),
             "last" => Ok(Some(DebeziumSnapshotMarker::Last)),
+            "last_in_data_collection" => Ok(Some(DebeziumSnapshotMarker::LastInDataCollection)),
             "incremental" => Ok(Some(DebeziumSnapshotMarker::Incremental)),
             other => Err(DebeziumDecodeError::UnsupportedSnapshotMarker {
                 marker: other.to_string(),

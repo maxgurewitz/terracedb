@@ -1,10 +1,12 @@
 use async_trait::async_trait;
+use futures::executor::block_on;
 use terracedb::{ReadError, Transaction, test_support::row_table_config};
 use terracedb_kafka::{
     KafkaBatchHandler, KafkaBootstrapPolicy, KafkaBroker, KafkaFetchedBatch, KafkaFilterDecision,
     KafkaIngressDefinition, KafkaMaterializationLayout, KafkaOffset, KafkaPartitionOffset,
     KafkaPartitionSource, KafkaProgressStore, KafkaRecord, KafkaRecordFilter, KafkaSourceId,
-    KafkaSourceProgress, KafkaWorkerOptions, KeepAllKafkaRecords,
+    KafkaSourceProgress, KafkaWorkerOptions, KeepAllKafkaRecords, RskafkaBroker,
+    RskafkaBrokerError,
 };
 
 #[derive(Clone, Debug)]
@@ -207,4 +209,10 @@ fn layout_selection_uses_the_same_route_interface() {
             panic!("shared layout should use (partition, offset) ordering")
         }
     }
+}
+
+#[test]
+fn rskafka_broker_rejects_empty_bootstrap_lists() {
+    let error = block_on(RskafkaBroker::connect(" , ")).expect_err("empty endpoints should fail");
+    assert!(matches!(error, RskafkaBrokerError::EmptyBootstrapServers));
 }

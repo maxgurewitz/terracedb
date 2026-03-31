@@ -5,6 +5,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use rskafka::client::{
+    Client, ClientBuilder,
+    partition::{OffsetAt, UnknownTopicHandling},
+};
 use terracedb::{
     CommitError, Db, FlushError, Key, ReadError, SequenceNumber, StorageError, StorageErrorKind,
     Table, Transaction, TransactionCommitError, Value,
@@ -357,6 +361,204 @@ pub trait KafkaBroker: Send + Sync {
         next_offset: KafkaOffset,
         max_records: usize,
     ) -> Result<KafkaFetchedBatch, Self::Error>;
+}
+
+#[derive(Debug, Error)]
+pub enum RskafkaBrokerError {
+    #[error("bootstrap server list cannot be empty")]
+    EmptyBootstrapServers,
+    #[error("kafka client request failed: {source}")]
+    Client {
+        #[source]
+        source: rskafka::client::error::Error,
+    },
+    #[error("kafka partition {topic}[{partition}] is not representable as i32")]
+    PartitionOutOfRange { topic: String, partition: u32 },
+    #[error("kafka request offset {offset} for {topic}[{partition}] exceeds i64")]
+    RequestOffsetOutOfRange {
+        topic: String,
+        partition: u32,
+        offset: u64,
+    },
+    #[error("kafka broker returned negative offset {offset} for {topic}[{partition}]")]
+    NegativeOffset {
+        topic: String,
+        partition: u32,
+        offset: i64,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct RskafkaBroker {
+    client: Arc<Client>,
+    fetch_max_bytes: i32,
+    fetch_max_wait_ms: i32,
+}
+
+impl RskafkaBroker {
+    pub async fn connect(bootstrap_servers: &str) -> Result<Self, RskafkaBrokerError> {
+        let brokers = bootstrap_servers
+            .split(',')
+            .map(str::trim)
+            .filter(|server| !server.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        Self::connect_endpoints(brokers).await
+    }
+
+    pub async fn connect_endpoints<I, S>(bootstrap_servers: I) -> Result<Self, RskafkaBrokerError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let brokers = bootstrap_servers
+            .into_iter()
+            .map(Into::into)
+            .filter(|server: &String| !server.trim().is_empty())
+            .collect::<Vec<_>>();
+        if brokers.is_empty() {
+            return Err(RskafkaBrokerError::EmptyBootstrapServers);
+        }
+
+        let client = ClientBuilder::new(brokers)
+            .build()
+            .await
+            .map_err(|source| RskafkaBrokerError::Client { source })?;
+        Ok(Self {
+            client: Arc::new(client),
+            fetch_max_bytes: 1_048_576,
+            fetch_max_wait_ms: 250,
+        })
+    }
+
+    pub fn with_fetch_limits(mut self, fetch_max_bytes: i32, fetch_max_wait_ms: i32) -> Self {
+        self.fetch_max_bytes = fetch_max_bytes;
+        self.fetch_max_wait_ms = fetch_max_wait_ms;
+        self
+    }
+
+    pub fn client(&self) -> &Arc<Client> {
+        &self.client
+    }
+
+    async fn partition_client(
+        &self,
+        claim: &KafkaPartitionClaim,
+    ) -> Result<rskafka::client::partition::PartitionClient, RskafkaBrokerError> {
+        let topic = claim.source.topic_partition.topic.clone();
+        let partition = claim.source.topic_partition.partition.get();
+        let partition =
+            i32::try_from(partition).map_err(|_| RskafkaBrokerError::PartitionOutOfRange {
+                topic: topic.clone(),
+                partition,
+            })?;
+
+        self.client
+            .partition_client(topic, partition, UnknownTopicHandling::Retry)
+            .await
+            .map_err(|source| RskafkaBrokerError::Client { source })
+    }
+
+    fn encode_offset(
+        topic: &str,
+        partition: u32,
+        offset: i64,
+    ) -> Result<KafkaOffset, RskafkaBrokerError> {
+        let offset = u64::try_from(offset).map_err(|_| RskafkaBrokerError::NegativeOffset {
+            topic: topic.to_string(),
+            partition,
+            offset,
+        })?;
+        Ok(KafkaOffset::new(offset))
+    }
+
+    fn request_offset(
+        topic: &str,
+        partition: u32,
+        offset: KafkaOffset,
+    ) -> Result<i64, RskafkaBrokerError> {
+        i64::try_from(offset.get()).map_err(|_| RskafkaBrokerError::RequestOffsetOutOfRange {
+            topic: topic.to_string(),
+            partition,
+            offset: offset.get(),
+        })
+    }
+}
+
+#[async_trait]
+impl KafkaBroker for RskafkaBroker {
+    type Error = RskafkaBrokerError;
+
+    async fn resolve_offset(
+        &self,
+        claim: &KafkaPartitionClaim,
+        policy: KafkaBootstrapPolicy,
+    ) -> Result<KafkaOffset, Self::Error> {
+        let topic = claim.source.topic_partition.topic.clone();
+        let partition = claim.source.topic_partition.partition.get();
+        let at = match policy {
+            KafkaBootstrapPolicy::Earliest => OffsetAt::Earliest,
+            KafkaBootstrapPolicy::Latest => OffsetAt::Latest,
+        };
+        let offset = self
+            .partition_client(claim)
+            .await?
+            .get_offset(at)
+            .await
+            .map_err(|source| RskafkaBrokerError::Client { source })?;
+        Self::encode_offset(&topic, partition, offset)
+    }
+
+    async fn fetch_batch(
+        &self,
+        claim: &KafkaPartitionClaim,
+        next_offset: KafkaOffset,
+        max_records: usize,
+    ) -> Result<KafkaFetchedBatch, Self::Error> {
+        let topic = claim.source.topic_partition.topic.clone();
+        let partition = claim.source.topic_partition.partition.get();
+        let client = self.partition_client(claim).await?;
+        let high = client
+            .get_offset(OffsetAt::Latest)
+            .await
+            .map_err(|source| RskafkaBrokerError::Client { source })?;
+        let high = Self::encode_offset(&topic, partition, high)?;
+        if next_offset >= high {
+            return Ok(KafkaFetchedBatch::empty(Some(high)));
+        }
+
+        let (records, observed_high) = client
+            .fetch_records(
+                Self::request_offset(&topic, partition, next_offset)?,
+                1..self.fetch_max_bytes,
+                self.fetch_max_wait_ms,
+            )
+            .await
+            .map_err(|source| RskafkaBrokerError::Client { source })?;
+        let high = Self::encode_offset(&topic, partition, observed_high)?;
+        let records = records
+            .into_iter()
+            .take(max_records.max(1))
+            .map(|record| {
+                Ok(KafkaRecord {
+                    topic_partition: KafkaTopicPartition::new(topic.clone(), partition),
+                    offset: Self::encode_offset(&topic, partition, record.offset)?,
+                    timestamp_millis: u64::try_from(record.record.timestamp.timestamp_millis())
+                        .ok(),
+                    key: record.record.key,
+                    value: record.record.value,
+                    headers: record
+                        .record
+                        .headers
+                        .into_iter()
+                        .map(|(key, value)| KafkaRecordHeader::new(key, value))
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, RskafkaBrokerError>>()?;
+
+        Ok(KafkaFetchedBatch::new(records, Some(high)))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,0 +1,52 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v25.1.4
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --reserve-memory
+      - 0M
+      - --check=false
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://127.0.0.1:19092
+    ports:
+      - "19092:19092"
+
+  postgres:
+    image: debezium/postgres:16
+    environment:
+      POSTGRES_DB: commerce
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    ports:
+      - "15432:5432"
+
+  connect:
+    image: debezium/connect:3.0.0.Final
+    depends_on:
+      - redpanda
+      - postgres
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      CONFIG_STORAGE_TOPIC: connect_configs
+      GROUP_ID: order-watch-connect
+      HEAP_OPTS: -Xms256M -Xmx512M
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "18083:8083"

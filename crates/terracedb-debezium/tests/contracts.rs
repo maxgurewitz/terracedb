@@ -2,16 +2,17 @@ use std::sync::Arc;
 
 use serde_json::json;
 use terracedb::{
-    Db, StubFileSystem, StubObjectStore,
+    ChangeEntry, ChangeKind, Db, LogCursor, SequenceNumber, StubFileSystem, StubObjectStore,
     test_support::{row_table_config, test_dependencies, tiered_test_config},
 };
 use terracedb_debezium::{
     DebeziumCodecError, DebeziumColumnProjection, DebeziumConnectorKind, DebeziumEnvelopeDecoder,
     DebeziumEvent, DebeziumEventKind, DebeziumMaterializationMode, DebeziumMaterializer,
-    DebeziumMirrorMutationPlan, DebeziumMirrorRow, DebeziumMirrorTables, DebeziumOperationKind,
-    DebeziumPartitionedTableLayout, DebeziumPostgresSourceMetadata, DebeziumPrimaryKey,
-    DebeziumRowPredicate, DebeziumSnapshotMarker, DebeziumSourceTable, DebeziumTableFilter,
-    DebeziumTransactionMetadata, PostgresDebeziumDecoder, event_log_workflow_source_config,
+    DebeziumMirrorChange, DebeziumMirrorMutationPlan, DebeziumMirrorRow, DebeziumMirrorTables,
+    DebeziumOperationKind, DebeziumPartitionedTableLayout, DebeziumPostgresSourceMetadata,
+    DebeziumPrimaryKey, DebeziumRowPredicate, DebeziumSnapshotBoundary, DebeziumSnapshotMarker,
+    DebeziumSnapshotPhase, DebeziumSourceTable, DebeziumTableFilter, DebeziumTransactionMetadata,
+    PostgresDebeziumDecoder, ensure_layout_tables, event_log_workflow_source_config,
     mirror_workflow_source_config,
 };
 
@@ -211,6 +212,151 @@ fn postgres_decoder_fails_closed_on_malformed_or_unbound_envelopes() {
     ));
 }
 
+#[test]
+fn postgres_decoder_accepts_first_snapshot_marker() {
+    let decoder = PostgresDebeziumDecoder::new().with_topic_binding(
+        "dbserver1.public.orders",
+        DebeziumSourceTable::new("app", "public", "orders"),
+    );
+
+    let mut snapshot = terracedb_kafka::KafkaRecord::new("dbserver1.public.orders", 0, 7);
+    snapshot.key = Some(br#"{"payload":{"id":"101"}}"#.to_vec());
+    snapshot.value = Some(
+        br#"{
+            "payload":{
+                "before":null,
+                "after":{"id":"101","region":"west","status":"open"},
+                "op":"r",
+                "ts_ms":1700000000002,
+                "source":{
+                    "db":"app",
+                    "schema":"public",
+                    "table":"orders",
+                    "snapshot":"first",
+                    "ts_ms":1700000000001
+                }
+            }
+        }"#
+        .to_vec(),
+    );
+
+    let decoded = decoder
+        .decode_record(&snapshot)
+        .expect("snapshot markers emitted by Debezium should decode");
+    assert_eq!(decoded.snapshot, Some(DebeziumSnapshotMarker::First));
+    assert_eq!(
+        decoded.snapshot_phase(),
+        Some(DebeziumSnapshotPhase::Initial)
+    );
+    assert_eq!(
+        decoded.snapshot_boundary(),
+        Some(DebeziumSnapshotBoundary::FirstRecordInCollection)
+    );
+    assert_eq!(decoded.operation(), Some(DebeziumOperationKind::Read));
+}
+
+#[test]
+fn postgres_decoder_accepts_last_in_data_collection_snapshot_marker() {
+    let decoder = PostgresDebeziumDecoder::new().with_topic_binding(
+        "dbserver1.public.orders",
+        DebeziumSourceTable::new("app", "public", "orders"),
+    );
+
+    let mut snapshot = terracedb_kafka::KafkaRecord::new("dbserver1.public.orders", 0, 8);
+    snapshot.key = Some(br#"{"payload":{"id":"102"}}"#.to_vec());
+    snapshot.value = Some(
+        br#"{
+            "payload":{
+                "before":null,
+                "after":{"id":"102","region":"west","status":"open"},
+                "op":"r",
+                "ts_ms":1700000000002,
+                "source":{
+                    "db":"app",
+                    "schema":"public",
+                    "table":"orders",
+                    "snapshot":"last_in_data_collection",
+                    "ts_ms":1700000000001
+                }
+            }
+        }"#
+        .to_vec(),
+    );
+
+    let decoded = decoder
+        .decode_record(&snapshot)
+        .expect("per-table snapshot boundary markers should decode");
+    assert_eq!(
+        decoded.snapshot,
+        Some(DebeziumSnapshotMarker::LastInDataCollection)
+    );
+    assert_eq!(
+        decoded.snapshot_phase(),
+        Some(DebeziumSnapshotPhase::Initial)
+    );
+    assert_eq!(
+        decoded.snapshot_boundary(),
+        Some(DebeziumSnapshotBoundary::LastRecordInCollection)
+    );
+    assert_eq!(decoded.operation(), Some(DebeziumOperationKind::Read));
+}
+
+#[tokio::test]
+async fn mirror_change_decoder_exposes_upserts_and_delete_provenance_explicitly() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config("/debezium-mirror-change-contracts"),
+        test_dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("orders_current"))
+        .await
+        .expect("create current-state table");
+
+    let event = sample_event();
+    let row = DebeziumMirrorRow {
+        source_table: event.source_table.clone(),
+        primary_key: event.primary_key.clone(),
+        values: event.after.clone().expect("snapshot row should exist"),
+        snapshot: event.snapshot,
+        kafka: event.kafka.clone(),
+        transaction: event.transaction.clone(),
+    };
+    let put = ChangeEntry {
+        key: row.primary_key.encode().expect("encode primary key"),
+        value: Some(row.to_value().expect("encode mirror row")),
+        cursor: LogCursor::new(SequenceNumber::new(7), 0),
+        sequence: SequenceNumber::new(7),
+        kind: ChangeKind::Put,
+        table: table.clone(),
+        operation_context: None,
+    };
+    let delete = ChangeEntry {
+        key: row.primary_key.encode().expect("encode primary key"),
+        value: None,
+        cursor: LogCursor::new(SequenceNumber::new(8), 0),
+        sequence: SequenceNumber::new(8),
+        kind: ChangeKind::Delete,
+        table,
+        operation_context: None,
+    };
+
+    let decoded_put = DebeziumMirrorChange::decode(&put).expect("decode mirror upsert");
+    assert!(matches!(decoded_put, DebeziumMirrorChange::Upsert(_)));
+    assert_eq!(decoded_put.kafka_coordinates(), Some(&row.kafka));
+
+    let decoded_delete = DebeziumMirrorChange::decode(&delete).expect("decode mirror delete");
+    assert!(matches!(
+        decoded_delete,
+        DebeziumMirrorChange::Delete { .. }
+    ));
+    assert_eq!(decoded_delete.kafka_coordinates(), None);
+    assert_eq!(decoded_delete.primary_key(), &row.primary_key);
+}
+
 #[tokio::test]
 async fn layout_helpers_open_projection_and_workflow_sources_without_kafka() {
     let file_system = Arc::new(StubFileSystem::default());
@@ -229,14 +375,30 @@ async fn layout_helpers_open_projection_and_workflow_sources_without_kafka() {
         [0_u32, 1_u32],
     );
 
-    for table_name in layout.cdc_table_names() {
-        db.create_table(row_table_config(&table_name))
-            .await
-            .expect("create cdc table");
-    }
-    db.create_table(row_table_config(layout.current_table_name()))
+    layout
+        .ensure_tables(
+            &db,
+            &row_table_config("cdc-template"),
+            &row_table_config("current-template"),
+        )
         .await
-        .expect("create current table");
+        .expect("install layout tables");
+    ensure_layout_tables(
+        &db,
+        [&layout],
+        &row_table_config("cdc-template"),
+        &row_table_config("current-template"),
+    )
+    .await
+    .expect("layout collection install should also be idempotent");
+    layout
+        .ensure_tables(
+            &db,
+            &row_table_config("cdc-template"),
+            &row_table_config("current-template"),
+        )
+        .await
+        .expect("re-installing layout tables should be idempotent");
 
     let projection_sources = layout.projection_sources(&db);
     assert_eq!(

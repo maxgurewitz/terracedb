@@ -34,8 +34,9 @@ use std::{
 use futures::{Stream, StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
 use terracedb::{
-    ColumnarRecord, Db, Key, KvStream, ReadError, ScanExecution, ScanOptions, SchemaDefinition,
-    SequenceNumber, Table, Transaction, TransactionCommitError, Value, WriteError,
+    ChangeEntry, ChangeKind, ColumnarRecord, Db, Key, KvStream, LogCursor, OperationContext,
+    ReadError, ScanExecution, ScanOptions, SchemaDefinition, SequenceNumber, Table, Transaction,
+    TransactionCommitError, Value, WriteError,
 };
 use thiserror::Error;
 
@@ -43,6 +44,17 @@ type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
 pub type RecordStream<K, V> = Pin<Box<dyn Stream<Item = (K, V)> + Send + 'static>>;
 pub type ProjectionStream<V> = Pin<Box<dyn Stream<Item = V> + Send + 'static>>;
+
+#[derive(Clone, Debug)]
+pub struct RecordChange<K, V> {
+    pub key: K,
+    pub value: Option<V>,
+    pub cursor: LogCursor,
+    pub sequence: SequenceNumber,
+    pub kind: ChangeKind,
+    pub table: Table,
+    pub operation_context: Option<OperationContext>,
+}
 
 /// Typed key codec used by [`RecordTable`] and [`RecordTransaction`].
 pub trait KeyCodec<K>: Clone + Send + Sync + 'static {
@@ -789,6 +801,25 @@ where
 
     pub fn decode_value(&self, value: &Value) -> Result<V, RecordCodecError> {
         self.value_codec.decode_value(value)
+    }
+
+    pub fn decode_change_entry(
+        &self,
+        entry: &ChangeEntry,
+    ) -> Result<RecordChange<K, V>, RecordCodecError> {
+        Ok(RecordChange {
+            key: self.decode_key(&entry.key)?,
+            value: entry
+                .value
+                .as_ref()
+                .map(|value| self.decode_value(value))
+                .transpose()?,
+            cursor: entry.cursor,
+            sequence: entry.sequence,
+            kind: entry.kind,
+            table: entry.table.clone(),
+            operation_context: entry.operation_context.clone(),
+        })
     }
 
     pub async fn read(&self, key: &K) -> Result<Option<V>, RecordReadError> {
