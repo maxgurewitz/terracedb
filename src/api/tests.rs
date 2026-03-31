@@ -2595,6 +2595,21 @@ where
     }
 }
 
+async fn next_admission_observation<F>(
+    updates: &mut crate::AdmissionObservationReceiver,
+    predicate: F,
+) -> crate::AdmissionObservation
+where
+    F: Fn(&crate::AdmissionObservation) -> bool,
+{
+    loop {
+        let observation = updates.recv().await.expect("admission observation");
+        if predicate(&observation) {
+            return observation;
+        }
+    }
+}
+
 #[tokio::test]
 async fn scheduler_observability_current_admission_clears_after_recovery_write() {
     let file_system = Arc::new(crate::StubFileSystem::default());
@@ -2734,9 +2749,7 @@ async fn scheduler_observability_subscription_matches_synchronous_snapshot_state
         snapshot
             .current_admission_diagnostics_by_domain
             .get(&domain)
-            .is_some_and(|current| {
-                current.diagnostics.level == crate::AdmissionPressureLevel::Open
-            })
+            .is_some_and(|current| current.diagnostics.level == crate::AdmissionPressureLevel::Open)
             && snapshot
                 .last_non_open_admission_by_domain
                 .get(&domain)

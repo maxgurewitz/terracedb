@@ -1,54 +1,51 @@
 # Simulation Testability Todo
 
-This tracks the refactor from blocking, reader-assembled observability toward
-published immutable state and event-driven simulation assertions.
+This tracks the current refactor from blocking, reader-assembled inspection
+paths toward published immutable state, event streams, and deterministic
+simulation probes.
 
-## Completed
-
-- [x] Fix per-write admission observability semantics.
-- [x] Make current vs historical admission explicit.
-- [x] Add simulation regressions for strongest-per-write diagnostics and
-  single-count stalled writes.
-- [x] Keep whole-system tests in the default nextest profile while excluding
-  them from the `pre-commit` profile.
-
-## In Progress
+## T76a: Published Observability
 
 - [x] Publish scheduler observability as immutable snapshots.
-- [x] Expose a subscription API for simulation tests instead of retrying a
-  blocking snapshot path.
-- [ ] Migrate remaining scheduler observability simulation tests to subscribe
-  and wait on predicates rather than relying on incidental yields.
+- [x] Expose a scheduler observability subscription API for simulation tests.
+- [x] Keep the synchronous snapshot API as a thin clone of published state.
+- [x] Add an admission observation stream for ordered write-level transitions.
+- [x] Add simulation regressions for `RateLimit -> Open` admission ordering.
+- [x] Add a simulation regression proving one admission event per logical
+  multi-table write.
+- [x] Add a unit regression proving the synchronous snapshot matches the
+  published subscription state after representative updates.
+- [ ] Sweep remaining scheduler observability tests onto subscription/event
+  helpers where they still rely on incidental yields.
 
-## Next
+## T76b: Remaining Blocking Inspection Surfaces
 
-- [ ] Add a dedicated admission event stream so simulations can assert ordered
-  transitions, not just sampled snapshots.
-- [ ] Convert other test-only polling helpers to subscription or event-driven
-  helpers where the product surface already has a natural change boundary.
-- [ ] Add a liveness regression that proves observability reads continue to make
-  progress while writes and maintenance mutate state concurrently.
-- [ ] Audit synchronous snapshot/introspection APIs that are still reachable
-  from simulation and split them into operator-only vs runtime-safe paths.
+- [ ] Audit synchronous snapshot/introspection APIs still reachable from
+  simulation and classify them as operator-only or runtime-safe.
+- [ ] Convert the highest-value remaining surfaces to published snapshots,
+  subscriptions, or explicit poll/step helpers.
+- [ ] Remove test-only retry loops that only exist to tiptoe around blocking
+  inspection.
+- [ ] Extend the debugging guide with the preferred simulation-safe
+  observation patterns.
 
-## Blocking Hotspots To Refactor
+## T76c: Deterministic Progress Probes
+
+- [ ] Identify the background maintenance/scheduler loops whose progress is
+  still only inferable through sleeps, yields, or eventual side effects.
+- [ ] Add explicit poll/step or bounded "wait until idle" helpers where that
+  can be done without weakening production invariants.
+- [ ] Rewrite representative simulations to use those probes instead of
+  timing-based heuristics.
+
+## Highest-Value Follow-Ups
 
 - [ ] [src/api/watermark.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/watermark.rs):
-  move table watermark reads toward published snapshots or subscription-first
-  helpers instead of mutex-backed sampling.
+  review table watermark inspection for the same published-state vs blocking
+  split.
 - [ ] [src/api/db_api.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/db_api.rs):
-  review other synchronous snapshot-style APIs such as compaction/filter stats
-  and cache-usage inspection for simulation-safe read paths.
-- [ ] [src/api/internals.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/internals.rs):
-  continue replacing mutex-assembled diagnostics state with published immutable
-  snapshots where tests need concurrent inspection.
+  audit other synchronous snapshot-style surfaces such as cache or maintenance
+  stats that simulations may want to sample mid-flight.
 - [ ] [tests/simulation_harness.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/tests/simulation_harness.rs):
-  extend the whole-system simulations to assert observability transitions using
-  subscriptions instead of point-in-time sampling after manual yields.
-
-## Stretch
-
-- [ ] Add step/poll helpers for background maintenance so simulations can drive
-  scheduler progress explicitly without sleeps.
-- [ ] Revisit remaining async-reachable `parking_lot` and `std::sync` locks and
-  document which ones are runtime-internal versus user/test-facing.
+  extend whole-system scenarios so they assert observability transitions
+  through subscriptions/events, not only end-of-test snapshots.

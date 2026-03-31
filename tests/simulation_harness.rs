@@ -3254,10 +3254,13 @@ fn admission_observation_stream_tracks_admission_recovery_sequence() -> turmoil:
                 observation.domain == domain
                     && observation.current.diagnostics.level
                         == terracedb::AdmissionPressureLevel::Open
-                    && observation.last_non_open.as_ref().is_some_and(|last_non_open| {
-                        last_non_open.diagnostics.level
-                            == terracedb::AdmissionPressureLevel::RateLimit
-                    })
+                    && observation
+                        .last_non_open
+                        .as_ref()
+                        .is_some_and(|last_non_open| {
+                            last_non_open.diagnostics.level
+                                == terracedb::AdmissionPressureLevel::RateLimit
+                        })
             })
             .await;
 
@@ -3448,8 +3451,8 @@ fn simulation_admission_observation_stream_emits_rate_limit_then_open() -> turmo
 }
 
 #[test]
-fn admission_observation_stream_emits_one_aggregated_event_per_multi_table_write()
--> turmoil::Result {
+fn admission_observation_stream_emits_one_aggregated_event_per_multi_table_write() -> turmoil::Result
+{
     SeededSimulationRunner::new(0x8384)
         .with_simulation_duration(Duration::from_secs(10))
         .run_with(|context| async move {
@@ -3515,109 +3518,16 @@ fn admission_observation_stream_emits_one_aggregated_event_per_multi_table_write
                 terracedb::AdmissionPressureLevel::Stall
             );
             assert_eq!(
-                observation
-                    .current
-                    .diagnostics
-                    .metadata
-                    .get("source_table"),
-                Some(&serde_json::Value::String("alpha".to_string()))
-            );
-            assert_eq!(observation.last_non_open, Some(observation.current.clone()));
-            assert!(
-                tokio::time::timeout(Duration::from_millis(1), observations.recv())
-                    .await
-                    .is_err(),
-                "one logical write should emit one aggregated admission observation"
-            );
-
-            Ok(())
-        })
-}
-
-#[test]
-fn simulation_admission_observation_stream_emits_one_event_for_multi_table_write()
--> turmoil::Result {
-    SeededSimulationRunner::new(0x8384)
-        .with_simulation_duration(Duration::from_secs(10))
-        .run_with(|context| async move {
-            let db = context
-                .open_db(simulation_db_config(
-                    "/terracedb/sim/t16a-admission-observation-multi-table",
-                    Arc::new(PerTableAdmissionSimulationScheduler {
-                        diagnostics_by_table: BTreeMap::from([
-                            (
-                                "alpha".to_string(),
-                                terracedb::AdmissionDiagnostics {
-                                    level: terracedb::AdmissionPressureLevel::Stall,
-                                    triggered_by: vec![
-                                        terracedb::AdmissionPressureSignal::L0Sstables,
-                                    ],
-                                    metadata: BTreeMap::from([(
-                                        "source_table".to_string(),
-                                        serde_json::Value::String("alpha".to_string()),
-                                    )]),
-                                    ..terracedb::AdmissionDiagnostics::default()
-                                },
-                            ),
-                            (
-                                "beta".to_string(),
-                                terracedb::AdmissionDiagnostics {
-                                    level: terracedb::AdmissionPressureLevel::RateLimit,
-                                    triggered_by: vec![
-                                        terracedb::AdmissionPressureSignal::MutableBudget,
-                                    ],
-                                    max_write_bytes_per_second: Some(128),
-                                    metadata: BTreeMap::from([(
-                                        "source_table".to_string(),
-                                        serde_json::Value::String("beta".to_string()),
-                                    )]),
-                                    ..terracedb::AdmissionDiagnostics::default()
-                                },
-                            ),
-                        ]),
-                    }),
-                    1024 * 1024,
-                ))
-                .await?;
-            let alpha = db
-                .create_table(SimulationTableSpec::row("alpha").table_config())
-                .await?;
-            let beta = db
-                .create_table(SimulationTableSpec::row("beta").table_config())
-                .await?;
-            let domain = db.execution_profile().foreground.domain.clone();
-            let mut observations = db.subscribe_admission_observations();
-
-            let mut tx = Transaction::begin(&db).await;
-            tx.write(&alpha, b"alpha".to_vec(), Value::bytes("a"));
-            tx.write(&beta, b"beta".to_vec(), Value::bytes("b"));
-            assert_eq!(tx.commit_no_flush().await?, SequenceNumber::new(1));
-
-            let observation = next_admission_observation(&mut observations, |observation| {
-                observation.domain == domain
-                    && observation.current.diagnostics.level
-                        == terracedb::AdmissionPressureLevel::Stall
-            })
-            .await;
-            assert_eq!(
                 observation.current.diagnostics.metadata.get("source_table"),
                 Some(&serde_json::Value::String("alpha".to_string()))
             );
-            assert_eq!(
-                observation
-                    .last_non_open
-                    .as_ref()
-                    .expect("stall should also refresh last non-open")
-                    .diagnostics
-                    .level,
-                terracedb::AdmissionPressureLevel::Stall
-            );
+            assert_eq!(observation.last_non_open, Some(observation.current.clone()));
             assert!(
                 observations
                     .try_recv()
                     .expect("multi-table stream should remain healthy")
                     .is_none(),
-                "one logical write should emit one aggregated admission observation",
+                "one logical write should emit one aggregated admission observation"
             );
 
             Ok(())
