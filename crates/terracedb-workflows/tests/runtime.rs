@@ -5,10 +5,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use terracedb::{
-    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor, OutboxEntry,
-    SequenceNumber, StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore,
-    Table, TieredDurabilityMode, Timestamp, Value,
+    ChangeFeedError, Clock, Db, FileSystemFailure, FileSystemOperation, LogCursor,
+    ObjectStoreFailure, ObjectStoreOperation, OutboxEntry, ScanOptions, SequenceNumber,
+    StorageError, StorageErrorKind, StubClock, StubFileSystem, StubObjectStore, Table,
+    TieredDurabilityMode, Timestamp, Value,
     test_support::{
         FailpointMode, db_failpoint_registry, row_table_config, test_dependencies,
         test_dependencies_with_clock, tiered_test_config_with_durability,
@@ -20,14 +22,15 @@ use terracedb_simulation::{
 use terracedb_workflows::{
     DEFAULT_TIMER_POLL_INTERVAL, RecurringSchedule, RecurringTickOutput,
     RecurringWorkflowDefinition, RecurringWorkflowHandle, RecurringWorkflowHandler,
-    RecurringWorkflowRuntime, RecurringWorkflowState, WorkflowContext, WorkflowDefinition,
+    RecurringWorkflowRuntime, RecurringWorkflowState, WorkflowCheckpointArtifactKind,
+    WorkflowCheckpointId, WorkflowCheckpointStore, WorkflowContext, WorkflowDefinition,
     WorkflowError, WorkflowHandle, WorkflowHandler, WorkflowHandlerError,
     WorkflowHistoricalArtifactSupport, WorkflowHistoricalEvent, WorkflowHistoricalSourceResolution,
-    WorkflowHistoricalSourceScenario, WorkflowOutput, WorkflowProgressMode,
-    WorkflowReplayableSourceKind, WorkflowRuntime, WorkflowSourceBootstrapPolicy,
-    WorkflowSourceConfig, WorkflowSourceProgress, WorkflowSourceProgressOrigin,
-    WorkflowSourceRecoveryPolicy, WorkflowStateMutation, WorkflowTimerCommand,
-    failpoints::names as workflow_failpoint_names,
+    WorkflowHistoricalSourceScenario, WorkflowObjectStoreCheckpointStore, WorkflowOutput,
+    WorkflowProgressMode, WorkflowReplayableSourceKind, WorkflowRuntime,
+    WorkflowSourceBootstrapPolicy, WorkflowSourceConfig, WorkflowSourceProgress,
+    WorkflowSourceProgressOrigin, WorkflowSourceRecoveryPolicy, WorkflowStateMutation,
+    WorkflowTables, WorkflowTimerCommand, failpoints::names as workflow_failpoint_names,
 };
 
 const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(600);
@@ -208,6 +211,71 @@ impl WorkflowHandler for TimerHandler {
             terracedb_workflows::WorkflowTrigger::Event(_) => {
                 panic!("timer workflow does not process source events")
             }
+        }
+    }
+}
+
+struct CheckpointCaptureHandler;
+
+#[async_trait]
+impl WorkflowHandler for CheckpointCaptureHandler {
+    async fn route_event(
+        &self,
+        entry: &terracedb::ChangeEntry,
+    ) -> Result<String, WorkflowHandlerError> {
+        let key = std::str::from_utf8(&entry.key).expect("source key should be utf-8");
+        Ok(key
+            .split_once(':')
+            .expect("source key should contain an instance prefix")
+            .0
+            .to_string())
+    }
+
+    async fn handle(
+        &self,
+        instance_id: &str,
+        _state: Option<Value>,
+        trigger: &terracedb_workflows::WorkflowTrigger,
+        _ctx: &WorkflowContext,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        match trigger {
+            terracedb_workflows::WorkflowTrigger::Event(entry) => Ok(WorkflowOutput {
+                state: WorkflowStateMutation::Put(Value::bytes(format!(
+                    "event:{}",
+                    String::from_utf8_lossy(&entry.key)
+                ))),
+                outbox_entries: vec![OutboxEntry {
+                    outbox_id: format!("{instance_id}:event").into_bytes(),
+                    idempotency_key: format!("{instance_id}:event"),
+                    payload: entry.key.clone(),
+                }],
+                timers: vec![WorkflowTimerCommand::Schedule {
+                    timer_id: b"follow-up".to_vec(),
+                    fire_at: Timestamp::new(50),
+                    payload: b"follow-up".to_vec(),
+                }],
+            }),
+            terracedb_workflows::WorkflowTrigger::Callback {
+                callback_id,
+                response,
+            } => Ok(WorkflowOutput {
+                state: WorkflowStateMutation::Put(Value::bytes(format!("callback:{callback_id}"))),
+                outbox_entries: vec![OutboxEntry {
+                    outbox_id: format!("{instance_id}:{callback_id}").into_bytes(),
+                    idempotency_key: format!("{instance_id}:{callback_id}"),
+                    payload: response.clone(),
+                }],
+                timers: Vec::new(),
+            }),
+            terracedb_workflows::WorkflowTrigger::Timer { payload, .. } => Ok(WorkflowOutput {
+                state: WorkflowStateMutation::Put(Value::bytes("timer-fired")),
+                outbox_entries: vec![OutboxEntry {
+                    outbox_id: format!("{instance_id}:timer").into_bytes(),
+                    idempotency_key: format!("{instance_id}:timer"),
+                    payload: payload.clone(),
+                }],
+                timers: Vec::new(),
+            }),
         }
     }
 }
@@ -632,6 +700,124 @@ where
             },
         )
         .await
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WorkflowTablesSnapshot {
+    rows: BTreeMap<String, Vec<(Vec<u8>, Value)>>,
+}
+
+async fn wait_for_runtime_state<H>(
+    runtime: &WorkflowRuntime<H>,
+    instance_id: &str,
+    expected: &str,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let expected = Value::bytes(expected);
+    for _ in 0..200 {
+        if runtime.load_state(instance_id).await? == Some(expected.clone()) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    Err(WorkflowError::Handler {
+        name: runtime.name().to_string(),
+        source: WorkflowHandlerError::new(std::io::Error::other(
+            "timed out waiting for workflow state",
+        )),
+    })
+}
+
+async fn scan_table_rows(table: &Table) -> Result<Vec<(Vec<u8>, Value)>, terracedb::ReadError> {
+    let mut rows = table
+        .scan(Vec::new(), vec![0xff], ScanOptions::default())
+        .await?;
+    let mut captured = Vec::new();
+    while let Some((key, value)) = rows.next().await {
+        captured.push((key, value));
+    }
+    Ok(captured)
+}
+
+async fn snapshot_workflow_tables(
+    tables: &WorkflowTables,
+) -> Result<WorkflowTablesSnapshot, terracedb::ReadError> {
+    let mut rows = BTreeMap::new();
+    rows.insert(
+        tables.state_table().name().to_string(),
+        scan_table_rows(tables.state_table()).await?,
+    );
+    rows.insert(
+        tables.inbox_table().name().to_string(),
+        scan_table_rows(tables.inbox_table()).await?,
+    );
+    rows.insert(
+        tables.trigger_order_table().name().to_string(),
+        scan_table_rows(tables.trigger_order_table()).await?,
+    );
+    rows.insert(
+        tables.source_progress_table().name().to_string(),
+        scan_table_rows(tables.source_progress_table()).await?,
+    );
+    rows.insert(
+        tables.timer_schedule_table().name().to_string(),
+        scan_table_rows(tables.timer_schedule_table()).await?,
+    );
+    rows.insert(
+        tables.timer_lookup_table().name().to_string(),
+        scan_table_rows(tables.timer_lookup_table()).await?,
+    );
+    rows.insert(
+        tables.outbox_table().name().to_string(),
+        scan_table_rows(tables.outbox_table()).await?,
+    );
+    rows.insert(
+        tables.trigger_journal_table().name().to_string(),
+        scan_table_rows(tables.trigger_journal_table()).await?,
+    );
+    Ok(WorkflowTablesSnapshot { rows })
+}
+
+async fn clear_table(table: &Table) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rows = scan_table_rows(table).await?;
+    for (key, _) in rows {
+        table.delete(key).await?;
+    }
+    Ok(())
+}
+
+async fn clear_workflow_tables(
+    tables: &WorkflowTables,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    clear_table(tables.state_table()).await?;
+    clear_table(tables.inbox_table()).await?;
+    clear_table(tables.trigger_order_table()).await?;
+    clear_table(tables.source_progress_table()).await?;
+    clear_table(tables.timer_schedule_table()).await?;
+    clear_table(tables.timer_lookup_table()).await?;
+    clear_table(tables.outbox_table()).await?;
+    clear_table(tables.trigger_journal_table()).await?;
+    Ok(())
+}
+
+async fn open_checkpointed_runtime(
+    db: Db,
+    source: Table,
+    clock: Arc<dyn Clock>,
+    checkpoint_store: Arc<WorkflowObjectStoreCheckpointStore>,
+    restore_on_open: bool,
+) -> Result<WorkflowRuntime<CheckpointCaptureHandler>, WorkflowError> {
+    let mut definition =
+        WorkflowDefinition::new("checkpointed", [source], CheckpointCaptureHandler)
+            .with_checkpoint_store(checkpoint_store)
+            .with_timer_poll_interval(Duration::from_millis(1));
+    if restore_on_open {
+        definition = definition.with_restore_latest_checkpoint_on_open();
+    }
+    WorkflowRuntime::open(db, clock, definition).await
 }
 
 async fn wait_for_recurring_state<H, P>(
@@ -1164,6 +1350,298 @@ fn workflow_auto_progress_allows_timer_chains_without_manual_flush() -> turmoil:
             harness.shutdown().await?;
             Ok(())
         })
+}
+
+#[tokio::test]
+async fn workflow_checkpoints_restore_workflow_owned_tables_exactly() {
+    let root = "/workflow-checkpoint-restore";
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(7)));
+    let checkpoint_store = Arc::new(WorkflowObjectStoreCheckpointStore::new(
+        object_store.clone(),
+        "workflow-checkpoints",
+    ));
+
+    let db = Db::open(
+        tiered_test_config_with_durability(root, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("checkpoint_source"))
+        .await
+        .expect("create source table");
+    let runtime = open_checkpointed_runtime(
+        db.clone(),
+        source.clone(),
+        clock.clone(),
+        checkpoint_store.clone(),
+        false,
+    )
+    .await
+    .expect("open checkpointed runtime");
+
+    source
+        .write(b"order-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write source event");
+    let handle = runtime.start().await.expect("start checkpointed runtime");
+    wait_for_runtime_state(&runtime, "order-1", "event:order-1:created")
+        .await
+        .expect("wait for event state");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown checkpointed runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit callback after shutdown");
+
+    let expected_snapshot = snapshot_workflow_tables(runtime.tables())
+        .await
+        .expect("capture expected workflow tables");
+    let manifest = runtime
+        .capture_checkpoint(WorkflowCheckpointId::new(7))
+        .await
+        .expect("capture checkpoint");
+    assert_eq!(manifest.trigger_journal_high_watermark, Some(2));
+    assert!(
+        manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == WorkflowCheckpointArtifactKind::TriggerJournal)
+    );
+
+    clear_workflow_tables(runtime.tables())
+        .await
+        .expect("clear local workflow tables");
+    runtime
+        .tables()
+        .state_table()
+        .write(b"order-1".to_vec(), Value::bytes("mutated"))
+        .await
+        .expect("write mutated local state");
+    let mutated_snapshot = snapshot_workflow_tables(runtime.tables())
+        .await
+        .expect("capture mutated workflow tables");
+    assert_ne!(mutated_snapshot, expected_snapshot);
+
+    drop(runtime);
+    drop(db);
+
+    let reopened_db = Db::open(
+        tiered_test_config_with_durability(root, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("reopen db");
+    let reopened_source = reopened_db.table("checkpoint_source");
+    let restored_runtime =
+        open_checkpointed_runtime(reopened_db, reopened_source, clock, checkpoint_store, true)
+            .await
+            .expect("restore checkpoint on open");
+
+    let restored_snapshot = snapshot_workflow_tables(restored_runtime.tables())
+        .await
+        .expect("capture restored workflow tables");
+    assert_eq!(restored_snapshot, expected_snapshot);
+}
+
+#[tokio::test]
+async fn workflow_checkpoint_manifest_publication_fails_closed_until_latest_pointer_updates() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let checkpoint_store = Arc::new(WorkflowObjectStoreCheckpointStore::new(
+        object_store.clone(),
+        "workflow-checkpoints",
+    ));
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-checkpoint-manifest-publication",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        )
+        .with_checkpoint_store(checkpoint_store.clone()),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit first callback");
+    let first_manifest = runtime
+        .capture_checkpoint(WorkflowCheckpointId::new(1))
+        .await
+        .expect("capture first checkpoint");
+
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit second callback");
+    object_store.inject_failure(ObjectStoreFailure::timeout(
+        ObjectStoreOperation::Put,
+        checkpoint_store.latest_manifest_key("callbacks"),
+    ));
+
+    let error = runtime
+        .capture_checkpoint(WorkflowCheckpointId::new(2))
+        .await
+        .expect_err("latest pointer upload should fail");
+    match error {
+        WorkflowError::CheckpointStore { source, .. } => {
+            assert!(
+                source.to_string().contains("Timeout"),
+                "expected timeout from object-store publish failure, got {source}",
+            );
+        }
+        other => panic!("unexpected checkpoint publish error: {other:?}"),
+    }
+
+    let latest_manifest = checkpoint_store
+        .load_latest_manifest("callbacks")
+        .await
+        .expect("load latest manifest")
+        .expect("first checkpoint should remain latest");
+    assert_eq!(latest_manifest.checkpoint_id, first_manifest.checkpoint_id);
+    assert!(
+        checkpoint_store
+            .load_manifest("callbacks", WorkflowCheckpointId::new(2))
+            .await
+            .expect("load second manifest")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn workflow_checkpoint_restore_failpoint_leaves_existing_local_state_untouched() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(9)));
+    let checkpoint_store = Arc::new(WorkflowObjectStoreCheckpointStore::new(
+        object_store.clone(),
+        "workflow-checkpoints",
+    ));
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-checkpoint-restore-failpoint",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("checkpoint_source"))
+        .await
+        .expect("create source table");
+    let runtime = open_checkpointed_runtime(
+        db.clone(),
+        source.clone(),
+        clock.clone(),
+        checkpoint_store.clone(),
+        false,
+    )
+    .await
+    .expect("open checkpointed runtime");
+
+    source
+        .write(b"order-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write source event");
+    let handle = runtime.start().await.expect("start checkpointed runtime");
+    wait_for_runtime_state(&runtime, "order-1", "event:order-1:created")
+        .await
+        .expect("wait for event state");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown checkpointed runtime");
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit callback after shutdown");
+
+    let expected_snapshot = snapshot_workflow_tables(runtime.tables())
+        .await
+        .expect("capture expected workflow tables");
+    runtime
+        .capture_checkpoint(WorkflowCheckpointId::new(3))
+        .await
+        .expect("capture restore checkpoint");
+
+    clear_workflow_tables(runtime.tables())
+        .await
+        .expect("clear workflow tables before restore");
+    runtime
+        .tables()
+        .state_table()
+        .write(b"order-1".to_vec(), Value::bytes("mutated"))
+        .await
+        .expect("write mutated state");
+    let mutated_snapshot = snapshot_workflow_tables(runtime.tables())
+        .await
+        .expect("capture mutated workflow tables");
+
+    db_failpoint_registry(&db).arm_error(
+        workflow_failpoint_names::WORKFLOW_CHECKPOINT_RESTORE_BEFORE_COMMIT,
+        StorageError::io("simulated checkpoint restore failpoint"),
+        FailpointMode::Once,
+    );
+
+    let error = match open_checkpointed_runtime(
+        db.clone(),
+        source.clone(),
+        clock.clone(),
+        checkpoint_store.clone(),
+        true,
+    )
+    .await
+    {
+        Ok(_) => panic!("restore failpoint should abort runtime open"),
+        Err(error) => error,
+    };
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Io);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("simulated checkpoint restore failpoint"),
+                "expected injected restore failpoint context, got {storage}",
+            );
+        }
+        other => panic!("unexpected restore failure: {other:?}"),
+    }
+
+    let after_failed_restore = snapshot_workflow_tables(runtime.tables())
+        .await
+        .expect("capture post-failure workflow tables");
+    assert_eq!(after_failed_restore, mutated_snapshot);
+
+    let restored_runtime = open_checkpointed_runtime(db, source, clock, checkpoint_store, true)
+        .await
+        .expect("restore checkpoint after one-shot failpoint");
+    let restored_snapshot = snapshot_workflow_tables(restored_runtime.tables())
+        .await
+        .expect("capture restored workflow tables");
+    assert_eq!(restored_snapshot, expected_snapshot);
 }
 
 #[tokio::test]

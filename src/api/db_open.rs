@@ -764,7 +764,7 @@ impl Db {
                     dependencies.file_system.clone(),
                     root,
                     crate::remote::RemoteCacheConfig {
-                        max_bytes: config.raw_segment_cache_bytes,
+                        max_bytes: hybrid_read.raw_segment_cache_bytes,
                         ..Default::default()
                     },
                 )

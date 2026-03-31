@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::{
     sync::{Notify, watch},
@@ -18,9 +18,10 @@ use tracing::{Instrument, instrument::WithSubscriber};
 
 use terracedb::{
     ChangeEntry, ChangeFeedError, ChangeKind, Clock, CommitError, CreateTableError, Db,
-    DurableTimerSet, Key, LogCursor, OperationContext, OutboxEntry, ReadError, ScanOptions,
-    ScheduledTimer, SnapshotTooOld, StorageError, Table, TableConfig, TableFormat, Timestamp,
-    Transaction, TransactionCommitError, TransactionalOutbox, Value,
+    DurableTimerSet, Key, LogCursor, ObjectStore, OperationContext, OutboxEntry, ReadError,
+    ScanOptions, ScheduledTimer, SnapshotTooOld, StorageError, StorageErrorKind, Table,
+    TableConfig, TableFormat, Timestamp, Transaction, TransactionCommitError, TransactionalOutbox,
+    Value,
 };
 use terracedb::{
     CompactionStrategy, SequenceNumber, SpanRelation, set_span_attribute, telemetry_attrs,
@@ -35,8 +36,14 @@ pub const DEFAULT_TIMER_BATCH_LIMIT: usize = 128;
 const WORKFLOW_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_SOURCE_PROGRESS_FORMAT_VERSION: u8 = 2;
 const WORKFLOW_TRIGGER_ORDER_FORMAT_VERSION: u8 = 1;
+const WORKFLOW_TRIGGER_JOURNAL_HEAD_FORMAT_VERSION: u8 = 1;
+const WORKFLOW_CHECKPOINT_ARTIFACT_FORMAT_VERSION: u8 = 1;
+const WORKFLOW_CHECKPOINT_MANIFEST_FORMAT_VERSION: u8 = 1;
+const WORKFLOW_CHECKPOINT_LATEST_POINTER_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_TABLE_PREFIX: &str = "_workflow_";
 const INBOX_KEY_SEPARATOR: u8 = 0;
+const TRIGGER_JOURNAL_ENTRY_PREFIX: u8 = 0;
+const TRIGGER_JOURNAL_HEAD_KEY: &[u8] = &[0xff];
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
 
@@ -173,10 +180,20 @@ pub enum WorkflowError {
     EmptyName,
     #[error("workflow instance id cannot be empty")]
     EmptyInstanceId,
+    #[error("workflow {name} does not have a checkpoint store configured")]
+    MissingCheckpointStore { name: String },
     #[error("workflow {name} is already running")]
     AlreadyRunning { name: String },
+    #[error("workflow {name} cannot restore a checkpoint while running")]
+    RestoreWhileRunning { name: String },
     #[error("workflow {name} subscription closed unexpectedly")]
     SubscriptionClosed { name: String },
+    #[error("workflow {name} checkpoint store failed")]
+    CheckpointStore {
+        name: String,
+        #[source]
+        source: WorkflowCheckpointStoreError,
+    },
     #[error("workflow {name} handler failed")]
     Handler {
         name: String,
@@ -199,8 +216,11 @@ impl WorkflowError {
             | Self::Join(_)
             | Self::EmptyName
             | Self::EmptyInstanceId
+            | Self::MissingCheckpointStore { .. }
             | Self::AlreadyRunning { .. }
+            | Self::RestoreWhileRunning { .. }
             | Self::SubscriptionClosed { .. }
+            | Self::CheckpointStore { .. }
             | Self::Handler { .. }
             | Self::Panic { .. } => None,
         }
@@ -712,6 +732,14 @@ impl Ord for WorkflowSourceProgress {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkflowCheckpointRestoreOnOpen {
+    #[default]
+    Disabled,
+    Latest,
+    Specific(WorkflowCheckpointId),
+}
+
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -779,6 +807,8 @@ pub struct WorkflowCheckpointManifest {
     pub checkpoint_id: WorkflowCheckpointId,
     pub captured_at: Timestamp,
     pub source_frontier: BTreeMap<String, WorkflowSourceProgress>,
+    #[serde(default)]
+    pub trigger_journal_high_watermark: Option<u64>,
     pub artifacts: Vec<WorkflowCheckpointArtifact>,
 }
 
@@ -796,11 +826,22 @@ impl WorkflowCheckpointLayout {
         }
     }
 
+    pub fn latest_pointer_path_for(workflow_name: impl AsRef<str>) -> String {
+        format!(
+            "workflow/{}/checkpoints/LATEST.json",
+            workflow_name.as_ref()
+        )
+    }
+
     pub fn checkpoint_prefix(&self) -> String {
         format!(
             "workflow/{}/checkpoints/CHK-{}",
             self.workflow_name, self.checkpoint_id
         )
+    }
+
+    pub fn latest_pointer_path(&self) -> String {
+        Self::latest_pointer_path_for(&self.workflow_name)
     }
 
     pub fn manifest_path(&self) -> String {
@@ -822,6 +863,7 @@ impl WorkflowCheckpointLayout {
             checkpoint_id: self.checkpoint_id,
             captured_at,
             source_frontier,
+            trigger_journal_high_watermark: None,
             artifacts: artifact_kinds
                 .into_iter()
                 .map(|kind| WorkflowCheckpointArtifact {
@@ -886,6 +928,180 @@ pub trait WorkflowCheckpointStore: Send + Sync {
         manifest: WorkflowCheckpointManifest,
         artifacts: Vec<WorkflowCheckpointArtifactPayload>,
     ) -> Result<(), WorkflowCheckpointStoreError>;
+}
+
+#[derive(Clone)]
+pub struct WorkflowObjectStoreCheckpointStore {
+    object_store: Arc<dyn ObjectStore>,
+    prefix: String,
+}
+
+impl WorkflowObjectStoreCheckpointStore {
+    pub fn new(object_store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
+        Self {
+            object_store,
+            prefix: prefix.into(),
+        }
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub fn latest_manifest_key(&self, workflow_name: &str) -> String {
+        self.object_key(&WorkflowCheckpointLayout::latest_pointer_path_for(
+            workflow_name,
+        ))
+    }
+
+    fn object_key(&self, relative: &str) -> String {
+        join_object_key(&self.prefix, relative)
+    }
+}
+
+impl std::fmt::Debug for WorkflowObjectStoreCheckpointStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowObjectStoreCheckpointStore")
+            .field("prefix", &self.prefix)
+            .field("object_store", &"<dyn ObjectStore>")
+            .finish()
+    }
+}
+
+#[async_trait]
+impl WorkflowCheckpointStore for WorkflowObjectStoreCheckpointStore {
+    async fn load_latest_manifest(
+        &self,
+        workflow_name: &str,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowCheckpointStoreError> {
+        let latest_key = self.latest_manifest_key(workflow_name);
+        let bytes = match self.object_store.get(&latest_key).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WorkflowCheckpointStoreError::new(error)),
+        };
+        let latest = decode_versioned_json::<WorkflowCheckpointLatestPointer>(
+            WORKFLOW_CHECKPOINT_LATEST_POINTER_FORMAT_VERSION,
+            &bytes,
+            "workflow checkpoint latest pointer",
+        )
+        .map_err(WorkflowCheckpointStoreError::new)?;
+        self.load_manifest(workflow_name, latest.checkpoint_id)
+            .await
+    }
+
+    async fn load_manifest(
+        &self,
+        workflow_name: &str,
+        checkpoint_id: WorkflowCheckpointId,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowCheckpointStoreError> {
+        let layout = WorkflowCheckpointLayout::new(workflow_name, checkpoint_id);
+        let bytes = match self
+            .object_store
+            .get(&self.object_key(&layout.manifest_path()))
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WorkflowCheckpointStoreError::new(error)),
+        };
+        let manifest = decode_versioned_json::<WorkflowCheckpointManifest>(
+            WORKFLOW_CHECKPOINT_MANIFEST_FORMAT_VERSION,
+            &bytes,
+            "workflow checkpoint manifest",
+        )
+        .map_err(WorkflowCheckpointStoreError::new)?;
+        Ok(Some(manifest))
+    }
+
+    async fn read_artifact(
+        &self,
+        workflow_name: &str,
+        checkpoint_id: WorkflowCheckpointId,
+        kind: WorkflowCheckpointArtifactKind,
+    ) -> Result<Option<Vec<u8>>, WorkflowCheckpointStoreError> {
+        let layout = WorkflowCheckpointLayout::new(workflow_name, checkpoint_id);
+        match self
+            .object_store
+            .get(&self.object_key(&layout.artifact_path(kind)))
+            .await
+        {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == StorageErrorKind::NotFound => Ok(None),
+            Err(error) => Err(WorkflowCheckpointStoreError::new(error)),
+        }
+    }
+
+    async fn publish_checkpoint(
+        &self,
+        manifest: WorkflowCheckpointManifest,
+        artifacts: Vec<WorkflowCheckpointArtifactPayload>,
+    ) -> Result<(), WorkflowCheckpointStoreError> {
+        let layout = WorkflowCheckpointLayout::new(&manifest.workflow_name, manifest.checkpoint_id);
+        let mut payloads = artifacts
+            .into_iter()
+            .map(|artifact| (artifact.kind, artifact.bytes))
+            .collect::<BTreeMap<_, _>>();
+
+        for artifact in &manifest.artifacts {
+            let expected_path = layout.artifact_path(artifact.kind);
+            if artifact.path != expected_path {
+                return Err(WorkflowCheckpointStoreError::new(StorageError::corruption(
+                    format!(
+                        "checkpoint artifact {:?} expected path {expected_path}, got {}",
+                        artifact.kind, artifact.path
+                    ),
+                )));
+            }
+            let Some(bytes) = payloads.remove(&artifact.kind) else {
+                return Err(WorkflowCheckpointStoreError::new(StorageError::corruption(
+                    format!(
+                        "checkpoint artifact payload for {:?} is missing",
+                        artifact.kind
+                    ),
+                )));
+            };
+            self.object_store
+                .put(&self.object_key(&artifact.path), &bytes)
+                .await
+                .map_err(WorkflowCheckpointStoreError::new)?;
+        }
+
+        if !payloads.is_empty() {
+            return Err(WorkflowCheckpointStoreError::new(StorageError::corruption(
+                "checkpoint payload set contains unexpected artifacts",
+            )));
+        }
+
+        let manifest_bytes = encode_versioned_json(
+            WORKFLOW_CHECKPOINT_MANIFEST_FORMAT_VERSION,
+            &manifest,
+            "workflow checkpoint manifest",
+        )
+        .map_err(WorkflowCheckpointStoreError::new)?;
+        self.object_store
+            .put(&self.object_key(&layout.manifest_path()), &manifest_bytes)
+            .await
+            .map_err(WorkflowCheckpointStoreError::new)?;
+
+        let latest_bytes = encode_versioned_json(
+            WORKFLOW_CHECKPOINT_LATEST_POINTER_FORMAT_VERSION,
+            &WorkflowCheckpointLatestPointer {
+                checkpoint_id: manifest.checkpoint_id,
+            },
+            "workflow checkpoint latest pointer",
+        )
+        .map_err(WorkflowCheckpointStoreError::new)?;
+        self.object_store
+            .put(
+                &self.latest_manifest_key(&manifest.workflow_name),
+                &latest_bytes,
+            )
+            .await
+            .map_err(WorkflowCheckpointStoreError::new)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1062,6 +1278,7 @@ pub struct WorkflowTableNames {
     pub timer_schedule: String,
     pub timer_lookup: String,
     pub outbox: String,
+    pub trigger_journal: String,
 }
 
 impl WorkflowTableNames {
@@ -1075,6 +1292,7 @@ impl WorkflowTableNames {
             timer_schedule: format!("{prefix}_timer_schedule"),
             timer_lookup: format!("{prefix}_timer_lookup"),
             outbox: format!("{prefix}_outbox"),
+            trigger_journal: format!("{prefix}_trigger_journal"),
         }
     }
 }
@@ -1087,6 +1305,7 @@ pub struct WorkflowTables {
     source_cursors: Table,
     timers: DurableTimerSet,
     outbox: TransactionalOutbox,
+    trigger_journal: Table,
 }
 
 impl WorkflowTables {
@@ -1129,6 +1348,10 @@ impl WorkflowTables {
     pub fn outbox(&self) -> &TransactionalOutbox {
         &self.outbox
     }
+
+    pub fn trigger_journal_table(&self) -> &Table {
+        &self.trigger_journal
+    }
 }
 
 pub struct WorkflowDefinition<H> {
@@ -1142,6 +1365,7 @@ pub struct WorkflowDefinition<H> {
     source_batch_limit: usize,
     timer_batch_limit: usize,
     progress_mode: WorkflowProgressMode,
+    checkpoint_restore_on_open: WorkflowCheckpointRestoreOnOpen,
 }
 
 impl<H> WorkflowDefinition<H> {
@@ -1162,6 +1386,7 @@ impl<H> WorkflowDefinition<H> {
             source_batch_limit: DEFAULT_SOURCE_BATCH_LIMIT,
             timer_batch_limit: DEFAULT_TIMER_BATCH_LIMIT,
             progress_mode: WorkflowProgressMode::Auto,
+            checkpoint_restore_on_open: WorkflowCheckpointRestoreOnOpen::Disabled,
         }
     }
 
@@ -1217,6 +1442,24 @@ impl<H> WorkflowDefinition<H> {
         } else {
             WorkflowProgressMode::Buffered
         };
+        self
+    }
+
+    pub fn with_restore_latest_checkpoint_on_open(mut self) -> Self {
+        self.checkpoint_restore_on_open = WorkflowCheckpointRestoreOnOpen::Latest;
+        self
+    }
+
+    pub fn with_restore_checkpoint_on_open(mut self, checkpoint_id: WorkflowCheckpointId) -> Self {
+        self.checkpoint_restore_on_open = WorkflowCheckpointRestoreOnOpen::Specific(checkpoint_id);
+        self
+    }
+
+    fn with_checkpoint_restore_on_open_mode(
+        mut self,
+        checkpoint_restore_on_open: WorkflowCheckpointRestoreOnOpen,
+    ) -> Self {
+        self.checkpoint_restore_on_open = checkpoint_restore_on_open;
         self
     }
 }
@@ -1288,11 +1531,12 @@ where
             }
 
             let tables = ensure_workflow_tables(&db, &definition.table_names).await?;
+            let checkpoint_restore_on_open = definition.checkpoint_restore_on_open;
             let scheduler = definition
                 .scheduler
                 .unwrap_or_else(|| Arc::new(RoundRobinWorkflowScheduler::default()));
 
-            Ok(Self {
+            let runtime = Self {
                 inner: Arc::new(WorkflowRuntimeInner {
                     name: definition.name,
                     db,
@@ -1310,7 +1554,9 @@ where
                     in_flight_instances: Mutex::new(BTreeSet::new()),
                     ready_notify: Notify::new(),
                 }),
-            })
+            };
+            restore_checkpoint_on_open(&runtime.inner, checkpoint_restore_on_open).await?;
+            Ok(runtime)
         }
         .instrument(span.clone())
         .await
@@ -1346,6 +1592,53 @@ where
 
     pub async fn load_source_cursor(&self, source: &Table) -> Result<LogCursor, WorkflowError> {
         Ok(self.load_source_progress(source).await?.as_log_cursor())
+    }
+
+    pub async fn capture_checkpoint(
+        &self,
+        checkpoint_id: WorkflowCheckpointId,
+    ) -> Result<WorkflowCheckpointManifest, WorkflowError> {
+        let Some(checkpoint_store) = self.inner.checkpoint_store.clone() else {
+            return Err(WorkflowError::MissingCheckpointStore {
+                name: self.inner.name.clone(),
+            });
+        };
+        capture_workflow_checkpoint(&self.inner, checkpoint_store, checkpoint_id).await
+    }
+
+    pub async fn restore_latest_checkpoint(
+        &self,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowError> {
+        ensure_runtime_stopped_for_checkpoint_restore(&self.inner)?;
+        let Some(checkpoint_store) = self.inner.checkpoint_store.clone() else {
+            return Err(WorkflowError::MissingCheckpointStore {
+                name: self.inner.name.clone(),
+            });
+        };
+        restore_checkpoint_selection(
+            &self.inner,
+            checkpoint_store,
+            WorkflowCheckpointRestoreOnOpen::Latest,
+        )
+        .await
+    }
+
+    pub async fn restore_checkpoint(
+        &self,
+        checkpoint_id: WorkflowCheckpointId,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowError> {
+        ensure_runtime_stopped_for_checkpoint_restore(&self.inner)?;
+        let Some(checkpoint_store) = self.inner.checkpoint_store.clone() else {
+            return Err(WorkflowError::MissingCheckpointStore {
+                name: self.inner.name.clone(),
+            });
+        };
+        restore_checkpoint_selection(
+            &self.inner,
+            checkpoint_store,
+            WorkflowCheckpointRestoreOnOpen::Specific(checkpoint_id),
+        )
+        .await
     }
 
     pub async fn admit_callback(
@@ -1620,6 +1913,7 @@ pub struct RecurringWorkflowDefinition<H> {
     timer_poll_interval: Duration,
     timer_batch_limit: usize,
     progress_mode: WorkflowProgressMode,
+    checkpoint_restore_on_open: WorkflowCheckpointRestoreOnOpen,
 }
 
 impl<H> RecurringWorkflowDefinition<H> {
@@ -1641,6 +1935,7 @@ impl<H> RecurringWorkflowDefinition<H> {
             timer_poll_interval: DEFAULT_TIMER_POLL_INTERVAL,
             timer_batch_limit: DEFAULT_TIMER_BATCH_LIMIT,
             progress_mode: WorkflowProgressMode::Auto,
+            checkpoint_restore_on_open: WorkflowCheckpointRestoreOnOpen::Disabled,
         }
     }
 
@@ -1676,6 +1971,16 @@ impl<H> RecurringWorkflowDefinition<H> {
         self.progress_mode = progress_mode;
         self
     }
+
+    pub fn with_restore_latest_checkpoint_on_open(mut self) -> Self {
+        self.checkpoint_restore_on_open = WorkflowCheckpointRestoreOnOpen::Latest;
+        self
+    }
+
+    pub fn with_restore_checkpoint_on_open(mut self, checkpoint_id: WorkflowCheckpointId) -> Self {
+        self.checkpoint_restore_on_open = WorkflowCheckpointRestoreOnOpen::Specific(checkpoint_id);
+        self
+    }
 }
 
 pub struct RecurringWorkflowRuntime<H> {
@@ -1707,6 +2012,8 @@ where
             return Err(WorkflowError::EmptyInstanceId);
         }
 
+        let checkpoint_restore_on_open = definition.checkpoint_restore_on_open;
+
         let runtime = WorkflowRuntime::open(
             db,
             clock.clone(),
@@ -1728,7 +2035,8 @@ where
             .with_table_names(definition.table_names)
             .with_timer_poll_interval(definition.timer_poll_interval)
             .with_timer_batch_limit(definition.timer_batch_limit)
-            .with_progress_mode(definition.progress_mode),
+            .with_progress_mode(definition.progress_mode)
+            .with_checkpoint_restore_on_open_mode(checkpoint_restore_on_open),
         )
         .await?;
 
@@ -1749,6 +2057,26 @@ where
 
     pub fn tables(&self) -> &WorkflowTables {
         self.runtime.tables()
+    }
+
+    pub async fn capture_checkpoint(
+        &self,
+        checkpoint_id: WorkflowCheckpointId,
+    ) -> Result<WorkflowCheckpointManifest, WorkflowError> {
+        self.runtime.capture_checkpoint(checkpoint_id).await
+    }
+
+    pub async fn restore_latest_checkpoint(
+        &self,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowError> {
+        self.runtime.restore_latest_checkpoint().await
+    }
+
+    pub async fn restore_checkpoint(
+        &self,
+        checkpoint_id: WorkflowCheckpointId,
+    ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowError> {
+        self.runtime.restore_checkpoint(checkpoint_id).await
     }
 
     pub async fn telemetry_snapshot(&self) -> Result<WorkflowTelemetrySnapshot, WorkflowError> {
@@ -2620,13 +2948,509 @@ where
                 workflow_instance: instance_id.to_string(),
                 trigger_seq: trigger_sequence,
                 trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
-                operation_context,
+                operation_context: operation_context.clone(),
             },
             "workflow inbox trigger",
         )?),
     );
+    stage_trigger_journal_admission(
+        tx,
+        runtime.tables.trigger_journal_table(),
+        StoredAdmittedWorkflowTrigger {
+            workflow_instance: instance_id.to_string(),
+            trigger_seq: trigger_sequence,
+            trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
+            operation_context,
+        },
+    )
+    .await?;
 
     Ok(trigger_sequence)
+}
+
+async fn stage_trigger_journal_admission(
+    tx: &mut Transaction,
+    trigger_journal: &Table,
+    admitted: StoredAdmittedWorkflowTrigger,
+) -> Result<(), WorkflowError> {
+    let current = tx.read(trigger_journal, trigger_journal_head_key()).await?;
+    let journal_sequence = decode_trigger_journal_head(current.as_ref())?.saturating_add(1);
+
+    tx.write(
+        trigger_journal,
+        trigger_journal_head_key(),
+        Value::bytes(encode_trigger_journal_head(journal_sequence)?),
+    );
+    tx.write(
+        trigger_journal,
+        trigger_journal_entry_key(journal_sequence),
+        Value::bytes(encode_payload(&admitted, "workflow trigger journal entry")?),
+    );
+    Ok(())
+}
+
+fn checkpoint_store_error(
+    workflow_name: &str,
+    source: WorkflowCheckpointStoreError,
+) -> WorkflowError {
+    WorkflowError::CheckpointStore {
+        name: workflow_name.to_string(),
+        source,
+    }
+}
+
+fn ensure_runtime_stopped_for_checkpoint_restore<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+) -> Result<(), WorkflowError> {
+    if *runtime.running.lock().expect("running lock poisoned") {
+        return Err(WorkflowError::RestoreWhileRunning {
+            name: runtime.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+async fn restore_checkpoint_on_open<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    checkpoint_restore_on_open: WorkflowCheckpointRestoreOnOpen,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    if checkpoint_restore_on_open == WorkflowCheckpointRestoreOnOpen::Disabled {
+        return Ok(());
+    }
+
+    let Some(checkpoint_store) = runtime.checkpoint_store.clone() else {
+        return Err(WorkflowError::MissingCheckpointStore {
+            name: runtime.name.clone(),
+        });
+    };
+    restore_checkpoint_selection(runtime, checkpoint_store, checkpoint_restore_on_open)
+        .await
+        .map(|_| ())
+}
+
+async fn restore_checkpoint_selection<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    checkpoint_store: Arc<dyn WorkflowCheckpointStore>,
+    selection: WorkflowCheckpointRestoreOnOpen,
+) -> Result<Option<WorkflowCheckpointManifest>, WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let manifest = match selection {
+        WorkflowCheckpointRestoreOnOpen::Disabled => return Ok(None),
+        WorkflowCheckpointRestoreOnOpen::Latest => checkpoint_store
+            .load_latest_manifest(&runtime.name)
+            .await
+            .map_err(|error| checkpoint_store_error(&runtime.name, error))?,
+        WorkflowCheckpointRestoreOnOpen::Specific(checkpoint_id) => checkpoint_store
+            .load_manifest(&runtime.name, checkpoint_id)
+            .await
+            .map_err(|error| checkpoint_store_error(&runtime.name, error))?,
+    };
+
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    restore_checkpoint_manifest(runtime, checkpoint_store, manifest.clone()).await?;
+    Ok(Some(manifest))
+}
+
+async fn capture_workflow_checkpoint<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    checkpoint_store: Arc<dyn WorkflowCheckpointStore>,
+    checkpoint_id: WorkflowCheckpointId,
+) -> Result<WorkflowCheckpointManifest, WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    let durable_sequence = runtime.db.current_durable_sequence();
+    let captured_at = runtime.clock.now();
+    let layout = WorkflowCheckpointLayout::new(&runtime.name, checkpoint_id);
+
+    let state_rows =
+        scan_table_rows_at_sequence(runtime.tables.state_table(), durable_sequence).await?;
+    let inbox_rows =
+        scan_table_rows_at_sequence(runtime.tables.inbox_table(), durable_sequence).await?;
+    let trigger_order_rows =
+        scan_table_rows_at_sequence(runtime.tables.trigger_order_table(), durable_sequence).await?;
+    let source_progress_rows =
+        scan_table_rows_at_sequence(runtime.tables.source_progress_table(), durable_sequence)
+            .await?;
+    let timer_schedule_rows =
+        scan_table_rows_at_sequence(runtime.tables.timer_schedule_table(), durable_sequence)
+            .await?;
+    let timer_lookup_rows =
+        scan_table_rows_at_sequence(runtime.tables.timer_lookup_table(), durable_sequence).await?;
+    let outbox_rows =
+        scan_table_rows_at_sequence(runtime.tables.outbox_table(), durable_sequence).await?;
+    let trigger_journal_rows =
+        scan_table_rows_at_sequence(runtime.tables.trigger_journal_table(), durable_sequence)
+            .await?;
+
+    let source_frontier = decode_source_frontier_from_rows(&source_progress_rows)?;
+    let trigger_journal_high_watermark =
+        trigger_journal_high_watermark_from_rows(&trigger_journal_rows)?;
+
+    let mut artifacts = vec![
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::State,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::State,
+                &state_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::Inbox,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Inbox,
+                &inbox_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::TriggerOrder,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::TriggerOrder,
+                &trigger_order_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::SourceProgress,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::SourceProgress,
+                &source_progress_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::TimerSchedule,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::TimerSchedule,
+                &timer_schedule_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::TimerLookup,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::TimerLookup,
+                &timer_lookup_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::Outbox,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Outbox,
+                &outbox_rows,
+            )?,
+        },
+    ];
+
+    let mut artifact_kinds = artifacts
+        .iter()
+        .map(|artifact| artifact.kind)
+        .collect::<Vec<_>>();
+    if trigger_journal_high_watermark > 0 {
+        artifacts.push(WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::TriggerJournal,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::TriggerJournal,
+                &trigger_journal_rows,
+            )?,
+        });
+        artifact_kinds.push(WorkflowCheckpointArtifactKind::TriggerJournal);
+    }
+
+    let mut manifest = layout.manifest_with_frontier(captured_at, source_frontier, artifact_kinds);
+    manifest.trigger_journal_high_watermark =
+        (trigger_journal_high_watermark > 0).then_some(trigger_journal_high_watermark);
+
+    checkpoint_store
+        .publish_checkpoint(manifest.clone(), artifacts)
+        .await
+        .map_err(|error| checkpoint_store_error(&runtime.name, error))?;
+
+    Ok(manifest)
+}
+
+async fn restore_checkpoint_manifest<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    checkpoint_store: Arc<dyn WorkflowCheckpointStore>,
+    manifest: WorkflowCheckpointManifest,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowHandler + 'static,
+{
+    if manifest.workflow_name != runtime.name {
+        return Err(StorageError::corruption(format!(
+            "checkpoint workflow {} does not match runtime {}",
+            manifest.workflow_name, runtime.name
+        ))
+        .into());
+    }
+
+    let state_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::State,
+    )
+    .await?;
+    let inbox_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::Inbox,
+    )
+    .await?;
+    let trigger_order_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::TriggerOrder,
+    )
+    .await?;
+    let source_progress_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::SourceProgress,
+    )
+    .await?;
+    let timer_schedule_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::TimerSchedule,
+    )
+    .await?;
+    let timer_lookup_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::TimerLookup,
+    )
+    .await?;
+    let outbox_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::Outbox,
+    )
+    .await?;
+    let mut trigger_journal_rows = if manifest
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == WorkflowCheckpointArtifactKind::TriggerJournal)
+    {
+        load_required_checkpoint_rows(
+            checkpoint_store.as_ref(),
+            &runtime.name,
+            manifest.checkpoint_id,
+            WorkflowCheckpointArtifactKind::TriggerJournal,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    if !trigger_journal_rows.is_empty()
+        && !trigger_journal_rows
+            .iter()
+            .any(|row| row.key == trigger_journal_head_key())
+    {
+        let high_watermark = manifest.trigger_journal_high_watermark.unwrap_or(
+            trigger_journal_high_watermark_from_rows(&trigger_journal_rows)?,
+        );
+        if high_watermark > 0 {
+            trigger_journal_rows.push(WorkflowCheckpointTableRow {
+                key: trigger_journal_head_key(),
+                value: Value::bytes(encode_trigger_journal_head(high_watermark)?),
+            });
+        }
+    }
+
+    let durable_sequence = runtime.db.current_durable_sequence();
+    let existing_state_keys =
+        scan_table_keys_at_sequence(runtime.tables.state_table(), durable_sequence).await?;
+    let existing_inbox_keys =
+        scan_table_keys_at_sequence(runtime.tables.inbox_table(), durable_sequence).await?;
+    let existing_trigger_order_keys =
+        scan_table_keys_at_sequence(runtime.tables.trigger_order_table(), durable_sequence).await?;
+    let existing_source_progress_keys =
+        scan_table_keys_at_sequence(runtime.tables.source_progress_table(), durable_sequence)
+            .await?;
+    let existing_timer_schedule_keys =
+        scan_table_keys_at_sequence(runtime.tables.timer_schedule_table(), durable_sequence)
+            .await?;
+    let existing_timer_lookup_keys =
+        scan_table_keys_at_sequence(runtime.tables.timer_lookup_table(), durable_sequence).await?;
+    let existing_outbox_keys =
+        scan_table_keys_at_sequence(runtime.tables.outbox_table(), durable_sequence).await?;
+    let existing_trigger_journal_keys =
+        scan_table_keys_at_sequence(runtime.tables.trigger_journal_table(), durable_sequence)
+            .await?;
+
+    let mut tx = Transaction::begin(&runtime.db).await;
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.state_table(),
+        &existing_state_keys,
+        &state_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.inbox_table(),
+        &existing_inbox_keys,
+        &inbox_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.trigger_order_table(),
+        &existing_trigger_order_keys,
+        &trigger_order_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.source_progress_table(),
+        &existing_source_progress_keys,
+        &source_progress_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.timer_schedule_table(),
+        &existing_timer_schedule_keys,
+        &timer_schedule_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.timer_lookup_table(),
+        &existing_timer_lookup_keys,
+        &timer_lookup_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.outbox_table(),
+        &existing_outbox_keys,
+        &outbox_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.trigger_journal_table(),
+        &existing_trigger_journal_keys,
+        &trigger_journal_rows,
+    );
+
+    let _ = runtime
+        .db
+        .__run_failpoint(
+            crate::failpoints::names::WORKFLOW_CHECKPOINT_RESTORE_BEFORE_COMMIT,
+            BTreeMap::from([
+                ("workflow".to_string(), runtime.name.clone()),
+                (
+                    "checkpoint_id".to_string(),
+                    manifest.checkpoint_id.get().to_string(),
+                ),
+            ]),
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn load_required_checkpoint_rows(
+    checkpoint_store: &dyn WorkflowCheckpointStore,
+    workflow_name: &str,
+    checkpoint_id: WorkflowCheckpointId,
+    kind: WorkflowCheckpointArtifactKind,
+) -> Result<Vec<WorkflowCheckpointTableRow>, WorkflowError> {
+    let bytes = checkpoint_store
+        .read_artifact(workflow_name, checkpoint_id, kind)
+        .await
+        .map_err(|error| checkpoint_store_error(workflow_name, error))?
+        .ok_or_else(|| {
+            StorageError::corruption(format!(
+                "checkpoint {} is missing {:?} artifact",
+                checkpoint_id, kind
+            ))
+        })?;
+    decode_checkpoint_table_artifact(kind, &bytes)
+}
+
+fn replace_table_rows_in_transaction(
+    tx: &mut Transaction,
+    table: &Table,
+    existing_keys: &[Key],
+    rows: &[WorkflowCheckpointTableRow],
+) {
+    for key in existing_keys {
+        tx.delete(table, key.clone());
+    }
+    for row in rows {
+        tx.write(table, row.key.clone(), row.value.clone());
+    }
+}
+
+async fn scan_table_rows_at_sequence(
+    table: &Table,
+    sequence: SequenceNumber,
+) -> Result<Vec<WorkflowCheckpointTableRow>, WorkflowError> {
+    let mut rows = table
+        .scan_at(
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    let mut captured = Vec::new();
+    while let Some((key, value)) = rows.next().await {
+        captured.push(WorkflowCheckpointTableRow { key, value });
+    }
+    Ok(captured)
+}
+
+async fn scan_table_keys_at_sequence(
+    table: &Table,
+    sequence: SequenceNumber,
+) -> Result<Vec<Key>, WorkflowError> {
+    Ok(scan_table_rows_at_sequence(table, sequence)
+        .await?
+        .into_iter()
+        .map(|row| row.key)
+        .collect())
+}
+
+fn decode_source_frontier_from_rows(
+    rows: &[WorkflowCheckpointTableRow],
+) -> Result<BTreeMap<String, WorkflowSourceProgress>, WorkflowError> {
+    let mut source_frontier = BTreeMap::new();
+    for row in rows {
+        let source_name = std::str::from_utf8(&row.key).map_err(|error| {
+            StorageError::corruption(format!(
+                "workflow source progress key must be valid utf-8: {error}"
+            ))
+        })?;
+        source_frontier.insert(
+            source_name.to_string(),
+            decode_workflow_source_progress_value(&row.value)?,
+        );
+    }
+    Ok(source_frontier)
+}
+
+fn trigger_journal_high_watermark_from_rows(
+    rows: &[WorkflowCheckpointTableRow],
+) -> Result<u64, WorkflowError> {
+    let mut max_sequence = 0;
+    for row in rows {
+        if row.key == trigger_journal_head_key() {
+            return decode_trigger_journal_head(Some(&row.value));
+        }
+        if let Some(sequence) = decode_trigger_journal_entry_sequence(&row.key) {
+            max_sequence = max_sequence.max(sequence);
+        }
+    }
+    Ok(max_sequence)
 }
 
 async fn ensure_workflow_tables(
@@ -2640,6 +3464,7 @@ async fn ensure_workflow_tables(
     let timer_schedule = ensure_table(db, &table_names.timer_schedule).await?;
     let timer_lookup = ensure_table(db, &table_names.timer_lookup).await?;
     let outbox = ensure_table(db, &table_names.outbox).await?;
+    let trigger_journal = ensure_table(db, &table_names.trigger_journal).await?;
 
     Ok(WorkflowTables {
         state,
@@ -2648,6 +3473,7 @@ async fn ensure_workflow_tables(
         source_cursors,
         timers: DurableTimerSet::new(timer_schedule, timer_lookup),
         outbox: TransactionalOutbox::new(outbox),
+        trigger_journal,
     })
 }
 
@@ -2780,6 +3606,48 @@ fn decode_u64_bytes(bytes: &[u8], context: &str) -> Result<u64, std::io::Error> 
     Ok(u64::from_be_bytes(raw))
 }
 
+fn trigger_journal_head_key() -> Key {
+    TRIGGER_JOURNAL_HEAD_KEY.to_vec()
+}
+
+fn trigger_journal_entry_key(journal_sequence: u64) -> Key {
+    let mut key = Vec::with_capacity(9);
+    key.push(TRIGGER_JOURNAL_ENTRY_PREFIX);
+    key.extend_from_slice(&journal_sequence.to_be_bytes());
+    key
+}
+
+fn decode_trigger_journal_entry_sequence(key: &[u8]) -> Option<u64> {
+    if key.len() != 9 || key.first().copied() != Some(TRIGGER_JOURNAL_ENTRY_PREFIX) {
+        return None;
+    }
+    let mut raw = [0_u8; 8];
+    raw.copy_from_slice(&key[1..]);
+    Some(u64::from_be_bytes(raw))
+}
+
+fn encode_trigger_journal_head(journal_sequence: u64) -> Result<Vec<u8>, WorkflowError> {
+    encode_versioned_json(
+        WORKFLOW_TRIGGER_JOURNAL_HEAD_FORMAT_VERSION,
+        &journal_sequence,
+        "workflow trigger journal head",
+    )
+    .map_err(Into::into)
+}
+
+fn decode_trigger_journal_head(value: Option<&Value>) -> Result<u64, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let bytes = expect_bytes_value(value, "workflow trigger journal head")?;
+    decode_versioned_json(
+        WORKFLOW_TRIGGER_JOURNAL_HEAD_FORMAT_VERSION,
+        bytes,
+        "workflow trigger journal head",
+    )
+    .map_err(Into::into)
+}
+
 fn encode_workflow_source_progress(
     progress: WorkflowSourceProgress,
 ) -> Result<Vec<u8>, StorageError> {
@@ -2837,6 +3705,82 @@ where
     serde_json::from_slice(&bytes[1..]).map_err(|error| {
         StorageError::corruption(format!("{context} decoding failed: {error}")).into()
     })
+}
+
+fn encode_versioned_json<T>(version: u8, value: &T, context: &str) -> Result<Vec<u8>, StorageError>
+where
+    T: Serialize,
+{
+    let json = serde_json::to_vec(value).map_err(|error| {
+        StorageError::corruption(format!("{context} serialization failed: {error}"))
+    })?;
+    let mut bytes = Vec::with_capacity(1 + json.len());
+    bytes.push(version);
+    bytes.extend_from_slice(&json);
+    Ok(bytes)
+}
+
+fn decode_versioned_json<T>(
+    expected_version: u8,
+    bytes: &[u8],
+    context: &str,
+) -> Result<T, StorageError>
+where
+    T: DeserializeOwned,
+{
+    if bytes.first().copied() != Some(expected_version) {
+        return Err(StorageError::corruption(format!(
+            "{context} version is invalid"
+        )));
+    }
+    serde_json::from_slice(&bytes[1..])
+        .map_err(|error| StorageError::corruption(format!("{context} decoding failed: {error}")))
+}
+
+fn encode_checkpoint_table_artifact(
+    kind: WorkflowCheckpointArtifactKind,
+    rows: &[WorkflowCheckpointTableRow],
+) -> Result<Vec<u8>, WorkflowError> {
+    encode_versioned_json(
+        WORKFLOW_CHECKPOINT_ARTIFACT_FORMAT_VERSION,
+        &WorkflowCheckpointTableArtifact {
+            kind,
+            rows: rows.to_vec(),
+        },
+        "workflow checkpoint artifact",
+    )
+    .map_err(Into::into)
+}
+
+fn decode_checkpoint_table_artifact(
+    kind: WorkflowCheckpointArtifactKind,
+    bytes: &[u8],
+) -> Result<Vec<WorkflowCheckpointTableRow>, WorkflowError> {
+    let artifact = decode_versioned_json::<WorkflowCheckpointTableArtifact>(
+        WORKFLOW_CHECKPOINT_ARTIFACT_FORMAT_VERSION,
+        bytes,
+        "workflow checkpoint artifact",
+    )?;
+    if artifact.kind != kind {
+        return Err(StorageError::corruption(format!(
+            "workflow checkpoint artifact kind mismatch: expected {:?}, got {:?}",
+            kind, artifact.kind
+        ))
+        .into());
+    }
+    Ok(artifact.rows)
+}
+
+fn join_object_key(prefix: &str, relative: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    let relative = relative.trim_matches('/');
+    if prefix.is_empty() {
+        relative.to_string()
+    } else if relative.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/{relative}")
+    }
 }
 
 fn decode_admitted_trigger(
@@ -2939,6 +3883,23 @@ async fn count_rows_at_sequence(
         count += 1;
     }
     Ok(count)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkflowCheckpointLatestPointer {
+    checkpoint_id: WorkflowCheckpointId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WorkflowCheckpointTableRow {
+    key: Key,
+    value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WorkflowCheckpointTableArtifact {
+    kind: WorkflowCheckpointArtifactKind,
+    rows: Vec<WorkflowCheckpointTableRow>,
 }
 
 #[derive(Clone, Debug)]
