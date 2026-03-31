@@ -201,6 +201,7 @@ pub(super) struct ColumnarReadContext {
     pub(super) remote_cache: Option<Arc<RemoteCache>>,
     pub(super) decoded_cache: DecodedColumnarCache,
     pub(super) raw_byte_cache_enabled: AtomicBool,
+    pub(super) raw_byte_cache_population_enabled: AtomicBool,
     pub(super) decoded_cache_enabled: AtomicBool,
     pub(super) raw_byte_cache_budget_bytes: u64,
     pub(super) raw_byte_cache_budget_state: Mutex<RawByteCacheBudgetState>,
