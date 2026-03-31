@@ -311,6 +311,10 @@ impl SandboxSession {
         self.runtime.clone()
     }
 
+    pub(crate) fn operation_lock(&self) -> Arc<Mutex<()>> {
+        self.operation_lock.clone()
+    }
+
     pub fn filesystem(&self) -> Arc<dyn SandboxFilesystemShim> {
         Arc::new(VfsSandboxFilesystemShim::new(self.volume.fs()))
     }
@@ -670,6 +674,8 @@ async fn seed_session_layout(
         "/.terrace/tools",
         "/.terrace/npm",
         "/.terrace/typescript/libs",
+        "/.terrace/typescript/transpile",
+        "/.terrace/typescript/emits",
         "/.terrace/tools/bash",
     ] {
         fs.mkdir(
@@ -737,7 +743,7 @@ async fn write_session_info_exact(
     Ok(())
 }
 
-async fn record_completed_tool_run(
+pub(crate) async fn record_completed_tool_run(
     volume: &dyn Volume,
     name: &str,
     params: Option<JsonValue>,

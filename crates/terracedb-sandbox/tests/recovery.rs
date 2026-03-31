@@ -2,8 +2,11 @@ use std::sync::Arc;
 
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_sandbox::{
-    DefaultSandboxStore, GitProvenance, ReopenSessionOptions, SandboxConfig, SandboxServices,
-    SandboxStore, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
+    BashRequest, BashService, DefaultSandboxStore, DeterministicBashService,
+    DeterministicTypeScriptService, GitProvenance, ReopenSessionOptions, SandboxConfig,
+    SandboxServices, SandboxStore, TERRACE_BASH_SESSION_STATE_PATH, TERRACE_SESSION_INFO_KV_KEY,
+    TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,
+    TypeCheckRequest, TypeScriptService, TypeScriptTranspileRequest,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore,
@@ -45,6 +48,17 @@ async fn seed_base(store: &InMemoryVfsStore, volume_id: VolumeId) {
         )
         .await
         .expect("seed base");
+    base.fs()
+        .write_file(
+            "/workspace/tooling.ts",
+            b"export const value: number = 1;\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed tooling");
 }
 
 #[tokio::test]
@@ -193,4 +207,109 @@ async fn durable_recovery_only_sees_flushed_provenance_updates() {
             .expect("flushed branch"),
         "pending"
     );
+}
+
+#[tokio::test]
+async fn reopen_preserves_typescript_and_bash_service_metadata() {
+    let (vfs, sandbox) = sandbox_store(80, 205);
+    let base_volume_id = VolumeId::new(0x8200);
+    let session_volume_id = VolumeId::new(0x8201);
+    seed_base(&vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open session");
+    let ts = DeterministicTypeScriptService::default();
+    ts.transpile(
+        &session,
+        TypeScriptTranspileRequest {
+            path: "/workspace/tooling.ts".to_string(),
+            target: "es2022".to_string(),
+            module_kind: "esm".to_string(),
+            jsx: None,
+        },
+    )
+    .await
+    .expect("transpile tooling");
+    ts.check(
+        &session,
+        TypeCheckRequest {
+            roots: vec!["/workspace/tooling.ts".to_string()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("check tooling");
+    let bash = DeterministicBashService::default();
+    bash.run(
+        &session,
+        BashRequest {
+            command: "mkdir -p notes && cd notes && export NAME=Terrace".to_string(),
+            cwd: "/workspace".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("run bash");
+    session.flush().await.expect("flush service state");
+
+    let reopened = sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen session");
+    assert!(
+        reopened
+            .filesystem()
+            .read_file(TERRACE_TYPESCRIPT_STATE_PATH)
+            .await
+            .expect("read ts state")
+            .is_some()
+    );
+    assert!(
+        reopened
+            .filesystem()
+            .read_file(TERRACE_TYPESCRIPT_MIRROR_PATH)
+            .await
+            .expect("read ts mirror")
+            .is_some()
+    );
+    assert!(
+        reopened
+            .filesystem()
+            .read_file(TERRACE_BASH_SESSION_STATE_PATH)
+            .await
+            .expect("read bash state")
+            .is_some()
+    );
+
+    let cached = ts
+        .transpile(
+            &reopened,
+            TypeScriptTranspileRequest {
+                path: "/workspace/tooling.ts".to_string(),
+                target: "es2022".to_string(),
+                module_kind: "esm".to_string(),
+                jsx: None,
+            },
+        )
+        .await
+        .expect("transpile after reopen");
+    assert!(cached.cache_hit);
+
+    let resumed = bash
+        .run(
+            &reopened,
+            BashRequest {
+                command: "echo $NAME && pwd".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("resume bash");
+    assert_eq!(resumed.stdout, "Terrace\n/workspace/notes\n");
+    assert_eq!(resumed.cwd, "/workspace/notes");
 }

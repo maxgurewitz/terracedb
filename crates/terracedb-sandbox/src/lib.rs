@@ -13,7 +13,10 @@ pub mod types;
 pub mod typescript;
 pub mod view;
 
-pub use bash::{BashReport, BashRequest, BashService, DeterministicBashService};
+pub use bash::{
+    BashReport, BashRequest, BashService, BashSessionState, DeterministicBashService,
+    JustBashFilesystemAdapter, TERRACE_BASH_SESSION_STATE_PATH,
+};
 pub use capabilities::{
     CapabilityManifest, CapabilityRegistry, SandboxCapability, StaticCapabilityRegistry,
 };
@@ -46,8 +49,10 @@ pub use types::{
     TERRACE_METADATA_DIR, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
 };
 pub use typescript::{
-    DeterministicTypeScriptService, TypeCheckReport, TypeCheckRequest, TypeScriptDiagnostic,
-    TypeScriptEmitReport, TypeScriptService,
+    DeterministicTypeScriptService, TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,
+    TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR, TypeCheckReport, TypeCheckRequest,
+    TypeScriptDiagnostic, TypeScriptEmitReport, TypeScriptMirrorEntry, TypeScriptMirrorState,
+    TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
 };
 pub use view::{
     DeterministicReadonlyViewProvider, READONLY_VIEW_URI_SCHEME, ReadonlyViewCut,
