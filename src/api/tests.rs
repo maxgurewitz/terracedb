@@ -604,6 +604,121 @@ impl Scheduler for DomainMutableBudgetRateLimitScheduler {
     }
 }
 
+#[derive(Debug)]
+struct SizeSensitiveAdmissionScheduler {
+    rate_limit_bytes_threshold: u64,
+    max_write_bytes_per_second: u64,
+}
+
+impl Scheduler for SizeSensitiveAdmissionScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &crate::Table,
+        _stats: &TableStats,
+        signals: &crate::AdmissionSignals,
+        _tag: &crate::WorkRuntimeTag,
+        _domain_budget: Option<&crate::ExecutionDomainBudget>,
+    ) -> Option<crate::AdmissionDiagnostics> {
+        if signals.batch_write_bytes < self.rate_limit_bytes_threshold {
+            return Some(crate::AdmissionDiagnostics::default());
+        }
+
+        Some(crate::AdmissionDiagnostics {
+            level: crate::AdmissionPressureLevel::RateLimit,
+            triggered_by: vec![crate::AdmissionPressureSignal::MutableBudget],
+            max_write_bytes_per_second: Some(self.max_write_bytes_per_second),
+            metadata: BTreeMap::from([(
+                "scheduler".to_string(),
+                json!("size-sensitive-rate-limit"),
+            )]),
+            ..crate::AdmissionDiagnostics::default()
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct PerTableAdmissionScheduler {
+    diagnostics_by_table: BTreeMap<String, crate::AdmissionDiagnostics>,
+}
+
+impl Scheduler for PerTableAdmissionScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        table: &crate::Table,
+        _stats: &TableStats,
+        _signals: &crate::AdmissionSignals,
+        _tag: &crate::WorkRuntimeTag,
+        _domain_budget: Option<&crate::ExecutionDomainBudget>,
+    ) -> Option<crate::AdmissionDiagnostics> {
+        Some(
+            self.diagnostics_by_table
+                .get(table.name())
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct AlwaysStallAdmissionScheduler;
+
+impl Scheduler for AlwaysStallAdmissionScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &crate::Table,
+        _stats: &TableStats,
+        _signals: &crate::AdmissionSignals,
+        _tag: &crate::WorkRuntimeTag,
+        _domain_budget: Option<&crate::ExecutionDomainBudget>,
+    ) -> Option<crate::AdmissionDiagnostics> {
+        Some(crate::AdmissionDiagnostics {
+            level: crate::AdmissionPressureLevel::Stall,
+            triggered_by: vec![crate::AdmissionPressureSignal::L0Sstables],
+            metadata: BTreeMap::from([("scheduler".to_string(), json!("always-stall"))]),
+            ..crate::AdmissionDiagnostics::default()
+        })
+    }
+}
+
 #[derive(Default)]
 struct TinyCompactionBudgetScheduler;
 
@@ -2432,17 +2547,22 @@ async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlo
 
     let snapshot = db.scheduler_observability_snapshot();
     let recorded = snapshot
-        .last_admission_diagnostics_by_domain
+        .last_non_open_admission_by_domain
         .get(&profile.foreground.domain)
         .expect("foreground diagnostics should be recorded");
-    assert_eq!(recorded.level, crate::AdmissionPressureLevel::RateLimit);
+    assert_eq!(
+        recorded.diagnostics.level,
+        crate::AdmissionPressureLevel::RateLimit
+    );
     assert!(
         recorded
+            .diagnostics
             .triggered_by
             .contains(&crate::AdmissionPressureSignal::MutableBudget)
     );
     assert!(
         !recorded
+            .diagnostics
             .triggered_by
             .contains(&crate::AdmissionPressureSignal::L0Sstables)
     );
@@ -2453,6 +2573,233 @@ async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlo
             .copied()
             .unwrap_or_default()
             >= 1
+    );
+}
+
+#[tokio::test]
+async fn scheduler_observability_current_admission_clears_after_recovery_write() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(10)));
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/scheduler-current-admission-clears",
+            Arc::new(SizeSensitiveAdmissionScheduler {
+                rate_limit_bytes_threshold: 64,
+                max_write_bytes_per_second: 128,
+            }),
+        ),
+        dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    let domain = db.execution_profile().foreground.domain.clone();
+    let throttled_start = clock.now();
+
+    let throttled_table = table.clone();
+    let throttled = tokio::spawn(async move {
+        throttled_table
+            .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
+            .await
+            .expect("throttled write")
+    });
+    let elapsed = advance_clock_until_task_finishes(
+        clock.as_ref(),
+        &throttled,
+        Duration::from_millis(250),
+        16,
+    )
+    .await;
+    assert!(elapsed > 0);
+    assert_eq!(
+        throttled.await.expect("join throttled write"),
+        SequenceNumber::new(1)
+    );
+
+    let throttled_snapshot = db.scheduler_observability_snapshot();
+    let throttled_current = throttled_snapshot
+        .current_admission_diagnostics_by_domain
+        .get(&domain)
+        .expect("current throttled admission");
+    let throttled_last_non_open = throttled_snapshot
+        .last_non_open_admission_by_domain
+        .get(&domain)
+        .expect("last non-open throttled admission");
+    assert_eq!(
+        throttled_current.diagnostics.level,
+        crate::AdmissionPressureLevel::RateLimit
+    );
+    assert!(
+        throttled_current.recorded_at >= throttled_start,
+        "throttled write should record at or after the write start time",
+    );
+    assert_eq!(throttled_last_non_open, throttled_current);
+
+    clock.advance(Duration::from_millis(1));
+    table
+        .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
+        .await
+        .expect("open write should clear current admission");
+
+    let recovered_snapshot = db.scheduler_observability_snapshot();
+    let current = recovered_snapshot
+        .current_admission_diagnostics_by_domain
+        .get(&domain)
+        .expect("current admission after recovery");
+    let last_non_open = recovered_snapshot
+        .last_non_open_admission_by_domain
+        .get(&domain)
+        .expect("retained non-open admission after recovery");
+    assert_eq!(
+        current.diagnostics.level,
+        crate::AdmissionPressureLevel::Open
+    );
+    assert!(
+        current.recorded_at > last_non_open.recorded_at,
+        "recovery write should refresh current admission timestamp",
+    );
+    assert_eq!(
+        last_non_open.diagnostics.level,
+        crate::AdmissionPressureLevel::RateLimit
+    );
+    assert_eq!(last_non_open.recorded_at, throttled_current.recorded_at);
+}
+
+#[tokio::test]
+async fn scheduler_observability_keeps_strongest_diagnostics_for_multi_table_write() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let scheduler = Arc::new(PerTableAdmissionScheduler {
+        diagnostics_by_table: BTreeMap::from([
+            (
+                "alpha".to_string(),
+                crate::AdmissionDiagnostics {
+                    level: crate::AdmissionPressureLevel::Stall,
+                    triggered_by: vec![crate::AdmissionPressureSignal::L0Sstables],
+                    metadata: BTreeMap::from([("source_table".to_string(), json!("alpha"))]),
+                    ..crate::AdmissionDiagnostics::default()
+                },
+            ),
+            (
+                "beta".to_string(),
+                crate::AdmissionDiagnostics {
+                    level: crate::AdmissionPressureLevel::RateLimit,
+                    triggered_by: vec![crate::AdmissionPressureSignal::MutableBudget],
+                    max_write_bytes_per_second: Some(128),
+                    metadata: BTreeMap::from([("source_table".to_string(), json!("beta"))]),
+                    ..crate::AdmissionDiagnostics::default()
+                },
+            ),
+        ]),
+    });
+    let db = Db::open(
+        tiered_config_with_scheduler("/scheduler-strongest-multi-table-admission", scheduler),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let alpha = db
+        .create_table(row_table_config("alpha"))
+        .await
+        .expect("create alpha");
+    let beta = db
+        .create_table(row_table_config("beta"))
+        .await
+        .expect("create beta");
+    let domain = db.execution_profile().foreground.domain.clone();
+
+    let mut tx = Transaction::begin(&db).await;
+    tx.write(&alpha, b"alpha".to_vec(), Value::bytes("a"));
+    tx.write(&beta, b"beta".to_vec(), Value::bytes("b"));
+    assert_eq!(
+        tx.commit_no_flush().await.expect("commit multi-table tx"),
+        SequenceNumber::new(1)
+    );
+
+    let snapshot = db.scheduler_observability_snapshot();
+    let current = snapshot
+        .current_admission_diagnostics_by_domain
+        .get(&domain)
+        .expect("current admission for multi-table write");
+    let last_non_open = snapshot
+        .last_non_open_admission_by_domain
+        .get(&domain)
+        .expect("last non-open admission for multi-table write");
+    assert_eq!(
+        current.diagnostics.level,
+        crate::AdmissionPressureLevel::Stall
+    );
+    assert_eq!(
+        last_non_open.diagnostics.level,
+        crate::AdmissionPressureLevel::Stall
+    );
+    assert_eq!(
+        current.diagnostics.metadata.get("source_table"),
+        Some(&json!("alpha"))
+    );
+    assert_eq!(
+        snapshot
+            .throttled_writes_by_domain
+            .get(&domain)
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn scheduler_observability_counts_stalled_writes_once_per_write() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/scheduler-stalled-write-counts-once",
+            Arc::new(AlwaysStallAdmissionScheduler),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    let domain = db.execution_profile().foreground.domain.clone();
+
+    let before = db
+        .scheduler_observability_snapshot()
+        .throttled_writes_by_domain
+        .get(&domain)
+        .copied()
+        .unwrap_or_default();
+
+    assert_eq!(
+        table
+            .write(b"stalled".to_vec(), Value::bytes("v"))
+            .await
+            .expect("stalled write"),
+        SequenceNumber::new(1)
+    );
+
+    let snapshot = db.scheduler_observability_snapshot();
+    let after = snapshot
+        .throttled_writes_by_domain
+        .get(&domain)
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(after - before, 1);
+    assert_eq!(
+        snapshot
+            .current_admission_diagnostics_by_domain
+            .get(&domain)
+            .expect("current stalled admission")
+            .diagnostics
+            .level,
+        crate::AdmissionPressureLevel::Stall
     );
 }
 

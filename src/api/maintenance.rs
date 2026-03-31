@@ -528,6 +528,7 @@ impl Db {
             .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
         mutex_lock(&self.inner.work_deferral_domains)
             .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn record_deferred_work(
@@ -553,11 +554,15 @@ impl Db {
                 }
             }
         }
+        drop(domains);
+        drop(deferrals);
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn reset_work_deferral(&self, work_id: &str) {
         mutex_lock(&self.inner.work_deferrals).remove(work_id);
         mutex_lock(&self.inner.work_deferral_domains).remove(work_id);
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn work_deferral_cycles(&self, work_id: &str) -> u32 {
@@ -572,6 +577,7 @@ impl Db {
             .scheduler_observability
             .forced_executions
             .fetch_add(1, Ordering::Relaxed);
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn record_forced_flush(&self) {
@@ -579,6 +585,7 @@ impl Db {
             .scheduler_observability
             .forced_flushes
             .fetch_add(1, Ordering::Relaxed);
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn record_forced_l0_compaction(&self) {
@@ -586,6 +593,7 @@ impl Db {
             .scheduler_observability
             .forced_l0_compactions
             .fetch_add(1, Ordering::Relaxed);
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn record_budget_blocked_execution(&self, tag: &crate::WorkRuntimeTag) {
@@ -601,6 +609,7 @@ impl Db {
         )
         .entry(tag.domain.clone())
         .or_default() += 1;
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn record_background_delay(&self, tag: &crate::WorkRuntimeTag, delay: Duration) {
@@ -631,6 +640,7 @@ impl Db {
         )
         .entry(tag.domain.clone())
         .or_default() += delay.as_millis() as u64;
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn pending_work_budget_block_reason(

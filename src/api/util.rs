@@ -16,6 +16,10 @@ pub(super) fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
 }
 
+pub(super) fn mutex_try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    mutex.try_lock()
+}
+
 pub(super) async fn read_all_file(
     dependencies: &DbDependencies,
     handle: &crate::FileHandle,

@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, fmt, sync::Mutex};
 use serde_json::Value as JsonValue;
 
 use crate::{
+    Timestamp,
     api::Table,
     current_state::CurrentStateRetentionStats,
     execution::{
@@ -165,6 +166,12 @@ pub enum DomainPriorityOverride {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordedAdmissionDiagnostics {
+    pub diagnostics: AdmissionDiagnostics,
+    pub recorded_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchedulerObservabilitySnapshot {
     pub deferred_work: BTreeMap<String, u32>,
     pub deferred_work_by_domain: BTreeMap<ExecutionDomainPath, u32>,
@@ -179,7 +186,10 @@ pub struct SchedulerObservabilitySnapshot {
     pub background_delay_events_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub background_delay_millis_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub throttled_writes_by_domain: BTreeMap<ExecutionDomainPath, u64>,
-    pub last_admission_diagnostics_by_domain: BTreeMap<ExecutionDomainPath, AdmissionDiagnostics>,
+    pub current_admission_diagnostics_by_domain:
+        BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
+    pub last_non_open_admission_by_domain:
+        BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

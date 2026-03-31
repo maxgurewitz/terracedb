@@ -1876,6 +1876,8 @@ impl Db {
                 .await;
             let mut should_run_maintenance = flush_guardrail.soft_triggered;
             let mut must_stall = flush_guardrail.force_triggered;
+            let mut aggregated_diagnostics = crate::AdmissionDiagnostics::default();
+            let mut saw_admission = false;
 
             for table in &touched_tables {
                 let stats = self.table_stats(table).await;
@@ -1906,6 +1908,9 @@ impl Db {
                     &foreground_tag,
                     foreground_budget.as_ref(),
                 );
+                let hard_l0_stall = stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT;
+                let effective_diagnostics =
+                    Self::effective_admission_diagnostics(&decision, diagnostics, hard_l0_stall);
 
                 let table_delay = decision
                     .max_write_bytes_per_second
@@ -1914,26 +1919,32 @@ impl Db {
                 max_delay = max_delay.max(table_delay);
                 let carry_delay = crate::carry_write_delay_across_maintenance(
                     decision.max_write_bytes_per_second,
-                    diagnostics.as_ref(),
+                    Some(&effective_diagnostics),
                 );
-                if decision.throttle {
-                    if let Some(diagnostics) = diagnostics.clone() {
-                        self.record_admission_diagnostics(&foreground_tag, diagnostics);
-                    }
-                    self.record_throttled_write_domain(&foreground_tag);
+                if !saw_admission {
+                    aggregated_diagnostics = effective_diagnostics.clone();
+                    saw_admission = true;
+                } else {
+                    aggregated_diagnostics = Self::stronger_admission_diagnostics(
+                        aggregated_diagnostics,
+                        effective_diagnostics.clone(),
+                    );
+                }
+                if effective_diagnostics.level != crate::AdmissionPressureLevel::Open {
                     should_run_maintenance = true;
                 }
-                if decision.stall || stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
-                {
-                    if let Some(diagnostics) = diagnostics {
-                        self.record_admission_diagnostics(&foreground_tag, diagnostics);
-                    }
-                    self.record_throttled_write_domain(&foreground_tag);
-                    should_run_maintenance = true;
+                if effective_diagnostics.level == crate::AdmissionPressureLevel::Stall {
                     must_stall = true;
                 }
                 if carry_delay {
                     pending_delay = pending_delay.max(table_delay);
+                }
+            }
+
+            if saw_admission {
+                self.record_admission_diagnostics(&foreground_tag, aggregated_diagnostics.clone());
+                if aggregated_diagnostics.level != crate::AdmissionPressureLevel::Open {
+                    self.record_throttled_write_domain(&foreground_tag);
                 }
             }
 
@@ -1966,6 +1977,64 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    fn effective_admission_diagnostics(
+        decision: &crate::ThrottleDecision,
+        diagnostics: Option<crate::AdmissionDiagnostics>,
+        hard_l0_stall: bool,
+    ) -> crate::AdmissionDiagnostics {
+        let mut diagnostics = diagnostics.unwrap_or_default();
+        if hard_l0_stall {
+            diagnostics.level = crate::AdmissionPressureLevel::Stall;
+            diagnostics.max_write_bytes_per_second = None;
+            if !diagnostics
+                .triggered_by
+                .contains(&crate::AdmissionPressureSignal::L0Sstables)
+            {
+                diagnostics
+                    .triggered_by
+                    .push(crate::AdmissionPressureSignal::L0Sstables);
+            }
+        } else if decision.stall {
+            diagnostics.level = crate::AdmissionPressureLevel::Stall;
+            diagnostics.max_write_bytes_per_second = None;
+        } else if decision.throttle && diagnostics.level == crate::AdmissionPressureLevel::Open {
+            diagnostics.level = crate::AdmissionPressureLevel::RateLimit;
+            diagnostics.max_write_bytes_per_second = decision.max_write_bytes_per_second;
+        }
+        diagnostics.triggered_by.sort();
+        diagnostics.triggered_by.dedup();
+        diagnostics
+    }
+
+    fn stronger_admission_diagnostics(
+        current: crate::AdmissionDiagnostics,
+        candidate: crate::AdmissionDiagnostics,
+    ) -> crate::AdmissionDiagnostics {
+        let current_rank = Self::admission_diagnostics_rank(&current);
+        let candidate_rank = Self::admission_diagnostics_rank(&candidate);
+        if candidate_rank > current_rank {
+            return candidate;
+        }
+        if candidate_rank < current_rank {
+            return current;
+        }
+
+        let current_rate = current.max_write_bytes_per_second.unwrap_or(u64::MAX);
+        let candidate_rate = candidate.max_write_bytes_per_second.unwrap_or(u64::MAX);
+        if candidate_rate < current_rate {
+            return candidate;
+        }
+        current
+    }
+
+    fn admission_diagnostics_rank(diagnostics: &crate::AdmissionDiagnostics) -> u8 {
+        match diagnostics.level {
+            crate::AdmissionPressureLevel::Open => 0,
+            crate::AdmissionPressureLevel::RateLimit => 1,
+            crate::AdmissionPressureLevel::Stall => 2,
+        }
     }
 
     pub(super) fn memtable_budget_bytes(&self) -> Option<u64> {
@@ -4346,9 +4415,160 @@ impl Db {
         self.inner.columnar_read_context.cache_usage_snapshot()
     }
 
+    pub fn try_scheduler_observability_snapshot(&self) -> Option<SchedulerObservabilitySnapshot> {
+        let deferred_work = mutex_try_lock(&self.inner.work_deferrals)?.clone();
+        let deferred_domains = mutex_try_lock(&self.inner.work_deferral_domains)?.clone();
+        let budget_blocked_executions_by_domain = self
+            .inner
+            .scheduler_observability
+            .budget_blocked_executions_by_domain
+            .try_lock()?
+            .clone();
+        let background_delay_events_by_domain = self
+            .inner
+            .scheduler_observability
+            .background_delay_events_by_domain
+            .try_lock()?
+            .clone();
+        let background_delay_millis_by_domain = self
+            .inner
+            .scheduler_observability
+            .background_delay_millis_by_domain
+            .try_lock()?
+            .clone();
+        let throttled_writes_by_domain = self
+            .inner
+            .scheduler_observability
+            .throttled_writes_by_domain
+            .try_lock()?
+            .clone();
+        let current_admission_diagnostics_by_domain = self
+            .inner
+            .scheduler_observability
+            .current_admission_diagnostics_by_domain
+            .try_lock()?
+            .clone();
+        let last_non_open_admission_by_domain = self
+            .inner
+            .scheduler_observability
+            .last_non_open_admission_by_domain
+            .try_lock()?
+            .clone();
+        let mut deferred_work_by_domain = BTreeMap::new();
+        let mut starved_domains = BTreeMap::new();
+        for (work_id, cycles) in &deferred_work {
+            let Some(domain) = deferred_domains.get(work_id) else {
+                continue;
+            };
+            *deferred_work_by_domain.entry(domain.clone()).or_default() += *cycles;
+            if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
+                *starved_domains.entry(domain.clone()).or_default() += 1;
+            }
+        }
+
+        Some(SchedulerObservabilitySnapshot {
+            deferred_work,
+            deferred_work_by_domain,
+            starved_domains,
+            forced_executions: self
+                .inner
+                .scheduler_observability
+                .forced_executions
+                .load(Ordering::Relaxed),
+            forced_flushes: self
+                .inner
+                .scheduler_observability
+                .forced_flushes
+                .load(Ordering::Relaxed),
+            forced_l0_compactions: self
+                .inner
+                .scheduler_observability
+                .forced_l0_compactions
+                .load(Ordering::Relaxed),
+            budget_blocked_executions: self
+                .inner
+                .scheduler_observability
+                .budget_blocked_executions
+                .load(Ordering::Relaxed),
+            budget_blocked_executions_by_domain,
+            background_delay_events: self
+                .inner
+                .scheduler_observability
+                .background_delay_events
+                .load(Ordering::Relaxed),
+            background_delay_millis: self
+                .inner
+                .scheduler_observability
+                .background_delay_millis
+                .load(Ordering::Relaxed),
+            background_delay_events_by_domain,
+            background_delay_millis_by_domain,
+            throttled_writes_by_domain,
+            current_admission_diagnostics_by_domain,
+            last_non_open_admission_by_domain,
+        })
+    }
+
+    fn subscribe_scheduler_observability_pulse(&self) -> watch::Receiver<u64> {
+        self.inner.scheduler_observability.pulse()
+    }
+
+    pub async fn scheduler_observability_snapshot_async(&self) -> SchedulerObservabilitySnapshot {
+        let mut pulse = self.subscribe_scheduler_observability_pulse();
+        loop {
+            if let Some(snapshot) = self.try_scheduler_observability_snapshot() {
+                return snapshot;
+            }
+            if pulse.has_changed().unwrap_or(false) {
+                pulse.borrow_and_update();
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub(super) fn notify_scheduler_observability_changed(&self) {
+        self.inner.scheduler_observability.notify();
+    }
+
     pub fn scheduler_observability_snapshot(&self) -> SchedulerObservabilitySnapshot {
         let deferred_work = mutex_lock(&self.inner.work_deferrals).clone();
         let deferred_domains = mutex_lock(&self.inner.work_deferral_domains).clone();
+        let budget_blocked_executions_by_domain = self
+            .inner
+            .scheduler_observability
+            .budget_blocked_executions_by_domain
+            .lock()
+            .clone();
+        let background_delay_events_by_domain = self
+            .inner
+            .scheduler_observability
+            .background_delay_events_by_domain
+            .lock()
+            .clone();
+        let background_delay_millis_by_domain = self
+            .inner
+            .scheduler_observability
+            .background_delay_millis_by_domain
+            .lock()
+            .clone();
+        let throttled_writes_by_domain = self
+            .inner
+            .scheduler_observability
+            .throttled_writes_by_domain
+            .lock()
+            .clone();
+        let current_admission_diagnostics_by_domain = self
+            .inner
+            .scheduler_observability
+            .current_admission_diagnostics_by_domain
+            .lock()
+            .clone();
+        let last_non_open_admission_by_domain = self
+            .inner
+            .scheduler_observability
+            .last_non_open_admission_by_domain
+            .lock()
+            .clone();
         let mut deferred_work_by_domain = BTreeMap::new();
         let mut starved_domains = BTreeMap::new();
         for (work_id, cycles) in &deferred_work {
@@ -4384,12 +4604,7 @@ impl Db {
                 .scheduler_observability
                 .budget_blocked_executions
                 .load(Ordering::Relaxed),
-            budget_blocked_executions_by_domain: self
-                .inner
-                .scheduler_observability
-                .budget_blocked_executions_by_domain
-                .lock()
-                .clone(),
+            budget_blocked_executions_by_domain,
             background_delay_events: self
                 .inner
                 .scheduler_observability
@@ -4400,30 +4615,11 @@ impl Db {
                 .scheduler_observability
                 .background_delay_millis
                 .load(Ordering::Relaxed),
-            background_delay_events_by_domain: self
-                .inner
-                .scheduler_observability
-                .background_delay_events_by_domain
-                .lock()
-                .clone(),
-            background_delay_millis_by_domain: self
-                .inner
-                .scheduler_observability
-                .background_delay_millis_by_domain
-                .lock()
-                .clone(),
-            throttled_writes_by_domain: self
-                .inner
-                .scheduler_observability
-                .throttled_writes_by_domain
-                .lock()
-                .clone(),
-            last_admission_diagnostics_by_domain: self
-                .inner
-                .scheduler_observability
-                .last_admission_diagnostics_by_domain
-                .lock()
-                .clone(),
+            background_delay_events_by_domain,
+            background_delay_millis_by_domain,
+            throttled_writes_by_domain,
+            current_admission_diagnostics_by_domain,
+            last_non_open_admission_by_domain,
         }
     }
 
@@ -4432,13 +4628,27 @@ impl Db {
         tag: &WorkRuntimeTag,
         diagnostics: crate::AdmissionDiagnostics,
     ) {
+        let recorded = crate::RecordedAdmissionDiagnostics {
+            diagnostics,
+            recorded_at: self.inner.dependencies.clock.now(),
+        };
         mutex_lock(
             &self
                 .inner
                 .scheduler_observability
-                .last_admission_diagnostics_by_domain,
+                .current_admission_diagnostics_by_domain,
         )
-        .insert(tag.domain.clone(), diagnostics);
+        .insert(tag.domain.clone(), recorded.clone());
+        if recorded.diagnostics.level != crate::AdmissionPressureLevel::Open {
+            mutex_lock(
+                &self
+                    .inner
+                    .scheduler_observability
+                    .last_non_open_admission_by_domain,
+            )
+            .insert(tag.domain.clone(), recorded);
+        }
+        self.notify_scheduler_observability_changed();
     }
 
     pub(super) fn record_throttled_write_domain(&self, tag: &WorkRuntimeTag) {
@@ -4450,6 +4660,7 @@ impl Db {
         )
         .entry(tag.domain.clone())
         .or_default() += 1;
+        self.notify_scheduler_observability_changed();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

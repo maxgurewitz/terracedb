@@ -286,7 +286,6 @@ pub(super) struct ColumnarCacheStats {
     pub(super) decoded_column_block_admissions: AtomicU64,
 }
 
-#[derive(Default)]
 pub(super) struct SchedulerObservabilityStats {
     pub(super) forced_executions: AtomicU64,
     pub(super) forced_flushes: AtomicU64,
@@ -299,8 +298,47 @@ pub(super) struct SchedulerObservabilityStats {
     pub(super) background_delay_events_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
     pub(super) background_delay_millis_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
     pub(super) throttled_writes_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
-    pub(super) last_admission_diagnostics_by_domain:
-        Mutex<BTreeMap<crate::ExecutionDomainPath, crate::AdmissionDiagnostics>>,
+    pub(super) current_admission_diagnostics_by_domain:
+        Mutex<BTreeMap<crate::ExecutionDomainPath, crate::RecordedAdmissionDiagnostics>>,
+    pub(super) last_non_open_admission_by_domain:
+        Mutex<BTreeMap<crate::ExecutionDomainPath, crate::RecordedAdmissionDiagnostics>>,
+    pub(super) pulse: watch::Sender<u64>,
+}
+
+impl SchedulerObservabilityStats {
+    pub(super) fn new() -> Self {
+        let (pulse, _receiver) = watch::channel(0);
+        Self {
+            forced_executions: AtomicU64::default(),
+            forced_flushes: AtomicU64::default(),
+            forced_l0_compactions: AtomicU64::default(),
+            budget_blocked_executions: AtomicU64::default(),
+            budget_blocked_executions_by_domain: Mutex::default(),
+            background_delay_events: AtomicU64::default(),
+            background_delay_millis: AtomicU64::default(),
+            background_delay_events_by_domain: Mutex::default(),
+            background_delay_millis_by_domain: Mutex::default(),
+            throttled_writes_by_domain: Mutex::default(),
+            current_admission_diagnostics_by_domain: Mutex::default(),
+            last_non_open_admission_by_domain: Mutex::default(),
+            pulse,
+        }
+    }
+
+    pub(super) fn notify(&self) {
+        let next = (*self.pulse.borrow()).wrapping_add(1);
+        self.pulse.send_replace(next);
+    }
+
+    pub(super) fn pulse(&self) -> watch::Receiver<u64> {
+        self.pulse.subscribe()
+    }
+}
+
+impl Default for SchedulerObservabilityStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

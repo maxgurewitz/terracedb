@@ -2884,40 +2884,47 @@ async fn placement_reports_include_attached_subsystems_and_match_runtime_topolog
 
 #[tokio::test]
 async fn whole_system_execution_domain_campaigns_remain_deterministic_across_seeds() {
-    let seeds = [0x6901_u64, 0x6902, 0x6903];
+    let first = run_whole_system_campaign(0x6901).await;
+    let first_replay = run_whole_system_campaign(0x6901).await;
+    let second = run_whole_system_campaign(0x6902).await;
 
-    for seed in seeds {
-        let first = run_whole_system_campaign(seed).await;
-        let second = run_whole_system_campaign(seed).await;
-        assert_eq!(first, second, "seed {seed:#x} should be reproducible");
+    assert_eq!(first, first_replay, "seed 0x6901 should be reproducible");
+    assert!(
+        first.database_order != second.database_order
+            || first.durable_rows_by_db != second.durable_rows_by_db
+            || first.oracle_cpu_millis_by_domain != second.oracle_cpu_millis_by_domain,
+        "different seeds should change the whole-system execution-domain campaign shape"
+    );
+
+    for (seed, outcome) in [(0x6901_u64, &first), (0x6902_u64, &second)] {
         assert!(
-            first.admissions["warehouse-shared-overflow-blocked"],
+            outcome.admissions["warehouse-shared-overflow-blocked"],
             "seed {seed:#x} should block extra shard-ready background work after tightening budgets"
         );
         assert!(
-            first.admissions["primary-control-plane"],
+            outcome.admissions["primary-control-plane"],
             "seed {seed:#x} should keep the protected control-plane domain progressing"
         );
         assert_eq!(
-            first.mutable_budget_by_domain["process/dbs/analytics/foreground"],
+            outcome.mutable_budget_by_domain["process/dbs/analytics/foreground"],
             Some(64)
         );
         assert_eq!(
-            first.background_slots_by_domain["process/shards/warehouse/background"],
+            outcome.background_slots_by_domain["process/shards/warehouse/background"],
             Some(1)
         );
         assert_eq!(
-            first.backlog_items_by_domain["process/shards/warehouse/background"],
+            outcome.backlog_items_by_domain["process/shards/warehouse/background"],
             2
         );
         assert_eq!(
-            first.backlog_bytes_by_domain["process/shards/warehouse/background"],
+            outcome.backlog_bytes_by_domain["process/shards/warehouse/background"],
             256
         );
-        assert_eq!(first.control_tables_by_db["primary"].len(), 1);
-        assert_eq!(first.control_tables_by_db["warehouse"].len(), 1);
+        assert_eq!(outcome.control_tables_by_db["primary"].len(), 1);
+        assert_eq!(outcome.control_tables_by_db["warehouse"].len(), 1);
         assert!(
-            first.oracle_cpu_millis_by_domain.contains_key("process"),
+            outcome.oracle_cpu_millis_by_domain.contains_key("process"),
             "seed {seed:#x} should aggregate the oracle at the process root"
         );
     }

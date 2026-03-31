@@ -154,8 +154,9 @@ pub use remote::{
 pub use scheduler::{
     DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT,
     DomainPriorityOverride, NoopScheduler, PendingWork, PendingWorkBudget,
-    PendingWorkBudgetBlockReason, PendingWorkType, RoundRobinScheduler, ScheduleAction,
-    ScheduleDecision, Scheduler, SchedulerObservabilitySnapshot, TableStats, ThrottleDecision,
+    PendingWorkBudgetBlockReason, PendingWorkType, RecordedAdmissionDiagnostics,
+    RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
+    SchedulerObservabilitySnapshot, TableStats, ThrottleDecision,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{

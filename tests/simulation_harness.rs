@@ -344,10 +344,13 @@ fn simulation_s3_primary_config(prefix: &str) -> DbConfig {
     }
 }
 
+type DurableRow = (Vec<u8>, Vec<u8>);
+type DurableRowsByDb = BTreeMap<String, Vec<DurableRow>>;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WholeSystemSimulationCampaignOutcome {
     database_order: Vec<String>,
-    durable_rows_by_db: BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>,
+    durable_rows_by_db: DurableRowsByDb,
     control_tables_by_db: BTreeMap<String, Vec<String>>,
     visible_sequence_by_db: BTreeMap<String, u64>,
     durable_sequence_by_db: BTreeMap<String, u64>,
@@ -422,6 +425,115 @@ impl Scheduler for MutableBudgetThrottleSimulationScheduler {
 
         ThrottleDecision::default()
     }
+}
+
+#[derive(Debug)]
+struct SizeSensitiveAdmissionSimulationScheduler {
+    rate_limit_bytes_threshold: u64,
+    max_write_bytes_per_second: u64,
+}
+
+impl Scheduler for SizeSensitiveAdmissionSimulationScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+        signals: &terracedb::AdmissionSignals,
+        _tag: &terracedb::WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> Option<terracedb::AdmissionDiagnostics> {
+        if signals.batch_write_bytes < self.rate_limit_bytes_threshold {
+            return Some(terracedb::AdmissionDiagnostics::default());
+        }
+
+        Some(terracedb::AdmissionDiagnostics {
+            level: terracedb::AdmissionPressureLevel::RateLimit,
+            triggered_by: vec![terracedb::AdmissionPressureSignal::MutableBudget],
+            max_write_bytes_per_second: Some(self.max_write_bytes_per_second),
+            metadata: BTreeMap::from([(
+                "scheduler".to_string(),
+                serde_json::Value::String("size-sensitive-rate-limit".to_string()),
+            )]),
+            ..terracedb::AdmissionDiagnostics::default()
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct PerTableAdmissionSimulationScheduler {
+    diagnostics_by_table: BTreeMap<String, terracedb::AdmissionDiagnostics>,
+}
+
+impl Scheduler for PerTableAdmissionSimulationScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        table: &terracedb::Table,
+        _stats: &TableStats,
+        _signals: &terracedb::AdmissionSignals,
+        _tag: &terracedb::WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> Option<terracedb::AdmissionDiagnostics> {
+        Some(
+            self.diagnostics_by_table
+                .get(table.name())
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct AlwaysStallAdmissionSimulationScheduler;
+
+impl Scheduler for AlwaysStallAdmissionSimulationScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+        _signals: &terracedb::AdmissionSignals,
+        _tag: &terracedb::WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> Option<terracedb::AdmissionDiagnostics> {
+        Some(terracedb::AdmissionDiagnostics {
+            level: terracedb::AdmissionPressureLevel::Stall,
+            triggered_by: vec![terracedb::AdmissionPressureSignal::L0Sstables],
+            metadata: BTreeMap::from([(
+                "scheduler".to_string(),
+                serde_json::Value::String("always-stall".to_string()),
+            )]),
+            ..terracedb::AdmissionDiagnostics::default()
+        })
+    }
+}
+
+async fn scheduler_observability_snapshot_eventually(
+    db: &Db,
+) -> terracedb::SchedulerObservabilitySnapshot {
+    db.scheduler_observability_snapshot_async().await
 }
 
 fn whole_system_simulation_process_budget() -> ExecutionDomainBudget {
@@ -2839,6 +2951,278 @@ fn rate_limited_simulation_writes_consume_more_time_for_larger_payloads() -> tur
 }
 
 #[test]
+fn simulation_snapshot_async_observes_rate_limited_write_while_it_is_in_flight() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x8181)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16a-snapshot-async-in-flight",
+                    Arc::new(SizeSensitiveAdmissionSimulationScheduler {
+                        rate_limit_bytes_threshold: 64,
+                        max_write_bytes_per_second: 64,
+                    }),
+                    1024 * 1024,
+                ))
+                .await?;
+            let table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let domain = db.execution_profile().foreground.domain.clone();
+
+            let write_table = table.clone();
+            let write = tokio::spawn(async move {
+                write_table
+                    .write(b"in-flight".to_vec(), Value::Bytes(vec![b'x'; 256]))
+                    .await
+            });
+
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !write.is_finished(),
+                "rate-limited write should still be pending when the async snapshot reads"
+            );
+
+            let snapshot = scheduler_observability_snapshot_eventually(&db).await;
+            let current = snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .expect("current admission during in-flight write");
+            assert_eq!(
+                current.diagnostics.level,
+                terracedb::AdmissionPressureLevel::RateLimit
+            );
+            assert_eq!(
+                snapshot
+                    .throttled_writes_by_domain
+                    .get(&domain)
+                    .copied()
+                    .unwrap_or_default(),
+                1
+            );
+
+            assert_eq!(
+                write.await.expect("join in-flight write")?,
+                SequenceNumber::new(1)
+            );
+            assert_eq!(
+                table.read(b"in-flight".to_vec()).await?,
+                Some(Value::Bytes(vec![b'x'; 256]))
+            );
+
+            Ok(())
+        })
+}
+
+#[test]
+fn current_admission_simulation_clears_after_recovery_and_preserves_last_non_open()
+-> turmoil::Result {
+    SeededSimulationRunner::new(0x8282)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16a-current-admission-clears",
+                    Arc::new(SizeSensitiveAdmissionSimulationScheduler {
+                        rate_limit_bytes_threshold: 64,
+                        max_write_bytes_per_second: 128,
+                    }),
+                    1024 * 1024,
+                ))
+                .await?;
+            let table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let domain = db.execution_profile().foreground.domain.clone();
+
+            table
+                .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
+                .await?;
+            let throttled_snapshot = scheduler_observability_snapshot_eventually(&db).await;
+            let throttled_current = throttled_snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .expect("current throttled admission")
+                .clone();
+            let throttled_last_non_open = throttled_snapshot
+                .last_non_open_admission_by_domain
+                .get(&domain)
+                .expect("last non-open throttled admission")
+                .clone();
+            assert_eq!(
+                throttled_current.diagnostics.level,
+                terracedb::AdmissionPressureLevel::RateLimit
+            );
+            assert_eq!(throttled_last_non_open, throttled_current);
+
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            table
+                .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
+                .await?;
+            let recovered_snapshot = scheduler_observability_snapshot_eventually(&db).await;
+            let current = recovered_snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .expect("current admission after recovery");
+            let last_non_open = recovered_snapshot
+                .last_non_open_admission_by_domain
+                .get(&domain)
+                .expect("last non-open admission after recovery");
+            assert_eq!(
+                current.diagnostics.level,
+                terracedb::AdmissionPressureLevel::Open
+            );
+            assert_eq!(
+                last_non_open.diagnostics.level,
+                terracedb::AdmissionPressureLevel::RateLimit
+            );
+            assert_eq!(last_non_open, &throttled_last_non_open);
+            assert!(
+                current.recorded_at > last_non_open.recorded_at,
+                "recovery write should advance the current admission timestamp"
+            );
+
+            Ok(())
+        })
+}
+
+#[test]
+fn multi_table_write_simulation_keeps_strongest_domain_admission_diagnostics() -> turmoil::Result {
+    SeededSimulationRunner::new(0x8383)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16a-strongest-multi-table-admission",
+                    Arc::new(PerTableAdmissionSimulationScheduler {
+                        diagnostics_by_table: BTreeMap::from([
+                            (
+                                "alpha".to_string(),
+                                terracedb::AdmissionDiagnostics {
+                                    level: terracedb::AdmissionPressureLevel::Stall,
+                                    triggered_by: vec![
+                                        terracedb::AdmissionPressureSignal::L0Sstables,
+                                    ],
+                                    metadata: BTreeMap::from([(
+                                        "source_table".to_string(),
+                                        serde_json::Value::String("alpha".to_string()),
+                                    )]),
+                                    ..terracedb::AdmissionDiagnostics::default()
+                                },
+                            ),
+                            (
+                                "beta".to_string(),
+                                terracedb::AdmissionDiagnostics {
+                                    level: terracedb::AdmissionPressureLevel::RateLimit,
+                                    triggered_by: vec![
+                                        terracedb::AdmissionPressureSignal::MutableBudget,
+                                    ],
+                                    max_write_bytes_per_second: Some(128),
+                                    metadata: BTreeMap::from([(
+                                        "source_table".to_string(),
+                                        serde_json::Value::String("beta".to_string()),
+                                    )]),
+                                    ..terracedb::AdmissionDiagnostics::default()
+                                },
+                            ),
+                        ]),
+                    }),
+                    1024 * 1024,
+                ))
+                .await?;
+            let alpha = db
+                .create_table(SimulationTableSpec::row("alpha").table_config())
+                .await?;
+            let beta = db
+                .create_table(SimulationTableSpec::row("beta").table_config())
+                .await?;
+            let domain = db.execution_profile().foreground.domain.clone();
+
+            let mut tx = Transaction::begin(&db).await;
+            tx.write(&alpha, b"alpha".to_vec(), Value::bytes("a"));
+            tx.write(&beta, b"beta".to_vec(), Value::bytes("b"));
+            assert_eq!(tx.commit_no_flush().await?, SequenceNumber::new(1));
+
+            let snapshot = scheduler_observability_snapshot_eventually(&db).await;
+            let current = snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .expect("current multi-table admission");
+            assert_eq!(
+                current.diagnostics.level,
+                terracedb::AdmissionPressureLevel::Stall
+            );
+            assert_eq!(
+                current.diagnostics.metadata.get("source_table"),
+                Some(&serde_json::Value::String("alpha".to_string()))
+            );
+            assert_eq!(
+                snapshot
+                    .throttled_writes_by_domain
+                    .get(&domain)
+                    .copied()
+                    .unwrap_or_default(),
+                1
+            );
+
+            Ok(())
+        })
+}
+
+#[test]
+fn stalled_write_simulation_counts_one_throttle_event_per_write() -> turmoil::Result {
+    SeededSimulationRunner::new(0x8484)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16a-stalled-write-counts-once",
+                    Arc::new(AlwaysStallAdmissionSimulationScheduler),
+                    1024 * 1024,
+                ))
+                .await?;
+            let table = db
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let domain = db.execution_profile().foreground.domain.clone();
+
+            let before = scheduler_observability_snapshot_eventually(&db)
+                .await
+                .throttled_writes_by_domain
+                .get(&domain)
+                .copied()
+                .unwrap_or_default();
+
+            assert_eq!(
+                table.write(b"stalled".to_vec(), Value::bytes("v")).await?,
+                SequenceNumber::new(1)
+            );
+
+            let after_snapshot = scheduler_observability_snapshot_eventually(&db).await;
+            let after = after_snapshot
+                .throttled_writes_by_domain
+                .get(&domain)
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(after - before, 1);
+            assert_eq!(
+                after_snapshot
+                    .current_admission_diagnostics_by_domain
+                    .get(&domain)
+                    .expect("current stalled admission")
+                    .diagnostics
+                    .level,
+                terracedb::AdmissionPressureLevel::Stall
+            );
+
+            Ok(())
+        })
+}
+
+#[test]
 fn throttled_round_robin_simulation_services_three_backlogged_tables_without_starvation()
 -> turmoil::Result {
     SeededSimulationRunner::new(0x3131)
@@ -3140,25 +3524,12 @@ fn random_scheduler_simulation_keeps_real_db_progressing() -> turmoil::Result {
 
 #[test]
 fn whole_system_execution_domain_simulation_seed_campaign_is_reproducible() -> turmoil::Result {
-    let seeds = [0x6901_u64, 0x6902, 0x6903];
+    let first = run_simulated_whole_system_execution_domain_seed(0x6901)?;
+    let first_replay = run_simulated_whole_system_execution_domain_seed(0x6901)?;
+    let second = run_simulated_whole_system_execution_domain_seed(0x6902)?;
 
-    let first_pass = seeds
-        .into_iter()
-        .map(|seed| {
-            run_simulated_whole_system_execution_domain_seed(seed).map(|outcome| (seed, outcome))
-        })
-        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
-    let second_pass = seeds
-        .into_iter()
-        .map(|seed| {
-            run_simulated_whole_system_execution_domain_seed(seed).map(|outcome| (seed, outcome))
-        })
-        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+    assert_eq!(first, first_replay);
 
-    assert_eq!(first_pass, second_pass);
-
-    let first = first_pass.get(&0x6901).expect("seed 0x6901");
-    let second = first_pass.get(&0x6902).expect("seed 0x6902");
     assert!(
         first.database_order != second.database_order
             || first.durable_rows_by_db != second.durable_rows_by_db
@@ -3166,7 +3537,7 @@ fn whole_system_execution_domain_simulation_seed_campaign_is_reproducible() -> t
         "different seeds should change the whole-system simulation shape"
     );
 
-    for (seed, outcome) in &first_pass {
+    for (seed, outcome) in [(0x6901_u64, &first), (0x6902_u64, &second)] {
         assert!(
             outcome.admissions["warehouse-shared-overflow-blocked"],
             "seed {seed:#x} should block extra shard-ready background work after tightening budgets"
