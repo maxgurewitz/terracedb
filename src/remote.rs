@@ -545,13 +545,14 @@ impl RemoteCache {
             }
         }
 
-        let mut state = lock(&self.state);
-        state.entries = rebuilt;
-        state.in_flight.clear();
-        state.total_bytes = total_bytes;
-        state.next_access_tick = next_access_tick;
-        let evicted = self.plan_budget_evictions_locked(&mut state);
-        drop(state);
+        let evicted = {
+            let mut state = lock(&self.state);
+            state.entries = rebuilt;
+            state.in_flight.clear();
+            state.total_bytes = total_bytes;
+            state.next_access_tick = next_access_tick;
+            self.plan_budget_evictions_locked(&mut state)
+        };
         self.delete_entries(evicted).await?;
         Ok(())
     }
@@ -669,6 +670,32 @@ impl RemoteCache {
         }
     }
 
+    fn range_slice_from_span(span: CacheSpan, range: Range<u64>, bytes: &[u8]) -> Vec<u8> {
+        match span {
+            CacheSpan::Full => {
+                if range.start as usize >= bytes.len() {
+                    Vec::new()
+                } else {
+                    let end = (range.end as usize).min(bytes.len());
+                    bytes[range.start as usize..end].to_vec()
+                }
+            }
+            CacheSpan::Range { start, end } => {
+                let slice_start = range.start.max(start);
+                let slice_end = range.end.min(end);
+                if slice_start >= slice_end {
+                    Vec::new()
+                } else {
+                    let relative_start = slice_start.saturating_sub(start) as usize;
+                    let relative_end = slice_end.saturating_sub(start) as usize;
+                    let available_end = relative_end.min(bytes.len());
+                    let available_start = relative_start.min(available_end);
+                    bytes[available_start..available_end].to_vec()
+                }
+            }
+        }
+    }
+
     fn aligned_segment_span(&self, offset: u64) -> CacheSpan {
         let segment_start = offset - (offset % self.config.segment_bytes);
         CacheSpan::Range {
@@ -722,6 +749,10 @@ impl RemoteCache {
             };
         }
         spans
+    }
+
+    fn spans_exceed_cache_budget(&self, spans: &[CacheSpan]) -> bool {
+        (spans.len() as u64).saturating_mul(self.config.segment_bytes) > self.config.max_bytes
     }
 
     fn coalesce_ranges(ranges: &[Range<u64>], gap_bytes: u64) -> Vec<CoalescedReadRange> {
@@ -954,9 +985,19 @@ impl RemoteCache {
     async fn store_downloaded_segments(
         &self,
         object_key: &str,
+        downloaded_segments: &BTreeMap<CacheSpan, Vec<u8>>,
+    ) -> Result<(), StorageError> {
+        for (&span, bytes) in downloaded_segments {
+            self.store(object_key, span, bytes).await?;
+        }
+        Ok(())
+    }
+
+    fn extract_downloaded_segments(
         spans: &[CacheSpan],
         fetched_groups: &[(Range<u64>, Vec<u8>)],
-    ) -> Result<(), StorageError> {
+    ) -> BTreeMap<CacheSpan, Vec<u8>> {
+        let mut downloaded = BTreeMap::new();
         for &span in spans {
             let CacheSpan::Range { start, end } = span else {
                 continue;
@@ -972,10 +1013,9 @@ impl RemoteCache {
                     break;
                 }
             }
-            let bytes = segment_bytes.unwrap_or_default();
-            self.store(object_key, span, &bytes).await?;
+            downloaded.insert(span, segment_bytes.unwrap_or_default());
         }
-        Ok(())
+        downloaded
     }
 
     async fn spawn_background_prefetch(
@@ -1011,8 +1051,9 @@ impl RemoteCache {
                 );
             }
             Ok(fetched) => {
+                let downloaded = Self::extract_downloaded_segments(&spans, &fetched);
                 if let Err(error) = self
-                    .store_downloaded_segments(&object_key, &spans, &fetched)
+                    .store_downloaded_segments(&object_key, &downloaded)
                     .await
                 {
                     tracing::warn!(
@@ -1028,18 +1069,59 @@ impl RemoteCache {
         }
     }
 
+    async fn try_read_range_from_cache_or_downloads(
+        &self,
+        object_key: &str,
+        range: Range<u64>,
+        downloaded_segments: &BTreeMap<CacheSpan, Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        if let Some(bytes) = self
+            .try_read_range_from_cache(object_key, range.clone())
+            .await?
+        {
+            return Ok(Some(bytes));
+        }
+
+        let segments = self.segment_spans_for_ranges(std::slice::from_ref(&range));
+        if segments.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut stitched = Vec::new();
+        for span in segments {
+            let Some(bytes) = downloaded_segments.get(&span) else {
+                return Ok(None);
+            };
+            stitched.extend_from_slice(&Self::range_slice_from_span(span, range.clone(), bytes));
+        }
+        Ok(Some(stitched))
+    }
+
     async fn read_through_ranges(
         self: &Arc<Self>,
         object_store: Arc<dyn ObjectStore>,
         object_key: &str,
         ranges: &[Range<u64>],
     ) -> Result<Vec<u8>, UnifiedStorageError> {
+        let required = self.segment_spans_for_ranges(ranges);
+        if self.spans_exceed_cache_budget(&required) {
+            let parts =
+                UnifiedStorage::coalesced_remote_read(object_store.as_ref(), object_key, ranges)
+                    .await?;
+            return Ok(parts.concat());
+        }
+
+        let mut downloaded_segments = BTreeMap::<CacheSpan, Vec<u8>>::new();
         loop {
             let mut stitched = Vec::new();
             let mut all_hit = true;
             for range in ranges {
                 match self
-                    .try_read_range_from_cache(object_key, range.clone())
+                    .try_read_range_from_cache_or_downloads(
+                        object_key,
+                        range.clone(),
+                        &downloaded_segments,
+                    )
                     .await?
                 {
                     Some(bytes) => stitched.extend_from_slice(&bytes),
@@ -1053,7 +1135,6 @@ impl RemoteCache {
                 return Ok(stitched);
             }
 
-            let required = self.segment_spans_for_ranges(ranges);
             let prefetch = self.prefetch_spans_for_ranges(ranges);
             let (to_download, background, waiters) =
                 self.claim_segment_downloads(object_key, &required, &prefetch);
@@ -1082,8 +1163,9 @@ impl RemoteCache {
                         return Err(UnifiedStorageError::Remote(error));
                     }
                 };
+                let downloaded = Self::extract_downloaded_segments(&to_download, &fetched);
                 if let Err(error) = self
-                    .store_downloaded_segments(object_key, &to_download, &fetched)
+                    .store_downloaded_segments(object_key, &downloaded)
                     .await
                 {
                     for notify in self.finish_in_flight_segments(object_key, &to_download) {
@@ -1091,6 +1173,7 @@ impl RemoteCache {
                     }
                     return Err(UnifiedStorageError::Local(error));
                 }
+                downloaded_segments.extend(downloaded);
                 for notify in self.finish_in_flight_segments(object_key, &to_download) {
                     notify.notify_waiters();
                 }
@@ -1108,7 +1191,7 @@ impl RemoteCache {
             }
 
             if to_download.is_empty() && waiters.is_empty() {
-                return Ok(stitched);
+                continue;
             }
 
             for waiter in waiters {

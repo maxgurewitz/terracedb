@@ -41,7 +41,11 @@ impl ColumnarReadContext {
         let use_decoded_cache = self.decoded_cache_enabled.load(Ordering::Relaxed);
         let use_raw_byte_cache = matches!(source, StorageSource::RemoteObject { .. })
             && self.raw_byte_cache_enabled.load(Ordering::Relaxed)
-            && self.remote_cache.is_some();
+            && self.remote_cache.is_some()
+            && match artifact {
+                ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata => true,
+                ColumnarReadArtifact::ColumnBlock => access == ColumnarReadAccessPattern::Point,
+            };
         let populate_hot_data = match artifact {
             ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata => true,
             ColumnarReadArtifact::ColumnBlock => access == ColumnarReadAccessPattern::Point,
@@ -53,6 +57,48 @@ impl ColumnarReadContext {
             use_decoded_cache,
             populate_decoded_cache: use_decoded_cache && populate_hot_data,
         }
+    }
+
+    fn should_use_exact_raw_byte_cache_read(
+        access: ColumnarReadAccessPattern,
+        artifact: ColumnarReadArtifact,
+    ) -> bool {
+        access == ColumnarReadAccessPattern::Scan
+            && matches!(
+                artifact,
+                ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata
+            )
+    }
+
+    async fn read_exact_remote_range_via_raw_cache(
+        &self,
+        key: &str,
+        source: &StorageSource,
+        range: std::ops::Range<u64>,
+        populate_raw_byte_cache: bool,
+    ) -> Result<Vec<u8>, StorageError> {
+        let bytes = UnifiedStorage::new(
+            self.dependencies.file_system.clone(),
+            self.dependencies.object_store.clone(),
+            None,
+        )
+        .read_range(source, range.clone())
+        .await
+        .map_err(|error| error.into_storage_error())?;
+        if populate_raw_byte_cache && let Some(cache) = &self.remote_cache {
+            cache
+                .store(
+                    key,
+                    crate::remote::CacheSpan::Range {
+                        start: range.start,
+                        end: range.end,
+                    },
+                    &bytes,
+                )
+                .await?;
+            self.admit_raw_byte_cache_range(key, range, &bytes).await?;
+        }
+        Ok(bytes)
     }
 
     pub(super) async fn read_range(
@@ -78,6 +124,16 @@ impl ColumnarReadContext {
                 .stats
                 .raw_byte_misses
                 .fetch_add(1, Ordering::Relaxed);
+            if Self::should_use_exact_raw_byte_cache_read(access, artifact) {
+                return self
+                    .read_exact_remote_range_via_raw_cache(
+                        key,
+                        source,
+                        range,
+                        policy.populate_raw_byte_cache,
+                    )
+                    .await;
+            }
         }
 
         let bytes = UnifiedStorage::new(
@@ -137,22 +193,6 @@ impl ColumnarReadContext {
         state.order = order;
         state.lengths = lengths;
         Ok(())
-    }
-
-    fn record_raw_byte_cache_entry(
-        &self,
-        state: &mut RawByteCacheBudgetState,
-        key: RawByteCacheBudgetKey,
-        bytes: u64,
-    ) {
-        if let Some(previous) = state.lengths.insert(key.clone(), bytes) {
-            state.total_bytes = state.total_bytes.saturating_sub(previous);
-        }
-        if let Some(position) = state.order.iter().position(|cached| cached == &key) {
-            state.order.remove(position);
-        }
-        state.total_bytes = state.total_bytes.saturating_add(bytes);
-        state.order.push_back(key);
     }
 
     fn collect_raw_byte_cache_evictions(
