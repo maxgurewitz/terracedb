@@ -1,24 +1,30 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use terracedb::Clock;
 use terracedb_vfs::{
-    CompletedToolRun, CompletedToolRunOutcome, CreateOptions, MkdirOptions, ReadOnlyVfsFileSystem,
-    SnapshotOptions, ToolRunId, VfsError, VfsKvStore, VfsStoreExt, Volume, VolumeConfig,
-    VolumeSnapshot, VolumeStore,
+    CompletedToolRun, CompletedToolRunOutcome, CreateOptions, DirEntry, MkdirOptions,
+    ReadOnlyVfsFileSystem, SnapshotOptions, Stats, ToolRunId, VfsError, VfsKvStore, VfsStoreExt,
+    Volume, VolumeConfig, VolumeSnapshot, VolumeStore,
 };
 use tokio::sync::Mutex;
 
+use crate::disk::{
+    apply_delta_to_host, load_hoist_manifest, materialize_snapshot_to_host, prepare_hoist,
+    replace_vfs_tree, write_hoist_manifest,
+};
+use crate::git::{default_export_workspace_path, finalize_git_export};
 use crate::{
     BaseSnapshotIdentity, CapabilityCallRequest, CapabilityCallResult, CapabilityRegistry,
     ConflictPolicy, DeterministicGitWorkspaceManager, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
-    DeterministicRuntimeBackend, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest,
+    DeterministicRuntimeBackend, EjectMode, EjectReport, EjectRequest, GitWorkspaceManager,
+    GitWorkspaceReport, GitWorkspaceRequest, HoistReport, HoistRequest, HoistedSource,
     PackageInstallReport, PackageInstallRequest, PackageInstaller, PullRequestProviderClient,
     PullRequestReport, PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle,
-    ReadonlyViewProvider, ReadonlyViewRequest, SandboxConfig, SandboxError,
+    ReadonlyViewLocation, ReadonlyViewProvider, ReadonlyViewRequest, SandboxConfig, SandboxError,
     SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim, SandboxModuleLoader,
     SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeStateHandle,
     SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
@@ -515,6 +521,69 @@ impl SandboxSession {
         }
     }
 
+    pub async fn hoist_from_disk(
+        &self,
+        request: HoistRequest,
+    ) -> Result<HoistReport, SandboxError> {
+        let params = Some(serde_json::to_value(&request)?);
+        match self.hoist_from_disk_inner(request).await {
+            Ok(report) => {
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.disk.hoist",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&report)?),
+                    },
+                )
+                .await?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.disk.hoist",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn eject_to_disk(&self, request: EjectRequest) -> Result<EjectReport, SandboxError> {
+        let params = Some(serde_json::to_value(&request)?);
+        match self.eject_to_disk_inner(request).await {
+            Ok(report) => {
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.disk.eject",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&report)?),
+                    },
+                )
+                .await?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.disk.eject",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn prepare_git_workspace(
         &self,
         request: GitWorkspaceRequest,
@@ -553,12 +622,7 @@ impl SandboxSession {
         request: PullRequestRequest,
     ) -> Result<PullRequestReport, SandboxError> {
         let params = Some(serde_json::to_value(&request)?);
-        match self
-            .services
-            .pull_requests
-            .create_pull_request(self, request)
-            .await
-        {
+        match self.create_pull_request_inner(request).await {
             Ok(report) => {
                 record_completed_tool_run(
                     self.volume.as_ref(),
@@ -689,6 +753,155 @@ impl SandboxSession {
         }
     }
 
+    pub async fn active_readonly_views(&self) -> Vec<ReadonlyViewHandle> {
+        self.info().await.provenance.active_view_handles
+    }
+
+    pub async fn stat_readonly_view(
+        &self,
+        location: &ReadonlyViewLocation,
+    ) -> Result<Option<Stats>, SandboxError> {
+        self.services.readonly_views.stat(self, location).await
+    }
+
+    pub async fn read_file_readonly_view(
+        &self,
+        location: &ReadonlyViewLocation,
+    ) -> Result<Option<Vec<u8>>, SandboxError> {
+        self.services.readonly_views.read_file(self, location).await
+    }
+
+    pub async fn readdir_readonly_view(
+        &self,
+        location: &ReadonlyViewLocation,
+    ) -> Result<Vec<DirEntry>, SandboxError> {
+        self.services.readonly_views.readdir(self, location).await
+    }
+
+    async fn hoist_from_disk_inner(
+        &self,
+        request: HoistRequest,
+    ) -> Result<HoistReport, SandboxError> {
+        let prepared = prepare_hoist(&request)?;
+        let _guard = self.operation_lock.lock().await;
+        let deleted_paths = replace_vfs_tree(
+            self.volume.fs().as_ref(),
+            &prepared.manifest.target_root,
+            &prepared.entries,
+            request.delete_missing,
+        )
+        .await?;
+        write_hoist_manifest(self.volume.as_ref(), &prepared.manifest).await?;
+        let mut updated = self.info.lock().await.clone();
+        updated.provenance.hoisted_source = Some(HoistedSource {
+            source_path: prepared.manifest.source_path.clone(),
+            mode: prepared.manifest.mode.clone(),
+        });
+        updated.provenance.git = prepared.manifest.git_provenance.clone();
+        updated.revision = updated.revision.saturating_add(1);
+        updated.updated_at = self.clock.now();
+        write_session_info_exact(self.volume.as_ref(), &updated).await?;
+        *self.info.lock().await = updated;
+        Ok(HoistReport {
+            source_path: prepared.manifest.source_path,
+            target_root: prepared.manifest.target_root,
+            hoisted_paths: prepared.entries.len(),
+            deleted_paths,
+            git_provenance: prepared.manifest.git_provenance,
+        })
+    }
+
+    async fn eject_to_disk_inner(
+        &self,
+        request: EjectRequest,
+    ) -> Result<EjectReport, SandboxError> {
+        let export_root = self.export_root().await?;
+        let target_path = PathBuf::from(&request.target_path);
+        let manifest = load_hoist_manifest(self.volume.as_ref()).await?;
+        let git_provenance = self.info().await.provenance.git;
+        match request.mode {
+            EjectMode::MaterializeSnapshot => {
+                materialize_snapshot_to_host(self.volume.fs().as_ref(), &export_root, &target_path)
+                    .await
+            }
+            EjectMode::ApplyDelta => {
+                let manifest = manifest.ok_or(SandboxError::MissingHoistProvenance)?;
+                apply_delta_to_host(
+                    self.volume.fs().as_ref(),
+                    &export_root,
+                    &target_path,
+                    &manifest,
+                    request.conflict_policy,
+                    git_provenance.as_ref(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn create_pull_request_inner(
+        &self,
+        request: PullRequestRequest,
+    ) -> Result<PullRequestReport, SandboxError> {
+        let has_git_provenance = self.info().await.provenance.git.is_some();
+        let mut git_metadata = BTreeMap::new();
+        if has_git_provenance {
+            let workspace_path = default_export_workspace_path(
+                &self.info().await.session_volume_id.to_string(),
+                &request.head_branch,
+            );
+            let workspace = self
+                .prepare_git_workspace(GitWorkspaceRequest {
+                    branch_name: request.head_branch.clone(),
+                    base_branch: Some(request.base_branch.clone()),
+                    target_path: workspace_path.to_string_lossy().into_owned(),
+                })
+                .await?;
+            let export_mode = if load_hoist_manifest(self.volume.as_ref()).await?.is_some() {
+                EjectMode::ApplyDelta
+            } else {
+                EjectMode::MaterializeSnapshot
+            };
+            let export_mode_label = match export_mode {
+                EjectMode::MaterializeSnapshot => "materialize_snapshot",
+                EjectMode::ApplyDelta => "apply_delta",
+            };
+            let eject_report = self
+                .eject_to_disk(EjectRequest {
+                    target_path: workspace.workspace_path.clone(),
+                    mode: export_mode.clone(),
+                    conflict_policy: ConflictPolicy::Fail,
+                })
+                .await?;
+            git_metadata.extend(workspace.metadata.clone());
+            git_metadata.insert(
+                "workspace_path".to_string(),
+                JsonValue::from(workspace.workspace_path.clone()),
+            );
+            git_metadata.insert("eject_mode".to_string(), JsonValue::from(export_mode_label));
+            git_metadata.insert(
+                "provenance_validated".to_string(),
+                JsonValue::from(eject_report.provenance_validated),
+            );
+            if workspace.metadata.contains_key("repo_root") {
+                let workspace_path = PathBuf::from(&workspace.workspace_path);
+                git_metadata.extend(finalize_git_export(
+                    workspace_path.as_path(),
+                    &request.title,
+                    &request.body,
+                    &request.head_branch,
+                )?);
+            }
+        }
+        let mut report = self
+            .services
+            .pull_requests
+            .create_pull_request(self, request)
+            .await?;
+        report.metadata.extend(git_metadata);
+        Ok(report)
+    }
+
     pub async fn close(&self, options: CloseSessionOptions) -> Result<(), SandboxError> {
         let _guard = self.operation_lock.lock().await;
         let mut updated = self.info.lock().await.clone();
@@ -748,6 +961,14 @@ impl SandboxSession {
                 .await;
                 Err(error)
             }
+        }
+    }
+
+    async fn export_root(&self) -> Result<String, SandboxError> {
+        if let Some(manifest) = load_hoist_manifest(self.volume.as_ref()).await? {
+            Ok(manifest.target_root)
+        } else {
+            Ok(self.info().await.workspace_root)
         }
     }
 
@@ -811,6 +1032,7 @@ async fn seed_session_layout(
         "/.terrace/cache",
         TERRACE_RUNTIME_CACHE_DIR,
         "/.terrace/typescript",
+        "/.terrace/typescript/transpile",
         "/.terrace/tools",
         TERRACE_NPM_DIR,
         "/.terrace/npm/cache",

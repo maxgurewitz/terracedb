@@ -2,6 +2,8 @@ use thiserror::Error;
 
 use terracedb_vfs::{VfsError, VolumeId};
 
+use crate::ConflictReport;
+
 #[derive(Debug, Error)]
 pub enum SandboxError {
     #[error("sandbox session {session_volume_id} requires a base volume to be created")]
@@ -38,6 +40,24 @@ pub enum SandboxError {
     ViewHandleNotFound { handle_id: String },
     #[error("sandbox execution failed for {entrypoint}: {message}")]
     Execution { entrypoint: String, message: String },
+    #[error("readonly view session {session_volume_id} not found")]
+    ReadonlyViewSessionNotFound { session_volume_id: VolumeId },
+    #[error("readonly view request is unauthorized")]
+    ReadonlyViewUnauthorized,
+    #[error("sandbox disk operation found conflicts: {report}")]
+    DiskConflict { report: ConflictReport },
+    #[error("sandbox session does not have hoist provenance for apply-delta eject")]
+    MissingHoistProvenance,
+    #[error("sandbox session does not have git provenance for this operation")]
+    MissingGitProvenance,
+    #[error("host path error at {path}: {message}")]
+    Io { path: String, message: String },
+    #[error("command failed: {command} (status: {status:?}): {stderr}")]
+    CommandFailed {
+        command: String,
+        status: Option<i32>,
+        stderr: String,
+    },
     #[error("{service} backend error: {message}")]
     Service {
         service: &'static str,

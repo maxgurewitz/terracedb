@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use async_trait::async_trait;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
-use terracedb_vfs::{CompletedToolRunOutcome, CreateOptions};
+use terracedb_vfs::{CompletedToolRunOutcome, CreateOptions, MkdirOptions};
 
 use crate::{SandboxError, SandboxSession, session::record_completed_tool_run};
 
@@ -158,6 +158,14 @@ impl DeterministicTypeScriptService {
         let source_map_path = format!("{output_path}.map");
         let metadata_path = format!("{TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR}/{cache_key}.json");
         let fs = session.filesystem();
+        fs.mkdir(
+            TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR,
+            MkdirOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await?;
         let cache_hit = fs.read_file(&metadata_path).await?.is_some()
             && fs.read_file(&output_path).await?.is_some()
             && fs.read_file(&source_map_path).await?.is_some();
