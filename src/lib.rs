@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod api;
 pub mod composition;
 pub mod config;
+pub mod current_state;
 pub mod engine;
 pub mod error;
 pub mod failpoints;
@@ -43,6 +44,20 @@ pub use config::{
     S3PrimaryStorageConfig, SsdConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
     TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, TtlCompactionFilter,
     TtlExpiryExtractor,
+};
+pub use current_state::{
+    CurrentStateCompactionRowRemovalMode, CurrentStateCutoffSource, CurrentStateDerivedOnlyReason,
+    CurrentStateEffectiveMode, CurrentStateExactnessRequirement, CurrentStateLogicalFloor,
+    CurrentStateMissingValuePolicy, CurrentStateOracleMutation, CurrentStateOracleRow,
+    CurrentStateOrderingContract, CurrentStatePhysicalRetentionMode,
+    CurrentStatePhysicalRetentionSeam, CurrentStatePlanner, CurrentStateProjectionOwnedRange,
+    CurrentStateRankBoundary, CurrentStateRankRetentionPolicy,
+    CurrentStateRankedMaterializationSeam, CurrentStateRebuildMode, CurrentStateRebuildSeam,
+    CurrentStateRetainedSetSummary, CurrentStateRetentionContract, CurrentStateRetentionError,
+    CurrentStateRetentionEvaluation, CurrentStateRetentionOracle,
+    CurrentStateRetentionOracleSnapshot, CurrentStateRetentionPolicy, CurrentStateRetentionReason,
+    CurrentStateRetentionSkipReason, CurrentStateRetentionStats, CurrentStateRetentionStatus,
+    CurrentStateSortDirection, CurrentStateThresholdCutoff, CurrentStateThresholdRetentionPolicy,
 };
 pub use error::{
     ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
