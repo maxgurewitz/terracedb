@@ -12,16 +12,19 @@ use terracedb_vfs::{
 use tokio::sync::Mutex;
 
 use crate::{
-    BaseSnapshotIdentity, ConflictPolicy, DeterministicGitWorkspaceManager,
-    DeterministicPackageInstaller, DeterministicPullRequestProviderClient,
-    DeterministicReadonlyViewProvider, DeterministicRuntimeBackend, GitWorkspaceManager,
-    GitWorkspaceReport, GitWorkspaceRequest, PackageInstallReport, PackageInstallRequest,
-    PackageInstaller, PullRequestProviderClient, PullRequestReport, PullRequestRequest,
-    ReadonlyViewCut, ReadonlyViewHandle, ReadonlyViewProvider, ReadonlyViewRequest, SandboxConfig,
-    SandboxError, SandboxFilesystemShim, SandboxRuntimeBackend, SandboxRuntimeHandle,
+    BaseSnapshotIdentity, CapabilityCallRequest, CapabilityCallResult, CapabilityRegistry,
+    ConflictPolicy, DeterministicGitWorkspaceManager, DeterministicPackageInstaller,
+    DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
+    DeterministicRuntimeBackend, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest,
+    PackageInstallReport, PackageInstallRequest, PackageInstaller, PullRequestProviderClient,
+    PullRequestReport, PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle,
+    ReadonlyViewProvider, ReadonlyViewRequest, SandboxConfig, SandboxError,
+    SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim, SandboxModuleLoader,
+    SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeStateHandle,
     SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
-    TERRACE_METADATA_DIR, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
-    VfsSandboxFilesystemShim,
+    StaticCapabilityRegistry, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
+    TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
+    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, VfsSandboxFilesystemShim,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +45,7 @@ pub struct SandboxServices {
     pub git: Arc<dyn GitWorkspaceManager>,
     pub pull_requests: Arc<dyn PullRequestProviderClient>,
     pub readonly_views: Arc<dyn ReadonlyViewProvider>,
+    pub capabilities: Arc<dyn CapabilityRegistry>,
 }
 
 impl SandboxServices {
@@ -58,7 +62,13 @@ impl SandboxServices {
             git,
             pull_requests,
             readonly_views,
+            capabilities: Arc::new(StaticCapabilityRegistry::default()),
         }
+    }
+
+    pub fn with_capabilities(mut self, capabilities: Arc<dyn CapabilityRegistry>) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     pub fn deterministic() -> Self {
@@ -230,7 +240,7 @@ impl<S> DefaultSandboxStore<S> {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 pub trait SandboxStore: Send + Sync {
     async fn open_session(&self, config: SandboxConfig) -> Result<SandboxSession, SandboxError>;
     async fn reopen_session(
@@ -239,7 +249,7 @@ pub trait SandboxStore: Send + Sync {
     ) -> Result<SandboxSession, SandboxError>;
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl<S> SandboxStore for DefaultSandboxStore<S>
 where
     S: VolumeStore + Send + Sync + 'static,
@@ -279,6 +289,7 @@ pub struct SandboxSession {
     info: Arc<Mutex<SandboxSessionInfo>>,
     operation_lock: Arc<Mutex<()>>,
     runtime: SandboxRuntimeHandle,
+    runtime_actor: SandboxRuntimeActor,
 }
 
 impl SandboxSession {
@@ -292,6 +303,7 @@ impl SandboxSession {
         Self {
             volume,
             clock,
+            runtime_actor: SandboxRuntimeActor::new(services.runtime.clone(), runtime.clone()),
             services,
             info: Arc::new(Mutex::new(info)),
             operation_lock: Arc::new(Mutex::new(())),
@@ -319,8 +331,26 @@ impl SandboxSession {
         Arc::new(VfsSandboxFilesystemShim::new(self.volume.fs()))
     }
 
+    pub fn capability_registry(&self) -> Arc<dyn CapabilityRegistry> {
+        self.services.capabilities.clone()
+    }
+
     pub fn kv(&self) -> Arc<dyn VfsKvStore> {
         self.volume.kv()
+    }
+
+    pub async fn module_loader(&self) -> SandboxModuleLoader {
+        let info = self.info().await;
+        self.module_loader_with_state(info, self.runtime_actor.state())
+            .await
+    }
+
+    pub async fn module_loader_with_state(
+        &self,
+        info: SandboxSessionInfo,
+        state: SandboxRuntimeStateHandle,
+    ) -> SandboxModuleLoader {
+        SandboxModuleLoader::new(info, self.filesystem(), self.capability_registry(), state)
     }
 
     pub async fn snapshot_for_cut(
@@ -344,6 +374,81 @@ impl SandboxSession {
 
     pub async fn flush(&self) -> Result<(), SandboxError> {
         self.volume.flush().await.map_err(Into::into)
+    }
+
+    pub async fn exec_module(
+        &self,
+        specifier: impl Into<String>,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        self.execute_runtime(
+            "sandbox.runtime.exec_module",
+            SandboxExecutionRequest::module(specifier.into()),
+        )
+        .await
+    }
+
+    pub async fn eval(
+        &self,
+        source: impl Into<String>,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        self.execute_runtime(
+            "sandbox.runtime.eval",
+            SandboxExecutionRequest::eval(source.into()),
+        )
+        .await
+    }
+
+    pub async fn invoke_capability(
+        &self,
+        request: CapabilityCallRequest,
+    ) -> Result<CapabilityCallResult, SandboxError> {
+        if !self
+            .info()
+            .await
+            .provenance
+            .capabilities
+            .contains(&request.specifier)
+        {
+            return Err(SandboxError::CapabilityDenied {
+                specifier: request.specifier,
+            });
+        }
+
+        let tool_name = format!(
+            "host_api.{}.{}",
+            request
+                .specifier
+                .strip_prefix(crate::HOST_CAPABILITY_PREFIX)
+                .unwrap_or(request.specifier.as_str()),
+            request.method
+        );
+        let params = Some(serde_json::to_value(&request)?);
+        match self.services.capabilities.invoke(self, request).await {
+            Ok(result) => {
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    &tool_name,
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&result)?),
+                    },
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    &tool_name,
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn set_conflict_policy(
@@ -612,6 +717,40 @@ impl SandboxSession {
         Ok(())
     }
 
+    async fn execute_runtime(
+        &self,
+        operation_name: &str,
+        request: SandboxExecutionRequest,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        let params = Some(serde_json::to_value(&request)?);
+        match self.runtime_actor.execute(self, request).await {
+            Ok(result) => {
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    operation_name,
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&result)?),
+                    },
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    operation_name,
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
     async fn mutate_info<P, F>(
         &self,
         operation_name: &str,
@@ -670,9 +809,13 @@ async fn seed_session_layout(
     for path in [
         workspace_root,
         "/.terrace/cache",
+        TERRACE_RUNTIME_CACHE_DIR,
         "/.terrace/typescript",
         "/.terrace/tools",
-        "/.terrace/npm",
+        TERRACE_NPM_DIR,
+        "/.terrace/npm/cache",
+        TERRACE_NPM_SESSION_CACHE_DIR,
+        TERRACE_NPM_COMPATIBILITY_ROOT,
         "/.terrace/typescript/libs",
         "/.terrace/typescript/transpile",
         "/.terrace/typescript/emits",
