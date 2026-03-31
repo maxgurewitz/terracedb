@@ -2924,19 +2924,19 @@ Add a sibling example to `examples/todo-api` that demonstrates why execution dom
 
 ---
 
-## Phase 13 — Unified-log pressure, flush reclamation, and adaptive write admission
+## Phase 14 — Unified-log pressure, flush reclamation, and adaptive write admission
 
-**Parallelization:** T67 first. After that, T68, T69, and T70 can proceed in parallel against the frozen interfaces. T71 depends on T69 + T70 + T66. T72 depends on T68 + T69 + T70 + T71.
+**Parallelization:** T71 first. After that, T72, T73, and T74 can proceed in parallel against the frozen interfaces. T75 depends on T73 + T74 + T70. T76 depends on T72 + T73 + T74 + T75.
 
-**Phase rule:** T67 freezes the accounting and admission interfaces first, and the rest of the phase should maximize parallel implementation against those fixed seams rather than re-opening the core contracts. This phase changes when the engine chooses to flush, throttle, or stall; it must not change commit ordering, visibility rules, durability semantics, crash-recovery results, or the logical answers returned by reads/scans.
+**Phase rule:** T71 freezes the accounting and admission interfaces first, and the rest of the phase should maximize parallel implementation against those fixed seams rather than re-opening the core contracts. This phase changes when the engine chooses to flush, throttle, or stall; it must not change commit ordering, visibility rules, durability semantics, crash-recovery results, or the logical answers returned by reads/scans.
 
-**Simulation rule:** Every task in this phase must extend the relevant deterministic oracle/cut-point/simulation harness in the same change as the production-path change. Do not defer task-local simulation to the capstone; T72 is additive whole-system hardening, not a substitute for self-contained coverage in T68-T71.
+**Simulation rule:** Every task in this phase must extend the relevant deterministic oracle/cut-point/simulation harness in the same change as the production-path change. Do not defer task-local simulation to the capstone; T76 is additive whole-system hardening, not a substitute for self-contained coverage in T72-T75.
 
 **Adoption rule:** Treat the existing L0-driven controls as the conservative fallback, not something to delete immediately. The new unified-log pressure and fine-grained memory accounting signals should layer in alongside L0/compaction signals, with bounded default thresholds and explicit observability before more aggressive policies become the default. Domain-local soft policy may differ by workload shape — for example, stricter OLTP-oriented domains and looser OLAP-ingest-oriented domains — but process-wide hard guardrails for memory exhaustion, unified-log exhaustion, and liveness still override domain-local preferences.
 
-### T67. Freeze unified-log pressure, flush-reclaim, and admission-control contracts
+### T71. Freeze unified-log pressure, flush-reclaim, and admission-control contracts
 
-**Depends on:** T33, T59, T62
+**Depends on:** T33, T63, T66
 
 **Description**
 
@@ -2969,9 +2969,9 @@ Define the long-term contracts for pressure-aware flushing and write admission b
 
 ---
 
-### T68. Implement fine-grained dirty-byte, flushing-byte, and unified-log pinning accounting
+### T72. Implement fine-grained dirty-byte, flushing-byte, and unified-log pinning accounting
 
-**Depends on:** T67
+**Depends on:** T71
 
 **Description**
 
@@ -3004,9 +3004,9 @@ Implement the accounting substrate needed for pressure-aware flushing. This task
 
 ---
 
-### T69. Implement pressure-aware flush candidate scoring and forced-flush guardrails
+### T73. Implement pressure-aware flush candidate scoring and forced-flush guardrails
 
-**Depends on:** T67
+**Depends on:** T71
 
 **Description**
 
@@ -3033,9 +3033,9 @@ Teach the maintenance loop to choose flush work based on actual relief value, no
 
 ---
 
-### T70. Implement multi-signal write admission and domain-aware pressure budgeting
+### T74. Implement multi-signal write admission and domain-aware pressure budgeting
 
-**Depends on:** T67
+**Depends on:** T71
 
 **Description**
 
@@ -3069,9 +3069,9 @@ Teach the write-admission path to react to multiple pressure signals together in
 
 ---
 
-### T71. Extend the example app to demonstrate pressure-aware flushing and write admission
+### T75. Extend the example app to demonstrate pressure-aware flushing and write admission
 
-**Depends on:** T69, T70, T66
+**Depends on:** T73, T74, T70
 
 **Description**
 
@@ -3101,9 +3101,9 @@ Extend the domains example so users can see pressure-aware flushing and write ad
 
 ---
 
-### T72. Build the capstone whole-system simulation and chaos suite for pressure-aware flushing
+### T76. Build the capstone whole-system simulation and chaos suite for pressure-aware flushing
 
-**Depends on:** T68, T69, T70, T71
+**Depends on:** T72, T73, T74, T75
 
 **Description**
 
@@ -3279,8 +3279,8 @@ At this point the system should additionally support:
 - whole-system deterministic simulation and chaos coverage across domain composition, and
 - a small example app that demonstrates two colocated workloads plus protected control-plane progress.
 
-### Milestone M — Pressure-aware flushing and adaptive admission
-Complete: T67–T72
+### Milestone N — Pressure-aware flushing and adaptive admission
+Complete: T71–T76
 
 At this point the system should additionally support:
 - fixed interfaces for unified-log pressure, fine-grained memory accounting, and adaptive write-admission signals,
