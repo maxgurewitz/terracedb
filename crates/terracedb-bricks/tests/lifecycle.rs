@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 
 use terracedb::{
@@ -10,8 +11,9 @@ use terracedb::{
 use terracedb_bricks::{
     BLOB_ACTIVITY_TABLE_NAME, BLOB_CATALOG_TABLE_NAME, BlobActivityKey, BlobActivityKind,
     BlobActivityOptions, BlobAlias, BlobCatalogKey, BlobCollection, BlobCollectionConfig,
-    BlobError, BlobLocator, BlobQuery, BlobReadOptions, BlobStore, BlobWrite, BlobWriteData,
-    InMemoryBlobStore, TerracedbBlobCollection,
+    BlobError, BlobGcOptions, BlobLocator, BlobObjectLayout, BlobPutOptions, BlobQuery,
+    BlobReadOptions, BlobStore, BlobStoreFailure, BlobStoreOperation, BlobWrite, BlobWriteData,
+    InMemoryBlobStore, TerracedbBlobCollection, compute_blob_digest, upload_blob_bytes,
 };
 
 struct Harness {
@@ -304,4 +306,279 @@ async fn missing_backing_objects_fail_closed() {
         error,
         BlobError::MissingObject { object_key } if object_key == handle.object_key
     ));
+}
+
+#[tokio::test]
+async fn durable_put_recovers_lost_upload_response_and_uses_content_addressed_keys() {
+    let harness = Harness::new(
+        "/terracedb-bricks-lost-response",
+        TieredDurabilityMode::GroupCommit,
+    );
+    let (_db, collection) = harness.open_collection(true).await;
+    let payload = b"hello terracedb bricks";
+    let layout = BlobObjectLayout::new("", "docs").expect("layout");
+    let digest = compute_blob_digest(payload);
+    let object_key = layout
+        .content_addressed_key(&digest)
+        .expect("content-addressed key");
+
+    harness
+        .blob_store
+        .inject_failure(BlobStoreFailure::lost_put_response(object_key.clone()));
+
+    let handle = collection
+        .put(BlobWrite {
+            alias: Some(BlobAlias::new("guide/latest").expect("alias")),
+            data: BlobWriteData::bytes(payload.as_slice()),
+            content_type: Some("text/plain".to_string()),
+            tags: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("put should recover lost response");
+
+    assert_eq!(handle.digest, digest);
+    assert_eq!(handle.object_key, object_key);
+    assert!(
+        handle.object_key.contains("blobs/docs/objects/sha256/"),
+        "durable collection should use content-addressed object keys"
+    );
+}
+
+#[tokio::test]
+async fn gc_preserves_shared_objects_until_last_reference_is_deleted() {
+    let harness = Harness::new(
+        "/terracedb-bricks-gc-shared",
+        TieredDurabilityMode::GroupCommit,
+    );
+    let (_db, collection) = harness.open_collection(true).await;
+    let first_alias = BlobAlias::new("guide/latest").expect("alias");
+    let second_alias = BlobAlias::new("guide/archive").expect("alias");
+
+    let first = collection
+        .put(BlobWrite {
+            alias: Some(first_alias.clone()),
+            data: BlobWriteData::bytes("shared payload"),
+            content_type: Some("text/plain".to_string()),
+            tags: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("put first");
+    let second = collection
+        .put(BlobWrite {
+            alias: Some(second_alias.clone()),
+            data: BlobWriteData::bytes("shared payload"),
+            content_type: Some("text/plain".to_string()),
+            tags: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("put second");
+
+    assert_eq!(first.object_key, second.object_key);
+
+    collection
+        .delete(BlobLocator::Alias(first_alias))
+        .await
+        .expect("delete first alias");
+    let first_gc = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .expect("gc with remaining reference");
+    assert_eq!(first_gc.deleted_objects, 0);
+    assert!(
+        harness
+            .blob_store
+            .stat(&second.object_key)
+            .await
+            .expect("stat shared object")
+            .is_some()
+    );
+
+    collection
+        .delete(BlobLocator::Alias(second_alias))
+        .await
+        .expect("delete second alias");
+    let second_gc = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .expect("gc final reference");
+    assert_eq!(second_gc.deleted_objects, 1);
+    assert!(
+        harness
+            .blob_store
+            .stat(&second.object_key)
+            .await
+            .expect("stat reclaimed object")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn gc_waits_for_active_snapshots_before_reclaiming_published_objects() {
+    let harness = Harness::new(
+        "/terracedb-bricks-gc-snapshot-pin",
+        TieredDurabilityMode::GroupCommit,
+    );
+    let (db, collection) = harness.open_collection(true).await;
+    let alias = BlobAlias::new("guide/latest").expect("alias");
+
+    let handle = collection
+        .put(BlobWrite {
+            alias: Some(alias.clone()),
+            data: BlobWriteData::bytes("snapshot pinned"),
+            content_type: Some("text/plain".to_string()),
+            tags: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("put");
+
+    let snapshot = db.snapshot().await;
+    collection
+        .delete(BlobLocator::Alias(alias))
+        .await
+        .expect("delete metadata");
+
+    let pinned_gc = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .expect("gc while snapshot pinned");
+    assert_eq!(pinned_gc.deleted_objects, 0);
+    assert_eq!(pinned_gc.retained_by_snapshots, 1);
+    assert!(
+        harness
+            .blob_store
+            .stat(&handle.object_key)
+            .await
+            .expect("stat pinned object")
+            .is_some()
+    );
+
+    snapshot.release();
+
+    let unpinned_gc = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .expect("gc after snapshot release");
+    assert_eq!(unpinned_gc.deleted_objects, 1);
+    assert!(
+        harness
+            .blob_store
+            .stat(&handle.object_key)
+            .await
+            .expect("stat reclaimed object")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn stale_list_blocks_untracked_orphan_sweep_until_a_fresh_listing_succeeds() {
+    let harness = Harness::new(
+        "/terracedb-bricks-gc-stale-list",
+        TieredDurabilityMode::GroupCommit,
+    );
+    let (_db, collection) = harness.open_collection(true).await;
+    let layout = BlobObjectLayout::new("", "docs").expect("layout");
+    let orphan = upload_blob_bytes(
+        harness.blob_store.as_ref(),
+        &layout,
+        Bytes::from_static(b"orphan upload"),
+        BlobPutOptions::default(),
+    )
+    .await
+    .expect("upload orphan");
+
+    harness
+        .blob_store
+        .inject_failure(BlobStoreFailure::stale_list(layout.object_prefix()));
+
+    let error = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .err()
+        .expect("stale list should fail closed");
+    assert!(matches!(error, BlobError::Store(_)));
+    assert!(
+        harness
+            .blob_store
+            .stat(orphan.object_key())
+            .await
+            .expect("stat orphan after stale list")
+            .is_some()
+    );
+
+    let gc = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .expect("gc after fresh listing");
+    assert_eq!(gc.deleted_objects, 1);
+    assert!(
+        harness
+            .blob_store
+            .stat(orphan.object_key())
+            .await
+            .expect("stat orphan after gc")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn gc_retries_delete_failures_without_losing_the_gc_row() {
+    let harness = Harness::new(
+        "/terracedb-bricks-gc-delete-retry",
+        TieredDurabilityMode::GroupCommit,
+    );
+    let (_db, collection) = harness.open_collection(true).await;
+    let alias = BlobAlias::new("guide/latest").expect("alias");
+
+    let handle = collection
+        .put(BlobWrite {
+            alias: Some(alias.clone()),
+            data: BlobWriteData::bytes("retry me"),
+            content_type: Some("text/plain".to_string()),
+            tags: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("put");
+    collection
+        .delete(BlobLocator::Alias(alias))
+        .await
+        .expect("delete metadata");
+
+    harness.blob_store.inject_failure(BlobStoreFailure::timeout(
+        BlobStoreOperation::Delete,
+        handle.object_key.clone(),
+    ));
+
+    let error = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .err()
+        .expect("delete failure should surface");
+    assert!(matches!(error, BlobError::Store(_)));
+    assert!(
+        harness
+            .blob_store
+            .stat(&handle.object_key)
+            .await
+            .expect("stat after failed gc")
+            .is_some()
+    );
+
+    let gc = collection
+        .collect_garbage(BlobGcOptions::default())
+        .await
+        .expect("gc retry");
+    assert_eq!(gc.deleted_objects, 1);
+    assert!(
+        harness
+            .blob_store
+            .stat(&handle.object_key)
+            .await
+            .expect("stat after retry")
+            .is_none()
+    );
 }

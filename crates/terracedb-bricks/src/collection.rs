@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -102,6 +102,32 @@ pub const BLOB_COLLECTION_SEMANTICS: BlobSemantics = BlobSemantics {
     indexing: BlobIndexDurability::DurableActivityOnly,
     missing_object_reads: BlobMissingObjectSemantics::FailClosed,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobGcOptions {
+    pub grace_period: Duration,
+    pub max_objects: Option<usize>,
+}
+
+impl Default for BlobGcOptions {
+    fn default() -> Self {
+        Self {
+            grace_period: Duration::ZERO,
+            max_objects: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlobGcResult {
+    pub live_objects: usize,
+    pub tracked_objects: usize,
+    pub discovered_orphans: usize,
+    pub deleted_objects: usize,
+    pub retained_by_reference: usize,
+    pub retained_by_grace: usize,
+    pub retained_by_snapshots: usize,
+}
 
 pub enum BlobWriteData {
     Bytes(Bytes),
@@ -268,6 +294,7 @@ pub trait BlobCollection: Send + Sync {
         opts: BlobReadOptions,
     ) -> Result<BlobReadResult, BlobError>;
     async fn delete(&self, target: BlobLocator) -> Result<(), BlobError>;
+    async fn collect_garbage(&self, opts: BlobGcOptions) -> Result<BlobGcResult, BlobError>;
     async fn search(&self, query: BlobQuery) -> Result<BlobSearchStream, BlobError>;
     async fn activity_since(
         &self,
@@ -609,6 +636,63 @@ impl BlobCollection for InMemoryBlobCollection {
         Ok(())
     }
 
+    async fn collect_garbage(&self, opts: BlobGcOptions) -> Result<BlobGcResult, BlobError> {
+        let live = {
+            let state = lock(&self.inner.state);
+            state
+                .blobs
+                .values()
+                .map(|metadata| metadata.object_key.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let listed = self
+            .inner
+            .blob_store
+            .list_prefix(&self.inner.layout.object_prefix())
+            .await?;
+
+        let now = system_timestamp();
+        let mut deleted = 0_usize;
+        let mut retained_by_reference = 0_usize;
+        let mut retained_by_grace = 0_usize;
+        let discovered_orphans = listed
+            .iter()
+            .filter(|info| !live.contains(&info.key))
+            .count();
+
+        for info in listed {
+            if live.contains(&info.key) {
+                retained_by_reference += 1;
+                continue;
+            }
+            if !past_grace(info.last_modified, now, opts.grace_period) {
+                retained_by_grace += 1;
+                continue;
+            }
+            if opts.max_objects.is_some_and(|limit| deleted >= limit) {
+                retained_by_grace += 1;
+                continue;
+            }
+
+            match self.inner.blob_store.delete(&info.key).await {
+                Ok(()) | Err(BlobStoreError::NotFound { .. }) => {
+                    deleted += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(BlobGcResult {
+            live_objects: live.len(),
+            tracked_objects: live.len(),
+            discovered_orphans,
+            deleted_objects: deleted,
+            retained_by_reference,
+            retained_by_grace,
+            retained_by_snapshots: 0,
+        })
+    }
+
     async fn search(&self, query: BlobQuery) -> Result<BlobSearchStream, BlobError> {
         let mut rows = {
             let state = lock(&self.inner.state);
@@ -750,4 +834,26 @@ fn searchable_text(metadata: &BlobMetadata) -> String {
             .map(|(key, value)| format!("{}={}", key.to_lowercase(), value)),
     );
     fields.join(" ")
+}
+
+fn system_timestamp() -> Timestamp {
+    Timestamp::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64,
+    )
+}
+
+fn past_grace(reference: Option<Timestamp>, now: Timestamp, grace_period: Duration) -> bool {
+    if grace_period.is_zero() {
+        return true;
+    }
+
+    let Some(reference) = reference else {
+        return false;
+    };
+    let grace_micros = grace_period.as_micros().min(u64::MAX as u128) as u64;
+    reference.get().saturating_add(grace_micros) <= now.get()
 }
