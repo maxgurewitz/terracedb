@@ -11,8 +11,8 @@ use terracedb::{
     ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding,
     ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage,
     InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType, ResourceManager,
-    S3Location, ScanOptions, StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig,
-    TableFormat, Value,
+    S3Location, ScanOptions, ShardReadyPlacementLayout, StubClock, StubFileSystem, StubObjectStore,
+    StubRng, TableConfig, TableFormat, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -506,6 +506,254 @@ fn shared_domains_can_borrow_idle_capacity_but_not_reserved_or_busy_capacity() {
     assert_eq!(blocked.blocked_by, vec![ExecutionResourceKind::CpuWorkers]);
 }
 
+#[test]
+fn update_domain_replaces_explicit_contracts_so_budgets_can_relax_or_change_shape() {
+    let manager = InMemoryResourceManager::new(process_budget());
+    let path = ExecutionDomainPath::new(["process", "tenant-a", "background"]);
+    let owner = ExecutionDomainOwner::Database {
+        name: "tenant-a".to_string(),
+    };
+
+    manager.register_domain(dedicated_spec(
+        path.clone(),
+        owner.clone(),
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(2),
+                weight: None,
+            },
+            memory: DomainMemoryBudget::default(),
+            io: DomainIoBudget::default(),
+            background: DomainBackgroundBudget::default(),
+        },
+    ));
+
+    let updated = manager.update_domain(shared_spec(
+        path.clone(),
+        owner,
+        4,
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(5),
+                weight: Some(4),
+            },
+            memory: DomainMemoryBudget::default(),
+            io: DomainIoBudget::default(),
+            background: DomainBackgroundBudget::default(),
+        },
+    ));
+
+    assert_eq!(
+        updated.spec.placement,
+        ExecutionDomainPlacement::SharedWeighted { weight: 4 }
+    );
+    assert_eq!(updated.effective_budget.cpu.worker_slots, Some(5));
+
+    let admitted = manager.try_acquire(
+        &path,
+        ExecutionResourceUsage {
+            cpu_workers: 5,
+            ..ExecutionResourceUsage::default()
+        },
+    );
+    assert!(admitted.admitted);
+    assert_eq!(admitted.snapshot.effective_budget.cpu.worker_slots, Some(5));
+}
+
+#[test]
+fn shard_ready_layout_reserves_a_future_shard_namespace_without_claiming_physical_sharding() {
+    let layout = ShardReadyPlacementLayout::new("warehouse");
+    assert_eq!(
+        layout.database_lane_path(ExecutionLane::UserForeground),
+        ExecutionDomainPath::new(["process", "shards", "warehouse", "foreground"])
+    );
+    assert_eq!(
+        layout.future_shard_namespace,
+        ExecutionDomainPath::new(["process", "shards", "warehouse", "shards"])
+    );
+    assert_eq!(
+        layout.future_shard_lane_path("0003", ExecutionLane::UserBackground),
+        ExecutionDomainPath::new([
+            "process",
+            "shards",
+            "warehouse",
+            "shards",
+            "0003",
+            "background"
+        ])
+    );
+    assert_eq!(
+        layout.shard_owner("0003"),
+        ExecutionDomainOwner::Shard {
+            database: "warehouse".to_string(),
+            shard: "0003".to_string(),
+        }
+    );
+
+    let deployment =
+        ColocatedDeployment::shard_ready(process_budget(), "warehouse").expect("shard-ready");
+    let report = deployment.report();
+    let background = report.databases["warehouse"]
+        .background
+        .snapshot
+        .as_ref()
+        .expect("background snapshot");
+    assert_eq!(
+        background
+            .spec
+            .metadata
+            .get("terracedb.execution.layout")
+            .map(String::as_str),
+        Some("shard-ready")
+    );
+    assert_eq!(
+        background
+            .spec
+            .metadata
+            .get("terracedb.execution.future_shard_namespace")
+            .map(String::as_str),
+        Some("process/shards/warehouse/shards")
+    );
+    assert_eq!(
+        background
+            .spec
+            .metadata
+            .get("terracedb.execution.physical_sharding")
+            .map(String::as_str),
+        Some("not-enabled")
+    );
+}
+
+#[test]
+fn reserved_control_plane_progress_survives_shared_shard_background_pressure() {
+    let process_budget = ExecutionDomainBudget {
+        cpu: DomainCpuBudget {
+            worker_slots: Some(4),
+            weight: None,
+        },
+        memory: DomainMemoryBudget::default(),
+        io: DomainIoBudget::default(),
+        background: DomainBackgroundBudget {
+            task_slots: Some(4),
+            max_in_flight_bytes: None,
+        },
+    };
+    let manager = InMemoryResourceManager::new(process_budget);
+    let layout = ShardReadyPlacementLayout::new("warehouse");
+    let control_plane = layout.database_lane_path(ExecutionLane::ControlPlane);
+    let shard_a = layout.future_shard_lane_path("0001", ExecutionLane::UserBackground);
+    let shard_b = layout.future_shard_lane_path("0002", ExecutionLane::UserBackground);
+
+    manager.register_domain(dedicated_spec(
+        control_plane.clone(),
+        ExecutionDomainOwner::Subsystem {
+            database: Some("warehouse".to_string()),
+            name: "control-plane".to_string(),
+        },
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(1),
+                weight: None,
+            },
+            memory: DomainMemoryBudget::default(),
+            io: DomainIoBudget::default(),
+            background: DomainBackgroundBudget {
+                task_slots: Some(1),
+                max_in_flight_bytes: None,
+            },
+        },
+    ));
+    manager.register_domain(shared_spec(
+        shard_a.clone(),
+        layout.shard_owner("0001"),
+        1,
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(4),
+                weight: None,
+            },
+            memory: DomainMemoryBudget::default(),
+            io: DomainIoBudget::default(),
+            background: DomainBackgroundBudget {
+                task_slots: Some(4),
+                max_in_flight_bytes: None,
+            },
+        },
+    ));
+    manager.register_domain(shared_spec(
+        shard_b.clone(),
+        layout.shard_owner("0002"),
+        1,
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(4),
+                weight: None,
+            },
+            memory: DomainMemoryBudget::default(),
+            io: DomainIoBudget::default(),
+            background: DomainBackgroundBudget {
+                task_slots: Some(4),
+                max_in_flight_bytes: None,
+            },
+        },
+    ));
+
+    assert!(
+        manager
+            .try_acquire(
+                &shard_a,
+                ExecutionResourceUsage {
+                    cpu_workers: 2,
+                    background_tasks: 2,
+                    ..ExecutionResourceUsage::default()
+                },
+            )
+            .admitted
+    );
+    assert!(
+        manager
+            .try_acquire(
+                &shard_b,
+                ExecutionResourceUsage {
+                    cpu_workers: 1,
+                    background_tasks: 1,
+                    ..ExecutionResourceUsage::default()
+                },
+            )
+            .admitted
+    );
+
+    let control_progress = manager.try_acquire(
+        &control_plane,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            background_tasks: 1,
+            ..ExecutionResourceUsage::default()
+        },
+    );
+    assert!(control_progress.admitted);
+
+    let blocked_shared = manager.try_acquire(
+        &shard_a,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            background_tasks: 1,
+            ..ExecutionResourceUsage::default()
+        },
+    );
+    assert!(!blocked_shared.admitted);
+    assert!(
+        blocked_shared
+            .blocked_by
+            .contains(&ExecutionResourceKind::CpuWorkers)
+    );
+    assert!(
+        blocked_shared
+            .blocked_by
+            .contains(&ExecutionResourceKind::BackgroundTasks)
+    );
+}
+
 #[tokio::test]
 async fn db_open_registers_a_reserved_control_plane_domain_when_missing() {
     let profile = execution_profile("reserved");
@@ -737,6 +985,18 @@ fn colocated_deployment_presets_publish_default_profiles_and_budgets() {
             .domain,
         ExecutionDomainPath::new(["process", "shards", "warehouse", "foreground"])
     );
+    assert_eq!(
+        shard_ready.report().databases["warehouse"]
+            .foreground
+            .snapshot
+            .as_ref()
+            .expect("shard-ready foreground")
+            .spec
+            .metadata
+            .get("terracedb.execution.future_shard_namespace")
+            .map(String::as_str),
+        Some("process/shards/warehouse/shards")
+    );
 }
 
 #[tokio::test]
@@ -852,6 +1112,63 @@ async fn colocated_deployment_builder_supports_multi_db_open_and_recovery() {
             .binding
             .domain
     );
+}
+
+#[tokio::test]
+async fn shard_ready_reopen_preserves_correctness_after_background_pressure_and_partial_drain() {
+    let deployment =
+        ColocatedDeployment::shard_ready(process_budget(), "warehouse").expect("shard-ready");
+    let deployment_manager = deployment.resource_manager();
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+
+    let db = open_deployed_db(
+        &deployment,
+        "warehouse",
+        "/execution-shard-ready-reopen",
+        file_system.clone(),
+        object_store.clone(),
+    )
+    .await;
+    let rows = run_workload(&db).await;
+    let background_path = db.execution_placement_report().background.binding.domain;
+
+    let admitted = deployment_manager.try_acquire(
+        &background_path,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            background_tasks: 1,
+            ..ExecutionResourceUsage::default()
+        },
+    );
+    assert!(admitted.admitted);
+    deployment_manager.set_backlog(
+        &background_path,
+        ExecutionDomainBacklogSnapshot {
+            queued_work_items: 2,
+            queued_bytes: 256,
+        },
+    );
+
+    drop(db);
+
+    let reopened = open_deployed_db(
+        &deployment,
+        "warehouse",
+        "/execution-shard-ready-reopen",
+        file_system,
+        object_store,
+    )
+    .await;
+    assert_eq!(read_existing_rows(&reopened).await, rows);
+    let background_snapshot = reopened
+        .execution_placement_report()
+        .background
+        .snapshot
+        .expect("reopened background snapshot");
+    assert_eq!(background_snapshot.backlog.queued_work_items, 2);
+    assert_eq!(background_snapshot.backlog.queued_bytes, 256);
+    assert_eq!(background_snapshot.usage.background_tasks, 1);
 }
 
 #[tokio::test]

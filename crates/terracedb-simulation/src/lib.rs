@@ -45,8 +45,8 @@ pub use terracedb::{
     ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionPlacementDecision,
     ExecutionResourceKind, ExecutionResourceUsage, InMemoryDomainBudgetOracle,
     InMemoryResourceManager, PlacementAssignment, PlacementRequest, PlacementTarget,
-    ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot, WorkPlacementRequest,
-    WorkRuntimeTag,
+    ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot, ShardReadyPlacementLayout,
+    WorkPlacementRequest, WorkRuntimeTag,
 };
 
 const OBJECT_STORE_HOST: &str = "object-store";
