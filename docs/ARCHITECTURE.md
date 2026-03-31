@@ -25,6 +25,8 @@ These are the architectural choices that most constrain the rest of the design:
 - **External stream ingress is a library boundary, not an engine feature.** Kafka consumers persist source progress atomically with writes into ordinary Terracedb tables; Debezium support composes on top of Kafka ingress rather than extending the engine.
 - **Embedded virtual filesystems are libraries, not engine modes.** Their current-state filesystem/KV/tool rows live in ordinary tables; timelines and watchers are layered on top of append-only activity rows and change capture.
 - **Embedded sandbox runtimes are libraries on top of `terracedb-vfs`, not engine modes.** Sandboxes get their own session/overlay, capability model, host-disk/git interop, and editor-facing read-only view layer without turning the engine into a shell, CLI, or host-filesystem runtime.
+- **Migration, query-sandbox, and stored-procedure surfaces are capability-driven libraries layered above the sandbox runtime.** Guest code should receive explicit versioned modules with host-enforced policy, not raw engine handles.
+- **External agent protocols such as MCP are adapter layers above the library stack, not engine or VFS modes.** They should reuse the same capability and audit model as in-process sandboxes instead of introducing a parallel permission system.
 - **Blob and large-object storage are libraries, not engine value variants.** Large bytes live out-of-line in a blob store; Terracedb stores metadata, references, and derived indexes.
 - **Virtual filesystem compatibility is semantic, not SQLite-format compatibility.** The goal is to provide an in-process virtual filesystem/KV/tool model on Terracedb, not SQL, a single-file transport format, or SQLite WAL behavior.
 - **Event sourcing is recommended** for data that drives history-dependent projections. Mutable-record projections cannot be safely recomputed from SSTables after `SnapshotTooOld`.
@@ -3091,6 +3093,22 @@ Projection library ──→ DB
 Workflow library   ──→ DB
 ```
 
+The stronger long-term model for workflows should be explicitly **run-based and history-first**.
+
+- a **workflow definition** names long-lived logic and routing,
+- a **workflow bundle** is an immutable implementation artifact for that logic,
+- a **workflow run** is one execution epoch pinned to one bundle,
+- **workflow history** is the append-only durable replay record,
+- **workflow state** is the current mutable summary used for fast execution, and
+- **workflow visibility** is a separate operator-facing projection optimized for list/search/describe/history APIs.
+
+This split matters. History is the durable source of truth. State is a speed-oriented summary derived from history and current execution tables. Visibility is a separate product for operators and tooling. These should not collapse into one table or one API.
+
+One design constraint should stay explicit throughout the workflow library:
+
+- workflows must remain implementable directly in Rust without the sandbox, and
+- sandbox-authored workflows should be an additional handler/deployment path rather than the only workflow authoring model.
+
 ---
 
 ## Workflow Instances
@@ -3100,7 +3118,10 @@ A workflow instance is a persistent state machine. Its state is stored in a DB t
 ```typescript
 interface WorkflowDefinition {
   name: string
-  stateTable: Table               // persists workflow instance state
+  runTable: Table                 // durable workflow runs and lifecycle metadata, keyed by runId
+  historyTable: Table             // append-only replay record, keyed by (runId, historySeq)
+  stateTable: Table               // current mutable workflow state summary, keyed by active run or instance
+  visibilityTable: Table          // operator-facing projection for list/search/describe
   inboxTable: Table               // durably admitted event/timer/callback triggers awaiting execution, keyed by (instanceId, triggerSeq)
   triggerOrderTable: Table        // per-instance next trigger sequence for durable ordering
   sourceCursorTable: Table        // progress of durable event-ingress per source table
@@ -3108,7 +3129,7 @@ interface WorkflowDefinition {
   timerLookupTable: Table         // timers keyed by timerId → fireAt
   outboxTable: Table              // side-effect intents
   scheduler?: WorkflowScheduler   // optional inter-instance scheduler; default is fair round-robin over ready instances
-  handler: WorkflowHandler
+  handler: WorkflowHandler        // native Rust handler or adapted sandbox handler
 }
 
 interface WorkflowHandler {
@@ -3147,6 +3168,8 @@ interface AdmittedWorkflowTrigger {
   trigger: WorkflowTrigger
 }
 ```
+
+In simple single-run-per-instance configurations, the active `runId` may line up naturally with the logical instance identity. The architecture should still model runs explicitly so upgrades, restarts-as-new, and bundle pinning remain first-class rather than implicit.
 
 The handler is a pure function of `(currentState, trigger) → output`. Every trigger type is first turned into a **self-contained durable inbox row** before execution. The inbox row is the replay unit; the executor then applies the handler output atomically with inbox acknowledgement and timer deletion where relevant.
 
@@ -3232,6 +3255,40 @@ async function processWorkflowTrigger(
 
 State update, outbox entries, timer changes, inbox acknowledgement, and fired-timer deletion are all in one `WriteBatch`. If the process crashes before commit, nothing changes. After commit, the workflow state transition and the acknowledgement of the durable inbox row are atomically visible.
 
+### Workflow Transition Engine and Durability Fences
+
+All workflow inputs should flow through one Rust-owned transition engine:
+
+- admitted source events,
+- admitted timer firings,
+- admitted callbacks,
+- workflow-local retries or wakeups, and
+- later query/update-style control messages that are accepted into workflow execution.
+
+That transition engine should be the only place allowed to:
+
+- append workflow history,
+- update current workflow state,
+- change lifecycle status,
+- modify timer ownership or retry state,
+- schedule effect intents,
+- and acknowledge the admitted inbox row.
+
+The architectural rule is:
+
+- guest code interprets admitted input and proposes commands,
+- the Rust executor validates and durably applies those commands,
+- and only after that durable apply completes does the runtime hand work to effect delivery, timer wakeup machinery, or other external execution paths.
+
+This is a stricter form of the outbox principle and should be applied uniformly. Workflow correctness must not depend on side effects leaving the process before the durable transition that justifies them.
+
+The workflow library should therefore keep two distinct internal contracts:
+
+- a **public handler contract** used by native Rust handlers and sandbox adapters, and
+- a **private internal transition/effects contract** used inside the executor to reduce commands into history/state/timer/outbox mutations.
+
+Those are related, but they should not be conflated.
+
 Admission allocates the per-instance ordering key in the **same OCC unit** that writes the inbox row and any associated cursor/progress update. The helper is therefore a **staging helper**, not a separately committing transaction:
 
 ```typescript
@@ -3258,6 +3315,53 @@ async function stageTriggerAdmission(
 The important rule is the atomicity boundary: **trigger-sequence allocation, inbox admission, and any associated source/callback/timer progress advance must commit together in one OCC unit**. There is no separately-committing `allocateTriggerSeq(...)` step. Whether that OCC unit is already durable at commit return depends on the storage mode / flush policy; authoritative executors still consume only from the durable prefix.
 
 **Note on replay and duplicates:** duplicate timer firings or callbacks are possible. That is acceptable because the inbox row is self-contained, acknowledgement is atomic with the state transition, and the handler is written as a state-guarded/idempotent transition. Missing timer schedule/lookup rows on duplicate timer execution are benign no-ops.
+
+### Sandboxed TypeScript Workflow Handlers
+
+The workflow executor should remain Rust-owned even when workflow logic is authored in TypeScript. A sandbox-authored workflow is therefore a different implementation strategy for `WorkflowHandler`, not a second workflow runtime with different correctness rules.
+
+Native Rust workflows remain first-class. A Rust application should be able to implement `WorkflowHandler` directly without depending on the sandbox stack at all. The sandbox path is a companion handler adapter and deployment mechanism, not a replacement for native workflow authoring.
+
+Recommended layering:
+
+- `terracedb-workflows` remains authoritative for durable inbox ordering, timer admission and firing, outbox persistence and delivery, state commits, and crash recovery,
+- a companion crate such as `terracedb-workflows-sandbox` adapts a draft or published sandbox module into a `WorkflowHandler`, and
+- a workflow registry or deployment layer resolves draft sessions or published bundles, then starts, stops, or upgrades workflows dynamically at runtime without changing executor semantics.
+
+The sandbox-facing boundary should be treated as a real versioned contract, for example `workflow-task/v1`, rather than as direct guest access to engine internals. The executor may keep richer private transition/effects types internally, but guest code should see only the narrower task/command surface.
+
+If the current executor surface is too compile-time-oriented for dynamic workflow loading, it is reasonable to extend it with a type-erased handler adapter or factory. That is an implementation detail; the important architectural rule is that TypeScript plugs into the existing executor contract rather than replacing it.
+
+Recommended TypeScript authoring surface:
+
+```typescript
+export default defineWorkflow({
+  name: "payments",
+
+  routeToInstance(entry) {
+    return entry.key.accountId
+  },
+
+  async handle({ instanceId, state, trigger, ctx }) {
+    return {
+      newState: nextState(state, trigger),
+      outboxEntries: buildOutbox(instanceId, state, trigger, ctx),
+      timers: buildTimers(instanceId, state, trigger, ctx),
+    }
+  },
+})
+```
+
+Execution-time workflow APIs should remain much narrower than general sandbox APIs. A sandboxed workflow turn should receive:
+
+- the admitted trigger,
+- the current state,
+- deterministic helpers equivalent to `WorkflowContext`, and
+- optional workflow-scoped observability hooks or narrowly scoped reviewed read capabilities.
+
+It should not receive arbitrary database handles, shell access, live package installation, host-disk writes, or unrestricted network access. Side effects should still be expressed declaratively through `WorkflowOutput`, with the Rust executor applying them atomically. This keeps replay and recovery semantics identical between Rust-authored and TypeScript-authored workflows.
+
+For correctness, workflow execution must not depend on mutable guest-global state. The host may cache transpiled modules or sealed bundles, but each `routeToInstance` and `handle` call must behave as a pure function of admitted input, current state, and deterministic context.
 
 ---
 
@@ -3578,6 +3682,48 @@ class WorkflowOutboxProcessor {
 **Exactly-once for workflow state:** the state transition and outbox write are atomic (same `WriteBatch`). If the process crashes after commit, the state is advanced and the outbox entry exists.
 
 **At-least-once for external effects:** the outbox processor may retry on crash. The idempotency key allows the external system to deduplicate.
+
+---
+
+## Queries, Updates, Visibility, and Upgrades
+
+Not every interaction with a running workflow should become a durable workflow-history event.
+
+The library should support three distinct lanes:
+
+1. **durable admitted triggers** that become part of run history and participate in replay,
+2. **read-only queries** that inspect current state or derived visibility without mutating run history, and
+3. **update/control requests** that may validate against live state first and become durable only if accepted.
+
+This keeps cheap inspection and validation-style interaction from paying the full history-append cost when no state transition is accepted.
+
+Visibility should also be a first-class workflow product rather than a side effect of raw table inspection. The workflow library should expose dedicated surfaces for:
+
+- list and search over runs,
+- describe-style live inspection of one run,
+- paginated history retrieval for one run, and
+- optional lower-level SQL or raw-table introspection for deeper operator forensics.
+
+The key split is:
+
+- `historyTable` is the authoritative replay record,
+- `stateTable` is the fast mutable summary,
+- `visibilityTable` is the operator-facing projection.
+
+Raw table access may still exist for debugging or advanced tooling, but common operator paths should not require distributed scans or bespoke joins over raw workflow storage.
+
+Workflow upgrades should also remain explicit. A run should be pinned to an immutable bundle or native registration identity for its execution epoch. New runs may pick newer bundles under rollout policy, but changing code under an already-running execution should require an explicit compatibility decision. The default upgrade boundary should be:
+
+- keep the current run pinned,
+- let new runs start on the new bundle,
+- and use continue-as-new / restart-as-new style transitions when a running execution must migrate to new code with a clean compatibility boundary.
+
+This applies equally to:
+
+- native Rust workflows registered directly with the runtime, and
+- sandbox-authored workflows published as immutable reviewed bundles.
+
+Both should participate in the same deployment and visibility model.
 
 ---
 
@@ -3981,6 +4127,7 @@ These decisions most constrain the sandbox design:
 - **Execution, TypeScript tooling, package installation, disk/git interop, and editor visibility are separate subsystems sharing one virtual tree.** They should not collapse into one giant runtime abstraction.
 - **Guest-runtime compatibility is layered above a small VFS-backed op surface.** The Rust layer should expose a narrow host op set over `terracedb-vfs`; Node or Deno compatibility shims should mostly live in guest-side libraries.
 - **Host integration is capability-first.** Application APIs are explicit versioned modules, not ambient globals.
+- **Sandbox workloads should run in explicit execution domains.** Capability policy controls what guest code may do; execution domains control what CPU, memory, local I/O, remote I/O, and background capacity it may consume.
 - **Tool-like actions are first-class audited events.** `bash`, package install, type-check, hoist/eject, PR export, and host-capability calls should flow through the tool-run and activity model rather than bypassing it.
 - **Package installation is a host service, not a literal embedded npm CLI.** A useful pure-JS/TS subset comes first; native addons, arbitrary postinstall scripts, and full host-process expectations are deferred.
 - **Host-disk, git, PR, and editor interop are explicit library services.** They are not side effects of exposing the sandbox as a writable real filesystem.
@@ -4000,6 +4147,16 @@ interface SandboxConfig {
   bash?: "off" | "enabled"
   typescript?: "off" | "transpile_only" | "full"
   capabilities?: CapabilityManifest
+  execution?: SandboxExecutionPolicy
+}
+
+interface SandboxExecutionPolicy {
+  sessionDomain?: string
+  toolDomain?: string
+  typescriptDomain?: string
+  packageDomain?: string
+  exportDomain?: string
+  controlPlaneDomain?: string
 }
 
 interface SandboxStore {
@@ -4235,6 +4392,287 @@ await tickets.addComment({ id: open[0].id, body: "Investigating" })
 ```
 
 The sandbox should prefer imports over globals, small domain-specific modules over one giant `Terrace` object, async JSON-serializable calls over opaque handles, and idempotent write APIs where possible.
+
+### Capability and Permission Model
+
+The sandbox should treat injected APIs as a first-class domain model rather than as an ad hoc bag of permissions. The important distinction is:
+
+- a **capability template** defines what API shape exists,
+- a **capability grant** defines which subject may use that API against which resources and budgets, and
+- a **capability manifest** is the concrete set of bound modules injected into one sandbox session or one published procedure.
+
+Recommended model:
+
+```typescript
+interface CapabilityTemplate {
+  id: string
+  version: string
+  methods: string[]
+  dtsText: string
+}
+
+interface ResourcePolicy {
+  dbs?: string[]
+  tables?: string[]
+  keyPrefixes?: string[]
+  tenantScope?: "none" | "caller" | { fixed: string }
+  queryShapes?: Array<"point_read" | "prefix_scan" | "range_scan" | "index_query" | "write" | "schema">
+}
+
+interface BudgetPolicy {
+  timeoutMs: number
+  maxRows?: number
+  maxBytes?: number
+  rateLimitBucket?: string
+}
+
+interface CapabilityGrant {
+  binding: string
+  templateId: string
+  authMode: "caller" | "service"
+  resourcePolicy: ResourcePolicy
+  budgets: BudgetPolicy
+  auditLabel: string
+}
+
+interface CapabilityManifest {
+  subjectId: string
+  bindings: CapabilityGrant[]
+}
+```
+
+This model should remain host-authoritative. Guest code may request a capability by import specifier, but it must not be able to mint new grants or widen its own scope from inside the sandbox.
+
+The recommended import shape is one injected module per binding:
+
+```typescript
+import { orders } from "terrace:host/orders_ro"
+import { catalog } from "terrace:host/catalog_admin"
+```
+
+The effective manifest for a draft session should be derived from the intersection of:
+
+- the subject's standing grants,
+- any environment or deployment policy, and
+- the capabilities explicitly requested for that session.
+
+The effective manifest for a published procedure should be the reviewed immutable manifest attached to that procedure version, optionally intersected with deployment policy at invocation time. This keeps review and runtime enforcement aligned while preventing code from self-escalating after publication.
+
+### Database Access Capability Families
+
+Database access should be exposed through a small set of versioned capability families rather than by handing guest code raw `Db` or `Table` objects. The host must stay in the enforcement path for every database operation so it can apply policy consistently.
+
+Useful starter families are:
+
+- `db.table.v1`
+  Fixed-table access with methods such as `get`, `put`, `delete`, and `scanPrefix`.
+- `db.query.v1`
+  Broader query access for trusted internal subjects that need to choose among multiple tables or indexes dynamically.
+- `catalog.migrate.v1`
+  Catalog and schema-change helpers such as `ensureTable`, `installSchemaSuccessor`, `updateTableMetadata`, and precondition checks.
+- `procedure.invoke.v1`
+  Invocation of already-published reviewed procedures without exposing underlying table access directly.
+
+This is the layer that should own:
+
+- table allowlists,
+- tenant scoping,
+- query-shape restrictions,
+- row or key-prefix filters,
+- rate limits, and
+- audit logging.
+
+For example, a subject may receive a `db.table.v1` binding scoped to:
+
+- one database,
+- one or more specific tables,
+- a fixed tenant or caller-derived tenant,
+- a limited set of query shapes such as point reads and prefix scans only, and
+- per-binding timeout and row-count budgets.
+
+Even when a subject is trusted enough to run arbitrary draft query code, that code should still call versioned host capabilities such as `db.query.v1` rather than touching engine objects directly. This preserves one policy enforcement surface for employee sandboxes, reviewed procedures, and external adapters.
+
+### Execution Domains for Sandbox Workloads
+
+Capability policy and execution-domain policy should be treated as complementary but separate:
+
+- capabilities answer "what may this code touch?",
+- execution domains answer "how much of the process may this workload consume while doing it?"
+
+Sandbox execution should reuse the engine's existing execution-domain model rather than introducing a second resource-isolation mechanism. This is how the host prevents sandbox, procedure, or MCP activity from exhausting process resources and degrading the enclosing application.
+
+Recommended sandbox execution policy:
+
+- draft employee query sessions run in a bounded interactive sandbox domain,
+- draft workflow preview sessions run in a bounded workflow-preview domain so preview traffic cannot exhaust either foreground query lanes or the core workflow executor,
+- published procedure invocations run in a request-oriented domain with tighter CPU, memory, and row/byte budgets,
+- deployed published workflow handlers run in workflow execution domains chosen by deployment policy, with per-trigger budgets tighter than authoring sandboxes and isolated from the application's primary request paths,
+- package install, type-check, bash, export, and other heavier helper flows may run in sibling sandbox background domains,
+- publication, catalog updates, procedure registry writes, and auth bookkeeping stay in protected control-plane domains,
+- read-only editor and MCP inspection traffic may use their own low-priority domains so observability traffic cannot starve foreground app work.
+
+Important rules:
+
+- guest code must never choose or mutate its own execution domain,
+- the host chooses domains based on subject, operation kind, and deployment policy,
+- per-capability budgets such as timeout and row limits apply in addition to domain budgets rather than replacing them, and
+- moving sandbox work between domains may change latency or throughput, but must not change correctness semantics.
+
+Illustrative mappings:
+
+- a trusted employee draft session might execute guest code in `sandbox.employee.foreground`,
+- a draft workflow preview might execute handler turns in `sandbox.workflow.preview`,
+- the same session's `npm install` may run in `sandbox.employee.packages`,
+- a published customer-facing procedure may run in `sandbox.procedure.invoke`,
+- a deployed reviewed workflow version may execute turns in `workflow.ts.execute`,
+- procedure publication and migration-catalog writes may run in `control.sandbox.publish`, and
+- MCP connections may resolve tools in `sandbox.mcp.foreground` while publication metadata reads stay in control-plane lanes.
+
+This separation is especially important for colocated embeddings. A runaway sandbox or external-agent session should be throttled, shed, or rate-limited by its assigned domains before it can starve core application request handling or database control-plane recovery work.
+
+### Migrations, Draft Queries, Published Procedures, and Workflows
+
+The same sandbox runtime should support five distinct products with different trust and lifecycle models:
+
+1. **reviewed migrations** for table/catalog setup and app-schema changes,
+2. **draft query sandboxes** for trusted internal users who may run arbitrary code within their granted capabilities, and
+3. **published procedures** for lower-trust or external callers who may invoke only reviewed immutable code artifacts,
+4. **draft workflow sandboxes** for development-time authoring, testing, replay, and preview, and
+5. **published workflow bundles** that plug into the Rust workflow executor in preview or production.
+
+These should be modeled as separate libraries above `terracedb-sandbox` and `terracedb-workflows`, not as one undifferentiated execution mode.
+
+These sandbox-facing workflow products are optional complements to the core workflow library. Native Rust workflows should remain first-class and should participate in the same runtime, history, visibility, and deployment model without needing `terracedb-sandbox`.
+
+#### Migrations
+
+A migration library such as `terracedb-migrate` should execute reviewed TypeScript modules inside the sandbox, but it should intentionally remain narrow in scope for version 1:
+
+- create or ensure tables,
+- evolve columnar schemas through validated successors,
+- update table metadata and related catalog settings,
+- record migration metadata and audit history.
+
+Version 1 should explicitly not treat large data backfills or arbitrary row-rewrite jobs as part of this migration surface. Those are operational workloads with different scheduling, retry, and observability needs.
+
+The preferred migration model is reviewed code that drives catalog-scoped host capabilities, not guest code with unrestricted write access to arbitrary tables.
+
+#### Draft Query Sandboxes
+
+Trusted internal users such as company employees may be granted the right to run arbitrary TypeScript code for exploratory or operational queries. Those sessions should still execute under an explicit manifest and should still be constrained by per-binding resource policy and budgets.
+
+This keeps "arbitrary code" compatible with:
+
+- tenant scoping,
+- table allowlists,
+- query-shape restrictions,
+- rate limiting,
+- audit logging, and
+- future deployment-specific controls.
+
+#### Published Procedures
+
+A procedure library such as `terracedb-procedures` should turn reviewed sandbox code into immutable published artifacts. External or lower-trust callers should invoke a named reviewed version, not mutate the code that runs on their behalf.
+
+Recommended published-procedure metadata:
+
+```typescript
+interface PublishedProcedureManifest {
+  name: string
+  version: string
+  codeHash: string
+  entrypoint: string
+  inputSchema: JsonSchema
+  outputSchema: JsonSchema
+  capabilities: CapabilityGrant[]
+  budgets: BudgetPolicy
+  reviewedBy: string
+}
+```
+
+Recommended publish flow:
+
+1. author or update code in a draft sandbox,
+2. review code plus requested capability manifest,
+3. freeze an immutable snapshot or module bundle,
+4. persist publication metadata such as code hash, schemas, budgets, and reviewer, and
+5. invoke published versions by opening a fresh session from that immutable base.
+
+Invocation should accept caller identity and tenant context, then evaluate the published procedure under the reviewed manifest and host-enforced budgets. The caller should not be able to widen capabilities, modify the code, or reuse a mutable draft session as the invocation target.
+
+#### Draft Workflow Sandboxes
+
+Workflow authoring in development should happen inside mutable sandbox sessions rather than inside the production workflow runtime directly. These draft workflow sandboxes are where teams should:
+
+- edit workflow source and fixtures in a VFS-backed workspace,
+- install supported npm dependencies through the host package service,
+- run `tsc`, local tests, and workflow-specific validation,
+- use `just-bash` helpers for preview, replay, inspection, or publish flows, and
+- iterate on workflow code without first minting a reviewed immutable bundle.
+
+Draft workflow sandboxes are for authoring and preview, not for direct production execution.
+
+Preview should still route through the Rust executor. A preview runner may resolve workflow code from a mutable sandbox session, then create a normal workflow runtime with isolated table names or prefixes for that session, branch, or preview environment. This keeps development aligned with real inbox ordering, timers, outbox delivery, and crash-recovery semantics instead of inventing a second "dev-only" execution path.
+
+#### Published Workflow Bundles
+
+Production should execute immutable reviewed workflow bundles, not mutable draft sandbox sessions. A companion library or registry layer such as `terracedb-workflows-sandbox` plus a workflow deployment manager should:
+
+- bundle the workflow entrypoint together with supported JS or TS dependencies,
+- persist code hash, entrypoint, capability manifest, budgets, reviewer metadata, and execution-domain policy,
+- activate or deactivate specific workflow versions at runtime, and
+- start or stop the corresponding Rust executor bindings dynamically.
+
+Recommended published-workflow metadata:
+
+```typescript
+interface PublishedWorkflowManifest {
+  name: string
+  version: string
+  codeHash: string
+  entrypoint: string
+  capabilities: CapabilityGrant[]
+  budgets: BudgetPolicy
+  executionDomain: string
+  reviewedBy: string
+}
+```
+
+At execution time, published workflows should not receive authoring-only affordances such as `npm install`, `just-bash`, mutable VFS writes, or unrestricted network access. They should run as reviewed sealed artifacts under workflow-specific capabilities and host-chosen execution domains.
+
+#### Development Versus Production Workflow Sandboxes
+
+Development and production should share one TypeScript workflow source format, but they should not share one trust model.
+
+- development sandboxes are mutable, tool-rich, and optimized for authoring velocity,
+- published workflow sandboxes are sealed, reviewable, and optimized for deterministic execution under the Rust workflow runtime, and
+- the publication step converts a draft sandbox into an immutable artifact that can be previewed strictly, deployed, and audited.
+
+This means npm resolution, `just-bash`, and other authoring conveniences belong to draft workflow sessions and publish-time packaging, not to live production handler turns. Applications may still offer a "strict preview" mode in development by running the exact published bundle through the same Rust executor path that production will use.
+
+### External Agent Adapters and MCP
+
+The repo should support an external agent adapter crate, tentatively `terracedb-mcp`, that exposes selected sandbox and procedure surfaces to outside agents such as Claude Desktop. This adapter should sit above `terracedb-sandbox` and any procedure library; it should not be treated as a mode of `terracedb-vfs` itself.
+
+That layering matters because `terracedb-vfs` remains an embedded library surface rather than a general service boundary, while MCP is explicitly a protocol adapter for external tools.
+
+The MCP adapter should reuse the same capability model as in-process sandboxes:
+
+- each MCP connection is resolved to a subject identity,
+- the server derives an effective capability manifest for that subject and environment,
+- every exposed tool or resource maps onto host capabilities or published procedures, and
+- all invocations produce the same audit and tool-run history that local sandbox execution would.
+
+A good starter surface is:
+
+- list and inspect published procedures,
+- invoke reviewed procedures,
+- inspect read-only sandbox views,
+- read or diff files from a sandbox snapshot,
+- inspect tool-run and activity history,
+- optionally run draft query code only for explicitly trusted subjects.
+
+The important rule is that MCP should not introduce a second permission system. It should be a transport and presentation layer over the same capability templates, grants, manifests, quotas, and audit hooks already used by the sandbox runtime.
 
 ### Pull Requests and Editor Visibility
 
