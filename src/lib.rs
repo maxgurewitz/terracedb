@@ -29,10 +29,11 @@ pub use adapters::{
     SimulatedObjectStore, SystemClock, SystemRng, TokioFileSystem,
 };
 pub use api::{
-    BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarRecord, CommitOptions, Db,
-    DbBuilder, DbComponents, DbSettings, FieldDefinition, FieldType, FieldValue, Key, KeyPrefix,
-    KvStream, NamedColumnarRecord, ReadSet, ReadSetEntry, ScanOptions, SchemaDefinition, Snapshot,
-    Table, Value, WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
+    BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarCacheUsageSnapshot,
+    ColumnarRecord, CommitOptions, Db, DbBuilder, DbComponents, DbSettings, FieldDefinition,
+    FieldType, FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet, ReadSetEntry,
+    ScanOptions, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
+    WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
 };
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
@@ -105,8 +106,9 @@ pub use remote::{
 };
 pub use scheduler::{
     DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, NoopScheduler,
-    PendingWork, PendingWorkType, RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
-    TableStats, ThrottleDecision,
+    PendingWork, PendingWorkBudget, PendingWorkBudgetBlockReason, PendingWorkType,
+    RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
+    SchedulerObservabilitySnapshot, TableStats, ThrottleDecision,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{

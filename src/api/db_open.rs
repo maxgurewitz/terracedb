@@ -23,9 +23,13 @@ impl Db {
                 Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
             }
             let columnar_read_context = Arc::new(
-                Self::open_columnar_read_context(&config.storage, &dependencies)
-                    .await
-                    .map_err(OpenError::Storage)?,
+                Self::open_columnar_read_context(
+                    &config.storage,
+                    &config.hybrid_read,
+                    &dependencies,
+                )
+                .await
+                .map_err(OpenError::Storage)?,
             );
             let catalog_location = Self::catalog_location(&config.storage);
             let (tables, next_table_id) =
@@ -100,6 +104,8 @@ impl Db {
                     )),
                     durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
                     work_deferrals: Mutex::new(BTreeMap::new()),
+                    pending_work_budget_state: Mutex::new(PendingWorkBudgetState::default()),
+                    scheduler_observability: SchedulerObservabilityStats::default(),
                 }),
             };
             db.prune_commit_log(true)
@@ -597,6 +603,7 @@ impl Db {
 
     pub(super) async fn open_columnar_read_context(
         storage: &StorageConfig,
+        config: &crate::HybridReadConfig,
         dependencies: &DbDependencies,
     ) -> Result<ColumnarReadContext, StorageError> {
         let remote_cache_root = match storage {
@@ -612,25 +619,68 @@ impl Db {
             )),
             None => None,
         };
-        Ok(ColumnarReadContext {
+        let (raw_byte_total, raw_byte_order, raw_byte_lengths) = remote_cache
+            .as_ref()
+            .map(|cache| {
+                let entries = cache.entries_snapshot();
+                let lengths = entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            RawByteCacheBudgetKey {
+                                object_key: entry.object_key.clone(),
+                                span: entry.span,
+                            },
+                            entry.data_len,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let order = entries
+                    .into_iter()
+                    .map(|entry| RawByteCacheBudgetKey {
+                        object_key: entry.object_key,
+                        span: entry.span,
+                    })
+                    .collect::<VecDeque<_>>();
+                (cache.total_cached_bytes(), order, lengths)
+            })
+            .unwrap_or_default();
+        let context = ColumnarReadContext {
             dependencies: dependencies.clone(),
             remote_cache,
-            decoded_cache: DecodedColumnarCache::default(),
+            decoded_cache: DecodedColumnarCache::new(
+                config.decoded_metadata_cache_entries,
+                config.decoded_column_cache_entries,
+            ),
             raw_byte_cache_enabled: AtomicBool::new(true),
             decoded_cache_enabled: AtomicBool::new(true),
-        })
+            raw_byte_cache_budget_bytes: config.raw_segment_cache_bytes,
+            raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState {
+                total_bytes: raw_byte_total,
+                order: raw_byte_order,
+                lengths: raw_byte_lengths,
+            }),
+        };
+        context.trim_raw_byte_cache_to_budget().await?;
+        Ok(context)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn ephemeral_columnar_read_context(
         dependencies: &DbDependencies,
     ) -> ColumnarReadContext {
+        let config = crate::HybridReadConfig::default();
         ColumnarReadContext {
             dependencies: dependencies.clone(),
             remote_cache: None,
-            decoded_cache: DecodedColumnarCache::default(),
+            decoded_cache: DecodedColumnarCache::new(
+                config.decoded_metadata_cache_entries,
+                config.decoded_column_cache_entries,
+            ),
             raw_byte_cache_enabled: AtomicBool::new(false),
             decoded_cache_enabled: AtomicBool::new(true),
+            raw_byte_cache_budget_bytes: 0,
+            raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState::default()),
         }
     }
 

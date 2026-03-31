@@ -1,6 +1,31 @@
 use super::*;
 
 impl ColumnarReadContext {
+    pub(super) fn cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
+        let mut usage = self
+            .decoded_cache
+            .usage_snapshot(self.raw_byte_cache_budget_bytes);
+        let state = self.raw_byte_cache_budget_state.lock();
+        usage.raw_byte_entries = state.lengths.len();
+        usage.raw_byte_bytes = state.total_bytes;
+        usage
+    }
+
+    pub(super) async fn trim_raw_byte_cache_to_budget(&self) -> Result<(), StorageError> {
+        let Some(cache) = &self.remote_cache else {
+            return Ok(());
+        };
+
+        let evictions = {
+            let mut state = self.raw_byte_cache_budget_state.lock();
+            self.collect_raw_byte_cache_evictions(&mut state, None)
+        };
+        for evicted in evictions {
+            cache.remove_span(&evicted.object_key, evicted.span).await?;
+        }
+        Ok(())
+    }
+
     pub(super) fn cache_policy(
         &self,
         source: &StorageSource,
@@ -59,20 +84,90 @@ impl ColumnarReadContext {
         .map_err(|error| error.into_storage_error())?;
         if let StorageSource::RemoteObject { key } = source
             && policy.populate_raw_byte_cache
-            && let Some(cache) = &self.remote_cache
         {
-            cache
-                .store(
-                    key,
-                    crate::remote::CacheSpan::Range {
-                        start: range.start,
-                        end: range.end,
-                    },
-                    &bytes,
-                )
+            self.admit_raw_byte_cache_range(key, range.clone(), &bytes)
                 .await?;
         }
         Ok(bytes)
+    }
+
+    async fn admit_raw_byte_cache_range(
+        &self,
+        object_key: &str,
+        range: std::ops::Range<u64>,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        let Some(cache) = &self.remote_cache else {
+            return Ok(());
+        };
+        let span = crate::remote::CacheSpan::Range {
+            start: range.start,
+            end: range.end,
+        };
+        if bytes.is_empty()
+            || self.raw_byte_cache_budget_bytes == 0
+            || bytes.len() as u64 > self.raw_byte_cache_budget_bytes
+        {
+            return Ok(());
+        }
+
+        cache.store(object_key, span, bytes).await?;
+
+        let evictions = {
+            let mut state = self.raw_byte_cache_budget_state.lock();
+            let key = RawByteCacheBudgetKey {
+                object_key: object_key.to_string(),
+                span,
+            };
+            self.record_raw_byte_cache_entry(&mut state, key.clone(), bytes.len() as u64);
+            self.collect_raw_byte_cache_evictions(&mut state, Some(&key))
+        };
+
+        for evicted in evictions {
+            cache.remove_span(&evicted.object_key, evicted.span).await?;
+        }
+        Ok(())
+    }
+
+    fn record_raw_byte_cache_entry(
+        &self,
+        state: &mut RawByteCacheBudgetState,
+        key: RawByteCacheBudgetKey,
+        bytes: u64,
+    ) {
+        if let Some(previous) = state.lengths.insert(key.clone(), bytes) {
+            state.total_bytes = state.total_bytes.saturating_sub(previous);
+        }
+        if let Some(position) = state.order.iter().position(|cached| cached == &key) {
+            state.order.remove(position);
+        }
+        state.total_bytes = state.total_bytes.saturating_add(bytes);
+        state.order.push_back(key);
+    }
+
+    fn collect_raw_byte_cache_evictions(
+        &self,
+        state: &mut RawByteCacheBudgetState,
+        preserve: Option<&RawByteCacheBudgetKey>,
+    ) -> Vec<RawByteCacheBudgetKey> {
+        let mut evictions = Vec::new();
+        while state.total_bytes > self.raw_byte_cache_budget_bytes {
+            let Some(next) = state.order.pop_front() else {
+                break;
+            };
+            if preserve == Some(&next) {
+                state.order.push_back(next);
+                if state.order.len() <= 1 {
+                    break;
+                }
+                continue;
+            }
+            if let Some(bytes) = state.lengths.remove(&next) {
+                state.total_bytes = state.total_bytes.saturating_sub(bytes);
+                evictions.push(next);
+            }
+        }
+        evictions
     }
 
     pub(super) async fn footer_from_source(

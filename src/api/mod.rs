@@ -39,8 +39,9 @@ use crate::{
     metadata_flatbuffers as metadata_fb,
     remote::{ObjectKeyLayout, RemoteCache, StorageSource, UnifiedStorage},
     scheduler::{
-        DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkType, RoundRobinScheduler,
-        ScheduleAction, Scheduler, TableStats,
+        DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, PendingWork, PendingWorkBudget,
+        PendingWorkBudgetBlockReason, PendingWorkType, RoundRobinScheduler, ScheduleAction,
+        Scheduler, SchedulerObservabilitySnapshot, TableStats,
     },
     telemetry::{
         OperationContext, db_instance_from_storage, db_name_from_storage, storage_mode_name,
@@ -113,6 +114,7 @@ mod util;
 mod watermark;
 
 pub use self::builder::*;
+pub use self::internals::ColumnarCacheUsageSnapshot;
 pub use self::operations::*;
 pub use self::schema::*;
 pub use self::snapshot::Snapshot;
