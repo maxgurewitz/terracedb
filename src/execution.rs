@@ -1306,6 +1306,29 @@ impl ColocatedDeployment {
             .await
     }
 
+    pub async fn open_all<I>(
+        &self,
+        databases: I,
+        components: crate::DbComponents,
+    ) -> Result<BTreeMap<String, crate::Db>, crate::OpenError>
+    where
+        I: IntoIterator<Item = (String, crate::DbSettings)>,
+    {
+        let mut opened = BTreeMap::new();
+        for (database, settings) in databases {
+            if opened.contains_key(&database) {
+                return Err(crate::OpenError::InvalidConfig(format!(
+                    "duplicate colocated open request for database '{database}'"
+                )));
+            }
+            let db = self
+                .open_database(database.clone(), settings, components.clone())
+                .await?;
+            opened.insert(database, db);
+        }
+        Ok(opened)
+    }
+
     pub fn runtime_report(&self) -> ColocatedDeploymentReport {
         let snapshot = self.resource_manager.snapshot();
         ColocatedDeploymentReport {
@@ -1620,6 +1643,60 @@ pub struct ResourceAdmissionDecision {
     pub snapshot: ExecutionDomainSnapshot,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ExecutionUsageReleaseErrorDetails {
+    path: ExecutionDomainPath,
+    held_usage: ExecutionResourceUsage,
+    requested_release: ExecutionResourceUsage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionUsageReleaseError {
+    details: Box<ExecutionUsageReleaseErrorDetails>,
+}
+
+impl ExecutionUsageReleaseError {
+    pub fn new(
+        path: ExecutionDomainPath,
+        held_usage: ExecutionResourceUsage,
+        requested_release: ExecutionResourceUsage,
+    ) -> Self {
+        Self {
+            details: Box::new(ExecutionUsageReleaseErrorDetails {
+                path,
+                held_usage,
+                requested_release,
+            }),
+        }
+    }
+
+    pub fn path(&self) -> &ExecutionDomainPath {
+        &self.details.path
+    }
+
+    pub fn held_usage(&self) -> ExecutionResourceUsage {
+        self.details.held_usage
+    }
+
+    pub fn requested_release(&self) -> ExecutionResourceUsage {
+        self.details.requested_release
+    }
+}
+
+impl fmt::Display for ExecutionUsageReleaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "attempted to release more execution-domain usage than acquired for {}: have {:?}, requested {:?}",
+            self.path(),
+            self.held_usage(),
+            self.requested_release()
+        )
+    }
+}
+
+impl std::error::Error for ExecutionUsageReleaseError {}
+
 #[must_use = "execution usage is released when the lease is dropped"]
 pub struct ExecutionUsageLease {
     manager: Arc<dyn ResourceManager>,
@@ -1773,6 +1850,11 @@ pub trait ResourceManager: Send + Sync {
         path: &ExecutionDomainPath,
         usage: ExecutionResourceUsage,
     ) -> ResourceAdmissionDecision;
+    fn checked_release(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> Result<ExecutionDomainSnapshot, ExecutionUsageReleaseError>;
     fn release(
         &self,
         path: &ExecutionDomainPath,
@@ -2484,25 +2566,34 @@ impl ResourceManager for InMemoryResourceManager {
         }
     }
 
-    fn release(
+    fn checked_release(
         &self,
         path: &ExecutionDomainPath,
         usage: ExecutionResourceUsage,
-    ) -> ExecutionDomainSnapshot {
+    ) -> Result<ExecutionDomainSnapshot, ExecutionUsageReleaseError> {
         let mut domains = self.domains.lock();
         Self::ensure_record(&mut domains, path);
         let entry = domains
             .get_mut(path)
             .expect("domain must exist before releasing usage");
-        assert!(
-            entry.direct_usage.contains(usage),
-            "attempted to release more execution-domain usage than acquired for {}: have {:?}, requested {:?}",
-            path,
-            entry.direct_usage,
-            usage
-        );
+        if !entry.direct_usage.contains(usage) {
+            return Err(ExecutionUsageReleaseError::new(
+                path.clone(),
+                entry.direct_usage,
+                usage,
+            ));
+        }
         entry.direct_usage.saturating_sub_assign(usage);
-        self.domain_snapshot_locked(&domains, path)
+        Ok(self.domain_snapshot_locked(&domains, path))
+    }
+
+    fn release(
+        &self,
+        path: &ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> ExecutionDomainSnapshot {
+        self.checked_release(path, usage)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn direct_backlog(&self, path: &ExecutionDomainPath) -> ExecutionDomainBacklogSnapshot {

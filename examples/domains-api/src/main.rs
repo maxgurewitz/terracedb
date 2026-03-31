@@ -19,25 +19,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let deployment = profile.deployment()?;
     let object_store_root = format!("{data_root}/object-store");
     let components = DbComponents::production_local(object_store_root);
-
-    let primary = deployment
-        .open_database(
-            PRIMARY_DATABASE_NAME,
-            domains_db_settings(&format!("{data_root}/primary/ssd"), "domains-api/primary"),
-            components.clone(),
-        )
-        .await?;
-
-    let analytics = deployment
-        .open_database(
-            ANALYTICS_DATABASE_NAME,
-            domains_db_settings(
-                &format!("{data_root}/analytics/ssd"),
-                "domains-api/analytics",
-            ),
+    let mut databases = deployment
+        .open_all(
+            [
+                (
+                    PRIMARY_DATABASE_NAME.to_string(),
+                    domains_db_settings(&format!("{data_root}/primary/ssd"), "domains-api/primary"),
+                ),
+                (
+                    ANALYTICS_DATABASE_NAME.to_string(),
+                    domains_db_settings(
+                        &format!("{data_root}/analytics/ssd"),
+                        "domains-api/analytics",
+                    ),
+                ),
+            ],
             components,
         )
         .await?;
+    let primary = databases
+        .remove(PRIMARY_DATABASE_NAME)
+        .expect("primary should be opened");
+    let analytics = databases
+        .remove(ANALYTICS_DATABASE_NAME)
+        .expect("analytics should be opened");
 
     let app = DomainsApp::open(deployment, primary, analytics, profile).await?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

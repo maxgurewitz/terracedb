@@ -27,7 +27,6 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
             let file_system = Arc::new(SimulatedFileSystem::default());
             let object_store = Arc::new(SimulatedObjectStore::default());
             let clock = Arc::new(TurmoilClock);
-
             let primary = deployment
                 .open_database(
                     PRIMARY_DATABASE_NAME,

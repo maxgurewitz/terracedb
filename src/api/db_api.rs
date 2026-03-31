@@ -48,8 +48,20 @@ pub struct FlushStatus {
 }
 
 impl FlushStatus {
+    pub fn visible_sequence_advanced(&self) -> bool {
+        self.current_sequence_after > self.current_sequence_before
+    }
+
     pub fn durable_sequence_advanced(&self) -> bool {
         self.durable_sequence_after > self.durable_sequence_before
+    }
+
+    pub fn had_visible_non_durable_writes(&self) -> bool {
+        self.current_sequence_before > self.durable_sequence_before
+    }
+
+    pub fn changed_any_frontier(&self) -> bool {
+        self.visible_sequence_advanced() || self.durable_sequence_advanced()
     }
 }
 
@@ -658,8 +670,7 @@ impl Db {
         lane: ExecutionLane,
         usage: ExecutionResourceUsage,
     ) -> ResourceAdmissionDecision {
-        let lease = self.acquire_lane_usage(lane, usage);
-        lease.decision().clone()
+        self.with_lane_usage(lane, usage, |decision| decision)
     }
 
     pub fn set_lane_backlog(
@@ -672,6 +683,62 @@ impl Db {
             self.execution_lane_binding(lane).domain.clone(),
             backlog,
         )
+    }
+
+    pub fn with_lane_usage<T>(
+        &self,
+        lane: ExecutionLane,
+        usage: ExecutionResourceUsage,
+        f: impl FnOnce(ResourceAdmissionDecision) -> T,
+    ) -> T {
+        let lease = self.acquire_lane_usage(lane, usage);
+        let result = f(lease.decision().clone());
+        drop(lease);
+        result
+    }
+
+    pub async fn with_lane_usage_async<F, Fut, T>(
+        &self,
+        lane: ExecutionLane,
+        usage: ExecutionResourceUsage,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce(ResourceAdmissionDecision) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let lease = self.acquire_lane_usage(lane, usage);
+        let result = f(lease.decision().clone()).await;
+        drop(lease);
+        result
+    }
+
+    pub fn with_lane_backlog<T>(
+        &self,
+        lane: ExecutionLane,
+        backlog: crate::ExecutionDomainBacklogSnapshot,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let guard = self.set_lane_backlog(lane, backlog);
+        let result = f();
+        drop(guard);
+        result
+    }
+
+    pub async fn with_lane_backlog_async<F, Fut, T>(
+        &self,
+        lane: ExecutionLane,
+        backlog: crate::ExecutionDomainBacklogSnapshot,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let guard = self.set_lane_backlog(lane, backlog);
+        let result = f().await;
+        drop(guard);
+        result
     }
 
     pub fn telemetry_db_name(&self) -> String {
@@ -833,6 +900,8 @@ impl Db {
         self.flush_with_status().await.map(|_| ())
     }
 
+    /// Flushes the current runtime state and reports how the visible and
+    /// durable sequence frontiers changed while doing so.
     pub async fn flush_with_status(&self) -> Result<FlushStatus, FlushError> {
         self.flush_internal(true).await
     }

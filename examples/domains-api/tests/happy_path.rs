@@ -20,28 +20,33 @@ async fn open_fixture(
     let deployment = profile.deployment()?;
     let object_store_root = data_root.join("object-store");
     let components = DbComponents::production_local(object_store_root);
-
-    let primary = deployment
-        .open_database(
-            PRIMARY_DATABASE_NAME,
-            domains_db_settings(
-                data_root.join("primary-ssd").to_string_lossy().as_ref(),
-                "fixture/primary",
-            ),
-            components.clone(),
-        )
-        .await?;
-
-    let analytics = deployment
-        .open_database(
-            ANALYTICS_DATABASE_NAME,
-            domains_db_settings(
-                data_root.join("analytics-ssd").to_string_lossy().as_ref(),
-                "fixture/analytics",
-            ),
+    let mut databases = deployment
+        .open_all(
+            [
+                (
+                    PRIMARY_DATABASE_NAME.to_string(),
+                    domains_db_settings(
+                        data_root.join("primary-ssd").to_string_lossy().as_ref(),
+                        "fixture/primary",
+                    ),
+                ),
+                (
+                    ANALYTICS_DATABASE_NAME.to_string(),
+                    domains_db_settings(
+                        data_root.join("analytics-ssd").to_string_lossy().as_ref(),
+                        "fixture/analytics",
+                    ),
+                ),
+            ],
             components,
         )
         .await?;
+    let primary = databases
+        .remove(PRIMARY_DATABASE_NAME)
+        .expect("primary fixture db");
+    let analytics = databases
+        .remove(ANALYTICS_DATABASE_NAME)
+        .expect("analytics fixture db");
 
     Ok(AppFixture {
         _dir: dir,
@@ -58,28 +63,31 @@ async fn default_profile_reopens_with_reserved_control_plane_and_domain_introspe
         .expect("deployment");
     let object_store_root = data_root.join("object-store");
     let components = DbComponents::production_local(object_store_root.clone());
-
-    let primary = deployment
-        .open_database(
-            PRIMARY_DATABASE_NAME,
-            domains_db_settings(
-                data_root.join("primary-ssd").to_string_lossy().as_ref(),
-                "reopen/primary",
-            ),
+    let mut opened = deployment
+        .open_all(
+            [
+                (
+                    PRIMARY_DATABASE_NAME.to_string(),
+                    domains_db_settings(
+                        data_root.join("primary-ssd").to_string_lossy().as_ref(),
+                        "reopen/primary",
+                    ),
+                ),
+                (
+                    ANALYTICS_DATABASE_NAME.to_string(),
+                    domains_db_settings(
+                        data_root.join("analytics-ssd").to_string_lossy().as_ref(),
+                        "reopen/analytics",
+                    ),
+                ),
+            ],
             components.clone(),
         )
         .await
-        .expect("open primary");
-    let analytics = deployment
-        .open_database(
-            ANALYTICS_DATABASE_NAME,
-            domains_db_settings(
-                data_root.join("analytics-ssd").to_string_lossy().as_ref(),
-                "reopen/analytics",
-            ),
-            components.clone(),
-        )
-        .await
+        .expect("open colocated databases");
+    let primary = opened.remove(PRIMARY_DATABASE_NAME).expect("open primary");
+    let analytics = opened
+        .remove(ANALYTICS_DATABASE_NAME)
         .expect("open analytics");
 
     let app = DomainsApp::open(
@@ -152,27 +160,33 @@ async fn default_profile_reopens_with_reserved_control_plane_and_domain_introspe
     app.shutdown().await.expect("shutdown");
 
     let reopened_components = DbComponents::production_local(object_store_root);
-    let reopened_primary = deployment
-        .open_database(
-            PRIMARY_DATABASE_NAME,
-            domains_db_settings(
-                data_root.join("primary-ssd").to_string_lossy().as_ref(),
-                "reopen/primary",
-            ),
-            reopened_components.clone(),
-        )
-        .await
-        .expect("reopen primary");
-    let reopened_analytics = deployment
-        .open_database(
-            ANALYTICS_DATABASE_NAME,
-            domains_db_settings(
-                data_root.join("analytics-ssd").to_string_lossy().as_ref(),
-                "reopen/analytics",
-            ),
+    let mut reopened_databases = deployment
+        .open_all(
+            [
+                (
+                    PRIMARY_DATABASE_NAME.to_string(),
+                    domains_db_settings(
+                        data_root.join("primary-ssd").to_string_lossy().as_ref(),
+                        "reopen/primary",
+                    ),
+                ),
+                (
+                    ANALYTICS_DATABASE_NAME.to_string(),
+                    domains_db_settings(
+                        data_root.join("analytics-ssd").to_string_lossy().as_ref(),
+                        "reopen/analytics",
+                    ),
+                ),
+            ],
             reopened_components,
         )
         .await
+        .expect("reopen colocated databases");
+    let reopened_primary = reopened_databases
+        .remove(PRIMARY_DATABASE_NAME)
+        .expect("reopen primary");
+    let reopened_analytics = reopened_databases
+        .remove(ANALYTICS_DATABASE_NAME)
         .expect("reopen analytics");
 
     let reopened = DomainsApp::open(

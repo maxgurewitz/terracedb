@@ -1274,22 +1274,24 @@ async fn colocated_deployment_builder_supports_multi_db_open_and_recovery() {
     let file_system = Arc::new(StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
 
-    let primary = open_deployed_db(
-        &deployment,
-        "primary",
-        "/execution-deployment-primary",
-        file_system.clone(),
-        object_store.clone(),
-    )
-    .await;
-    let analytics = open_deployed_db(
-        &deployment,
-        "analytics",
-        "/execution-deployment-analytics",
-        file_system.clone(),
-        object_store.clone(),
-    )
-    .await;
+    let mut opened = deployment
+        .open_all(
+            [
+                (
+                    "primary".to_string(),
+                    tiered_settings("/execution-deployment-primary"),
+                ),
+                (
+                    "analytics".to_string(),
+                    tiered_settings("/execution-deployment-analytics"),
+                ),
+            ],
+            shared_stub_components(file_system.clone(), object_store.clone()),
+        )
+        .await
+        .expect("open colocated deployment");
+    let primary = opened.remove("primary").expect("primary db");
+    let analytics = opened.remove("analytics").expect("analytics db");
 
     let primary_rows = run_workload(&primary).await;
     let analytics_rows = run_workload(&analytics).await;
@@ -1298,22 +1300,24 @@ async fn colocated_deployment_builder_supports_multi_db_open_and_recovery() {
     drop(primary);
     drop(analytics);
 
-    let reopened_primary = open_deployed_db(
-        &deployment,
-        "primary",
-        "/execution-deployment-primary",
-        file_system.clone(),
-        object_store.clone(),
-    )
-    .await;
-    let reopened_analytics = open_deployed_db(
-        &deployment,
-        "analytics",
-        "/execution-deployment-analytics",
-        file_system,
-        object_store,
-    )
-    .await;
+    let mut reopened = deployment
+        .open_all(
+            [
+                (
+                    "primary".to_string(),
+                    tiered_settings("/execution-deployment-primary"),
+                ),
+                (
+                    "analytics".to_string(),
+                    tiered_settings("/execution-deployment-analytics"),
+                ),
+            ],
+            shared_stub_components(file_system, object_store),
+        )
+        .await
+        .expect("reopen colocated deployment");
+    let reopened_primary = reopened.remove("primary").expect("reopened primary");
+    let reopened_analytics = reopened.remove("analytics").expect("reopened analytics");
 
     assert!(Arc::ptr_eq(
         &reopened_primary.resource_manager(),
@@ -1389,6 +1393,44 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         },
     );
     assert!(probe.admitted);
+    assert!(db.with_lane_usage(
+        ExecutionLane::UserForeground,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        },
+        |decision| decision.admitted
+    ));
+    let observed_during_scoped_usage = db.with_lane_usage(
+        ExecutionLane::UserForeground,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        },
+        |_| {
+            db.resource_manager_snapshot().domains[&foreground_path]
+                .usage
+                .cpu_workers_in_use
+        },
+    );
+    assert_eq!(observed_during_scoped_usage, 1);
+    assert_eq!(
+        db.resource_manager_snapshot().domains[&foreground_path]
+            .usage
+            .cpu_workers_in_use,
+        0
+    );
+    assert!(
+        db.with_lane_usage_async(
+            ExecutionLane::UserForeground,
+            ExecutionResourceUsage {
+                cpu_workers: 1,
+                ..ExecutionResourceUsage::default()
+            },
+            |decision| async move { decision.admitted }
+        )
+        .await
+    );
     assert_eq!(
         db.resource_manager_snapshot().domains[&foreground_path]
             .usage
@@ -1440,6 +1482,37 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         0
     );
     assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
+    let queued = db.with_lane_backlog(
+        ExecutionLane::UserBackground,
+        ExecutionDomainBacklogSnapshot {
+            queued_work_items: 3,
+            queued_bytes: 96,
+        },
+        || db.resource_manager_snapshot().domains[&background_path].backlog,
+    );
+    assert_eq!(queued.queued_work_items, 3);
+    assert_eq!(queued.queued_bytes, 96);
+    let queued_async = db
+        .with_lane_backlog_async(
+            ExecutionLane::UserBackground,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 4,
+                queued_bytes: 128,
+            },
+            || async {
+                db.resource_manager_snapshot().domains[&background_path]
+                    .backlog
+                    .queued_work_items
+            },
+        )
+        .await;
+    assert_eq!(queued_async, 4);
+    let snapshot = db.resource_manager_snapshot();
+    assert_eq!(
+        snapshot.domains[&background_path].backlog.queued_work_items,
+        0
+    );
+    assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
 }
 
 #[tokio::test]
@@ -1469,9 +1542,45 @@ async fn ensure_table_and_flush_with_status_surface_happy_path_state() {
     let status = db.flush_with_status().await.expect("flush with status");
     assert_eq!(status.current_sequence_before, sequence);
     assert_eq!(status.current_sequence_after, sequence);
+    assert!(!status.visible_sequence_advanced());
     assert!(status.durable_sequence_before < sequence);
+    assert!(status.had_visible_non_durable_writes());
     assert!(status.durable_sequence_advanced());
+    assert!(status.changed_any_frontier());
     assert!(status.durable_sequence_after >= sequence);
+}
+
+#[test]
+fn checked_release_returns_structured_error_on_underflow() {
+    let manager = InMemoryResourceManager::new(process_budget());
+    let path = ExecutionDomainPath::new(["process", "db-a", "foreground"]);
+    manager.register_domain(shared_spec(
+        path.clone(),
+        ExecutionDomainOwner::Database {
+            name: "db-a".to_string(),
+        },
+        1,
+        ExecutionDomainBudget::default(),
+    ));
+
+    let error = manager
+        .checked_release(
+            &path,
+            ExecutionResourceUsage {
+                cpu_workers: 1,
+                ..ExecutionResourceUsage::default()
+            },
+        )
+        .expect_err("checked release should report underflow");
+    assert_eq!(error.path(), &path);
+    assert_eq!(error.held_usage(), ExecutionResourceUsage::default());
+    assert_eq!(
+        error.requested_release(),
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..ExecutionResourceUsage::default()
+        }
+    );
 }
 
 #[test]

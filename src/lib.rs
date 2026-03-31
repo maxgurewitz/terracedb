@@ -95,10 +95,11 @@ pub use execution::{
     ExecutionDomainPlacement, ExecutionDomainSnapshot, ExecutionDomainSpec, ExecutionDomainState,
     ExecutionDomainUsageSnapshot, ExecutionLane, ExecutionLaneBinding,
     ExecutionLanePlacementConfig, ExecutionPlacementDecision, ExecutionResourceKind,
-    ExecutionResourceUsage, ExecutionUsageLease, InMemoryDomainBudgetOracle,
-    InMemoryResourceManager, PlacementAssignment, PlacementPolicy, PlacementRequest,
-    PlacementTarget, PreferRequestedDomainPolicy, ResourceAdmissionDecision, ResourceManager,
-    ResourceManagerSnapshot, ShardReadyPlacementLayout, WorkPlacementRequest, WorkRuntimeTag,
+    ExecutionResourceUsage, ExecutionUsageLease, ExecutionUsageReleaseError,
+    InMemoryDomainBudgetOracle, InMemoryResourceManager, PlacementAssignment, PlacementPolicy,
+    PlacementRequest, PlacementTarget, PreferRequestedDomainPolicy, ResourceAdmissionDecision,
+    ResourceManager, ResourceManagerSnapshot, ShardReadyPlacementLayout, WorkPlacementRequest,
+    WorkRuntimeTag,
 };
 #[doc(hidden)]
 pub use failpoints::{
