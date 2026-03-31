@@ -6,7 +6,7 @@ An embedded database library (not a server) built on LSM tree fundamentals. The 
 
 All I/O, time, and randomness are abstracted behind traits, enabling deterministic simulation testing in the style of FoundationDB. The engine is verified via large-scale randomized scenario generation with fault injection and invariant checking, reproducible from a seed.
 
-Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, external stream ingress from systems such as Kafka and Debezium, embedded virtual filesystems, and out-of-line blob storage — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), embedded virtual filesystem library (Part 5), and the `terracedb-bricks` blob/large-object library (Part 6).
+Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, external stream ingress from systems such as Kafka and Debezium, embedded virtual filesystems, embedded sandbox runtimes, and out-of-line blob storage — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), the embedded virtual filesystem and sandbox-runtime libraries (Part 5), and the `terracedb-bricks` blob/large-object library (Part 6).
 
 When multiple DB instances, future physical shards, or attached subsystems share one process, resource isolation is expressed through **execution domains**. An execution domain is a named placement and budgeting boundary for CPU, memory, local I/O, remote I/O, and background work. Domains affect where work runs and what it may consume, but they do not change correctness semantics such as commit ordering, visibility, durability, or recovery. A unit of work may carry both an execution domain and a **durability class**; domains control resource isolation, while durability classes control persistence-path semantics.
 
@@ -24,6 +24,7 @@ These are the architectural choices that most constrain the rest of the design:
 - **Historical workflow processing is configurable.** A workflow source may bootstrap from the beginning, from the current durable frontier, or from restored checkpoint/replay state; running a workflow "from the start" is not mandatory.
 - **External stream ingress is a library boundary, not an engine feature.** Kafka consumers persist source progress atomically with writes into ordinary Terracedb tables; Debezium support composes on top of Kafka ingress rather than extending the engine.
 - **Embedded virtual filesystems are libraries, not engine modes.** Their current-state filesystem/KV/tool rows live in ordinary tables; timelines and watchers are layered on top of append-only activity rows and change capture.
+- **Embedded sandbox runtimes are libraries on top of `terracedb-vfs`, not engine modes.** Sandboxes get their own session/overlay, capability model, host-disk/git interop, and editor-facing read-only view layer without turning the engine into a shell, CLI, or host-filesystem runtime.
 - **Blob and large-object storage are libraries, not engine value variants.** Large bytes live out-of-line in a blob store; Terracedb stores metadata, references, and derived indexes.
 - **Virtual filesystem compatibility is semantic, not SQLite-format compatibility.** The goal is to provide an in-process virtual filesystem/KV/tool model on Terracedb, not SQL, a single-file transport format, or SQLite WAL behavior.
 - **Event sourcing is recommended** for data that drives history-dependent projections. Mutable-record projections cannot be safely recomputed from SSTables after `SnapshotTooOld`.
@@ -3925,6 +3926,365 @@ The embedded virtual filesystem layer does not need its own replication or sync 
 - in s3-primary or deferred-durability configurations, visible state may lead durable state until flush boundaries.
 
 This library should inherit the same deterministic testing bar as the rest of the stack. The simulation target is the real filesystem/KV/tool/overlay code. The shadow model needs to cover directories, inode link counts, file bytes, whiteouts, origin mappings, KV state, tool-run lifecycle state, and activity-prefix correctness across crash and restart.
+
+---
+
+## Embedded Sandbox Runtime Library
+
+This section describes a separate library, tentatively `terracedb-sandbox`, that embeds an AI-oriented JavaScript/TypeScript runtime on top of `terracedb-vfs`. The goal is to let guest code operate inside the application against a TerraceDB-backed virtual tree, optional injected app capabilities, sandboxed shell tooling, TypeScript services, package installation, host-disk hoist/eject flows, and git/PR workflows without turning the engine itself into a general host runtime.
+
+The layering matters:
+
+- the engine remains unaware of sandboxes,
+- `terracedb-vfs` remains the authoritative filesystem/KV/tool substrate,
+- `terracedb-sandbox` adds runtime, compatibility, disk/git/editor interop, and capability injection on top of that substrate.
+
+### Goals and Non-Goals
+
+`terracedb-sandbox` should preserve the following externally visible properties:
+
+- an embedded guest runtime whose root filesystem is a `terracedb-vfs` overlay or volume rather than the host disk,
+- optional injected host capabilities exposed as explicit importable modules with matching TypeScript declarations,
+- shell-style utility execution via a guest-visible library surface rather than ambient host subprocess access,
+- TypeScript execution and `tsc`-style diagnostics against the same virtual tree,
+- package-install workflows for a useful subset of the npm ecosystem,
+- hoist of a real directory or git repo into a sandbox session,
+- eject of a sandbox snapshot or delta back onto disk,
+- easy pull-request creation from sandboxed code changes, and
+- an easy read-only way to inspect sandbox state from VS Code and Cursor.
+
+Version 1 is intentionally narrower than the full space of JavaScript runtimes and workstation integrations:
+
+- no engine-level sandbox mode,
+- no promise to replicate the full Deno CLI, Node.js host process model, or unrestricted npm ecosystem,
+- no ambient host filesystem, subprocess, or FFI access,
+- no requirement that sandboxes become writable kernel mounts,
+- no requirement that editor visibility imply a writable host filesystem bridge, and
+- no assumption that every guest-runtime component can run inside the deterministic simulation harness unchanged.
+
+### Load-Bearing Decisions
+
+These decisions most constrain the sandbox design:
+
+- **A sandbox session is a `terracedb-vfs` overlay volume.** Sandboxes are not ad hoc temp directories; they inherit the virtual filesystem's snapshot, overlay, activity, KV, and tool-run semantics.
+- **Execution, TypeScript tooling, package installation, disk/git interop, and editor visibility are separate subsystems sharing one virtual tree.** They should not collapse into one giant runtime abstraction.
+- **Guest-runtime compatibility is layered above a small VFS-backed op surface.** The Rust layer should expose a narrow host op set over `terracedb-vfs`; Node or Deno compatibility shims should mostly live in guest-side libraries.
+- **Host integration is capability-first.** Application APIs are explicit versioned modules, not ambient globals.
+- **Tool-like actions are first-class audited events.** `bash`, package install, type-check, hoist/eject, PR export, and host-capability calls should flow through the tool-run and activity model rather than bypassing it.
+- **Package installation is a host service, not a literal embedded npm CLI.** A useful pure-JS/TS subset comes first; native addons, arbitrary postinstall scripts, and full host-process expectations are deferred.
+- **Host-disk, git, PR, and editor interop are explicit library services.** They are not side effects of exposing the sandbox as a writable real filesystem.
+- **If part of the sandbox stack cannot run deterministically under simulation, it must be hidden behind a stable interface with a deterministic stub/fake implementation.** The real integration may remain outside turmoil, but the core semantics should still be exercised under seeded replay.
+
+### Public Surface
+
+The library should expose an embedded API surface oriented around sessions, execution, interop, and read-only views:
+
+```typescript
+interface SandboxConfig {
+  baseVolumeId: string
+  sessionVolumeId: string
+  durableBase?: boolean
+  npmMode?: "off" | "pure_js" | "compat_view"
+  nodeCompat?: "off" | "subset"
+  bash?: "off" | "enabled"
+  typescript?: "off" | "transpile_only" | "full"
+  capabilities?: CapabilityManifest
+}
+
+interface SandboxStore {
+  openSession(config: SandboxConfig): Promise<SandboxSession>
+}
+
+interface SandboxSession {
+  volume: OverlayVolume
+
+  eval(code: string): Promise<ExecOutcome>
+  execModule(specifier: string): Promise<ExecOutcome>
+  installPackages(reqs: PackageReq[]): Promise<InstallReport>
+  checkTypes(roots: string[]): Promise<TypeCheckReport>
+
+  hoistFromDisk(req: HoistRequest): Promise<HoistReport>
+  ejectToDisk(req: EjectRequest): Promise<EjectReport>
+  createPullRequest(req: PullRequestRequest): Promise<PullRequestReport>
+
+  openReadonlyView(req?: ReadonlyViewRequest): Promise<ReadonlyViewHandle>
+  flush(): Promise<void>
+}
+
+interface ReadonlyViewHandle {
+  viewId: string
+  rootUri: string               // for example terrace-vfs:/session/<id>/
+  close(): Promise<void>
+}
+```
+
+The public surface is intentionally library-first. It is enough to embed the sandbox inside an application, hand bounded capabilities to guest code, import/export work from real repos, and expose a read-only editor/browser view without promising a general-purpose mount or daemon boundary.
+
+### Session Model
+
+Each sandbox session should be backed by:
+
+- a base `Volume` or `VolumeSnapshot` containing workspace files, templates, and shared cache state,
+- a writable overlay `OverlayVolume` for the live guest session, and
+- optional shared read-only cache volumes for unpacked packages, tarballs, transpile caches, or TypeScript standard-library files.
+
+Recommended session layout:
+
+```text
+/workspace/                 guest-visible project root
+/.terrace/
+  session.json             session metadata and origin/provenance
+  cache/
+    v8/                    code cache blobs
+    transpile/             transpile cache metadata
+  npm/
+    package.json
+    install-manifest.json
+    node_modules/          optional compatibility view
+  typescript/
+    libs/
+  tools/
+    bash/
+```
+
+This layout keeps the session self-describing and makes it possible to reopen, export, or inspect the sandbox without inventing hidden side channels.
+
+### Host Filesystem and Git Interop
+
+The sandbox should support three explicit hoist modes:
+
+1. **directory snapshot** — import a host directory tree into the sandbox,
+2. **git head** — import the tracked contents of a repo at `HEAD`,
+3. **git working tree** — import the current working tree, optionally including untracked or ignored files.
+
+Each hoist should record provenance in session metadata and/or VFS KV:
+
+- source path,
+- repo root if applicable,
+- `HEAD` commit,
+- branch,
+- remote URL,
+- hoist mode,
+- included pathspecs,
+- whether the imported source was dirty.
+
+The sandbox should support two explicit eject modes:
+
+1. **materialize snapshot** — write the current visible sandbox tree to a target directory,
+2. **apply delta** — apply only changes relative to the recorded hoist base.
+
+`apply delta` should not proceed blindly if the target checkout has diverged from the stored provenance. It should either fail with a conflict report, emit a patch bundle, or apply only non-conflicting changes if the caller opts into that weaker behavior.
+
+For repos, `git head` should be the safest default import mode. `git working tree` is useful, but it should be explicit because it complicates later conflict handling and PR export.
+
+### Runtime Model
+
+The low-level execution surface should be `deno_core::JsRuntime` with custom module loading and host extensions. `deno_runtime` and full Deno CLI behavior are not the design center for version 1.
+
+One important embedding constraint is load-bearing: `deno_core::JsRuntime` is not `Send` or `Sync`. Each sandbox instance should therefore behave like a pinned actor on a dedicated current-thread executor or dedicated OS thread, with message-passing from the surrounding app into the sandbox actor.
+
+The runtime phases are:
+
+1. open or create the overlay session volume,
+2. build the capability manifest,
+3. construct the sandbox actor and runtime backend,
+4. initialize guest-side libraries for filesystem shims, capabilities, and optional bash/npm/TypeScript helpers,
+5. evaluate the requested code or module graph, and
+6. publish tool/activity metadata and optionally flush durable state.
+
+### Module Resolution and Loading
+
+The sandbox should implement a custom module loader with three jobs:
+
+1. resolve specifiers,
+2. prepare dependencies and caches,
+3. load final source plus source maps and code-cache metadata.
+
+Recommended specifier space:
+
+- `terrace:/workspace/...`
+  Guest-visible project files stored in the session volume.
+- `terrace:host/<capability>`
+  Host-provided capability modules generated from the capability manifest.
+- `npm:<pkg>` and optionally bare package imports
+  Package dependencies resolved by the sandbox package installer.
+- `node:<builtin>`
+  Optional and gated by node-compat mode.
+
+The loader's `prepareLoad` equivalent is where the sandbox should resolve packages, transpile TypeScript, prefetch dependency graphs, and populate code-cache keys before the runtime requests the final source.
+
+### Filesystem API Strategy
+
+The Rust layer should expose a narrow host-op surface over `terracedb-vfs`:
+
+- `read_file`,
+- `write_file`,
+- `pread`,
+- `pwrite`,
+- `stat`,
+- `lstat`,
+- `readdir`,
+- `readlink`,
+- `mkdir`,
+- `rename`,
+- `link`,
+- `symlink`,
+- `unlink`,
+- `rmdir`,
+- `truncate`,
+- `fsync`.
+
+Guest-facing compatibility should then be layered in libraries:
+
+- a runtime-neutral `@terracedb/sandbox/fs`,
+- the subset of `Deno.*` the sandbox actually needs,
+- `node:fs/promises` shims built on the same op surface,
+- selected sync compatibility layers only where a concrete package requires them.
+
+This keeps the Rust surface small and lets compatibility grow without rewriting the storage substrate.
+
+### Shell Tooling via just-bash
+
+`just-bash` fits the sandbox well because it is AI-oriented and already exposes an async filesystem interface. The recommended integration is:
+
+1. provide a guest-side adapter that implements `just-bash`'s filesystem interface on top of `@terracedb/sandbox/fs`,
+2. expose a library such as `@terracedb/sandbox/bash`,
+3. wrap `just-bash` in a persistent session helper that remembers cwd and exported environment across calls.
+
+Each bash invocation should still be recorded as a tool run and use the same VFS tree as the guest runtime. Good candidates for built-in custom commands are:
+
+- `npm`
+  Delegates to the host package installer service.
+- `tsc`
+  Delegates to the TypeScript service.
+- `terrace-call`
+  Invokes allowlisted host capabilities.
+
+### TypeScript Strategy
+
+TypeScript needs two distinct stories:
+
+1. execution-time transpilation for guest modules,
+2. language-service and `tsc`-style analysis.
+
+These should share a module graph and virtual tree, but they should not be the same implementation.
+
+Execution-time transpilation should happen before the guest runtime evaluates a `.ts`, `.tsx`, `.mts`, or `.cts` module. The resulting JS and source maps should be cached with keys that include:
+
+- file content hash,
+- compiler target,
+- JSX mode,
+- module kind, and
+- relevant package-resolution settings.
+
+For language-service behavior, `@typescript/vfs` is a good fit because it supplies a `Map`-backed `ts.System`/compiler-host model. The sandbox should maintain a TypeScript mirror derived from the current volume view or a snapshot and update it incrementally from VFS activity instead of rebuilding it from scratch after every edit.
+
+### npm Dependency Strategy
+
+Package installation is the highest-risk compatibility area. The key constraint is that `deno_core` gives the embedder a runtime and module-loader hooks, but broader npm and Node compatibility lives above that layer.
+
+Version 1 should support:
+
+- pure JS/TS packages,
+- ESM-first packages,
+- packages that only require the explicitly supported host shims, and
+- installation through a host-managed package service.
+
+Version 1 should explicitly defer:
+
+- native Node-API addons,
+- arbitrary postinstall scripts,
+- packages that require unrestricted host-process behavior, and
+- the full long tail of CommonJS or `node_modules`-layout assumptions.
+
+The package installer should be a host service that:
+
+1. resolves versions,
+2. fetches and verifies tarballs,
+3. unpacks into a shared cache or session-local cache,
+4. materializes the compatibility view the sandbox loader expects, and
+5. records install metadata in the session plus tool/activity streams.
+
+### Host Capability Injection
+
+Application APIs should be explicit capability modules with both runtime and type surfaces. Each capability should define:
+
+- a stable module specifier,
+- TypeScript declaration text,
+- one or more host ops or backend hooks, and
+- an allowlist entry in the session capability manifest.
+
+Guest code should import capabilities explicitly:
+
+```typescript
+import { tickets } from "terrace:host/tickets"
+
+const open = await tickets.listOpen()
+await tickets.addComment({ id: open[0].id, body: "Investigating" })
+```
+
+The sandbox should prefer imports over globals, small domain-specific modules over one giant `Terrace` object, async JSON-serializable calls over opaque handles, and idempotent write APIs where possible.
+
+### Pull Requests and Editor Visibility
+
+Pull-request creation should be a first-class sandbox workflow, not an external afterthought.
+
+The recommended default PR path is:
+
+1. record git provenance when hoisting the repo,
+2. create an ephemeral worktree or temp export checkout at the recorded base,
+3. eject the sandbox delta into that worktree,
+4. create a branch, commit, push, and
+5. open the PR through a provider adapter.
+
+This is safer than mutating the user's active checkout directly and makes failures easier to replay and debug.
+
+Editor visibility should be easy, but read-only by design. The preferred approach is a real VS Code extension package, kept in-repo, backed by a read-only sandbox-view protocol that works the same way for:
+
+- a local app running on the developer machine, and
+- a remote app exposing sandbox views across the network.
+
+Cursor inherits VS Code's extension model, so the same extension package or a closely related build target should work there too. The extension should talk to either:
+
+- a local in-process or loopback bridge when the app is local, or
+- an authenticated remote endpoint when the app is remote,
+
+without changing the user-facing editor workflow.
+
+The editor-view surface should support at least:
+
+- browse/list/open/stat on visible or durable sandbox cuts,
+- refresh/reconnect behavior,
+- read-only diffs against hoist base or ejected output when useful,
+- session/volume selection if the application hosts multiple sandboxes, and
+- the same view protocol and UX for local and remote sandboxes.
+
+If an extension is not available, a fallback export-to-temp or local read-only bridge is acceptable for debugging, but the architecture should still treat "easy read-only viewing from VS Code and Cursor for both local and remote apps" as a first-class requirement rather than a manual debug trick.
+
+### Deterministic Testing and Simulation Boundary
+
+The deterministic testing bar for `terracedb-sandbox` should be as high as practical, but the architecture should not pretend that every dependency is equally simulatable.
+
+The first step in implementation should be to decide which parts can run inside the seeded simulation harness unchanged. The likely high-value deterministic targets are:
+
+- session lifecycle,
+- overlay/VFS mutations and activity ordering,
+- capability dispatch semantics,
+- TypeScript mirror updates,
+- package-manifest and cache-state transitions,
+- hoist/eject diff and provenance logic,
+- PR-export planning,
+- read-only editor-view snapshot semantics.
+
+If a component such as the real V8 runtime, real package fetching, real git provider integration, or real editor extension host cannot run inside the deterministic harness with acceptable fidelity, it should sit behind a stable interface with a deterministic stub/fake implementation. The simulation target then becomes the real session semantics plus the stubbed boundary behavior, while non-simulated production integrations still receive ordinary integration tests outside the turmoil harness.
+
+This library should therefore define simulation seams explicitly and test them aggressively:
+
+- same-seed replay should reproduce the same sandbox trace,
+- cross-cutting workloads should cover guest execution, shell/tool actions, package changes, disk import/export, git export, and read-only editor views,
+- crash/restart points should exist around session creation, cache publish, install metadata updates, hoist/eject commits, and PR export bookkeeping.
+
+The architectural goal is not "simulate absolutely everything"; it is "simulate the maximum semantically important subset, and hide the rest behind deterministic contracts."
 
 ---
 

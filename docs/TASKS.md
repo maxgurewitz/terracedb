@@ -59,6 +59,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 6** builds composition helpers, projections, workflows, and application-facing simulation harnesses.
 - **Phase 7** expands deterministic simulation to the full stack.
 - **Phase 8** adds an embedded virtual filesystem library on top of Terracedb.
+- **Phase 8a** adds an embedded sandbox runtime library, host-disk/git/PR interop, and local/remote read-only editor views on top of `terracedb-vfs`.
 - **Phase 9** adds the `terracedb-bricks` blob / large-object library on top of Terracedb.
 - **Phase 10** adds an optional Arrow-ecosystem analytical export crate on top of Terracedb.
 - **Phase 11** hardens the hybrid OLTP/OLAP path with columnar-v2 layout contracts, selective-read execution, segmented remote caching, stronger publish/recovery semantics, and a small analytically shaped example app.
@@ -73,7 +74,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into nineteen mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into twenty mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -83,6 +84,7 @@ Once Phase 0 is complete, the work naturally splits into nineteen mostly indepen
 - **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T28a follows T28; T31 depends on T30; T31a follows T31 and T31b follows T31a; T32 depends on T18/T19/T28/T29, T32c follows T32, and T32d follows T32c; T32a depends on T03a/T31/T32, and T32e depends on T03a
 - **Track G — full-stack hardening:** T33b and T33c can begin once the relevant engine/runtime surfaces exist; T33 follows T33c; T33a and T33d follow T33
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
+- **Track H2 — embedded sandbox runtime:** T40a first; T40b depends on T40a; T40c, T40d, and T40f can proceed once T40b and their library dependencies are ready; T40e depends on T40b + T40c; T40g depends on T40b + T40f; T40h depends on T33 + T40c + T40d + T40e + T40f + T40g; T40i depends on T40c + T40d + T40e + T40f + T40g + T40h
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
 - **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
 - **Track K — hybrid-read and columnar-v2 hardening:** T48 first; T49 follows T48; then T50, T51, T53, T55, and T56 can proceed in parallel; T52 depends on T50 + T51; T54 depends on T51 + T52 + T55; T57 depends on T50 + T51 + T52 + T53 + T55 + T56; T58 depends on T52 + T53 + T54 + T55 + T56 + T57
@@ -1957,6 +1959,326 @@ Bring the virtual filesystem crate up to the same correctness bar as the rest of
 - Same-seed replay tests proving identical traces and results.
 - Compatibility-corpus tests passing against the virtual filesystem crate.
 - Recovered-state prefix tests across standalone volumes and overlay volumes.
+
+---
+
+## Phase 8a — Embedded sandbox runtime library
+
+**Phase rule:** T40a freezes the sandbox crate boundary, editor-view protocol, and deterministic seams first. Every implementation task in this phase must add deterministic simulation coverage for the parts that can run under the seeded harness immediately. Any part of the real stack that cannot run under the simulation harness with acceptable fidelity must be hidden behind a stable interface with a deterministic stub/fake backend and tested through that seam in the same task. Do not defer the simulation-boundary decision to a late hardening-only step.
+
+**Parallelization:** T40a first. T40b depends on T40a. T40c, T40d, and T40f can proceed in parallel once T40b and their own library dependencies exist. T40e depends on T40b and T40c. T40g depends on T40b and T40f. T40h depends on T33, T40c, T40d, T40e, T40f, and T40g. T40i depends on T40c, T40d, T40e, T40f, T40g, and T40h.
+
+### T40a. Freeze the sandbox crate boundary, capability contracts, editor-view protocol, and deterministic seams
+
+**Depends on:** T03a, T34, T39
+
+**Description**
+
+Define the `terracedb-sandbox` public surface and the simulation boundary before implementation work branches. This task answers a critical question up front: which parts of the sandbox stack can run under the deterministic simulation harness unchanged, and which parts must sit behind stable interfaces with deterministic stub implementations.
+
+**Implementation steps**
+
+1. Add a new workspace member (for example `crates/terracedb-sandbox`) and define its top-level module boundaries:
+   - session lifecycle,
+   - runtime backend / actor,
+   - filesystem and module-loader shims,
+   - capability registry and injected app APIs,
+   - TypeScript service,
+   - bash service,
+   - package-install service,
+   - disk/git/PR interop,
+   - read-only editor/view service,
+   - shared error and metadata types.
+2. Freeze the core public contracts:
+   - `SandboxStore`,
+   - `SandboxSession`,
+   - `SandboxRuntimeBackend`,
+   - `PackageInstaller`,
+   - `GitWorkspaceManager`,
+   - `PullRequestProviderClient`,
+   - `ReadonlyViewProvider`,
+   - `SandboxCapability`,
+   - session provenance and conflict-policy types.
+3. Freeze the guest-visible module and URI namespaces:
+   - sandbox module specifiers such as `terrace:/...` and `terrace:host/...`,
+   - any package/builtin compatibility modes,
+   - the read-only editor/view URI or protocol surface used by VS Code and Cursor.
+4. Evaluate which concrete integrations can run under the current deterministic harness with acceptable fidelity:
+   - the real `deno_core` runtime,
+   - `just-bash`,
+   - package fetching and integrity/cache transitions,
+   - git export / worktree preparation,
+   - PR provider integration,
+   - the local/remote read-only editor view service.
+5. For anything that is not a good direct simulation target, define the stable interface and deterministic stub/fake implementation strategy now rather than after implementation begins.
+
+**Verification**
+
+- Compile-only tests that instantiate all public sandbox/session/capability/view interfaces.
+- Unit tests that round-trip session provenance, conflict-policy, and view-handle metadata encodings.
+- A deterministic smoke test that opens a sandbox session over a fake volume and a deterministic stub backend without touching real I/O, V8, git, or network services.
+
+---
+
+### T40b. Implement session lifecycle, provenance metadata, backend abstraction, and deterministic stub backends
+
+**Depends on:** T40a, T38, T39
+
+**Description**
+
+Implement the shared sandbox substrate that every later task uses: session open/close, overlay binding, persistent session metadata, provenance capture, and the stable backend interfaces that separate deterministic semantics from non-simulatable production integrations.
+
+**Implementation steps**
+
+1. Implement session open/reopen/close on top of `terracedb-vfs` overlays, including `/.terrace/session.json` and any supporting KV metadata.
+2. Implement stable provenance metadata for:
+   - base volume/snapshot identity,
+   - hoisted source path and mode,
+   - git repo root / commit / branch / remote when applicable,
+   - package-compat and capability configuration,
+   - active read-only view handles if the architecture needs to track them.
+3. Implement the abstract backend/service traits frozen in T40a plus deterministic stub/fake implementations for simulation:
+   - runtime backend,
+   - package installer,
+   - git workspace manager,
+   - PR provider client,
+   - read-only view provider.
+4. Wire all nontrivial sandbox operations into VFS tool-run/activity semantics so later tasks inherit the same auditability model.
+5. Add recovery/reopen logic so existing sessions preserve metadata and provenance without repair steps.
+
+**Verification**
+
+- Reopen tests proving session metadata and provenance survive restart unchanged.
+- Tests showing sandbox lifecycle operations append the expected tool/activity records and do not drift from overlay state.
+- Deterministic simulation tests using only the stub backends to prove seeded replay of open/reopen/close and metadata update flows.
+- Crash/recovery tests around session metadata publish and provenance updates.
+
+---
+
+### T40c. Implement the core sandbox actor, VFS-backed runtime shims, module loading, and injected capability plumbing
+
+**Depends on:** T40a, T40b, T36, T37, T38, T39
+
+**Description**
+
+Implement the execution core of the sandbox: the actor model, the runtime backend integration, the VFS-backed filesystem op layer, guest module loading, and the host-capability injection path. This task establishes the main execution vertical slice for guest code over a sandbox session.
+
+**Implementation steps**
+
+1. Implement the sandbox actor/executor model and the real runtime-backend wrapper for guest execution, preserving the thread-affinity or placement constraints required by the chosen runtime.
+2. Implement the VFS-backed op layer for file operations and the guest-side filesystem shim library used by runtime-facing compatibility code.
+3. Implement the custom module-loader surface:
+   - specifier resolution for sandbox files and host capability modules,
+   - runtime cache hooks,
+   - source-map plumbing,
+   - explicit gating for unsupported schemes or compatibility modes.
+4. Implement the capability registry and guest-visible injected app modules with matching type/declaration plumbing where appropriate.
+5. Ensure capability calls, entrypoint/module execution, and related runtime actions produce tool-run/activity records and preserve session isolation.
+
+**Verification**
+
+- Integration tests that execute guest code against a real sandbox session and verify VFS reads/writes, capability calls, and activity publication.
+- Tests proving capability modules are explicit imports rather than ambient globals and that denied capabilities fail predictably.
+- Deterministic simulation tests that exercise the same session/module/capability flows through the stub runtime backend and validate state changes, tool runs, and activity ordering.
+- Recovery tests for runtime-cache or metadata publication boundaries exposed by the implementation.
+
+---
+
+### T40d. Implement TypeScript services and just-bash integration on the sandbox contracts
+
+**Depends on:** T40a, T40b, T30, T31
+
+**Description**
+
+Implement the TypeScript and shell-tooling layers against the sandbox contracts without reopening the runtime/session interfaces. This task covers TypeScript transpilation/checking and `just-bash` integration over the VFS-backed sandbox filesystem.
+
+**Implementation steps**
+
+1. Implement execution-time TypeScript transpilation support and cache-key plumbing against the sandbox's module-resolution contracts.
+2. Implement the TypeScript mirror / language-service layer using `@typescript/vfs` or an equivalent compiler-host approach tied to the sandbox tree rather than the host disk.
+3. Implement guest-visible TypeScript service entrypoints for diagnostics, emits, and related operations, and route them through tool-run/activity surfaces.
+4. Implement the `just-bash` filesystem adapter and persistent shell-session wrapper on top of the sandbox filesystem shim.
+5. Add the built-in custom command bridges needed by the architecture, such as delegating `npm`, `tsc`, or allowlisted host capability calls through stable sandbox services rather than host subprocesses.
+
+**Verification**
+
+- Integration tests for TypeScript transpile/check flows over sandboxed files.
+- Integration tests for bash sessions reading and writing through the sandbox tree and producing expected tool-run records.
+- Deterministic simulation tests for TypeScript-mirror updates, diagnostic replay, and bash/VFS flows using the stub runtime backend where the real runtime is not required.
+- Restart tests for any persisted TypeScript or shell-session metadata introduced by the implementation.
+
+---
+
+### T40e. Implement package installation, cache/materialization policy, and runtime compatibility modes
+
+**Depends on:** T40a, T40b, T40c
+
+**Description**
+
+Implement version-1 package installation and compatibility support as a host-managed service rather than a literal embedded npm CLI. The goal is a useful pure-JS/TS package subset with stable cache and manifest semantics that can still be simulated deterministically.
+
+**Implementation steps**
+
+1. Implement the package-installer service contract with support for:
+   - version resolution,
+   - integrity verification,
+   - shared package cache,
+   - session-local install metadata,
+   - optional compatibility-view materialization.
+2. Implement the session-local package/install manifest and whichever compatibility view the runtime module loader expects in version 1.
+3. Restrict the supported package surface explicitly to the intended version-1 subset and make unsupported package classes fail predictably.
+4. Wire package install/use flows into tool-run/activity metadata and any runtime-loader hooks established in T40c.
+5. Add a deterministic fake registry/fetch/cache surface for simulation so package graph changes can be replayed without real network access.
+
+**Verification**
+
+- Integration tests that install a small supported package set and import it successfully from guest code.
+- Cache and reinstall tests proving repeated installs reuse compatible cached state correctly.
+- Deterministic simulation tests using the fake registry/fetch layer to replay package resolution, cache hits/misses, and manifest updates.
+- Crash/recovery tests around install-manifest publication and compatibility-view materialization.
+
+---
+
+### T40f. Implement host-disk hoist/eject, git provenance, branch/export, and pull-request flows
+
+**Depends on:** T40a, T40b, T38
+
+**Description**
+
+Implement the real-world interop path between sandboxes and host projects: import a directory or repo into a session, export a snapshot or delta back to disk, and create branches / pull requests from sandbox changes. The default PR path should prepare an isolated export workspace rather than mutating the user's active checkout directly.
+
+**Implementation steps**
+
+1. Implement host-directory and repo hoist modes:
+   - directory snapshot,
+   - git head,
+   - git working tree with explicit untracked/ignored-file policy.
+2. Implement eject modes:
+   - materialize full snapshot,
+   - apply delta relative to recorded provenance,
+   - structured conflict reporting and optional patch-bundle fallback.
+3. Implement git provenance capture and validation during hoist/eject/export.
+4. Implement git-aware export helpers that prepare an isolated export/worktree, apply sandbox changes, create a branch, commit, and push.
+5. Implement the PR provider-client integration on top of the stable provider interface instead of baking one provider directly into sandbox core logic.
+
+**Verification**
+
+- Round-trip tests for hoist → sandbox mutate → eject on ordinary directories and git repos.
+- Tests covering rename/delete/conflict behavior and provenance validation.
+- Deterministic simulation tests for diff/provenance/conflict logic and PR-export planning using stub git and provider backends.
+- Integration tests against real git worktrees for the non-simulated production path.
+
+---
+
+### T40g. Implement the read-only local/remote editor-view service and ship a real VS Code/Cursor extension package
+
+**Depends on:** T40a, T40b, T40f
+
+**Description**
+
+Implement the read-only editor-facing view layer so developers can browse sandbox state from VS Code and Cursor whether the application is running locally or remotely. This task must produce a real extension package in the repo, not just an abstract provider surface or protocol sketch. The goal is one user-facing editor workflow backed by the same read-only view protocol across both deployment shapes.
+
+**Implementation steps**
+
+1. Implement the read-only view provider/service defined in T40a for:
+   - browse/list/open/stat,
+   - visible or durable cut selection,
+   - refresh/reconnect,
+   - session/volume selection.
+2. Implement the local transport/bridge path for an app running on the developer's machine.
+3. Implement the authenticated remote transport/endpoint path so the same extension/protocol works across the network against a remote app.
+4. Implement and check in a real VS Code extension package in the repo, preferably using the editor's read-only virtual filesystem/provider APIs, and make Cursor compatibility an explicit requirement of that package or its build target rather than an assumed follow-up.
+5. Ensure the editor-view path remains read-only and does not silently become a writable mount or unchecked export path.
+
+**Verification**
+
+- Unit and integration tests for browse/list/open/stat semantics over sandbox snapshots or session views.
+- Deterministic simulation tests for the core view protocol and snapshot/view semantics using the stub view provider or local protocol stub.
+- Local integration tests for the checked-in extension package against a local app bridge.
+- Remote integration tests for the same checked-in extension package against an authenticated remote endpoint.
+
+---
+
+### T40h. Build cross-cutting deterministic compatibility, crash, and randomized fault suites for the sandbox stack
+
+**Depends on:** T33, T40c, T40d, T40e, T40f, T40g
+
+**Description**
+
+Bring the sandbox stack up to the same correctness bar as the rest of Terracedb by extending the deterministic simulation framework to the maximum semantically important subset of sandbox behavior and by verifying the non-simulated seams through the deterministic stub contracts.
+
+**Implementation steps**
+
+1. Extend the sandbox shadow model to cover:
+   - session filesystem state,
+   - capability-visible state,
+   - TypeScript mirror state,
+   - package/install manifest state,
+   - hoist/eject provenance and delta planning,
+   - read-only view snapshot semantics,
+   - tool-run/activity ordering.
+2. Add randomized workloads that combine:
+   - guest execution,
+   - filesystem mutations,
+   - capability calls,
+   - TypeScript checks,
+   - bash commands,
+   - package installs,
+   - hoist/eject/export operations,
+   - editor-view reads.
+3. Add crash cut points around:
+   - session creation,
+   - cache publication,
+   - install metadata updates,
+   - hoist/eject commits,
+   - PR-export bookkeeping,
+   - read-only view handle state if the implementation persists it.
+4. Add conformance tests comparing the deterministic stub contracts with the observable behavior of the real integrations wherever that comparison is practical.
+5. Ensure every failing seed captures enough session/provenance/cache/view metadata to replay the issue exactly.
+
+**Verification**
+
+- Large-seed simulation campaigns checking both current-state and cross-cutting prefix/order invariants after each step or recovery point.
+- Same-seed replay tests proving identical traces and sandbox outcomes.
+- Conformance tests for stub-versus-real backend behavior on the seams that must remain outside the harness.
+- Recovered-state and export/view consistency tests across standalone and repo-backed sessions.
+
+---
+
+### T40i. Add a simple example project that demonstrates sandbox execution, injected app capabilities, editor visibility, and repo workflows
+
+**Depends on:** T40c, T40d, T40e, T40f, T40g, T40h
+
+**Description**
+
+Add a small, teachable example project that demonstrates what the sandbox is for in practice: a real sandbox session over a project tree, injected app capabilities, guest code execution, shell/tool usage, read-only editor visibility, and an export or PR-style workflow.
+
+**Implementation steps**
+
+1. Add a small example app and companion sandboxed project that can be opened locally and used as the basis for hoist/eject flows.
+2. Implement at least one injected app capability that is visible to guest code and easy to understand in the example, such as:
+   - a note store,
+   - a ticket/comment API,
+   - a task queue or inbox surface.
+3. Demonstrate the core sandbox flows in the example:
+   - open a session on a base tree or hoisted repo,
+   - execute guest code,
+   - use TypeScript and/or bash tooling,
+   - view files read-only from the VS Code/Cursor integration,
+   - eject or prepare a branch/PR-style export.
+4. Add example docs that explain the boundaries clearly:
+   - what is simulated versus what is a real integration,
+   - why the editor view is read-only,
+   - how app capabilities are injected,
+   - how repo export and PR creation work.
+5. Keep the example small enough to teach, but real enough that it validates the crate boundaries against normal application embedding.
+
+**Verification**
+
+- End-to-end example tests exercising the documented happy path.
+- Tests proving the injected app capability behaves the same through the example as it does through the sandbox API directly.
+- Local editor-view smoke tests against the example project and, where practical, a remote-view smoke path using the same protocol.
+- Deterministic simulation coverage for the example's capability and session semantics wherever the example uses simulated-capable paths.
 
 ---
 
