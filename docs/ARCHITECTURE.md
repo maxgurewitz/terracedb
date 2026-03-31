@@ -345,8 +345,10 @@ interface TableConfig {
   name: string
   format: "row" | "columnar"
   mergeOperator?: MergeOperator
+  maxMergeOperandChainLength?: number
   compactionFilter?: CompactionFilter
   bloomFilterBitsPerKey?: number
+  historyRetentionSequences?: number
   compactionStrategy: "leveled" | "tiered" | "fifo"
   schema?: SchemaDefinition  // required for columnar tables
   metadata?: Record<string, any>  // user-defined, opaque to engine, read by scheduler
@@ -355,13 +357,15 @@ interface TableConfig {
 
 Each table has independent SSTables, compaction scheduling, and bloom filters. The engine does not interpret table contents, relationships, or metadata. `metadata` is passed through to the scheduler without interpretation; the user uses it to inform scheduling policy (priority, backpressure behavior, etc.). See **Scheduling** for details.
 
+`mergeOperator` and `compactionFilter` are **runtime callbacks**, not durable catalog data. The durable catalog stores the rest of the table definition plus the table's stable ID; applications that rely on those callbacks re-register them after open against the existing table definition.
+
 **A table's format applies everywhere** — on SSD and on S3. Row stays row, columnar stays columnar. There is no format conversion at the offload boundary. SSTables move from SSD to S3 as-is. This simplifies the backup and offload paths (exact same bytes, no transformation) and means the user commits to a format at table creation time.
 
 ### SSTable Formats
 
 **Row-oriented:** values are opaque bytes. The engine does not interpret them. Efficient for point lookups and single-record retrieval. No schema required.
 
-**Columnar:** values are structured records decomposed into per-column storage. The engine owns the encoding — it must understand the structure to do type-specific compression and column pruning. Requires a registered schema.
+**Columnar:** values are structured records decomposed into versioned per-column storage. The architecture uses a `columnar-v2` base format with typed binary substreams, page/granule metadata, and selective-read execution, plus optional sidecars and optional compact-to-wide promotion for mixed OLTP/OLAP workloads. Requires a registered schema.
 
 ### Row-Oriented Tables
 
@@ -484,31 +488,35 @@ function flushColumnar(memtable: Memtable, schema: SchemaDefinition): ColumnarSS
 }
 ```
 
-#### Column Encoding
+#### Versioned Columnar Physical Model
 
-Each column is encoded independently with type-specific compression:
+The columnar format is versioned. The architecture for the next frozen format is a `columnar-v2` **base part** plus optional sibling sidecars:
 
-```typescript
-function encodeColumn(type: FieldType, values: any[]): bytes {
-  if (isMonotonicallyIncreasing(values)) {
-    return deltaEncode(values)              // timestamps, auto-increment IDs
-  } else if (distinctCount(values) < 256) {
-    return dictionaryEncode(values)         // categories, status enums
-  } else if (type === "int64" || type === "float64") {
-    return bitpackEncode(values)            // numeric measurements
-  } else {
-    return zstdCompress(rawEncode(values))  // fallback
-  }
-}
-```
+- typed binary substreams for fixed-width numeric/bool values, null/present bitmaps, and offset-plus-bytes variable-width values,
+- per-stream codec descriptors with an initial `None` / `LZ4` / `ZSTD` set and room for future composition,
+- per-granule/page marks and page directories so readers do not load whole metadata arrays up front,
+- base-format zone maps / min-max synopses on configured fields,
+- per-part checksums plus compact digests embedded in publish metadata,
+- optional, explicitly versioned sibling artifacts such as richer skip indexes and per-SSTable projection sidecars.
 
-Columnar can compress substantially better than row-oriented for suitable structured data, though the actual ratio depends on data shape, cardinality, sort order, and codec choice.
+Zone maps and bounded caches are part of the base profile. Richer skip indexes, projection sidecars, compact-to-wide promotion, and any aggressive background behavior remain explicit opt-ins rather than mandatory baseline behavior.
+
+#### Selective Read and Hybrid Layout
+
+The `columnar-v2` execution path is intentionally selective rather than full-row-by-default:
+
+- scans collect row refs in batches instead of materializing every candidate row up front,
+- predicate columns can be fetched first (`PREWHERE-lite`) to produce a survivor bitmap,
+- remaining projected columns are fetched only for surviving row refs,
+- remote reads use bounded segmented raw-byte caching with coalesced async range reads and downloader election,
+- decoded footer/page/metadata state can be cached separately from raw bytes,
+- tables may optionally use compact-to-wide promotion so hot write-friendly segments serve point reads and short scans while colder data promotes into wide-columnar parts for analytical scans.
+
+The base engine profile does not require compact-to-wide promotion or sidecars. Those remain explicit workload-driven accelerants.
 
 #### Read Path
 
-Point lookups binary-search the key index and reconstruct a single row from column chunks:
-
-> **Scope note (Columnar v1):** this layout is the right fit for append-only or immutable analytical rows, where the latest row for a user key is the only row that matters. The engine-level `readAt` / `scanAt` API still defines the general MVCC contract, but callers should **not** assume that Columnar v1 preserves the same full overwritten-key history as row tables for arbitrary mutable workloads. If a table relies on complete version-history reads for overwritten keys, use row format in v1.
+Point lookups still use key-oriented metadata, but wide columnar parts are optimized first for analytical scans and selective projection reads. Mixed OLTP/OLAP workloads can stay row-oriented or opt into the hybrid compact-to-wide path so hot segments remain write-friendly while colder data becomes wide-columnar.
 
 ```typescript
 function readColumnar(sst: ColumnarSSTable, targetKey: bytes, schema: SchemaDefinition): Value | null {
@@ -530,61 +538,73 @@ function readColumnar(sst: ColumnarSSTable, targetKey: bytes, schema: SchemaDefi
 }
 ```
 
-Scans with column pruning only decompress the requested columns:
+Scans with column pruning operate on row refs, survivor masks, and late materialization rather than eagerly decoding full rows:
 
 ```typescript
 function scanColumnar(
   sst: ColumnarSSTable, startKey: bytes, endKey: bytes,
-  requestedColumns: number[]
+  predicate: Predicate,
+  projectedColumns: number[]
 ): Iterator<[Key, Record]> {
-  const startRow = sst.keyIndex.seekGE(startKey)
-  const endRow = sst.keyIndex.seekGE(endKey)
-  const colData = requestedColumns.map(id => sst.getColumn(id))
+  const candidateGranules = pruneGranules(
+    sst.pageDirectory,
+    sst.zoneMaps,
+    startKey,
+    endKey,
+    predicate
+  )
 
-  for (let i = startRow; i < endRow; i++) {
-    if (sst.tombstones[i]) continue
-    const record = {}
-    for (let c = 0; c < requestedColumns.length; c++) {
-      record[requestedColumns[c]] = colData[c].valueAt(i)
-    }
-    yield [sst.keyIndex.keyAt(i), record]
+  for (const granule of candidateGranules) {
+    const rowRefs = collectRowRefs(granule, startKey, endKey)
+    const survivors = evaluatePredicate(
+      readColumns(granule, predicate.columns, rowRefs),
+      predicate
+    )
+    const projected = readColumns(granule, projectedColumns, survivors)
+    yield* materializeRows(granule, rowRefs, survivors, projected)
   }
 }
 ```
 
 #### S3 Column Pruning
 
-Columnar SSTables on S3 store each column in a contiguous byte range with an index in the footer. This enables fetching only the columns needed via S3 range requests:
+Columnar SSTables on S3 store footer/page-directory metadata plus typed substreams in stable byte ranges. Readers fetch the footer first, prune granules, then issue only the range reads needed for predicate and projected substreams:
 
 ```typescript
-async function readColumnsFromS3(sstKey: string, columns: number[]): ColumnData {
-  const index = await s3.getRange(sstKey, { suffix: 1024 })
-  const results = await Promise.all(
-    columns.map(fieldId => {
-      const [start, end] = index.columnOffsets[fieldId]
-      return s3.getRange(sstKey, { start, end })
-    })
-  )
-  return decodeColumns(results)
+async function readColumnsFromS3(
+  sstKey: string,
+  predicate: Predicate,
+  projectedColumns: number[]
+): ColumnData {
+  const footer = await readFooter(sstKey)
+  const pageDirectory = await readPageDirectory(sstKey, footer)
+  const candidateGranules = pruneGranules(pageDirectory, footer.zoneMaps, predicate)
+  const ranges = planCoalescedRanges(candidateGranules, predicate.columns, projectedColumns)
+  const bytes = await readCoalescedRanges(sstKey, ranges)
+  return decodeRequestedSubstreams(bytes)
 }
 ```
 
-For a 200MB SSTable where a scan needs 2 of 20 columns, this fetches ~20MB instead of 200MB.
+For a 200MB SSTable where a scan needs 2 of 20 columns and most granules are pruned, this fetches only the footer/page metadata plus the predicate and projected substreams for the surviving granules, not the entire object.
 
 #### Columnar SSTable Physical Layout
 
 ```
-[Key index]          — sorted array of user keys + row offsets
-[Sequence column]    — sequence numbers per row (delta encoded)
-[Tombstone bitmap]   — one bit per row
-[Column 1 data]      — type-specific encoding (field ID 1)
-[Column 2 data]      — type-specific encoding (field ID 2)
+[Versioned header]
+[Key index / key marks]
+[Sequence + row-kind metadata streams]
+[Column 1 typed substreams]
+[Column 2 typed substreams]
 ...
-[Column N data]      — type-specific encoding (field ID N)
-[Footer]             — column offsets, lengths, field IDs, schema version, checksums
+[Column N typed substreams]
+[Per-granule/page marks]
+[Zone-map synopses]
+[Footer / page directory / checksums]
 ```
 
-The footer is at the end so a reader can fetch it first (single read from the tail), then use the offsets to fetch only the columns needed.
+Optional skip indexes and projection sidecars are sibling artifacts tied to the base part lifecycle rather than separate logical tables. The footer remains discoverable from the tail so a reader can fetch metadata first, prune granules, and then fetch only the required substreams.
+
+Immutable parts and sidecars publish **temp → finalize checksums/digests → publish/rename → visible**. Verification can quarantine a corrupt artifact; optional sidecars must fall back to the base part rather than changing answers or making the base part unreadable.
 
 #### Schema Evolution
 
@@ -680,12 +700,14 @@ type StorageConfig =
       ssd: { path: string }
       s3: { bucket: string, prefix: string }
       maxLocalBytes: number  // per-table size limit on SSD
+      durability?: "group-commit" | "deferred"
       localRetention: "offload" | "delete"  // oldest-first reclaim policy once over budget
     }
   | {
       mode: "s3-primary"
       s3: { bucket: string, prefix: string }
       memCacheSizeBytes: number
+      autoFlushIntervalMs?: number
     }
 ```
 
@@ -698,7 +720,7 @@ Data starts on SSD and is reclaimed when a table exceeds its configured `maxLoca
 - **Offload (cold storage):** in `localRetention: "offload"`, a background process monitors per-table size on SSD. When a table exceeds `maxLocalBytes`, it uploads the oldest SSTables to S3, updates the manifest, and reclaims local space — repeating until the table is back under the limit.
 - **Delete retention:** in `localRetention: "delete"`, the same oldest-first selection logic removes SSTables from the live manifest instead of moving them to the cold prefix. Reads no longer see that expired data, and backup GC later removes the unreferenced remote copies.
 - **Backup (replication):** background process continuously copies commit log segments and SSTables to S3. If the SSD is lost, the database can be fully recovered.
-- **Read path:** memtable → local SSTables (bloom filter assisted) → S3 SSTables (with in-memory LRU cache).
+- **Read path:** memtable → local SSTables (bloom filter assisted) → remote SSTables. Columnar reads use footer/page-directory metadata, zone-map pruning, row-ref batches, PREWHERE-lite, late materialization, and bounded segmented raw-byte caching with coalesced remote reads.
 - **Disaster recovery:** pull latest manifest from S3, download live SSTables, replay commit log tail.
 
 ### S3-Primary Mode
@@ -711,7 +733,7 @@ No persistent local disk. Memory is the hot tier, S3 is the source of truth.
   - `await db.flush()` — ships buffered commit log segment and SSTables to S3. Everything committed up to that point becomes durable.
   - `db.commit()` in s3-primary mode does **not** automatically flush. Use `flush()` explicitly for durability checkpoints.
 - **Flush to SSTable:** memtable → SSTable uploaded directly to S3.
-- **Read path:** memtable → in-memory SSTable cache → S3 (fetched on demand, cached for future reads). Point-read latency is bounded by S3 GET latency (~50-100ms) on cache miss. This mode is best suited for write-heavy and scan-heavy workloads, not low-latency random-read OLTP.
+- **Read path:** memtable → row and columnar SSTables → S3 on demand. Columnar remote reads use the same selective-read path as tiered cold reads: footer/page-directory fetch, pruning, bounded segmented raw-byte caching, and coalesced remote reads. Point-read latency is still bounded by S3/object-store latency on cache miss, so this mode is best suited for write-heavy and scan-heavy workloads, not low-latency random-read OLTP.
 - **Auto-flush:** configurable background interval bounds worst-case data loss window.
 
 The calling pattern for high-throughput ingest:
@@ -772,10 +794,15 @@ The separator byte and fixed-width encoding of the `CommitId` prevent ambiguity 
 
 ### MVCC Garbage Collection
 
-Old versions are dropped during compaction when they fall outside the GC horizon. The GC horizon is the minimum of:
+Old versions are dropped during compaction when they fall outside the GC horizon. Historical retention is **sequence-count based**, not wall-clock based. If `historyRetentionSequences` is unset for a table, historical reads remain available until ordinary compaction can prove older versions are obsolete. When it is set, the GC horizon is the older of:
 
-- The configured maximum retention duration.
+- The per-table retention floor derived from `historyRetentionSequences`.
 - The oldest active snapshot's sequence number.
+
+```typescript
+retentionFloor = currentSequence - (historyRetentionSequences - 1)
+gcHorizon = min(retentionFloor, oldestActiveSnapshot ?? retentionFloor)
+```
 
 A compaction filter must not remove data still visible to an active snapshot. Long-running snapshots pin the GC horizon and prevent space reclamation — unreleased snapshots are a resource leak.
 
@@ -788,7 +815,7 @@ These horizons may differ — commit log retention can be configured independent
 
 ### Manifest
 
-Metadata tracking which SSTables are live at each level, their key ranges, time ranges, sequence number ranges, and storage location (local file path or S3 key). See **Local Storage** for structure and atomicity guarantees.
+Metadata tracking which SSTables are live at each level, their key ranges, sequence-number ranges, checksums, and storage location (local path or remote object key). Table names and durable table configuration live in a separate catalog keyed by stable table IDs. See **Local Storage** for structure and atomicity guarantees.
 
 ### Local Storage
 
@@ -796,6 +823,8 @@ The local storage layout is a **directory of files**:
 
 ```
 db/
+  catalog/
+    CATALOG.json          ← table IDs + durable table config
   manifest/
     MANIFEST-000012        ← current manifest
     MANIFEST-000011        ← previous (retained for recovery)
@@ -803,19 +832,19 @@ db/
     SEG-000045
     SEG-000046             ← active (append target)
   sst/
-    events/                ← per-table SSTable directories
+    table-000001/          ← per-table-ID SSTable directories
       0000/                ← shard index (always 0000 until physical sharding)
         SST-000001.sst
         SST-000002.sst
         ...
-    users/
+    table-000002/
       0000/
         SST-000003.sst
         ...
   CURRENT                  ← points to latest manifest file
 ```
 
-The commit log is unified across all tables (see **Commit Log**). SSTables are per-table, each within a shard directory that defaults to `0000`. When physical sharding is added, additional shard directories (`0001/`, `0002/`, ...) appear alongside `0000/`, and the commit log splits into per-shard lanes. See **Future Extension: Physical Sharding**.
+The commit log is unified across all tables (see **Commit Log**). SSTables are grouped by stable table ID, each within a shard directory that defaults to `0000`. When physical sharding is added, additional shard directories (`0001/`, `0002/`, ...) appear alongside `0000/`, and the commit log splits into per-shard lanes. See **Future Extension: Physical Sharding**.
 
 Each SSTable, commit log segment, and manifest version is an independent file. Compaction creates new SSTable files and writes a new manifest file; old files are deleted after the new manifest is confirmed. Commit log segments are retained according to the dual retention policy described in **Commit Log**.
 
@@ -826,16 +855,18 @@ A future version may support an optional single-file packaging mode for simplifi
 ```typescript
 interface Manifest {
   generation: number          // monotonically increasing
-  checksum: bytes             // integrity check over manifest contents
+  checksum: number            // integrity check over manifest body
   lastFlushedSequence: SequenceNumber
   sstables: Array<{
-    table: string
+    tableId: number
     shard: number              // always 0 until physical sharding
     level: number
-    id: string
+    localId: string
     filePath?: string         // local file path (if on disk)
-    s3Key?: string            // S3 object key (if offloaded)
+    remoteKey?: string        // remote object key (if uploaded/offloaded)
     length: number
+    checksum: number
+    dataChecksum: number
     minKey: bytes
     maxKey: bytes
     minSequence: SequenceNumber
@@ -845,9 +876,11 @@ interface Manifest {
 }
 ```
 
+The S3-backed remote manifest extends this with the durable commit-log segment descriptors needed for recovery and `scanDurableSince` without reopening every segment object eagerly.
+
 #### Crash Safety
 
-The engine uses a **superblock pair** for crash-safe manifest updates:
+The engine uses immutable manifest generations plus a `CURRENT` pointer for crash-safe manifest updates:
 
 1. Each manifest version is written as a new immutable file with a generation number and checksum.
 2. The `CURRENT` pointer file is updated to reference the new manifest.
@@ -1058,21 +1091,26 @@ These are separate background processes. Cold storage is about reclaiming SSD sp
 The local representation is a directory of files. The S3 representation is individual objects. The backup process uploads local files as standalone S3 objects:
 
 ```typescript
+function onCatalogUpdated(catalog: Catalog) {
+  await s3.put("backup/catalog/CATALOG.json", serialize(catalog))
+}
+
 function onSSTableCreated(sst: SSTableRef) {
-  await s3.put(`backup/sst/${sst.table}/${sst.shard}/${sst.id}`, readFile(sst.filePath))
+  await s3.put(`backup/sst/table-${sst.tableId}/${sst.shard}/${sst.localId}.sst`, readFile(sst.filePath))
 }
 
 function onCommitLogSegmentSealed(segment: CommitLogSegmentRef) {
   await s3.put(`backup/commitlog/${segment.segmentId}`, readFile(segment.filePath))
 }
 
-function onManifestUpdated(manifest: Manifest) {
-  await s3.put(`backup/manifest/${manifest.generation}`, serialize(manifest))
-  await s3.put(`backup/manifest/latest`, serialize(manifest))
+function onManifestUpdated(remoteManifest: RemoteManifest) {
+  const manifestKey = `backup/manifest/MANIFEST-${remoteManifest.generation}`
+  await s3.put(manifestKey, serialize(remoteManifest))
+  await s3.put(`backup/manifest/latest`, utf8(`${manifestKey}\n`))
 }
 ```
 
-Manifest uploads are **immutable and generation-numbered** on S3, not just a single mutable `latest` key. The `latest` pointer is a convenience; recovery can also scan manifest generations and pick the highest valid one.
+Manifest uploads are **immutable and generation-numbered** on S3, not just a single mutable `latest` key. The `latest` object is a convenience pointer containing the newest manifest key, and recovery can also scan manifest generations and pick the highest valid one. The catalog remains a separate replicated object because table names and durable table configuration are not derivable from the manifest alone.
 
 ### Interaction Between Backup and Offload
 
@@ -1080,12 +1118,12 @@ The backup and offload processes share S3 upload work. The backup process upload
 
 ```typescript
 function offloadSSTable(sst: SSTableRef) {
-  const coldKey = `cold/${sst.table}/${sst.shard}/${sst.minSequence}-${sst.maxSequence}/${sst.id}`
-  await s3.copy(`backup/sst/${sst.table}/${sst.shard}/${sst.id}`, coldKey)
+  const coldKey = `cold/table-${sst.tableId}/${sst.shard}/${sst.minSequence}-${sst.maxSequence}/${sst.localId}.sst`
+  await s3.copy(`backup/sst/table-${sst.tableId}/${sst.shard}/${sst.localId}.sst`, coldKey)
 
-  updateManifest(sst.id, { storage: "s3", s3Key: coldKey, filePath: null })
+  updateManifest(sst.localId, { remoteKey: coldKey, filePath: null })
   deleteLocalFile(sst.filePath)
-  // backup/sst/{table}/{shard}/{id} is now unreferenced — GC will clean it up
+  // backup/sst/table-{id}/{shard}/{localId}.sst is now unreferenced — GC will clean it up
 }
 ```
 
@@ -1106,12 +1144,12 @@ If the process crashes between steps 2 and 3, new SSTables exist in S3 but nothi
 
 S3 objects are garbage collected using a **mark-and-sweep** approach:
 
-1. The GC root set is the set of retained manifest generations (not just `latest`).
-2. Walk all manifests in the root set and collect the set of referenced SSTable and commit log segment keys.
+1. The GC root set includes the retained manifest generations, the `backup/manifest/latest` pointer object, and `backup/catalog/CATALOG.json`.
+2. Walk all retained manifests in the root set and collect the set of referenced SSTable and commit log segment keys.
 3. List all objects under `backup/` and `cold/` prefixes.
-4. Delete any object not referenced by any retained manifest and older than a configurable grace period.
+4. Delete any object not referenced by the retained manifests/catalog and older than a configurable grace period.
 
-The grace period prevents races where a new SSTable has been uploaded but the manifest referencing it hasn't been published yet.
+The grace period prevents races where a new SSTable has been uploaded but the manifest referencing it hasn't been published yet. Implementations can make this fail-closed by storing a small birth record alongside each uploaded backup object (for example under `backup/gc/objects/...`) rather than relying on object-store listing timestamps.
 
 ### Disaster Recovery
 
@@ -1119,23 +1157,28 @@ If the SSD is unrecoverable:
 
 ```typescript
 async function recover() {
+  const catalog = await s3.get("backup/catalog/CATALOG.json")
+
   // 1. Find the latest valid manifest
   //    Try direct GET on 'latest' pointer first (avoids S3 LIST eventual consistency)
   //    Fall back to listing generations if 'latest' is missing or corrupt
+  let manifestKey: string
   let manifest: Manifest
   try {
-    manifest = await s3.get("backup/manifest/latest")
+    manifestKey = decodeUtf8(await s3.get("backup/manifest/latest")).trim()
+    manifest = await s3.get(manifestKey)
     validate(manifest)
   } catch {
     const generations = await s3.list("backup/manifest/")
-    manifest = findLatestValidManifest(generations)  // highest generation with valid checksum
+    manifestKey = findLatestValidManifestKey(generations)  // highest generation with valid checksum
+    manifest = await s3.get(manifestKey)
   }
 
   // 2. Download SSTables that were still on SSD
   for (const sst of manifest.sstables) {
-    if (sst.s3Key) continue  // already offloaded to cold — leave on S3
-    const bytes = await s3.get(`backup/sst/${sst.table}/${sst.shard}/${sst.id}`)
-    const localPath = `db/sst/${sst.table}/${sst.shard}/${sst.id}.sst`
+    if (sst.remoteKey) continue  // already remote — leave on object storage
+    const bytes = await s3.get(`backup/sst/table-${sst.tableId}/${sst.shard}/${sst.localId}.sst`)
+    const localPath = `db/sst/table-${sst.tableId}/${sst.shard}/${sst.localId}.sst`
     writeFile(localPath, bytes)
     sst.filePath = localPath
   }
@@ -1148,7 +1191,8 @@ async function recover() {
     replayCommitLog(bytes, memtable)
   }
 
-  // 4. Write the manifest locally
+  // 4. Restore catalog + manifest locally
+  writeCatalog(catalog)
   writeManifest(manifest)
 }
 ```
@@ -1159,23 +1203,28 @@ The recovered database has hot SSTables in the local directory and cold SSTables
 
 ```
 backup/
+  catalog/
+    CATALOG.json
   commitlog/
     SEG-000045
     SEG-000046
     ...
   sst/
-    events/0000/sst-0001           ← per-table, per-shard (mirrors local layout)
-    events/0000/sst-0002
-    users/0000/sst-0003
+    table-000001/0000/SST-000001.sst   ← per-table-ID, per-shard (mirrors local layout)
+    table-000001/0000/SST-000002.sst
+    table-000002/0000/SST-000003.sst
     ...
   manifest/
-    000011                         ← immutable, generation-numbered
-    000012
+    MANIFEST-000011                ← immutable, generation-numbered
+    MANIFEST-000012
     latest                         ← convenience pointer
+  gc/
+    objects/
+      <hex(object-key)>.json       ← optional birth metadata for grace-period GC
 
 cold/                              ← offloaded SSTables (moved, not on SSD)
-  events/0000/00000100-00000500/sst-0045
-  events/0000/00000501-00001200/sst-0078
+  table-000001/0000/00000100-00000500/SST-000045.sst
+  table-000001/0000/00000501-00001200/SST-000078.sst
   ...
 ```
 
