@@ -9,11 +9,11 @@ use terracedb::{
     ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainLifecycleEvent,
     ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
     ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding,
-    ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage,
-    FileSystemFailure, FileSystemOperation, InMemoryResourceManager, NoopScheduler, PendingWork,
-    PendingWorkType, PressureScope, ResourceManager, S3Location, ScanOptions, Scheduler,
-    ShardReadyPlacementLayout, StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig,
-    TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode, Value,
+    ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage, FileSystemFailure,
+    FileSystemOperation, InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType,
+    PressureScope, ResourceManager, S3Location, ScanOptions, Scheduler, ShardReadyPlacementLayout,
+    StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TableStats,
+    ThrottleDecision, TieredDurabilityMode, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
