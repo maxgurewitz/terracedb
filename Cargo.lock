@@ -1849,6 +1849,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-sandbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-simulation",
+ "terracedb-vfs",
+ "thiserror",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-simulation"
 version = "0.1.0"
 dependencies = [
