@@ -64,6 +64,34 @@ In practice this usually produces a better fix, because the simulation test
 forces us to state what behavior is actually broken instead of only chasing a
 slow or noisy harness symptom.
 
+## Prefer Published Updates Over Sampling Shared State
+
+When a simulation needs to observe live runtime state, prefer the published
+subscription or event-stream APIs over point-in-time shared-state sampling.
+
+For scheduler/admission observability, the default pattern should now be:
+
+1. Subscribe first.
+2. Trigger the work you want to observe.
+3. Wait on the subscription or event stream until the predicate you care about
+   becomes true.
+4. Only fall back to a one-shot synchronous snapshot when you are inspecting
+   quiescent state after the interesting work is already complete.
+
+In practice that means:
+
+- use `Db::subscribe_scheduler_observability()` when the test wants an
+  eventually consistent view of the published observability snapshot;
+- use `Db::subscribe_admission_observations()` when the test cares about the
+  order of admission transitions such as `RateLimit -> Open` or "one event per
+  logical write"; and
+- use `Db::scheduler_observability_snapshot()` for post-condition assertions
+  once the system is idle, not as the primary in-flight observation mechanism.
+
+This keeps the simulation aligned with the product surface and avoids
+re-introducing hidden dependencies on mutex timing or reader-side state
+assembly.
+
 ## Use Tracing As The First Debugger
 
 Turmoil already emits useful network/runtime events through `tracing`. Upstream
