@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     sync::{
         Arc, Mutex,
@@ -14,14 +14,16 @@ use terracedb::{
     test_support::{row_table_config, tiered_test_config},
 };
 use terracedb_kafka::{
-    KafkaAdmissionBatch, KafkaAppendOnlyMaterializer, KafkaAppendOnlyTables, KafkaBatchHandler,
-    KafkaBootstrapPolicy, KafkaBroker, KafkaCurrentStateMirror, KafkaCurrentStateMutation,
-    KafkaFetchedBatch, KafkaFilterDecision, KafkaMaterializationError, KafkaMaterializationLayout,
-    KafkaOffset, KafkaPartitionClaim, KafkaPartitionSource, KafkaPartitionTelemetrySnapshot,
-    KafkaProgressStore, KafkaRecord, KafkaRecordFilter, KafkaRuntimeError, KafkaRuntimeEvent,
-    KafkaRuntimeObserver, KafkaSimulationSeam, KafkaSourceProgress, KafkaWorkerOptions,
-    NoopKafkaTelemetrySink, TableKafkaProgressStore, drive_partition_once,
-    drive_partition_once_with_retry,
+    DeterministicKafkaBroker, DeterministicKafkaBrokerTraceEvent, DeterministicKafkaFetchOutcome,
+    DeterministicKafkaFetchResponse, DeterministicKafkaPartitionScript, KafkaAdmissionBatch,
+    KafkaAppendOnlyMaterializer, KafkaAppendOnlyTables, KafkaBatchHandler, KafkaBootstrapPolicy,
+    KafkaBroker, KafkaCurrentStateMirror, KafkaCurrentStateMutation, KafkaFetchedBatch,
+    KafkaFilterDecision, KafkaMaterializationError, KafkaMaterializationLayout, KafkaOffset,
+    KafkaPartitionClaim, KafkaPartitionOffset, KafkaPartitionSource,
+    KafkaPartitionTelemetrySnapshot, KafkaProgressStore, KafkaRecord, KafkaRecordFilter,
+    KafkaRuntimeError, KafkaRuntimeEvent, KafkaRuntimeObserver, KafkaSimulationSeam,
+    KafkaSourceProgress, KafkaWorkerOptions, NoopKafkaTelemetrySink, TableKafkaProgressStore,
+    drive_partition_once, drive_partition_once_with_retry,
 };
 use terracedb_simulation::{CutPoint, SeededSimulationRunner};
 
@@ -197,6 +199,16 @@ async fn read_bytes(table: &Table, key: &[u8]) -> Result<Option<Vec<u8>>, ReadEr
     Ok(Some(bytes))
 }
 
+fn collect_shared_offsets(rows: &[(Key, Vec<u8>)]) -> Vec<KafkaOffset> {
+    rows.iter()
+        .map(|(key, _)| {
+            KafkaPartitionOffset::decode(key)
+                .expect("append table should use shared partition-offset ordering")
+                .offset
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 struct FailAfterStage<H> {
     inner: H,
@@ -259,6 +271,271 @@ impl KafkaBatchHandler for ConflictOnceHandler {
         }
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct ConflictOnceThen<H> {
+    inner: H,
+    conflict_table: Table,
+    triggered: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl<H> KafkaBatchHandler for ConflictOnceThen<H>
+where
+    H: KafkaBatchHandler<Error = KafkaMaterializationError> + Send + Sync,
+{
+    type Error = io::Error;
+
+    async fn apply_batch(
+        &self,
+        tx: &mut Transaction,
+        batch: &KafkaAdmissionBatch,
+    ) -> Result<(), Self::Error> {
+        let guard_key = b"guard".to_vec();
+        let _ = tx
+            .read(&self.conflict_table, guard_key.clone())
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if !self.triggered.swap(true, Ordering::SeqCst) {
+            self.conflict_table
+                .write(guard_key, Value::bytes(b"conflict".to_vec()))
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+
+        self.inner
+            .apply_batch(tx, batch)
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KafkaIngressCampaignCapture {
+    append_offsets: Vec<KafkaOffset>,
+    append_values: Vec<Vec<u8>>,
+    mirror_rows: Vec<(Key, Vec<u8>)>,
+    progress: Option<KafkaSourceProgress>,
+    runtime_events: Vec<KafkaRuntimeEvent>,
+    telemetry_snapshots: Vec<KafkaPartitionTelemetrySnapshot>,
+    broker_trace: Vec<DeterministicKafkaBrokerTraceEvent>,
+}
+
+fn campaign_batch(partition: u32, start_offset: u64) -> Vec<KafkaRecord> {
+    [start_offset, start_offset + 1]
+        .into_iter()
+        .map(|offset| {
+            record_with_key(
+                "orders",
+                partition,
+                offset,
+                &format!("order-{offset}"),
+                Some(&format!("payload-{offset}")),
+            )
+        })
+        .collect()
+}
+
+fn delayed_fetch_plan(
+    partition: u32,
+    start_offset: u64,
+    empty_polls: usize,
+) -> Vec<DeterministicKafkaFetchResponse> {
+    let mut responses =
+        vec![DeterministicKafkaFetchResponse::empty(Some(KafkaOffset::new(6))); empty_polls];
+    responses.push(DeterministicKafkaFetchResponse::batch(
+        KafkaFetchedBatch::new(
+            campaign_batch(partition, start_offset),
+            Some(KafkaOffset::new(6)),
+        ),
+    ));
+    responses
+}
+
+fn build_campaign_broker(seed: u64, partition: u32) -> DeterministicKafkaBroker {
+    let mid_delay_polls = (seed & 1) as usize;
+    let final_delay_polls = ((seed >> 1) & 1) as usize;
+    let topic_partition = terracedb_kafka::KafkaTopicPartition::new("orders", partition);
+    let script = DeterministicKafkaPartitionScript::new(KafkaOffset::new(0), KafkaOffset::new(6))
+        .with_fetch_responses(
+            KafkaOffset::new(0),
+            [DeterministicKafkaFetchResponse::batch(
+                KafkaFetchedBatch::new(campaign_batch(partition, 0), Some(KafkaOffset::new(6))),
+            )],
+        )
+        .with_fetch_responses(
+            KafkaOffset::new(2),
+            delayed_fetch_plan(partition, 2, mid_delay_polls),
+        )
+        .with_fetch_responses(
+            KafkaOffset::new(4),
+            delayed_fetch_plan(partition, 4, final_delay_polls),
+        );
+    DeterministicKafkaBroker::new([(topic_partition, script)])
+}
+
+fn run_seeded_ingress_campaign(seed: u64) -> turmoil::Result<KafkaIngressCampaignCapture> {
+    SeededSimulationRunner::new(seed).run_with(move |context| async move {
+        let config = tiered_test_config(&format!("/kafka/t91/campaign-{seed}"));
+        let db = context.open_db(config.clone()).await?;
+        let append = db.create_table(row_table_config("append")).await?;
+        let mirror = db.create_table(row_table_config("mirror")).await?;
+        let progress_table = db.create_table(row_table_config("kafka_progress")).await?;
+        let conflict = db.create_table(row_table_config("conflict_guard")).await?;
+        let progress_store = TableKafkaProgressStore::new(progress_table);
+        let source = KafkaPartitionSource::new("orders", 10, KafkaBootstrapPolicy::Earliest);
+        let claim = KafkaPartitionClaim::new(source.source_id("consumer-g"), source.bootstrap, 11);
+        let broker = build_campaign_broker(seed, 10);
+        let observer = RecordingObserver::default();
+        let telemetry = RecordingTelemetrySink::default();
+        let triggered = Arc::new(AtomicBool::new(false));
+
+        let build_handler = |append: Table, mirror: Table| {
+            KafkaAppendOnlyMaterializer::new(
+                KafkaAppendOnlyTables::shared_partition_offset_table(append),
+                |record: &KafkaRecord| -> Result<Value, std::convert::Infallible> {
+                    Ok(Value::bytes(record.value.clone().unwrap_or_default()))
+                },
+            )
+            .with_current_state_mirror(KafkaCurrentStateMirror::new(
+                mirror,
+                |record: &KafkaRecord| -> Result<KafkaCurrentStateMutation, std::convert::Infallible> {
+                    Ok(KafkaCurrentStateMutation::upsert(
+                        record.key.clone().unwrap_or_default(),
+                        Value::bytes(record.value.clone().unwrap_or_default()),
+                    ))
+                },
+            ))
+        };
+
+        let first = drive_partition_once_with_retry(
+            &db,
+            &broker,
+            &progress_store,
+            &claim,
+            KafkaWorkerOptions {
+                batch_limit: 2,
+                ..KafkaWorkerOptions::default()
+            },
+            &KeepEvenOffsets,
+            &ConflictOnceThen {
+                inner: build_handler(append.clone(), mirror.clone()),
+                conflict_table: conflict.clone(),
+                triggered: triggered.clone(),
+            },
+            &observer,
+            &telemetry,
+            2,
+        )
+        .await?;
+        assert_eq!(first.retained_offsets, vec![KafkaOffset::new(0)]);
+        assert_eq!(first.skipped_offsets, vec![KafkaOffset::new(1)]);
+        assert_eq!(
+            progress_store.load(&claim.source).await?,
+            Some(KafkaSourceProgress::new(KafkaOffset::new(2)))
+        );
+
+        let second_handler = build_handler(append.clone(), mirror.clone());
+        let mut second = drive_partition_once(
+            &db,
+            &broker,
+            &progress_store,
+            &claim,
+            KafkaWorkerOptions {
+                batch_limit: 2,
+                ..KafkaWorkerOptions::default()
+            },
+            &KeepEvenOffsets,
+            &second_handler,
+            &observer,
+            &telemetry,
+        )
+        .await?;
+        while second.telemetry.next_offset == KafkaOffset::new(2) {
+            assert_eq!(second.telemetry.committed_sequence, None);
+            second = drive_partition_once(
+                &db,
+                &broker,
+                &progress_store,
+                &claim,
+                KafkaWorkerOptions {
+                    batch_limit: 2,
+                    ..KafkaWorkerOptions::default()
+                },
+                &KeepEvenOffsets,
+                &second_handler,
+                &observer,
+                &telemetry,
+            )
+            .await?;
+        }
+        assert_eq!(second.retained_offsets, vec![KafkaOffset::new(2)]);
+        assert_eq!(second.skipped_offsets, vec![KafkaOffset::new(3)]);
+        assert_eq!(
+            progress_store.load(&claim.source).await?,
+            Some(KafkaSourceProgress::new(KafkaOffset::new(4)))
+        );
+
+        db.flush().await?;
+        let reopened = context
+            .restart_db(config.clone(), CutPoint::AfterDurabilityBoundary)
+            .await?;
+        let reopened_append = reopened.table("append");
+        let reopened_mirror = reopened.table("mirror");
+        let reopened_progress = TableKafkaProgressStore::new(reopened.table("kafka_progress"));
+        let third_handler = build_handler(reopened_append.clone(), reopened_mirror.clone());
+        let mut third = drive_partition_once(
+            &reopened,
+            &broker,
+            &reopened_progress,
+            &claim,
+            KafkaWorkerOptions {
+                batch_limit: 2,
+                ..KafkaWorkerOptions::default()
+            },
+            &KeepEvenOffsets,
+            &third_handler,
+            &observer,
+            &telemetry,
+        )
+        .await?;
+        while third.telemetry.next_offset == KafkaOffset::new(4) {
+            assert_eq!(third.telemetry.committed_sequence, None);
+            third = drive_partition_once(
+                &reopened,
+                &broker,
+                &reopened_progress,
+                &claim,
+                KafkaWorkerOptions {
+                    batch_limit: 2,
+                    ..KafkaWorkerOptions::default()
+                },
+                &KeepEvenOffsets,
+                &third_handler,
+                &observer,
+                &telemetry,
+            )
+            .await?;
+        }
+        assert_eq!(third.retained_offsets, vec![KafkaOffset::new(4)]);
+        assert_eq!(third.skipped_offsets, vec![KafkaOffset::new(5)]);
+
+        let append_rows = collect_rows(&reopened_append).await?;
+        let mirror_rows = collect_rows(&reopened_mirror).await?;
+        Ok(KafkaIngressCampaignCapture {
+            append_offsets: collect_shared_offsets(&append_rows),
+            append_values: append_rows
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>(),
+            mirror_rows,
+            progress: reopened_progress.load(&claim.source).await?,
+            runtime_events: observer.events(),
+            telemetry_snapshots: telemetry.snapshots(),
+            broker_trace: broker.trace(),
+        })
+    })
 }
 
 #[test]
@@ -787,4 +1064,232 @@ fn retry_helper_replays_the_same_batch_after_a_transaction_abort() -> turmoil::R
         )));
         Ok(())
     })
+}
+
+#[test]
+fn deterministic_broker_fetch_failure_does_not_advance_progress_or_outputs() -> turmoil::Result {
+    SeededSimulationRunner::new(0x91_01).run_with(|context| async move {
+        let db = context
+            .open_db(tiered_test_config("/kafka/t91/fetch-failure"))
+            .await?;
+        let output = db.create_table(row_table_config("append")).await?;
+        let progress_table = db.create_table(row_table_config("kafka_progress")).await?;
+        let progress_store = TableKafkaProgressStore::new(progress_table);
+        let source = KafkaPartitionSource::new("orders", 11, KafkaBootstrapPolicy::Earliest);
+        let claim = KafkaPartitionClaim::new(source.source_id("consumer-h"), source.bootstrap, 1);
+        let broker = DeterministicKafkaBroker::new([(
+            terracedb_kafka::KafkaTopicPartition::new("orders", 11),
+            DeterministicKafkaPartitionScript::new(KafkaOffset::new(0), KafkaOffset::new(2))
+                .with_fetch_responses(
+                    KafkaOffset::new(0),
+                    [
+                        DeterministicKafkaFetchResponse::failure("synthetic fetch timeout"),
+                        DeterministicKafkaFetchResponse::batch(KafkaFetchedBatch::new(
+                            vec![
+                                record("orders", 11, 0, "alpha"),
+                                record("orders", 11, 1, "beta"),
+                            ],
+                            Some(KafkaOffset::new(2)),
+                        )),
+                    ],
+                ),
+        )]);
+
+        let error = drive_partition_once(
+            &db,
+            &broker,
+            &progress_store,
+            &claim,
+            KafkaWorkerOptions {
+                batch_limit: 2,
+                ..KafkaWorkerOptions::default()
+            },
+            &terracedb_kafka::KeepAllKafkaRecords,
+            &LayoutWriter {
+                table: output.clone(),
+                layout: KafkaMaterializationLayout::SharedPartitionOffsetTable,
+            },
+            &RecordingObserver::default(),
+            &NoopKafkaTelemetrySink,
+        )
+        .await
+        .expect_err("synthetic broker failure should bubble up");
+        assert!(matches!(error, KafkaRuntimeError::Broker { .. }));
+        assert_eq!(progress_store.load(&claim.source).await?, None);
+        assert!(collect_rows(&output).await?.is_empty());
+
+        let recovered = drive_partition_once(
+            &db,
+            &broker,
+            &progress_store,
+            &claim,
+            KafkaWorkerOptions {
+                batch_limit: 2,
+                ..KafkaWorkerOptions::default()
+            },
+            &terracedb_kafka::KeepAllKafkaRecords,
+            &LayoutWriter {
+                table: output.clone(),
+                layout: KafkaMaterializationLayout::SharedPartitionOffsetTable,
+            },
+            &RecordingObserver::default(),
+            &NoopKafkaTelemetrySink,
+        )
+        .await?;
+        assert_eq!(recovered.telemetry.next_offset, KafkaOffset::new(2));
+        assert_eq!(
+            progress_store.load(&claim.source).await?,
+            Some(KafkaSourceProgress::new(KafkaOffset::new(2)))
+        );
+        assert_eq!(
+            collect_shared_offsets(&collect_rows(&output).await?),
+            vec![KafkaOffset::new(0), KafkaOffset::new(1),]
+        );
+        let trace = broker.trace();
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            DeterministicKafkaBrokerTraceEvent::FetchBatch {
+                outcome: DeterministicKafkaFetchOutcome::Failure { .. },
+                ..
+            }
+        )));
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            DeterministicKafkaBrokerTraceEvent::FetchBatch {
+                outcome: DeterministicKafkaFetchOutcome::Batch { record_offsets, .. },
+                ..
+            } if record_offsets == &vec![KafkaOffset::new(0), KafkaOffset::new(1)]
+        )));
+        Ok(())
+    })
+}
+
+#[test]
+fn corrupt_progress_row_is_reported_before_broker_fetch() -> turmoil::Result {
+    SeededSimulationRunner::new(0x91_02).run_with(|context| async move {
+        let db = context
+            .open_db(tiered_test_config("/kafka/t91/corrupt-progress"))
+            .await?;
+        let progress_table = db.create_table(row_table_config("kafka_progress")).await?;
+        let progress_store = TableKafkaProgressStore::new(progress_table.clone());
+        let source = KafkaPartitionSource::new("orders", 12, KafkaBootstrapPolicy::Earliest);
+        let claim = KafkaPartitionClaim::new(source.source_id("consumer-i"), source.bootstrap, 4);
+        progress_table
+            .write(
+                TableKafkaProgressStore::source_key(&claim.source),
+                Value::bytes(vec![7, 8, 9]),
+            )
+            .await?;
+
+        let broker = DeterministicKafkaBroker::new([(
+            terracedb_kafka::KafkaTopicPartition::new("orders", 12),
+            DeterministicKafkaPartitionScript::new(KafkaOffset::new(0), KafkaOffset::new(1)),
+        )]);
+
+        let error = drive_partition_once(
+            &db,
+            &broker,
+            &progress_store,
+            &claim,
+            KafkaWorkerOptions::default(),
+            &terracedb_kafka::KeepAllKafkaRecords,
+            &LayoutWriter {
+                table: db.create_table(row_table_config("append")).await?,
+                layout: KafkaMaterializationLayout::SharedPartitionOffsetTable,
+            },
+            &RecordingObserver::default(),
+            &NoopKafkaTelemetrySink,
+        )
+        .await
+        .expect_err("corrupt progress row should fail before contacting broker");
+        assert!(matches!(error, KafkaRuntimeError::Decode { .. }));
+        assert!(broker.trace().is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn seeded_kafka_ingress_campaign_is_reproducible() -> turmoil::Result {
+    let seeds = [0x91_10_u64, 0x91_11, 0x91_12];
+
+    let first_pass = seeds
+        .into_iter()
+        .map(|seed| run_seeded_ingress_campaign(seed).map(|capture| (seed, capture)))
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+    let second_pass = seeds
+        .into_iter()
+        .map(|seed| run_seeded_ingress_campaign(seed).map(|capture| (seed, capture)))
+        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+
+    assert_eq!(first_pass, second_pass);
+    assert!(
+        first_pass
+            .values()
+            .all(|capture| capture.progress == Some(KafkaSourceProgress::new(KafkaOffset::new(6))))
+    );
+    assert!(first_pass.values().all(|capture| capture.append_offsets
+        == vec![
+            KafkaOffset::new(0),
+            KafkaOffset::new(2),
+            KafkaOffset::new(4),
+        ]));
+    assert!(first_pass.values().all(|capture| capture.append_values
+        == vec![
+            b"payload-0".to_vec(),
+            b"payload-2".to_vec(),
+            b"payload-4".to_vec(),
+        ]));
+    assert!(
+        first_pass.values().all(
+            |capture| capture.runtime_events.iter().any(|event| matches!(
+                event,
+                KafkaRuntimeEvent::SimulationSeam(KafkaSimulationSeam::DuplicateDelivery { .. })
+            ))
+        )
+    );
+    assert!(
+        first_pass.values().all(
+            |capture| capture.runtime_events.iter().any(|event| matches!(
+                event,
+                KafkaRuntimeEvent::SimulationSeam(KafkaSimulationSeam::RestartFromOffset {
+                    next_offset,
+                    ..
+                }) if *next_offset == KafkaOffset::new(4)
+            ))
+        )
+    );
+    assert!(first_pass.values().all(|capture| {
+        capture
+            .runtime_events
+            .iter()
+            .filter_map(|event| match event {
+                KafkaRuntimeEvent::SimulationSeam(
+                    KafkaSimulationSeam::FilteredButAcknowledged { offset, .. },
+                ) => Some(*offset),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([
+                KafkaOffset::new(1),
+                KafkaOffset::new(3),
+                KafkaOffset::new(5),
+            ])
+    }));
+    assert!(first_pass.values().all(|capture| capture.mirror_rows
+        == vec![
+            (b"order-0".to_vec(), b"payload-0".to_vec()),
+            (b"order-2".to_vec(), b"payload-2".to_vec()),
+            (b"order-4".to_vec(), b"payload-4".to_vec()),
+        ]));
+    Ok(())
+}
+
+#[test]
+fn seeded_kafka_ingress_campaign_changes_shape_for_different_seeds() -> turmoil::Result {
+    let left = run_seeded_ingress_campaign(0x91_20)?;
+    let right = run_seeded_ingress_campaign(0x91_21)?;
+
+    assert_ne!(left.broker_trace, right.broker_trace);
+    assert_ne!(left.telemetry_snapshots, right.telemetry_snapshots);
+    Ok(())
 }
