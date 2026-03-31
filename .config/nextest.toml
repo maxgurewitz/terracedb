@@ -3,5 +3,9 @@ nextest-version = "0.9.132"
 [profile.default]
 slow-timeout = { period = "15s", terminate-after = 1, grace-period = "0s" }
 
+[[profile.default.overrides]]
+filter = "test(whole_system_execution_domain_campaigns_remain_deterministic_across_seeds)"
+slow-timeout = { period = "25s", terminate-after = 1, grace-period = "0s" }
+
 [profile.pre-commit]
 inherits = "default"

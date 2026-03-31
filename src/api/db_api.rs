@@ -1868,6 +1868,7 @@ impl Db {
             .into_values()
             .collect::<Vec<_>>();
 
+        let mut pending_delay = Duration::ZERO;
         loop {
             let mut max_delay = Duration::ZERO;
             let flush_guardrail = self
@@ -1906,9 +1907,15 @@ impl Db {
                     foreground_budget.as_ref(),
                 );
 
-                if let Some(rate) = decision.max_write_bytes_per_second {
-                    max_delay = max_delay.max(Self::throttle_delay(table_bytes, rate));
-                }
+                let table_delay = decision
+                    .max_write_bytes_per_second
+                    .map(|rate| Self::throttle_delay(table_bytes, rate))
+                    .unwrap_or_default();
+                max_delay = max_delay.max(table_delay);
+                let carry_delay = crate::carry_write_delay_across_maintenance(
+                    decision.max_write_bytes_per_second,
+                    diagnostics.as_ref(),
+                );
                 if decision.throttle {
                     if let Some(diagnostics) = diagnostics.clone() {
                         self.record_admission_diagnostics(&foreground_tag, diagnostics);
@@ -1925,6 +1932,9 @@ impl Db {
                     should_run_maintenance = true;
                     must_stall = true;
                 }
+                if carry_delay {
+                    pending_delay = pending_delay.max(table_delay);
+                }
             }
 
             if should_run_maintenance {
@@ -1938,18 +1948,19 @@ impl Db {
                 if must_stall {
                     // Oversized writes can still trip a hard guardrail after
                     // maintenance has already exhausted the relievable
-                    // pressure. Preserve any explicit scheduler backoff before
-                    // allowing the write through so domain throttles still
-                    // apply in those cases.
-                    if max_delay > Duration::ZERO {
-                        self.inner.dependencies.clock.sleep(max_delay).await;
+                    // pressure. Preserve any explicit scheduler backoff, and
+                    // keep it even if maintenance made progress earlier in the
+                    // loop, so domain throttles still apply in those cases.
+                    if pending_delay > Duration::ZERO {
+                        self.inner.dependencies.clock.sleep(pending_delay).await;
                     }
                     break;
                 }
             }
 
-            if max_delay > Duration::ZERO {
-                self.inner.dependencies.clock.sleep(max_delay).await;
+            let delay = pending_delay.max(max_delay);
+            if delay > Duration::ZERO {
+                self.inner.dependencies.clock.sleep(delay).await;
             }
             break;
         }

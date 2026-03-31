@@ -480,8 +480,116 @@ mod tests {
     use serde_json::json;
     use terracedb::{
         AdmissionPressureLevel, AdmissionPressureSignal, ContentionClass, DurabilityClass,
-        ExecutionDomainOwner, ExecutionLane, multi_signal_write_admission,
+        ExecutionDomainOwner, ExecutionLane, carry_write_delay_across_maintenance,
+        multi_signal_write_admission,
     };
+
+    fn diagnostics_with_metadata(
+        oracle: &DeterministicPressureOracle,
+        table: &str,
+        runtime_tag: &WorkRuntimeTag,
+        batch_write_bytes: u64,
+        metadata: &BTreeMap<String, serde_json::Value>,
+    ) -> terracedb::AdmissionDiagnostics {
+        let mut signals = oracle.admission_signals(table, runtime_tag.clone(), batch_write_bytes);
+        signals.metadata.extend(metadata.clone());
+        multi_signal_write_admission(&signals)
+    }
+
+    fn throttle_delay(bytes: u64, max_write_bytes_per_second: u64) -> Duration {
+        if bytes == 0 || max_write_bytes_per_second == 0 {
+            return Duration::ZERO;
+        }
+
+        let millis = ((bytes as u128).saturating_mul(1000))
+            .div_ceil(max_write_bytes_per_second as u128) as u64;
+        Duration::from_millis(millis)
+    }
+
+    fn simulate_write_backpressure_delay<F>(
+        oracle: &mut DeterministicPressureOracle,
+        table: &str,
+        runtime_tag: &WorkRuntimeTag,
+        batch_write_bytes: u64,
+        metadata: &BTreeMap<String, serde_json::Value>,
+        mut run_maintenance: F,
+    ) -> Duration
+    where
+        F: FnMut(&mut DeterministicPressureOracle) -> bool,
+    {
+        let mut pending_delay = Duration::ZERO;
+
+        loop {
+            let diagnostics =
+                diagnostics_with_metadata(oracle, table, runtime_tag, batch_write_bytes, metadata);
+            let table_delay = diagnostics
+                .max_write_bytes_per_second
+                .map(|rate| throttle_delay(batch_write_bytes, rate))
+                .unwrap_or_default();
+            if carry_write_delay_across_maintenance(
+                diagnostics.max_write_bytes_per_second,
+                Some(&diagnostics),
+            ) {
+                pending_delay = pending_delay.max(table_delay);
+            }
+
+            let should_run_maintenance = diagnostics.level != AdmissionPressureLevel::Open;
+            let must_stall = diagnostics.level == AdmissionPressureLevel::Stall;
+            if should_run_maintenance {
+                let progressed = run_maintenance(oracle);
+                if progressed {
+                    continue;
+                }
+                if must_stall {
+                    break;
+                }
+            }
+            break;
+        }
+
+        pending_delay
+    }
+
+    fn simulate_write_backpressure_delay_from_signals<F, G>(
+        batch_write_bytes: u64,
+        mut next_signals: F,
+        mut run_maintenance: G,
+    ) -> Duration
+    where
+        F: FnMut() -> AdmissionSignals,
+        G: FnMut() -> bool,
+    {
+        let mut pending_delay = Duration::ZERO;
+
+        loop {
+            let diagnostics = multi_signal_write_admission(&next_signals());
+            let table_delay = diagnostics
+                .max_write_bytes_per_second
+                .map(|rate| throttle_delay(batch_write_bytes, rate))
+                .unwrap_or_default();
+            if carry_write_delay_across_maintenance(
+                diagnostics.max_write_bytes_per_second,
+                Some(&diagnostics),
+            ) {
+                pending_delay = pending_delay.max(table_delay);
+            }
+
+            let should_run_maintenance = diagnostics.level != AdmissionPressureLevel::Open;
+            let must_stall = diagnostics.level == AdmissionPressureLevel::Stall;
+            if should_run_maintenance {
+                let progressed = run_maintenance();
+                if progressed {
+                    continue;
+                }
+                if must_stall {
+                    break;
+                }
+            }
+            break;
+        }
+
+        pending_delay
+    }
 
     #[test]
     fn deterministic_pressure_oracle_reconstructs_and_tags_work() {
@@ -792,6 +900,115 @@ mod tests {
         assert_eq!(
             multi_signal_write_admission(&after_flush).level,
             AdmissionPressureLevel::Open
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_survives_maintenance_progress() {
+        let domain = ExecutionDomainPath::new(["process", "db", "foreground"]);
+        let tag = WorkRuntimeTag {
+            owner: ExecutionDomainOwner::Database {
+                name: "multi-signal".to_string(),
+            },
+            lane: ExecutionLane::UserForeground,
+            contention_class: ContentionClass::UserData,
+            domain: domain.clone(),
+            durability_class: DurabilityClass::UserData,
+        };
+
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(1024),
+            ..PressureBudget::default()
+        });
+        oracle.set_domain_budget(
+            domain.clone(),
+            PressureBudget {
+                mutable_hard_limit_bytes: Some(512),
+                ..PressureBudget::default()
+            },
+        );
+        oracle.bind_table_domain("events", domain);
+        oracle.record_mutable_write("events", 220);
+
+        let policy_metadata =
+            BTreeMap::from([("terracedb.execution.role".to_string(), json!("primary"))]);
+        let before = diagnostics_with_metadata(&oracle, "events", &tag, 96, &policy_metadata);
+        assert_eq!(before.level, AdmissionPressureLevel::RateLimit);
+        assert!(
+            before
+                .triggered_by
+                .contains(&AdmissionPressureSignal::MutableBudget)
+        );
+
+        let mut maintenance_ran = false;
+        let delay = simulate_write_backpressure_delay(
+            &mut oracle,
+            "events",
+            &tag,
+            96,
+            &policy_metadata,
+            |oracle| {
+                if maintenance_ran {
+                    return false;
+                }
+                maintenance_ran = true;
+                oracle.queue_flush("events");
+                oracle.begin_flush("events", 220);
+                oracle.finish_flush("events", 220);
+                true
+            },
+        );
+
+        let after = diagnostics_with_metadata(&oracle, "events", &tag, 96, &policy_metadata);
+        assert_eq!(after.level, AdmissionPressureLevel::Open);
+        assert!(
+            delay > Duration::ZERO,
+            "maintenance progress should not erase a previously observed rate-limit delay",
+        );
+    }
+
+    #[test]
+    fn l0_only_backoff_clears_once_maintenance_progresses() {
+        let l0_sstable_count =
+            std::cell::Cell::new(terracedb::DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT);
+        let domain = ExecutionDomainPath::new(["process", "db", "foreground"]);
+        let tag = WorkRuntimeTag {
+            owner: ExecutionDomainOwner::Database {
+                name: "workflow".to_string(),
+            },
+            lane: ExecutionLane::UserForeground,
+            contention_class: ContentionClass::UserData,
+            domain,
+            durability_class: DurabilityClass::UserData,
+        };
+
+        let mut oracle = DeterministicPressureOracle::default();
+        oracle.set_process_budget(PressureBudget {
+            mutable_hard_limit_bytes: Some(1024 * 1024),
+            ..PressureBudget::default()
+        });
+
+        let delay = simulate_write_backpressure_delay_from_signals(
+            64,
+            || {
+                let mut signals = oracle.admission_signals("events", tag.clone(), 64);
+                signals.l0_sstable_count = l0_sstable_count.get();
+                signals
+            },
+            || {
+                if l0_sstable_count.get() == 0 {
+                    return false;
+                }
+                l0_sstable_count.set(0);
+                true
+            },
+        );
+
+        assert_eq!(
+            delay,
+            Duration::ZERO,
+            "maintenance that clears pure L0 pressure should not leave a carried-over delay",
         );
     }
 }

@@ -144,8 +144,8 @@ pub use io::{
 pub use pressure::{
     AdmissionCorrectnessContext, AdmissionDiagnostics, AdmissionPolicyProfile,
     AdmissionPressureLevel, AdmissionPressureSignal, AdmissionSignals, FlushPressureCandidate,
-    PressureBudget, PressureBytes, PressureScope, PressureStats, derive_pressure_budget,
-    multi_signal_write_admission,
+    PressureBudget, PressureBytes, PressureScope, PressureStats,
+    carry_write_delay_across_maintenance, derive_pressure_budget, multi_signal_write_admission,
 };
 pub use remote::{
     CacheSpan, ObjectKeyLayout, RemoteCache, RemoteOperation, RemoteRecoveryHint,

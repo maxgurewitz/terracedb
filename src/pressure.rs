@@ -856,6 +856,20 @@ pub fn multi_signal_write_admission(signals: &AdmissionSignals) -> AdmissionDiag
     }
 }
 
+pub fn carry_write_delay_across_maintenance(
+    max_write_bytes_per_second: Option<u64>,
+    diagnostics: Option<&AdmissionDiagnostics>,
+) -> bool {
+    max_write_bytes_per_second.is_some()
+        && !diagnostics.is_some_and(|diagnostics| {
+            !diagnostics.triggered_by.is_empty()
+                && diagnostics
+                    .triggered_by
+                    .iter()
+                    .all(|signal| *signal == AdmissionPressureSignal::L0Sstables)
+        })
+}
+
 fn scale_bytes(value: u64, basis_points: u64) -> u64 {
     value
         .saturating_mul(basis_points)
