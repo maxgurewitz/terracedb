@@ -39,6 +39,7 @@ struct ColumnarScanExecutionState {
     parts: BTreeMap<String, ColumnarScanPartExecution>,
 }
 
+/// Summary of how the visible and durable sequence frontiers changed during a flush.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlushStatus {
     pub current_sequence_before: SequenceNumber,
@@ -48,18 +49,22 @@ pub struct FlushStatus {
 }
 
 impl FlushStatus {
+    /// Returns `true` when the visible sequence advanced during the flush.
     pub fn visible_sequence_advanced(&self) -> bool {
         self.current_sequence_after > self.current_sequence_before
     }
 
+    /// Returns `true` when the durable sequence advanced during the flush.
     pub fn durable_sequence_advanced(&self) -> bool {
         self.durable_sequence_after > self.durable_sequence_before
     }
 
+    /// Returns `true` when visible writes were ahead of durability at flush start.
     pub fn had_visible_non_durable_writes(&self) -> bool {
         self.current_sequence_before > self.durable_sequence_before
     }
 
+    /// Returns `true` when either the visible or durable frontier changed.
     pub fn changed_any_frontier(&self) -> bool {
         self.visible_sequence_advanced() || self.durable_sequence_advanced()
     }
@@ -507,6 +512,7 @@ impl Db {
         Ok(table)
     }
 
+    /// Creates the table if it does not exist, otherwise returns the existing handle.
     pub async fn ensure_table(&self, config: TableConfig) -> Result<Table, CreateTableError> {
         let table_name = config.name.clone();
         match self.create_table(config).await {
@@ -562,26 +568,34 @@ impl Db {
         ReadSet::default()
     }
 
+    /// Returns the lane bindings configured for this database.
     pub fn execution_profile(&self) -> &DbExecutionProfile {
         &self.inner.execution_profile
     }
 
+    /// Returns the binding for one logical execution lane.
     pub fn execution_lane_binding(&self, lane: ExecutionLane) -> &crate::ExecutionLaneBinding {
         self.execution_profile().binding(lane)
     }
 
+    /// Returns the execution identity used to name this database in placement reports.
     pub fn execution_identity(&self) -> &str {
         &self.inner.execution_identity
     }
 
+    /// Returns the underlying resource manager.
+    ///
+    /// Most application code should prefer the higher-level lane helpers on [`Db`].
     pub fn resource_manager(&self) -> Arc<dyn ResourceManager> {
         self.inner.resource_manager.clone()
     }
 
+    /// Returns a snapshot of the full colocated resource manager state.
     pub fn resource_manager_snapshot(&self) -> ResourceManagerSnapshot {
         self.inner.resource_manager.snapshot()
     }
 
+    /// Returns a placement report for this database and any attached subsystems.
     pub fn execution_placement_report(&self) -> crate::DbExecutionPlacementReport {
         crate::execution::build_db_execution_placement_report(
             &self.inner.resource_manager.snapshot(),
@@ -602,6 +616,10 @@ impl Db {
             .map(|snapshot| snapshot.spec.budget)
     }
 
+    /// Tags work with an explicit owner, lane, and contention class.
+    ///
+    /// This is the lowest-level public tagging helper on [`Db`]. Most callers
+    /// will prefer [`Self::tag_lane_work`] or one of the lane-specific helpers.
     pub fn tag_work<T>(
         &self,
         work: T,
@@ -615,6 +633,7 @@ impl Db {
         DomainTaggedWork::new(work, self.inner.resource_manager.placement_tag(request))
     }
 
+    /// Tags work using this database's default owner for the given lane.
     pub fn tag_lane_work<T>(
         &self,
         work: T,
@@ -629,6 +648,7 @@ impl Db {
         )
     }
 
+    /// Tags foreground user work for this database.
     pub fn tag_user_foreground_work<T>(&self, work: T) -> DomainTaggedWork<T> {
         self.tag_lane_work(
             work,
@@ -637,6 +657,7 @@ impl Db {
         )
     }
 
+    /// Tags background user work for this database.
     pub fn tag_user_background_work<T>(&self, work: T) -> DomainTaggedWork<T> {
         self.tag_lane_work(
             work,
@@ -645,6 +666,7 @@ impl Db {
         )
     }
 
+    /// Tags control-plane work for this database.
     pub fn tag_control_plane_work<T>(&self, work: T) -> DomainTaggedWork<T> {
         self.tag_lane_work(
             work,
@@ -653,6 +675,9 @@ impl Db {
         )
     }
 
+    /// Acquires a drop-safe usage lease for one logical lane.
+    ///
+    /// Prefer [`Self::with_lane_usage`] for short scoped work.
     pub fn acquire_lane_usage(
         &self,
         lane: ExecutionLane,
@@ -665,6 +690,7 @@ impl Db {
         )
     }
 
+    /// Probes whether a lane could admit the requested usage without keeping a lease alive.
     pub fn probe_lane_admission(
         &self,
         lane: ExecutionLane,
@@ -673,6 +699,9 @@ impl Db {
         self.with_lane_usage(lane, usage, |decision| decision)
     }
 
+    /// Temporarily overrides direct backlog for one logical lane.
+    ///
+    /// Prefer [`Self::with_lane_backlog`] for short scoped adjustments.
     pub fn set_lane_backlog(
         &self,
         lane: ExecutionLane,
@@ -685,6 +714,10 @@ impl Db {
         )
     }
 
+    /// Runs a closure while holding a lane-usage lease.
+    ///
+    /// The lease is always released after `f` returns, even if the decision was
+    /// not admitted.
     pub fn with_lane_usage<T>(
         &self,
         lane: ExecutionLane,
@@ -697,6 +730,7 @@ impl Db {
         result
     }
 
+    /// Async variant of [`Self::with_lane_usage`].
     pub async fn with_lane_usage_async<F, Fut, T>(
         &self,
         lane: ExecutionLane,
@@ -713,6 +747,7 @@ impl Db {
         result
     }
 
+    /// Runs a closure while one lane reports temporary direct backlog.
     pub fn with_lane_backlog<T>(
         &self,
         lane: ExecutionLane,
@@ -725,6 +760,7 @@ impl Db {
         result
     }
 
+    /// Async variant of [`Self::with_lane_backlog`].
     pub async fn with_lane_backlog_async<F, Fut, T>(
         &self,
         lane: ExecutionLane,
@@ -896,6 +932,7 @@ impl Db {
         .await
     }
 
+    /// Flushes visible state and discards the frontier details.
     pub async fn flush(&self) -> Result<(), FlushError> {
         self.flush_with_status().await.map(|_| ())
     }

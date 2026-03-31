@@ -379,6 +379,12 @@ impl DbBuilder {
         self
     }
 
+    /// Binds this builder to a database declared by a [`crate::ColocatedDeployment`].
+    ///
+    /// This wires in the deployment's shared resource manager and execution
+    /// identity. Runtime components such as clocks, RNGs, or object stores still
+    /// come from later builder calls like [`Self::components`] or
+    /// [`Self::object_store`].
     pub fn colocated_database(
         mut self,
         deployment: &crate::execution::ColocatedDeployment,
