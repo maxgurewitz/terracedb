@@ -8,6 +8,7 @@ publish = false
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 terracedb = { path = "../.." }
+terracedb-retention = { path = "../../crates/terracedb-retention" }
 thiserror = "2.0.17"
 
 [dev-dependencies]

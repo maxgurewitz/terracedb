@@ -4,8 +4,8 @@ use terracedb::{
 };
 use terracedb_example_retention_api::{
     LeaderboardEntry, LeaderboardPolicyMode, LeaderboardPolicyRequest, LeaderboardTieBreak,
-    SessionPolicyRequest, SessionRecord, ThresholdRetentionLayout, leaderboard_context,
-    leaderboard_contract, leaderboard_row, session_context, session_contract, session_row,
+    SessionPolicyRequest, SessionRecord, ThresholdRetentionLayout, leaderboard_configuration,
+    leaderboard_row, session_configuration, session_row,
 };
 use terracedb_simulation::{
     CurrentStateSimulationOperation, CurrentStateSimulationOutcome, CurrentStateSimulationScenario,
@@ -57,9 +57,11 @@ fn run_sessions_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationO
         minimum_last_seen_ms: 120,
         layout: ThresholdRetentionLayout::RewriteCompactionDelete,
     };
+    let initial_configuration = session_configuration(&initial_policy);
+    let revised_configuration = session_configuration(&revised_policy);
     let scenario = CurrentStateSimulationScenario {
-        initial_contract: session_contract(&initial_policy),
-        coordination: session_context(&initial_policy),
+        initial_contract: initial_configuration.contract.clone(),
+        coordination: initial_configuration.context.clone(),
         operations: vec![
             CurrentStateSimulationOperation::Upsert(session_row(&session_record(
                 "alpha", "user-a", 90, 12,
@@ -74,7 +76,7 @@ fn run_sessions_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationO
                 row_keys: vec![b"alpha".to_vec()],
             },
             CurrentStateSimulationOperation::ReviseContract {
-                contract: session_contract(&revised_policy),
+                contract: revised_configuration.contract.clone(),
             },
             CurrentStateSimulationOperation::Restart,
             CurrentStateSimulationOperation::PublishManifest,
@@ -100,9 +102,11 @@ fn run_leaderboard_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulati
         mode: LeaderboardPolicyMode::DerivedOnly,
         tie_break: LeaderboardTieBreak::CreatedAtThenStableId,
     };
+    let initial_configuration = leaderboard_configuration(&initial_policy);
+    let revised_configuration = leaderboard_configuration(&revised_policy);
     let scenario = CurrentStateSimulationScenario {
-        initial_contract: leaderboard_contract(&initial_policy),
-        coordination: leaderboard_context(&initial_policy),
+        initial_contract: initial_configuration.contract.clone(),
+        coordination: initial_configuration.context.clone(),
         operations: vec![
             CurrentStateSimulationOperation::Upsert(leaderboard_row(
                 &leaderboard_entry("alpha", 10, 1, 10),
@@ -126,7 +130,7 @@ fn run_leaderboard_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulati
                 initial_policy.tie_break,
             )),
             CurrentStateSimulationOperation::ReviseContract {
-                contract: leaderboard_contract(&revised_policy),
+                contract: revised_configuration.contract.clone(),
             },
             CurrentStateSimulationOperation::Restart,
         ],

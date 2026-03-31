@@ -64,6 +64,30 @@ impl CurrentStateThresholdCutoff {
         }
     }
 
+    pub fn explicit_ordering_key(encoded_value: CurrentStateComputedOrderingKey) -> Self {
+        Self::explicit(encoded_value.into_bytes())
+    }
+
+    pub fn explicit_unsigned(value: u64) -> Self {
+        Self::explicit_ordering_key(CurrentStateComputedOrderingKey::new().unsigned(value))
+    }
+
+    pub fn explicit_signed(value: i64) -> Self {
+        Self::explicit_ordering_key(CurrentStateComputedOrderingKey::new().signed(value))
+    }
+
+    pub fn explicit_timestamp_millis(value: u64) -> Self {
+        Self::explicit_ordering_key(CurrentStateComputedOrderingKey::new().timestamp_millis(value))
+    }
+
+    pub fn explicit_bytes(value: impl AsRef<[u8]>) -> Self {
+        Self::explicit_ordering_key(CurrentStateComputedOrderingKey::new().bytes(value))
+    }
+
+    pub fn explicit_utf8(value: impl AsRef<str>) -> Self {
+        Self::explicit_bytes(value.as_ref().as_bytes())
+    }
+
     pub fn engine_derived(
         source_name: impl Into<String>,
         encoded_value: impl Into<Vec<u8>>,
@@ -74,6 +98,34 @@ impl CurrentStateThresholdCutoff {
             },
             encoded_value: encoded_value.into(),
         }
+    }
+
+    pub fn engine_derived_ordering_key(
+        source_name: impl Into<String>,
+        encoded_value: CurrentStateComputedOrderingKey,
+    ) -> Self {
+        Self::engine_derived(source_name, encoded_value.into_bytes())
+    }
+
+    pub fn engine_derived_unsigned(source_name: impl Into<String>, value: u64) -> Self {
+        Self::engine_derived_ordering_key(
+            source_name,
+            CurrentStateComputedOrderingKey::new().unsigned(value),
+        )
+    }
+
+    pub fn engine_derived_signed(source_name: impl Into<String>, value: i64) -> Self {
+        Self::engine_derived_ordering_key(
+            source_name,
+            CurrentStateComputedOrderingKey::new().signed(value),
+        )
+    }
+
+    pub fn engine_derived_timestamp_millis(source_name: impl Into<String>, value: u64) -> Self {
+        Self::engine_derived_ordering_key(
+            source_name,
+            CurrentStateComputedOrderingKey::new().timestamp_millis(value),
+        )
     }
 }
 
@@ -172,6 +224,30 @@ pub struct CurrentStateRetentionContract {
     pub revision: u64,
     pub policy: CurrentStateRetentionPolicy,
     pub planner: CurrentStatePlanner,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionConfiguration {
+    pub contract: CurrentStateRetentionContract,
+    pub context: CurrentStateRetentionCoordinationContext,
+}
+
+impl CurrentStateRetentionConfiguration {
+    pub fn new(
+        contract: CurrentStateRetentionContract,
+        context: CurrentStateRetentionCoordinationContext,
+    ) -> Self {
+        Self { contract, context }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        CurrentStateRetentionContract,
+        CurrentStateRetentionCoordinationContext,
+    ) {
+        (self.contract, self.context)
+    }
 }
 
 impl CurrentStateRetentionContract {
@@ -364,6 +440,19 @@ pub struct CurrentStateRetentionCoordinationPlan {
     pub physical_bytes_pending: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateManifestPublicationResult {
+    pub published: bool,
+    pub plan: Option<CurrentStateRetentionCoordinationPlan>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateLocalCleanupResult {
+    pub completed: bool,
+    pub removed_row_keys: Vec<Vec<u8>>,
+    pub completed_plan: Option<CurrentStateRetentionCoordinationPlan>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CurrentStateRetentionPlanPhase {
@@ -460,6 +549,28 @@ impl Default for CurrentStateRetentionCoordinationContext {
 pub struct CurrentStateRetentionStatus {
     pub effective_mode: CurrentStateEffectiveMode,
     pub reasons: Vec<CurrentStateRetentionReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateOperationalSummary {
+    pub semantics: CurrentStateOperationalSemantics,
+    pub effective_mode: CurrentStateEffectiveMode,
+    pub reasons: Vec<CurrentStateRetentionReason>,
+    pub active_plan_phase: Option<CurrentStateRetentionPlanPhase>,
+    pub blocked_by_snapshots: bool,
+    pub waiting_for_manifest_publication: bool,
+    pub waiting_for_local_cleanup: bool,
+    pub backpressure_signals: Vec<CurrentStateRetentionBackpressureSignal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStateOperationalSemantics {
+    PhysicalReclaim,
+    WaitingOnPhysicalReclaim,
+    DerivedOnly,
+    LogicalOnly,
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +670,83 @@ impl CurrentStateOracleRow {
             Some(ordering.tie_break_key),
             estimated_row_bytes,
         )
+    }
+
+    pub fn from_threshold(
+        row_key: impl Into<Vec<u8>>,
+        primary_sort_key: impl Into<Vec<u8>>,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::new(
+            row_key,
+            Some(primary_sort_key.into()),
+            None,
+            estimated_row_bytes,
+        )
+    }
+
+    pub fn from_threshold_ordering_key(
+        row_key: impl Into<Vec<u8>>,
+        primary_sort_key: CurrentStateComputedOrderingKey,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::from_threshold(row_key, primary_sort_key.into_bytes(), estimated_row_bytes)
+    }
+
+    pub fn from_threshold_unsigned(
+        row_key: impl Into<Vec<u8>>,
+        value: u64,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::from_threshold_ordering_key(
+            row_key,
+            CurrentStateComputedOrderingKey::new().unsigned(value),
+            estimated_row_bytes,
+        )
+    }
+
+    pub fn from_threshold_signed(
+        row_key: impl Into<Vec<u8>>,
+        value: i64,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::from_threshold_ordering_key(
+            row_key,
+            CurrentStateComputedOrderingKey::new().signed(value),
+            estimated_row_bytes,
+        )
+    }
+
+    pub fn from_threshold_timestamp_millis(
+        row_key: impl Into<Vec<u8>>,
+        value: u64,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::from_threshold_ordering_key(
+            row_key,
+            CurrentStateComputedOrderingKey::new().timestamp_millis(value),
+            estimated_row_bytes,
+        )
+    }
+
+    pub fn from_threshold_bytes(
+        row_key: impl Into<Vec<u8>>,
+        value: impl AsRef<[u8]>,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::from_threshold_ordering_key(
+            row_key,
+            CurrentStateComputedOrderingKey::new().bytes(value),
+            estimated_row_bytes,
+        )
+    }
+
+    pub fn from_threshold_utf8(
+        row_key: impl Into<Vec<u8>>,
+        value: impl AsRef<str>,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::from_threshold_bytes(row_key, value.as_ref().as_bytes(), estimated_row_bytes)
     }
 }
 
@@ -665,6 +853,65 @@ pub struct CurrentStateRetentionEvaluation {
     pub reclaimable_row_keys: Vec<Vec<u8>>,
     pub deferred_row_keys: Vec<Vec<u8>>,
     pub stats: CurrentStateRetentionStats,
+}
+
+impl CurrentStateRetentionEvaluation {
+    pub fn operational_summary(&self) -> CurrentStateOperationalSummary {
+        let active_plan_phase = self
+            .stats
+            .coordination
+            .active_plan
+            .as_ref()
+            .map(|plan| plan.phase);
+        let blocked_by_snapshots = self
+            .stats
+            .status
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason, CurrentStateRetentionReason::BlockedBySnapshots));
+        let waiting_for_manifest_publication =
+            active_plan_phase == Some(CurrentStateRetentionPlanPhase::Planned);
+        let waiting_for_local_cleanup = active_plan_phase
+            == Some(CurrentStateRetentionPlanPhase::ManifestPublished)
+            || self.stats.coordination.physical_rows_pending > 0
+            || self.stats.coordination.deferred_physical_rows > 0
+            || self.stats.deferred_rows > 0;
+        let semantics = if self.stats.status.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                CurrentStateRetentionReason::Skipped {
+                    reason: CurrentStateRetentionSkipReason::UnsupportedPhysicalLayout,
+                }
+            )
+        }) {
+            CurrentStateOperationalSemantics::LogicalOnly
+        } else {
+            match self.stats.status.effective_mode {
+                CurrentStateEffectiveMode::PhysicalReclaim => {
+                    if waiting_for_manifest_publication || waiting_for_local_cleanup {
+                        CurrentStateOperationalSemantics::WaitingOnPhysicalReclaim
+                    } else {
+                        CurrentStateOperationalSemantics::PhysicalReclaim
+                    }
+                }
+                CurrentStateEffectiveMode::DerivedOnly => {
+                    CurrentStateOperationalSemantics::DerivedOnly
+                }
+                CurrentStateEffectiveMode::Skipped => CurrentStateOperationalSemantics::Skipped,
+            }
+        };
+
+        CurrentStateOperationalSummary {
+            semantics,
+            effective_mode: self.stats.status.effective_mode,
+            reasons: self.stats.status.reasons.clone(),
+            active_plan_phase,
+            blocked_by_snapshots,
+            waiting_for_manifest_publication,
+            waiting_for_local_cleanup,
+            backpressure_signals: self.stats.coordination.backpressure.signals.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1058,6 +1305,11 @@ impl CurrentStateRetentionOracle {
 }
 
 impl CurrentStateRetentionCoordinator {
+    pub fn from_configuration(configuration: CurrentStateRetentionConfiguration) -> Self {
+        let (contract, context) = configuration.into_parts();
+        Self::new(contract, context)
+    }
+
     pub fn new(
         contract: CurrentStateRetentionContract,
         context: CurrentStateRetentionCoordinationContext,
@@ -1106,6 +1358,40 @@ impl CurrentStateRetentionCoordinator {
         self.state.active_plan = None;
     }
 
+    pub fn reconfigure(&mut self, configuration: CurrentStateRetentionConfiguration) {
+        let rows = self.snapshot().oracle.rows;
+        self.reconfigure_with_rows(configuration, rows);
+    }
+
+    pub fn reconfigure_with_rows<I>(
+        &mut self,
+        configuration: CurrentStateRetentionConfiguration,
+        rows: I,
+    ) where
+        I: IntoIterator<Item = CurrentStateOracleRow>,
+    {
+        let snapshot = self.snapshot();
+        let revision_changed = snapshot.oracle.contract.revision != configuration.contract.revision;
+        let rebuild_fallback_pending = snapshot.state.rebuild_fallback_pending
+            || (revision_changed
+                && configuration.contract.planner.rebuild.on_revision
+                    != CurrentStateRebuildMode::None);
+
+        self.oracle =
+            CurrentStateRetentionOracle::from_snapshot(CurrentStateRetentionOracleSnapshot {
+                contract: configuration.contract,
+                rows: rows.into_iter().collect(),
+                snapshot_pins: snapshot.oracle.snapshot_pins,
+                published_ranked_row_keys: snapshot.oracle.published_ranked_row_keys,
+            });
+        self.context = configuration.context;
+        self.state = CurrentStateRetentionCoordinatorState {
+            active_plan: None,
+            last_observed_retained_row_keys: snapshot.state.last_observed_retained_row_keys,
+            rebuild_fallback_pending,
+        };
+    }
+
     pub fn set_contract(&mut self, contract: CurrentStateRetentionContract) {
         let revision_changed = self.oracle.contract().revision != contract.revision;
         let rebuild_on_revision = contract.planner.rebuild.on_revision;
@@ -1136,38 +1422,61 @@ impl CurrentStateRetentionCoordinator {
     }
 
     pub fn publish_manifest(&mut self) -> bool {
+        self.publish_manifest_result().published
+    }
+
+    pub fn publish_manifest_result(&mut self) -> CurrentStateManifestPublicationResult {
         let Some(plan) = self.state.active_plan.as_mut() else {
-            return false;
+            return CurrentStateManifestPublicationResult::default();
         };
         if !self.context.requires_manifest_publication
             || plan.phase != CurrentStateRetentionPlanPhase::Planned
         {
-            return false;
+            return CurrentStateManifestPublicationResult {
+                published: false,
+                plan: Some(plan.clone()),
+            };
         }
 
         plan.phase = CurrentStateRetentionPlanPhase::ManifestPublished;
-        true
+        CurrentStateManifestPublicationResult {
+            published: true,
+            plan: Some(plan.clone()),
+        }
     }
 
     pub fn complete_local_cleanup(&mut self) -> bool {
+        self.complete_local_cleanup_result().completed
+    }
+
+    pub fn complete_local_cleanup_result(&mut self) -> CurrentStateLocalCleanupResult {
         let Some(plan) = self.state.active_plan.clone() else {
-            return false;
+            return CurrentStateLocalCleanupResult::default();
         };
         if self.context.requires_manifest_publication
             && plan.phase != CurrentStateRetentionPlanPhase::ManifestPublished
         {
-            return false;
+            return CurrentStateLocalCleanupResult::default();
         }
         if !self.context.requires_local_cleanup || plan.physical_row_keys.is_empty() {
-            return false;
+            return CurrentStateLocalCleanupResult {
+                completed: false,
+                removed_row_keys: Vec::new(),
+                completed_plan: Some(plan),
+            };
         }
 
-        for row_key in plan.physical_row_keys {
-            self.oracle
-                .apply(CurrentStateOracleMutation::Delete { row_key });
+        for row_key in &plan.physical_row_keys {
+            self.oracle.apply(CurrentStateOracleMutation::Delete {
+                row_key: row_key.clone(),
+            });
         }
         self.state.active_plan = None;
-        true
+        CurrentStateLocalCleanupResult {
+            completed: true,
+            removed_row_keys: plan.physical_row_keys.clone(),
+            completed_plan: Some(plan),
+        }
     }
 
     pub fn plan(&mut self) -> Result<CurrentStateRetentionEvaluation, CurrentStateRetentionError> {
@@ -1660,14 +1969,16 @@ mod tests {
     use super::{
         CurrentStateCompactionRowRemovalMode, CurrentStateCutoffSource,
         CurrentStateDerivedOnlyReason, CurrentStateEffectiveMode, CurrentStateExactnessRequirement,
-        CurrentStateLogicalFloor, CurrentStateMissingValuePolicy, CurrentStateOracleMutation,
-        CurrentStateOracleRow, CurrentStatePhysicalRetentionMode,
-        CurrentStatePhysicalRetentionSeam, CurrentStatePlanner, CurrentStateProjectionOwnedRange,
-        CurrentStateRankBoundary, CurrentStateRankSource, CurrentStateRankedMaterializationSeam,
-        CurrentStateRebuildMode, CurrentStateRebuildSeam, CurrentStateRetentionContract,
-        CurrentStateRetentionDeferredReason, CurrentStateRetentionError,
-        CurrentStateRetentionReason, CurrentStateRetentionSkipReason, CurrentStateSortDirection,
-        CurrentStateThresholdCutoff,
+        CurrentStateLogicalFloor, CurrentStateMissingValuePolicy, CurrentStateOperationalSemantics,
+        CurrentStateOracleMutation, CurrentStateOracleRow, CurrentStatePhysicalReclaimSemantics,
+        CurrentStatePhysicalRetentionMode, CurrentStatePhysicalRetentionSeam, CurrentStatePlanner,
+        CurrentStateProjectionOwnedRange, CurrentStateRankBoundary, CurrentStateRankSource,
+        CurrentStateRankedMaterializationSeam, CurrentStateRebuildMode, CurrentStateRebuildSeam,
+        CurrentStateRetentionConfiguration, CurrentStateRetentionContract,
+        CurrentStateRetentionCoordinationContext, CurrentStateRetentionDeferredReason,
+        CurrentStateRetentionError, CurrentStateRetentionPlanPhase, CurrentStateRetentionReason,
+        CurrentStateRetentionSemantics, CurrentStateRetentionSkipReason,
+        CurrentStateRetentionTarget, CurrentStateSortDirection, CurrentStateThresholdCutoff,
     };
 
     fn row(
@@ -2183,6 +2494,309 @@ mod tests {
                 field: "tie_break_key",
             })
         );
+    }
+
+    #[test]
+    fn threshold_helper_constructors_encode_sortable_values_consistently() {
+        let cutoff = CurrentStateThresholdCutoff::explicit_unsigned(50);
+        let row = CurrentStateOracleRow::from_threshold_unsigned("alpha", 50, 10);
+        assert_eq!(row.primary_sort_key, Some(cutoff.encoded_value.clone()));
+
+        let timestamp_cutoff =
+            CurrentStateThresholdCutoff::engine_derived_timestamp_millis("clock", 123);
+        assert_eq!(
+            timestamp_cutoff.source,
+            CurrentStateCutoffSource::EngineDerived {
+                source_name: "clock".to_string(),
+            }
+        );
+        let timestamp_row = CurrentStateOracleRow::from_threshold_timestamp_millis("beta", 123, 10);
+        assert_eq!(
+            timestamp_row.primary_sort_key,
+            Some(timestamp_cutoff.encoded_value)
+        );
+    }
+
+    #[test]
+    fn manifest_and_cleanup_results_report_plan_details() {
+        let contract = CurrentStateRetentionContract::threshold(
+            40,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Ascending),
+            CurrentStateThresholdCutoff::explicit_unsigned(50),
+        )
+        .with_planner(CurrentStatePlanner {
+            compaction_row_removal: CurrentStateCompactionRowRemovalMode::RemoveDuringCompaction,
+            physical_retention: CurrentStatePhysicalRetentionSeam {
+                mode: CurrentStatePhysicalRetentionMode::Delete,
+                ..Default::default()
+            },
+            rebuild: CurrentStateRebuildSeam {
+                on_restart: CurrentStateRebuildMode::RecomputeFromCurrentState,
+                on_revision: CurrentStateRebuildMode::RecomputeFromCurrentState,
+            },
+            ..Default::default()
+        });
+        let mut coordinator = super::CurrentStateRetentionCoordinator::from_configuration(
+            CurrentStateRetentionConfiguration::new(
+                contract,
+                CurrentStateRetentionCoordinationContext::default(),
+            ),
+        );
+        coordinator.apply(CurrentStateOracleMutation::Upsert(
+            CurrentStateOracleRow::from_threshold_unsigned("alpha", 10, 12),
+        ));
+
+        let evaluation = coordinator.plan().expect("plan threshold reclaim");
+        assert_eq!(evaluation.non_retained_row_keys, vec![b"alpha".to_vec()]);
+
+        let publication = coordinator.publish_manifest_result();
+        assert!(publication.published);
+        assert_eq!(
+            publication.plan.as_ref().map(|plan| plan.phase),
+            Some(CurrentStateRetentionPlanPhase::ManifestPublished)
+        );
+
+        let cleanup = coordinator.complete_local_cleanup_result();
+        assert!(cleanup.completed);
+        assert_eq!(cleanup.removed_row_keys, vec![b"alpha".to_vec()]);
+        assert_eq!(
+            cleanup.completed_plan.as_ref().map(|plan| plan.phase),
+            Some(CurrentStateRetentionPlanPhase::ManifestPublished)
+        );
+    }
+
+    #[test]
+    fn operational_summary_captures_derived_logical_and_waiting_modes() {
+        let derived_contract = CurrentStateRetentionContract::global_rank(
+            41,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Descending),
+            1,
+        )
+        .with_planner(CurrentStatePlanner {
+            ranked_materialization: CurrentStateRankedMaterializationSeam::ProjectionOwned(
+                CurrentStateProjectionOwnedRange {
+                    output_table: "derived".to_string(),
+                    range_start: b"derived:00".to_vec(),
+                    range_end: b"derived:ff".to_vec(),
+                },
+            ),
+            ..Default::default()
+        });
+        let mut derived = super::CurrentStateRetentionCoordinator::from_configuration(
+            CurrentStateRetentionConfiguration::new(
+                derived_contract,
+                CurrentStateRetentionCoordinationContext {
+                    semantics: CurrentStateRetentionSemantics::new(
+                        CurrentStateRetentionTarget::ProjectionOwnedOutput,
+                        CurrentStatePhysicalReclaimSemantics::DerivedOnly,
+                    ),
+                    ..Default::default()
+                },
+            ),
+        );
+        derived.apply(CurrentStateOracleMutation::Upsert(
+            CurrentStateOracleRow::from_computed_ordering(
+                "alpha",
+                super::CurrentStateComputedOrderingKeys::leaderboard(10, "alpha"),
+                10,
+            ),
+        ));
+        assert_eq!(
+            derived
+                .plan()
+                .expect("plan derived retention")
+                .operational_summary()
+                .semantics,
+            CurrentStateOperationalSemantics::DerivedOnly
+        );
+
+        let logical_contract = CurrentStateRetentionContract::threshold(
+            42,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Ascending),
+            CurrentStateThresholdCutoff::explicit_unsigned(50),
+        )
+        .with_planner(CurrentStatePlanner {
+            compaction_row_removal: CurrentStateCompactionRowRemovalMode::RemoveDuringCompaction,
+            physical_retention: CurrentStatePhysicalRetentionSeam {
+                mode: CurrentStatePhysicalRetentionMode::Delete,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut logical = super::CurrentStateRetentionCoordinator::from_configuration(
+            CurrentStateRetentionConfiguration::new(
+                logical_contract,
+                CurrentStateRetentionCoordinationContext {
+                    semantics: CurrentStateRetentionSemantics::new(
+                        CurrentStateRetentionTarget::ColumnarTable,
+                        CurrentStatePhysicalReclaimSemantics::LogicalOnly,
+                    ),
+                    ..Default::default()
+                },
+            ),
+        );
+        logical.apply(CurrentStateOracleMutation::Upsert(
+            CurrentStateOracleRow::from_threshold_unsigned("alpha", 10, 10),
+        ));
+        assert_eq!(
+            logical
+                .plan()
+                .expect("plan logical-only retention")
+                .operational_summary()
+                .semantics,
+            CurrentStateOperationalSemantics::LogicalOnly
+        );
+
+        let waiting_contract = CurrentStateRetentionContract::threshold(
+            43,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Ascending),
+            CurrentStateThresholdCutoff::explicit_unsigned(50),
+        )
+        .with_planner(CurrentStatePlanner {
+            compaction_row_removal: CurrentStateCompactionRowRemovalMode::RemoveDuringCompaction,
+            physical_retention: CurrentStatePhysicalRetentionSeam {
+                mode: CurrentStatePhysicalRetentionMode::Delete,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut waiting = super::CurrentStateRetentionCoordinator::from_configuration(
+            CurrentStateRetentionConfiguration::new(
+                waiting_contract,
+                CurrentStateRetentionCoordinationContext::default(),
+            ),
+        );
+        waiting.apply(CurrentStateOracleMutation::Upsert(
+            CurrentStateOracleRow::from_threshold_unsigned("alpha", 10, 10),
+        ));
+        let waiting_summary = waiting
+            .plan()
+            .expect("plan waiting retention")
+            .operational_summary();
+        assert_eq!(
+            waiting_summary.semantics,
+            CurrentStateOperationalSemantics::WaitingOnPhysicalReclaim
+        );
+        assert_eq!(
+            waiting_summary.active_plan_phase,
+            Some(CurrentStateRetentionPlanPhase::Planned)
+        );
+    }
+
+    #[test]
+    fn coordinator_reconfigure_with_rows_preserves_publication_state_and_remaps_ordering() {
+        let old_contract = CurrentStateRetentionContract::global_rank(
+            50,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Descending),
+            1,
+        )
+        .with_planner(CurrentStatePlanner {
+            ranked_materialization: CurrentStateRankedMaterializationSeam::ProjectionOwned(
+                CurrentStateProjectionOwnedRange {
+                    output_table: "ranked".to_string(),
+                    range_start: b"ranked:00".to_vec(),
+                    range_end: b"ranked:ff".to_vec(),
+                },
+            ),
+            rebuild: CurrentStateRebuildSeam {
+                on_restart: CurrentStateRebuildMode::RecomputeFromCurrentState,
+                on_revision: CurrentStateRebuildMode::RecomputeFromCurrentState,
+            },
+            ..Default::default()
+        });
+        let mut coordinator = super::CurrentStateRetentionCoordinator::from_configuration(
+            CurrentStateRetentionConfiguration::new(
+                old_contract,
+                CurrentStateRetentionCoordinationContext {
+                    semantics: CurrentStateRetentionSemantics::new(
+                        CurrentStateRetentionTarget::ProjectionOwnedOutput,
+                        CurrentStatePhysicalReclaimSemantics::DerivedOnly,
+                    ),
+                    ..Default::default()
+                },
+            ),
+        );
+        for row in [
+            CurrentStateOracleRow::from_computed_ordering(
+                "alpha",
+                super::CurrentStateComputedOrderingKeys::leaderboard(10, "alpha"),
+                10,
+            ),
+            CurrentStateOracleRow::from_computed_ordering(
+                "bravo",
+                super::CurrentStateComputedOrderingKeys::leaderboard(10, "bravo"),
+                10,
+            ),
+            CurrentStateOracleRow::from_computed_ordering(
+                "charlie",
+                super::CurrentStateComputedOrderingKeys::leaderboard(9, "charlie"),
+                10,
+            ),
+        ] {
+            coordinator.apply(CurrentStateOracleMutation::Upsert(row));
+        }
+        coordinator
+            .publish_retained_set()
+            .expect("publish original retained set");
+
+        let new_contract = CurrentStateRetentionContract::global_rank(
+            51,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Descending),
+            1,
+        )
+        .with_planner(CurrentStatePlanner {
+            ranked_materialization: CurrentStateRankedMaterializationSeam::ProjectionOwned(
+                CurrentStateProjectionOwnedRange {
+                    output_table: "ranked".to_string(),
+                    range_start: b"ranked:00".to_vec(),
+                    range_end: b"ranked:ff".to_vec(),
+                },
+            ),
+            rebuild: CurrentStateRebuildSeam {
+                on_restart: CurrentStateRebuildMode::RecomputeFromCurrentState,
+                on_revision: CurrentStateRebuildMode::RecomputeFromCurrentState,
+            },
+            ..Default::default()
+        });
+        coordinator.reconfigure_with_rows(
+            CurrentStateRetentionConfiguration::new(
+                new_contract,
+                CurrentStateRetentionCoordinationContext {
+                    semantics: CurrentStateRetentionSemantics::new(
+                        CurrentStateRetentionTarget::ProjectionOwnedOutput,
+                        CurrentStatePhysicalReclaimSemantics::DerivedOnly,
+                    ),
+                    ..Default::default()
+                },
+            ),
+            [
+                CurrentStateOracleRow::from_computed_ordering(
+                    "alpha",
+                    super::CurrentStateComputedOrderingKeys::hybrid(10, 1, "alpha"),
+                    10,
+                ),
+                CurrentStateOracleRow::from_computed_ordering(
+                    "bravo",
+                    super::CurrentStateComputedOrderingKeys::hybrid(10, 2, "bravo"),
+                    10,
+                ),
+                CurrentStateOracleRow::from_computed_ordering(
+                    "charlie",
+                    super::CurrentStateComputedOrderingKeys::hybrid(9, 3, "charlie"),
+                    10,
+                ),
+            ],
+        );
+
+        let evaluation = coordinator
+            .plan()
+            .expect("plan reconfigured ranked retention");
+        assert_eq!(evaluation.retained_row_keys, vec![b"bravo".to_vec()]);
+        assert_eq!(
+            evaluation.entered_retained_row_keys,
+            vec![b"bravo".to_vec()]
+        );
+        assert_eq!(evaluation.exited_retained_row_keys, vec![b"alpha".to_vec()]);
     }
 
     #[test]

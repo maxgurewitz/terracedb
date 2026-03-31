@@ -1722,6 +1722,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "terracedb",
+ "terracedb-retention",
  "terracedb-simulation",
  "thiserror",
  "turmoil",
@@ -1825,6 +1826,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "turmoil",
+]
+
+[[package]]
+name = "terracedb-retention"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "terracedb",
 ]
 
 [[package]]

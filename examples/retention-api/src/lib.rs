@@ -11,6 +11,6 @@ pub use model::{
     ThresholdRetentionLayout, UpsertLeaderboardEntryRequest, UpsertSessionRequest,
 };
 pub use retention::{
-    LEADERBOARD_OUTPUT_TABLE, leaderboard_context, leaderboard_contract, leaderboard_row,
-    session_context, session_contract, session_row,
+    LEADERBOARD_OUTPUT_TABLE, leaderboard_configuration, leaderboard_row, session_configuration,
+    session_row,
 };

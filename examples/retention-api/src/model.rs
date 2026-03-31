@@ -1,44 +1,13 @@
 use serde::{Deserialize, Serialize};
-use terracedb::{
-    CurrentStateEffectiveMode, CurrentStateRetentionBackpressureSignal,
-    CurrentStateRetentionPlanPhase, CurrentStateRetentionReason,
+pub use terracedb::{
+    CurrentStateOperationalSemantics as ExampleOperationalSemantics,
+    CurrentStateOperationalSummary as OperationalView,
+};
+pub use terracedb_retention::{
+    LeaderboardTieBreak, RankedPolicyMode as LeaderboardPolicyMode, ThresholdRetentionLayout,
 };
 
 pub const HISTORY_RETENTION_NOTE: &str = "This example only changes generalized current-state retention. MVCC and CDC history retention remain sequence-based and are not modified by these policy updates.";
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ThresholdRetentionLayout {
-    #[default]
-    RewriteCompactionDelete,
-    LogicalOnly,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LeaderboardPolicyMode {
-    #[default]
-    DerivedOnly,
-    DestructiveRebuildable,
-    DestructiveUnrebuildable,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LeaderboardTieBreak {
-    #[default]
-    StableIdAscending,
-    CreatedAtThenStableId,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ExampleOperationalSemantics {
-    PhysicalReclaim,
-    WaitingOnPhysicalReclaim,
-    DerivedOnly,
-    LogicalOnly,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRecord {
@@ -137,18 +106,6 @@ impl Default for LeaderboardPolicyRequest {
 pub struct PublicationChanges {
     pub entered_ids: Vec<String>,
     pub exited_ids: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OperationalView {
-    pub semantics: ExampleOperationalSemantics,
-    pub effective_mode: CurrentStateEffectiveMode,
-    pub reasons: Vec<CurrentStateRetentionReason>,
-    pub active_plan_phase: Option<CurrentStateRetentionPlanPhase>,
-    pub blocked_by_snapshots: bool,
-    pub waiting_for_manifest_publication: bool,
-    pub waiting_for_local_cleanup: bool,
-    pub backpressure_signals: Vec<CurrentStateRetentionBackpressureSignal>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

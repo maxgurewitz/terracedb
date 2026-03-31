@@ -8,22 +8,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use terracedb::{
-    CurrentStateEffectiveMode, CurrentStateLogicalFloor, CurrentStateOracleMutation,
-    CurrentStateRankedMaterializationSeam, CurrentStateRetentionBackpressureSignal,
+    CurrentStateLogicalFloor, CurrentStateOracleMutation, CurrentStateRankedMaterializationSeam,
     CurrentStateRetentionCoordinator, CurrentStateRetentionCoordinatorSnapshot,
-    CurrentStateRetentionCoordinatorState, CurrentStateRetentionError,
-    CurrentStateRetentionEvaluation, CurrentStateRetentionOracleSnapshot,
-    CurrentStateRetentionPlanPhase, CurrentStateRetentionReason,
+    CurrentStateRetentionError, CurrentStateRetentionEvaluation,
 };
 
 use crate::{
-    ExampleInspection, ExampleOperationalSemantics, HISTORY_RETENTION_NOTE,
-    LeaderboardBoundaryView, LeaderboardEntry, LeaderboardInspection, LeaderboardPolicyMode,
-    LeaderboardPolicyRequest, LeaderboardPolicyView, OperationalView, PublicationChanges,
+    ExampleInspection, HISTORY_RETENTION_NOTE, LeaderboardBoundaryView, LeaderboardEntry,
+    LeaderboardInspection, LeaderboardPolicyRequest, LeaderboardPolicyView, PublicationChanges,
     SessionInspection, SessionPolicyRequest, SessionPolicyView, SessionRecord,
-    ThresholdRetentionLayout, UpsertLeaderboardEntryRequest, UpsertSessionRequest,
-    leaderboard_context, leaderboard_contract, leaderboard_row, session_context, session_contract,
-    session_row,
+    UpsertLeaderboardEntryRequest, UpsertSessionRequest, leaderboard_configuration,
+    leaderboard_row, session_configuration, session_row,
 };
 
 const SNAPSHOT_FILE_NAME: &str = "retention-example-state.json";
@@ -80,15 +75,13 @@ impl RetentionExampleApp {
             snapshot_path,
             session_policy: session_policy.clone(),
             sessions: BTreeMap::new(),
-            session_coordinator: CurrentStateRetentionCoordinator::new(
-                session_contract(&session_policy),
-                session_context(&session_policy),
+            session_coordinator: CurrentStateRetentionCoordinator::from_configuration(
+                session_configuration(&session_policy),
             ),
             leaderboard_policy: leaderboard_policy.clone(),
             leaderboard_entries: BTreeMap::new(),
-            leaderboard_coordinator: CurrentStateRetentionCoordinator::new(
-                leaderboard_contract(&leaderboard_policy),
-                leaderboard_context(&leaderboard_policy),
+            leaderboard_coordinator: CurrentStateRetentionCoordinator::from_configuration(
+                leaderboard_configuration(&leaderboard_policy),
             ),
         };
         app.save()?;
@@ -101,9 +94,7 @@ impl RetentionExampleApp {
     ) -> Result<SessionInspection, RetentionExampleError> {
         self.session_policy = policy.clone();
         self.session_coordinator
-            .set_context(session_context(&policy));
-        self.session_coordinator
-            .set_contract(session_contract(&policy));
+            .reconfigure(session_configuration(&policy));
         self.inspect_sessions()
     }
 
@@ -147,19 +138,18 @@ impl RetentionExampleApp {
     }
 
     pub fn publish_session_manifest(&mut self) -> Result<bool, RetentionExampleError> {
-        let changed = self.session_coordinator.publish_manifest();
+        let changed = self.session_coordinator.publish_manifest_result().published;
         self.save()?;
         Ok(changed)
     }
 
     pub fn complete_session_cleanup(&mut self) -> Result<bool, RetentionExampleError> {
-        let row_keys = self.active_plan_row_keys(&self.session_coordinator);
-        let changed = self.session_coordinator.complete_local_cleanup();
-        if changed {
-            self.remove_sessions(row_keys)?;
+        let cleanup = self.session_coordinator.complete_local_cleanup_result();
+        if cleanup.completed {
+            self.remove_sessions(cleanup.removed_row_keys)?;
         }
         self.save()?;
-        Ok(changed)
+        Ok(cleanup.completed)
     }
 
     pub fn inspect_sessions(&mut self) -> Result<SessionInspection, RetentionExampleError> {
@@ -168,17 +158,6 @@ impl RetentionExampleApp {
         let retained_sessions = self.lookup_sessions(&evaluation.retained_row_keys)?;
         let non_retained_sessions = self.lookup_sessions(&evaluation.non_retained_row_keys)?;
         let snapshot_pins = decode_row_keys(&snapshot.oracle.snapshot_pins)?;
-        let active_plan_phase = evaluation
-            .stats
-            .coordination
-            .active_plan
-            .as_ref()
-            .map(|plan| plan.phase);
-        let operational = operational_view(
-            self.session_policy.layout.context_semantics_kind(),
-            &evaluation,
-            active_plan_phase,
-        );
         let inspection = SessionInspection {
             policy: SessionPolicyView {
                 revision: self.session_policy.revision,
@@ -190,7 +169,7 @@ impl RetentionExampleApp {
             reclaimable_session_ids: decode_row_keys(&evaluation.reclaimable_row_keys)?,
             deferred_session_ids: decode_row_keys(&evaluation.deferred_row_keys)?,
             snapshot_pins,
-            operational,
+            operational: evaluation.operational_summary(),
         };
         self.save()?;
         Ok(inspection)
@@ -201,7 +180,12 @@ impl RetentionExampleApp {
         policy: LeaderboardPolicyRequest,
     ) -> Result<LeaderboardInspection, RetentionExampleError> {
         self.leaderboard_policy = policy.clone();
-        self.rebuild_leaderboard_coordinator();
+        self.leaderboard_coordinator.reconfigure_with_rows(
+            leaderboard_configuration(&policy),
+            self.leaderboard_entries
+                .values()
+                .map(|entry| leaderboard_row(entry, policy.tie_break)),
+        );
         self.inspect_leaderboard()
     }
 
@@ -241,38 +225,29 @@ impl RetentionExampleApp {
     }
 
     pub fn publish_leaderboard_manifest(&mut self) -> Result<bool, RetentionExampleError> {
-        let changed = self.leaderboard_coordinator.publish_manifest();
+        let changed = self
+            .leaderboard_coordinator
+            .publish_manifest_result()
+            .published;
         self.save()?;
         Ok(changed)
     }
 
     pub fn complete_leaderboard_cleanup(&mut self) -> Result<bool, RetentionExampleError> {
-        let row_keys = self.active_plan_row_keys(&self.leaderboard_coordinator);
-        let changed = self.leaderboard_coordinator.complete_local_cleanup();
-        if changed {
-            self.remove_leaderboard_rows(row_keys)?;
+        let cleanup = self.leaderboard_coordinator.complete_local_cleanup_result();
+        if cleanup.completed {
+            self.remove_leaderboard_rows(cleanup.removed_row_keys)?;
         }
         self.save()?;
-        Ok(changed)
+        Ok(cleanup.completed)
     }
 
     pub fn inspect_leaderboard(&mut self) -> Result<LeaderboardInspection, RetentionExampleError> {
         let evaluation = self.leaderboard_coordinator.plan()?;
-        let active_plan_phase = evaluation
-            .stats
-            .coordination
-            .active_plan
-            .as_ref()
-            .map(|plan| plan.phase);
         let retained = self.lookup_leaderboard(&evaluation.retained_row_keys)?;
         let outside_limit = self.lookup_leaderboard(&evaluation.non_retained_row_keys)?;
         let source_rows = self.leaderboard_entries.values().cloned().collect();
         let boundary = leaderboard_boundary(&self.leaderboard_entries, &evaluation);
-        let operational = operational_view(
-            self.leaderboard_policy.mode.operational_semantics_hint(),
-            &evaluation,
-            active_plan_phase,
-        );
         let inspection = LeaderboardInspection {
             policy: LeaderboardPolicyView {
                 revision: self.leaderboard_policy.revision,
@@ -289,7 +264,7 @@ impl RetentionExampleApp {
                 entered_ids: decode_row_keys(&evaluation.entered_retained_row_keys)?,
                 exited_ids: decode_row_keys(&evaluation.exited_retained_row_keys)?,
             },
-            operational,
+            operational: evaluation.operational_summary(),
         };
         self.save()?;
         Ok(inspection)
@@ -336,37 +311,6 @@ impl RetentionExampleApp {
         Ok(())
     }
 
-    fn rebuild_leaderboard_coordinator(&mut self) {
-        let previous = self.leaderboard_coordinator.snapshot();
-        let contract = leaderboard_contract(&self.leaderboard_policy);
-        let context = leaderboard_context(&self.leaderboard_policy);
-        let rows = self
-            .leaderboard_entries
-            .values()
-            .map(|entry| leaderboard_row(entry, self.leaderboard_policy.tie_break))
-            .collect();
-        let revision_changed = previous.oracle.contract.revision != contract.revision;
-        let rebuild_fallback_pending =
-            revision_changed && contract.planner.rebuild.on_revision != Default::default();
-
-        self.leaderboard_coordinator = CurrentStateRetentionCoordinator::from_snapshot(
-            CurrentStateRetentionCoordinatorSnapshot {
-                oracle: CurrentStateRetentionOracleSnapshot {
-                    contract,
-                    rows,
-                    snapshot_pins: previous.oracle.snapshot_pins,
-                    published_ranked_row_keys: previous.oracle.published_ranked_row_keys,
-                },
-                context,
-                state: CurrentStateRetentionCoordinatorState {
-                    active_plan: None,
-                    last_observed_retained_row_keys: previous.state.last_observed_retained_row_keys,
-                    rebuild_fallback_pending,
-                },
-            },
-        );
-    }
-
     fn lookup_sessions(
         &self,
         row_keys: &[Vec<u8>],
@@ -397,15 +341,6 @@ impl RetentionExampleApp {
                     .ok_or(RetentionExampleError::MissingRow { row_id })
             })
             .collect()
-    }
-
-    fn active_plan_row_keys(&self, coordinator: &CurrentStateRetentionCoordinator) -> Vec<Vec<u8>> {
-        coordinator
-            .snapshot()
-            .state
-            .active_plan
-            .map(|plan| plan.physical_row_keys)
-            .unwrap_or_default()
     }
 
     fn remove_sessions(&mut self, row_keys: Vec<Vec<u8>>) -> Result<(), RetentionExampleError> {
@@ -467,103 +402,4 @@ fn leaderboard_boundary(
         points: entry.points,
         created_at_ms: entry.created_at_ms,
     })
-}
-
-fn operational_view(
-    semantics_hint: ExampleOperationalSemantics,
-    evaluation: &CurrentStateRetentionEvaluation,
-    active_plan_phase: Option<CurrentStateRetentionPlanPhase>,
-) -> OperationalView {
-    let blocked_by_snapshots = evaluation
-        .stats
-        .status
-        .reasons
-        .iter()
-        .any(|reason| matches!(reason, CurrentStateRetentionReason::BlockedBySnapshots));
-    let waiting_on_physical_reclaim = matches!(
-        semantics_hint,
-        ExampleOperationalSemantics::PhysicalReclaim
-            | ExampleOperationalSemantics::WaitingOnPhysicalReclaim
-    ) && (active_plan_phase.is_some()
-        || evaluation.stats.deferred_rows > 0);
-    let semantics = if matches!(semantics_hint, ExampleOperationalSemantics::LogicalOnly) {
-        ExampleOperationalSemantics::LogicalOnly
-    } else if matches!(
-        evaluation.stats.status.effective_mode,
-        CurrentStateEffectiveMode::DerivedOnly
-    ) {
-        ExampleOperationalSemantics::DerivedOnly
-    } else if waiting_on_physical_reclaim {
-        ExampleOperationalSemantics::WaitingOnPhysicalReclaim
-    } else {
-        semantics_hint
-    };
-
-    let waiting_for_manifest_publication =
-        active_plan_phase == Some(CurrentStateRetentionPlanPhase::Planned);
-    let waiting_for_local_cleanup = active_plan_phase
-        == Some(CurrentStateRetentionPlanPhase::ManifestPublished)
-        || evaluation.stats.coordination.physical_rows_pending > 0
-        || evaluation.stats.coordination.deferred_physical_rows > 0;
-
-    OperationalView {
-        semantics,
-        effective_mode: evaluation.stats.status.effective_mode,
-        reasons: evaluation.stats.status.reasons.clone(),
-        active_plan_phase,
-        blocked_by_snapshots,
-        waiting_for_manifest_publication,
-        waiting_for_local_cleanup,
-        backpressure_signals: evaluation
-            .stats
-            .coordination
-            .backpressure
-            .signals
-            .iter()
-            .copied()
-            .collect::<Vec<CurrentStateRetentionBackpressureSignal>>(),
-    }
-}
-
-trait ExampleSemanticsHint {
-    fn operational_semantics_hint(&self) -> ExampleOperationalSemantics;
-}
-
-impl ExampleSemanticsHint for LeaderboardPolicyMode {
-    fn operational_semantics_hint(&self) -> ExampleOperationalSemantics {
-        match self {
-            LeaderboardPolicyMode::DerivedOnly => ExampleOperationalSemantics::DerivedOnly,
-            LeaderboardPolicyMode::DestructiveRebuildable
-            | LeaderboardPolicyMode::DestructiveUnrebuildable => {
-                ExampleOperationalSemantics::PhysicalReclaim
-            }
-        }
-    }
-}
-
-trait SessionContextSemanticsHint {
-    fn context_semantics_kind(&self) -> ExampleOperationalSemantics;
-}
-
-impl SessionContextSemanticsHint for terracedb::CurrentStateRetentionContract {
-    fn context_semantics_kind(&self) -> ExampleOperationalSemantics {
-        if self.planner.physical_retention.mode == Default::default()
-            && self.planner.compaction_row_removal == Default::default()
-        {
-            ExampleOperationalSemantics::DerivedOnly
-        } else {
-            ExampleOperationalSemantics::PhysicalReclaim
-        }
-    }
-}
-
-impl SessionContextSemanticsHint for ThresholdRetentionLayout {
-    fn context_semantics_kind(&self) -> ExampleOperationalSemantics {
-        match self {
-            ThresholdRetentionLayout::RewriteCompactionDelete => {
-                ExampleOperationalSemantics::PhysicalReclaim
-            }
-            ThresholdRetentionLayout::LogicalOnly => ExampleOperationalSemantics::LogicalOnly,
-        }
-    }
 }
