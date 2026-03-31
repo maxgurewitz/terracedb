@@ -32,6 +32,29 @@ The tests for this crate are the contract for the boundary: they prove the Kafka
 Debezium materializations, projection frontier, workflow attach mode, and user-visible outputs can
 all be checked from one deterministic seeded run.
 
+## Read Surface
+
+The example intentionally exposes a small application-facing read surface instead of a service API:
+
+- `OrderWatchBoundary::attention_orders_table(&db)` is the typed read model the application would
+  query for open west-region orders needing attention.
+- `OrderWatchBoundary::attention_transitions_table(&db)` is the typed append-only stream the
+  workflow consumes to emit alerts.
+- `boundary.orders_layout().current_table_name()` is the underlying Debezium mirror table for the
+  filtered `orders` current-state when Hybrid or Mirror materialization is enabled.
+- `OrderWatchOrder::from_current_value(...)` decodes that mirror row into the example's typed
+  `OrderWatchOrder` surface when callers want to inspect the raw current-state directly.
+
+Materialization expectations are part of the example contract:
+
+- `EventLog` and `Hybrid` produce the same logical `attention_orders`, `attention_transitions`, and
+  outbox alerts because both feed projections and workflows from the replayable `*_cdc` history.
+- `Hybrid` additionally preserves the filtered `*_current` mirror for direct application reads.
+- `Mirror` keeps only that filtered current-state. It can show the retained west-region rows, but it
+  cannot reconstruct the historical enter/exit transition stream the example uses for backlog replay.
+  That is why the example documents `Mirror` as a current-state-only surface, not a full substitute
+  for replayable CDC history.
+
 Both workflow modes now run through the real workflow runtime from the same append-only
 `attention_transitions` stream. The example intentionally uses the newer ergonomics added while
 freezing this boundary:

@@ -15,12 +15,12 @@ use terracedb::{
 };
 use terracedb_debezium::{
     DebeziumChangeEntry, DebeziumDerivedTransition, DebeziumDerivedTransitionProjection,
-    DebeziumMaterializationMode, DebeziumMirrorRow, DebeziumRowExt, ensure_layout_tables,
+    DebeziumMaterializationMode, ensure_layout_tables,
 };
 use terracedb_example_order_watch::{
     ATTENTION_ORDERS_TABLE_NAME, ATTENTION_TRANSITIONS_TABLE_NAME, BACKLOG_ALERT_ORDER_ID,
     FILTERED_OUT_ORDER_ID, IGNORED_CUSTOMER_ID, LIVE_TRANSITION_ORDER_ID, OrderAttentionTransition,
-    OrderAttentionView, OrderStatus, OrderWatchAlert, OrderWatchBoundary, OrderWatchOracleSnapshot,
+    OrderAttentionView, OrderWatchAlert, OrderWatchBoundary, OrderWatchOracleSnapshot,
     OrderWatchOrder, OrderWatchSourceProgress, OrderWatchWorkflowMode, SNAPSHOT_WEST_ORDER_ID,
 };
 use terracedb_kafka::{
@@ -416,25 +416,8 @@ async fn collect_current_orders(
         .await?;
     let mut out = BTreeMap::new();
     while let Some((_key, value)) = rows.next().await {
-        let row = DebeziumMirrorRow::from_value(&value)?;
-        out.insert(
-            row.primary_key.require_string_or_number("id")?,
-            OrderWatchOrder {
-                order_id: row.primary_key.require_string_or_number("id")?,
-                region: row.values.require_string("region")?.to_string(),
-                status: match row.values.require_string("status")? {
-                    "open" => OrderStatus::Open,
-                    "closed" => OrderStatus::Closed,
-                    other => {
-                        return Err(Box::new(io::Error::other(format!(
-                            "unknown order status `{other}`"
-                        ))));
-                    }
-                },
-                source_partition: row.kafka.partition,
-                source_offset: row.kafka.offset,
-            },
-        );
+        let order = OrderWatchOrder::from_current_value(&value)?;
+        out.insert(order.order_id.clone(), order);
     }
     Ok(out)
 }
