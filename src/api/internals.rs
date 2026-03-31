@@ -151,6 +151,7 @@ pub(super) struct LoadedColumnarMetadata {
 pub(super) enum ColumnarReadAccessPattern {
     Point,
     Scan,
+    Recovery,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

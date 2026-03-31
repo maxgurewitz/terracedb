@@ -1,9 +1,9 @@
-use std::error::Error as StdError;
+use std::{collections::BTreeMap, error::Error as StdError};
 
 use async_trait::async_trait;
 use terracedb::{
-    Db, Key, ReadError, SequenceNumber, StorageError, Table, Transaction, TransactionCommitError,
-    Value,
+    CommitError, Db, FlushError, Key, ReadError, SequenceNumber, StorageError, StorageErrorKind,
+    Table, Transaction, TransactionCommitError, Value,
 };
 use thiserror::Error;
 
@@ -543,6 +543,386 @@ impl KafkaMaterializationLayout {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct KafkaMaterializedWrite {
+    pub table: Table,
+    pub route: KafkaMaterializationRoute,
+    pub value: Value,
+}
+
+impl KafkaMaterializedWrite {
+    pub fn key(&self) -> Key {
+        self.route.key.encode()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum KafkaMaterializationError {
+    #[error("append-only table mapping contains a duplicate entry for {topic}[{partition}]")]
+    DuplicatePartitionTable { topic: String, partition: u32 },
+    #[error("no append-only table was configured for {topic}[{partition}]")]
+    MissingPartitionTable { topic: String, partition: u32 },
+    #[error("shared append-only materialization is missing its shared table")]
+    MissingSharedTable,
+    #[error("append-only value mapping failed: {message}")]
+    AppendValueMapping {
+        message: String,
+        #[source]
+        source: BoxedError,
+    },
+    #[error("current-state mirror mapping failed: {message}")]
+    MirrorMapping {
+        message: String,
+        #[source]
+        source: BoxedError,
+    },
+}
+
+impl KafkaMaterializationError {
+    fn append_value<E>(error: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self::AppendValueMapping {
+            message: error.to_string(),
+            source: Box::new(error),
+        }
+    }
+
+    fn mirror<E>(error: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self::MirrorMapping {
+            message: error.to_string(),
+            source: Box::new(error),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KafkaAppendOnlyTables {
+    layout: KafkaMaterializationLayout,
+    shared_table: Option<Table>,
+    partition_tables: BTreeMap<KafkaTopicPartition, Table>,
+}
+
+impl KafkaAppendOnlyTables {
+    /// Use one Terracedb table per Kafka partition when downstream consumers
+    /// need to replay a single partition in offset order with direct scans.
+    pub fn one_table_per_partition<I>(bindings: I) -> Result<Self, KafkaMaterializationError>
+    where
+        I: IntoIterator<Item = (KafkaTopicPartition, Table)>,
+    {
+        let mut partition_tables = BTreeMap::new();
+        for (topic_partition, table) in bindings {
+            if partition_tables
+                .insert(topic_partition.clone(), table)
+                .is_some()
+            {
+                return Err(KafkaMaterializationError::DuplicatePartitionTable {
+                    topic: topic_partition.topic,
+                    partition: topic_partition.partition.get(),
+                });
+            }
+        }
+
+        Ok(Self {
+            layout: KafkaMaterializationLayout::OneTablePerPartition,
+            shared_table: None,
+            partition_tables,
+        })
+    }
+
+    /// Use a shared Terracedb table keyed by `(partition, offset)` when many
+    /// partitions should land in one table but each partition's replay order
+    /// still needs to remain deterministic.
+    pub fn shared_partition_offset_table(table: Table) -> Self {
+        Self {
+            layout: KafkaMaterializationLayout::SharedPartitionOffsetTable,
+            shared_table: Some(table),
+            partition_tables: BTreeMap::new(),
+        }
+    }
+
+    pub fn layout(&self) -> KafkaMaterializationLayout {
+        self.layout
+    }
+
+    pub fn table_for(
+        &self,
+        topic_partition: &KafkaTopicPartition,
+    ) -> Result<&Table, KafkaMaterializationError> {
+        match self.layout {
+            KafkaMaterializationLayout::OneTablePerPartition => self
+                .partition_tables
+                .get(topic_partition)
+                .ok_or_else(|| KafkaMaterializationError::MissingPartitionTable {
+                    topic: topic_partition.topic.clone(),
+                    partition: topic_partition.partition.get(),
+                }),
+            KafkaMaterializationLayout::SharedPartitionOffsetTable => self
+                .shared_table
+                .as_ref()
+                .ok_or(KafkaMaterializationError::MissingSharedTable),
+        }
+    }
+
+    pub fn materialized_write(
+        &self,
+        record: &KafkaRecord,
+        value: Value,
+    ) -> Result<KafkaMaterializedWrite, KafkaMaterializationError> {
+        Ok(KafkaMaterializedWrite {
+            table: self.table_for(&record.topic_partition)?.clone(),
+            route: self.layout.route_record(record),
+            value,
+        })
+    }
+
+    pub fn stage_value(
+        &self,
+        tx: &mut Transaction,
+        record: &KafkaRecord,
+        value: Value,
+    ) -> Result<(), KafkaMaterializationError> {
+        let write = self.materialized_write(record, value)?;
+        tx.write(&write.table, write.key(), write.value);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum KafkaCurrentStateMutation {
+    Upsert {
+        key: Key,
+        value: Value,
+    },
+    Delete {
+        key: Key,
+    },
+    /// Intentionally advance the source frontier without changing the mirror.
+    Ignore,
+}
+
+impl KafkaCurrentStateMutation {
+    pub fn upsert(key: impl Into<Key>, value: Value) -> Self {
+        Self::Upsert {
+            key: key.into(),
+            value,
+        }
+    }
+
+    pub fn delete(key: impl Into<Key>) -> Self {
+        Self::Delete { key: key.into() }
+    }
+}
+
+pub trait KafkaAppendValueMapper: Send + Sync {
+    type Error: StdError + Send + Sync + 'static;
+
+    fn map_value(&self, record: &KafkaRecord) -> Result<Value, Self::Error>;
+}
+
+impl<F, E> KafkaAppendValueMapper for F
+where
+    F: Fn(&KafkaRecord) -> Result<Value, E> + Send + Sync,
+    E: StdError + Send + Sync + 'static,
+{
+    type Error = E;
+
+    fn map_value(&self, record: &KafkaRecord) -> Result<Value, Self::Error> {
+        self(record)
+    }
+}
+
+pub trait KafkaCurrentStateMapper: Send + Sync {
+    type Error: StdError + Send + Sync + 'static;
+
+    fn map_mutation(&self, record: &KafkaRecord) -> Result<KafkaCurrentStateMutation, Self::Error>;
+}
+
+impl<F, E> KafkaCurrentStateMapper for F
+where
+    F: Fn(&KafkaRecord) -> Result<KafkaCurrentStateMutation, E> + Send + Sync,
+    E: StdError + Send + Sync + 'static,
+{
+    type Error = E;
+
+    fn map_mutation(&self, record: &KafkaRecord) -> Result<KafkaCurrentStateMutation, Self::Error> {
+        self(record)
+    }
+}
+
+pub struct KafkaCurrentStateMirror<M> {
+    table: Table,
+    mapper: M,
+}
+
+impl<M> KafkaCurrentStateMirror<M> {
+    pub fn new(table: Table, mapper: M) -> Self {
+        Self { table, mapper }
+    }
+
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    fn stage_record(
+        &self,
+        tx: &mut Transaction,
+        record: &KafkaRecord,
+    ) -> Result<(), KafkaMaterializationError>
+    where
+        M: KafkaCurrentStateMapper,
+    {
+        match self
+            .mapper
+            .map_mutation(record)
+            .map_err(KafkaMaterializationError::mirror)?
+        {
+            KafkaCurrentStateMutation::Upsert { key, value } => tx.write(&self.table, key, value),
+            KafkaCurrentStateMutation::Delete { key } => tx.delete(&self.table, key),
+            KafkaCurrentStateMutation::Ignore => {}
+        }
+        Ok(())
+    }
+}
+
+pub struct KafkaCurrentStateMaterializer<M> {
+    mirror: KafkaCurrentStateMirror<M>,
+}
+
+impl<M> KafkaCurrentStateMaterializer<M> {
+    pub fn new(mirror: KafkaCurrentStateMirror<M>) -> Self {
+        Self { mirror }
+    }
+
+    pub fn mirror(&self) -> &KafkaCurrentStateMirror<M> {
+        &self.mirror
+    }
+}
+
+#[async_trait]
+impl<M> KafkaBatchHandler for KafkaCurrentStateMaterializer<M>
+where
+    M: KafkaCurrentStateMapper,
+{
+    type Error = KafkaMaterializationError;
+
+    async fn apply_batch(
+        &self,
+        tx: &mut Transaction,
+        batch: &KafkaAdmissionBatch,
+    ) -> Result<(), Self::Error> {
+        for record in &batch.retained_records {
+            self.mirror.stage_record(tx, record)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct KafkaAppendOnlyMaterializer<V> {
+    append_only: KafkaAppendOnlyTables,
+    value_mapper: V,
+}
+
+impl<V> KafkaAppendOnlyMaterializer<V> {
+    pub fn new(append_only: KafkaAppendOnlyTables, value_mapper: V) -> Self {
+        Self {
+            append_only,
+            value_mapper,
+        }
+    }
+
+    pub fn append_only(&self) -> &KafkaAppendOnlyTables {
+        &self.append_only
+    }
+
+    pub fn with_current_state_mirror<M>(
+        self,
+        mirror: KafkaCurrentStateMirror<M>,
+    ) -> KafkaAppendOnlyWithCurrentStateMirror<V, M> {
+        KafkaAppendOnlyWithCurrentStateMirror {
+            append_only: self,
+            mirror,
+        }
+    }
+
+    pub fn with_selective_current_state_mirror<M>(
+        self,
+        mirror: KafkaCurrentStateMirror<M>,
+    ) -> KafkaAppendOnlyWithCurrentStateMirror<V, M> {
+        self.with_current_state_mirror(mirror)
+    }
+}
+
+#[async_trait]
+impl<V> KafkaBatchHandler for KafkaAppendOnlyMaterializer<V>
+where
+    V: KafkaAppendValueMapper,
+{
+    type Error = KafkaMaterializationError;
+
+    async fn apply_batch(
+        &self,
+        tx: &mut Transaction,
+        batch: &KafkaAdmissionBatch,
+    ) -> Result<(), Self::Error> {
+        for record in &batch.retained_records {
+            let value = self
+                .value_mapper
+                .map_value(record)
+                .map_err(KafkaMaterializationError::append_value)?;
+            self.append_only.stage_value(tx, record, value)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct KafkaAppendOnlyWithCurrentStateMirror<V, M> {
+    append_only: KafkaAppendOnlyMaterializer<V>,
+    mirror: KafkaCurrentStateMirror<M>,
+}
+
+impl<V, M> KafkaAppendOnlyWithCurrentStateMirror<V, M> {
+    pub fn append_only(&self) -> &KafkaAppendOnlyTables {
+        self.append_only.append_only()
+    }
+
+    pub fn mirror(&self) -> &KafkaCurrentStateMirror<M> {
+        &self.mirror
+    }
+}
+
+#[async_trait]
+impl<V, M> KafkaBatchHandler for KafkaAppendOnlyWithCurrentStateMirror<V, M>
+where
+    V: KafkaAppendValueMapper,
+    M: KafkaCurrentStateMapper,
+{
+    type Error = KafkaMaterializationError;
+
+    async fn apply_batch(
+        &self,
+        tx: &mut Transaction,
+        batch: &KafkaAdmissionBatch,
+    ) -> Result<(), Self::Error> {
+        for record in &batch.retained_records {
+            let value = self
+                .append_only
+                .value_mapper
+                .map_value(record)
+                .map_err(KafkaMaterializationError::append_value)?;
+            self.append_only
+                .append_only
+                .stage_value(tx, record, value)?;
+            self.mirror.stage_record(tx, record)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KafkaShutdownMode {
     #[default]
@@ -850,16 +1230,45 @@ pub enum KafkaContractError {
 #[derive(Debug, Error)]
 pub enum KafkaRuntimeError {
     #[error(transparent)]
-    Read(#[from] ReadError),
-    #[error(transparent)]
-    Commit(#[from] TransactionCommitError),
-    #[error(transparent)]
     Contract(#[from] KafkaContractError),
     #[error("kafka broker operation failed: {message}")]
     Broker {
         message: String,
         #[source]
         source: BoxedError,
+    },
+    #[error("kafka source-progress decode failed: {message}")]
+    Decode {
+        message: String,
+        #[source]
+        source: StorageError,
+    },
+    #[error("kafka storage operation failed: {message}")]
+    Storage {
+        message: String,
+        #[source]
+        source: StorageError,
+    },
+    #[error("kafka progress load failed: {message}")]
+    ProgressLoad {
+        message: String,
+        #[source]
+        source: ReadError,
+    },
+    #[error(
+        "kafka transaction aborted for {source_id:?} while applying offset {start_offset:?}; the batch may be retried"
+    )]
+    TransactionAborted {
+        source_id: KafkaSourceId,
+        start_offset: KafkaOffset,
+        #[source]
+        source: CommitError,
+    },
+    #[error("kafka transaction committed at sequence {sequence}, but the flush failed")]
+    Flush {
+        sequence: SequenceNumber,
+        #[source]
+        source: FlushError,
     },
     #[error("kafka handler failed: {message}")]
     Handler {
@@ -870,6 +1279,10 @@ pub enum KafkaRuntimeError {
 }
 
 impl KafkaRuntimeError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::TransactionAborted { .. })
+    }
+
     fn broker<E>(error: E) -> Self
     where
         E: StdError + Send + Sync + 'static,
@@ -889,6 +1302,60 @@ impl KafkaRuntimeError {
             source: Box::new(error),
         }
     }
+
+    fn decode(context: &str, error: StorageError) -> Self {
+        Self::Decode {
+            message: format!("{context}: {}", error.message()),
+            source: error,
+        }
+    }
+
+    fn storage(context: &str, error: StorageError) -> Self {
+        Self::Storage {
+            message: format!("{context}: {}", error.message()),
+            source: error,
+        }
+    }
+
+    fn progress_load(error: ReadError) -> Self {
+        match error {
+            ReadError::Storage(storage) => match storage.kind() {
+                StorageErrorKind::Corruption | StorageErrorKind::Unsupported => {
+                    Self::decode("source progress row", storage)
+                }
+                _ => Self::storage("source progress row", storage),
+            },
+            other => Self::ProgressLoad {
+                message: other.to_string(),
+                source: other,
+            },
+        }
+    }
+
+    fn transaction(
+        error: TransactionCommitError,
+        source_id: &KafkaSourceId,
+        start_offset: KafkaOffset,
+    ) -> Self {
+        match error {
+            TransactionCommitError::Commit(CommitError::Conflict) => Self::TransactionAborted {
+                source_id: source_id.clone(),
+                start_offset,
+                source: CommitError::Conflict,
+            },
+            TransactionCommitError::Commit(CommitError::Storage(storage)) => {
+                Self::storage("transaction commit", storage)
+            }
+            TransactionCommitError::Commit(CommitError::Unimplemented(message)) => {
+                Self::storage("transaction commit", StorageError::unsupported(message))
+            }
+            TransactionCommitError::Commit(CommitError::EmptyBatch) => Self::storage(
+                "transaction commit",
+                StorageError::unsupported("kafka runtime attempted to commit an empty batch"),
+            ),
+            TransactionCommitError::Flush { sequence, source } => Self::Flush { sequence, source },
+        }
+    }
 }
 
 pub async fn resolve_start_position<B, S>(
@@ -900,7 +1367,11 @@ where
     B: KafkaBroker,
     S: KafkaProgressStore,
 {
-    if let Some(progress) = progress_store.load(&claim.source).await? {
+    if let Some(progress) = progress_store
+        .load(&claim.source)
+        .await
+        .map_err(KafkaRuntimeError::progress_load)?
+    {
         return Ok(KafkaStartPosition::Persisted {
             next_offset: progress.next_offset,
         });
@@ -1019,12 +1490,20 @@ where
                 .await
                 .map_err(KafkaRuntimeError::handler)?;
         }
+        observer.on_event(KafkaRuntimeEvent::SimulationSeam(
+            KafkaSimulationSeam::CrashBetweenWriteAndProgressPersist {
+                source: claim.source.clone(),
+                next_offset,
+            },
+        ));
         progress_store.stage_persist(
             &mut tx,
             &claim.source,
             KafkaSourceProgress::new(next_offset),
         );
-        let sequence = tx.commit_no_flush().await?;
+        let sequence = tx.commit_no_flush().await.map_err(|error| {
+            KafkaRuntimeError::transaction(error, &claim.source, requested_offset)
+        })?;
         observer.on_event(KafkaRuntimeEvent::BatchCommitted {
             source: claim.source.clone(),
             next_offset,
@@ -1058,6 +1537,62 @@ where
         skipped_offsets,
         telemetry: telemetry_snapshot,
     })
+}
+
+pub async fn drive_partition_once_with_retry<B, S, F, H, O, T>(
+    db: &Db,
+    broker: &B,
+    progress_store: &S,
+    claim: &KafkaPartitionClaim,
+    worker: KafkaWorkerOptions,
+    filter: &F,
+    handler: &H,
+    observer: &O,
+    telemetry: &T,
+    max_attempts: usize,
+) -> Result<KafkaWorkerStepOutcome, KafkaRuntimeError>
+where
+    B: KafkaBroker,
+    S: KafkaProgressStore,
+    F: KafkaRecordFilter,
+    H: KafkaBatchHandler,
+    O: KafkaRuntimeObserver,
+    T: KafkaTelemetrySink,
+{
+    let max_attempts = max_attempts.max(1);
+    for attempt in 0..max_attempts {
+        match drive_partition_once(
+            db,
+            broker,
+            progress_store,
+            claim,
+            worker,
+            filter,
+            handler,
+            observer,
+            telemetry,
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(KafkaRuntimeError::TransactionAborted {
+                source_id,
+                start_offset,
+                source,
+            }) if attempt + 1 < max_attempts => {
+                observer.on_event(KafkaRuntimeEvent::SimulationSeam(
+                    KafkaSimulationSeam::DuplicateDelivery {
+                        source: source_id,
+                        offset: start_offset,
+                    },
+                ));
+                let _ = source;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("retry loop must return or error")
 }
 
 fn expect_bytes_value<'a>(value: &'a Value, context: &str) -> Result<&'a [u8], StorageError> {
