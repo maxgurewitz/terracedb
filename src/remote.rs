@@ -1,8 +1,15 @@
-use std::{collections::BTreeMap, fmt, ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::{sync::Notify, task};
 
 use crate::{
     config::S3Location,
@@ -16,6 +23,10 @@ const LOCAL_READ_CHUNK_BYTES: usize = 64 * 1024;
 const CACHE_FORMAT_VERSION: u32 = 1;
 const FB_CACHE_SPAN_FULL: u8 = 1;
 const FB_CACHE_SPAN_RANGE: u8 = 2;
+const DEFAULT_REMOTE_CACHE_SEGMENT_BYTES: u64 = 128;
+const DEFAULT_REMOTE_CACHE_COALESCE_GAP_BYTES: u64 = 128;
+const DEFAULT_REMOTE_CACHE_PREFETCH_BYTES: u64 = 128;
+const DEFAULT_REMOTE_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
@@ -254,7 +265,7 @@ impl ObjectKeyLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CacheSpan {
     Full,
     Range { start: u64, end: u64 },
@@ -294,6 +305,60 @@ struct CacheIndexEntry {
     record: CacheEntryRecord,
     metadata_path: String,
     data_path: String,
+    last_access_tick: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoalescedReadRange {
+    fetch: Range<u64>,
+    members: Vec<(usize, Range<u64>)>,
+}
+
+#[derive(Clone, Debug)]
+struct InFlightSegment {
+    notify: Arc<Notify>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteCacheConfig {
+    pub(crate) max_bytes: u64,
+    pub(crate) segment_bytes: u64,
+    pub(crate) coalesce_gap_bytes: u64,
+    pub(crate) prefetch_bytes: u64,
+}
+
+impl Default for RemoteCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_REMOTE_CACHE_MAX_BYTES,
+            segment_bytes: DEFAULT_REMOTE_CACHE_SEGMENT_BYTES,
+            coalesce_gap_bytes: DEFAULT_REMOTE_CACHE_COALESCE_GAP_BYTES,
+            prefetch_bytes: DEFAULT_REMOTE_CACHE_PREFETCH_BYTES,
+        }
+    }
+}
+
+impl RemoteCacheConfig {
+    fn normalized(self) -> Self {
+        let segment_bytes = self.segment_bytes.max(1);
+        let coalesce_gap_bytes = self.coalesce_gap_bytes.min(segment_bytes);
+        let prefetch_bytes = self.prefetch_bytes - (self.prefetch_bytes % segment_bytes);
+        let max_bytes = self.max_bytes.max(segment_bytes);
+        Self {
+            max_bytes,
+            segment_bytes,
+            coalesce_gap_bytes,
+            prefetch_bytes,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RemoteCacheState {
+    entries: BTreeMap<String, Vec<CacheIndexEntry>>,
+    in_flight: BTreeMap<(String, CacheSpan), InFlightSegment>,
+    total_bytes: u64,
+    next_access_tick: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,7 +427,8 @@ pub struct RemoteCache {
     root: String,
     data_dir: String,
     metadata_dir: String,
-    entries: Mutex<BTreeMap<String, Vec<CacheIndexEntry>>>,
+    config: RemoteCacheConfig,
+    state: Mutex<RemoteCacheState>,
 }
 
 impl fmt::Debug for RemoteCache {
@@ -371,6 +437,7 @@ impl fmt::Debug for RemoteCache {
             .field("root", &self.root)
             .field("data_dir", &self.data_dir)
             .field("metadata_dir", &self.metadata_dir)
+            .field("config", &self.config)
             .field("entry_count", &self.entry_count())
             .finish()
     }
@@ -380,6 +447,14 @@ impl RemoteCache {
     pub async fn open(
         file_system: Arc<dyn FileSystem>,
         root: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_config(file_system, root, RemoteCacheConfig::default()).await
+    }
+
+    pub(crate) async fn open_with_config(
+        file_system: Arc<dyn FileSystem>,
+        root: impl Into<String>,
+        config: RemoteCacheConfig,
     ) -> Result<Self, StorageError> {
         let root = root.into();
         let data_dir = join_fs_path(&root, "data");
@@ -392,7 +467,8 @@ impl RemoteCache {
             root,
             data_dir,
             metadata_dir,
-            entries: Mutex::new(BTreeMap::new()),
+            config: config.normalized(),
+            state: Mutex::new(RemoteCacheState::default()),
         };
         cache.rebuild_index().await?;
         Ok(cache)
@@ -403,11 +479,12 @@ impl RemoteCache {
     }
 
     pub fn entry_count(&self) -> usize {
-        lock(&self.entries).values().map(Vec::len).sum()
+        lock(&self.state).entries.values().map(Vec::len).sum()
     }
 
     pub(crate) fn total_cached_bytes(&self) -> u64 {
-        lock(&self.entries)
+        lock(&self.state)
+            .entries
             .values()
             .flatten()
             .map(|entry| entry.record.data_len)
@@ -415,7 +492,8 @@ impl RemoteCache {
     }
 
     pub(crate) fn entries_snapshot(&self) -> Vec<RemoteCacheEntryInfo> {
-        let mut entries = lock(&self.entries)
+        let mut entries = lock(&self.state)
+            .entries
             .values()
             .flatten()
             .map(|entry| RemoteCacheEntryInfo {
@@ -433,20 +511,48 @@ impl RemoteCache {
     }
 
     async fn rebuild_index(&self) -> Result<(), StorageError> {
-        let listed = self.file_system.list(&self.metadata_dir).await?;
+        let mut listed = self.file_system.list(&self.metadata_dir).await?;
+        listed.sort();
         let mut rebuilt = BTreeMap::new();
+        let mut known_data_paths = BTreeSet::new();
+        let mut total_bytes = 0_u64;
+        let mut next_access_tick = 0_u64;
 
         for metadata_path in listed.into_iter().filter(|path| path.ends_with(".json")) {
             let Some(entry) = self.load_index_entry(&metadata_path).await? else {
+                let _ = self.file_system.delete(&metadata_path).await;
                 continue;
             };
+            known_data_paths.insert(entry.data_path.clone());
+            total_bytes = total_bytes.saturating_add(entry.record.data_len);
             rebuilt
                 .entry(entry.record.object_key.clone())
                 .or_insert_with(Vec::new)
-                .push(entry);
+                .push(CacheIndexEntry {
+                    last_access_tick: next_access_tick,
+                    ..entry
+                });
+            next_access_tick = next_access_tick.saturating_add(1);
         }
 
-        *lock(&self.entries) = rebuilt;
+        let mut data_paths = self.file_system.list(&self.data_dir).await?;
+        data_paths.sort();
+        for data_path in data_paths {
+            if (data_path.ends_with(".bin") || data_path.ends_with(".tmp"))
+                && !known_data_paths.contains(&data_path)
+            {
+                let _ = self.file_system.delete(&data_path).await;
+            }
+        }
+
+        let mut state = lock(&self.state);
+        state.entries = rebuilt;
+        state.in_flight.clear();
+        state.total_bytes = total_bytes;
+        state.next_access_tick = next_access_tick;
+        let evicted = self.plan_budget_evictions_locked(&mut state);
+        drop(state);
+        self.delete_entries(evicted).await?;
         Ok(())
     }
 
@@ -473,6 +579,7 @@ impl RemoteCache {
                 record: file.record,
                 metadata_path: metadata_path.to_string(),
                 data_path,
+                last_access_tick: 0,
             })),
             Err(error) if error.kind() == StorageErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -497,48 +604,49 @@ impl RemoteCache {
         )
     }
 
-    fn lookup_covering_entry(
-        &self,
+    fn next_access_tick_locked(state: &mut RemoteCacheState) -> u64 {
+        let tick = state.next_access_tick;
+        state.next_access_tick = state.next_access_tick.saturating_add(1);
+        tick
+    }
+
+    fn lookup_covering_entry_locked(
+        state: &mut RemoteCacheState,
         object_key: &str,
         range: Range<u64>,
     ) -> Option<CacheIndexEntry> {
-        let entries = lock(&self.entries);
-        let object_entries = entries.get(object_key)?;
-        object_entries.iter().find_map(|entry| {
-            entry
-                .record
-                .span
-                .contains(range.clone())
-                .then(|| entry.clone())
-        })
+        let tick = Self::next_access_tick_locked(state);
+        let object_entries = state.entries.get_mut(object_key)?;
+        let entry = object_entries
+            .iter_mut()
+            .find(|entry| entry.record.span.contains(range.clone()))?;
+        entry.last_access_tick = tick;
+        Some(entry.clone())
     }
 
-    pub async fn read_full(&self, object_key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        let Some(entry) = self.lookup_covering_entry(object_key, 0..0) else {
-            return Ok(None);
-        };
-        if entry.record.span != CacheSpan::Full {
-            return Ok(None);
-        }
-        read_local_file_all(self.file_system.as_ref(), &entry.data_path)
-            .await
-            .map(Some)
-    }
-
-    pub async fn read_range(
-        &self,
+    fn lookup_exact_entry_locked(
+        state: &mut RemoteCacheState,
         object_key: &str,
-        range: Range<u64>,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        if range.start >= range.end {
-            return Ok(Some(Vec::new()));
-        }
+        span: CacheSpan,
+    ) -> Option<CacheIndexEntry> {
+        let tick = Self::next_access_tick_locked(state);
+        let object_entries = state.entries.get_mut(object_key)?;
+        let entry = object_entries
+            .iter_mut()
+            .find(|entry| entry.record.span == span)?;
+        entry.last_access_tick = tick;
+        Some(entry.clone())
+    }
 
-        let Some(entry) = self.lookup_covering_entry(object_key, range.clone()) else {
-            return Ok(None);
-        };
-        let bytes = read_local_file_all(self.file_system.as_ref(), &entry.data_path).await?;
-        let slice = match entry.record.span {
+    fn lookup_full_entry_locked(
+        state: &mut RemoteCacheState,
+        object_key: &str,
+    ) -> Option<CacheIndexEntry> {
+        Self::lookup_exact_entry_locked(state, object_key, CacheSpan::Full)
+    }
+
+    fn range_entry_slice(entry: &CacheIndexEntry, range: Range<u64>, bytes: &[u8]) -> Vec<u8> {
+        match entry.record.span {
             CacheSpan::Full => {
                 if range.start as usize >= bytes.len() {
                     Vec::new()
@@ -547,7 +655,7 @@ impl RemoteCache {
                     bytes[range.start as usize..end].to_vec()
                 }
             }
-            CacheSpan::Range { start, end: _ } => {
+            CacheSpan::Range { start, .. } => {
                 let relative_start = range.start.saturating_sub(start) as usize;
                 if relative_start >= bytes.len() {
                     Vec::new()
@@ -558,8 +666,475 @@ impl RemoteCache {
                     bytes[relative_start..relative_end].to_vec()
                 }
             }
+        }
+    }
+
+    fn aligned_segment_span(&self, offset: u64) -> CacheSpan {
+        let segment_start = offset - (offset % self.config.segment_bytes);
+        CacheSpan::Range {
+            start: segment_start,
+            end: segment_start.saturating_add(self.config.segment_bytes),
+        }
+    }
+
+    fn segment_spans_for_ranges(&self, ranges: &[Range<u64>]) -> Vec<CacheSpan> {
+        let mut spans = BTreeSet::new();
+        for range in ranges {
+            if range.start >= range.end {
+                continue;
+            }
+            let mut cursor = range.start;
+            while cursor < range.end {
+                let span = self.aligned_segment_span(cursor);
+                spans.insert(span);
+                cursor = match span {
+                    CacheSpan::Range { end, .. } => end,
+                    CacheSpan::Full => range.end,
+                };
+            }
+        }
+        spans.into_iter().collect()
+    }
+
+    fn prefetch_spans_for_ranges(&self, ranges: &[Range<u64>]) -> Vec<CacheSpan> {
+        let prefetch_segments = (self.config.prefetch_bytes / self.config.segment_bytes) as usize;
+        if prefetch_segments == 0 {
+            return Vec::new();
+        }
+        let required = self.segment_spans_for_ranges(ranges);
+        let last_end = required
+            .iter()
+            .filter_map(|span| match span {
+                CacheSpan::Range { end, .. } => Some(*end),
+                CacheSpan::Full => None,
+            })
+            .max();
+        let Some(mut cursor) = last_end else {
+            return Vec::new();
         };
-        Ok(Some(slice))
+        let mut spans = Vec::with_capacity(prefetch_segments);
+        while spans.len() < prefetch_segments {
+            let span = self.aligned_segment_span(cursor);
+            spans.push(span);
+            cursor = match span {
+                CacheSpan::Range { end, .. } => end,
+                CacheSpan::Full => break,
+            };
+        }
+        spans
+    }
+
+    fn coalesce_ranges(ranges: &[Range<u64>], gap_bytes: u64) -> Vec<CoalescedReadRange> {
+        let mut sorted = ranges.iter().cloned().enumerate().collect::<Vec<_>>();
+        sorted.sort_by_key(|(_, range)| (range.start, range.end));
+        let mut merged: Vec<CoalescedReadRange> = Vec::new();
+        for (index, range) in sorted {
+            if range.start >= range.end {
+                continue;
+            }
+            match merged.last_mut() {
+                Some(current) if range.start <= current.fetch.end.saturating_add(gap_bytes) => {
+                    current.fetch.end = current.fetch.end.max(range.end);
+                    current.members.push((index, range));
+                }
+                _ => merged.push(CoalescedReadRange {
+                    fetch: range.clone(),
+                    members: vec![(index, range)],
+                }),
+            }
+        }
+        merged
+    }
+
+    fn can_satisfy_segment_locked(
+        state: &RemoteCacheState,
+        object_key: &str,
+        span: CacheSpan,
+    ) -> bool {
+        state
+            .entries
+            .get(object_key)
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .any(|entry| {
+                entry.record.span.contains(match span {
+                    CacheSpan::Full => 0..0,
+                    CacheSpan::Range { start, end } => start..end,
+                })
+            })
+    }
+
+    fn claim_segment_downloads(
+        &self,
+        object_key: &str,
+        required: &[CacheSpan],
+        prefetch: &[CacheSpan],
+    ) -> (Vec<CacheSpan>, Vec<CacheSpan>, Vec<Arc<Notify>>) {
+        let mut state = lock(&self.state);
+        let mut to_download = Vec::new();
+        let mut background = Vec::new();
+        let mut waiters = Vec::new();
+
+        for &span in required {
+            if Self::can_satisfy_segment_locked(&state, object_key, span) {
+                continue;
+            }
+            let key = (object_key.to_string(), span);
+            if let Some(in_flight) = state.in_flight.get(&key) {
+                if !waiters
+                    .iter()
+                    .any(|notify: &Arc<Notify>| Arc::ptr_eq(notify, &in_flight.notify))
+                {
+                    waiters.push(in_flight.notify.clone());
+                }
+                continue;
+            }
+            let notify = Arc::new(Notify::new());
+            state.in_flight.insert(key, InFlightSegment { notify });
+            to_download.push(span);
+        }
+
+        for &span in prefetch {
+            if Self::can_satisfy_segment_locked(&state, object_key, span) {
+                continue;
+            }
+            let key = (object_key.to_string(), span);
+            if state.in_flight.contains_key(&key) {
+                continue;
+            }
+            let notify = Arc::new(Notify::new());
+            state.in_flight.insert(key, InFlightSegment { notify });
+            background.push(span);
+        }
+
+        (to_download, background, waiters)
+    }
+
+    fn finish_in_flight_segments(&self, object_key: &str, spans: &[CacheSpan]) -> Vec<Arc<Notify>> {
+        let mut state = lock(&self.state);
+        let mut notifies = Vec::new();
+        for &span in spans {
+            if let Some(in_flight) = state.in_flight.remove(&(object_key.to_string(), span)) {
+                notifies.push(in_flight.notify);
+            }
+        }
+        notifies
+    }
+
+    fn plan_budget_evictions_locked(&self, state: &mut RemoteCacheState) -> Vec<CacheIndexEntry> {
+        let mut removed = Vec::new();
+        while state.total_bytes > self.config.max_bytes {
+            let Some((object_key, span, _)) = state
+                .entries
+                .iter()
+                .flat_map(|(object_key, entries)| {
+                    entries.iter().map(move |entry| {
+                        (
+                            object_key.clone(),
+                            entry.record.span,
+                            entry.last_access_tick,
+                        )
+                    })
+                })
+                .min_by_key(|(_, _, tick)| *tick)
+            else {
+                break;
+            };
+            let Some(entries) = state.entries.get_mut(&object_key) else {
+                continue;
+            };
+            let Some(index) = entries.iter().position(|entry| entry.record.span == span) else {
+                continue;
+            };
+            let removed_entry = entries.remove(index);
+            state.total_bytes = state
+                .total_bytes
+                .saturating_sub(removed_entry.record.data_len);
+            removed.push(removed_entry);
+            if entries.is_empty() {
+                state.entries.remove(&object_key);
+            }
+        }
+        removed
+    }
+
+    async fn delete_entries(&self, entries: Vec<CacheIndexEntry>) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for entry in entries {
+            match self.file_system.delete(&entry.data_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == StorageErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            match self.file_system.delete(&entry.metadata_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == StorageErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.file_system.sync_dir(&self.data_dir).await?;
+        self.file_system.sync_dir(&self.metadata_dir).await?;
+        Ok(())
+    }
+
+    async fn try_read_range_from_cache(
+        &self,
+        object_key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        if range.start >= range.end {
+            return Ok(Some(Vec::new()));
+        }
+
+        if let Some(entry) = {
+            let mut state = lock(&self.state);
+            Self::lookup_covering_entry_locked(&mut state, object_key, range.clone())
+        } {
+            let bytes = read_local_file_all(self.file_system.as_ref(), &entry.data_path).await?;
+            return Ok(Some(Self::range_entry_slice(&entry, range, &bytes)));
+        }
+
+        let segments = self.segment_spans_for_ranges(std::slice::from_ref(&range));
+        let segment_entries = {
+            let mut state = lock(&self.state);
+            let mut entries = Vec::with_capacity(segments.len());
+            for span in &segments {
+                let Some(entry) = Self::lookup_exact_entry_locked(&mut state, object_key, *span)
+                else {
+                    return Ok(None);
+                };
+                entries.push(entry);
+            }
+            entries
+        };
+
+        let mut stitched = Vec::new();
+        for entry in segment_entries {
+            let bytes = read_local_file_all(self.file_system.as_ref(), &entry.data_path).await?;
+            let CacheSpan::Range { start, end } = entry.record.span else {
+                continue;
+            };
+            let slice_start = range.start.max(start);
+            let slice_end = range.end.min(end);
+            if slice_start >= slice_end {
+                continue;
+            }
+            stitched.extend_from_slice(&Self::range_entry_slice(
+                &entry,
+                slice_start..slice_end,
+                &bytes,
+            ));
+        }
+        Ok(Some(stitched))
+    }
+
+    async fn fetch_remote_ranges(
+        object_store: &dyn ObjectStore,
+        key: &str,
+        ranges: &[Range<u64>],
+        gap_bytes: u64,
+    ) -> Result<Vec<(Range<u64>, Vec<u8>)>, RemoteStorageError> {
+        let mut fetched = Vec::new();
+        for merged in Self::coalesce_ranges(ranges, gap_bytes) {
+            let bytes = object_store
+                .get_range(key, merged.fetch.start, merged.fetch.end)
+                .await
+                .map_err(|error| {
+                    let error = RemoteStorageError::classify(RemoteOperation::GetRange, key, error);
+                    emit_remote_error(&error);
+                    error
+                })?;
+            fetched.push((merged.fetch, bytes));
+        }
+        Ok(fetched)
+    }
+
+    async fn store_downloaded_segments(
+        &self,
+        object_key: &str,
+        spans: &[CacheSpan],
+        fetched_groups: &[(Range<u64>, Vec<u8>)],
+    ) -> Result<(), StorageError> {
+        for &span in spans {
+            let CacheSpan::Range { start, end } = span else {
+                continue;
+            };
+            let mut segment_bytes = None;
+            for (fetched_range, bytes) in fetched_groups {
+                if fetched_range.start <= start && fetched_range.end >= end {
+                    let relative_start = start.saturating_sub(fetched_range.start) as usize;
+                    let relative_end = end.saturating_sub(fetched_range.start) as usize;
+                    let available_end = relative_end.min(bytes.len());
+                    let available_start = relative_start.min(available_end);
+                    segment_bytes = Some(bytes[available_start..available_end].to_vec());
+                    break;
+                }
+            }
+            let bytes = segment_bytes.unwrap_or_default();
+            self.store(object_key, span, &bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn spawn_background_prefetch(
+        self: Arc<Self>,
+        object_store: Arc<dyn ObjectStore>,
+        object_key: String,
+        spans: Vec<CacheSpan>,
+    ) {
+        if spans.is_empty() {
+            return;
+        }
+        let ranges = spans
+            .iter()
+            .filter_map(|span| match span {
+                CacheSpan::Range { start, end } => Some(*start..*end),
+                CacheSpan::Full => None,
+            })
+            .collect::<Vec<_>>();
+        let outcome = Self::fetch_remote_ranges(
+            object_store.as_ref(),
+            &object_key,
+            &ranges,
+            self.config.coalesce_gap_bytes,
+        )
+        .await;
+
+        match outcome {
+            Err(error) => {
+                tracing::warn!(
+                    terracedb_remote_target = %object_key,
+                    error = %error,
+                    "terracedb background segment prefetch failed"
+                );
+            }
+            Ok(fetched) => {
+                if let Err(error) = self
+                    .store_downloaded_segments(&object_key, &spans, &fetched)
+                    .await
+                {
+                    tracing::warn!(
+                        terracedb_remote_target = %object_key,
+                        error = %error,
+                        "terracedb background segment cache write failed"
+                    );
+                }
+            }
+        }
+        for notify in self.finish_in_flight_segments(&object_key, &spans) {
+            notify.notify_waiters();
+        }
+    }
+
+    async fn read_through_ranges(
+        self: &Arc<Self>,
+        object_store: Arc<dyn ObjectStore>,
+        object_key: &str,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<u8>, UnifiedStorageError> {
+        loop {
+            let mut stitched = Vec::new();
+            let mut all_hit = true;
+            for range in ranges {
+                match self
+                    .try_read_range_from_cache(object_key, range.clone())
+                    .await?
+                {
+                    Some(bytes) => stitched.extend_from_slice(&bytes),
+                    None => {
+                        all_hit = false;
+                        break;
+                    }
+                }
+            }
+            if all_hit {
+                return Ok(stitched);
+            }
+
+            let required = self.segment_spans_for_ranges(ranges);
+            let prefetch = self.prefetch_spans_for_ranges(ranges);
+            let (to_download, background, waiters) =
+                self.claim_segment_downloads(object_key, &required, &prefetch);
+
+            if !to_download.is_empty() {
+                let download_ranges = to_download
+                    .iter()
+                    .filter_map(|span| match span {
+                        CacheSpan::Range { start, end } => Some(*start..*end),
+                        CacheSpan::Full => None,
+                    })
+                    .collect::<Vec<_>>();
+                let fetched = match Self::fetch_remote_ranges(
+                    object_store.as_ref(),
+                    object_key,
+                    &download_ranges,
+                    self.config.coalesce_gap_bytes,
+                )
+                .await
+                {
+                    Ok(fetched) => fetched,
+                    Err(error) => {
+                        for notify in self.finish_in_flight_segments(object_key, &to_download) {
+                            notify.notify_waiters();
+                        }
+                        return Err(UnifiedStorageError::Remote(error));
+                    }
+                };
+                if let Err(error) = self
+                    .store_downloaded_segments(object_key, &to_download, &fetched)
+                    .await
+                {
+                    for notify in self.finish_in_flight_segments(object_key, &to_download) {
+                        notify.notify_waiters();
+                    }
+                    return Err(UnifiedStorageError::Local(error));
+                }
+                for notify in self.finish_in_flight_segments(object_key, &to_download) {
+                    notify.notify_waiters();
+                }
+            }
+
+            if !background.is_empty() {
+                let cache = self.clone();
+                let object_store = object_store.clone();
+                let object_key = object_key.to_string();
+                task::spawn(async move {
+                    cache
+                        .spawn_background_prefetch(object_store, object_key, background)
+                        .await;
+                });
+            }
+
+            if to_download.is_empty() && waiters.is_empty() {
+                return Ok(stitched);
+            }
+
+            for waiter in waiters {
+                waiter.notified().await;
+            }
+        }
+    }
+
+    pub async fn read_full(&self, object_key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(entry) = ({
+            let mut state = lock(&self.state);
+            Self::lookup_full_entry_locked(&mut state, object_key)
+        }) else {
+            return Ok(None);
+        };
+        read_local_file_all(self.file_system.as_ref(), &entry.data_path)
+            .await
+            .map(Some)
+    }
+
+    pub async fn read_range(
+        &self,
+        object_key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.try_read_range_from_cache(object_key, range).await
     }
 
     pub async fn store(
@@ -568,6 +1143,9 @@ impl RemoteCache {
         span: CacheSpan,
         bytes: &[u8],
     ) -> Result<(), StorageError> {
+        if bytes.len() as u64 > self.config.max_bytes {
+            return Ok(());
+        }
         let data_path = self.data_path(object_key, span);
         let metadata_path = self.metadata_path(object_key, span);
         write_bytes_atomic(self.file_system.as_ref(), &data_path, bytes).await?;
@@ -585,14 +1163,36 @@ impl RemoteCache {
         self.file_system.sync_dir(&self.data_dir).await?;
         self.file_system.sync_dir(&self.metadata_dir).await?;
 
-        let mut entries = lock(&self.entries);
-        let object_entries = entries.entry(object_key.to_string()).or_default();
-        object_entries.retain(|entry| entry.record.span != span);
-        object_entries.push(CacheIndexEntry {
-            record: metadata.record,
-            metadata_path,
-            data_path,
-        });
+        let evicted = {
+            let mut state = lock(&self.state);
+            let tick = Self::next_access_tick_locked(&mut state);
+            let removed_bytes = {
+                let object_entries = state.entries.entry(object_key.to_string()).or_default();
+                if let Some(index) = object_entries
+                    .iter()
+                    .position(|entry| entry.record.span == span)
+                {
+                    let removed = object_entries.remove(index);
+                    Some(removed.record.data_len)
+                } else {
+                    None
+                }
+            };
+            if let Some(removed_bytes) = removed_bytes {
+                state.total_bytes = state.total_bytes.saturating_sub(removed_bytes);
+            }
+            let record = metadata.record.clone();
+            let object_entries = state.entries.entry(object_key.to_string()).or_default();
+            object_entries.push(CacheIndexEntry {
+                record,
+                metadata_path,
+                data_path,
+                last_access_tick: tick,
+            });
+            state.total_bytes = state.total_bytes.saturating_add(metadata.record.data_len);
+            self.plan_budget_evictions_locked(&mut state)
+        };
+        self.delete_entries(evicted).await?;
         Ok(())
     }
 
@@ -602,40 +1202,60 @@ impl RemoteCache {
         span: CacheSpan,
     ) -> Result<(), StorageError> {
         let removed = {
-            let mut entries = lock(&self.entries);
-            let object_entries = entries.entry(object_key.to_string()).or_default();
-            let mut removed = Vec::new();
-            object_entries.retain(|entry| {
-                let matches = entry.record.span == span;
-                if matches {
-                    removed.push(entry.clone());
-                }
-                !matches
-            });
-            if object_entries.is_empty() {
-                entries.remove(object_key);
+            let mut state = lock(&self.state);
+            let removed = {
+                let object_entries = state.entries.entry(object_key.to_string()).or_default();
+                let mut removed = Vec::new();
+                object_entries.retain(|entry| {
+                    let matches = entry.record.span == span;
+                    if matches {
+                        removed.push(entry.clone());
+                    }
+                    !matches
+                });
+                removed
+            };
+            for entry in &removed {
+                state.total_bytes = state.total_bytes.saturating_sub(entry.record.data_len);
+            }
+            let remove_object = state
+                .entries
+                .get(object_key)
+                .is_some_and(|entries| entries.is_empty());
+            if remove_object {
+                state.entries.remove(object_key);
             }
             removed
         };
 
-        for entry in removed {
-            self.file_system.delete(&entry.data_path).await?;
-            self.file_system.delete(&entry.metadata_path).await?;
-        }
-        self.file_system.sync_dir(&self.data_dir).await?;
-        self.file_system.sync_dir(&self.metadata_dir).await?;
-        Ok(())
+        self.delete_entries(removed).await
     }
 
     pub async fn remove_object(&self, object_key: &str) -> Result<(), StorageError> {
-        let removed = lock(&self.entries).remove(object_key).unwrap_or_default();
-        for entry in removed {
-            self.file_system.delete(&entry.data_path).await?;
-            self.file_system.delete(&entry.metadata_path).await?;
+        let (removed, notifies) = {
+            let mut state = lock(&self.state);
+            let removed = state.entries.remove(object_key).unwrap_or_default();
+            for entry in &removed {
+                state.total_bytes = state.total_bytes.saturating_sub(entry.record.data_len);
+            }
+            let keys = state
+                .in_flight
+                .keys()
+                .filter(|(key, _)| key == object_key)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut notifies = Vec::new();
+            for key in keys {
+                if let Some(in_flight) = state.in_flight.remove(&key) {
+                    notifies.push(in_flight.notify);
+                }
+            }
+            (removed, notifies)
+        };
+        for notify in notifies {
+            notify.notify_waiters();
         }
-        self.file_system.sync_dir(&self.data_dir).await?;
-        self.file_system.sync_dir(&self.metadata_dir).await?;
-        Ok(())
+        self.delete_entries(removed).await
     }
 }
 
@@ -840,36 +1460,23 @@ impl UnifiedStorage {
                     .map_err(UnifiedStorageError::Local)
             }
             StorageSource::RemoteObject { key } => {
-                if let Some(cache) = &self.cache
-                    && let Ok(Some(bytes)) = cache.read_range(key, range.clone()).await
-                {
-                    return Ok(bytes);
+                if let Some(cache) = &self.cache {
+                    return cache
+                        .read_through_ranges(
+                            self.object_store.clone(),
+                            key,
+                            std::slice::from_ref(&range),
+                        )
+                        .await;
                 }
 
-                let bytes = self
-                    .object_store
-                    .get_range(key, range.start, range.end)
-                    .await
-                    .map_err(|error| {
-                        let error =
-                            RemoteStorageError::classify(RemoteOperation::GetRange, key, error);
-                        emit_remote_error(&error);
-                        UnifiedStorageError::Remote(error)
-                    })?;
-                if let Some(cache) = &self.cache {
-                    cache
-                        .store(
-                            key,
-                            CacheSpan::Range {
-                                start: range.start,
-                                end: range.end,
-                            },
-                            &bytes,
-                        )
-                        .await
-                        .map_err(UnifiedStorageError::Local)?;
-                }
-                Ok(bytes)
+                let mut stitched = Self::coalesced_remote_read(
+                    self.object_store.as_ref(),
+                    key,
+                    std::slice::from_ref(&range),
+                )
+                .await?;
+                Ok(stitched.pop().unwrap_or_default())
             }
         }
     }
@@ -879,11 +1486,52 @@ impl UnifiedStorage {
         source: &StorageSource,
         ranges: &[Range<u64>],
     ) -> Result<Vec<u8>, UnifiedStorageError> {
-        let mut stitched = Vec::new();
-        for range in ranges {
-            stitched.extend_from_slice(&self.read_range(source, range.clone()).await?);
+        match source {
+            StorageSource::LocalFile { .. } => {
+                let mut stitched = Vec::new();
+                for range in ranges {
+                    stitched.extend_from_slice(&self.read_range(source, range.clone()).await?);
+                }
+                Ok(stitched)
+            }
+            StorageSource::RemoteObject { key } => {
+                if let Some(cache) = &self.cache {
+                    return cache
+                        .read_through_ranges(self.object_store.clone(), key, ranges)
+                        .await;
+                }
+                let parts =
+                    Self::coalesced_remote_read(self.object_store.as_ref(), key, ranges).await?;
+                Ok(parts.concat())
+            }
         }
-        Ok(stitched)
+    }
+
+    async fn coalesced_remote_read(
+        object_store: &dyn ObjectStore,
+        key: &str,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<Vec<u8>>, UnifiedStorageError> {
+        let merged = RemoteCache::coalesce_ranges(ranges, DEFAULT_REMOTE_CACHE_COALESCE_GAP_BYTES);
+        let mut responses = vec![Vec::new(); ranges.len()];
+        for group in merged {
+            let bytes = object_store
+                .get_range(key, group.fetch.start, group.fetch.end)
+                .await
+                .map_err(|error| {
+                    let error = RemoteStorageError::classify(RemoteOperation::GetRange, key, error);
+                    emit_remote_error(&error);
+                    UnifiedStorageError::Remote(error)
+                })?;
+            for (member_index, member) in &group.members {
+                let relative_start = member.start.saturating_sub(group.fetch.start) as usize;
+                let relative_end = member.end.saturating_sub(group.fetch.start) as usize;
+                let available_end = relative_end.min(bytes.len());
+                let available_start = relative_start.min(available_end);
+                responses[*member_index] = bytes[available_start..available_end].to_vec();
+            }
+        }
+        Ok(responses)
     }
 
     pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, RemoteStorageError> {
@@ -901,14 +1549,11 @@ impl UnifiedStorage {
             error
         })?;
         if let Some(cache) = &self.cache {
-            cache
-                .store(key, CacheSpan::Full, data)
-                .await
-                .map_err(|error| {
-                    let error = RemoteStorageError::classify(RemoteOperation::Put, key, error);
-                    emit_remote_error(&error);
-                    error
-                })?;
+            cache.remove_object(key).await.map_err(|error| {
+                let error = RemoteStorageError::classify(RemoteOperation::Put, key, error);
+                emit_remote_error(&error);
+                error
+            })?;
         }
         Ok(())
     }
@@ -953,7 +1598,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
     };
 
@@ -999,6 +1644,19 @@ mod tests {
         }
     }
 
+    fn test_cache_config(
+        segment_bytes: u64,
+        max_bytes: u64,
+        prefetch_bytes: u64,
+    ) -> RemoteCacheConfig {
+        RemoteCacheConfig {
+            max_bytes,
+            segment_bytes,
+            coalesce_gap_bytes: segment_bytes,
+            prefetch_bytes,
+        }
+    }
+
     #[derive(Clone)]
     struct CountingObjectStore {
         inner: Arc<dyn ObjectStore>,
@@ -1019,6 +1677,45 @@ mod tests {
 
         fn get_count(&self) -> usize {
             lock(&self.get_calls).len()
+        }
+
+        fn range_calls(&self) -> Vec<(String, u64, u64)> {
+            lock(&self.range_calls).clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingRangeObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        range_calls: Arc<Mutex<Vec<(String, u64, u64)>>>,
+        range_call_notify: Arc<Notify>,
+        block_ranges: Arc<AtomicBool>,
+        release_ranges: Arc<Notify>,
+    }
+
+    impl BlockingRangeObjectStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                range_calls: Arc::new(Mutex::new(Vec::new())),
+                range_call_notify: Arc::new(Notify::new()),
+                block_ranges: Arc::new(AtomicBool::new(true)),
+                release_ranges: Arc::new(Notify::new()),
+            }
+        }
+
+        async fn wait_for_range_calls(&self, expected: usize) {
+            loop {
+                if lock(&self.range_calls).len() >= expected {
+                    return;
+                }
+                self.range_call_notify.notified().await;
+            }
+        }
+
+        fn release(&self) {
+            self.block_ranges.store(false, Ordering::Relaxed);
+            self.release_ranges.notify_waiters();
         }
 
         fn range_calls(&self) -> Vec<(String, u64, u64)> {
@@ -1053,6 +1750,43 @@ mod tests {
 
         async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
             lock(&self.list_calls).push(prefix.to_string());
+            self.inner.list(prefix).await
+        }
+
+        async fn copy(&self, from: &str, to: &str) -> Result<(), StorageError> {
+            self.inner.copy(from, to).await
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for BlockingRangeObjectStore {
+        async fn put(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
+            self.inner.put(key, data).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+            self.inner.get(key).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            start: u64,
+            end: u64,
+        ) -> Result<Vec<u8>, StorageError> {
+            lock(&self.range_calls).push((key.to_string(), start, end));
+            self.range_call_notify.notify_waiters();
+            if self.block_ranges.load(Ordering::Relaxed) {
+                self.release_ranges.notified().await;
+            }
+            self.inner.get_range(key, start, end).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.delete(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
             self.inner.list(prefix).await
         }
 
@@ -1276,9 +2010,10 @@ mod tests {
         let file_system = Arc::new(TokioFileSystem::new());
         let inner_store: Arc<dyn ObjectStore> = Arc::new(LocalDirObjectStore::new(&object_root));
         let store = Arc::new(CountingObjectStore::new(inner_store));
-        let cache = RemoteCache::open(
+        let cache = RemoteCache::open_with_config(
             file_system.clone(),
             cache_root.to_string_lossy().into_owned(),
+            test_cache_config(8, 1024 * 1024, 0),
         )
         .await
         .expect("open cache");
@@ -1330,9 +2065,10 @@ mod tests {
         .expect("rewrite unsupported metadata");
 
         let rebuilt = Arc::new(
-            RemoteCache::open(
+            RemoteCache::open_with_config(
                 file_system.clone(),
                 cache_root.to_string_lossy().into_owned(),
+                test_cache_config(8, 1024 * 1024, 0),
             )
             .await
             .expect("reopen cache"),
@@ -1359,23 +2095,24 @@ mod tests {
         assert_eq!(full, b"hello invalid cache");
         assert_eq!(range, b"cdef");
         assert_eq!(store.get_count(), 1);
-        assert_eq!(store.range_calls(), vec![(range_key.to_string(), 2, 6)]);
+        assert_eq!(store.range_calls(), vec![(range_key.to_string(), 0, 8)]);
 
         cleanup(&cache_root);
         cleanup(&object_root);
     }
 
     #[tokio::test]
-    async fn range_reads_fetch_exact_windows_and_stitch_them() {
+    async fn range_reads_coalesce_nearby_windows_into_aligned_segment_fetches() {
         let cache_root = unique_test_dir("range-reads");
         let object_root = unique_test_dir("range-reads-objects");
         let file_system = Arc::new(TokioFileSystem::new());
         let inner_store: Arc<dyn ObjectStore> = Arc::new(LocalDirObjectStore::new(&object_root));
         let store = Arc::new(CountingObjectStore::new(inner_store));
         let cache = Arc::new(
-            RemoteCache::open(
+            RemoteCache::open_with_config(
                 file_system.clone(),
                 cache_root.to_string_lossy().into_owned(),
+                test_cache_config(8, 1024 * 1024, 0),
             )
             .await
             .expect("open cache"),
@@ -1394,12 +2131,250 @@ mod tests {
             .expect("stitched range read");
 
         assert_eq!(stitched, b"cdeklmuvwxyz");
+        assert_eq!(store.range_calls(), vec![(key.to_string(), 0, 32)]);
+
+        cleanup(&cache_root);
+        cleanup(&object_root);
+    }
+
+    #[tokio::test]
+    async fn overlapping_range_reads_reuse_aligned_segments() {
+        let cache_root = unique_test_dir("overlapping-segment-reuse");
+        let object_root = unique_test_dir("overlapping-segment-reuse-objects");
+        let file_system = Arc::new(TokioFileSystem::new());
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(LocalDirObjectStore::new(&object_root));
+        let store = Arc::new(CountingObjectStore::new(inner_store));
+        let cache = Arc::new(
+            RemoteCache::open_with_config(
+                file_system.clone(),
+                cache_root.to_string_lossy().into_owned(),
+                test_cache_config(8, 1024 * 1024, 0),
+            )
+            .await
+            .expect("open cache"),
+        );
+        let storage = UnifiedStorage::new(file_system, store.clone(), Some(cache));
+        let key = "cold/table-000001/0000/00000000000000000001-00000000000000000009/SST-000321.sst";
+        store
+            .put(key, b"abcdefghijklmnopqrstuvwxyz")
+            .await
+            .expect("seed object store");
+        let source = StorageSource::remote_object(key);
+
+        let first = storage
+            .read_range(&source, 2..6)
+            .await
+            .expect("first range read");
+        let second = storage
+            .read_range(&source, 4..7)
+            .await
+            .expect("second overlapping read");
+
+        assert_eq!(first, b"cdef");
+        assert_eq!(second, b"efg");
+        assert_eq!(store.range_calls(), vec![(key.to_string(), 0, 8)]);
+
+        cleanup(&cache_root);
+        cleanup(&object_root);
+    }
+
+    #[tokio::test]
+    async fn downloader_election_prevents_duplicate_remote_segment_fetches() {
+        let cache_root = unique_test_dir("segment-election");
+        let object_root = unique_test_dir("segment-election-objects");
+        let file_system = Arc::new(TokioFileSystem::new());
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(LocalDirObjectStore::new(&object_root));
+        let store = Arc::new(BlockingRangeObjectStore::new(inner_store));
+        let cache = Arc::new(
+            RemoteCache::open_with_config(
+                file_system.clone(),
+                cache_root.to_string_lossy().into_owned(),
+                test_cache_config(8, 1024 * 1024, 0),
+            )
+            .await
+            .expect("open cache"),
+        );
+        let storage = Arc::new(UnifiedStorage::new(file_system, store.clone(), Some(cache)));
+        let key = "backup/sst/table-000001/0000/SST-000654.sst";
+        store
+            .put(key, b"abcdefghijklmnopqrstuvwxyz")
+            .await
+            .expect("seed object store");
+        let source = StorageSource::remote_object(key);
+
+        let storage_a = storage.clone();
+        let source_a = source.clone();
+        let first = tokio::spawn(async move { storage_a.read_range(&source_a, 2..6).await });
+        store.wait_for_range_calls(1).await;
+
+        let storage_b = storage.clone();
+        let source_b = source.clone();
+        let second = tokio::spawn(async move { storage_b.read_range(&source_b, 2..6).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.range_calls(), vec![(key.to_string(), 0, 8)]);
+
+        store.release();
+        assert_eq!(
+            first.await.expect("join first").expect("first read"),
+            b"cdef"
+        );
+        assert_eq!(
+            second.await.expect("join second").expect("second read"),
+            b"cdef"
+        );
+        assert_eq!(store.range_calls(), vec![(key.to_string(), 0, 8)]);
+
+        cleanup(&cache_root);
+        cleanup(&object_root);
+    }
+
+    #[tokio::test]
+    async fn background_prefetch_completes_next_segment_within_budget() {
+        let cache_root = unique_test_dir("background-prefetch");
+        let object_root = unique_test_dir("background-prefetch-objects");
+        let file_system = Arc::new(TokioFileSystem::new());
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(LocalDirObjectStore::new(&object_root));
+        let store = Arc::new(CountingObjectStore::new(inner_store));
+        let cache = Arc::new(
+            RemoteCache::open_with_config(
+                file_system.clone(),
+                cache_root.to_string_lossy().into_owned(),
+                test_cache_config(8, 1024 * 1024, 8),
+            )
+            .await
+            .expect("open cache"),
+        );
+        let storage = UnifiedStorage::new(file_system, store.clone(), Some(cache.clone()));
+        let key = "backup/sst/table-000001/0000/SST-000888.sst";
+        store
+            .put(key, b"abcdefghijklmnopqrstuvwxyz")
+            .await
+            .expect("seed object store");
+        let source = StorageSource::remote_object(key);
+
+        let first = storage.read_range(&source, 2..6).await.expect("first read");
+        assert_eq!(first, b"cdef");
+
+        let mut prefetched = false;
+        for _ in 0..50 {
+            if store.range_calls().len() >= 2
+                && cache
+                    .read_range(key, 8..12)
+                    .await
+                    .expect("prefetch lookup")
+                    .is_some()
+            {
+                prefetched = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            prefetched,
+            "background prefetch should warm the next segment"
+        );
+
+        let second = storage
+            .read_range(&source, 8..12)
+            .await
+            .expect("prefetched read");
+        assert_eq!(second, b"ijkl");
+        assert_eq!(
+            store.range_calls(),
+            vec![(key.to_string(), 0, 8), (key.to_string(), 8, 16)]
+        );
+
+        cleanup(&cache_root);
+        cleanup(&object_root);
+    }
+
+    #[tokio::test]
+    async fn rebuild_discards_orphaned_segment_files() {
+        let cache_root = unique_test_dir("orphaned-segments");
+        let file_system = Arc::new(TokioFileSystem::new());
+        let root = cache_root.to_string_lossy().into_owned();
+        let cache = RemoteCache::open_with_config(
+            file_system.clone(),
+            root.clone(),
+            test_cache_config(8, 1024 * 1024, 0),
+        )
+        .await
+        .expect("open cache");
+
+        let orphan_data_path = join_fs_path(&cache.data_dir, "orphan.bin");
+        write_bytes_atomic(file_system.as_ref(), &orphan_data_path, b"orphan-bytes")
+            .await
+            .expect("write orphan data");
+
+        let reopened = RemoteCache::open_with_config(
+            file_system.clone(),
+            root,
+            test_cache_config(8, 1024 * 1024, 0),
+        )
+        .await
+        .expect("reopen cache");
+
+        assert_eq!(reopened.entry_count(), 0);
+        assert!(
+            file_system
+                .list(&reopened.data_dir)
+                .await
+                .expect("list data dir")
+                .into_iter()
+                .all(|path| !path.ends_with("orphan.bin"))
+        );
+
+        cleanup(&cache_root);
+    }
+
+    #[tokio::test]
+    async fn bounded_segment_cache_evicts_oldest_entries() {
+        let cache_root = unique_test_dir("cache-eviction");
+        let object_root = unique_test_dir("cache-eviction-objects");
+        let file_system = Arc::new(TokioFileSystem::new());
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(LocalDirObjectStore::new(&object_root));
+        let store = Arc::new(CountingObjectStore::new(inner_store));
+        let cache = Arc::new(
+            RemoteCache::open_with_config(
+                file_system.clone(),
+                cache_root.to_string_lossy().into_owned(),
+                test_cache_config(8, 8, 0),
+            )
+            .await
+            .expect("open cache"),
+        );
+        let storage = UnifiedStorage::new(file_system, store.clone(), Some(cache));
+        let key = "backup/sst/table-000001/0000/SST-000999.sst";
+        store
+            .put(key, b"abcdefghijklmnopqrstuvwxyz")
+            .await
+            .expect("seed object store");
+        let source = StorageSource::remote_object(key);
+
+        let first = storage
+            .read_range(&source, 0..4)
+            .await
+            .expect("first segment read");
+        let second = storage
+            .read_range(&source, 8..12)
+            .await
+            .expect("second segment read");
+        let third = storage
+            .read_range(&source, 0..4)
+            .await
+            .expect("reloaded first segment");
+
+        assert_eq!(first, b"abcd");
+        assert_eq!(second, b"ijkl");
+        assert_eq!(third, b"abcd");
         assert_eq!(
             store.range_calls(),
             vec![
-                (key.to_string(), 2, 5),
-                (key.to_string(), 10, 13),
-                (key.to_string(), 20, 26)
+                (key.to_string(), 0, 8),
+                (key.to_string(), 8, 16),
+                (key.to_string(), 0, 8)
             ]
         );
 

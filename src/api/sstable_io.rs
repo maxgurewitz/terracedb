@@ -83,7 +83,11 @@ impl ColumnarReadContext {
         let bytes = UnifiedStorage::new(
             self.dependencies.file_system.clone(),
             self.dependencies.object_store.clone(),
-            None,
+            if policy.populate_raw_byte_cache {
+                self.remote_cache.clone()
+            } else {
+                None
+            },
         )
         .read_range(source, range.clone())
         .await
@@ -99,39 +103,39 @@ impl ColumnarReadContext {
 
     async fn admit_raw_byte_cache_range(
         &self,
-        object_key: &str,
-        range: std::ops::Range<u64>,
-        bytes: &[u8],
+        _object_key: &str,
+        _range: std::ops::Range<u64>,
+        _bytes: &[u8],
     ) -> Result<(), StorageError> {
         let Some(cache) = &self.remote_cache else {
             return Ok(());
         };
-        let span = crate::remote::CacheSpan::Range {
-            start: range.start,
-            end: range.end,
-        };
-        if bytes.is_empty()
-            || self.raw_byte_cache_budget_bytes == 0
-            || bytes.len() as u64 > self.raw_byte_cache_budget_bytes
-        {
-            return Ok(());
-        }
 
-        cache.store(object_key, span, bytes).await?;
+        let entries = cache.entries_snapshot();
+        let lengths = entries
+            .iter()
+            .map(|entry| {
+                (
+                    RawByteCacheBudgetKey {
+                        object_key: entry.object_key.clone(),
+                        span: entry.span,
+                    },
+                    entry.data_len,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let order = entries
+            .into_iter()
+            .map(|entry| RawByteCacheBudgetKey {
+                object_key: entry.object_key,
+                span: entry.span,
+            })
+            .collect::<VecDeque<_>>();
 
-        let evictions = {
-            let mut state = self.raw_byte_cache_budget_state.lock();
-            let key = RawByteCacheBudgetKey {
-                object_key: object_key.to_string(),
-                span,
-            };
-            self.record_raw_byte_cache_entry(&mut state, key.clone(), bytes.len() as u64);
-            self.collect_raw_byte_cache_evictions(&mut state, Some(&key))
-        };
-
-        for evicted in evictions {
-            cache.remove_span(&evicted.object_key, evicted.span).await?;
-        }
+        let mut state = self.raw_byte_cache_budget_state.lock();
+        state.total_bytes = cache.total_cached_bytes();
+        state.order = order;
+        state.lengths = lengths;
         Ok(())
     }
 

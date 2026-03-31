@@ -756,7 +756,15 @@ impl Db {
         };
         let remote_cache = match remote_cache_root {
             Some(root) => Some(Arc::new(
-                RemoteCache::open(dependencies.file_system.clone(), root).await?,
+                RemoteCache::open_with_config(
+                    dependencies.file_system.clone(),
+                    root,
+                    crate::remote::RemoteCacheConfig {
+                        max_bytes: config.raw_segment_cache_bytes,
+                        ..Default::default()
+                    },
+                )
+                .await?,
             )),
             None => None,
         };
