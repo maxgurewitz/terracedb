@@ -1515,6 +1515,20 @@ impl CommitPhase {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FlushPhase {
+    InputsMarkedFlushing,
+}
+
+impl FlushPhase {
+    pub(super) fn failpoint_name(self) -> &'static str {
+        match self {
+            Self::InputsMarkedFlushing => crate::failpoints::names::DB_FLUSH_INPUTS_MARKED_FLUSHING,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CompactionPhase {
     OutputWritten,
     ManifestSwitched,
@@ -1559,6 +1573,11 @@ pub(super) struct CommitPhaseBlocker {
 }
 
 #[cfg(test)]
+pub(super) struct FlushPhaseBlocker {
+    pub(super) handle: crate::failpoints::FailpointHandle,
+}
+
+#[cfg(test)]
 pub(super) struct CompactionPhaseBlocker {
     pub(super) handle: crate::failpoints::FailpointHandle,
 }
@@ -1581,6 +1600,17 @@ impl CommitPhaseBlocker {
             .parse::<u64>()
             .expect("commit phase failpoint sequence should parse");
         SequenceNumber::new(value)
+    }
+
+    pub(super) fn release(&mut self) {
+        self.handle.release();
+    }
+}
+
+#[cfg(test)]
+impl FlushPhaseBlocker {
+    pub(super) async fn wait_until_reached(&mut self) {
+        self.handle.wait_until_hit().await;
     }
 
     pub(super) fn release(&mut self) {

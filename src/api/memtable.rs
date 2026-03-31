@@ -35,6 +35,8 @@ impl MemtableEntry {
 pub(super) struct TableMemtable {
     pub(super) entries: BTreeMap<Vec<u8>, MemtableEntry>,
     pub(super) pending_flush_bytes: u64,
+    pub(super) min_sequence: Option<SequenceNumber>,
+    pub(super) max_sequence: Option<SequenceNumber>,
 }
 
 impl TableMemtable {
@@ -44,6 +46,16 @@ impl TableMemtable {
             self.pending_flush_bytes = self.pending_flush_bytes.saturating_sub(replaced.size_bytes);
         }
         self.pending_flush_bytes = self.pending_flush_bytes.saturating_add(entry.size_bytes);
+        self.min_sequence = Some(
+            self.min_sequence
+                .map(|current| current.min(entry.sequence))
+                .unwrap_or(entry.sequence),
+        );
+        self.max_sequence = Some(
+            self.max_sequence
+                .map(|current| current.max(entry.sequence))
+                .unwrap_or(entry.sequence),
+        );
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -89,16 +101,26 @@ impl TableMemtable {
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub(super) fn sequence_range(&self) -> Option<(SequenceNumber, SequenceNumber)> {
+        self.min_sequence.zip(self.max_sequence)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct Memtable {
     pub(super) tables: BTreeMap<TableId, TableMemtable>,
+    pub(super) min_sequence: Option<SequenceNumber>,
     pub(super) max_sequence: SequenceNumber,
 }
 
 impl Memtable {
     pub(super) fn apply(&mut self, sequence: SequenceNumber, operation: &ResolvedBatchOperation) {
+        self.min_sequence = Some(
+            self.min_sequence
+                .map(|current| current.min(sequence))
+                .unwrap_or(sequence),
+        );
         self.max_sequence = self.max_sequence.max(sequence);
         self.tables
             .entry(operation.table_id)
@@ -112,6 +134,11 @@ impl Memtable {
     }
 
     pub(super) fn apply_recovered_entry(&mut self, sequence: SequenceNumber, entry: &CommitEntry) {
+        self.min_sequence = Some(
+            self.min_sequence
+                .map(|current| current.min(sequence))
+                .unwrap_or(sequence),
+        );
         self.max_sequence = self.max_sequence.max(sequence);
         self.tables
             .entry(entry.table_id)
@@ -164,6 +191,11 @@ impl Memtable {
         sequence: SequenceNumber,
         value: Value,
     ) {
+        self.min_sequence = Some(
+            self.min_sequence
+                .map(|current| current.min(sequence))
+                .unwrap_or(sequence),
+        );
         self.max_sequence = self.max_sequence.max(sequence);
         self.tables
             .entry(table_id)
@@ -197,6 +229,20 @@ impl Memtable {
             .values()
             .map(|table| table.pending_flush_bytes)
             .sum()
+    }
+
+    pub(super) fn pending_flush_sequence_range(
+        &self,
+        table_id: TableId,
+    ) -> Option<(SequenceNumber, SequenceNumber)> {
+        self.tables
+            .get(&table_id)
+            .and_then(TableMemtable::sequence_range)
+    }
+
+    pub(super) fn total_sequence_range(&self) -> Option<(SequenceNumber, SequenceNumber)> {
+        self.min_sequence
+            .zip((self.max_sequence != SequenceNumber::default()).then_some(self.max_sequence))
     }
 
     pub(super) fn has_entries_for_table(&self, table_id: TableId) -> bool {
@@ -911,8 +957,16 @@ impl SstableState {
 }
 
 #[derive(Clone, Debug)]
+pub(super) enum ImmutableMemtableFlushState {
+    Queued,
+    Flushing,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct ImmutableMemtable {
+    pub(super) min_sequence: SequenceNumber,
     pub(super) max_sequence: SequenceNumber,
+    pub(super) state: ImmutableMemtableFlushState,
     pub(super) memtable: Memtable,
 }
 
@@ -1018,9 +1072,14 @@ impl MemtableState {
         }
 
         let rotated = std::mem::take(&mut self.mutable);
+        let min_sequence = rotated
+            .min_sequence
+            .expect("non-empty memtable should track a minimum sequence");
         let max_sequence = rotated.max_sequence;
         self.immutables.push(ImmutableMemtable {
+            min_sequence,
             max_sequence,
+            state: ImmutableMemtableFlushState::Queued,
             memtable: rotated,
         });
         Some(max_sequence)
@@ -1040,6 +1099,9 @@ impl MemtableState {
     pub(super) fn immutable_flush_backlog_by_table(&self) -> BTreeMap<TableId, u64> {
         let mut backlog = BTreeMap::new();
         for immutable in &self.immutables {
+            if !matches!(immutable.state, ImmutableMemtableFlushState::Queued) {
+                continue;
+            }
             for (table_id, bytes) in immutable.memtable.pending_flush_bytes_by_table() {
                 backlog
                     .entry(table_id)
@@ -1048,6 +1110,22 @@ impl MemtableState {
             }
         }
         backlog
+    }
+
+    pub(super) fn immutable_flushing_bytes_by_table(&self) -> BTreeMap<TableId, u64> {
+        let mut flushing = BTreeMap::new();
+        for immutable in &self.immutables {
+            if !matches!(immutable.state, ImmutableMemtableFlushState::Flushing) {
+                continue;
+            }
+            for (table_id, bytes) in immutable.memtable.pending_flush_bytes_by_table() {
+                flushing
+                    .entry(table_id)
+                    .and_modify(|current: &mut u64| *current = current.saturating_add(bytes))
+                    .or_insert(bytes);
+            }
+        }
+        flushing
     }
 
     pub(super) fn total_pending_flush_bytes(&self) -> u64 {
@@ -1064,6 +1142,115 @@ impl MemtableState {
             .iter()
             .filter(|immutable| immutable.memtable.has_entries_for_table(table_id))
             .count() as u32
+    }
+
+    pub(super) fn queued_immutable_memtable_count(&self, table_id: Option<TableId>) -> u32 {
+        self.immutables
+            .iter()
+            .filter(|immutable| matches!(immutable.state, ImmutableMemtableFlushState::Queued))
+            .filter(|immutable| {
+                table_id
+                    .map(|table_id| immutable.memtable.has_entries_for_table(table_id))
+                    .unwrap_or(true)
+            })
+            .count() as u32
+    }
+
+    pub(super) fn flushing_immutable_memtable_count(&self, table_id: Option<TableId>) -> u32 {
+        self.immutables
+            .iter()
+            .filter(|immutable| matches!(immutable.state, ImmutableMemtableFlushState::Flushing))
+            .filter(|immutable| {
+                table_id
+                    .map(|table_id| immutable.memtable.has_entries_for_table(table_id))
+                    .unwrap_or(true)
+            })
+            .count() as u32
+    }
+
+    pub(super) fn pending_flush_sequence_range(
+        &self,
+        table_id: TableId,
+    ) -> Option<(SequenceNumber, SequenceNumber)> {
+        let mut min_sequence = self
+            .mutable
+            .pending_flush_sequence_range(table_id)
+            .map(|range| range.0);
+        let mut max_sequence = self
+            .mutable
+            .pending_flush_sequence_range(table_id)
+            .map(|range| range.1);
+        for immutable in &self.immutables {
+            let Some((immutable_min, immutable_max)) =
+                immutable.memtable.pending_flush_sequence_range(table_id)
+            else {
+                continue;
+            };
+            min_sequence = Some(
+                min_sequence
+                    .map(|current| current.min(immutable_min))
+                    .unwrap_or(immutable_min),
+            );
+            max_sequence = Some(
+                max_sequence
+                    .map(|current| current.max(immutable_max))
+                    .unwrap_or(immutable_max),
+            );
+        }
+        min_sequence.zip(max_sequence)
+    }
+
+    pub(super) fn total_sequence_range(&self) -> Option<(SequenceNumber, SequenceNumber)> {
+        let mut min_sequence = self.mutable.total_sequence_range().map(|range| range.0);
+        let mut max_sequence = self.mutable.total_sequence_range().map(|range| range.1);
+        for immutable in &self.immutables {
+            min_sequence = Some(
+                min_sequence
+                    .map(|current| current.min(immutable.min_sequence))
+                    .unwrap_or(immutable.min_sequence),
+            );
+            max_sequence = Some(
+                max_sequence
+                    .map(|current| current.max(immutable.max_sequence))
+                    .unwrap_or(immutable.max_sequence),
+            );
+        }
+        min_sequence.zip(max_sequence)
+    }
+
+    pub(super) fn mark_queued_immutables_flushing(&mut self) -> Vec<ImmutableMemtable> {
+        let mut flushing = Vec::new();
+        for immutable in &mut self.immutables {
+            if matches!(immutable.state, ImmutableMemtableFlushState::Queued) {
+                immutable.state = ImmutableMemtableFlushState::Flushing;
+                flushing.push(immutable.clone());
+            }
+        }
+        flushing
+    }
+
+    pub(super) fn restore_flushing_immutables(&mut self) {
+        for immutable in &mut self.immutables {
+            if matches!(immutable.state, ImmutableMemtableFlushState::Flushing) {
+                immutable.state = ImmutableMemtableFlushState::Queued;
+            }
+        }
+    }
+
+    pub(super) fn remove_flushing_immutables(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let mut remaining = count;
+        self.immutables.retain(|immutable| {
+            if remaining > 0 && matches!(immutable.state, ImmutableMemtableFlushState::Flushing) {
+                remaining = remaining.saturating_sub(1);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub(super) fn table_watermarks(&self) -> BTreeMap<TableId, SequenceNumber> {

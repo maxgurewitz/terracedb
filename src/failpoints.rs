@@ -266,6 +266,7 @@ pub mod names {
     pub const DB_COMPACTION_INPUT_CLEANUP_FINISHED: &str = "db.compaction.input_cleanup_finished";
     pub const DB_COMPACTION_MANIFEST_SWITCHED: &str = "db.compaction.manifest_switched";
     pub const DB_COMPACTION_OUTPUT_WRITTEN: &str = "db.compaction.output_written";
+    pub const DB_FLUSH_INPUTS_MARKED_FLUSHING: &str = "db.flush.inputs_marked_flushing";
     pub const DB_MANIFEST_BEFORE_CURRENT_POINTER: &str = "db.manifest.before_current_pointer";
     pub const DB_OFFLOAD_LOCAL_CLEANUP_FINISHED: &str = "db.offload.local_cleanup_finished";
     pub const DB_OFFLOAD_MANIFEST_SWITCHED: &str = "db.offload.manifest_switched";

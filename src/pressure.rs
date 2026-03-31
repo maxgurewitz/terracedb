@@ -37,17 +37,12 @@ pub struct PressureBudget {
     pub unified_log_hard_limit_bytes: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PressureScope {
+    #[default]
     Process,
     Domain(ExecutionDomainPath),
     Table(String),
-}
-
-impl Default for PressureScope {
-    fn default() -> Self {
-        Self::Process
-    }
 }
 
 /// Pressure view for one scope plus optional wider totals.
