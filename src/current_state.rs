@@ -100,6 +100,71 @@ pub struct CurrentStateThresholdRetentionPolicy {
 pub struct CurrentStateRankRetentionPolicy {
     pub order: CurrentStateOrderingContract,
     pub limit: usize,
+    #[serde(default)]
+    pub source: CurrentStateRankSource,
+}
+
+impl CurrentStateRankRetentionPolicy {
+    pub fn with_source(mut self, source: CurrentStateRankSource) -> Self {
+        self.source = source;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRankSource {
+    pub scope: CurrentStateRankSourceScope,
+    pub rebuildable: bool,
+}
+
+impl CurrentStateRankSource {
+    pub fn current_state() -> Self {
+        Self {
+            scope: CurrentStateRankSourceScope::CurrentState,
+            rebuildable: false,
+        }
+    }
+
+    pub fn projection_owned_range(
+        source_table: impl Into<String>,
+        range_start: impl Into<Vec<u8>>,
+        range_end: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            scope: CurrentStateRankSourceScope::ProjectionOwnedRange(CurrentStateRankSourceRange {
+                source_table: source_table.into(),
+                range_start: range_start.into(),
+                range_end: range_end.into(),
+            }),
+            rebuildable: false,
+        }
+    }
+
+    pub fn with_rebuildable(mut self, rebuildable: bool) -> Self {
+        self.rebuildable = rebuildable;
+        self
+    }
+}
+
+impl Default for CurrentStateRankSource {
+    fn default() -> Self {
+        Self::current_state()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CurrentStateRankSourceScope {
+    #[default]
+    CurrentState,
+    ProjectionOwnedRange(CurrentStateRankSourceRange),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRankSourceRange {
+    pub source_table: String,
+    pub range_start: Vec<u8>,
+    pub range_end: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +196,7 @@ impl CurrentStateRetentionContract {
             policy: CurrentStateRetentionPolicy::GlobalRank(CurrentStateRankRetentionPolicy {
                 order,
                 limit,
+                source: CurrentStateRankSource::default(),
             }),
             planner: CurrentStatePlanner::default(),
         }
@@ -138,6 +204,13 @@ impl CurrentStateRetentionContract {
 
     pub fn with_planner(mut self, planner: CurrentStatePlanner) -> Self {
         self.planner = planner;
+        self
+    }
+
+    pub fn with_rank_source(mut self, source: CurrentStateRankSource) -> Self {
+        if let CurrentStateRetentionPolicy::GlobalRank(policy) = &mut self.policy {
+            policy.source = source;
+        }
         self
     }
 }
@@ -225,11 +298,26 @@ pub struct CurrentStateRetentionStats {
     pub policy_revision: u64,
     pub effective_logical_floor: Option<CurrentStateLogicalFloor>,
     pub retained_set: CurrentStateRetainedSetSummary,
+    pub membership_changes: CurrentStateRetentionMembershipChanges,
+    pub evaluation_cost: CurrentStateRetentionEvaluationCost,
     pub reclaimed_rows: u64,
     pub reclaimed_bytes: u64,
     pub deferred_rows: u64,
     pub deferred_bytes: u64,
     pub status: CurrentStateRetentionStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionMembershipChanges {
+    pub entered_rows: u64,
+    pub exited_rows: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionEvaluationCost {
+    pub rows_scanned: u64,
+    pub rows_ranked: u64,
+    pub rows_materialized: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +409,107 @@ impl CurrentStateOracleRow {
             estimated_row_bytes,
         }
     }
+
+    pub fn from_computed_ordering(
+        row_key: impl Into<Vec<u8>>,
+        ordering: CurrentStateComputedOrderingKeys,
+        estimated_row_bytes: u64,
+    ) -> Self {
+        Self::new(
+            row_key,
+            Some(ordering.primary_sort_key),
+            Some(ordering.tie_break_key),
+            estimated_row_bytes,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateComputedOrderingKey {
+    encoded: Vec<u8>,
+}
+
+impl CurrentStateComputedOrderingKey {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn unsigned(mut self, value: u64) -> Self {
+        self.encoded.extend_from_slice(&value.to_be_bytes());
+        self
+    }
+
+    pub fn signed(mut self, value: i64) -> Self {
+        let encoded = ((value as u64) ^ 0x8000_0000_0000_0000_u64).to_be_bytes();
+        self.encoded.extend_from_slice(&encoded);
+        self
+    }
+
+    pub fn timestamp_millis(self, value: u64) -> Self {
+        self.unsigned(value)
+    }
+
+    pub fn bytes(mut self, value: impl AsRef<[u8]>) -> Self {
+        append_escaped_ordering_component(&mut self.encoded, value.as_ref());
+        self
+    }
+
+    pub fn utf8(self, value: impl AsRef<str>) -> Self {
+        self.bytes(value.as_ref().as_bytes())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.encoded
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateComputedOrderingKeys {
+    pub primary_sort_key: Vec<u8>,
+    pub tie_break_key: Vec<u8>,
+}
+
+impl CurrentStateComputedOrderingKeys {
+    pub fn new(primary_sort_key: impl Into<Vec<u8>>, tie_break_key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            primary_sort_key: primary_sort_key.into(),
+            tie_break_key: tie_break_key.into(),
+        }
+    }
+
+    pub fn leaderboard(points: u64, stable_id: impl AsRef<[u8]>) -> Self {
+        Self::new(
+            CurrentStateComputedOrderingKey::new()
+                .unsigned(points)
+                .into_bytes(),
+            CurrentStateComputedOrderingKey::new()
+                .bytes(stable_id)
+                .into_bytes(),
+        )
+    }
+
+    pub fn recent_item(updated_at_millis: u64, stable_id: impl AsRef<[u8]>) -> Self {
+        Self::new(
+            CurrentStateComputedOrderingKey::new()
+                .timestamp_millis(updated_at_millis)
+                .into_bytes(),
+            CurrentStateComputedOrderingKey::new()
+                .bytes(stable_id)
+                .into_bytes(),
+        )
+    }
+
+    pub fn hybrid(points: u64, created_at_millis: u64, stable_id: impl AsRef<[u8]>) -> Self {
+        Self::new(
+            CurrentStateComputedOrderingKey::new()
+                .unsigned(points)
+                .timestamp_millis(created_at_millis)
+                .into_bytes(),
+            CurrentStateComputedOrderingKey::new()
+                .bytes(stable_id)
+                .into_bytes(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +521,8 @@ pub enum CurrentStateOracleMutation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentStateRetentionEvaluation {
     pub retained_row_keys: Vec<Vec<u8>>,
+    pub entered_retained_row_keys: Vec<Vec<u8>>,
+    pub exited_retained_row_keys: Vec<Vec<u8>>,
     pub non_retained_row_keys: Vec<Vec<u8>>,
     pub reclaimable_row_keys: Vec<Vec<u8>>,
     pub deferred_row_keys: Vec<Vec<u8>>,
@@ -343,6 +534,7 @@ pub struct CurrentStateRetentionOracleSnapshot {
     pub contract: CurrentStateRetentionContract,
     pub rows: Vec<CurrentStateOracleRow>,
     pub snapshot_pins: Vec<Vec<u8>>,
+    pub published_ranked_row_keys: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -350,12 +542,14 @@ pub struct CurrentStateRetentionOracle {
     contract: CurrentStateRetentionContract,
     rows: BTreeMap<Vec<u8>, CurrentStateOracleRow>,
     snapshot_pins: BTreeSet<Vec<u8>>,
+    published_ranked_row_keys: BTreeSet<Vec<u8>>,
 }
 
 type OracleEvaluationPartition = (
     Vec<CurrentStateOracleRow>,
     Vec<CurrentStateOracleRow>,
     Option<CurrentStateLogicalFloor>,
+    CurrentStateRetentionEvaluationCost,
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,6 +565,7 @@ impl CurrentStateRetentionOracle {
             contract,
             rows: BTreeMap::new(),
             snapshot_pins: BTreeSet::new(),
+            published_ranked_row_keys: BTreeSet::new(),
         }
     }
 
@@ -383,6 +578,7 @@ impl CurrentStateRetentionOracle {
                 .map(|row| (row.row_key.clone(), row))
                 .collect(),
             snapshot_pins: snapshot.snapshot_pins.into_iter().collect(),
+            published_ranked_row_keys: snapshot.published_ranked_row_keys.into_iter().collect(),
         }
     }
 
@@ -391,6 +587,7 @@ impl CurrentStateRetentionOracle {
             contract: self.contract.clone(),
             rows: self.rows.values().cloned().collect(),
             snapshot_pins: self.snapshot_pins.iter().cloned().collect(),
+            published_ranked_row_keys: self.published_ranked_row_keys.iter().cloned().collect(),
         }
     }
 
@@ -425,20 +622,49 @@ impl CurrentStateRetentionOracle {
         self.snapshot_pins.clear();
     }
 
+    pub fn publish_retained_set(&mut self) -> Result<(), CurrentStateRetentionError> {
+        let evaluation = self.evaluate()?;
+        self.published_ranked_row_keys = evaluation.retained_row_keys.into_iter().collect();
+        Ok(())
+    }
+
     pub fn evaluate(&self) -> Result<CurrentStateRetentionEvaluation, CurrentStateRetentionError> {
-        let (retained_rows, non_retained_rows, effective_logical_floor) = match &self
-            .contract
-            .policy
-        {
-            CurrentStateRetentionPolicy::Threshold(policy) => self.evaluate_threshold(policy)?,
-            CurrentStateRetentionPolicy::GlobalRank(policy) => self.evaluate_rank(policy)?,
-        };
+        self.validate_planner()?;
+
+        let (retained_rows, non_retained_rows, effective_logical_floor, evaluation_cost) =
+            match &self.contract.policy {
+                CurrentStateRetentionPolicy::Threshold(policy) => {
+                    self.evaluate_threshold(policy)?
+                }
+                CurrentStateRetentionPolicy::GlobalRank(policy) => self.evaluate_rank(policy)?,
+            };
 
         let (effective_mode, mut reasons) = self.effective_mode_and_reasons();
         let non_retained_set = non_retained_rows
             .iter()
             .map(|row| row.row_key.clone())
             .collect::<BTreeSet<_>>();
+        let retained_set = retained_rows
+            .iter()
+            .map(|row| row.row_key.clone())
+            .collect::<BTreeSet<_>>();
+        let (entered_retained_row_keys, exited_retained_row_keys) = if matches!(
+            &self.contract.policy,
+            CurrentStateRetentionPolicy::GlobalRank(_)
+        ) {
+            (
+                retained_set
+                    .difference(&self.published_ranked_row_keys)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                self.published_ranked_row_keys
+                    .difference(&retained_set)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let exact_reclaim_is_deferred = self.threshold_exact_reclaim_is_deferred();
         let exact_reclaim_blocks_reclaim =
             exact_reclaim_is_deferred && !non_retained_rows.is_empty();
@@ -483,6 +709,8 @@ impl CurrentStateRetentionOracle {
                 .iter()
                 .map(|row| row.row_key.clone())
                 .collect(),
+            entered_retained_row_keys: entered_retained_row_keys.clone(),
+            exited_retained_row_keys: exited_retained_row_keys.clone(),
             non_retained_row_keys: non_retained_rows
                 .iter()
                 .map(|row| row.row_key.clone())
@@ -505,6 +733,11 @@ impl CurrentStateRetentionOracle {
                         .map(|row| row.estimated_row_bytes)
                         .sum(),
                 },
+                membership_changes: CurrentStateRetentionMembershipChanges {
+                    entered_rows: entered_retained_row_keys.len() as u64,
+                    exited_rows: exited_retained_row_keys.len() as u64,
+                },
+                evaluation_cost,
                 reclaimed_rows: reclaimable_rows.len() as u64,
                 reclaimed_bytes: reclaimable_rows
                     .iter()
@@ -547,6 +780,11 @@ impl CurrentStateRetentionOracle {
             Some(CurrentStateLogicalFloor::Threshold {
                 cutoff: policy.cutoff.clone(),
             }),
+            CurrentStateRetentionEvaluationCost {
+                rows_scanned: self.rows.len() as u64,
+                rows_ranked: 0,
+                rows_materialized: 0,
+            },
         ))
     }
 
@@ -585,7 +823,32 @@ impl CurrentStateRetentionOracle {
                 limit: policy.limit,
                 boundary,
             }),
+            CurrentStateRetentionEvaluationCost {
+                rows_scanned: self.rows.len() as u64,
+                rows_ranked: candidates.len() as u64,
+                rows_materialized: retained_count as u64,
+            },
         ))
+    }
+
+    fn validate_planner(&self) -> Result<(), CurrentStateRetentionError> {
+        let CurrentStateRetentionPolicy::GlobalRank(policy) = &self.contract.policy else {
+            return Ok(());
+        };
+
+        let requests_physical_reclaim = self.contract.planner.compaction_row_removal
+            != CurrentStateCompactionRowRemovalMode::Disabled
+            || self.contract.planner.physical_retention.mode
+                != CurrentStatePhysicalRetentionMode::None;
+        if requests_physical_reclaim && !policy.source.rebuildable {
+            return Err(
+                CurrentStateRetentionError::RankPhysicalRetentionRequiresRebuildableSource {
+                    rank_source: policy.source.clone(),
+                },
+            );
+        }
+
+        Ok(())
     }
 
     fn effective_mode_and_reasons(
@@ -641,6 +904,10 @@ pub enum CurrentStateRetentionError {
         row_key: Vec<u8>,
         field: &'static str,
     },
+    #[error(
+        "rank-based physical retention requires an explicitly rebuildable source, got {rank_source:?}"
+    )]
+    RankPhysicalRetentionRequiresRebuildableSource { rank_source: CurrentStateRankSource },
 }
 
 fn threshold_retention_disposition(
@@ -814,6 +1081,16 @@ fn compare_missing_against_present(
     }
 }
 
+fn append_escaped_ordering_component(encoded: &mut Vec<u8>, value: &[u8]) {
+    for byte in value {
+        encoded.push(*byte);
+        if *byte == 0 {
+            encoded.push(0xff);
+        }
+    }
+    encoded.extend_from_slice(&[0, 0]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -822,11 +1099,11 @@ mod tests {
         CurrentStateLogicalFloor, CurrentStateMissingValuePolicy, CurrentStateOracleMutation,
         CurrentStateOracleRow, CurrentStatePhysicalRetentionMode,
         CurrentStatePhysicalRetentionSeam, CurrentStatePlanner, CurrentStateProjectionOwnedRange,
-        CurrentStateRankBoundary, CurrentStateRankedMaterializationSeam, CurrentStateRebuildMode,
-        CurrentStateRebuildSeam, CurrentStateRetentionContract,
-        CurrentStateRetentionDeferredReason, CurrentStateRetentionError,
-        CurrentStateRetentionReason, CurrentStateRetentionSkipReason, CurrentStateSortDirection,
-        CurrentStateThresholdCutoff,
+        CurrentStateRankBoundary, CurrentStateRankSource, CurrentStateRankedMaterializationSeam,
+        CurrentStateRebuildMode, CurrentStateRebuildSeam, CurrentStateRetentionContract,
+        CurrentStateRetentionDeferredReason,
+        CurrentStateRetentionError, CurrentStateRetentionReason,
+        CurrentStateRetentionSkipReason, CurrentStateSortDirection, CurrentStateThresholdCutoff,
     };
 
     fn row(
@@ -1082,6 +1359,240 @@ mod tests {
                     row_key: b"charlie".to_vec(),
                 }),
             })
+        );
+    }
+
+    #[test]
+    fn rank_oracle_tracks_membership_changes_costs_and_publication_across_restart() {
+        let contract = CurrentStateRetentionContract::global_rank(
+            9,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Descending),
+            2,
+        )
+        .with_planner(CurrentStatePlanner {
+            ranked_materialization: CurrentStateRankedMaterializationSeam::ProjectionOwned(
+                CurrentStateProjectionOwnedRange {
+                    output_table: "leaderboard".to_string(),
+                    range_start: b"top:00".to_vec(),
+                    range_end: b"top:ff".to_vec(),
+                },
+            ),
+            rebuild: CurrentStateRebuildSeam {
+                on_restart: CurrentStateRebuildMode::RecomputeFromCurrentState,
+                on_revision: CurrentStateRebuildMode::RecomputeDerivedState,
+            },
+            ..Default::default()
+        });
+        let mut oracle = super::CurrentStateRetentionOracle::new(contract);
+        for row in [
+            row("alpha", Some("090"), Some("001"), 8),
+            row("bravo", Some("080"), Some("001"), 8),
+            row("charlie", Some("070"), Some("001"), 8),
+        ] {
+            oracle.apply(CurrentStateOracleMutation::Upsert(row));
+        }
+
+        let initial = oracle.evaluate().expect("evaluate initial rank");
+        assert_eq!(
+            initial.retained_row_keys,
+            vec![b"alpha".to_vec(), b"bravo".to_vec()]
+        );
+        assert_eq!(
+            initial.entered_retained_row_keys,
+            vec![b"alpha".to_vec(), b"bravo".to_vec()]
+        );
+        assert!(initial.exited_retained_row_keys.is_empty());
+        assert_eq!(initial.stats.membership_changes.entered_rows, 2);
+        assert_eq!(initial.stats.membership_changes.exited_rows, 0);
+        assert_eq!(initial.stats.evaluation_cost.rows_scanned, 3);
+        assert_eq!(initial.stats.evaluation_cost.rows_ranked, 3);
+        assert_eq!(initial.stats.evaluation_cost.rows_materialized, 2);
+
+        oracle
+            .publish_retained_set()
+            .expect("publish retained ranked set");
+        let published = oracle.evaluate().expect("evaluate after publish");
+        assert!(published.entered_retained_row_keys.is_empty());
+        assert!(published.exited_retained_row_keys.is_empty());
+
+        let snapshot = oracle.snapshot();
+        let mut restored = super::CurrentStateRetentionOracle::from_snapshot(snapshot);
+        restored.apply(CurrentStateOracleMutation::Upsert(row(
+            "charlie",
+            Some("095"),
+            Some("001"),
+            8,
+        )));
+
+        let after_restart = restored.evaluate().expect("evaluate after restart");
+        assert_eq!(
+            after_restart.retained_row_keys,
+            vec![b"charlie".to_vec(), b"alpha".to_vec()]
+        );
+        assert_eq!(
+            after_restart.entered_retained_row_keys,
+            vec![b"charlie".to_vec()]
+        );
+        assert_eq!(
+            after_restart.exited_retained_row_keys,
+            vec![b"bravo".to_vec()]
+        );
+    }
+
+    #[test]
+    fn rank_policy_fails_closed_when_destructive_reclaim_lacks_rebuildable_source() {
+        let contract = CurrentStateRetentionContract::global_rank(
+            12,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Descending),
+            1,
+        )
+        .with_planner(CurrentStatePlanner {
+            physical_retention: CurrentStatePhysicalRetentionSeam {
+                mode: CurrentStatePhysicalRetentionMode::Delete,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut oracle = super::CurrentStateRetentionOracle::new(contract);
+        oracle.apply(CurrentStateOracleMutation::Upsert(row(
+            "alpha",
+            Some("100"),
+            Some("001"),
+            16,
+        )));
+
+        assert_eq!(
+            oracle.evaluate(),
+            Err(
+                CurrentStateRetentionError::RankPhysicalRetentionRequiresRebuildableSource {
+                    rank_source: CurrentStateRankSource::current_state(),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn rank_policy_allows_destructive_reclaim_for_rebuildable_source() {
+        let contract = CurrentStateRetentionContract::global_rank(
+            13,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Descending),
+            1,
+        )
+        .with_rank_source(CurrentStateRankSource::current_state().with_rebuildable(true))
+        .with_planner(CurrentStatePlanner {
+            physical_retention: CurrentStatePhysicalRetentionSeam {
+                mode: CurrentStatePhysicalRetentionMode::Delete,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut oracle = super::CurrentStateRetentionOracle::new(contract);
+        for row in [
+            row("alpha", Some("100"), Some("001"), 16),
+            row("bravo", Some("050"), Some("001"), 12),
+        ] {
+            oracle.apply(CurrentStateOracleMutation::Upsert(row));
+        }
+
+        let evaluation = oracle
+            .evaluate()
+            .expect("rebuildable source should allow physical rank retention");
+        assert_eq!(
+            evaluation.stats.status.effective_mode,
+            CurrentStateEffectiveMode::PhysicalReclaim
+        );
+        assert_eq!(evaluation.reclaimable_row_keys, vec![b"bravo".to_vec()]);
+    }
+
+    #[test]
+    fn computed_ordering_recipes_cover_leaderboards_recent_items_and_hybrid_rankings() {
+        let order = super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Descending);
+
+        let mut leaderboard = super::CurrentStateRetentionOracle::new(
+            CurrentStateRetentionContract::global_rank(20, order.clone(), 2),
+        );
+        for (name, ordering) in [
+            (
+                "alpha",
+                super::CurrentStateComputedOrderingKeys::leaderboard(10, "alpha"),
+            ),
+            (
+                "bravo",
+                super::CurrentStateComputedOrderingKeys::leaderboard(15, "bravo"),
+            ),
+            (
+                "charlie",
+                super::CurrentStateComputedOrderingKeys::leaderboard(15, "charlie"),
+            ),
+        ] {
+            leaderboard.apply(CurrentStateOracleMutation::Upsert(
+                CurrentStateOracleRow::from_computed_ordering(name, ordering, 10),
+            ));
+        }
+        assert_eq!(
+            leaderboard
+                .evaluate()
+                .expect("evaluate leaderboard")
+                .retained_row_keys,
+            vec![b"bravo".to_vec(), b"charlie".to_vec()]
+        );
+
+        let mut recent = super::CurrentStateRetentionOracle::new(
+            CurrentStateRetentionContract::global_rank(21, order.clone(), 2),
+        );
+        for (name, ordering) in [
+            (
+                "alpha",
+                super::CurrentStateComputedOrderingKeys::recent_item(100, "alpha"),
+            ),
+            (
+                "bravo",
+                super::CurrentStateComputedOrderingKeys::recent_item(105, "bravo"),
+            ),
+            (
+                "charlie",
+                super::CurrentStateComputedOrderingKeys::recent_item(103, "charlie"),
+            ),
+        ] {
+            recent.apply(CurrentStateOracleMutation::Upsert(
+                CurrentStateOracleRow::from_computed_ordering(name, ordering, 10),
+            ));
+        }
+        assert_eq!(
+            recent
+                .evaluate()
+                .expect("evaluate recent")
+                .retained_row_keys,
+            vec![b"bravo".to_vec(), b"charlie".to_vec()]
+        );
+
+        let mut hybrid = super::CurrentStateRetentionOracle::new(
+            CurrentStateRetentionContract::global_rank(22, order, 3),
+        );
+        for (name, ordering) in [
+            (
+                "alpha",
+                super::CurrentStateComputedOrderingKeys::hybrid(20, 100, "alpha"),
+            ),
+            (
+                "bravo",
+                super::CurrentStateComputedOrderingKeys::hybrid(20, 110, "bravo"),
+            ),
+            (
+                "charlie",
+                super::CurrentStateComputedOrderingKeys::hybrid(18, 999, "charlie"),
+            ),
+        ] {
+            hybrid.apply(CurrentStateOracleMutation::Upsert(
+                CurrentStateOracleRow::from_computed_ordering(name, ordering, 10),
+            ));
+        }
+        assert_eq!(
+            hybrid
+                .evaluate()
+                .expect("evaluate hybrid")
+                .retained_row_keys,
+            vec![b"bravo".to_vec(), b"alpha".to_vec(), b"charlie".to_vec()]
         );
     }
 

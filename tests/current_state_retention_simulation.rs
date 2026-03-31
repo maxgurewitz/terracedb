@@ -152,6 +152,27 @@ fn run_rank_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutco
     })
 }
 
+fn run_rank_publication_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutcome> {
+    let scenario = CurrentStateSimulationScenario {
+        initial_contract: rank_contract(7, 2),
+        operations: vec![
+            CurrentStateSimulationOperation::Upsert(row("alpha", 90, 1, 10)),
+            CurrentStateSimulationOperation::Upsert(row("bravo", 80, 1, 10)),
+            CurrentStateSimulationOperation::Upsert(row("charlie", 70, 1, 10)),
+            CurrentStateSimulationOperation::PublishRetainedSet,
+            CurrentStateSimulationOperation::Upsert(row("charlie", 95, 1, 10)),
+            CurrentStateSimulationOperation::Upsert(row("bravo", 97, 1, 10)),
+            CurrentStateSimulationOperation::Restart,
+            CurrentStateSimulationOperation::PublishRetainedSet,
+        ],
+    };
+
+    SeededSimulationRunner::new(seed).run_with(move |_context| async move {
+        Ok(run_current_state_simulation(&scenario)
+            .expect("rank publication simulation should succeed"))
+    })
+}
+
 #[test]
 fn threshold_retention_simulation_is_deterministic_through_revision_and_restart() -> turmoil::Result
 {
@@ -230,6 +251,43 @@ fn threshold_retention_simulation_keeps_missing_keys_out_of_reclaim() -> turmoil
     );
     assert!(final_step.evaluation.deferred_row_keys.is_empty());
     assert_eq!(final_step.evaluation.stats.policy_revision, 2);
+
+    Ok(())
+}
+
+#[test]
+fn rank_retention_simulation_tracks_publication_boundary_churn_and_restart() -> turmoil::Result {
+    let first = run_rank_publication_simulation(0x5961)?;
+    let second = run_rank_publication_simulation(0x5961)?;
+    assert_eq!(first, second);
+
+    let pre_restart = &first.steps[5].evaluation;
+    assert_eq!(
+        decode_keys(&pre_restart.retained_row_keys),
+        vec!["bravo".to_string(), "charlie".to_string()]
+    );
+    assert_eq!(
+        decode_keys(&pre_restart.entered_retained_row_keys),
+        vec!["charlie".to_string()]
+    );
+    assert_eq!(
+        decode_keys(&pre_restart.exited_retained_row_keys),
+        vec!["alpha".to_string()]
+    );
+    assert_eq!(pre_restart.stats.membership_changes.entered_rows, 1);
+    assert_eq!(pre_restart.stats.membership_changes.exited_rows, 1);
+    assert_eq!(pre_restart.stats.evaluation_cost.rows_scanned, 3);
+    assert_eq!(pre_restart.stats.evaluation_cost.rows_ranked, 3);
+    assert_eq!(pre_restart.stats.evaluation_cost.rows_materialized, 2);
+
+    let after_restart = &first.steps[6].evaluation;
+    assert_eq!(pre_restart, after_restart);
+
+    let after_publish = &first.steps[7].evaluation;
+    assert!(after_publish.entered_retained_row_keys.is_empty());
+    assert!(after_publish.exited_retained_row_keys.is_empty());
+    assert_eq!(after_publish.stats.membership_changes.entered_rows, 0);
+    assert_eq!(after_publish.stats.membership_changes.exited_rows, 0);
 
     Ok(())
 }

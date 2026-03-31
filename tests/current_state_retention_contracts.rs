@@ -2,11 +2,11 @@ use terracedb::{
     CurrentStateCompactionRowRemovalMode, CurrentStateDerivedOnlyReason,
     CurrentStateExactnessRequirement, CurrentStateMissingValuePolicy, CurrentStateOrderingContract,
     CurrentStatePhysicalRetentionMode, CurrentStatePhysicalRetentionSeam, CurrentStatePlanner,
-    CurrentStateProjectionOwnedRange, CurrentStateRankedMaterializationSeam,
-    CurrentStateRebuildMode, CurrentStateRebuildSeam, CurrentStateRetentionContract,
-    CurrentStateRetentionDeferredReason, CurrentStateRetentionReason,
-    CurrentStateRetentionSkipReason, CurrentStateSortDirection, CurrentStateThresholdCutoff,
-    TableStats,
+    CurrentStateProjectionOwnedRange, CurrentStateRankSource,
+    CurrentStateRankedMaterializationSeam, CurrentStateRebuildMode, CurrentStateRebuildSeam,
+    CurrentStateRetentionContract, CurrentStateRetentionDeferredReason,
+    CurrentStateRetentionReason, CurrentStateRetentionSkipReason, CurrentStateSortDirection,
+    CurrentStateThresholdCutoff, TableStats,
 };
 
 #[test]
@@ -42,6 +42,10 @@ fn current_state_retention_contracts_cover_policy_families_and_planner_seams() {
             .with_missing_values(CurrentStateMissingValuePolicy::TreatAsLowest),
         10,
     )
+    .with_rank_source(
+        CurrentStateRankSource::projection_owned_range("rank_input", b"players:00", b"players:ff")
+            .with_rebuildable(true),
+    )
     .with_planner(CurrentStatePlanner {
         ranked_materialization: CurrentStateRankedMaterializationSeam::DerivedOnly {
             name: "top-ten-derived".to_string(),
@@ -62,6 +66,8 @@ fn current_state_retention_contracts_cover_policy_families_and_planner_seams() {
             policy_revision: rank.revision,
             effective_logical_floor: None,
             retained_set: terracedb::CurrentStateRetainedSetSummary { rows: 0, bytes: 0 },
+            membership_changes: terracedb::CurrentStateRetentionMembershipChanges::default(),
+            evaluation_cost: terracedb::CurrentStateRetentionEvaluationCost::default(),
             reclaimed_rows: 0,
             reclaimed_bytes: 0,
             deferred_rows: 0,

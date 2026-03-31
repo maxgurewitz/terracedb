@@ -1804,6 +1804,7 @@ pub enum CurrentStateSimulationOperation {
         row_keys: Vec<Vec<u8>>,
     },
     ClearSnapshotPins,
+    PublishRetainedSet,
     Restart,
 }
 
@@ -1848,6 +1849,9 @@ pub fn run_current_state_simulation(
             }
             CurrentStateSimulationOperation::ClearSnapshotPins => {
                 oracle.clear_snapshot_pins();
+            }
+            CurrentStateSimulationOperation::PublishRetainedSet => {
+                oracle.publish_retained_set()?;
             }
             CurrentStateSimulationOperation::Restart => {
                 oracle = CurrentStateRetentionOracle::from_snapshot(oracle.snapshot());
