@@ -8,6 +8,8 @@ All I/O, time, and randomness are abstracted behind traits, enabling determinist
 
 Higher-level features — OCC transactions, projections, windowed aggregations, change feeds, durable timers, workflows, embedded virtual filesystems, and out-of-line blob storage — are not built into the engine. They are implemented as **separate libraries** on top of the core primitives, sharing the same process, DB instance, and async runtime. This document describes the core engine first (Part 1), then the composition patterns the libraries use (Part 2), then the projection library (Part 3), workflow library (Part 4), embedded virtual filesystem library (Part 5), and the `terracedb-bricks` blob/large-object library (Part 6).
 
+When multiple DB instances, future physical shards, or attached subsystems share one process, resource isolation is expressed through **execution domains**. An execution domain is a named placement and budgeting boundary for CPU, memory, local I/O, remote I/O, and background work. Domains affect where work runs and what it may consume, but they do not change correctness semantics such as commit ordering, visibility, durability, or recovery. A unit of work may carry both an execution domain and a **durability class**; domains control resource isolation, while durability classes control persistence-path semantics.
+
 ### Load-Bearing Decisions
 
 These are the architectural choices that most constrain the rest of the design:
@@ -23,6 +25,8 @@ These are the architectural choices that most constrain the rest of the design:
 - **Blob and large-object storage are libraries, not engine value variants.** Large bytes live out-of-line in a blob store; Terracedb stores metadata, references, and derived indexes.
 - **Virtual filesystem compatibility is semantic, not SQLite-format compatibility.** The goal is to provide an in-process virtual filesystem/KV/tool model on Terracedb, not SQL, a single-file transport format, or SQLite WAL behavior.
 - **Event sourcing is recommended** for data that drives history-dependent projections. Mutable-record projections cannot be safely recomputed from SSTables after `SnapshotTooOld`.
+- **Execution domains are resource-isolation boundaries, not correctness boundaries.** A unit of work may be assigned both an execution domain and a durability class. Domains control placement and budgets; durability classes control persistence-path semantics. Changing domains may affect latency, throughput, and backlog behavior, but not logical outcomes.
+- **Control-plane work may use a protected domain and internal durability lane.** Catalog, manifest, schema, cursor, and other recovery-critical metadata must be able to make progress even under sustained user-data load.
 - **Tokio is the sole runtime.** io_uring is an optional backend optimization behind the `FileSystem` trait, not a semantic requirement.
 - **Deterministic simulation testing** covers the full stack — DB, projections, workflows, and higher-level libraries such as the embedded virtual filesystem layer — via injected I/O traits, virtual clock, and seeded PRNG.
 
@@ -42,6 +46,14 @@ The engine's public API is asynchronous because operations may involve commit lo
 interface DBConfig {
   storage: StorageConfig
   scheduler?: Scheduler          // injected at open time; defaults to built-in scheduler
+  execution?: ExecutionConfig    // optional placement/budget policy for colocated DBs/subsystems
+}
+
+interface ExecutionConfig {
+  resourceManager?: ResourceManager
+  foregroundDomain?: string      // default domain for foreground table work
+  backgroundDomain?: string      // default domain for flush/compaction/offload work
+  controlPlaneDomain?: string    // protected domain for catalog/manifest/schema/cursor work
 }
 
 interface DB {
@@ -142,6 +154,8 @@ interface ReadSet {
   add(table: Table, key: Key, atSequence: SequenceNumber): void
 }
 ```
+
+`execution` is optional. Simple single-DB embeddings can omit it and use built-in defaults. When multiple DBs or future shards share one process, the same `ResourceManager` may be shared across openings so they draw from a common process-wide budget while still retaining per-domain isolation.
 
 `table(name)` is a synchronous handle lookup — it returns an in-memory reference to an already-created table. No I/O, and no `Result` in the guaranteed-existing path. It panics if the table is missing; use `tryTable(name)`/`try_table(name)` when existence is not guaranteed. `createTable(config)` is async and fallible because it mutates catalog metadata, which may touch durable storage.
 
@@ -1301,14 +1315,33 @@ The engine is built around a **single async runtime model**:
 
 The **background workers** execution class (see Execution Model above) includes several processes competing for resources: memtable flushes, compaction across multiple tables and levels, S3 backup, S3 offload, and (in user space) projection updaters. The engine delegates scheduling policy to a **user-provided scheduler** (injected at DB open time via `DBConfig.scheduler`), but enforces hard safety invariants that the scheduler cannot override.
 
+### Execution Domains
+
+When multiple DB instances, future shards, or attached subsystems share one process, the engine may assign work into **execution domains** such as:
+
+- `process.control`
+- `db.primary.foreground`
+- `db.primary.background`
+- `db.analytics.foreground`
+- `db.analytics.background`
+
+Each work item may carry both:
+
+- an **execution domain**, which controls placement and resource budgeting, and
+- a **durability class**, which controls which persistence path or WAL class it uses.
+
+These two concepts are intentionally related but separate. Moving work between domains or changing domain budgets may affect latency, throughput, and backlog behavior, but must not change correctness semantics such as commit ordering, visibility, durability guarantees, or recovery results. Simple single-DB embeddings can ignore this entirely and rely on the built-in defaults; colocated multi-DB or future shard-aware embeddings opt into explicit domain/resource configuration.
+
 ### Engine Responsibilities
 
 The engine:
 
 - Executes flushes, compactions, backups, and offloads when told to by the scheduler.
+- Resolves work items into execution domains and accounts CPU / memory / I/O usage against domain-local budgets when domains are configured.
 - Exposes accurate per-table stats and a list of pending work.
 - Calls the scheduler's `shouldThrottle` before accepting writes.
 - Calls the scheduler's `onWorkAvailable` when new work appears.
+- Routes catalog, manifest, schema, cursor, and other recovery-critical metadata through the protected control-plane domain and its internal durability lane when that path is enabled.
 - Passes table `metadata` through without interpreting it.
 
 ### Engine Safety Guardrails
@@ -1318,6 +1351,7 @@ The scheduler is trusted policy code, but the engine enforces hard limits to pre
 - **Forced memtable flush** when available memory for memtables is exhausted. The engine will flush even if the scheduler defers all flush work.
 - **Forced L0 compaction** when L0 SSTable count exceeds a hard ceiling. The engine will stall writes and compact even if the scheduler defers.
 - **Guaranteed eventual execution** of backup and offload work. If the scheduler defers a work item indefinitely, the engine will force it after a configurable maximum deferral time.
+- **Protected control-plane progress** for catalog, manifest, schema, cursor, and other recovery-critical metadata. User-data pressure must not be able to starve internal recovery-critical work forever.
 
 The scheduler controls priority, throttling, and fairness *within* these guardrails. It cannot prevent the engine from maintaining core liveness.
 
@@ -1333,6 +1367,7 @@ interface PendingWork {
   id: string
   type: "flush" | "compaction" | "backup" | "offload"
   table: string
+  domain?: string           // execution-domain label when domain-aware placement is enabled
   level?: number            // for compaction: source level
   estimatedBytes: number
 }
@@ -1361,6 +1396,8 @@ interface TableStats {
 ```
 
 The scheduler interface is intentionally **synchronous**. The engine gathers stats asynchronously (via `tableStats()` / `pendingWork()`), then invokes the scheduler with in-memory snapshots of that state. The scheduler makes decisions purely from the data it is given — no I/O, no async, no DB access. This keeps the scheduler simple to implement and test, and avoids the scheduler becoming a source of latency or deadlock in the engine's background work loop.
+
+When execution domains are not configured, `PendingWork.domain` may be omitted or collapse to a built-in default. Domain topology, budget usage, and colocated-DB placement introspection are exposed through runtime APIs and diagnostics; the synchronous scheduler callback only needs enough information to prioritize and throttle pending work without becoming a second control plane.
 
 ### Table Metadata for Scheduling
 
@@ -1450,7 +1487,7 @@ The engine provides primitives, not business semantics. The following are explic
 
 ## Future Extension: Physical Sharding
 
-Physical per-table sharding — where a table gets independent memtables, commit log lanes, SSTables, and compaction schedules per shard — is a future optimization for CPU-bound write throughput on many cores. It is not implemented, but the current design is future-proofed in three ways:
+Physical per-table sharding — where a table gets independent memtables, commit log lanes, SSTables, and compaction schedules per shard — is a future optimization for CPU-bound write throughput on many cores. It is not implemented, but the current design is future-proofed in four ways:
 
 1. **Structured sequence identifier.** Commit log records and MVCC key suffixes use a `CommitId` struct rather than a bare `u64`. Currently this contains only a sequence number, but the encoding reserves space for a shard identifier. This avoids a storage format migration when sharding is added.
 
@@ -1462,6 +1499,8 @@ Physical per-table sharding — where a table gets independent memtables, commit
    Adding physical shards creates `0001/`, `0002/`, etc. alongside the existing `0000/` directory. No migration of existing data.
 
 3. **WriteBatch shard grouping.** The commit path resolves each entry's target shard (always 0 today) and groups entries by `(table, shard)` before acquiring the mutex. When physical sharding is added, the commit path can validate that no batch spans multiple shards of the same sharded table — a one-line check on an already-computed grouping.
+
+4. **Execution-domain hierarchy already separates placement from correctness.** A future physical shard can slot into the existing domain tree as another workload unit (for example `db.orders.shard_3.foreground`) without redefining commit semantics or resource-isolation concepts. Domains provide the placement/budgeting foundation for shard-local foreground, background, and control-plane work, but they are not themselves physical sharding.
 
 When physical sharding is implemented, it will be opt-in per table via `TableConfig`. Unsharded tables continue to work exactly as today. Cross-shard `WriteBatch` operations on a sharded table will be rejected at commit time, enforcing the single-writer-per-entity discipline that is currently an application convention.
 

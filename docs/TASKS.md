@@ -2130,7 +2130,7 @@ Build a separate add-on crate that turns Terracedb state into analytics-friendly
 
 ## Phase 11 — Columnar v2, hybrid read path, and performance hardening
 
-**Parallelization:** T48 first. T49 follows T48. After that, T50, T51, T53, T55, and T56 can proceed in parallel. T52 depends on T50 + T51. T54 depends on T51 + T52 + T55. T57 depends on T50 + T51 + T52 + T53 + T55 + T56. T58 depends on T52 + T53 + T54 + T55 + T56 + T57.
+**Parallelization:** T48 first. T49 follows T48. After that, T50, T51, T53, T55, and T56 can proceed in parallel. T50a depends on T50. T52 depends on T50 + T51. T54 depends on T51 + T52 + T55. T57 depends on T50 + T50a + T51 + T52 + T53 + T55 + T56. T58 depends on T52 + T53 + T54 + T55 + T56 + T57.
 
 **Phase rule:** Every task in this phase must add the related deterministic oracle extensions, cut points, and simulation coverage at the same time as the production-path change. Do not defer crash/recovery, pruning-correctness, or cache-state coverage to a later hardening-only step.
 
@@ -2256,6 +2256,33 @@ Replace JSON-backed column blocks with typed binary substreams while preserving 
 - Round-trip tests for every field type and codec combination introduced by the task.
 - Restart tests proving mixed v1/v2 SSTable sets can be reopened and read correctly where compatibility is intended.
 - Deterministic simulation tests, introduced in the same change, covering write/crash/restart at codec/footer publish cut points, low-cache-budget runs, and verifying logical reads match the oracle.
+
+---
+
+### T50a. Implement compact decode metadata and lazy schema materialization
+
+**Depends on:** T48, T49, T50
+
+**Description**
+
+Add a compact per-part/per-version decode-metadata layer that lets reopen and hot read paths interpret persisted columnar bytes without eagerly materializing the full schema object. The goal is to keep the hot path cheap while preserving explicit, fail-closed schema compatibility rules.
+
+**Implementation steps**
+
+1. Extend the T49 oracle/harness first to model:
+   - compact decode-metadata lookup,
+   - lazy full-schema materialization only when required, and
+   - fail-closed behavior when compact decode metadata and full schema metadata disagree.
+2. Define a compact decode-metadata representation that is distinct from the full schema object but sufficient to interpret persisted columnar-v2 substreams, including field identity/order, nullability/default-fill requirements, and any compatibility/version identifiers needed by the reader.
+3. Persist compact decode metadata, or stable identifiers that resolve to it, in the per-part/footer/publish metadata needed for reopen and read-path use without forcing eager full-schema loads.
+4. Teach reopen and hot read paths to use compact decode metadata first, materializing the full schema object only when required for higher-level validation, unsupported edge cases, or explicit schema inspection.
+5. Fail closed on incompatible or corrupt decode-metadata/schema combinations rather than silently accepting mismatched physical bytes.
+
+**Verification**
+
+- Restart tests proving mixed schema-version SSTable sets can be reopened and decoded through compact decode metadata without requiring eager full-schema materialization on the hot path.
+- Read-path tests proving default-filling and nullability semantics remain correct when compact decode metadata is used instead of the full schema object.
+- Corruption and incompatibility tests proving decode-metadata/schema mismatches fail closed and surface actionable recovery or repair states.
 
 ---
 
@@ -2614,6 +2641,503 @@ Coordinate generalized logical retention with compaction, offload/delete, schedu
 
 ---
 
+## Phase 13 — Execution domains, control-plane isolation, and colocated multi-DB foundations
+
+**Parallelization:** T63 first. After that, T64, T65, and T66 can proceed in parallel. T67 depends on T64 + T65 + T66. T68 depends on T64 + T66 + T67. T69 depends on T64 + T65 + T66 + T67 + T68. T70 depends on T64 + T65 + T66 + T67.
+
+**Phase rule:** T63 freezes the interfaces first, and the rest of the phase should maximize parallel work against those fixed seams rather than re-opening the core contracts. Execution domains are a placement/scheduling/resource abstraction, not a correctness abstraction. Moving work between domains or changing domain budgets may change latency, throughput, and backlog behavior, but must not change commit ordering, visibility, durability semantics, recovery outcomes, or the final correctness of rebuild/replication-derived state.
+
+**Simulation rule:** Every task in this phase must extend the relevant deterministic oracle/cut-point/simulation harness in the same change as the production-path change. Do not defer task-local verification to the capstone; T69 is additive whole-system hardening, not a substitute for self-contained simulation in T64-T68 and T70.
+
+**Adoption rule:** Treat the control-plane domain and conservative bounded per-domain budgeting as the universal foundation. Treat aggressive isolation, shard-local placement rules, and any optional dedicated-resource reservations as incremental opt-in controls that remain configurable and default-off until workload evidence justifies broader adoption.
+
+### T63. Freeze execution-domain, durability-class, and resource-manager contracts
+
+**Depends on:** T16, T33, T56
+
+**Description**
+
+Define the long-term abstraction for colocating multiple Terracedb workloads in one process without conflating correctness and resource isolation. The goal is to freeze the contracts before implementation branches diverge: a unit of work may be assigned an execution domain and a durability class, but the two are related without being the same thing.
+
+**Implementation steps**
+
+1. Define an `ExecutionDomain`-style contract covering:
+   - hierarchical naming and ownership,
+   - domain-local CPU/memory/I/O/background-work budgets,
+   - optional dedicated versus shared-weighted placement modes, and
+   - domain introspection and lifecycle hooks.
+2. Define a distinct `DurabilityClass`-style contract covering:
+   - default user-data durability,
+   - internal/control-plane durability,
+   - any future specialized classes such as deferred or remote-primary write lanes,
+   while making it explicit that execution-domain assignment alone does not change correctness semantics.
+3. Freeze the process-wide `ResourceManager` / placement-policy seam that owns total process budgets and maps databases, shards, and subsystems into domains.
+4. Define the required invariants up front:
+   - correctness invariants under domain movement,
+   - isolation invariants under overload,
+   - liveness rules for emergency flush/compaction/recovery work, and
+   - explicit rules for control-plane progress under user-data pressure.
+5. Freeze the reusable simulation/oracle seams up front for:
+   - domain-tagged work items,
+   - domain-local budget accounting,
+   - control-plane versus user-data contention, and
+   - colocated multi-DB workload generators.
+6. Add compile-time stubs and placeholder types so later tasks can build against the domain/resource contracts without immediately committing to one scheduling backend.
+
+**Verification**
+
+- Compile-only tests proving the new domain/resource/durability contracts compose cleanly with the existing scheduler, DB builder, and maintenance APIs.
+- Deterministic smoke tests proving work can be tagged with domains and durability classes through injected fake runtimes without touching real I/O.
+- Invariant tests making it explicit that changing execution-domain placement does not change logical DB outcomes.
+
+---
+
+### T64. Implement hierarchical execution domains and process-wide resource budgeting
+
+**Depends on:** T63
+
+**Description**
+
+Implement the runtime substrate for hierarchical execution domains so colocated databases, future shards, and attached subsystems can share one process under explicit budgets. This task owns resource accounting and placement, not separate storage semantics.
+
+**Implementation steps**
+
+1. Extend the simulation/oracle harness first so it can model hierarchical domains, shared versus reserved budgets, and deterministic contention outcomes before the production resource manager lands.
+2. Implement the process-wide resource manager for:
+   - total CPU worker/scheduling budget,
+   - cache and mutable-memory budgeting,
+   - local I/O concurrency/bandwidth ceilings,
+   - remote/object-store concurrency ceilings, and
+   - background task slot accounting.
+3. Implement hierarchical domains that can represent at least:
+   - process/control,
+   - database foreground/background,
+   - future shard-local foreground/background, and
+   - attached subsystem domains such as projections, workflows, or analytics helpers.
+4. Support both shared-weighted and optionally dedicated reservations, while keeping the conservative default profile shared and bounded rather than over-partitioned.
+5. Extend the DB open/builder/configuration path so colocated databases can be assigned to domains without requiring storage-level changes.
+6. Add observability for configured budgets, effective usage, contention, and domain-local backlog without turning those signals into correctness primitives.
+
+**Verification**
+
+- Tests proving per-domain budgets are enforced for representative CPU/memory/I/O/background limits.
+- Deterministic scheduler tests proving busy domains cannot consume more than their configured allowances while idle capacity can still be reused when policy allows.
+- Multi-DB simulation tests proving colocated databases can be opened with different domain assignments while preserving identical logical results.
+
+---
+
+### T65. Implement the control-plane domain and dedicated internal durability lane
+
+**Depends on:** T23b, T63
+
+**Description**
+
+Introduce a protected control-plane path for catalog, manifest, schema, cursor, and other recovery-critical metadata. This task owns the explicit mapping between the control-plane execution domain and a dedicated internal durability class, while preserving the rule that domain placement and durability class remain distinct concepts.
+
+**Implementation steps**
+
+1. Extend the simulation/recovery harness first with control-plane-domain contention, dedicated durability-lane behavior, and restart ordering checks before the production control-plane path lands.
+2. Define the reserved control-plane domain and route recovery-critical metadata work through it:
+   - catalog/schema updates,
+   - manifest and publish metadata,
+   - durable cursor/control metadata, and
+   - any other internal state required for reopen/recovery progress.
+3. Implement a dedicated control-plane durability lane or WAL class for that metadata rather than forcing it to share the default user-data path under all conditions.
+4. Reserve a bounded internal write/memory budget so control-plane progress cannot deadlock behind user-data pressure.
+5. Integrate startup/recovery ordering so control-plane metadata can be replayed/validated before dependent user-data recovery steps when required.
+6. Add explicit fail-closed rules for control-plane corruption or class mismatch, including actionable repair/recovery reporting.
+
+**Verification**
+
+- Tests proving control-plane writes remain durable and progress-capable under sustained user-data write/load pressure.
+- Crash/restart tests proving control-plane recovery can complete before dependent user-data reopen steps where required.
+- Simulation tests proving protected internal budgets do not let user-data workloads starve schema/manifest/cursor progress.
+
+---
+
+### T66. Make scheduler, admission control, caches, and background work domain-aware
+
+**Depends on:** T63, T56
+
+**Description**
+
+Teach the existing runtime controls to respect execution-domain boundaries. This task owns the integration between domains and the scheduler/backpressure/caching machinery so domains become real operational boundaries instead of passive labels.
+
+**Implementation steps**
+
+1. Extend the deterministic scheduler/admission harness first so it can reason about domain-aware deferral, throttling, control-plane overrides, and cache-budget partitioning before the production integration lands.
+2. Extend the scheduler and maintenance pipeline so work items carry execution-domain identity and domain-local budget context.
+3. Make read/write admission, remote-cache admission, prefetch, compaction, offload, and projection/workflow background work respect domain-local ceilings and priorities.
+4. Add support for control-plane priority overrides so emergency/internal work can still make progress without bypassing the domain model entirely.
+5. Ensure caches and mutable-memory budgets can be partitioned or weighted per domain, while keeping conservative defaults simple and bounded.
+6. Surface domain-aware backlog, throttling, and starvation diagnostics so operators can understand why work was deferred or shed.
+
+**Verification**
+
+- Deterministic tests proving domain-aware scheduling changes resource distribution but not logical DB outcomes.
+- Mixed-workload simulation tests where one domain runs scan-heavy or compaction-heavy traffic and cannot starve protected foreground or control-plane domains.
+- Cache/admission tests proving per-domain ceilings stay bounded and observable under both local and remote-read pressure.
+
+---
+
+### T67. Add multi-DB colocated deployment support and placement policy wiring
+
+**Depends on:** T64, T65, T66
+
+**Description**
+
+Make execution domains usable by real embeddings that host multiple databases in one process. This task owns the policy/configuration and ergonomic layer needed to place colocated DBs and subsystems into domains without exposing too much runtime plumbing to ordinary callers.
+
+**Implementation steps**
+
+1. Extend the simulation/integration harness first with colocated multi-DB placement scenarios and default-policy checks before the production API wiring lands.
+2. Extend the builder/config API so callers can:
+   - declare multiple colocated DB instances,
+   - assign them to domain hierarchies,
+   - select conservative shared versus reserved placements, and
+   - wire attached subsystems into the same domain tree.
+3. Define default placement policies for common shapes:
+   - single DB,
+   - two colocated DBs,
+   - primary DB plus analytics/helper DB, and
+   - future shard-ready layouts with distinct foreground/background lanes.
+4. Add introspection/reporting APIs for domain topology, effective budgets, and placement decisions.
+5. Keep the single-DB default ergonomics simple so ordinary users are not forced to understand domains before they need them.
+6. Document the operational model clearly, including the distinction between execution-domain placement and durability class selection.
+
+**Verification**
+
+- Multi-DB integration tests proving colocated databases can be opened, operated, and recovered independently while sharing one process/runtime.
+- Configuration tests proving default single-DB profiles do not require explicit domain setup.
+- Introspection tests proving domain trees, budget assignments, and placement decisions are reported consistently.
+
+---
+
+### T68. Add shard-ready placement rules and deterministic hardening for execution domains
+
+**Depends on:** T64, T66, T67
+
+**Description**
+
+Harden the execution-domain system so it can serve as the future foundation for physical sharding without claiming that full sharding is complete in this phase. This task owns shard-ready placement semantics, migration-safe invariants, and the deterministic test matrix for domain-aware overload and recovery behavior.
+
+**Implementation steps**
+
+1. Extend the deterministic domain harness first with shard-ready placement shapes and reconfiguration events before the production hardening work lands.
+2. Define shard-ready domain naming and ownership rules so future physical shards can slot into the existing hierarchy without redesigning the abstraction.
+3. Add deterministic workload generators for:
+   - multiple colocated DBs,
+   - control-plane pressure,
+   - scan-heavy versus write-heavy competing domains, and
+   - future shard-local foreground/background placement shapes.
+4. Add cut points and recovery tests for:
+   - control-plane replay under user-data pressure,
+   - domain-budget reconfiguration,
+   - emergency flush/compaction progress, and
+   - reopen after overloaded or partially drained background domains.
+5. Verify liveness rules such as:
+   - control-plane progress under load,
+   - emergency maintenance progress,
+   - no deadlock when protected and shared domains contend, and
+   - deterministic behavior when budgets are tightened or relaxed.
+6. Document the exact boundary of the phase: the engine becomes shard-ready from a placement/resource perspective, but physical per-table data sharding still remains a later phase.
+
+**Verification**
+
+- Deterministic simulation suites proving domain-aware overload, reconfiguration, and recovery remain reproducible and do not alter correctness outcomes.
+- Liveness tests proving protected domains continue to make progress while shared domains are throttled or shed.
+- Tests and docs making it explicit that execution domains provide shard-ready placement foundations without claiming completed physical data sharding.
+
+---
+
+### T69. Build whole-system simulation and chaos suites for execution domains
+
+**Depends on:** T64, T65, T66, T67, T68
+
+**Description**
+
+Add the capstone deterministic hardening pass for the domains subsystem. This task owns the holistic simulation and chaos matrix across multiple features together: colocated DBs, control-plane isolation, domain-aware scheduling, budget reconfiguration, and shard-ready placement behavior. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact.
+
+**Implementation steps**
+
+1. Compose the per-task domain simulation/oracle helpers into a whole-system harness that can run:
+   - multiple colocated DB instances,
+   - competing foreground/background/control-plane domains,
+   - dynamic budget changes,
+   - restart/recovery under pressure, and
+   - shard-ready placement shapes.
+2. Add long-running deterministic campaigns that combine:
+   - user-data pressure plus control-plane metadata churn,
+   - scan-heavy versus write-heavy competing tenants,
+   - remote-I/O contention plus cache partitioning,
+   - emergency maintenance work under protected/shared contention, and
+   - colocated DB open/close/reopen sequences in one process.
+3. Add a real-runtime fault/chaos layer for this phase's features where appropriate, including controlled task stalls, injected timing skew, and budget-tightening events that complement the deterministic harness without weakening reproducibility requirements.
+4. Verify the full invariants matrix:
+   - correctness does not change under domain reassignment,
+   - protected domains retain progress under load,
+   - shared domains respect configured ceilings, and
+   - recovery remains deterministic and fail-closed.
+
+**Verification**
+
+- Large-seed deterministic simulation campaigns proving domain-aware behavior remains reproducible across colocated multi-DB, control-plane, and shard-ready placement scenarios.
+- Cross-feature chaos tests proving budget changes, recovery, and protected-domain progress remain correct under injected contention and task stalls.
+- End-to-end invariant tests proving the full execution-domain system changes performance behavior only, not logical DB outcomes.
+
+---
+
+### T70. Build a small example app that demonstrates execution domains
+
+**Depends on:** T64, T65, T66, T67
+
+**Description**
+
+Add a sibling example to `examples/todo-api` that demonstrates why execution domains exist in practice. The example should stay small and teachable while showing two colocated workloads in one process plus a protected control-plane path, so users can see domain assignment, conservative defaults, and basic observability without needing to read the full architecture doc first.
+
+**Implementation steps**
+
+1. Extend the phase-local simulation/example harness first with an example-oriented workload model covering:
+   - one latency-sensitive primary DB,
+   - one lower-priority analytics/helper DB, and
+   - control-plane metadata activity under competing load.
+2. Create a small example app (for example `examples/domains-api`) with:
+   - two colocated DB instances opened in one process,
+   - explicit execution-domain configuration,
+   - a protected control-plane domain,
+   - a small HTTP or CLI surface that triggers foreground reads/writes, background activity, and a helper/analytics workload, and
+   - observability output that shows the chosen domain topology and effective budgets.
+3. Keep the default profile conservative and approachable:
+   - shared weighted domains by default,
+   - optional reserved/protected settings called out explicitly,
+   - no requirement to understand future physical sharding.
+4. Document clearly:
+   - which operations run in which domains,
+   - how the control-plane domain differs from ordinary foreground/background domains, and
+   - that domain placement changes performance/isolation behavior, not correctness semantics.
+
+**Verification**
+
+- End-to-end deterministic simulation tests for the example workload proving the primary workload remains correct and protected while the helper workload is stressed.
+- Example integration tests proving colocated DB open/reopen, domain introspection, and control-plane progress all work under the documented default profile.
+- Example-level equivalence tests proving changing domain placement alters latency/backlog behavior but not logical answers.
+
+---
+
+## Phase 14 — Unified-log pressure, flush reclamation, and adaptive write admission
+
+**Parallelization:** T71 first. After that, T72, T73, and T74 can proceed in parallel against the frozen interfaces. T75 depends on T73 + T74 + T70. T76 depends on T72 + T73 + T74 + T75.
+
+**Phase rule:** T71 freezes the accounting and admission interfaces first, and the rest of the phase should maximize parallel implementation against those fixed seams rather than re-opening the core contracts. This phase changes when the engine chooses to flush, throttle, or stall; it must not change commit ordering, visibility rules, durability semantics, crash-recovery results, or the logical answers returned by reads/scans.
+
+**Simulation rule:** Every task in this phase must extend the relevant deterministic oracle/cut-point/simulation harness in the same change as the production-path change. Do not defer task-local simulation to the capstone; T76 is additive whole-system hardening, not a substitute for self-contained coverage in T72-T75.
+
+**Adoption rule:** Treat the existing L0-driven controls as the conservative fallback, not something to delete immediately. The new unified-log pressure and fine-grained memory accounting signals should layer in alongside L0/compaction signals, with bounded default thresholds and explicit observability before more aggressive policies become the default. Domain-local soft policy may differ by workload shape — for example, stricter OLTP-oriented domains and looser OLAP-ingest-oriented domains — but process-wide hard guardrails for memory exhaustion, unified-log exhaustion, and liveness still override domain-local preferences.
+
+### T71. Freeze unified-log pressure, flush-reclaim, and admission-control contracts
+
+**Depends on:** T33, T63, T66
+
+**Description**
+
+Define the long-term contracts for pressure-aware flushing and write admission before implementation branches diverge. The goal is to make the engine reason explicitly about dirty bytes, queued-for-flush bytes, bytes already being flushed, and unified-log pressure without conflating those signals or changing correctness semantics.
+
+**Implementation steps**
+
+1. Extend the deterministic simulation/oracle harness first with a fake unified-log pressure model that can represent:
+   - mutable dirty bytes,
+   - immutable bytes queued for flush,
+   - immutable bytes already in-flight to flush,
+   - unified-log bytes pinned by unflushed state,
+   - oldest-unflushed age, and
+   - estimated relief from candidate flushes.
+2. Freeze a `PressureStats` / `FlushPressureCandidate` / `AdmissionSignals`-style interface that distinguishes:
+   - current dirty bytes versus already-flushing bytes,
+   - memory pressure versus unified-log pressure,
+   - local per-table/per-domain signals versus process-wide totals, and
+   - pressure signals versus correctness metadata such as durable watermarks.
+3. Define the crash/restart and failed-flush reconstruction rules up front so pressure accounting can be rebuilt deterministically from manifests, memtables, and unified-log state after reopen.
+4. Define the relationship to execution domains and the resource manager: domains may budget mutable memory and unified-log pressure, but the single-DB/single-domain default must remain simple and conservative. Make it explicit that domains may choose different soft policies by workload shape, while process-wide hard safety guardrails remain global.
+5. Freeze the scheduler/admission seam for pressure-aware flush scoring and write throttling/stalling so later tasks can implement policy without reworking the public contracts.
+6. Add compile-time stubs and placeholder types so the accounting, scheduler, and observability work can proceed in parallel against the same fixed interface.
+
+**Verification**
+
+- Compile-only tests proving the new pressure/admission contracts compose with the existing scheduler, maintenance, and DB builder APIs.
+- Deterministic smoke tests proving fake runtimes can tag work with pressure signals and reconstruct those signals after simulated restart.
+- Invariant tests making it explicit that changing pressure thresholds changes latency/backlog behavior only, not logical DB outcomes.
+
+---
+
+### T72. Implement fine-grained dirty-byte, flushing-byte, and unified-log pinning accounting
+
+**Depends on:** T71
+
+**Description**
+
+Implement the accounting substrate needed for pressure-aware flushing. This task owns the production tracking of dirty bytes, queued-for-flush bytes, bytes already being flushed, and unified-log pressure pinned by unflushed state across steady-state operation, failures, and restart.
+
+**Implementation steps**
+
+1. Extend the simulation/oracle harness first so it models accounting transitions across:
+   - commit into the mutable memtable,
+   - memtable rotation,
+   - flush start,
+   - flush completion,
+   - flush failure, and
+   - crash/restart reconstruction.
+2. Extend memtable / immutable-memtable state so the engine tracks at least:
+   - mutable dirty bytes,
+   - immutable queued bytes,
+   - immutable flushing bytes,
+   - per-table and per-domain contributions, and
+   - any unified-log segment/range or sequence-watermark information needed to estimate pinned log pressure.
+3. Implement deterministic reconstruction of those counters on open/recovery instead of trusting stale in-memory state.
+4. Expose the accounting through runtime stats/telemetry/introspection without turning it into correctness metadata.
+5. Keep the accounting precise enough to distinguish "still dirty" bytes from bytes already being drained by an in-flight flush.
+
+**Verification**
+
+- Accounting tests proving bytes transition cleanly between mutable, queued, flushing, and reclaimed states without double-counting.
+- Crash/restart tests proving pressure counters reconstruct deterministically after reopen and after failed flushes.
+- Simulation tests proving the same write history yields the same pressure-accounting trace across replay of the same seed.
+
+---
+
+### T73. Implement pressure-aware flush candidate scoring and forced-flush guardrails
+
+**Depends on:** T71
+
+**Description**
+
+Teach the maintenance loop to choose flush work based on actual relief value, not just the existence of immutable memtables. This task owns pressure-aware flush scoring, age-sensitive guardrails, and conservative forced-flush rules that react earlier than coarse L0-only pressure.
+
+**Implementation steps**
+
+1. Extend the deterministic maintenance harness first with a pressure-aware flush oracle that scores candidate flushes by:
+   - unified-log bytes likely to be reclaimed,
+   - dirty-byte relief,
+   - oldest-unflushed age,
+   - per-table/per-domain budget pressure, and
+   - interaction with existing L0/compaction guardrails.
+2. Enrich pending flush candidates with the estimated relief metadata needed by the scheduler/maintenance loop rather than surfacing only a raw byte count.
+3. Implement pressure-aware flush prioritization so the engine can prefer the flush that best relieves unified-log and memory pressure, while preserving conservative fallback behavior when the richer signals are unavailable.
+4. Add forced-flush rules based on unified-log pressure, dirty-byte pressure, and age ceilings, while retaining L0 hard ceilings as an independent safety guardrail.
+5. Surface operator-facing diagnostics that explain why a flush was selected or forced.
+
+**Verification**
+
+- Deterministic tests proving the chosen flush order changes when pressure relief changes, even if raw immutable-byte counts are similar.
+- Mixed-workload simulation tests proving pressure-aware flush selection reduces pathological stalls compared with L0-only heuristics while preserving correctness.
+- Guardrail tests proving the engine still forces progress when the scheduler defers work indefinitely.
+
+---
+
+### T74. Implement multi-signal write admission and domain-aware pressure budgeting
+
+**Depends on:** T71
+
+**Description**
+
+Teach the write-admission path to react to multiple pressure signals together instead of waiting mostly for L0 count to become unhealthy. This task owns adaptive throttling/stalling based on unified-log pressure, fine-grained memory pressure, flush backlog, and optional domain-local budgets.
+
+**Implementation steps**
+
+1. Extend the deterministic scheduler/admission harness first so it can model multi-signal throttling decisions using:
+   - unified-log pinned bytes,
+   - mutable dirty bytes,
+   - immutable queued/flushing bytes,
+   - oldest-unflushed age,
+   - L0/compaction debt, and
+   - optional per-domain budget pressure.
+2. Implement admission heuristics that combine those signals into:
+   - no throttle,
+   - rate limit, or
+   - stall,
+   while keeping the default thresholds conservative and debuggable.
+3. Integrate the new admission signals with execution domains / resource-manager budgets so one busy DB or domain cannot pin all mutable memory or unified-log headroom for the process.
+4. Support workload-shaped soft policy at the domain level, so OLTP-oriented domains can prefer earlier throttling/flush pressure relief while OLAP-ingest-oriented domains can tolerate larger buffers and later intervention.
+5. Preserve process-wide hard guardrails above all domain policy so global memory exhaustion, unified-log exhaustion, and liveness threats still force action even when a domain's preferred policy is more relaxed.
+6. Preserve a simple single-DB path where the engine can run without explicit domain configuration and still benefit from the richer pressure model.
+7. Add observability for which signal triggered throttling/stalling and how much pressure relief is needed to recover.
+
+**Verification**
+
+- Deterministic tests proving write admission reacts before the system reaches pathological L0 pressure when unified-log or memory pressure is already high.
+- Multi-DB/domain simulation tests proving one workload cannot monopolize pressure budgets and force unrelated tenants into avoidable stalls.
+- Equivalence tests proving richer admission signals change only performance/backlog behavior, not committed results.
+
+---
+
+### T75. Extend the example app to demonstrate pressure-aware flushing and write admission
+
+**Depends on:** T73, T74, T70
+
+**Description**
+
+Extend the domains example so users can see pressure-aware flushing and write admission in practice. The example should stay small and teachable while showing how dirty bytes, in-flight flush bytes, unified-log pressure, and domain budgets interact under a bursty workload.
+
+**Implementation steps**
+
+1. Extend the phase-local simulation/example harness first with an example-oriented workload model covering:
+   - a bursty primary writer,
+   - a lower-priority helper workload,
+   - slower background flush capacity, and
+   - a visible recovery path once pressure is relieved.
+2. Extend the domains sample app (or its successor example) so it surfaces:
+   - current dirty bytes,
+   - queued versus already-flushing bytes,
+   - unified-log pressure,
+   - active throttle/stall state, and
+   - the configured domain/resource budget layout.
+3. Demonstrate conservative defaults first, then optionally show a more aggressive profile where domain-aware budgets protect the primary workload sooner.
+4. Document clearly that these controls affect latency, backlog, and resource isolation rather than logical correctness.
+
+**Verification**
+
+- Example simulation tests proving the primary workload remains correct while pressure-aware throttling/flush selection changes backlog and latency behavior.
+- Example integration tests proving the surfaced pressure metrics and throttle states match the documented workload transitions.
+- Example-level equivalence tests proving conservative and aggressive profiles return the same logical answers.
+
+---
+
+### T76. Build the capstone whole-system simulation and chaos suite for pressure-aware flushing
+
+**Depends on:** T72, T73, T74, T75
+
+**Description**
+
+Add the capstone deterministic hardening pass for the pressure-aware flush/admission subsystem. This task owns the whole-system matrix across group commit, deferred durability, unified-log pressure, flush selection, multi-DB/domain contention, and restart/failure handling. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact.
+
+**Implementation steps**
+
+1. Compose the per-task pressure simulation/oracle helpers into a whole-system harness that can run:
+   - bursty write spikes,
+   - slow or failed flushes,
+   - group-commit and deferred-durability modes,
+   - multiple colocated DB/domain workloads, and
+   - restart/recovery under sustained pressure.
+2. Add long-running deterministic campaigns that combine:
+   - unified-log pressure plus L0/compaction debt,
+   - flush failures plus retry/reopen,
+   - pressure spikes during control-plane and user-data contention, and
+   - budget reconfiguration in the presence of in-flight flush work.
+3. Add a real-runtime chaos layer where appropriate, including injected flush stalls, delayed durability completion, and abrupt budget tightening events that complement the deterministic harness without weakening reproducibility requirements.
+4. Verify the full invariants matrix:
+   - no correctness change under different pressure thresholds,
+   - pressure counters eventually converge after work completes,
+   - domain-local soft policy differences change performance behavior only, while global hard guardrails still preserve liveness,
+   - protected domains retain progress under load, and
+   - recovery remains deterministic and fail-closed.
+
+**Verification**
+
+- Large-seed deterministic simulation campaigns proving pressure-aware flushing and admission remain reproducible across restart, failure, and multi-tenant contention scenarios.
+- Cross-feature chaos tests proving flush stalls, retry paths, and budget tightening still preserve deterministic recovery and liveness.
+- End-to-end invariant tests proving the subsystem changes performance behavior only, not logical DB outcomes.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
@@ -2712,11 +3236,12 @@ At this point the system should additionally support:
 - a clean separation between authoritative Terracedb backups and disposable analytical exports.
 
 ### Milestone J — Hybrid columnar-v2 and selective-read hardening
-Complete: T48–T57
+Complete: T48–T50a, T51–T57
 
 At this point the system should additionally support:
 - a formalized columnar-v2 contract with stable internal seams for format, scan, cache, and repair work,
 - typed binary columnar substreams with an initial codec pipeline,
+- compact per-part/per-version decode metadata with lazy full-schema materialization on reopen and hot read paths,
 - sparse marks/granules and zone-map pruning,
 - batch-based selective-read execution with PREWHERE-lite and late materialization,
 - segmented remote caching with coalesced async reads and downloader election,
@@ -2742,13 +3267,37 @@ At this point the system should additionally support:
 - explicit separation between sequence-based MVCC/CDC retention and generalized current-state retention, and
 - coordinated logical and physical reclamation behavior with deterministic simulation coverage for policy churn, crashes, and restart.
 
+### Milestone M — Execution domains and colocated multi-DB operation
+Complete: T63–T70
+
+At this point the system should additionally support:
+- hierarchical execution domains with fixed resource-manager and durability-class interfaces,
+- a protected control-plane domain and dedicated internal durability lane for recovery-critical metadata,
+- domain-aware scheduling, admission control, caches, and background work with bounded default policies,
+- colocated multi-DB deployment and placement-policy support in one process,
+- shard-ready placement/resource foundations without claiming completed physical data sharding,
+- whole-system deterministic simulation and chaos coverage across domain composition, and
+- a small example app that demonstrates two colocated workloads plus protected control-plane progress.
+
+### Milestone N — Pressure-aware flushing and adaptive admission
+Complete: T71–T76
+
+At this point the system should additionally support:
+- fixed interfaces for unified-log pressure, fine-grained memory accounting, and adaptive write-admission signals,
+- explicit distinction between dirty bytes, queued-for-flush bytes, and bytes already being flushed,
+- pressure-aware flush selection that optimizes for actual relief value rather than only immutable presence or coarse L0 heuristics,
+- adaptive throttling/stalling that considers unified-log pressure, memory pressure, flush backlog, and L0/compaction pressure together,
+- optional domain-aware pressure budgeting so one colocated workload cannot pin all mutable-memory or unified-log headroom,
+- whole-system deterministic simulation and chaos coverage for pressure spikes, failed flushes, and recovery, and
+- an example app that demonstrates pressure-aware flushing and admission without changing logical answers.
+
 ---
 
 ## Deferred items from the architecture
 
 The following architecture sections are intentionally **not** decomposed into implementation tasks here because they are either explicitly future work or outside the requested scope:
 
-- physical per-table sharding,
+- full physical per-table sharding,
 - mount/protocol adapters for exposing the embedded virtual filesystem outside the process,
 - zero-downtime upgrade handoff library,
 - platform-specific deployment recipes and rollout automation.

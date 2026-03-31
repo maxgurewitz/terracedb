@@ -1135,13 +1135,18 @@ impl Db {
                             input.meta.max_sequence,
                             &input.meta.local_id,
                         );
-                        let bytes = read_path(&self.inner.dependencies, &input.meta.file_path).await?;
+                        let bytes =
+                            read_path(&self.inner.dependencies, &input.meta.file_path).await?;
                         storage
                             .put_object(&remote_key, &bytes)
                             .await
                             .map_err(|error| error.into_storage_error())?;
-                        Self::note_backup_object_birth(&self.inner.dependencies, &layout, &remote_key)
-                            .await;
+                        Self::note_backup_object_birth(
+                            &self.inner.dependencies,
+                            &layout,
+                            &remote_key,
+                        )
+                        .await;
 
                         let mut updated = input.clone();
                         updated.meta.file_path.clear();
