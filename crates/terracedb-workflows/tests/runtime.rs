@@ -27,11 +27,13 @@ use terracedb_workflows::{
     WorkflowError, WorkflowHandle, WorkflowHandler, WorkflowHandlerError,
     WorkflowHistoricalArtifactSupport, WorkflowHistoricalEvent, WorkflowHistoricalSourceResolution,
     WorkflowHistoricalSourceScenario, WorkflowObjectStoreCheckpointStore, WorkflowOutput,
-    WorkflowProgressMode, WorkflowReplayableSourceKind, WorkflowRuntime,
-    WorkflowSourceBootstrapPolicy, WorkflowSourceConfig, WorkflowSourceProgress,
-    WorkflowSourceProgressOrigin, WorkflowSourceRecoveryPolicy, WorkflowStateMutation,
-    WorkflowTables, WorkflowTimerCommand, failpoints::names as workflow_failpoint_names,
+    WorkflowProgressMode, WorkflowReplayableSourceKind, WorkflowRuntime, WorkflowSource,
+    WorkflowSourceAttachMode, WorkflowSourceBootstrapPolicy, WorkflowSourceConfig,
+    WorkflowSourceProgress, WorkflowSourceProgressOrigin, WorkflowSourceRecoveryPolicy,
+    WorkflowSourceResumePoint, WorkflowStateMutation, WorkflowTables, WorkflowTimerCommand,
+    failpoints::names as workflow_failpoint_names,
 };
+use tokio::sync::Notify;
 
 const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(600);
 const WORKFLOW_TIMER_SIMULATION_DURATION: Duration = Duration::from_millis(1_200);
@@ -303,6 +305,82 @@ impl RecurringWorkflowHandler for RecurringTimerHandler {
     }
 }
 
+#[derive(Clone, Default)]
+struct BlockingResumeControl {
+    callback_entered: Arc<Notify>,
+    release_callback: Arc<Notify>,
+    order: Arc<Mutex<Vec<String>>>,
+}
+
+impl BlockingResumeControl {
+    fn record(&self, entry: impl Into<String>) {
+        self.order
+            .lock()
+            .expect("blocking resume order lock poisoned")
+            .push(entry.into());
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.order
+            .lock()
+            .expect("blocking resume order lock poisoned")
+            .clone()
+    }
+}
+
+struct BlockingResumeHandler {
+    control: BlockingResumeControl,
+}
+
+#[async_trait]
+impl WorkflowHandler for BlockingResumeHandler {
+    async fn route_event(
+        &self,
+        entry: &terracedb::ChangeEntry,
+    ) -> Result<String, WorkflowHandlerError> {
+        let key = std::str::from_utf8(&entry.key).expect("source key should be utf-8");
+        Ok(key
+            .split_once(':')
+            .expect("source key should contain an instance prefix")
+            .0
+            .to_string())
+    }
+
+    async fn handle(
+        &self,
+        instance_id: &str,
+        state: Option<Value>,
+        trigger: &terracedb_workflows::WorkflowTrigger,
+        _ctx: &WorkflowContext,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        match trigger {
+            terracedb_workflows::WorkflowTrigger::Callback { callback_id, .. } => {
+                self.control
+                    .record(format!("{instance_id}:callback:{callback_id}:entered"));
+                self.control.callback_entered.notify_one();
+                self.control.release_callback.notified().await;
+                self.control
+                    .record(format!("{instance_id}:callback:{callback_id}:completed"));
+            }
+            terracedb_workflows::WorkflowTrigger::Event(entry) => {
+                self.control.record(format!(
+                    "{instance_id}:event:{}",
+                    std::str::from_utf8(&entry.key).expect("source key should be utf-8")
+                ));
+            }
+            terracedb_workflows::WorkflowTrigger::Timer { .. } => {
+                panic!("blocking resume test only uses callbacks and source events")
+            }
+        }
+
+        Ok(WorkflowOutput {
+            state: WorkflowStateMutation::Put(Value::bytes((decode_count(state) + 1).to_string())),
+            outbox_entries: Vec::new(),
+            timers: Vec::new(),
+        })
+    }
+}
+
 #[tokio::test]
 async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
     let file_system = Arc::new(StubFileSystem::default());
@@ -466,16 +544,28 @@ where
 fn backlog_stack_builder(
     stats: ExecutionStats,
 ) -> SimulationStackBuilder<WorkflowStack<RecordingHandler>> {
+    configured_backlog_stack_builder(stats, WorkflowSourceConfig::default())
+}
+
+fn configured_backlog_stack_builder(
+    stats: ExecutionStats,
+    source_config: WorkflowSourceConfig,
+) -> SimulationStackBuilder<WorkflowStack<RecordingHandler>> {
     SimulationStackBuilder::new(
         move |context, db| {
             let stats = stats.clone();
+            let source_config = source_config;
             async move {
                 let source = db.create_table(row_table_config("workflow_source")).await?;
                 let runtime = WorkflowRuntime::open(
                     db.clone(),
                     context.clock(),
-                    WorkflowDefinition::new("orders", [source.clone()], RecordingHandler { stats })
-                        .with_progress_mode(WorkflowProgressMode::Buffered),
+                    WorkflowDefinition::new(
+                        "orders",
+                        [WorkflowSource::new(source.clone()).with_config(source_config)],
+                        RecordingHandler { stats },
+                    )
+                    .with_progress_mode(WorkflowProgressMode::Buffered),
                 )
                 .await?;
 
@@ -1197,6 +1287,292 @@ fn workflow_replays_startup_backlog_round_robin_and_outbox_order() -> turmoil::R
             harness.shutdown().await?;
             Ok(())
         })
+}
+
+#[test]
+fn workflow_current_durable_bootstrap_skips_history_and_processes_new_events() -> turmoil::Result {
+    SeededSimulationRunner::new(0x4106)
+        .with_simulation_duration(WORKFLOW_SIMULATION_DURATION)
+        .with_message_latency(
+            SIMULATION_MIN_MESSAGE_LATENCY,
+            SIMULATION_MAX_MESSAGE_LATENCY,
+        )
+        .run_with(|context| async move {
+            let stats = ExecutionStats::default();
+            let mut harness = TerracedbSimulationHarness::open(
+                context,
+                tiered_test_config_with_durability(
+                    "/workflow-current-durable-bootstrap",
+                    TieredDurabilityMode::GroupCommit,
+                ),
+                configured_backlog_stack_builder(
+                    stats,
+                    WorkflowSourceConfig::default()
+                        .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CurrentDurable),
+                ),
+            )
+            .await?;
+            let source = harness
+                .stack()
+                .source
+                .clone()
+                .expect("current-durable workflow source should exist");
+
+            source
+                .write(b"skipped-1:created".to_vec(), Value::bytes("created"))
+                .await?;
+            let durable_before_start = harness.db().current_durable_sequence();
+
+            harness.stack_mut().start().await?;
+
+            let source_progress_table = harness
+                .stack()
+                .runtime
+                .tables()
+                .source_progress_table()
+                .clone();
+            let source_for_wait = source.clone();
+            harness
+                .wait_for_change(
+                    "workflow current-durable bootstrap progress",
+                    [&source_progress_table],
+                    [&source_progress_table],
+                    move |_db, stack| {
+                        let source = source_for_wait.clone();
+                        Box::pin(async move {
+                            let progress = stack.runtime.load_source_progress(&source).await?;
+                            Ok(progress.origin()
+                                == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
+                                && progress.resume_point()
+                                    == WorkflowSourceResumePoint::DurableSequenceFence {
+                                        sequence: durable_before_start,
+                                    })
+                        })
+                    },
+                )
+                .await?;
+
+            harness.require_eq(
+                "skipped backlog state",
+                &harness.stack().runtime.load_state("skipped-1").await?,
+                &None,
+            )?;
+
+            source
+                .write(b"live-1:created".to_vec(), Value::bytes("created"))
+                .await?;
+            wait_for_workflow_state(&harness, "live-1", "1").await?;
+
+            harness.require_eq(
+                "live-only backlog skip",
+                &harness.stack().runtime.load_state("skipped-1").await?,
+                &None,
+            )?;
+
+            let telemetry = harness.stack().runtime.telemetry_snapshot().await?;
+            harness.require_eq(
+                "telemetry progress origin",
+                &telemetry.source_lags[0].progress_origin,
+                &WorkflowSourceProgressOrigin::CurrentDurableBootstrap,
+            )?;
+            harness.require_eq(
+                "telemetry attach mode",
+                &telemetry.source_lags[0].attach_mode,
+                &Some(WorkflowSourceAttachMode::LiveOnly),
+            )?;
+
+            harness.shutdown().await?;
+            Ok(())
+        })
+}
+
+#[tokio::test]
+async fn workflow_fail_closed_recovery_surfaces_snapshot_too_old_without_fast_forwarding() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-fail-closed-recovery",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let mut source_config = row_table_config("workflow_source");
+    source_config.history_retention_sequences = Some(1);
+    let source = db
+        .create_table(source_config)
+        .await
+        .expect("create source table");
+
+    let first = source
+        .write(b"order-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write first retained event");
+    let second = source
+        .write(b"order-2:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write second retained event");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone())
+                .with_recovery_policy(WorkflowSourceRecoveryPolicy::FailClosed)],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+
+    let stale_progress = WorkflowSourceProgress::from_cursor(LogCursor::new(first, 0));
+    runtime
+        .tables()
+        .source_progress_table()
+        .write(
+            source.name().as_bytes().to_vec(),
+            Value::bytes(
+                stale_progress
+                    .encode()
+                    .expect("encode stale source progress"),
+            ),
+        )
+        .await
+        .expect("persist stale workflow source progress");
+
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let error = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("workflow shutdown should return promptly")
+        .expect_err("workflow runtime should fail closed on stale source progress");
+
+    let snapshot_too_old = error
+        .snapshot_too_old()
+        .expect("workflow error should preserve SnapshotTooOld");
+    assert_eq!(snapshot_too_old.requested, first);
+    assert!(
+        snapshot_too_old.oldest_available >= second,
+        "history loss should advance the oldest available source sequence past the stale cursor",
+    );
+    assert_eq!(
+        runtime
+            .load_source_progress(&source)
+            .await
+            .expect("load source progress after fail-closed recovery"),
+        stale_progress,
+        "fail-closed recovery must not silently fast-forward the source progress",
+    );
+}
+
+#[tokio::test]
+async fn workflow_restart_resumes_local_inbox_before_source_bootstrap() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let dependencies =
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone());
+    let path = "/workflow-local-resume-before-bootstrap";
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        dependencies,
+    )
+    .await
+    .expect("open first db");
+    let source = db
+        .create_table(row_table_config("workflow_source"))
+        .await
+        .expect("create source table");
+    source
+        .write(b"source-1:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write source backlog");
+
+    let initial_runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock.clone(),
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone())],
+            BlockingResumeHandler {
+                control: BlockingResumeControl::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open initial workflow runtime");
+    initial_runtime
+        .admit_callback("local-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("persist local callback before restart");
+    drop(initial_runtime);
+    drop(db);
+
+    let reopened = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock),
+    )
+    .await
+    .expect("reopen db");
+    let reopened_source = reopened.table("workflow_source");
+    let control = BlockingResumeControl::default();
+    let runtime = WorkflowRuntime::open(
+        reopened,
+        Arc::new(StubClock::default()),
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(reopened_source.clone())],
+            BlockingResumeHandler {
+                control: control.clone(),
+            },
+        ),
+    )
+    .await
+    .expect("open restarted workflow runtime");
+
+    let handle = runtime
+        .start()
+        .await
+        .expect("start restarted workflow runtime");
+    tokio::time::timeout(Duration::from_secs(1), control.callback_entered.notified())
+        .await
+        .expect("callback should begin during local durable resume");
+
+    assert!(
+        runtime
+            .tables()
+            .source_progress_table()
+            .read(reopened_source.name().as_bytes().to_vec())
+            .await
+            .expect("read source progress during blocked callback")
+            .is_none(),
+        "source bootstrap must wait until local durable inbox work has resumed",
+    );
+    assert_eq!(
+        runtime
+            .load_state("source-1")
+            .await
+            .expect("load source-backed workflow state while callback is blocked"),
+        None,
+        "source events should not execute while restart is still replaying local inbox work",
+    );
+
+    assert_eq!(
+        control.snapshot(),
+        vec!["local-1:callback:cb-1:entered".to_string()],
+        "restart should still be replaying local durable inbox work before source bootstrap begins",
+    );
+
+    handle
+        .abort()
+        .await
+        .expect("abort restarted workflow runtime while callback replay is blocked");
 }
 
 #[test]
