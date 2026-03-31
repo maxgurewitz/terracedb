@@ -1101,9 +1101,9 @@ mod tests {
         CurrentStatePhysicalRetentionSeam, CurrentStatePlanner, CurrentStateProjectionOwnedRange,
         CurrentStateRankBoundary, CurrentStateRankSource, CurrentStateRankedMaterializationSeam,
         CurrentStateRebuildMode, CurrentStateRebuildSeam, CurrentStateRetentionContract,
-        CurrentStateRetentionDeferredReason,
-        CurrentStateRetentionError, CurrentStateRetentionReason,
-        CurrentStateRetentionSkipReason, CurrentStateSortDirection, CurrentStateThresholdCutoff,
+        CurrentStateRetentionDeferredReason, CurrentStateRetentionError,
+        CurrentStateRetentionReason, CurrentStateRetentionSkipReason, CurrentStateSortDirection,
+        CurrentStateThresholdCutoff,
     };
 
     fn row(

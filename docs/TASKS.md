@@ -60,7 +60,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 9** adds the `terracedb-bricks` blob / large-object library on top of Terracedb.
 - **Phase 10** adds an optional Arrow-ecosystem analytical export crate on top of Terracedb.
 - **Phase 11** hardens the hybrid OLTP/OLAP path with columnar-v2 layout contracts, selective-read execution, segmented remote caching, stronger publish/recovery semantics, and a small analytically shaped example app.
-- **Phase 12** adds generalized current-state retention and ranking policies.
+- **Phase 12** adds generalized current-state retention and ranking policies plus a small example app that demonstrates how to configure them.
 - **Phase 13** adds execution domains, control-plane isolation, and colocated multi-DB foundations.
 - **Phase 14** adds unified-log pressure, flush reclamation, and adaptive write admission.
 - **Phase 15** adds opt-in physical sharding, resharding via virtual partitions, and a small sharded example app.
@@ -80,7 +80,7 @@ Once Phase 0 is complete, the work naturally splits into fifteen mostly independ
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
 - **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
 - **Track K — hybrid-read and columnar-v2 hardening:** T48 first; T49 follows T48; then T50, T51, T53, T55, and T56 can proceed in parallel; T52 depends on T50 + T51; T54 depends on T51 + T52 + T55; T57 depends on T50 + T51 + T52 + T53 + T55 + T56; T58 depends on T52 + T53 + T54 + T55 + T56 + T57
-- **Track L — generalized current-state retention and ranking:** T59 first; T60 and T61 proceed in parallel once the contracts and shared simulation/oracle seams from T59 exist; T62 follows once both policy families exist and can be coordinated with scheduler/offload behavior
+- **Track L — generalized current-state retention and ranking:** T59 first; T60 and T61 proceed in parallel once the contracts and shared simulation/oracle seams from T59 exist; T62 follows once both policy families exist and can be coordinated with scheduler/offload behavior; T62a follows T62 once the public configuration surface and operational semantics are stable enough to teach through an example
 - **Track M — execution domains and colocated multi-DB:** T63 first; T64, T65, and T66 can proceed in parallel; T67 depends on T64 + T65 + T66; T68 depends on T64 + T66 + T67; T69 depends on T64 + T65 + T66 + T67 + T68; T70 depends on T64 + T65 + T66 + T67
 - **Track N — pressure-aware flushing and adaptive admission:** T71 first; T72, T73, and T74 can proceed in parallel; T75 depends on T73 + T74 + T70; T76 depends on T72 + T73 + T74 + T75
 - **Track O — physical sharding and resharding:** T77 first; T78, T79, and T80 can proceed in parallel; T81 depends on T78 + T79 + T80; T82 depends on T78 + T79 + T80 + T81; T83 depends on T78 + T79 + T80 + T81
@@ -2538,7 +2538,7 @@ Add a sibling example to `examples/todo-api` that is as small and teachable as t
 
 ## Phase 12 — Generalized current-state retention and ranking
 
-**Parallelization:** T59 first. After that, T60 and T61 can proceed in parallel against the frozen contracts and shared simulation/oracle scaffolding. T62 follows once both policy families exist and can be integrated with scheduler/backpressure and physical reclamation behavior.
+**Parallelization:** T59 first. After that, T60 and T61 can proceed in parallel against the frozen contracts and shared simulation/oracle scaffolding. T62 follows once both policy families exist and can be integrated with scheduler/backpressure and physical reclamation behavior. T62a follows T62 once the public configuration surface and operational semantics are stable enough to teach through a small example.
 
 ### T59. Freeze generalized current-state retention contracts, planner seams, and shared simulation/oracle scaffolding
 
@@ -2644,6 +2644,42 @@ Coordinate generalized logical retention with compaction, offload/delete, schedu
 - Tests proving scheduler/offload/backpressure decisions never violate logical retention guarantees or degrade into silent approximation.
 - Cross-mode tests covering tiered/offload and other supported storage layouts, with explicit fail-closed assertions for unsupported combinations.
 - Simulation tests with oscillating budgets, rapid rank churn, concurrent compaction/offload, and crash/restart around every coordination boundary introduced by the new policies.
+
+---
+
+### T62a. Build a small example app that demonstrates generalized retention policy configuration
+
+**Depends on:** T62
+
+**Description**
+
+Add a sibling example to `examples/todo-api` that demonstrates how applications configure and observe the generalized current-state retention policies introduced in Phase 12. The example should stay small and teachable while showing both threshold-style retention and rank-based retention/materialization, along with the operational signals that explain when a policy is logical-only, derived-only, or waiting on physical reclamation.
+
+**Implementation steps**
+
+1. Extend the Phase 12 simulation/example harness first with an example-oriented workload model and app-level invariants covering threshold cutoffs, rank churn near the boundary, policy updates, and restart behavior before the example implementation branches from the engine work.
+2. Create a small example app (for example `examples/retention-api`) with:
+   - one threshold-retained dataset such as expiring sessions, events, or records keyed by a sortable timestamp/score,
+   - one rank-retained or derived leaderboard/recent-items dataset with explicit tie-break configuration, and
+   - typed request/response helpers so the example focuses on retention concepts rather than serialization boilerplate.
+3. Add the smallest API or CLI surface that still demonstrates how to set the new policies in practice:
+   - configure or update a threshold policy,
+   - configure or update a rank/limit policy,
+   - write and mutate rows so membership crosses the configured boundaries, and
+   - inspect the retained current state or derived output after policy application.
+4. Surface the operational semantics the phase introduces:
+   - introspection showing the effective cutoff/rank boundary,
+   - whether the example policy is destructive or derived-only,
+   - when snapshots or compaction are delaying physical reclaim, and
+   - the explicit separation between generalized current-state retention and MVCC/CDC history retention.
+5. Document clearly which example operations map to threshold retention, rank retention, policy updates, and physical-reclaim behavior so users can copy the configuration patterns into their own applications without reading the full architecture document first.
+
+**Verification**
+
+- End-to-end deterministic simulation tests for the example workload covering threshold retention, rank retention, policy updates, and seed-stable retained membership/results.
+- Example integration tests proving reopen/restart preserves policy configuration, retained outputs, and documented introspection behavior.
+- Tests proving the example's documented policy toggles fail closed for unsupported destructive modes and otherwise keep derived-only versus destructive behavior explicit.
+- Simulation tests showing snapshot pinning, compaction delay, or rapid rank churn do not make the example report misleading retained-state or reclamation status.
 
 ---
 
@@ -3525,13 +3561,14 @@ At this point the system should additionally support:
 - deterministic end-to-end simulation coverage for ingest, filtered scans, cold remote reads, restart/fault handling, and low-footprint operation for the example workload.
 
 ### Milestone L — Generalized current-state retention and ranking
-Complete: T59–T62
+Complete: T59–T62a
 
 At this point the system should additionally support:
 - threshold-based current-state retention over caller-defined sortable keys,
 - rank-based current-state retention/materialization over computed measures with deterministic tie-breaking,
-- explicit separation between sequence-based MVCC/CDC retention and generalized current-state retention, and
-- coordinated logical and physical reclamation behavior with deterministic simulation coverage for policy churn, crashes, and restart.
+- explicit separation between sequence-based MVCC/CDC retention and generalized current-state retention,
+- coordinated logical and physical reclamation behavior with deterministic simulation coverage for policy churn, crashes, and restart, and
+- a small example app that demonstrates how threshold and rank-based retention policies are configured and observed in practice.
 
 ### Milestone M — Execution domains and colocated multi-DB operation
 Complete: T63–T70
