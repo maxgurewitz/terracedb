@@ -1241,7 +1241,7 @@ fn s3_primary_simulation_failed_flush_recovers_last_durable_prefix() -> turmoil:
             .object_store()
             .inject_failure(ObjectStoreFaultSpec::Timeout {
                 operation: ObjectStoreOperation::Put,
-                target_prefix: layout.backup_manifest(ManifestId::new(2)),
+                target_prefix: layout.control_manifest(ManifestId::new(2)),
             })
             .await?;
 
@@ -2561,6 +2561,53 @@ fn tiered_backup_retries_after_interrupted_restore_in_simulation() -> turmoil::R
         assert_eq!(
             restored_events.read(b"banana".to_vec()).await?,
             Some(bytes("tail"))
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn control_plane_catalog_survives_user_data_remote_lane_pressure_in_simulation() -> turmoil::Result
+{
+    SeededSimulationRunner::new(0x2324).run_with(|context| async move {
+        let config = simulation_s3_primary_config("control-plane-sim");
+        let db = context.open_db(config.clone()).await?;
+        let events = db
+            .create_table(SimulationTableSpec::row("events").table_config())
+            .await?;
+
+        events.write(b"apple".to_vec(), bytes("v1")).await?;
+        db.flush().await?;
+
+        let StorageConfig::S3Primary(remote_config) = &config.storage else {
+            panic!("simulation config should use s3-primary storage");
+        };
+        let layout = ObjectKeyLayout::new(&remote_config.s3);
+        context
+            .object_store()
+            .inject_failure(ObjectStoreFaultSpec::Timeout {
+                operation: ObjectStoreOperation::Put,
+                target_prefix: layout.backup_commit_log_prefix(),
+            })
+            .await?;
+
+        events.write(b"apple".to_vec(), bytes("volatile")).await?;
+        db.flush()
+            .await
+            .expect_err("user-data remote lane should stay under pressure");
+        db.create_table(SimulationTableSpec::row("audit").table_config())
+            .await
+            .expect("control-plane metadata should still progress");
+
+        let reopened = context
+            .restart_db(config, CutPoint::AfterDurabilityBoundary)
+            .await?;
+        let reopened_events = reopened.table("events");
+        assert!(reopened.try_table("audit").is_some());
+        assert_eq!(
+            reopened_events.read(b"apple".to_vec()).await?,
+            Some(bytes("v1"))
         );
 
         Ok(())

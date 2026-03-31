@@ -491,6 +491,41 @@ fn shared_domains_can_borrow_idle_capacity_but_not_reserved_or_busy_capacity() {
     assert_eq!(blocked.blocked_by, vec![ExecutionResourceKind::CpuWorkers]);
 }
 
+#[tokio::test]
+async fn db_open_registers_a_reserved_control_plane_domain_when_missing() {
+    let profile = execution_profile("reserved");
+    let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
+
+    let db = Db::builder()
+        .settings(tiered_settings("/execution-reserved").with_execution_profile(profile.clone()))
+        .components(stub_components(resource_manager))
+        .open()
+        .await
+        .expect("open db with reserved control-plane domain");
+
+    let snapshot = db.resource_manager_snapshot();
+    let control = snapshot
+        .domains
+        .get(&profile.control_plane.domain)
+        .expect("control-plane domain should be auto-registered");
+
+    assert_eq!(
+        control.spec.metadata.get("reserved").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        control
+            .spec
+            .metadata
+            .get("durability_class")
+            .map(String::as_str),
+        Some("control-plane")
+    );
+    assert_eq!(control.spec.budget.cpu.worker_slots, Some(1));
+    assert_eq!(control.spec.budget.io.remote_concurrency, Some(1));
+    assert_eq!(control.spec.budget.background.task_slots, Some(1));
+}
+
 async fn run_logical_workload(path: &str, profile: DbExecutionProfile) -> Vec<(Vec<u8>, Vec<u8>)> {
     let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
     let db = Db::builder()

@@ -11662,6 +11662,134 @@ async fn s3_primary_failed_manifest_upload_preserves_last_durable_prefix_until_r
 }
 
 #[tokio::test]
+async fn s3_primary_control_plane_catalog_progress_survives_user_data_remote_lane_pressure() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store.clone());
+    let config = s3_primary_config("s3-control-plane-pressure");
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open s3-primary db");
+    let events = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create events table");
+    let first = events
+        .write(b"user:1".to_vec(), bytes("durable"))
+        .await
+        .expect("write durable value");
+    db.flush().await.expect("flush durable value");
+
+    let StorageConfig::S3Primary(remote_config) = &config.storage else {
+        panic!("test config should use s3-primary storage");
+    };
+    let layout = ObjectKeyLayout::new(&remote_config.s3);
+    object_store.inject_failure(ObjectStoreFailure::timeout(
+        ObjectStoreOperation::Put,
+        layout.backup_commit_log_prefix(),
+    ));
+
+    events
+        .write(b"user:1".to_vec(), bytes("volatile"))
+        .await
+        .expect("write volatile tail");
+    db.flush()
+        .await
+        .expect_err("user-data remote lane should remain under pressure");
+
+    db.create_table(row_table_config("audit"))
+        .await
+        .expect("control-plane catalog update should still succeed");
+
+    let control_catalog = object_store
+        .get(&layout.control_catalog())
+        .await
+        .expect("read control-plane catalog");
+    let decoded_catalog = Db::decode_catalog(&control_catalog).expect("decode control catalog");
+    assert!(
+        decoded_catalog
+            .tables
+            .iter()
+            .any(|entry| entry.config.name == "audit")
+    );
+    assert_eq!(
+        object_store
+            .get(&layout.backup_catalog())
+            .await
+            .expect_err("legacy backup catalog should stay unused")
+            .kind(),
+        StorageErrorKind::NotFound
+    );
+
+    let reopened = Db::open(config, dependencies)
+        .await
+        .expect("reopen after user-data pressure");
+    let reopened_events = reopened.table("events");
+    assert!(reopened.try_table("audit").is_some());
+    assert_eq!(reopened.current_sequence(), first);
+    assert_eq!(reopened.current_durable_sequence(), first);
+    assert_eq!(
+        reopened_events
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read durable value after reopen"),
+        Some(bytes("durable"))
+    );
+}
+
+#[tokio::test]
+async fn s3_primary_control_plane_manifest_mismatch_fails_closed_before_user_recovery() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store.clone());
+    let config = s3_primary_config("s3-control-plane-mismatch");
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open s3-primary db");
+    let events = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create events table");
+    events
+        .write(b"user:1".to_vec(), bytes("v1"))
+        .await
+        .expect("write durable value");
+    db.flush().await.expect("flush durable value");
+
+    let StorageConfig::S3Primary(remote_config) = &config.storage else {
+        panic!("test config should use s3-primary storage");
+    };
+    let layout = ObjectKeyLayout::new(&remote_config.s3);
+    object_store
+        .put(
+            &layout.backup_manifest_latest(),
+            format!("{}\n", layout.backup_manifest(ManifestId::new(99))).as_bytes(),
+        )
+        .await
+        .expect("write conflicting legacy manifest pointer");
+    object_store.inject_failure(
+        ObjectStoreFailure::timeout(ObjectStoreOperation::Get, layout.backup_commit_log_prefix())
+            .persistent(),
+    );
+
+    let error = Db::open(config, dependencies)
+        .await
+        .expect_err("control-plane mismatch should fail closed");
+    let OpenError::Storage(error) = error else {
+        panic!("expected storage error");
+    };
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
+    assert!(
+        error
+            .message()
+            .contains("control-plane remote manifest latest pointer")
+    );
+    assert!(error.message().contains("durability lane mismatch"));
+}
+
+#[tokio::test]
 async fn scan_since_resumes_after_cursor_within_interleaved_batch() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
