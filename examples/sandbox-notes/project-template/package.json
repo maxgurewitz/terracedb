@@ -1,0 +1,10 @@
+{
+  "name": "sandbox-notes-project",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "lodash": "*",
+    "zod": "*"
+  }
+}
+
