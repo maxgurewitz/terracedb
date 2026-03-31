@@ -4,15 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use terracedb::{Db, SequenceNumber};
 use terracedb_debezium::{
-    DebeziumMaterializationError, DebeziumMaterializationMode, DebeziumMaterializer,
-    DebeziumPartitionedTableLayout, DebeziumRowPredicate, DebeziumSourceTable,
-    DebeziumTableFilter, event_log_workflow_source_config,
+    DebeziumIngressHandler, DebeziumMaterializationError, DebeziumMaterializationMode,
+    DebeziumMaterializer, DebeziumPartitionedTableLayout, DebeziumRowPredicate,
+    DebeziumSourceTable, DebeziumTableFilter, PostgresDebeziumDecoder,
 };
 use terracedb_records::{JsonValueCodec, RecordTable, Utf8StringCodec};
-use terracedb_workflows::{
-    WorkflowSourceAttachMode, WorkflowSourceCapabilities, WorkflowSourceConfig,
-    WorkflowSourceRecoveryPolicy,
-};
+use terracedb_workflows::{WorkflowSource, WorkflowSourceAttachMode, WorkflowSourceConfig};
 
 use crate::model::{
     OrderAttentionTransition, OrderAttentionTransitionKind, OrderAttentionView, OrderStatus,
@@ -96,18 +93,26 @@ impl Default for OrderWatchBoundary {
 
 impl OrderWatchBoundary {
     pub fn new() -> Self {
+        Self::with_partitions([0_u32, 1_u32], [0_u32])
+    }
+
+    pub fn with_partitions<I, J>(orders_partitions: I, ignored_partitions: J) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+        J: IntoIterator<Item = u32>,
+    {
         Self {
             orders_layout: DebeziumPartitionedTableLayout::new(
                 "order_watch",
                 "commerce.public.orders",
                 DebeziumSourceTable::new("commerce", "public", "orders"),
-                [0_u32, 1_u32],
+                orders_partitions,
             ),
             ignored_layout: DebeziumPartitionedTableLayout::new(
                 "order_watch",
                 "commerce.public.customers",
                 DebeziumSourceTable::new("commerce", "public", "customers"),
-                [0_u32],
+                ignored_partitions,
             ),
         }
     }
@@ -151,29 +156,39 @@ impl OrderWatchBoundary {
         }
     }
 
+    pub fn attention_row_predicate(&self) -> DebeziumRowPredicate {
+        DebeziumRowPredicate::And {
+            predicates: vec![
+                self.row_predicate(),
+                DebeziumRowPredicate::ColumnEquals {
+                    column: "status".to_string(),
+                    value: json!("open"),
+                },
+            ],
+        }
+    }
+
     pub fn make_materializer(
         &self,
         db: &Db,
         mode: DebeziumMaterializationMode,
     ) -> Result<DebeziumMaterializer, DebeziumMaterializationError> {
-        let event_log = terracedb_debezium::DebeziumEventLogTables::from_layouts(
-            db,
-            self.source_layouts(),
-        )?;
-        let mirror = terracedb_debezium::DebeziumMirrorTables::from_layouts(
-            db,
-            self.source_layouts(),
-        )?;
+        Ok(
+            DebeziumMaterializer::from_layouts(db, self.source_layouts(), mode)?
+                .with_table_filter(self.table_filter())
+                .with_row_predicate(self.row_predicate()),
+        )
+    }
 
-        let materializer = match mode {
-            DebeziumMaterializationMode::EventLog => DebeziumMaterializer::event_log(event_log),
-            DebeziumMaterializationMode::Mirror => DebeziumMaterializer::mirror(mirror),
-            DebeziumMaterializationMode::Hybrid => DebeziumMaterializer::hybrid(event_log, mirror),
-        };
-
-        Ok(materializer
-            .with_table_filter(self.table_filter())
-            .with_row_predicate(self.row_predicate()))
+    pub fn ingress_handler(
+        &self,
+        db: &Db,
+        mode: DebeziumMaterializationMode,
+    ) -> Result<DebeziumIngressHandler<PostgresDebeziumDecoder>, DebeziumMaterializationError> {
+        Ok(DebeziumIngressHandler::postgres(
+            self.source_layouts(),
+            self.make_materializer(db, mode)?,
+        ))
     }
 
     pub fn attention_orders_table(&self, db: &Db) -> OrderAttentionOrdersTable {
@@ -194,14 +209,22 @@ impl OrderWatchBoundary {
 
     pub fn workflow_source_config(&self, mode: OrderWatchWorkflowMode) -> WorkflowSourceConfig {
         match mode {
-            OrderWatchWorkflowMode::HistoricalReplay => event_log_workflow_source_config(),
-            OrderWatchWorkflowMode::LiveOnlyAttach => WorkflowSourceConfig::default()
-                .with_bootstrap_policy(
-                    terracedb_workflows::WorkflowSourceBootstrapPolicy::CurrentDurable,
-                )
-                .with_recovery_policy(WorkflowSourceRecoveryPolicy::FailClosed)
-                .with_capabilities(WorkflowSourceCapabilities::replayable_append_only()),
+            OrderWatchWorkflowMode::HistoricalReplay => {
+                WorkflowSourceConfig::historical_replayable_source()
+            }
+            OrderWatchWorkflowMode::LiveOnlyAttach => {
+                WorkflowSourceConfig::live_only_replayable_append_only_source()
+            }
         }
+    }
+
+    pub fn transition_workflow_source(
+        &self,
+        db: &Db,
+        mode: OrderWatchWorkflowMode,
+    ) -> WorkflowSource {
+        WorkflowSource::new(self.attention_transitions_table(db).table().clone())
+            .with_config(self.workflow_source_config(mode))
     }
 }
 
@@ -345,8 +368,7 @@ impl OrderWatchOracleSnapshot {
             .iter()
             .any(|alert| alert.order_id == BACKLOG_ALERT_ORDER_ID);
         expect(
-            backlog_seen
-                == matches!(mode, OrderWatchWorkflowMode::HistoricalReplay),
+            backlog_seen == matches!(mode, OrderWatchWorkflowMode::HistoricalReplay),
             "historical mode should replay backlog alerts and live-only mode should skip them",
         )?;
 

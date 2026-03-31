@@ -518,6 +518,17 @@ impl ProjectionSequenceRun {
     pub fn entries(&self) -> &[ChangeEntry] {
         &self.entries
     }
+
+    pub fn source_scoped_key(&self, key: &[u8]) -> Vec<u8> {
+        let mut encoded = self.source.name().as_bytes().to_vec();
+        encoded.push(0);
+        encoded.extend_from_slice(key);
+        encoded
+    }
+
+    pub fn source_scoped_entry_key(&self, entry: &ChangeEntry) -> Vec<u8> {
+        self.source_scoped_key(&entry.key)
+    }
 }
 
 #[derive(Debug)]

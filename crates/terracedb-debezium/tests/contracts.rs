@@ -211,6 +211,79 @@ fn postgres_decoder_fails_closed_on_malformed_or_unbound_envelopes() {
     ));
 }
 
+#[test]
+fn postgres_decoder_accepts_first_snapshot_marker() {
+    let decoder = PostgresDebeziumDecoder::new().with_topic_binding(
+        "dbserver1.public.orders",
+        DebeziumSourceTable::new("app", "public", "orders"),
+    );
+
+    let mut snapshot = terracedb_kafka::KafkaRecord::new("dbserver1.public.orders", 0, 7);
+    snapshot.key = Some(br#"{"payload":{"id":"101"}}"#.to_vec());
+    snapshot.value = Some(
+        br#"{
+            "payload":{
+                "before":null,
+                "after":{"id":"101","region":"west","status":"open"},
+                "op":"r",
+                "ts_ms":1700000000002,
+                "source":{
+                    "db":"app",
+                    "schema":"public",
+                    "table":"orders",
+                    "snapshot":"first",
+                    "ts_ms":1700000000001
+                }
+            }
+        }"#
+        .to_vec(),
+    );
+
+    let decoded = decoder
+        .decode_record(&snapshot)
+        .expect("snapshot markers emitted by Debezium should decode");
+    assert_eq!(decoded.snapshot, Some(DebeziumSnapshotMarker::First));
+    assert_eq!(decoded.operation(), Some(DebeziumOperationKind::Read));
+}
+
+#[test]
+fn postgres_decoder_accepts_last_in_data_collection_snapshot_marker() {
+    let decoder = PostgresDebeziumDecoder::new().with_topic_binding(
+        "dbserver1.public.orders",
+        DebeziumSourceTable::new("app", "public", "orders"),
+    );
+
+    let mut snapshot = terracedb_kafka::KafkaRecord::new("dbserver1.public.orders", 0, 8);
+    snapshot.key = Some(br#"{"payload":{"id":"102"}}"#.to_vec());
+    snapshot.value = Some(
+        br#"{
+            "payload":{
+                "before":null,
+                "after":{"id":"102","region":"west","status":"open"},
+                "op":"r",
+                "ts_ms":1700000000002,
+                "source":{
+                    "db":"app",
+                    "schema":"public",
+                    "table":"orders",
+                    "snapshot":"last_in_data_collection",
+                    "ts_ms":1700000000001
+                }
+            }
+        }"#
+        .to_vec(),
+    );
+
+    let decoded = decoder
+        .decode_record(&snapshot)
+        .expect("per-table snapshot boundary markers should decode");
+    assert_eq!(
+        decoded.snapshot,
+        Some(DebeziumSnapshotMarker::LastInDataCollection)
+    );
+    assert_eq!(decoded.operation(), Some(DebeziumOperationKind::Read));
+}
+
 #[tokio::test]
 async fn layout_helpers_open_projection_and_workflow_sources_without_kafka() {
     let file_system = Arc::new(StubFileSystem::default());

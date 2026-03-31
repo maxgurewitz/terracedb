@@ -307,6 +307,24 @@ pub struct WorkflowSourceConfig {
 }
 
 impl WorkflowSourceConfig {
+    pub fn historical_replayable_source() -> Self {
+        Self::default()
+            .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::Beginning)
+            .with_recovery_policy(WorkflowSourceRecoveryPolicy::ReplayFromHistory)
+            .with_capabilities(WorkflowSourceCapabilities::replayable_append_only())
+    }
+
+    pub fn live_only_current_state_source() -> Self {
+        Self::default()
+            .with_bootstrap_policy(WorkflowSourceBootstrapPolicy::CurrentDurable)
+            .with_recovery_policy(WorkflowSourceRecoveryPolicy::FailClosed)
+    }
+
+    pub fn live_only_replayable_append_only_source() -> Self {
+        Self::live_only_current_state_source()
+            .with_capabilities(WorkflowSourceCapabilities::replayable_append_only())
+    }
+
     pub fn with_bootstrap_policy(mut self, bootstrap: WorkflowSourceBootstrapPolicy) -> Self {
         self.bootstrap = bootstrap;
         self

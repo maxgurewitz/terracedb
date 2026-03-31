@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+async-trait = "0.1.89"
+futures = "0.3.31"
+rskafka = { version = "0.6.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 terracedb = { path = "../.." }
@@ -13,10 +16,9 @@ terracedb-kafka = { path = "../../crates/terracedb-kafka" }
 terracedb-projections = { path = "../../crates/terracedb-projections" }
 terracedb-records = { path = "../../crates/terracedb-records" }
 terracedb-workflows = { path = "../../crates/terracedb-workflows" }
+thiserror = "2.0.17"
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-async-trait = "0.1.89"
-futures = "0.3.31"
 terracedb-simulation = { path = "../../crates/terracedb-simulation" }
-tokio = { version = "1.50.0", features = ["macros", "rt", "sync", "time"] }
 turmoil = "0.7.1"
