@@ -4,8 +4,9 @@ use terracedb::{
     CurrentStatePhysicalRetentionMode, CurrentStatePhysicalRetentionSeam, CurrentStatePlanner,
     CurrentStateProjectionOwnedRange, CurrentStateRankedMaterializationSeam,
     CurrentStateRebuildMode, CurrentStateRebuildSeam, CurrentStateRetentionContract,
-    CurrentStateRetentionReason, CurrentStateRetentionSkipReason, CurrentStateSortDirection,
-    CurrentStateThresholdCutoff, TableStats,
+    CurrentStateRetentionDeferredReason, CurrentStateRetentionReason,
+    CurrentStateRetentionSkipReason, CurrentStateSortDirection, CurrentStateThresholdCutoff,
+    TableStats,
 };
 
 #[test]
@@ -102,6 +103,9 @@ fn current_state_retention_contracts_cover_policy_families_and_planner_seams() {
 fn current_state_retention_reason_variants_are_instantiable() {
     let reasons = [
         CurrentStateRetentionReason::BlockedBySnapshots,
+        CurrentStateRetentionReason::Deferred {
+            reason: CurrentStateRetentionDeferredReason::ExactReclaimNotAvailable,
+        },
         CurrentStateRetentionReason::DegradedToDerivedOnly {
             reason: CurrentStateDerivedOnlyReason::ProjectionOwnedWithoutPhysicalReclaim,
         },
@@ -113,5 +117,5 @@ fn current_state_retention_reason_variants_are_instantiable() {
         },
     ];
 
-    assert_eq!(reasons.len(), 4);
+    assert_eq!(reasons.len(), 5);
 }

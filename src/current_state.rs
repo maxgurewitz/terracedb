@@ -250,12 +250,21 @@ pub enum CurrentStateEffectiveMode {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CurrentStateRetentionReason {
     BlockedBySnapshots,
+    Deferred {
+        reason: CurrentStateRetentionDeferredReason,
+    },
     Skipped {
         reason: CurrentStateRetentionSkipReason,
     },
     DegradedToDerivedOnly {
         reason: CurrentStateDerivedOnlyReason,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStateRetentionDeferredReason {
+    ExactReclaimNotAvailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +358,13 @@ type OracleEvaluationPartition = (
     Option<CurrentStateLogicalFloor>,
 );
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThresholdRetentionDisposition {
+    Retained,
+    NonRetained,
+    ExcludedFromPolicy,
+}
+
 impl CurrentStateRetentionOracle {
     pub fn new(contract: CurrentStateRetentionContract) -> Self {
         Self {
@@ -423,19 +439,30 @@ impl CurrentStateRetentionOracle {
             .iter()
             .map(|row| row.row_key.clone())
             .collect::<BTreeSet<_>>();
+        let exact_reclaim_is_deferred = self.threshold_exact_reclaim_is_deferred();
+        let exact_reclaim_blocks_reclaim =
+            exact_reclaim_is_deferred && !non_retained_rows.is_empty();
+        let snapshot_blocks_reclaim = non_retained_rows
+            .iter()
+            .any(|row| self.snapshot_pins.contains(&row.row_key));
 
         let (reclaimable_rows, deferred_rows) = match effective_mode {
             CurrentStateEffectiveMode::PhysicalReclaim => {
                 let mut reclaimable = Vec::new();
                 let mut deferred = Vec::new();
                 for row in &non_retained_rows {
-                    if self.snapshot_pins.contains(&row.row_key) {
+                    if exact_reclaim_blocks_reclaim || self.snapshot_pins.contains(&row.row_key) {
                         deferred.push(row.clone());
                     } else {
                         reclaimable.push(row.clone());
                     }
                 }
-                if !deferred.is_empty() {
+                if exact_reclaim_blocks_reclaim {
+                    reasons.push(CurrentStateRetentionReason::Deferred {
+                        reason: CurrentStateRetentionDeferredReason::ExactReclaimNotAvailable,
+                    });
+                }
+                if snapshot_blocks_reclaim {
                     reasons.push(CurrentStateRetentionReason::BlockedBySnapshots);
                 }
                 (reclaimable, deferred)
@@ -504,10 +531,10 @@ impl CurrentStateRetentionOracle {
         let mut non_retained = Vec::new();
 
         for row in self.rows.values() {
-            if threshold_matches(policy, row)? {
-                retained.push(row.clone());
-            } else {
-                non_retained.push(row.clone());
+            match threshold_retention_disposition(policy, row)? {
+                ThresholdRetentionDisposition::Retained
+                | ThresholdRetentionDisposition::ExcludedFromPolicy => retained.push(row.clone()),
+                ThresholdRetentionDisposition::NonRetained => non_retained.push(row.clone()),
             }
         }
 
@@ -593,6 +620,18 @@ impl CurrentStateRetentionOracle {
             ),
         }
     }
+
+    fn threshold_exact_reclaim_is_deferred(&self) -> bool {
+        matches!(
+            self.contract.policy,
+            CurrentStateRetentionPolicy::Threshold(_)
+        ) && self.contract.planner.compaction_row_removal
+            == CurrentStateCompactionRowRemovalMode::Disabled
+            && self.contract.planner.physical_retention.mode
+                != CurrentStatePhysicalRetentionMode::None
+            && self.contract.planner.physical_retention.exactness
+                == CurrentStateExactnessRequirement::FailClosed
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -604,17 +643,25 @@ pub enum CurrentStateRetentionError {
     },
 }
 
-fn threshold_matches(
+fn threshold_retention_disposition(
     policy: &CurrentStateThresholdRetentionPolicy,
     row: &CurrentStateOracleRow,
-) -> Result<bool, CurrentStateRetentionError> {
+) -> Result<ThresholdRetentionDisposition, CurrentStateRetentionError> {
     match row.primary_sort_key.as_deref() {
         Some(primary) => Ok(match policy.order.direction {
             CurrentStateSortDirection::Ascending => {
-                primary >= policy.cutoff.encoded_value.as_slice()
+                if primary >= policy.cutoff.encoded_value.as_slice() {
+                    ThresholdRetentionDisposition::Retained
+                } else {
+                    ThresholdRetentionDisposition::NonRetained
+                }
             }
             CurrentStateSortDirection::Descending => {
-                primary <= policy.cutoff.encoded_value.as_slice()
+                if primary <= policy.cutoff.encoded_value.as_slice() {
+                    ThresholdRetentionDisposition::Retained
+                } else {
+                    ThresholdRetentionDisposition::NonRetained
+                }
             }
         }),
         None => match policy.order.missing_values {
@@ -624,15 +671,26 @@ fn threshold_matches(
                     field: "primary_sort_key",
                 })
             }
-            CurrentStateMissingValuePolicy::ExcludeRow => Ok(false),
-            CurrentStateMissingValuePolicy::TreatAsLowest => Ok(matches!(
-                policy.order.direction,
-                CurrentStateSortDirection::Descending
-            )),
-            CurrentStateMissingValuePolicy::TreatAsHighest => Ok(matches!(
-                policy.order.direction,
-                CurrentStateSortDirection::Ascending
-            )),
+            CurrentStateMissingValuePolicy::ExcludeRow => {
+                Ok(ThresholdRetentionDisposition::ExcludedFromPolicy)
+            }
+            CurrentStateMissingValuePolicy::TreatAsLowest => Ok(
+                if matches!(
+                    policy.order.direction,
+                    CurrentStateSortDirection::Descending
+                ) {
+                    ThresholdRetentionDisposition::Retained
+                } else {
+                    ThresholdRetentionDisposition::NonRetained
+                },
+            ),
+            CurrentStateMissingValuePolicy::TreatAsHighest => Ok(
+                if matches!(policy.order.direction, CurrentStateSortDirection::Ascending) {
+                    ThresholdRetentionDisposition::Retained
+                } else {
+                    ThresholdRetentionDisposition::NonRetained
+                },
+            ),
         },
     }
 }
@@ -760,13 +818,15 @@ fn compare_missing_against_present(
 mod tests {
     use super::{
         CurrentStateCompactionRowRemovalMode, CurrentStateCutoffSource,
-        CurrentStateDerivedOnlyReason, CurrentStateEffectiveMode, CurrentStateLogicalFloor,
-        CurrentStateMissingValuePolicy, CurrentStateOracleMutation, CurrentStateOracleRow,
-        CurrentStatePhysicalRetentionMode, CurrentStatePhysicalRetentionSeam, CurrentStatePlanner,
-        CurrentStateProjectionOwnedRange, CurrentStateRankBoundary,
-        CurrentStateRankedMaterializationSeam, CurrentStateRebuildMode, CurrentStateRebuildSeam,
-        CurrentStateRetentionContract, CurrentStateRetentionError, CurrentStateRetentionReason,
-        CurrentStateRetentionSkipReason, CurrentStateSortDirection, CurrentStateThresholdCutoff,
+        CurrentStateDerivedOnlyReason, CurrentStateEffectiveMode, CurrentStateExactnessRequirement,
+        CurrentStateLogicalFloor, CurrentStateMissingValuePolicy, CurrentStateOracleMutation,
+        CurrentStateOracleRow, CurrentStatePhysicalRetentionMode,
+        CurrentStatePhysicalRetentionSeam, CurrentStatePlanner, CurrentStateProjectionOwnedRange,
+        CurrentStateRankBoundary, CurrentStateRankedMaterializationSeam, CurrentStateRebuildMode,
+        CurrentStateRebuildSeam, CurrentStateRetentionContract,
+        CurrentStateRetentionDeferredReason, CurrentStateRetentionError,
+        CurrentStateRetentionReason, CurrentStateRetentionSkipReason, CurrentStateSortDirection,
+        CurrentStateThresholdCutoff,
     };
 
     fn row(
@@ -868,6 +928,90 @@ mod tests {
         assert_eq!(
             evaluation.stats.status.reasons,
             vec![CurrentStateRetentionReason::BlockedBySnapshots]
+        );
+    }
+
+    #[test]
+    fn threshold_policy_exclude_row_keeps_missing_keys_out_of_reclaim() {
+        let planner = CurrentStatePlanner {
+            compaction_row_removal: CurrentStateCompactionRowRemovalMode::RemoveDuringCompaction,
+            physical_retention: CurrentStatePhysicalRetentionSeam {
+                mode: CurrentStatePhysicalRetentionMode::Delete,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let contract = CurrentStateRetentionContract::threshold(
+            9,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Ascending)
+                .with_missing_values(CurrentStateMissingValuePolicy::ExcludeRow),
+            CurrentStateThresholdCutoff::explicit("050"),
+        )
+        .with_planner(planner);
+        let mut oracle = super::CurrentStateRetentionOracle::new(contract);
+        for row in [
+            row("alpha", None, Some("001"), 11),
+            row("bravo", Some("040"), Some("002"), 12),
+            row("charlie", Some("060"), Some("003"), 13),
+        ] {
+            oracle.apply(CurrentStateOracleMutation::Upsert(row));
+        }
+
+        let evaluation = oracle
+            .evaluate()
+            .expect("evaluate threshold policy with excluded row");
+        assert_eq!(
+            evaluation.retained_row_keys,
+            vec![b"alpha".to_vec(), b"charlie".to_vec()]
+        );
+        assert_eq!(evaluation.non_retained_row_keys, vec![b"bravo".to_vec()]);
+        assert_eq!(evaluation.reclaimable_row_keys, vec![b"bravo".to_vec()]);
+        assert!(evaluation.deferred_row_keys.is_empty());
+        assert_eq!(evaluation.stats.retained_set.rows, 2);
+        assert_eq!(evaluation.stats.retained_set.bytes, 24);
+    }
+
+    #[test]
+    fn threshold_policy_defers_reclaim_when_exactness_is_fail_closed() {
+        let planner = CurrentStatePlanner {
+            physical_retention: CurrentStatePhysicalRetentionSeam {
+                mode: CurrentStatePhysicalRetentionMode::Delete,
+                exactness: CurrentStateExactnessRequirement::FailClosed,
+            },
+            ..Default::default()
+        };
+        let contract = CurrentStateRetentionContract::threshold(
+            10,
+            super::CurrentStateOrderingContract::new(CurrentStateSortDirection::Ascending),
+            CurrentStateThresholdCutoff::explicit("050"),
+        )
+        .with_planner(planner);
+        let mut oracle = super::CurrentStateRetentionOracle::new(contract);
+        for row in [
+            row("alpha", Some("010"), Some("001"), 14),
+            row("bravo", Some("080"), Some("002"), 16),
+        ] {
+            oracle.apply(CurrentStateOracleMutation::Upsert(row));
+        }
+
+        let evaluation = oracle
+            .evaluate()
+            .expect("evaluate threshold policy with exact reclaim deferral");
+        assert_eq!(evaluation.retained_row_keys, vec![b"bravo".to_vec()]);
+        assert_eq!(evaluation.non_retained_row_keys, vec![b"alpha".to_vec()]);
+        assert!(evaluation.reclaimable_row_keys.is_empty());
+        assert_eq!(evaluation.deferred_row_keys, vec![b"alpha".to_vec()]);
+        assert_eq!(evaluation.stats.reclaimed_rows, 0);
+        assert_eq!(evaluation.stats.deferred_rows, 1);
+        assert_eq!(
+            evaluation.stats.status.effective_mode,
+            CurrentStateEffectiveMode::PhysicalReclaim
+        );
+        assert_eq!(
+            evaluation.stats.status.reasons,
+            vec![CurrentStateRetentionReason::Deferred {
+                reason: CurrentStateRetentionDeferredReason::ExactReclaimNotAvailable,
+            }]
         );
     }
 
