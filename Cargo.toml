@@ -6,6 +6,7 @@ members = [
     "crates/terracedb-kafka",
     "crates/terracedb-http",
     "crates/terracedb-retention",
+    "examples/domains-api",
     "examples/retention-api",
     "examples/sandbox-notes",
     "examples/telemetry-api",
