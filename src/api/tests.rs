@@ -2085,6 +2085,67 @@ async fn pressure_accounting_transitions_queued_bytes_into_flushing_and_reclaims
 }
 
 #[tokio::test]
+async fn pressure_stats_report_oldest_unflushed_age_per_table_and_process() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(10)));
+    let db = Db::open(
+        tiered_config("/pressure-oldest-age"),
+        dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let older = db
+        .create_table(row_table_config("older"))
+        .await
+        .expect("create older table");
+    let newer = db
+        .create_table(row_table_config("newer"))
+        .await
+        .expect("create newer table");
+
+    older
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write older value");
+    clock.advance(Duration::from_millis(15));
+
+    let older_mutable = db.table_pressure_stats(&older).await;
+    assert_eq!(
+        older_mutable.oldest_unflushed_age,
+        Some(Duration::from_millis(15))
+    );
+    assert!(older_mutable.local.mutable_dirty_bytes > 0);
+
+    db.memtables_write().rotate_mutable();
+    clock.advance(Duration::from_millis(10));
+    newer
+        .write(b"user:2".to_vec(), Value::bytes("v2"))
+        .await
+        .expect("write newer value");
+
+    let older_queued = db.table_pressure_stats(&older).await;
+    let newer_mutable = db.table_pressure_stats(&newer).await;
+    let process = db.process_pressure_stats().await;
+
+    assert_eq!(
+        older_queued.oldest_unflushed_age,
+        Some(Duration::from_millis(25))
+    );
+    assert_eq!(older_queued.local.mutable_dirty_bytes, 0);
+    assert!(older_queued.local.immutable_queued_bytes > 0);
+    assert_eq!(newer_mutable.oldest_unflushed_age, Some(Duration::ZERO));
+    assert!(newer_mutable.local.mutable_dirty_bytes > 0);
+    assert_eq!(newer_mutable.local.immutable_queued_bytes, 0);
+    assert_eq!(
+        process.oldest_unflushed_age,
+        Some(Duration::from_millis(25))
+    );
+    assert!(process.local.mutable_dirty_bytes > 0);
+    assert!(process.local.immutable_queued_bytes > 0);
+}
+
+#[tokio::test]
 async fn failed_flush_restores_flushing_bytes_to_queued_accounting() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());

@@ -2061,6 +2061,7 @@ impl CommitRuntime {
     pub(super) async fn recover_after(
         &self,
         after_sequence: SequenceNumber,
+        recovered_at: Timestamp,
     ) -> Result<RecoveredCommitLogState, StorageError> {
         let records = match &self.backend {
             CommitLogBackend::Local(manager) => manager.scan_from_sequence(after_sequence).await?,
@@ -2075,7 +2076,7 @@ impl CommitRuntime {
             recovered.max_sequence = recovered.max_sequence.max(record.sequence());
             recovered
                 .memtables
-                .apply_recovered_record(&record, Timestamp::new(0));
+                .apply_recovered_record(&record, recovered_at);
         }
 
         Ok(recovered)

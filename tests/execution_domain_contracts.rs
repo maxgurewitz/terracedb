@@ -13,7 +13,7 @@ use terracedb::{
     FileSystemOperation, InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType,
     PressureScope, ResourceManager, S3Location, ScanOptions, Scheduler, ShardReadyPlacementLayout,
     StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TableStats,
-    ThrottleDecision, TieredDurabilityMode, Value,
+    ThrottleDecision, TieredDurabilityMode, Timestamp, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -968,6 +968,70 @@ async fn pressure_stats_reconstruct_after_failed_flush_reopen() {
         after_reopen.metadata.get("oldest_unflushed_sequence"),
         Some(&serde_json::Value::from(sequence.get()))
     );
+}
+
+#[tokio::test]
+async fn oldest_unflushed_age_restarts_from_open_time_after_reopen() {
+    let profile = execution_profile("pressure-age-reopen");
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
+    let config =
+        tiered_settings("/execution-pressure-age-reopen").with_execution_profile(profile.clone());
+
+    let initial_clock = Arc::new(StubClock::new(Timestamp::new(10)));
+    let initial = Db::builder()
+        .settings(config.clone())
+        .components(
+            DbComponents::new(
+                file_system.clone(),
+                object_store.clone(),
+                initial_clock.clone(),
+                Arc::new(StubRng::seeded(31)),
+            )
+            .with_scheduler(Arc::new(NoopScheduler))
+            .with_resource_manager(resource_manager.clone()),
+        )
+        .open()
+        .await
+        .expect("open initial pressure-age db");
+    let table = initial
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create pressure-age table");
+    table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write unflushed value");
+    initial_clock.advance(Duration::from_millis(30));
+
+    let before_reopen = initial.table_pressure_stats(&table).await;
+    assert_eq!(
+        before_reopen.oldest_unflushed_age,
+        Some(Duration::from_millis(30))
+    );
+    drop(initial);
+
+    let reopened = Db::builder()
+        .settings(config)
+        .components(
+            DbComponents::new(
+                file_system,
+                object_store,
+                Arc::new(StubClock::new(Timestamp::new(100))),
+                Arc::new(StubRng::seeded(31)),
+            )
+            .with_scheduler(Arc::new(NoopScheduler))
+            .with_resource_manager(resource_manager),
+        )
+        .open()
+        .await
+        .expect("reopen pressure-age db");
+    let reopened_table = reopened.table("events");
+    let after_reopen = reopened.table_pressure_stats(&reopened_table).await;
+
+    assert_eq!(after_reopen.local, before_reopen.local);
+    assert_eq!(after_reopen.oldest_unflushed_age, Some(Duration::ZERO));
 }
 
 #[tokio::test]

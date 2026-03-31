@@ -129,6 +129,7 @@ impl DeterministicPressureOracle {
                 .saturating_add(state.pressure.immutable_flushing_bytes);
             state.pressure.immutable_queued_bytes = 0;
             state.pressure.immutable_flushing_bytes = 0;
+            state.oldest_unflushed_since = None;
             Self::refresh_table_state(restored.elapsed, state);
         }
         restored
