@@ -75,7 +75,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 17** adds a Kafka ingress crate and deterministic broker simulation support.
 - **Phase 18** adds a Debezium crate on top of Kafka ingress, including EventLog / Mirror / Hybrid materialization.
 - **Phase 19** adds end-to-end CDC deterministic hardening and a small example app that demonstrates Kafka + Debezium + projections + workflows together.
-- **Phase 20** adds sandbox capability policy, reviewed migrations, published procedures, MCP exposure, and an end-to-end example app on top of the sandbox/runtime stack.
+- **Phase 20** adds sandbox capability policy, capability presets, shell-facing bridges, reviewed migrations, published procedures, MCP exposure, draft/live session UX, and an end-to-end example app on top of the sandbox/runtime stack.
 - **Phase 21** refactors workflows around explicit runs, history, transition-engine contracts, and shared native/sandbox execution semantics, then closes with a toy example repo.
 - **Phase 22** adds workflow deployment, visibility, upgrades, preview/prod flows, and a second toy example repo that demonstrates the operator and rollout surface.
 
@@ -91,7 +91,7 @@ Once Phase 0 is complete, the work naturally splits into twenty-three mostly ind
 - **Track F — libraries:** T28, T29, and T30 start once their own engine dependencies are met; T28a follows T28; T31 depends on T30; T31a follows T31 and T31b follows T31a; T32 depends on T18/T19/T28/T29, T32c follows T32, and T32d follows T32c; T32a depends on T03a/T31/T32, and T32e depends on T03a
 - **Track G — full-stack hardening:** T33b and T33c can begin once the relevant engine/runtime surfaces exist; T33 follows T33c; T33a and T33d follow T33
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
-- **Track H2 — embedded sandbox runtime:** T40a first; T40b depends on T40a; T40c, T40d, and T40f can proceed once T40b and their library dependencies are ready; T40e depends on T40b + T40c; T40g depends on T40b + T40f; T40h depends on T33 + T40c + T40d + T40e + T40f + T40g; T40i depends on T40c + T40d + T40e + T40f + T40g + T40h
+- **Track H2 — embedded sandbox runtime:** T40a first; T40b depends on T40a; T40c, T40d, and T40f can proceed once T40b and their library dependencies are ready; T40e depends on T40b + T40c; T40g depends on T40b + T40c + T40f; T40h depends on T33 + T40c + T40d + T40e + T40f + T40g; T40i depends on T40c + T40d + T40e + T40f + T40g + T40h
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
 - **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
 - **Track K — hybrid-read and columnar-v2 hardening:** T48 first; T49 follows T48; then T50, T51, T53, T55, and T56 can proceed in parallel; T52 depends on T50 + T51; T54 depends on T51 + T52 + T55; T57 depends on T50 + T51 + T52 + T53 + T55 + T56; T58 depends on T52 + T53 + T54 + T55 + T56 + T57
@@ -103,7 +103,7 @@ Once Phase 0 is complete, the work naturally splits into twenty-three mostly ind
 - **Track Q — Kafka ingress:** T88 first; T89 follows T88; T90 follows T88 + T89; T91 follows T89 + T90
 - **Track R — Debezium CDC materialization:** T92 follows T31 + T84 + T88 + T90 + T91; T93 follows T92; T94 follows T84 + T92 + T93; T95 follows T93 + T94
 - **Track S — end-to-end CDC hardening and example app:** T96 follows T87 + T91 + T95; T97 follows T96; T98 follows T33 + T96 + T97; T99 follows T97 + T98
-- **Track T — sandbox capabilities, procedures, and MCP:** T100 first; T101 follows T100; T101a follows T101 + T31a; T102 follows T100 + T101 + T101a; T102a follows T101a + T102 + T31a; T103 and T104 can proceed in parallel once T102 exists; T105 follows T101 + T102 + T104 + T40g; T106 depends on T33 + T102a + T103 + T104 + T105; T107 depends on T102a + T103 + T104 + T105 + T106
+- **Track T — sandbox capabilities, procedures, and MCP:** T100 first; T101 follows T100; T101a follows T101 + T31a; T101b follows T101; T101c follows T40c + T101; T102 follows T100 + T101 + T101a; T102a follows T101a + T102 + T31a; T103 and T104 can proceed in parallel once T102 exists; T105 follows T101 + T102 + T104 + T40g; T106 depends on T33 + T101b + T101c + T102a + T103 + T104 + T105; T107 depends on T101b + T101c + T102a + T103 + T104 + T105 + T106
 - **Track U — workflow run model and execution contract:** T108 first; T109, T110, and T111 can proceed in parallel once T108 exists; T112 depends on T109 + T110 + T111; T113 depends on T33 + T109 + T110 + T111 + T112; T114 depends on T109 + T110 + T111 + T112 + T113
 - **Track V — workflow deployment, visibility, and upgrades:** T115 follows T108; T116, T117, and T118 can proceed in parallel once T115 exists; T119 depends on T116 + T117 + T118; T120 depends on T116 + T119 + T40i; T121 depends on T33 + T116 + T117 + T118 + T119 + T120; T122 depends on T116 + T117 + T118 + T119 + T120 + T121
 
@@ -1976,7 +1976,7 @@ Bring the virtual filesystem crate up to the same correctness bar as the rest of
 
 **Phase rule:** T40a freezes the sandbox crate boundary, editor-view protocol, and deterministic seams first. Every implementation task in this phase must add deterministic simulation coverage for the parts that can run under the seeded harness immediately. Any part of the real stack that cannot run under the simulation harness with acceptable fidelity must be hidden behind a stable interface with a deterministic stub/fake backend and tested through that seam in the same task. Do not defer the simulation-boundary decision to a late hardening-only step.
 
-**Parallelization:** T40a first. T40b depends on T40a. T40c, T40d, and T40f can proceed in parallel once T40b and their own library dependencies exist. T40e depends on T40b and T40c. T40g depends on T40b and T40f. T40h depends on T33, T40c, T40d, T40e, T40f, and T40g. T40i depends on T40c, T40d, T40e, T40f, T40g, and T40h.
+**Parallelization:** T40a first. T40b depends on T40a. T40c, T40d, and T40f can proceed in parallel once T40b and their own library dependencies exist. T40e depends on T40b and T40c. T40g depends on T40b, T40c, and T40f. T40h depends on T33, T40c, T40d, T40e, T40f, and T40g. T40i depends on T40c, T40d, T40e, T40f, T40g, and T40h.
 
 ### T40a. Freeze the sandbox crate boundary, capability contracts, editor-view protocol, and deterministic seams
 
@@ -2014,7 +2014,7 @@ Define the `terracedb-sandbox` public surface and the simulation boundary before
    - any package/builtin compatibility modes,
    - the read-only editor/view URI or protocol surface used by VS Code and Cursor.
 4. Evaluate which concrete integrations can run under the current deterministic harness with acceptable fidelity:
-   - the real `deno_core` runtime,
+   - the real pure-Rust JS runtime backend (currently `boa_engine`),
    - `just-bash`,
    - package fetching and integrity/cache transitions,
    - git export / worktree preparation,
@@ -2026,7 +2026,7 @@ Define the `terracedb-sandbox` public surface and the simulation boundary before
 
 - Compile-only tests that instantiate all public sandbox/session/capability/view interfaces.
 - Unit tests that round-trip session provenance, conflict-policy, and view-handle metadata encodings.
-- A deterministic smoke test that opens a sandbox session over a fake volume and a deterministic stub backend without touching real I/O, V8, git, or network services.
+- A deterministic smoke test that opens a sandbox session over a fake volume and a deterministic stub backend without touching real I/O, the real JS engine, git, or network services.
 
 ---
 
@@ -2100,7 +2100,7 @@ Implement the execution core of the sandbox: the actor model, the runtime backen
 
 **Description**
 
-Implement the TypeScript and shell-tooling layers against the sandbox contracts without reopening the runtime/session interfaces. This task covers TypeScript transpilation/checking and `just-bash` integration over the VFS-backed sandbox filesystem.
+Implement the TypeScript and shell-tooling layers against the sandbox contracts without reopening the runtime/session interfaces. This task covers TypeScript transpilation/checking, `just-bash` integration over the VFS-backed sandbox filesystem, and the shell-facing bridge for host-owned capabilities and procedures.
 
 **Implementation steps**
 
@@ -2109,11 +2109,14 @@ Implement the TypeScript and shell-tooling layers against the sandbox contracts 
 3. Implement guest-visible TypeScript service entrypoints for diagnostics, emits, and related operations, and route them through tool-run/activity surfaces.
 4. Implement the `just-bash` filesystem adapter and persistent shell-session wrapper on top of the sandbox filesystem shim.
 5. Add the built-in custom command bridges needed by the architecture, such as delegating `npm`, `tsc`, or allowlisted host capability calls through stable sandbox services rather than host subprocesses.
+6. Implement a shell-facing capability/procedure bridge for `just-bash` that is derived from the same capability or procedure metadata as typed imports rather than hand-maintained separately.
+7. Ensure the shell bridge provides stable command naming, built-in help/argument descriptions, structured JSON input/output, and first-class tool-run/activity recording without introducing a second authority model.
 
 **Verification**
 
 - Integration tests for TypeScript transpile/check flows over sandboxed files.
 - Integration tests for bash sessions reading and writing through the sandbox tree and producing expected tool-run records.
+- Integration tests proving the same host capability can be exercised through both a typed import and the shell-facing bridge with the same manifest enforcement and audit metadata.
 - Deterministic simulation tests for TypeScript-mirror updates, diagnostic replay, and bash/VFS flows using the stub runtime backend where the real runtime is not required.
 - Restart tests for any persisted TypeScript or shell-session metadata introduced by the implementation.
 
@@ -2180,13 +2183,13 @@ Implement the real-world interop path between sandboxes and host projects: impor
 
 ---
 
-### T40g. Implement the read-only local/remote editor-view service and ship a real VS Code/Cursor extension package
+### T40g. Implement the read-only local/remote editor-view service, foreground session surfaces, and ship a real VS Code/Cursor extension package
 
-**Depends on:** T40a, T40b, T40f
+**Depends on:** T40a, T40b, T40c, T40f
 
 **Description**
 
-Implement the read-only editor-facing view layer so developers can browse sandbox state from VS Code and Cursor whether the application is running locally or remotely. This task must produce a real extension package in the repo, not just an abstract provider surface or protocol sketch. The goal is one user-facing editor workflow backed by the same read-only view protocol across both deployment shapes.
+Implement the read-only editor-facing view layer so developers can browse sandbox state from VS Code and Cursor whether the application is running locally or remotely, and add a live foreground-session surface so the same tooling can show what an active sandbox is doing right now. This task must produce a real extension package in the repo, not just an abstract provider surface or protocol sketch. The goal is one user-facing editor workflow backed by the same read-only view and foreground-session protocols across both deployment shapes.
 
 **Implementation steps**
 
@@ -2198,14 +2201,19 @@ Implement the read-only editor-facing view layer so developers can browse sandbo
 2. Implement the local transport/bridge path for an app running on the developer's machine.
 3. Implement the authenticated remote transport/endpoint path so the same extension/protocol works across the network against a remote app.
 4. Implement and check in a real VS Code extension package in the repo, preferably using the editor's read-only virtual filesystem/provider APIs, and make Cursor compatibility an explicit requirement of that package or its build target rather than an assumed follow-up.
-5. Ensure the editor-view path remains read-only and does not silently become a writable mount or unchecked export path.
+5. Expose a foreground session-state surface over the same local/remote bridge for:
+   - running or recently failed tool actions,
+   - active readonly-view handles and reconnect status,
+   - host-enforced denials or budget/resource failures that actually reached the enforcement path,
+   - clear machine-readable indication when a capability or shell bridge is simply unavailable because it was never injected.
+6. Ensure the editor/view path remains read-only and that the foreground session surface is derived from or mirrored into the same durable activity/tool-run model rather than a disconnected telemetry plane.
 
 **Verification**
 
 - Unit and integration tests for browse/list/open/stat semantics over sandbox snapshots or session views.
 - Deterministic simulation tests for the core view protocol and snapshot/view semantics using the stub view provider or local protocol stub.
-- Local integration tests for the checked-in extension package against a local app bridge.
-- Remote integration tests for the same checked-in extension package against an authenticated remote endpoint.
+- Local integration tests for the checked-in extension package against a local app bridge, including foreground session-state queries.
+- Remote integration tests for the same checked-in extension package against an authenticated remote endpoint and reconnect/status behavior.
 
 ---
 
@@ -2261,32 +2269,37 @@ Bring the sandbox stack up to the same correctness bar as the rest of Terracedb 
 
 **Description**
 
-Add a small, teachable example project that demonstrates what the sandbox is for in practice: a real sandbox session over a project tree, injected app capabilities, guest code execution, shell/tool usage, read-only editor visibility, and an export or PR-style workflow.
+Add a small, teachable example project that demonstrates what the sandbox is for in practice: a real sandbox session over a project tree, injected app capabilities, guest code execution, shell/tool usage, read-only editor visibility, foreground session state, and an export or PR-style workflow.
 
 **Implementation steps**
 
-1. Add a small example app and companion sandboxed project that can be opened locally and used as the basis for hoist/eject flows.
+1. Extend `examples/sandbox-notes` as the canonical sandbox example unless the scope stops being teachable; prefer evolving that existing example over creating a near-duplicate app.
 2. Implement at least one injected app capability that is visible to guest code and easy to understand in the example, such as:
    - a note store,
    - a ticket/comment API,
    - a task queue or inbox surface.
 3. Demonstrate the core sandbox flows in the example:
    - open a session on a base tree or hoisted repo,
-   - execute guest code,
+   - execute guest code through an explicit typed capability import,
+   - call the same capability through the shell-facing bridge,
    - use TypeScript and/or bash tooling,
+   - inspect live foreground session state for tool runs, view handles, and other active work,
    - view files read-only from the VS Code/Cursor integration,
    - eject or prepare a branch/PR-style export.
 4. Add example docs that explain the boundaries clearly:
    - what is simulated versus what is a real integration,
    - why the editor view is read-only,
    - how app capabilities are injected,
+   - how typed imports and shell bridges share one authority model,
+   - the difference between a capability that is absent from the session and an operation that reaches the host and is denied,
    - how repo export and PR creation work.
 5. Keep the example small enough to teach, but real enough that it validates the crate boundaries against normal application embedding.
 
 **Verification**
 
-- End-to-end example tests exercising the documented happy path.
+- End-to-end example tests exercising the documented happy path, including both typed-import and shell-bridge capability use.
 - Tests proving the injected app capability behaves the same through the example as it does through the sandbox API directly.
+- Tests covering the foreground session-state surface the example presents for active tool runs and readonly-view state.
 - Local editor-view smoke tests against the example project and, where practical, a remote-view smoke path using the same protocol.
 - Deterministic simulation coverage for the example's capability and session semantics wherever the example uses simulated-capable paths.
 
@@ -4323,11 +4336,11 @@ Finish the capstone work by hardening the new example app under failure/restart 
 
 ---
 
-## Phase 20 — Sandbox capability policy, reviewed procedures, MCP exposure, and example app
+## Phase 20 — Sandbox capability policy, authoring UX, reviewed procedures, MCP exposure, and example app
 
 **Phase rule:** T100 freezes the shared capability, procedure, and MCP-facing contracts first, and T101a freezes the row-scope and visibility-index contracts before the row-permission-specific implementation branches diverge. Every implementation task in this phase must add deterministic simulation coverage for the semantics it introduces rather than deferring simulation to the end. T106 is the capstone cross-cutting deterministic hardening task for the combined stack, and T107 adds a small example repo/app with its own simulation tests that demonstrates the intended end-to-end usage.
 
-**Parallelization:** T100 first. T101 follows T100. T101a follows T101 + T31a. T102 follows T100 + T101 + T101a. T102a follows T101a + T102 + T31a. T103 and T104 can proceed in parallel once T102 exists. T105 follows T101 + T102 + T104 + T40g. T106 depends on T33 + T102a + T103 + T104 + T105. T107 depends on T102a + T103 + T104 + T105 + T106.
+**Parallelization:** T100 first. T101 follows T100. T101a follows T101 + T31a. T101b follows T101. T101c follows T40c + T101. T102 follows T100 + T101 + T101a. T102a follows T101a + T102 + T31a. T103 and T104 can proceed in parallel once T102 exists. T105 follows T101 + T102 + T104 + T40g. T106 depends on T33 + T101b + T101c + T102a + T103 + T104 + T105. T107 depends on T101b + T101c + T102a + T103 + T104 + T105 + T106.
 
 ### T100. Freeze sandbox capability, migration, procedure, and MCP contracts plus deterministic seams
 
@@ -4350,15 +4363,19 @@ Freeze the shared contracts that the rest of the phase will implement: capabilit
    - `CapabilityManifest`,
    - `ResourcePolicy`,
    - `BudgetPolicy`,
+   - host-authored preset/profile descriptors that expand into manifests,
+   - interactive draft-authorization request/outcome records,
+   - foreground session-status snapshot/projection records,
    - sandbox execution-policy wiring that maps operations into execution domains,
    - reviewed procedure publication metadata and invocation contracts,
    - migration-plan and migration-history metadata,
    - MCP tool/resource descriptors and session/auth context.
-3. Freeze the guest-visible module conventions for bound capabilities, including import shapes such as `terrace:host/<binding>`.
+3. Freeze the guest-visible module conventions for bound capabilities, including import shapes such as `terrace:host/<binding>`, and the matching shell-facing command naming/descriptor conventions where a binding is exposed to `just-bash`.
 4. Decide which boundaries must sit behind deterministic stubs or fakes from the start, including:
    - auth and subject-resolution,
    - rate limiting,
    - execution-domain placement and budget accounting hooks,
+   - interactive authorization request/approval plumbing,
    - reviewed-procedure publication storage,
    - MCP connection/session state.
 5. Document the rule that capability policy and execution-domain policy are separate and composable: capabilities constrain authority, domains constrain resource consumption.
@@ -4377,7 +4394,7 @@ Freeze the shared contracts that the rest of the phase will implement: capabilit
 
 **Description**
 
-Implement the shared policy substrate used by every later task: subject-to-grant resolution, manifest construction, audit labels, budget enforcement hooks, and host-controlled execution-domain assignment for sandbox and procedure work.
+Implement the shared policy substrate used by every later task: subject-to-grant resolution, manifest construction, preset/profile expansion, audit labels, optional draft authorization plumbing, live session-status projection, budget enforcement hooks, and host-controlled execution-domain assignment for sandbox and procedure work.
 
 **Implementation steps**
 
@@ -4385,6 +4402,7 @@ Implement the shared policy substrate used by every later task: subject-to-grant
    - capability templates,
    - subject grants,
    - environment/deployment policy intersection,
+   - host-authored preset/profile expansion,
    - binding-name generation,
    - immutable reviewed-manifest loading for published procedures.
 2. Implement host-owned execution-policy resolution that maps:
@@ -4399,14 +4417,23 @@ Implement the shared policy substrate used by every later task: subject-to-grant
    - binding or capability used,
    - target resource set,
    - rate-limit/budget outcome,
-   - chosen execution domain.
-4. Add stub/fake implementations for auth, rate limiting, and domain-resolution seams so deterministic simulation can exercise policy outcomes without real external identity or quota systems.
-5. Ensure every policy decision can be attached to tool runs, activity entries, or equivalent procedure/audit records without inventing an unrelated telemetry plane.
+   - chosen execution domain,
+   - preset/profile name when one seeded the session,
+   - authorization request/approval/rejection outcomes for trusted draft sessions.
+4. Implement the host-mediated draft interactive-authorization substrate, including:
+   - optional requests for additional bindings in trusted draft sessions,
+   - approval scopes such as one call, one session, or host-defined policy update,
+   - explicit distinction between a capability that was never injected and an operation that reached host enforcement and was denied.
+5. Implement a live session-status projection surface derived from tool runs, activity entries, view state, and policy outcomes so active sessions can surface foreground state without inventing a disconnected telemetry plane.
+6. Add stub/fake implementations for auth, rate limiting, interactive authorization, and domain-resolution seams so deterministic simulation can exercise policy outcomes without real external identity or quota systems.
+7. Ensure every policy decision can be attached to tool runs, activity entries, or equivalent procedure/audit records without inventing an unrelated telemetry plane.
 
 **Verification**
 
 - Deterministic simulation tests proving the same subject/grant/environment inputs resolve to the same manifest and execution-domain assignments on replay.
-- Tests covering deny, allow, rate-limited, and budget-exhausted outcomes with stable audit metadata.
+- Tests covering preset expansion, allow, deny, rate-limited, and budget-exhausted outcomes with stable audit metadata.
+- Tests proving absent bindings are surfaced differently from host-enforced denials and that interactive draft authorization can only widen scope through host approval.
+- Tests proving the live session-status projection remains consistent with the underlying durable tool/activity history.
 - Crash/recovery tests if any manifest or reviewed-policy metadata becomes persistent state.
 
 ---
@@ -4454,6 +4481,57 @@ Freeze the row-level-permission model before the implementation branches diverge
 
 ---
 
+### T101b. Productize named capability presets and profile-driven draft-session UX
+
+**Depends on:** T101
+
+**Description**
+
+Build the user-facing preset/profile layer on top of the shared policy substrate so draft-session UX can start from named host-authored bundles rather than making every caller construct raw manifests by hand. This task is about making presets a first-class product surface rather than just a hidden expansion mechanism in the resolver.
+
+**Implementation steps**
+
+1. Add host-facing APIs and metadata surfaces for listing, describing, and selecting named presets or profiles backed by the expansion machinery from T101.
+2. Support inspection of the expanded effective manifest, narrowing or overriding parts of it before session open, and surfacing both the preset name and expanded manifest in audit metadata.
+3. Attach default budget, execution-domain, and session-mode hints to presets where useful without letting presets bypass the normal grant/intersection rules.
+4. Reuse the same preset/profile surface in examples, draft-session tooling, and host APIs rather than inventing app-local shortcuts.
+5. Keep preset resolution deterministic and replayable under the same stubbed policy seams used elsewhere in the phase.
+
+**Verification**
+
+- Unit tests covering preset listing, expansion, narrowing, override, and audit metadata.
+- Deterministic simulation tests proving the same subject, preset, and environment inputs produce the same effective manifest and draft-session defaults on replay.
+- Tests proving presets cannot widen authority beyond standing grants and environment/deployment policy.
+
+---
+
+### T101c. Productize optional host-mediated interactive authorization for trusted draft sessions
+
+**Depends on:** T40c, T101
+
+**Description**
+
+Build the end-to-end interactive authorization flow on top of the substrate from T101. This is specifically for trusted draft/internal sessions: the host may choose to surface a request for more authority or a retry after a host-enforced denial, but guest code must never self-escalate from inside the sandbox.
+
+**Implementation steps**
+
+1. Add host-facing request/decision APIs for trusted draft sessions that can represent:
+   - asking for a currently absent binding to be injected,
+   - retry after an operation was denied at host enforcement,
+   - approve-once, approve-for-session, reject, or host-policy-update outcomes.
+2. Implement manifest refresh or retry flows so approved requests take effect through the same host-authoritative manifest machinery as ordinary grants.
+3. Ensure the UX distinguishes cleanly between "binding was never injected" and "operation reached the host and was denied."
+4. Record request, approval, rejection, and retry outcomes in the same audit/tool-run history as the attempted operation.
+5. Explicitly disable the flow for published procedures, reviewed workflow bundles, and lower-trust production execution paths.
+
+**Verification**
+
+- Integration tests for trusted draft sessions covering request, approval, rejection, and retry behavior.
+- Tests proving guest code cannot self-grant authority and that lower-trust paths cannot enter the interactive authorization flow.
+- Tests proving absent bindings remain absent unless the host explicitly refreshes the manifest.
+
+---
+
 ### T102. Implement database capability families and host-enforced policy checks
 
 **Depends on:** T100, T101, T101a, T40c, T27
@@ -4478,13 +4556,14 @@ Implement the first real host capability families for sandboxed code, especially
    - scope-escaping-write rejection using preimage/postimage checks plus OCC read sets,
    - per-binding row/byte/time budgets, including accounting for scanned candidates vs returned rows where applicable.
 3. Generate matching TypeScript declarations and guest-visible bound modules from the resolved manifest instead of hand-maintaining separate runtime and type definitions.
-4. Ensure denied operations fail predictably, carry enough machine-readable metadata for callers, audit logs, and simulations, and can normalize "not visible" to "not found" where low-leakage behavior is required.
+4. Ensure capabilities that are not granted are omitted from the injected module or shell-bridge surface entirely, while granted operations that do reach host enforcement fail predictably, carry enough machine-readable metadata for callers, audit logs, and simulations, and can normalize "not visible" to "not found" where low-leakage behavior is required.
 5. Record capability usage with consistent tool-run or capability-event metadata so later procedure and MCP layers inherit the same audit surface automatically.
 
 **Verification**
 
 - Deterministic simulation tests for allowed and denied reads/writes/scans across table allowlists, tenant scopes, query-shape restrictions, deterministic key-prefix filters, typed row predicates, and scope-escaping writes.
 - Integration tests that import generated bound modules from guest code and verify the host remains in the enforcement path.
+- Integration tests proving ungranted bindings are absent from both guest imports and any generated shell-bridge surface, distinct from host-enforced denials for granted bindings.
 - Restart or reopen tests for any persisted capability metadata introduced by the implementation.
 
 ---
@@ -4636,7 +4715,7 @@ Implement `terracedb-mcp` as an external adapter for agents such as Claude Deskt
 
 ### T106. Build cross-cutting deterministic simulation, crash, and fault suites for the capability/procedure/MCP stack
 
-**Depends on:** T33, T102a, T103, T104, T105
+**Depends on:** T33, T101b, T101c, T102a, T103, T104, T105
 
 **Description**
 
@@ -4646,19 +4725,26 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
 
 1. Extend the deterministic shadow/oracle model to cover:
    - capability-grant resolution,
+   - preset/profile expansion,
    - manifest intersections,
    - row-scope policy resolution,
    - visibility-index projection state and membership transitions,
    - execution-domain assignment outcomes,
    - migration history state,
    - published-procedure metadata and immutable-version selection,
+   - shell-bridge command mapping,
    - MCP request-to-capability mapping,
+   - draft-authorization request and outcome state,
+   - foreground session-status projection state,
    - audit/tool-run history.
 2. Add randomized workloads that combine:
    - draft sandbox execution,
    - approved and denied DB capability calls,
    - direct row-scoped reads and writes,
    - visibility-index-backed shared-row queries,
+   - absent binding and shell-bridge lookups,
+   - shell-bridge invocations,
+   - optional draft authorization requests,
    - reviewed migration application,
    - procedure publication,
    - procedure invocation under varying caller contexts,
@@ -4675,10 +4761,12 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
    - denied capability escalation attempts,
    - scope-escaping writes,
    - stale or divergent visibility-index state,
+   - preset/profile expansion mismatches,
    - stale review metadata,
    - rate-limit exhaustion,
    - domain-budget exhaustion,
    - conflicting procedure publication,
+   - absent-binding versus host-denial confusion in foreground session state,
    - read-only view reconnect behavior through MCP.
 5. Ensure failing seeds preserve enough manifest, subject, procedure-version, and execution-domain context for exact local replay.
 
@@ -4693,11 +4781,11 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
 
 ### T107. Build a small example repo/app that demonstrates reviewed migrations, draft queries, published procedures, and MCP exposure
 
-**Depends on:** T102a, T103, T104, T105, T106
+**Depends on:** T101b, T101c, T102a, T103, T104, T105, T106
 
 **Description**
 
-Add a small, teachable example repo/app that demonstrates the intended way to use the new stack in practice: reviewed migrations for catalog setup, trusted draft query sandboxes for internal users, row-scoped visibility rules, immutable published procedures for lower-trust callers, and an MCP surface that exposes the approved capabilities to an external agent. The example should include its own simulation tests and serve as the reference integration pattern for these libraries.
+Add a small, teachable example repo/app that demonstrates the intended way to use the new stack in practice: reviewed migrations for catalog setup, trusted draft query sandboxes for internal users, row-scoped visibility rules, immutable published procedures for lower-trust callers, and an MCP surface that exposes the approved capabilities to an external agent. The example should include its own simulation tests, demonstrate the policy/authorization/session-UX affordances added in this phase, and serve as the reference integration pattern for these libraries. Build on the sandbox example from T40i where practical rather than creating a near-duplicate teaching app.
 
 **Implementation steps**
 
@@ -4706,8 +4794,12 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
    - an employee draft-query sandbox with broader internal grants,
    - row-scoped access to a shared-record domain enforced through bound DB capabilities,
    - a projection-maintained visibility index for shared rows,
+   - a named preset/profile that seeds the draft sandbox manifest,
+   - optional host-mediated draft authorization for requesting an additional binding,
+   - at least one capability or reviewed procedure exposed through the shell-facing bridge as well as the typed import path,
    - one or more reviewed published procedures for external callers,
-   - MCP exposure of approved procedure and read-only sandbox surfaces.
+   - MCP exposure of approved procedure and read-only sandbox surfaces,
+   - a foreground session-state surface for active draft work.
 2. Give the example a simple but realistic authorization model with at least:
    - an internal employee subject,
    - a publication/reviewer subject,
@@ -4723,17 +4815,23 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
    - capability templates vs grants vs manifests,
    - row-scope policies vs projection-maintained visibility indexes,
    - why ACL-like shared visibility should usually route through projected indexes or reviewed procedures instead of ad hoc full scans,
+   - how presets/profiles expand into concrete manifests,
+   - how typed imports and shell-facing bridges share the same authority model,
+   - the difference between a capability that is absent from a draft session and a host-enforced denial on a granted binding,
    - why published procedures are immutable,
    - why migrations are intentionally catalog-scoped in version 1,
    - how MCP reuses the same permission model instead of introducing a second one,
-   - how execution domains limit resource blast radius.
-5. Add deterministic simulation tests owned by the example itself for its documented happy paths and representative deny/fault cases.
+   - how execution domains limit resource blast radius,
+   - how the foreground session surface relates to the durable audit/tool-run log.
+5. Add deterministic simulation tests owned by the example itself for its documented happy paths and representative deny/fault cases, including shell-bridge parity with the typed-import path.
 
 **Verification**
 
 - Example-level deterministic simulation tests proving the documented migration, row-scoped query, procedure, and MCP flows behave as described.
 - Tests proving the example's internal and external subjects receive meaningfully different capabilities and execution-domain assignments.
 - Tests proving visibility-index transitions such as share/unshare or tenant mismatch produce the documented visible vs hidden outcomes.
+- Tests proving the example's preset/profile selection, optional draft authorization flow, and foreground session-state surface behave as documented.
+- Tests proving the example's shell-facing bridge and typed-import path stay aligned under the same effective manifest and audit model.
 - Smoke tests or docs checks proving the example can be run and inspected without hidden setup.
 - Regression tests ensuring the example remains aligned with the supported public crate APIs instead of drifting into bespoke internals.
 
@@ -5465,15 +5563,18 @@ At this point the system should additionally support:
 - cross-cutting deterministic simulation campaigns for the full CDC ingestion/materialization/runtime stack, and
 - polished reference docs that show how to build on the new crates without coupling projections or workflows directly to Kafka.
 
-### Milestone T — Sandbox capability policy, reviewed procedures, MCP exposure, and example app
+### Milestone T — Sandbox capability policy, authoring UX, reviewed procedures, MCP exposure, and example app
 Complete: T100–T107
 
 At this point the system should additionally support:
 - a shared capability/grant/manifest model for sandbox, migration, procedure, and MCP-facing access,
+- host-authored presets/profiles that expand into explainable effective manifests,
 - host-enforced database capability families with table allowlists, tenant scoping, query-shape restrictions, key-prefix and row-scope filters, visibility-index projection helpers, rate limits, and audit hooks,
+- shell-facing bridges for selected capabilities or reviewed procedures that reuse the same authority model as typed imports,
 - reviewed migration flows for catalog setup and app-schema evolution without claiming large backfill support,
 - immutable published procedures with reviewed manifests, typed inputs/outputs, and caller-context-aware invocation,
 - an external `terracedb-mcp` adapter that reuses the same permission and audit model as in-process sandboxes,
+- optional host-mediated draft authorization plus foreground session-state surfaces that distinguish absent bindings from host-enforced denials,
 - execution-domain isolation for sandbox, procedure, publication, and MCP work so resource exhaustion cannot trivially starve the enclosing app, and
 - a small reference example app with its own deterministic simulation suites covering the intended end-to-end usage.
 

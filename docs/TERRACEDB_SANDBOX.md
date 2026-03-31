@@ -5,7 +5,7 @@
 This document proposes an architecture that fits the current repo:
 
 - `terracedb-vfs` already provides the right storage kernel: filesystem, KV, tool runs, snapshots, overlays, and visible vs durable cuts.
-- `deno_core` is the right low-level embedding surface for a guest JS runtime.
+- `boa_engine` is the right low-level embedding surface for a guest JS runtime because it keeps the sandbox pure Rust.
 - `just-bash` is a strong fit for shell utilities because it is designed for AI agents and accepts a custom async filesystem interface.
 - `@typescript/vfs` is a good fit for TypeScript language service and `tsc`-style analysis, but it should not be treated as the runtime filesystem itself.
 
@@ -13,7 +13,7 @@ This document proposes an architecture that fits the current repo:
 
 1. Model a sandbox session as a `terracedb-vfs` overlay volume, not as an ad hoc temp directory.
 2. Treat execution, TypeScript tooling, and package installation as separate subsystems that share one virtual tree.
-3. Start with `deno_core::JsRuntime` plus custom extensions and a custom `ModuleLoader`; do not try to rebuild full Deno/npm/Node compatibility in the first iteration.
+3. Start with `boa_engine` plus a custom `ModuleLoader`; do not try to rebuild full Deno/npm/Node compatibility in the first iteration.
 4. Expose host integration as versioned capability modules, not ambient globals.
 5. Make `bash`, `npm install`, `tsc`, and host API calls flow through `ToolRunStore` so they become part of the sandbox timeline.
 6. Support pure JS/TS npm packages first; explicitly defer native Node-API addons and postinstall-heavy packages.
@@ -238,14 +238,14 @@ Without this, eject and PR creation become guesswork.
 
 ### Core Runtime
 
-Use `deno_core::JsRuntime` as the base embedding surface.
+Use `boa_engine` as the base embedding surface.
 
-Important runtime implication: `JsRuntime` is `!Send` and `!Sync`, so each sandbox instance should be treated as a pinned actor running on a dedicated current-thread executor or dedicated thread. Do not model it as a normal Tokio task that hops worker threads.
+Important runtime implication: even though the chosen engine is pure Rust, each sandbox instance should still be treated as a logically serialized actor. Keep one runtime owner per session and do not let guest execution, module-cache mutation, or capability dispatch race across arbitrary tasks.
 
 Recommended shape:
 
 - one `SandboxActor` per session,
-- one current-thread Tokio runtime or `LocalSet` per actor,
+- one logical runtime owner per actor,
 - message-passing API from the host app to the actor,
 - explicit teardown that flushes the overlay if requested.
 
@@ -253,16 +253,15 @@ Recommended shape:
 
 1. Open or create overlay session volume.
 2. Build capability manifest for this session.
-3. Start `JsRuntime` with:
+3. Start the JS runtime backend with:
    - custom `ModuleLoader`,
-   - custom extensions/ops,
    - bootstrapped JS libraries for FS shims, host APIs, and optional bash/npm helpers.
 4. Load entrypoint module or evaluate code.
 5. Persist tool activity and optionally flush durable state.
 
 ## Module Resolution and Loading
 
-Implement a custom `deno_core::ModuleLoader` with three distinct jobs:
+Implement a custom module loader with three distinct jobs:
 
 1. Resolve specifiers
 2. Prepare dependencies
@@ -294,11 +293,11 @@ Recommended `ModuleLoader` behavior:
   - collect source maps,
   - populate code cache lookup keys.
 - `load()`
-  - return final JS source for V8,
+  - return final JS source for the guest runtime,
   - attach source-map metadata,
   - use VFS or shared cache volumes as backing storage.
-- `code_cache_ready()`
-  - persist V8 code cache blobs into `/.terrace/cache/v8`.
+- module-cache publication
+  - persist module cache metadata or transpilation artifacts into `/.terrace/cache/runtime`.
 
 ## File System API Strategy
 
@@ -327,8 +326,8 @@ Then layer JS shims on top:
 
 - `@terracedb/sandbox/fs`
   A small runtime-neutral library used by everything else.
-- `Deno.*` subset shim
-  Only the methods you actually need.
+- sandbox runtime/global shim
+  Only the APIs you actually need.
 - `node:fs/promises` shim
   Implemented in JS using the same op layer.
 - `node:fs` sync API
@@ -393,11 +392,11 @@ These should share a module graph and virtual tree, but they should not be the s
 
 ### Execution-Time TS
 
-`deno_runtime` explicitly removes TypeScript integration, so if you embed `deno_core` or even `deno_runtime`, you should assume TS execution is your responsibility.
+`boa_engine` executes JavaScript, not TypeScript, so TS execution is unambiguously the embedder's responsibility.
 
 Recommended design:
 
-- the module loader transpiles `.ts`, `.tsx`, `.mts`, and `.cts` to JS before V8 execution,
+- the module loader transpiles `.ts`, `.tsx`, `.mts`, and `.cts` to JS before guest execution,
 - source maps are stored alongside the transpiled output,
 - transpile cache keys include:
   - file content hash,
@@ -459,8 +458,8 @@ This is the highest-risk part of the feature.
 
 The key architectural point is:
 
-- `deno_core` gives you the embedder runtime and the module-loader hooks,
-- Deno's broader npm/Node compatibility lives above that,
+- the chosen JS engine gives you the embedder runtime and module-loader hooks,
+- broader npm/Node compatibility lives above that,
 - full compatibility from scratch will be a large project.
 
 ### Recommended Scope Split
@@ -563,7 +562,7 @@ pub trait SandboxCapability: Send + Sync {
     fn name(&self) -> &str;
     fn esm_specifier(&self) -> String;
     fn dts_text(&self) -> String;
-    fn extension(&self) -> deno_core::Extension;
+    fn module_source(&self) -> String;
 }
 ```
 
@@ -925,4 +924,4 @@ Broader npm ecosystem support without abandoning the embedded model.
 
 If we compress this down to one sentence:
 
-`terracedb-sandbox` should be a `deno_core`-embedded, capability-oriented JS runtime whose root filesystem is a `terracedb-vfs` overlay, whose disk and git interop are explicit hoist/eject services with provenance, whose shell tooling comes from `just-bash` via a VFS adapter, whose TypeScript tooling comes from a separate `@typescript/vfs` mirror, whose npm support is delivered by a host-managed installer plus a custom module loader, and whose default PR flow exports into an ephemeral git worktree rather than mutating the user's checkout directly.
+`terracedb-sandbox` should be a `boa_engine`-embedded, capability-oriented JS runtime whose root filesystem is a `terracedb-vfs` overlay, whose disk and git interop are explicit hoist/eject services with provenance, whose shell tooling comes from `just-bash` via a VFS adapter, whose TypeScript tooling comes from a separate `@typescript/vfs` mirror, whose npm support is delivered by a host-managed installer plus a custom module loader, and whose default PR flow exports into an ephemeral git worktree rather than mutating the user's checkout directly.

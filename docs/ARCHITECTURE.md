@@ -4249,9 +4249,9 @@ For repos, `git head` should be the safest default import mode. `git working tre
 
 ### Runtime Model
 
-The low-level execution surface should be `deno_core::JsRuntime` with custom module loading and host extensions. `deno_runtime` and full Deno CLI behavior are not the design center for version 1.
+The low-level execution surface should be a pure-Rust JavaScript engine, currently `boa_engine`, with custom module loading and host integration. Full Deno CLI behavior and the unrestricted Node host process model are not the design center for version 1.
 
-One important embedding constraint is load-bearing: `deno_core::JsRuntime` is not `Send` or `Sync`. Each sandbox instance should therefore behave like a pinned actor on a dedicated current-thread executor or dedicated OS thread, with message-passing from the surrounding app into the sandbox actor.
+Choosing a pure-Rust engine avoids the non-Rust V8 embedding stack and keeps the sandbox easier to build, test, and simulate inside the rest of the Rust codebase. Each sandbox instance should still behave like a logically serialized actor with message-passing from the surrounding app so module state, caches, and capability calls stay predictable.
 
 The runtime phases are:
 
@@ -4307,7 +4307,7 @@ The Rust layer should expose a narrow host-op surface over `terracedb-vfs`:
 Guest-facing compatibility should then be layered in libraries:
 
 - a runtime-neutral `@terracedb/sandbox/fs`,
-- the subset of `Deno.*` the sandbox actually needs,
+- a small sandbox runtime/global shim for the APIs guest code actually needs,
 - `node:fs/promises` shims built on the same op surface,
 - selected sync compatibility layers only where a concrete package requires them.
 
@@ -4351,7 +4351,7 @@ For language-service behavior, `@typescript/vfs` is a good fit because it suppli
 
 ### npm Dependency Strategy
 
-Package installation is the highest-risk compatibility area. The key constraint is that `deno_core` gives the embedder a runtime and module-loader hooks, but broader npm and Node compatibility lives above that layer.
+Package installation is the highest-risk compatibility area. The key constraint is that the JS engine and module-loader surface give the embedder language execution plus resolution hooks, but broader npm and Node compatibility lives above that layer.
 
 Version 1 should support:
 
@@ -4394,6 +4394,27 @@ await tickets.addComment({ id: open[0].id, body: "Investigating" })
 ```
 
 The sandbox should prefer imports over globals, small domain-specific modules over one giant `Terrace` object, async JSON-serializable calls over opaque handles, and idempotent write APIs where possible.
+
+### Shell-Facing Capability Bridge
+
+Typed imports should remain the primary programmatic surface for guest code, but the same host-owned capabilities should also be exposable through a shell-friendly bridge for `just-bash` and related authoring tools.
+
+The important rule is that this bridge must not become a second API stack. It should be generated or derived from the same capability templates and procedure metadata already used for typed imports. The shell form is a convenience surface over the same authority model, not a separate integration plane.
+
+Useful properties for this bridge:
+
+- self-describing commands with built-in `--help`, argument descriptions, and examples,
+- structured JSON input/output so shell steps can compose with TypeScript and tooling code,
+- stable naming derived from capability bindings or published procedure names,
+- the same manifest enforcement, budgets, and audit labels as direct imported calls, and
+- tool-run/activity recording that makes shell-driven capability use first-class in session history.
+
+For example, a sandbox might expose:
+
+- a typed import such as `import { orders } from "terrace:host/orders_ro"`, and
+- a shell-facing command such as `terrace-call orders_ro get --json '{"id":"..."}'`
+
+both backed by the same capability binding.
 
 ### Capability and Permission Model
 
@@ -4459,6 +4480,47 @@ The effective manifest for a draft session should be derived from the intersecti
 - the capabilities explicitly requested for that session.
 
 The effective manifest for a published procedure should be the reviewed immutable manifest attached to that procedure version, optionally intersected with deployment policy at invocation time. This keeps review and runtime enforcement aligned while preventing code from self-escalating after publication.
+
+### Capability Presets and Policy Profiles
+
+The underlying capability/grant model should remain explicit and expressive, but normal users should not have to assemble every draft-session manifest from low-level bindings by hand. The architecture should therefore support named capability presets or policy profiles layered on top of the raw grant model.
+
+Examples of useful presets:
+
+- `query_ro`
+  Read-only draft query access for trusted internal users.
+- `repo_author`
+  Authoring flows that need sandbox editing, package install, bash, view, and export support.
+- `workflow_preview`
+  Draft workflow authoring and preview with workflow-specific helper capabilities.
+- `catalog_migrate`
+  Narrow reviewed migration authority over catalog/schema operations.
+- `procedure_publish`
+  Review and publication authority without broad draft-query access.
+
+These presets should be treated as host-authored convenience bundles rather than hidden magic. The host should still be able to:
+
+- inspect the expanded effective manifest,
+- override or narrow parts of a preset,
+- attach execution-domain mappings and budget defaults,
+- persist both the chosen preset name and the expanded manifest in audit metadata.
+
+The goal is not to replace the grant model; it is to give applications a humane UX layer over it.
+
+### Interactive Authorization for Draft Sessions
+
+Trusted draft sessions may benefit from an optional interactive authorization flow, but it must fit the fact that unavailable capabilities are normally omitted from the sandbox entirely rather than injected and then denied at call time. This can improve the foreground authoring experience without weakening the host-authoritative permission model.
+
+Recommended rules:
+
+- only trusted draft/internal sessions may use interactive authorization,
+- the host, not the guest, decides whether to surface a permission request,
+- interactive authorization should primarily apply either to operations that reached host enforcement and were denied there, or to an explicit host-mediated request surface for adding a new binding to the draft session,
+- approval may grant authority for one call, one draft session, or a host-defined policy update,
+- every approval or rejection should be recorded in the same audit/tool-run history as the attempted operation,
+- published procedures, reviewed workflow bundles, and lower-trust production paths must not request new authority at runtime.
+
+In other words, the sandbox may ask, but it may not self-escalate. The host remains authoritative over grants, manifests, and policy changes.
 
 ### Database Access Capability Families
 
@@ -4786,6 +4848,41 @@ The editor-view surface should support at least:
 
 If an extension is not available, a fallback export-to-temp or local read-only bridge is acceptable for debugging, but the architecture should still treat "easy read-only viewing from VS Code and Cursor for both local and remote apps" as a first-class requirement rather than a manual debug trick.
 
+### Foreground Session UX
+
+The durable tool-run and activity history is the source of truth, but the sandbox should also support a first-class foreground session UX for active authoring sessions. Users should not need to wait for a post-hoc audit view to understand what the sandbox is doing right now.
+
+Useful live session surfaces include:
+
+- currently running guest execution or tool actions,
+- pending interactive authorization requests for draft sessions,
+- recent host-enforced denials or budget/resource failures for operations that actually reached the enforcement path,
+- clear indication when a capability or shell bridge is simply unavailable in the current session because it was never injected,
+- package-install, type-check, export, or PR-progress state,
+- active read-only view handles and reconnect status.
+
+This foreground UX should, as much as practical, be derived from or mirrored into the same durable activity model rather than inventing a disconnected telemetry plane. The system should feel live without sacrificing replayability or auditability.
+
+### Onboarding and Teaching Surface
+
+The sandbox architecture is powerful enough that teams will need help learning where different kinds of code belong. The repo should therefore treat onboarding as a first-class architectural concern, not just as a documentation afterthought.
+
+The teaching surface should make these boundaries obvious:
+
+- what belongs in sandbox-authored code,
+- how draft authoring differs from reviewed production execution,
+- how editor visibility, export, and audit history fit into normal workflows.
+
+The ideal first-run experience is a small, concrete authoring path that demonstrates:
+
+1. open a draft sandbox,
+2. import or edit a project tree,
+3. call one injected host capability from TypeScript and from shell,
+4. inspect the result through the read-only editor view,
+5. export or publish through the normal audited path.
+
+This keeps the architecture teachable and makes the host/sandbox boundary feel intentional rather than accidental.
+
 ### Deterministic Testing and Simulation Boundary
 
 The deterministic testing bar for `terracedb-sandbox` should be as high as practical, but the architecture should not pretend that every dependency is equally simulatable.
@@ -4801,7 +4898,7 @@ The first step in implementation should be to decide which parts can run inside 
 - PR-export planning,
 - read-only editor-view snapshot semantics.
 
-If a component such as the real V8 runtime, real package fetching, real git provider integration, or real editor extension host cannot run inside the deterministic harness with acceptable fidelity, it should sit behind a stable interface with a deterministic stub/fake implementation. The simulation target then becomes the real session semantics plus the stubbed boundary behavior, while non-simulated production integrations still receive ordinary integration tests outside the turmoil harness.
+If a component such as the real JS runtime, real package fetching, real git provider integration, or real editor extension host cannot run inside the deterministic harness with acceptable fidelity, it should sit behind a stable interface with a deterministic stub/fake implementation. The simulation target then becomes the real session semantics plus the stubbed boundary behavior, while non-simulated production integrations still receive ordinary integration tests outside the turmoil harness.
 
 This library should therefore define simulation seams explicitly and test them aggressively:
 
