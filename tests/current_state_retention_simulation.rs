@@ -344,7 +344,10 @@ fn rank_retention_simulation_tracks_publication_boundary_churn_and_restart() -> 
     assert_eq!(pre_restart.stats.evaluation_cost.rows_materialized, 2);
 
     let after_restart = &first.steps[6].evaluation;
-    assert_eq!(pre_restart.retained_row_keys, after_restart.retained_row_keys);
+    assert_eq!(
+        pre_restart.retained_row_keys,
+        after_restart.retained_row_keys
+    );
     assert_eq!(
         pre_restart.entered_retained_row_keys,
         after_restart.entered_retained_row_keys
@@ -362,7 +365,10 @@ fn rank_retention_simulation_tracks_publication_boundary_churn_and_restart() -> 
         after_restart.stats.evaluation_cost
     );
     assert_eq!(
-        after_restart.stats.coordination.retained_membership_change_count,
+        after_restart
+            .stats
+            .coordination
+            .retained_membership_change_count,
         0
     );
 
