@@ -3,10 +3,11 @@ use super::*;
 pub(super) fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32>) {
     let priority = match work.work_type {
         PendingWorkType::Flush => 0,
-        PendingWorkType::Compaction => 1,
-        PendingWorkType::Backup => 2,
-        PendingWorkType::Offload => 3,
-        PendingWorkType::Prefetch => 4,
+        PendingWorkType::CurrentStateRetention => 1,
+        PendingWorkType::Compaction => 2,
+        PendingWorkType::Backup => 3,
+        PendingWorkType::Offload => 4,
+        PendingWorkType::Prefetch => 5,
     };
     (priority, work.table.as_str(), work.level)
 }

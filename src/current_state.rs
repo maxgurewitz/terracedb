@@ -304,6 +304,7 @@ pub struct CurrentStateRetentionStats {
     pub reclaimed_bytes: u64,
     pub deferred_rows: u64,
     pub deferred_bytes: u64,
+    pub coordination: CurrentStateRetentionCoordinationStats,
     pub status: CurrentStateRetentionStatus,
 }
 
@@ -318,6 +319,141 @@ pub struct CurrentStateRetentionEvaluationCost {
     pub rows_scanned: u64,
     pub rows_ranked: u64,
     pub rows_materialized: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionCoordinationStats {
+    pub active_plan: Option<CurrentStateRetentionCoordinationPlan>,
+    pub logical_rows_pending: u64,
+    pub physical_rows_pending: u64,
+    pub deferred_physical_rows: u64,
+    pub physical_bytes_pending: u64,
+    pub evaluation_cost: CurrentStateRetentionEvaluationCost,
+    pub retained_membership_change_count: u64,
+    pub rebuild_fallback_pending: bool,
+    pub backpressure: CurrentStateRetentionBackpressure,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionBackpressure {
+    pub signals: Vec<CurrentStateRetentionBackpressureSignal>,
+    pub throttle_writes: bool,
+    pub stall_writes: bool,
+    pub max_write_bytes_per_second: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStateRetentionBackpressureSignal {
+    CpuBound,
+    RankChurnHeavy,
+    RewriteCompactionBlocked,
+    SnapshotPinned,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionCoordinationPlan {
+    pub policy_revision: u64,
+    pub phase: CurrentStateRetentionPlanPhase,
+    pub semantics: CurrentStateRetentionSemantics,
+    pub logical_action: CurrentStateLogicalReclaimAction,
+    pub physical_action: CurrentStatePhysicalCleanupAction,
+    pub logical_row_keys: Vec<Vec<u8>>,
+    pub physical_row_keys: Vec<Vec<u8>>,
+    pub deferred_row_keys: Vec<Vec<u8>>,
+    pub physical_bytes_pending: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStateRetentionPlanPhase {
+    Planned,
+    ManifestPublished,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionSemantics {
+    pub target: CurrentStateRetentionTarget,
+    pub physical_reclaim: CurrentStatePhysicalReclaimSemantics,
+}
+
+impl CurrentStateRetentionSemantics {
+    pub fn new(
+        target: CurrentStateRetentionTarget,
+        physical_reclaim: CurrentStatePhysicalReclaimSemantics,
+    ) -> Self {
+        Self {
+            target,
+            physical_reclaim,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStateRetentionTarget {
+    RowTable,
+    ColumnarTable,
+    ProjectionOwnedOutput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStatePhysicalReclaimSemantics {
+    LogicalOnly,
+    DerivedOnly,
+    ExactFileSelection,
+    RewriteCompaction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStateLogicalReclaimAction {
+    None,
+    RewriteCompaction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentStatePhysicalCleanupAction {
+    None,
+    Delete,
+    Offload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionCoordinationContext {
+    pub semantics: CurrentStateRetentionSemantics,
+    pub requires_manifest_publication: bool,
+    pub requires_local_cleanup: bool,
+    pub cpu_cost_soft_limit: u64,
+    pub rank_churn_soft_limit: u64,
+    pub max_write_bytes_per_second: Option<u64>,
+}
+
+impl CurrentStateRetentionCoordinationContext {
+    pub fn new(semantics: CurrentStateRetentionSemantics) -> Self {
+        Self {
+            semantics,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for CurrentStateRetentionCoordinationContext {
+    fn default() -> Self {
+        Self {
+            semantics: CurrentStateRetentionSemantics::new(
+                CurrentStateRetentionTarget::RowTable,
+                CurrentStatePhysicalReclaimSemantics::ExactFileSelection,
+            ),
+            requires_manifest_publication: true,
+            requires_local_cleanup: true,
+            cpu_cost_soft_limit: 1_000,
+            rank_churn_soft_limit: 128,
+            max_write_bytes_per_second: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +495,7 @@ pub enum CurrentStateRetentionDeferredReason {
 #[serde(rename_all = "snake_case")]
 pub enum CurrentStateRetentionSkipReason {
     NoPlannerSeamConfigured,
+    UnsupportedPhysicalLayout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +503,7 @@ pub enum CurrentStateRetentionSkipReason {
 pub enum CurrentStateDerivedOnlyReason {
     ProjectionOwnedWithoutPhysicalReclaim,
     DerivedMaterializationOnly,
+    PhysicalReclaimNotSupportedByTarget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,12 +675,33 @@ pub struct CurrentStateRetentionOracleSnapshot {
     pub published_ranked_row_keys: Vec<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionCoordinatorSnapshot {
+    pub oracle: CurrentStateRetentionOracleSnapshot,
+    pub context: CurrentStateRetentionCoordinationContext,
+    pub state: CurrentStateRetentionCoordinatorState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateRetentionCoordinatorState {
+    pub active_plan: Option<CurrentStateRetentionCoordinationPlan>,
+    pub last_observed_retained_row_keys: Option<Vec<Vec<u8>>>,
+    pub rebuild_fallback_pending: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentStateRetentionOracle {
     contract: CurrentStateRetentionContract,
     rows: BTreeMap<Vec<u8>, CurrentStateOracleRow>,
     snapshot_pins: BTreeSet<Vec<u8>>,
     published_ranked_row_keys: BTreeSet<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrentStateRetentionCoordinator {
+    oracle: CurrentStateRetentionOracle,
+    context: CurrentStateRetentionCoordinationContext,
+    state: CurrentStateRetentionCoordinatorState,
 }
 
 type OracleEvaluationPartition = (
@@ -748,6 +907,7 @@ impl CurrentStateRetentionOracle {
                     .iter()
                     .map(|row| row.estimated_row_bytes)
                     .sum(),
+                coordination: CurrentStateRetentionCoordinationStats::default(),
                 status: CurrentStateRetentionStatus {
                     effective_mode,
                     reasons,
@@ -894,6 +1054,410 @@ impl CurrentStateRetentionOracle {
                 != CurrentStatePhysicalRetentionMode::None
             && self.contract.planner.physical_retention.exactness
                 == CurrentStateExactnessRequirement::FailClosed
+    }
+}
+
+impl CurrentStateRetentionCoordinator {
+    pub fn new(
+        contract: CurrentStateRetentionContract,
+        context: CurrentStateRetentionCoordinationContext,
+    ) -> Self {
+        Self {
+            oracle: CurrentStateRetentionOracle::new(contract),
+            context,
+            state: CurrentStateRetentionCoordinatorState::default(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: CurrentStateRetentionCoordinatorSnapshot) -> Self {
+        let mut state = snapshot.state;
+        if snapshot.oracle.contract.planner.rebuild.on_restart != CurrentStateRebuildMode::None
+            && state.active_plan.is_some()
+        {
+            state.active_plan = None;
+            state.rebuild_fallback_pending = true;
+        }
+
+        Self {
+            oracle: CurrentStateRetentionOracle::from_snapshot(snapshot.oracle),
+            context: snapshot.context,
+            state,
+        }
+    }
+
+    pub fn snapshot(&self) -> CurrentStateRetentionCoordinatorSnapshot {
+        CurrentStateRetentionCoordinatorSnapshot {
+            oracle: self.oracle.snapshot(),
+            context: self.context.clone(),
+            state: self.state.clone(),
+        }
+    }
+
+    pub fn contract(&self) -> &CurrentStateRetentionContract {
+        self.oracle.contract()
+    }
+
+    pub fn context(&self) -> &CurrentStateRetentionCoordinationContext {
+        &self.context
+    }
+
+    pub fn set_context(&mut self, context: CurrentStateRetentionCoordinationContext) {
+        self.context = context;
+        self.state.active_plan = None;
+    }
+
+    pub fn set_contract(&mut self, contract: CurrentStateRetentionContract) {
+        let revision_changed = self.oracle.contract().revision != contract.revision;
+        let rebuild_on_revision = contract.planner.rebuild.on_revision;
+        self.oracle.set_contract(contract);
+        if revision_changed && rebuild_on_revision != CurrentStateRebuildMode::None {
+            self.state.active_plan = None;
+            self.state.rebuild_fallback_pending = true;
+        }
+    }
+
+    pub fn apply(&mut self, mutation: CurrentStateOracleMutation) {
+        self.oracle.apply(mutation);
+    }
+
+    pub fn set_snapshot_pins<I>(&mut self, row_keys: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.oracle.set_snapshot_pins(row_keys);
+    }
+
+    pub fn clear_snapshot_pins(&mut self) {
+        self.oracle.clear_snapshot_pins();
+    }
+
+    pub fn publish_retained_set(&mut self) -> Result<(), CurrentStateRetentionError> {
+        self.oracle.publish_retained_set()
+    }
+
+    pub fn publish_manifest(&mut self) -> bool {
+        let Some(plan) = self.state.active_plan.as_mut() else {
+            return false;
+        };
+        if !self.context.requires_manifest_publication
+            || plan.phase != CurrentStateRetentionPlanPhase::Planned
+        {
+            return false;
+        }
+
+        plan.phase = CurrentStateRetentionPlanPhase::ManifestPublished;
+        true
+    }
+
+    pub fn complete_local_cleanup(&mut self) -> bool {
+        let Some(plan) = self.state.active_plan.clone() else {
+            return false;
+        };
+        if self.context.requires_manifest_publication
+            && plan.phase != CurrentStateRetentionPlanPhase::ManifestPublished
+        {
+            return false;
+        }
+        if !self.context.requires_local_cleanup || plan.physical_row_keys.is_empty() {
+            return false;
+        }
+
+        for row_key in plan.physical_row_keys {
+            self.oracle
+                .apply(CurrentStateOracleMutation::Delete { row_key });
+        }
+        self.state.active_plan = None;
+        true
+    }
+
+    pub fn plan(&mut self) -> Result<CurrentStateRetentionEvaluation, CurrentStateRetentionError> {
+        let mut evaluation = self.oracle.evaluate()?;
+        let retained_membership_change_count =
+            self.retained_membership_change_count(&evaluation.retained_row_keys);
+        let plan = self.build_plan(&mut evaluation);
+        let active_plan = self
+            .state
+            .active_plan
+            .as_ref()
+            .filter(|existing| {
+                plan.as_ref()
+                    .is_some_and(|planned| plan_matches(existing, planned))
+            })
+            .cloned()
+            .or(plan);
+
+        self.state.active_plan = active_plan.clone();
+        self.state.last_observed_retained_row_keys = Some(evaluation.retained_row_keys.clone());
+
+        let logical_rows_pending = evaluation.non_retained_row_keys.len() as u64;
+        let physical_rows_pending = evaluation.reclaimable_row_keys.len() as u64;
+        let deferred_physical_rows = evaluation.deferred_row_keys.len() as u64;
+        let physical_bytes_pending = evaluation
+            .stats
+            .reclaimed_bytes
+            .saturating_add(evaluation.stats.deferred_bytes);
+        let backpressure = self.backpressure_for(
+            &evaluation,
+            logical_rows_pending,
+            physical_rows_pending,
+            deferred_physical_rows,
+            physical_bytes_pending,
+            retained_membership_change_count,
+        );
+
+        evaluation.stats.coordination = CurrentStateRetentionCoordinationStats {
+            active_plan,
+            logical_rows_pending,
+            physical_rows_pending,
+            deferred_physical_rows,
+            physical_bytes_pending,
+            evaluation_cost: evaluation.stats.evaluation_cost.clone(),
+            retained_membership_change_count,
+            rebuild_fallback_pending: self.state.rebuild_fallback_pending,
+            backpressure,
+        };
+        self.state.rebuild_fallback_pending = false;
+
+        Ok(evaluation)
+    }
+
+    fn retained_membership_change_count(&self, retained_row_keys: &[Vec<u8>]) -> u64 {
+        let Some(previous) = self.state.last_observed_retained_row_keys.as_ref() else {
+            return 0;
+        };
+        let previous = previous.iter().cloned().collect::<BTreeSet<_>>();
+        let current = retained_row_keys.iter().cloned().collect::<BTreeSet<_>>();
+        previous.symmetric_difference(&current).count() as u64
+    }
+
+    fn build_plan(
+        &self,
+        evaluation: &mut CurrentStateRetentionEvaluation,
+    ) -> Option<CurrentStateRetentionCoordinationPlan> {
+        if evaluation.non_retained_row_keys.is_empty() {
+            return None;
+        }
+        if !policy_requests_physical_reclaim(self.oracle.contract()) {
+            return None;
+        }
+
+        match self.context.semantics.physical_reclaim {
+            CurrentStatePhysicalReclaimSemantics::LogicalOnly => {
+                disable_physical_reclaim(
+                    evaluation,
+                    CurrentStateEffectiveMode::Skipped,
+                    CurrentStateRetentionReason::Skipped {
+                        reason: CurrentStateRetentionSkipReason::UnsupportedPhysicalLayout,
+                    },
+                );
+                None
+            }
+            CurrentStatePhysicalReclaimSemantics::DerivedOnly => {
+                disable_physical_reclaim(
+                    evaluation,
+                    CurrentStateEffectiveMode::DerivedOnly,
+                    CurrentStateRetentionReason::DegradedToDerivedOnly {
+                        reason: CurrentStateDerivedOnlyReason::PhysicalReclaimNotSupportedByTarget,
+                    },
+                );
+                None
+            }
+            CurrentStatePhysicalReclaimSemantics::ExactFileSelection
+            | CurrentStatePhysicalReclaimSemantics::RewriteCompaction => {
+                let logical_action = logical_reclaim_action(self.oracle.contract());
+                if self.context.semantics.physical_reclaim
+                    == CurrentStatePhysicalReclaimSemantics::RewriteCompaction
+                    && logical_action == CurrentStateLogicalReclaimAction::None
+                    && !evaluation.reclaimable_row_keys.is_empty()
+                {
+                    move_reclaimable_rows_to_deferred(evaluation);
+                }
+
+                Some(CurrentStateRetentionCoordinationPlan {
+                    policy_revision: self.oracle.contract().revision,
+                    phase: self
+                        .state
+                        .active_plan
+                        .as_ref()
+                        .filter(|plan| {
+                            plan_matches(
+                                plan,
+                                &CurrentStateRetentionCoordinationPlan {
+                                    policy_revision: self.oracle.contract().revision,
+                                    phase: CurrentStateRetentionPlanPhase::Planned,
+                                    semantics: self.context.semantics.clone(),
+                                    logical_action,
+                                    physical_action: physical_cleanup_action(
+                                        self.oracle.contract(),
+                                    ),
+                                    logical_row_keys: evaluation.non_retained_row_keys.clone(),
+                                    physical_row_keys: evaluation.reclaimable_row_keys.clone(),
+                                    deferred_row_keys: evaluation.deferred_row_keys.clone(),
+                                    physical_bytes_pending: evaluation
+                                        .stats
+                                        .reclaimed_bytes
+                                        .saturating_add(evaluation.stats.deferred_bytes),
+                                },
+                            )
+                        })
+                        .map(|plan| plan.phase)
+                        .unwrap_or(CurrentStateRetentionPlanPhase::Planned),
+                    semantics: self.context.semantics.clone(),
+                    logical_action,
+                    physical_action: physical_cleanup_action(self.oracle.contract()),
+                    logical_row_keys: evaluation.non_retained_row_keys.clone(),
+                    physical_row_keys: evaluation.reclaimable_row_keys.clone(),
+                    deferred_row_keys: evaluation.deferred_row_keys.clone(),
+                    physical_bytes_pending: evaluation
+                        .stats
+                        .reclaimed_bytes
+                        .saturating_add(evaluation.stats.deferred_bytes),
+                })
+            }
+        }
+    }
+
+    fn backpressure_for(
+        &self,
+        evaluation: &CurrentStateRetentionEvaluation,
+        _logical_rows_pending: u64,
+        _physical_rows_pending: u64,
+        deferred_physical_rows: u64,
+        _physical_bytes_pending: u64,
+        retained_membership_change_count: u64,
+    ) -> CurrentStateRetentionBackpressure {
+        let mut signals = Vec::new();
+
+        let evaluation_rows = evaluation
+            .stats
+            .evaluation_cost
+            .rows_scanned
+            .saturating_add(evaluation.stats.evaluation_cost.rows_ranked)
+            .saturating_add(evaluation.stats.evaluation_cost.rows_materialized);
+        if evaluation_rows >= self.context.cpu_cost_soft_limit {
+            signals.push(CurrentStateRetentionBackpressureSignal::CpuBound);
+        }
+        if matches!(
+            self.oracle.contract().policy,
+            CurrentStateRetentionPolicy::GlobalRank(_)
+        ) && retained_membership_change_count >= self.context.rank_churn_soft_limit
+        {
+            signals.push(CurrentStateRetentionBackpressureSignal::RankChurnHeavy);
+        }
+        if deferred_physical_rows > 0 {
+            if evaluation
+                .stats
+                .status
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, CurrentStateRetentionReason::BlockedBySnapshots))
+            {
+                signals.push(CurrentStateRetentionBackpressureSignal::SnapshotPinned);
+            }
+            if self.context.semantics.physical_reclaim
+                == CurrentStatePhysicalReclaimSemantics::RewriteCompaction
+            {
+                signals.push(CurrentStateRetentionBackpressureSignal::RewriteCompactionBlocked);
+            }
+        }
+
+        CurrentStateRetentionBackpressure {
+            throttle_writes: !signals.is_empty()
+                && self.context.max_write_bytes_per_second.is_some(),
+            stall_writes: false,
+            max_write_bytes_per_second: if signals.is_empty() {
+                None
+            } else {
+                self.context.max_write_bytes_per_second
+            },
+            signals,
+        }
+    }
+}
+
+fn plan_matches(
+    left: &CurrentStateRetentionCoordinationPlan,
+    right: &CurrentStateRetentionCoordinationPlan,
+) -> bool {
+    left.policy_revision == right.policy_revision
+        && left.semantics == right.semantics
+        && left.logical_action == right.logical_action
+        && left.physical_action == right.physical_action
+        && left.logical_row_keys == right.logical_row_keys
+        && left.physical_row_keys == right.physical_row_keys
+        && left.deferred_row_keys == right.deferred_row_keys
+        && left.physical_bytes_pending == right.physical_bytes_pending
+}
+
+fn policy_requests_physical_reclaim(contract: &CurrentStateRetentionContract) -> bool {
+    contract.planner.compaction_row_removal != CurrentStateCompactionRowRemovalMode::Disabled
+        || contract.planner.physical_retention.mode != CurrentStatePhysicalRetentionMode::None
+}
+
+fn logical_reclaim_action(
+    contract: &CurrentStateRetentionContract,
+) -> CurrentStateLogicalReclaimAction {
+    match contract.planner.compaction_row_removal {
+        CurrentStateCompactionRowRemovalMode::Disabled => CurrentStateLogicalReclaimAction::None,
+        CurrentStateCompactionRowRemovalMode::RemoveDuringCompaction => {
+            CurrentStateLogicalReclaimAction::RewriteCompaction
+        }
+    }
+}
+
+fn physical_cleanup_action(
+    contract: &CurrentStateRetentionContract,
+) -> CurrentStatePhysicalCleanupAction {
+    match contract.planner.physical_retention.mode {
+        CurrentStatePhysicalRetentionMode::None => CurrentStatePhysicalCleanupAction::None,
+        CurrentStatePhysicalRetentionMode::Delete => CurrentStatePhysicalCleanupAction::Delete,
+        CurrentStatePhysicalRetentionMode::Offload => CurrentStatePhysicalCleanupAction::Offload,
+    }
+}
+
+fn disable_physical_reclaim(
+    evaluation: &mut CurrentStateRetentionEvaluation,
+    effective_mode: CurrentStateEffectiveMode,
+    reason: CurrentStateRetentionReason,
+) {
+    evaluation.reclaimable_row_keys.clear();
+    evaluation.deferred_row_keys.clear();
+    evaluation.stats.reclaimed_rows = 0;
+    evaluation.stats.reclaimed_bytes = 0;
+    evaluation.stats.deferred_rows = 0;
+    evaluation.stats.deferred_bytes = 0;
+    evaluation.stats.status.effective_mode = effective_mode;
+    if !evaluation.stats.status.reasons.contains(&reason) {
+        evaluation.stats.status.reasons.push(reason);
+    }
+}
+
+fn move_reclaimable_rows_to_deferred(evaluation: &mut CurrentStateRetentionEvaluation) {
+    if evaluation.reclaimable_row_keys.is_empty() {
+        return;
+    }
+
+    let mut deferred = evaluation
+        .deferred_row_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    deferred.extend(evaluation.reclaimable_row_keys.iter().cloned());
+    evaluation.deferred_row_keys = deferred.into_iter().collect();
+    evaluation.reclaimable_row_keys.clear();
+    evaluation.stats.deferred_rows = evaluation.deferred_row_keys.len() as u64;
+    evaluation.stats.deferred_bytes = evaluation
+        .stats
+        .deferred_bytes
+        .saturating_add(evaluation.stats.reclaimed_bytes);
+    evaluation.stats.reclaimed_rows = 0;
+    evaluation.stats.reclaimed_bytes = 0;
+
+    let reason = CurrentStateRetentionReason::Deferred {
+        reason: CurrentStateRetentionDeferredReason::ExactReclaimNotAvailable,
+    };
+    if !evaluation.stats.status.reasons.contains(&reason) {
+        evaluation.stats.status.reasons.push(reason);
     }
 }
 

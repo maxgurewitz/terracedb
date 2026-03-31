@@ -528,6 +528,7 @@ impl Scheduler for TinyCompactionBudgetScheduler {
                 ..PendingWorkBudget::default()
             },
             PendingWorkType::Flush
+            | PendingWorkType::CurrentStateRetention
             | PendingWorkType::Backup
             | PendingWorkType::Offload
             | PendingWorkType::Prefetch => PendingWorkBudget::default(),

@@ -72,6 +72,7 @@ fn current_state_retention_contracts_cover_policy_families_and_planner_seams() {
             reclaimed_bytes: 0,
             deferred_rows: 0,
             deferred_bytes: 0,
+            coordination: terracedb::CurrentStateRetentionCoordinationStats::default(),
             status: terracedb::CurrentStateRetentionStatus {
                 effective_mode: terracedb::CurrentStateEffectiveMode::Skipped,
                 reasons: vec![CurrentStateRetentionReason::Skipped {
@@ -118,10 +119,16 @@ fn current_state_retention_reason_variants_are_instantiable() {
         CurrentStateRetentionReason::DegradedToDerivedOnly {
             reason: CurrentStateDerivedOnlyReason::DerivedMaterializationOnly,
         },
+        CurrentStateRetentionReason::DegradedToDerivedOnly {
+            reason: CurrentStateDerivedOnlyReason::PhysicalReclaimNotSupportedByTarget,
+        },
         CurrentStateRetentionReason::Skipped {
             reason: CurrentStateRetentionSkipReason::NoPlannerSeamConfigured,
         },
+        CurrentStateRetentionReason::Skipped {
+            reason: CurrentStateRetentionSkipReason::UnsupportedPhysicalLayout,
+        },
     ];
 
-    assert_eq!(reasons.len(), 5);
+    assert_eq!(reasons.len(), 7);
 }

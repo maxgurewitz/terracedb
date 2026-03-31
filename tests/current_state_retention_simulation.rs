@@ -1,10 +1,12 @@
 use terracedb::{
     CurrentStateCompactionRowRemovalMode, CurrentStateDerivedOnlyReason, CurrentStateEffectiveMode,
     CurrentStateMissingValuePolicy, CurrentStateOracleRow, CurrentStateOrderingContract,
-    CurrentStatePhysicalRetentionMode, CurrentStatePhysicalRetentionSeam, CurrentStatePlanner,
-    CurrentStateProjectionOwnedRange, CurrentStateRankedMaterializationSeam,
-    CurrentStateRebuildMode, CurrentStateRebuildSeam, CurrentStateRetentionContract,
-    CurrentStateRetentionReason, CurrentStateSortDirection, CurrentStateThresholdCutoff,
+    CurrentStatePhysicalReclaimSemantics, CurrentStatePhysicalRetentionMode,
+    CurrentStatePhysicalRetentionSeam, CurrentStatePlanner, CurrentStateProjectionOwnedRange,
+    CurrentStateRankedMaterializationSeam, CurrentStateRebuildMode, CurrentStateRebuildSeam,
+    CurrentStateRetentionContract, CurrentStateRetentionCoordinationContext,
+    CurrentStateRetentionPlanPhase, CurrentStateRetentionReason, CurrentStateRetentionSemantics,
+    CurrentStateRetentionTarget, CurrentStateSortDirection, CurrentStateThresholdCutoff,
 };
 use terracedb_simulation::{
     CurrentStateSimulationOperation, CurrentStateSimulationOutcome, CurrentStateSimulationScenario,
@@ -56,6 +58,19 @@ fn threshold_contract(revision: u64, cutoff: u64) -> CurrentStateRetentionContra
     })
 }
 
+fn rewrite_coordination() -> CurrentStateRetentionCoordinationContext {
+    CurrentStateRetentionCoordinationContext {
+        semantics: CurrentStateRetentionSemantics::new(
+            CurrentStateRetentionTarget::RowTable,
+            CurrentStatePhysicalReclaimSemantics::RewriteCompaction,
+        ),
+        cpu_cost_soft_limit: 8,
+        rank_churn_soft_limit: 2,
+        max_write_bytes_per_second: Some(32),
+        ..Default::default()
+    }
+}
+
 fn rank_contract(revision: u64, limit: usize) -> CurrentStateRetentionContract {
     CurrentStateRetentionContract::global_rank(
         revision,
@@ -82,6 +97,7 @@ fn rank_contract(revision: u64, limit: usize) -> CurrentStateRetentionContract {
 fn run_threshold_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutcome> {
     let scenario = CurrentStateSimulationScenario {
         initial_contract: threshold_contract(1, 50),
+        coordination: CurrentStateRetentionCoordinationContext::default(),
         operations: vec![
             CurrentStateSimulationOperation::Upsert(row("alpha", 10, 1, 12)),
             CurrentStateSimulationOperation::Upsert(row("bravo", 60, 2, 14)),
@@ -110,6 +126,7 @@ fn run_threshold_missing_key_simulation(
 ) -> turmoil::Result<CurrentStateSimulationOutcome> {
     let scenario = CurrentStateSimulationScenario {
         initial_contract: threshold_contract(1, 50),
+        coordination: CurrentStateRetentionCoordinationContext::default(),
         operations: vec![
             CurrentStateSimulationOperation::Upsert(row_without_primary("alpha", 1, 12)),
             CurrentStateSimulationOperation::Upsert(row("bravo", 40, 2, 14)),
@@ -131,6 +148,7 @@ fn run_threshold_missing_key_simulation(
 fn run_rank_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutcome> {
     let scenario = CurrentStateSimulationScenario {
         initial_contract: rank_contract(1, 2),
+        coordination: CurrentStateRetentionCoordinationContext::default(),
         operations: vec![
             CurrentStateSimulationOperation::Upsert(row("alpha", 90, 1, 10)),
             CurrentStateSimulationOperation::Upsert(row("bravo", 90, 1, 10)),
@@ -155,6 +173,7 @@ fn run_rank_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutco
 fn run_rank_publication_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutcome> {
     let scenario = CurrentStateSimulationScenario {
         initial_contract: rank_contract(7, 2),
+        coordination: CurrentStateRetentionCoordinationContext::default(),
         operations: vec![
             CurrentStateSimulationOperation::Upsert(row("alpha", 90, 1, 10)),
             CurrentStateSimulationOperation::Upsert(row("bravo", 80, 1, 10)),
@@ -170,6 +189,50 @@ fn run_rank_publication_simulation(seed: u64) -> turmoil::Result<CurrentStateSim
     SeededSimulationRunner::new(seed).run_with(move |_context| async move {
         Ok(run_current_state_simulation(&scenario)
             .expect("rank publication simulation should succeed"))
+    })
+}
+
+fn run_restart_cleanup_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutcome> {
+    let scenario = CurrentStateSimulationScenario {
+        initial_contract: threshold_contract(1, 50),
+        coordination: rewrite_coordination(),
+        operations: vec![
+            CurrentStateSimulationOperation::Upsert(row("alpha", 10, 1, 12)),
+            CurrentStateSimulationOperation::Upsert(row("bravo", 60, 2, 14)),
+            CurrentStateSimulationOperation::Upsert(row("charlie", 80, 3, 16)),
+            CurrentStateSimulationOperation::PublishManifest,
+            CurrentStateSimulationOperation::Restart,
+            CurrentStateSimulationOperation::PublishManifest,
+            CurrentStateSimulationOperation::CompleteLocalCleanup,
+        ],
+    };
+
+    SeededSimulationRunner::new(seed).run_with(move |_context| async move {
+        Ok(run_current_state_simulation(&scenario)
+            .expect("restart cleanup simulation should succeed"))
+    })
+}
+
+fn run_revision_cleanup_simulation(seed: u64) -> turmoil::Result<CurrentStateSimulationOutcome> {
+    let scenario = CurrentStateSimulationScenario {
+        initial_contract: threshold_contract(1, 50),
+        coordination: rewrite_coordination(),
+        operations: vec![
+            CurrentStateSimulationOperation::Upsert(row("alpha", 10, 1, 12)),
+            CurrentStateSimulationOperation::Upsert(row("bravo", 60, 2, 14)),
+            CurrentStateSimulationOperation::Upsert(row("charlie", 80, 3, 16)),
+            CurrentStateSimulationOperation::PublishManifest,
+            CurrentStateSimulationOperation::ReviseContract {
+                contract: threshold_contract(2, 70),
+            },
+            CurrentStateSimulationOperation::PublishManifest,
+            CurrentStateSimulationOperation::CompleteLocalCleanup,
+        ],
+    };
+
+    SeededSimulationRunner::new(seed).run_with(move |_context| async move {
+        Ok(run_current_state_simulation(&scenario)
+            .expect("revision cleanup simulation should succeed"))
     })
 }
 
@@ -281,13 +344,162 @@ fn rank_retention_simulation_tracks_publication_boundary_churn_and_restart() -> 
     assert_eq!(pre_restart.stats.evaluation_cost.rows_materialized, 2);
 
     let after_restart = &first.steps[6].evaluation;
-    assert_eq!(pre_restart, after_restart);
+    assert_eq!(pre_restart.retained_row_keys, after_restart.retained_row_keys);
+    assert_eq!(
+        pre_restart.entered_retained_row_keys,
+        after_restart.entered_retained_row_keys
+    );
+    assert_eq!(
+        pre_restart.exited_retained_row_keys,
+        after_restart.exited_retained_row_keys
+    );
+    assert_eq!(
+        pre_restart.stats.membership_changes,
+        after_restart.stats.membership_changes
+    );
+    assert_eq!(
+        pre_restart.stats.evaluation_cost,
+        after_restart.stats.evaluation_cost
+    );
+    assert_eq!(
+        after_restart.stats.coordination.retained_membership_change_count,
+        0
+    );
 
     let after_publish = &first.steps[7].evaluation;
     assert!(after_publish.entered_retained_row_keys.is_empty());
     assert!(after_publish.exited_retained_row_keys.is_empty());
     assert_eq!(after_publish.stats.membership_changes.entered_rows, 0);
     assert_eq!(after_publish.stats.membership_changes.exited_rows, 0);
+
+    Ok(())
+}
+
+#[test]
+fn retention_coordination_rebuilds_after_restart_and_finishes_cleanup_once() -> turmoil::Result {
+    let first = run_restart_cleanup_simulation(0x5962)?;
+    let second = run_restart_cleanup_simulation(0x5962)?;
+    assert_eq!(first, second);
+
+    let restart_step = &first.steps[4];
+    let restart_plan = restart_step
+        .evaluation
+        .stats
+        .coordination
+        .active_plan
+        .as_ref()
+        .expect("restart should recompute a coordination plan");
+    assert_eq!(restart_plan.phase, CurrentStateRetentionPlanPhase::Planned);
+    assert!(
+        restart_step
+            .evaluation
+            .stats
+            .coordination
+            .rebuild_fallback_pending
+    );
+
+    let final_step = first
+        .steps
+        .last()
+        .expect("restart cleanup simulation should have steps");
+    assert_eq!(
+        decode_keys(&final_step.evaluation.retained_row_keys),
+        vec!["bravo".to_string(), "charlie".to_string()]
+    );
+    assert!(final_step.evaluation.non_retained_row_keys.is_empty());
+    assert!(
+        final_step
+            .evaluation
+            .stats
+            .coordination
+            .active_plan
+            .is_none()
+    );
+    assert_eq!(final_step.evaluation.stats.reclaimed_rows, 0);
+    assert_eq!(final_step.evaluation.stats.deferred_rows, 0);
+
+    Ok(())
+}
+
+#[test]
+fn retention_coordination_revises_plan_without_duplicate_reclaim() -> turmoil::Result {
+    let first = run_revision_cleanup_simulation(0x5963)?;
+    let second = run_revision_cleanup_simulation(0x5963)?;
+    assert_eq!(first, second);
+
+    let revision_step = &first.steps[4];
+    let revision_plan = revision_step
+        .evaluation
+        .stats
+        .coordination
+        .active_plan
+        .as_ref()
+        .expect("revision should install a replacement plan");
+    assert_eq!(revision_plan.policy_revision, 2);
+    assert_eq!(
+        decode_keys(&revision_plan.logical_row_keys),
+        vec!["alpha".to_string(), "bravo".to_string()]
+    );
+    assert_eq!(revision_plan.phase, CurrentStateRetentionPlanPhase::Planned);
+
+    let final_step = first
+        .steps
+        .last()
+        .expect("revision cleanup simulation should have steps");
+    assert_eq!(
+        decode_keys(&final_step.evaluation.retained_row_keys),
+        vec!["charlie".to_string()]
+    );
+    assert!(final_step.evaluation.non_retained_row_keys.is_empty());
+    assert!(
+        final_step
+            .evaluation
+            .stats
+            .coordination
+            .active_plan
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn retention_coordination_fails_closed_for_logical_only_targets() -> turmoil::Result {
+    let scenario = CurrentStateSimulationScenario {
+        initial_contract: threshold_contract(1, 50),
+        coordination: CurrentStateRetentionCoordinationContext {
+            semantics: CurrentStateRetentionSemantics::new(
+                CurrentStateRetentionTarget::ColumnarTable,
+                CurrentStatePhysicalReclaimSemantics::LogicalOnly,
+            ),
+            ..Default::default()
+        },
+        operations: vec![
+            CurrentStateSimulationOperation::Upsert(row("alpha", 10, 1, 12)),
+            CurrentStateSimulationOperation::Upsert(row("bravo", 60, 2, 14)),
+        ],
+    };
+
+    let outcome = SeededSimulationRunner::new(0x5964).run_with(move |_context| async move {
+        Ok(run_current_state_simulation(&scenario)
+            .expect("logical-only fail-closed simulation should succeed"))
+    })?;
+    let final_step = outcome
+        .steps
+        .last()
+        .expect("logical-only simulation should have steps");
+    assert_eq!(
+        final_step.evaluation.stats.status.effective_mode,
+        CurrentStateEffectiveMode::Skipped
+    );
+    assert_eq!(
+        final_step.evaluation.stats.status.reasons,
+        vec![CurrentStateRetentionReason::Skipped {
+            reason: terracedb::CurrentStateRetentionSkipReason::UnsupportedPhysicalLayout,
+        }]
+    );
+    assert!(final_step.evaluation.reclaimable_row_keys.is_empty());
+    assert!(final_step.evaluation.deferred_row_keys.is_empty());
 
     Ok(())
 }
