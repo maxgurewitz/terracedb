@@ -7,6 +7,7 @@ pub mod config;
 pub mod current_state;
 pub mod engine;
 pub mod error;
+pub mod execution;
 pub mod failpoints;
 pub mod hybrid;
 pub mod ids;
@@ -75,6 +76,18 @@ pub use current_state::{
 pub use error::{
     ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
     SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
+};
+pub use execution::{
+    ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec, ContentionClass, DbExecutionProfile,
+    DomainBackgroundBudget, DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot,
+    DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork, DurabilityClass,
+    ExecutionDomainBudget, ExecutionDomainInvariant, ExecutionDomainInvariantSet,
+    ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSnapshot, ExecutionDomainSpec,
+    ExecutionDomainState, ExecutionDomainUsageSnapshot, ExecutionLane, ExecutionLaneBinding,
+    InMemoryDomainBudgetOracle, InMemoryResourceManager, PlacementAssignment, PlacementPolicy,
+    PlacementRequest, PreferRequestedDomainPolicy, ResourceManager, ResourceManagerSnapshot,
+    WorkPlacementRequest, WorkRuntimeTag,
 };
 #[doc(hidden)]
 pub use failpoints::{

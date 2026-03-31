@@ -9,7 +9,11 @@ use std::{
 
 use async_trait::async_trait;
 
-use crate::{error::StorageError, ids::Timestamp};
+use crate::{
+    error::StorageError,
+    execution::{DbExecutionProfile, InMemoryResourceManager, ResourceManager},
+    ids::Timestamp,
+};
 
 pub use object_store::{
     ObjectStore as StandardObjectStore, ObjectStoreExt as StandardObjectStoreExt,
@@ -89,6 +93,8 @@ pub struct DbDependencies {
     pub object_store: Arc<dyn ObjectStore>,
     pub clock: Arc<dyn Clock>,
     pub rng: Arc<dyn Rng>,
+    pub(crate) resource_manager: Arc<dyn ResourceManager>,
+    pub(crate) execution_profile: DbExecutionProfile,
     pub(crate) failpoint_key: u64,
 }
 
@@ -108,8 +114,28 @@ impl DbDependencies {
             object_store,
             clock,
             rng,
+            resource_manager: Arc::new(InMemoryResourceManager::default()),
+            execution_profile: DbExecutionProfile::default(),
             failpoint_key,
         }
+    }
+
+    pub fn with_resource_manager(mut self, resource_manager: Arc<dyn ResourceManager>) -> Self {
+        self.resource_manager = resource_manager;
+        self
+    }
+
+    pub fn with_execution_profile(mut self, execution_profile: DbExecutionProfile) -> Self {
+        self.execution_profile = execution_profile;
+        self
+    }
+
+    pub fn resource_manager(&self) -> Arc<dyn ResourceManager> {
+        self.resource_manager.clone()
+    }
+
+    pub fn execution_profile(&self) -> &DbExecutionProfile {
+        &self.execution_profile
     }
 }
 
@@ -120,6 +146,8 @@ impl fmt::Debug for DbDependencies {
             .field("object_store", &"<dyn ObjectStore>")
             .field("clock", &"<dyn Clock>")
             .field("rng", &"<dyn Rng>")
+            .field("resource_manager", &"<dyn ResourceManager>")
+            .field("execution_profile", &self.execution_profile)
             .finish()
     }
 }

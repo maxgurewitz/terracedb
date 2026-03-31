@@ -1,5 +1,10 @@
 use super::*;
 
+use crate::execution::{
+    DbExecutionProfile, DomainTaggedWork, ExecutionDomainOwner, ExecutionLane, ResourceManager,
+    ResourceManagerSnapshot,
+};
+
 impl Db {
     /// Returns a synchronous handle lookup for an already-created table.
     ///
@@ -115,6 +120,41 @@ impl Db {
 
     pub fn read_set(&self) -> ReadSet {
         ReadSet::default()
+    }
+
+    pub fn execution_profile(&self) -> &DbExecutionProfile {
+        &self.inner.execution_profile
+    }
+
+    pub fn resource_manager(&self) -> Arc<dyn ResourceManager> {
+        self.inner.resource_manager.clone()
+    }
+
+    pub fn resource_manager_snapshot(&self) -> ResourceManagerSnapshot {
+        self.inner.resource_manager.snapshot()
+    }
+
+    pub fn tag_user_foreground_work<T>(&self, work: T) -> DomainTaggedWork<T> {
+        let request = self.execution_profile().work_request(
+            ExecutionDomainOwner::Database {
+                name: self.telemetry_db_name(),
+            },
+            ExecutionLane::UserForeground,
+            crate::ContentionClass::UserData,
+        );
+        DomainTaggedWork::new(work, self.inner.resource_manager.placement_tag(request))
+    }
+
+    pub fn tag_control_plane_work<T>(&self, work: T) -> DomainTaggedWork<T> {
+        let request = self.execution_profile().work_request(
+            ExecutionDomainOwner::Subsystem {
+                database: Some(self.telemetry_db_name()),
+                name: "control-plane".to_string(),
+            },
+            ExecutionLane::ControlPlane,
+            crate::ContentionClass::ControlPlane,
+        );
+        DomainTaggedWork::new(work, self.inner.resource_manager.placement_tag(request))
     }
 
     pub fn telemetry_db_name(&self) -> String {
@@ -675,6 +715,31 @@ impl Db {
             .into_iter()
             .map(|candidate| candidate.pending)
             .collect()
+    }
+
+    pub async fn pending_work_with_runtime_tags(&self) -> Vec<DomainTaggedWork<PendingWork>> {
+        self.pending_work()
+            .await
+            .into_iter()
+            .map(|work| self.tag_pending_work(work))
+            .collect()
+    }
+
+    pub fn tag_pending_work(&self, work: PendingWork) -> DomainTaggedWork<PendingWork> {
+        let owner = if work.work_type == PendingWorkType::Backup {
+            ExecutionDomainOwner::Subsystem {
+                database: Some(self.telemetry_db_name()),
+                name: "backup".to_string(),
+            }
+        } else {
+            ExecutionDomainOwner::Database {
+                name: self.telemetry_db_name(),
+            }
+        };
+        let request = self
+            .execution_profile()
+            .pending_work_request(owner, work.work_type);
+        DomainTaggedWork::new(work, self.inner.resource_manager.placement_tag(request))
     }
 
     pub(super) async fn apply_write_backpressure(
