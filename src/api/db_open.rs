@@ -19,6 +19,8 @@ impl Db {
                 .clone()
                 .unwrap_or_else(|| Arc::new(RoundRobinScheduler::default()));
             config.scheduler = Some(scheduler.clone());
+            let resource_manager = dependencies.resource_manager();
+            let execution_profile = dependencies.execution_profile().clone();
             if let StorageConfig::Tiered(tiered) = &config.storage {
                 Self::maybe_restore_tiered_from_backup(tiered, &dependencies).await?;
             }
@@ -78,6 +80,8 @@ impl Db {
                 inner: Arc::new(DbInner {
                     config,
                     scheduler,
+                    resource_manager,
+                    execution_profile,
                     dependencies,
                     columnar_read_context,
                     catalog_location,

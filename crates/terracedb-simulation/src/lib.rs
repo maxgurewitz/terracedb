@@ -32,6 +32,16 @@ mod hybrid;
 
 #[allow(unused_imports)]
 pub use self::hybrid::*;
+#[allow(unused_imports)]
+pub use terracedb::{
+    ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec, ContentionClass, DbExecutionProfile,
+    DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot, DomainTaggedWork,
+    DurabilityClass, ExecutionDomainBudget, ExecutionDomainInvariant, ExecutionDomainInvariantSet,
+    ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSnapshot,
+    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, InMemoryDomainBudgetOracle,
+    InMemoryResourceManager, PlacementAssignment, PlacementRequest, ResourceManager,
+    ResourceManagerSnapshot, WorkPlacementRequest, WorkRuntimeTag,
+};
 
 const OBJECT_STORE_HOST: &str = "object-store";
 const OBJECT_STORE_PORT: u16 = 9400;

@@ -3,6 +3,7 @@ use super::*;
 use crate::{
     adapters::{LocalDirObjectStore, SystemClock, SystemRng, TokioFileSystem},
     config::SsdConfig,
+    execution::{DbExecutionProfile, ResourceManager},
     hybrid::HybridReadConfig,
     io::{Clock, FileSystem, ObjectStore, Rng},
 };
@@ -20,6 +21,7 @@ pub const DEFAULT_S3_PRIMARY_MEM_CACHE_SIZE_BYTES: u64 = 1024 * 1024;
 pub struct DbSettings {
     storage: StorageConfig,
     hybrid_read: HybridReadConfig,
+    execution_profile: DbExecutionProfile,
 }
 
 impl DbSettings {
@@ -27,6 +29,7 @@ impl DbSettings {
         Self {
             storage,
             hybrid_read: HybridReadConfig::default(),
+            execution_profile: DbExecutionProfile::default(),
         }
     }
 
@@ -71,8 +74,17 @@ impl DbSettings {
         self
     }
 
+    pub fn with_execution_profile(mut self, execution_profile: DbExecutionProfile) -> Self {
+        self.execution_profile = execution_profile;
+        self
+    }
+
     pub fn into_storage(self) -> StorageConfig {
         self.storage
+    }
+
+    pub fn execution_profile(&self) -> &DbExecutionProfile {
+        &self.execution_profile
     }
 }
 
@@ -93,6 +105,7 @@ pub struct DbComponents {
     pub clock: Arc<dyn Clock>,
     pub rng: Arc<dyn Rng>,
     pub scheduler: Option<Arc<dyn Scheduler>>,
+    pub resource_manager: Option<Arc<dyn ResourceManager>>,
 }
 
 impl DbComponents {
@@ -108,6 +121,7 @@ impl DbComponents {
             clock,
             rng,
             scheduler: None,
+            resource_manager: None,
         }
     }
 
@@ -128,16 +142,23 @@ impl DbComponents {
         self.scheduler = Some(scheduler);
         self
     }
+
+    pub fn with_resource_manager(mut self, resource_manager: Arc<dyn ResourceManager>) -> Self {
+        self.resource_manager = Some(resource_manager);
+        self
+    }
 }
 
 impl From<DbDependencies> for DbComponents {
     fn from(dependencies: DbDependencies) -> Self {
+        let resource_manager = dependencies.resource_manager();
         Self::new(
             dependencies.file_system,
             dependencies.object_store,
             dependencies.clock,
             dependencies.rng,
         )
+        .with_resource_manager(resource_manager)
     }
 }
 
@@ -151,6 +172,13 @@ impl fmt::Debug for DbComponents {
             .field(
                 "scheduler",
                 &self.scheduler.as_ref().map(|_| "<dyn Scheduler>"),
+            )
+            .field(
+                "resource_manager",
+                &self
+                    .resource_manager
+                    .as_ref()
+                    .map(|_| "<dyn ResourceManager>"),
             )
             .finish()
     }
@@ -242,11 +270,13 @@ impl fmt::Debug for DbComponents {
 pub struct DbBuilder {
     settings: Option<DbSettings>,
     hybrid_read: Option<HybridReadConfig>,
+    execution_profile: Option<DbExecutionProfile>,
     file_system: Option<Arc<dyn FileSystem>>,
     object_store: Option<Arc<dyn ObjectStore>>,
     clock: Option<Arc<dyn Clock>>,
     rng: Option<Arc<dyn Rng>>,
     scheduler: Option<Arc<dyn Scheduler>>,
+    resource_manager: Option<Arc<dyn ResourceManager>>,
 }
 
 impl DbBuilder {
@@ -292,6 +322,7 @@ impl DbBuilder {
         self.clock = Some(components.clock);
         self.rng = Some(components.rng);
         self.scheduler = components.scheduler;
+        self.resource_manager = components.resource_manager;
         self
     }
 
@@ -328,6 +359,16 @@ impl DbBuilder {
         self
     }
 
+    pub fn resource_manager(mut self, resource_manager: Arc<dyn ResourceManager>) -> Self {
+        self.resource_manager = Some(resource_manager);
+        self
+    }
+
+    pub fn execution_profile(mut self, execution_profile: DbExecutionProfile) -> Self {
+        self.execution_profile = Some(execution_profile);
+        self
+    }
+
     pub fn hybrid_read_config(mut self, hybrid_read: HybridReadConfig) -> Self {
         self.hybrid_read = Some(hybrid_read);
         self
@@ -335,6 +376,7 @@ impl DbBuilder {
 
     pub fn into_open_parts(self) -> Result<(DbConfig, DbDependencies), OpenError> {
         let hybrid_read_override = self.hybrid_read;
+        let execution_profile_override = self.execution_profile;
         let settings = self.settings.ok_or_else(|| {
             OpenError::InvalidConfig(
                 "db builder requires storage settings; call .tiered(...), .s3_primary(...), \
@@ -349,15 +391,23 @@ impl DbBuilder {
                     .to_string(),
             )
         })?;
-        let dependencies = DbDependencies::new(
+        let settings_hybrid_read = settings.hybrid_read.clone();
+        let settings_execution_profile = settings.execution_profile.clone();
+        let storage = settings.into_storage();
+
+        let mut dependencies = DbDependencies::new(
             self.file_system
                 .unwrap_or_else(|| Arc::new(TokioFileSystem::new())),
             object_store,
             self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
             self.rng.unwrap_or_else(|| Arc::new(SystemRng::default())),
         );
-        let settings_hybrid_read = settings.hybrid_read.clone();
-        let storage = settings.into_storage();
+        if let Some(resource_manager) = self.resource_manager {
+            dependencies = dependencies.with_resource_manager(resource_manager);
+        }
+        dependencies = dependencies.with_execution_profile(
+            execution_profile_override.unwrap_or(settings_execution_profile),
+        );
         let config = DbConfig {
             storage,
             hybrid_read: hybrid_read_override.unwrap_or(settings_hybrid_read),
@@ -377,6 +427,7 @@ impl fmt::Debug for DbBuilder {
         f.debug_struct("DbBuilder")
             .field("settings", &self.settings)
             .field("hybrid_read", &self.hybrid_read)
+            .field("execution_profile", &self.execution_profile)
             .field(
                 "file_system",
                 &self.file_system.as_ref().map(|_| "<dyn FileSystem>"),
@@ -390,6 +441,13 @@ impl fmt::Debug for DbBuilder {
             .field(
                 "scheduler",
                 &self.scheduler.as_ref().map(|_| "<dyn Scheduler>"),
+            )
+            .field(
+                "resource_manager",
+                &self
+                    .resource_manager
+                    .as_ref()
+                    .map(|_| "<dyn ResourceManager>"),
             )
             .finish()
     }
