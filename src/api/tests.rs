@@ -2285,6 +2285,117 @@ async fn forced_flush_guardrails_still_honor_domain_rate_limit_delay() {
 }
 
 #[tokio::test]
+async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlog() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let profile = execution_profile_with_prefix("multi-signal-admission");
+    let resource_manager: Arc<dyn crate::ResourceManager> =
+        Arc::new(crate::InMemoryResourceManager::default());
+    resource_manager.register_domain(crate::ExecutionDomainSpec {
+        path: profile.foreground.domain.clone(),
+        owner: crate::ExecutionDomainOwner::Database {
+            name: "multi-signal".to_string(),
+        },
+        budget: crate::ExecutionDomainBudget {
+            memory: crate::DomainMemoryBudget {
+                mutable_bytes: Some(512),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        placement: crate::ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+        metadata: BTreeMap::from([(
+            "terracedb.execution.role".to_string(),
+            "primary".to_string(),
+        )]),
+    });
+    let dependencies = dependencies_with_clock(file_system, object_store, clock.clone())
+        .with_resource_manager(resource_manager)
+        .with_execution_profile(profile.clone());
+    let db = Db::open(
+        tiered_config_with_max_local_bytes("/scheduler-multi-signal-pressure", 1024),
+        dependencies,
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    table
+        .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 220]))
+        .await
+        .expect("seed write");
+
+    let signals = db.write_admission_signals(&table, 96).await;
+    assert_eq!(signals.l0_sstable_count, 0);
+    let diagnostics = crate::multi_signal_write_admission(&signals);
+    assert_eq!(diagnostics.level, crate::AdmissionPressureLevel::RateLimit);
+    assert!(
+        diagnostics
+            .triggered_by
+            .contains(&crate::AdmissionPressureSignal::MutableBudget)
+    );
+    assert!(
+        !diagnostics
+            .triggered_by
+            .contains(&crate::AdmissionPressureSignal::L0Sstables)
+    );
+
+    let write_table = table.clone();
+    let write = tokio::spawn(async move {
+        write_table
+            .write(b"user:2".to_vec(), Value::Bytes(vec![b'y'; 96]))
+            .await
+            .expect("multi-signal throttled write")
+    });
+
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !write.is_finished(),
+        "write should be waiting on the simulated clock before L0 pressure accumulates",
+    );
+
+    let elapsed =
+        advance_clock_until_task_finishes(clock.as_ref(), &write, Duration::from_millis(250), 12)
+            .await;
+    assert!(elapsed > 0);
+    assert_eq!(
+        write.await.expect("join write task"),
+        SequenceNumber::new(2)
+    );
+
+    let snapshot = db.scheduler_observability_snapshot();
+    let recorded = snapshot
+        .last_admission_diagnostics_by_domain
+        .get(&profile.foreground.domain)
+        .expect("foreground diagnostics should be recorded");
+    assert_eq!(recorded.level, crate::AdmissionPressureLevel::RateLimit);
+    assert!(
+        recorded
+            .triggered_by
+            .contains(&crate::AdmissionPressureSignal::MutableBudget)
+    );
+    assert!(
+        !recorded
+            .triggered_by
+            .contains(&crate::AdmissionPressureSignal::L0Sstables)
+    );
+    assert!(
+        snapshot
+            .throttled_writes_by_domain
+            .get(&profile.foreground.domain)
+            .copied()
+            .unwrap_or_default()
+            >= 1
+    );
+}
+
+#[tokio::test]
 async fn scheduler_choice_controls_which_compaction_runs_first() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
@@ -2687,6 +2798,7 @@ async fn age_ceiling_forces_flush_even_when_byte_pressure_is_low() {
 async fn domain_mutable_memory_budget_forces_flush_before_storage_ceiling() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
     let profile = execution_profile_with_prefix("domain-mutable");
     let resource_manager: Arc<dyn crate::ResourceManager> =
         Arc::new(crate::InMemoryResourceManager::default());
@@ -2706,7 +2818,7 @@ async fn domain_mutable_memory_budget_forces_flush_before_storage_ceiling() {
         metadata: BTreeMap::new(),
     });
 
-    let dependencies = dependencies(file_system, object_store)
+    let dependencies = dependencies_with_clock(file_system, object_store, clock.clone())
         .with_resource_manager(resource_manager)
         .with_execution_profile(profile);
     let db = Db::open(
@@ -2724,15 +2836,33 @@ async fn domain_mutable_memory_budget_forces_flush_before_storage_ceiling() {
     assert!(db.memtable_budget_exceeded_by(301));
 
     table
-        .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 200]))
+        .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 160]))
         .await
         .expect("write first value");
     assert!(db.sstables_read().live.is_empty());
 
-    table
-        .write(b"user:2".to_vec(), Value::Bytes(vec![b'y'; 200]))
-        .await
-        .expect("write second value");
+    let write_table = table.clone();
+    let second = tokio::spawn(async move {
+        write_table
+            .write(b"user:2".to_vec(), Value::Bytes(vec![b'y'; 200]))
+            .await
+            .expect("write second value")
+    });
+    let _elapsed =
+        advance_clock_until_task_finishes(clock.as_ref(), &second, Duration::from_millis(250), 24)
+            .await;
+    assert_eq!(
+        second.await.expect("join second write"),
+        SequenceNumber::new(2)
+    );
+
+    let stats = db.table_stats(&table).await;
+    assert_eq!(stats.immutable_memtable_count, 0);
+    assert!(
+        stats.total_bytes > 0,
+        "forced flush should still install live SSTables before the storage ceiling"
+    );
+    assert!(!db.sstables_read().live.is_empty());
 }
 
 #[test]

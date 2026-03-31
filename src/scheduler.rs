@@ -10,7 +10,10 @@ use crate::{
         ExecutionDomainPath, ExecutionLane, WorkRuntimeTag,
     },
     ids::SequenceNumber,
-    pressure::{AdmissionSignals, FlushPressureCandidate},
+    pressure::{
+        AdmissionDiagnostics, AdmissionPressureLevel, AdmissionSignals, FlushPressureCandidate,
+        multi_signal_write_admission,
+    },
 };
 
 pub const DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT: u32 = 3;
@@ -65,6 +68,16 @@ pub trait Scheduler: Send + Sync {
         domain_budget: Option<&ExecutionDomainBudget>,
     ) -> ThrottleDecision {
         self.should_throttle_in_domain(table, stats, tag, domain_budget)
+    }
+    fn admission_diagnostics(
+        &self,
+        _table: &Table,
+        _stats: &TableStats,
+        _signals: &AdmissionSignals,
+        _tag: &WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> Option<AdmissionDiagnostics> {
+        None
     }
     fn work_budget(&self, _work: &PendingWork, _stats: &TableStats) -> PendingWorkBudget {
         PendingWorkBudget::default()
@@ -166,6 +179,7 @@ pub struct SchedulerObservabilitySnapshot {
     pub background_delay_events_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub background_delay_millis_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub throttled_writes_by_domain: BTreeMap<ExecutionDomainPath, u64>,
+    pub last_admission_diagnostics_by_domain: BTreeMap<ExecutionDomainPath, AdmissionDiagnostics>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -464,6 +478,76 @@ impl Scheduler for RoundRobinScheduler {
         _domain_budget: Option<&ExecutionDomainBudget>,
     ) -> ThrottleDecision {
         self.should_throttle(table, stats)
+    }
+
+    fn admission_decision_in_domain(
+        &self,
+        table: &Table,
+        stats: &TableStats,
+        signals: &AdmissionSignals,
+        tag: &WorkRuntimeTag,
+        domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        if let Some(retention) = stats.current_state_retention.as_ref()
+            && retention.coordination.backpressure.throttle_writes
+        {
+            return ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: retention
+                    .coordination
+                    .backpressure
+                    .max_write_bytes_per_second,
+                stall: retention.coordination.backpressure.stall_writes,
+            };
+        }
+
+        let diagnostics = self
+            .admission_diagnostics(table, stats, signals, tag, domain_budget)
+            .unwrap_or_else(|| multi_signal_write_admission(signals));
+        match diagnostics.level {
+            AdmissionPressureLevel::Open => ThrottleDecision::default(),
+            AdmissionPressureLevel::RateLimit => ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: diagnostics.max_write_bytes_per_second,
+                stall: false,
+            },
+            AdmissionPressureLevel::Stall => ThrottleDecision {
+                throttle: true,
+                max_write_bytes_per_second: None,
+                stall: true,
+            },
+        }
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &Table,
+        stats: &TableStats,
+        signals: &AdmissionSignals,
+        _tag: &WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> Option<AdmissionDiagnostics> {
+        if let Some(retention) = stats.current_state_retention.as_ref()
+            && retention.coordination.backpressure.throttle_writes
+        {
+            return Some(AdmissionDiagnostics {
+                level: if retention.coordination.backpressure.stall_writes {
+                    AdmissionPressureLevel::Stall
+                } else {
+                    AdmissionPressureLevel::RateLimit
+                },
+                max_write_bytes_per_second: retention
+                    .coordination
+                    .backpressure
+                    .max_write_bytes_per_second,
+                metadata: BTreeMap::from([(
+                    "current_state_retention_backpressure".to_string(),
+                    JsonValue::Bool(true),
+                )]),
+                ..AdmissionDiagnostics::default()
+            });
+        }
+        Some(multi_signal_write_admission(signals))
     }
 }
 

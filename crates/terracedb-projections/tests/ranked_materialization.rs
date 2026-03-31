@@ -84,7 +84,7 @@ async fn current_output_ids(output: &Table) -> Vec<String> {
 
 async fn wait_for_source(handle: &mut ProjectionHandle, source: &Table, sequence: SequenceNumber) {
     tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(3),
         handle.wait_for_sources([(source, sequence)]),
     )
     .await

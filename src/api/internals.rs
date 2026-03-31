@@ -299,6 +299,8 @@ pub(super) struct SchedulerObservabilityStats {
     pub(super) background_delay_events_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
     pub(super) background_delay_millis_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
     pub(super) throttled_writes_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
+    pub(super) last_admission_diagnostics_by_domain:
+        Mutex<BTreeMap<crate::ExecutionDomainPath, crate::AdmissionDiagnostics>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
