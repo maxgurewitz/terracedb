@@ -1145,6 +1145,22 @@ impl MemtableState {
         backlog
     }
 
+    pub(super) fn immutable_flush_backlog_by_table(&self) -> BTreeMap<TableId, u64> {
+        let mut backlog = BTreeMap::new();
+        for immutable in &self.immutables {
+            if !matches!(immutable.state, ImmutableMemtableFlushState::Queued) {
+                continue;
+            }
+            for (table_id, bytes) in immutable.memtable.pending_flush_bytes_by_table() {
+                backlog
+                    .entry(table_id)
+                    .and_modify(|current: &mut u64| *current = current.saturating_add(bytes))
+                    .or_insert(bytes);
+            }
+        }
+        backlog
+    }
+
     pub(super) fn immutable_flushing_bytes_by_table(&self) -> BTreeMap<TableId, u64> {
         let mut flushing = BTreeMap::new();
         for immutable in &self.immutables {
