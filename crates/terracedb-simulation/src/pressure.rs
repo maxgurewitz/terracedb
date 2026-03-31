@@ -85,6 +85,18 @@ impl DeterministicPressureOracle {
         Self::refresh_table_state(self.elapsed, state);
     }
 
+    pub fn fail_flush(&mut self, table: &str, bytes: u64) {
+        let state = self.tables.entry(table.to_string()).or_default();
+        let bytes = bytes.min(state.pressure.immutable_flushing_bytes);
+        state.pressure.immutable_flushing_bytes = state
+            .pressure
+            .immutable_flushing_bytes
+            .saturating_sub(bytes);
+        state.pressure.immutable_queued_bytes =
+            state.pressure.immutable_queued_bytes.saturating_add(bytes);
+        Self::refresh_table_state(self.elapsed, state);
+    }
+
     pub fn snapshot(&self) -> DeterministicPressureSnapshot {
         DeterministicPressureSnapshot {
             elapsed: self.elapsed,
@@ -101,6 +113,21 @@ impl DeterministicPressureOracle {
             domain_budgets: snapshot.domain_budgets,
             tables: snapshot.tables,
         }
+    }
+
+    pub fn recover_after_restart(&self) -> Self {
+        let mut restored = self.clone();
+        for state in restored.tables.values_mut() {
+            state.pressure.mutable_dirty_bytes = state
+                .pressure
+                .mutable_dirty_bytes
+                .saturating_add(state.pressure.immutable_queued_bytes)
+                .saturating_add(state.pressure.immutable_flushing_bytes);
+            state.pressure.immutable_queued_bytes = 0;
+            state.pressure.immutable_flushing_bytes = 0;
+            Self::refresh_table_state(restored.elapsed, state);
+        }
+        restored
     }
 
     pub fn process_pressure_stats(&self) -> PressureStats {
@@ -152,10 +179,7 @@ impl DeterministicPressureOracle {
 
     pub fn flush_candidate(&self, table: &str) -> Option<FlushPressureCandidate> {
         let pressure = self.table_pressure_stats(table);
-        let estimated_bytes = pressure
-            .local
-            .immutable_queued_bytes
-            .saturating_add(pressure.local.immutable_flushing_bytes);
+        let estimated_bytes = pressure.local.immutable_queued_bytes;
         if estimated_bytes == 0 {
             return None;
         }
@@ -190,15 +214,16 @@ impl DeterministicPressureOracle {
             pressure: self.table_pressure_stats(table),
             batch_write_bytes,
             l0_sstable_count: 0,
-            immutable_memtable_count: if self
+            immutable_memtable_count: self
                 .tables
                 .get(table)
-                .is_some_and(|state| state.pressure.immutable_queued_bytes > 0)
-            {
-                1
-            } else {
-                0
-            },
+                .map(|state| {
+                    u32::from(
+                        state.pressure.immutable_queued_bytes > 0
+                            || state.pressure.immutable_flushing_bytes > 0,
+                    )
+                })
+                .unwrap_or_default(),
             compaction_debt_bytes: 0,
             correctness: AdmissionCorrectnessContext {
                 durable_sequence: SequenceNumber::default(),
@@ -338,6 +363,8 @@ mod tests {
         oracle.advance(Duration::from_millis(40));
         oracle.queue_flush("events");
         oracle.advance(Duration::from_millis(20));
+        oracle.begin_flush("events", 32);
+        oracle.fail_flush("events", 32);
 
         let candidate = oracle
             .flush_candidate("events")
@@ -349,6 +376,7 @@ mod tests {
         assert_eq!(signals.runtime_tag, tag);
         assert_eq!(signals.pressure.local.mutable_dirty_bytes, 0);
         assert_eq!(signals.pressure.local.immutable_queued_bytes, 64);
+        assert_eq!(signals.pressure.local.immutable_flushing_bytes, 0);
         assert_eq!(
             signals.pressure.oldest_unflushed_age,
             Some(Duration::from_millis(60))
@@ -366,5 +394,11 @@ mod tests {
             restored.admission_signals("events", tag, 32).pressure,
             signals.pressure
         );
+
+        let restarted = oracle.recover_after_restart();
+        let restarted_pressure = restarted.table_pressure_stats("events");
+        assert_eq!(restarted_pressure.local.mutable_dirty_bytes, 64);
+        assert_eq!(restarted_pressure.local.immutable_queued_bytes, 0);
+        assert_eq!(restarted_pressure.local.immutable_flushing_bytes, 0);
     }
 }

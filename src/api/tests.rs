@@ -10,7 +10,7 @@ use super::{
     BACKUP_GC_METADATA_FORMAT_VERSION, BackupObjectBirthRecord, CATALOG_FORMAT_VERSION,
     COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, ColumnarCacheStatsSnapshot,
     ColumnarReadAccessPattern, CommitPhase, CompactionJobKind, CompactionPhase, Db,
-    DurableRemoteCommitLogSegment, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
+    DurableRemoteCommitLogSegment, FlushPhase, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
     LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
     LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, MANIFEST_FORMAT_VERSION, ManifestId,
     OffloadJobKind, OffloadPhase, PendingWorkSpec, PersistedManifestBody, PersistedManifestFile,
@@ -1884,6 +1884,152 @@ async fn pending_flush_pressure_candidates_surface_relief_estimates() {
         candidate.work.estimated_relief.unified_log_pinned_bytes,
         candidate.work.work.estimated_bytes
     );
+}
+
+#[tokio::test]
+async fn pressure_accounting_transitions_queued_bytes_into_flushing_and_reclaims_them() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/pressure-accounting-transition"),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    let sequence = table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write first value");
+
+    let mutable = db.table_pressure_stats(&table).await;
+    assert!(mutable.local.mutable_dirty_bytes > 0);
+    assert_eq!(
+        mutable.metadata.get("oldest_unflushed_sequence"),
+        Some(&json!(sequence.get()))
+    );
+    assert_eq!(
+        mutable.metadata.get("newest_unflushed_sequence"),
+        Some(&json!(sequence.get()))
+    );
+
+    db.memtables_write().rotate_mutable();
+    let queued = db.table_pressure_stats(&table).await;
+    let queued_bytes = queued.local.immutable_queued_bytes;
+    assert_eq!(queued.local.mutable_dirty_bytes, 0);
+    assert!(queued_bytes > 0);
+    assert_eq!(queued.local.immutable_flushing_bytes, 0);
+    assert_eq!(queued.local.unified_log_pinned_bytes, queued_bytes);
+    assert_eq!(
+        queued.metadata.get("queued_immutable_memtables"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        queued.metadata.get("flushing_immutable_memtables"),
+        Some(&json!(0))
+    );
+
+    let mut blocker = db.block_next_flush_phase(FlushPhase::InputsMarkedFlushing);
+    let flush_db = db.clone();
+    let flush_task = tokio::spawn(async move { flush_db.flush().await });
+
+    blocker.wait_until_reached().await;
+
+    let flushing = db.table_pressure_stats(&table).await;
+    assert_eq!(flushing.local.mutable_dirty_bytes, 0);
+    assert_eq!(flushing.local.immutable_queued_bytes, 0);
+    assert_eq!(flushing.local.immutable_flushing_bytes, queued_bytes);
+    assert_eq!(flushing.local.unified_log_pinned_bytes, queued_bytes);
+    assert_eq!(
+        flushing.metadata.get("queued_immutable_memtables"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        flushing.metadata.get("flushing_immutable_memtables"),
+        Some(&json!(1))
+    );
+    assert!(
+        db.pending_flush_pressure_candidates().await.is_empty(),
+        "already-flushing bytes should not surface as a new flush candidate"
+    );
+
+    blocker.release();
+    flush_task
+        .await
+        .expect("join flush task")
+        .expect("flush should succeed");
+
+    let reclaimed = db.table_pressure_stats(&table).await;
+    assert_eq!(reclaimed.local.mutable_dirty_bytes, 0);
+    assert_eq!(reclaimed.local.immutable_queued_bytes, 0);
+    assert_eq!(reclaimed.local.immutable_flushing_bytes, 0);
+    assert_eq!(reclaimed.local.unified_log_pinned_bytes, 0);
+    assert_eq!(
+        reclaimed.metadata.get("queued_immutable_memtables"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        reclaimed.metadata.get("flushing_immutable_memtables"),
+        Some(&json!(0))
+    );
+}
+
+#[tokio::test]
+async fn failed_flush_restores_flushing_bytes_to_queued_accounting() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/pressure-accounting-failed-flush"),
+        dependencies(file_system.clone(), object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    let sequence = table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write first value");
+    db.memtables_write().rotate_mutable();
+    let queued_before_failure = db.table_pressure_stats(&table).await;
+
+    file_system.inject_failure(FileSystemFailure::timeout(
+        FileSystemOperation::SyncDir,
+        Db::local_manifest_dir("/pressure-accounting-failed-flush"),
+    ));
+    db.flush().await.expect_err("manifest sync failure");
+
+    let recovered = db.table_pressure_stats(&table).await;
+    assert_eq!(recovered.local.mutable_dirty_bytes, 0);
+    assert_eq!(recovered.local.immutable_flushing_bytes, 0);
+    assert_eq!(
+        recovered.local.immutable_queued_bytes,
+        queued_before_failure.local.immutable_queued_bytes
+    );
+    assert_eq!(
+        recovered.local.unified_log_pinned_bytes,
+        queued_before_failure.local.unified_log_pinned_bytes
+    );
+    assert_eq!(
+        recovered.metadata.get("queued_immutable_memtables"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        recovered.metadata.get("flushing_immutable_memtables"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        recovered.metadata.get("oldest_unflushed_sequence"),
+        Some(&json!(sequence.get()))
+    );
+    assert_eq!(db.pending_flush_pressure_candidates().await.len(), 1);
 }
 
 #[tokio::test]

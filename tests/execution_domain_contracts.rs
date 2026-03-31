@@ -10,10 +10,10 @@ use terracedb::{
     ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
     ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding,
     ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage,
-    InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType, PressureScope,
-    ResourceManager, S3Location, ScanOptions, Scheduler, ShardReadyPlacementLayout, StubClock,
-    StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TableStats,
-    ThrottleDecision, TieredDurabilityMode, Value,
+    FileSystemFailure, FileSystemOperation, InMemoryResourceManager, NoopScheduler, PendingWork,
+    PendingWorkType, PressureScope, ResourceManager, S3Location, ScanOptions, Scheduler,
+    ShardReadyPlacementLayout, StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig,
+    TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -484,6 +484,88 @@ async fn pressure_stats_reconstruct_deterministically_after_reopen() {
     assert_eq!(before_pressure, after_pressure);
     assert_eq!(before_signals.pressure, after_signals.pressure);
     assert_eq!(before_signals.domain_budget, after_signals.domain_budget);
+}
+
+#[tokio::test]
+async fn pressure_stats_reconstruct_after_failed_flush_reopen() {
+    let profile = execution_profile("pressure-failed-flush");
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let resource_manager: Arc<dyn ResourceManager> = Arc::new(InMemoryResourceManager::default());
+    let config =
+        tiered_settings("/execution-pressure-failed-flush").with_execution_profile(profile.clone());
+
+    let open_components = || {
+        DbComponents::new(
+            file_system.clone(),
+            object_store.clone(),
+            Arc::new(StubClock::default()),
+            Arc::new(StubRng::seeded(23)),
+        )
+        .with_scheduler(Arc::new(NoopScheduler))
+        .with_resource_manager(resource_manager.clone())
+    };
+
+    let db = Db::builder()
+        .settings(config.clone())
+        .components(open_components())
+        .open()
+        .await
+        .expect("open initial pressure db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create pressure table");
+    let sequence = table
+        .write(b"user:1".to_vec(), Value::bytes("v1"))
+        .await
+        .expect("write value before failed flush");
+
+    file_system.inject_failure(FileSystemFailure::timeout(
+        FileSystemOperation::SyncDir,
+        "/execution-pressure-failed-flush/manifest",
+    ));
+    db.flush().await.expect_err("flush should fail");
+
+    let after_failure = db.table_pressure_stats(&table).await;
+    assert_eq!(after_failure.local.mutable_dirty_bytes, 0);
+    assert!(after_failure.local.immutable_queued_bytes > 0);
+    assert_eq!(after_failure.local.immutable_flushing_bytes, 0);
+    assert_eq!(
+        after_failure.local.unified_log_pinned_bytes,
+        after_failure.local.immutable_queued_bytes
+    );
+    assert_eq!(
+        after_failure.metadata.get("oldest_unflushed_sequence"),
+        Some(&serde_json::Value::from(sequence.get()))
+    );
+
+    drop(db);
+    file_system.crash();
+
+    let reopened = Db::builder()
+        .settings(config)
+        .components(open_components())
+        .open()
+        .await
+        .expect("reopen after failed flush");
+    let reopened_table = reopened.table("events");
+    let after_reopen = reopened.table_pressure_stats(&reopened_table).await;
+
+    assert_eq!(
+        after_reopen.local.mutable_dirty_bytes,
+        after_failure.local.unified_log_pinned_bytes
+    );
+    assert_eq!(after_reopen.local.immutable_queued_bytes, 0);
+    assert_eq!(after_reopen.local.immutable_flushing_bytes, 0);
+    assert_eq!(
+        after_reopen.local.unified_log_pinned_bytes,
+        after_failure.local.unified_log_pinned_bytes
+    );
+    assert_eq!(
+        after_reopen.metadata.get("oldest_unflushed_sequence"),
+        Some(&serde_json::Value::from(sequence.get()))
+    );
 }
 
 #[tokio::test]

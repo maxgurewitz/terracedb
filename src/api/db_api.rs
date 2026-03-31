@@ -7,6 +7,7 @@ use crate::execution::{
     ExecutionUsageLease, ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot,
     WorkRuntimeTag,
 };
+use serde_json::Value as JsonValue;
 
 #[derive(Clone, Debug)]
 struct ResolvedScanPredicate {
@@ -67,6 +68,43 @@ impl FlushStatus {
     /// Returns `true` when either the visible or durable frontier changed.
     pub fn changed_any_frontier(&self) -> bool {
         self.visible_sequence_advanced() || self.durable_sequence_advanced()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PressureAccountingSnapshot {
+    bytes: PressureBytes,
+    oldest_unflushed_sequence: Option<SequenceNumber>,
+    newest_unflushed_sequence: Option<SequenceNumber>,
+    queued_immutable_memtables: u32,
+    flushing_immutable_memtables: u32,
+}
+
+impl PressureAccountingSnapshot {
+    fn metadata(&self) -> BTreeMap<String, JsonValue> {
+        let mut metadata = BTreeMap::from([
+            (
+                "queued_immutable_memtables".to_string(),
+                JsonValue::from(self.queued_immutable_memtables),
+            ),
+            (
+                "flushing_immutable_memtables".to_string(),
+                JsonValue::from(self.flushing_immutable_memtables),
+            ),
+        ]);
+        if let Some(sequence) = self.oldest_unflushed_sequence {
+            metadata.insert(
+                "oldest_unflushed_sequence".to_string(),
+                JsonValue::from(sequence.get()),
+            );
+        }
+        if let Some(sequence) = self.newest_unflushed_sequence {
+            metadata.insert(
+                "newest_unflushed_sequence".to_string(),
+                JsonValue::from(sequence.get()),
+            );
+        }
+        metadata
     }
 }
 
@@ -993,73 +1031,85 @@ impl Db {
                             .map_err(FlushError::Storage)?;
                         self.mark_all_commits_durable();
                         self.publish_watermarks();
-                        self.memtables_read().immutables.clone()
+                        self.memtables_write().mark_queued_immutables_flushing()
                     };
+                    let flush_result: Result<(), FlushError> = async {
+                        self.maybe_pause_flush_phase(FlushPhase::InputsMarkedFlushing)
+                            .await
+                            .map_err(FlushError::Storage)?;
 
-                    let mut flushed_count = 0_usize;
-                    let mut sstable_state = self.sstables_read().clone();
-                    let mut new_live = sstable_state.live.clone();
-                    let mut manifest_generation = sstable_state.manifest_generation;
+                        let mut flushed_count = 0_usize;
+                        let mut sstable_state = self.sstables_read().clone();
+                        let mut new_live = sstable_state.live.clone();
+                        let mut manifest_generation = sstable_state.manifest_generation;
 
-                    for immutable in &immutables {
-                        let next_generation =
-                            ManifestId::new(manifest_generation.get().saturating_add(1));
-                        let outputs = self
-                            .flush_immutable(&local_root, immutable, next_generation)
-                            .await?;
-                        if outputs.is_empty() {
+                        for immutable in &immutables {
+                            let next_generation =
+                                ManifestId::new(manifest_generation.get().saturating_add(1));
+                            let outputs = self
+                                .flush_immutable(&local_root, immutable, next_generation)
+                                .await?;
+                            if outputs.is_empty() {
+                                flushed_count += 1;
+                                continue;
+                            }
+
+                            new_live.extend(outputs);
+                            Self::sort_live_sstables(&mut new_live);
+                            manifest_generation = next_generation;
+                            self.install_manifest(
+                                manifest_generation,
+                                immutable.max_sequence,
+                                &new_live,
+                            )
+                            .await
+                            .map_err(FlushError::Storage)?;
                             flushed_count += 1;
-                            continue;
                         }
 
-                        new_live.extend(outputs);
-                        Self::sort_live_sstables(&mut new_live);
-                        manifest_generation = next_generation;
-                        self.install_manifest(
-                            manifest_generation,
-                            immutable.max_sequence,
-                            &new_live,
-                        )
-                        .await
-                        .map_err(FlushError::Storage)?;
-                        flushed_count += 1;
+                        if flushed_count > 0 {
+                            self.memtables_write()
+                                .remove_flushing_immutables(flushed_count);
+
+                            sstable_state.live = new_live;
+                            sstable_state.manifest_generation = manifest_generation;
+                            sstable_state.last_flushed_sequence =
+                                sstable_state.last_flushed_sequence.max(
+                                    immutables
+                                        .iter()
+                                        .take(flushed_count)
+                                        .map(|immutable| immutable.max_sequence)
+                                        .max()
+                                        .unwrap_or_default(),
+                                );
+                            *self.sstables_write() = sstable_state;
+                            self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
+                        }
+
+                        let backup_result = if flushed_count > 0 {
+                            let state = self.sstables_read().clone();
+                            self.sync_tiered_backup_manifest(
+                                state.manifest_generation,
+                                state.last_flushed_sequence,
+                                &state.live,
+                            )
+                            .await
+                        } else {
+                            self.sync_tiered_commit_log_tail().await
+                        };
+                        let _ = backup_result;
+
+                        self.prune_commit_log(true)
+                            .await
+                            .map_err(FlushError::Storage)?;
+                        Ok(())
                     }
+                    .await;
 
-                    if flushed_count > 0 {
-                        let mut memtables = self.memtables_write();
-                        memtables.immutables.drain(0..flushed_count);
-
-                        sstable_state.live = new_live;
-                        sstable_state.manifest_generation = manifest_generation;
-                        sstable_state.last_flushed_sequence =
-                            sstable_state.last_flushed_sequence.max(
-                                immutables
-                                    .iter()
-                                    .take(flushed_count)
-                                    .map(|immutable| immutable.max_sequence)
-                                    .max()
-                                    .unwrap_or_default(),
-                            );
-                        *self.sstables_write() = sstable_state;
-                        self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
+                    if flush_result.is_err() {
+                        self.memtables_write().restore_flushing_immutables();
                     }
-
-                    let backup_result = if flushed_count > 0 {
-                        let state = self.sstables_read().clone();
-                        self.sync_tiered_backup_manifest(
-                            state.manifest_generation,
-                            state.last_flushed_sequence,
-                            &state.live,
-                        )
-                        .await
-                    } else {
-                        self.sync_tiered_commit_log_tail().await
-                    };
-                    let _ = backup_result;
-
-                    self.prune_commit_log(true)
-                        .await
-                        .map_err(FlushError::Storage)?;
+                    flush_result?;
                 }
                 StorageConfig::S3Primary(config) => {
                     let (immutables, buffered_records, mut durable_segments, next_segment_id) = {
@@ -1068,10 +1118,9 @@ impl Db {
                             .await
                             .map_err(FlushError::Storage)?;
                         self.memtables_write().rotate_mutable();
-
-                        let immutables = self.memtables_read().immutables.clone();
                         let mut commit_runtime = self.inner.commit_runtime.lock().await;
                         commit_runtime.sync().await.map_err(FlushError::Storage)?;
+                        let immutables = self.memtables_write().mark_queued_immutables_flushing();
                         match &mut commit_runtime.backend {
                             CommitLogBackend::Memory(log) => (
                                 immutables,
@@ -1096,89 +1145,103 @@ impl Db {
                         );
                         return Ok(status);
                     }
-
-                    if !buffered_records.is_empty() {
-                        let (segment_bytes, footer) = encode_segment_bytes(
-                            crate::SegmentId::new(next_segment_id),
-                            &buffered_records,
-                            SegmentOptions::default().records_per_block,
-                        )
-                        .map_err(FlushError::Storage)?;
-                        let object_key =
-                            Self::remote_commit_log_segment_key(config, footer.segment_id);
-                        self.inner
-                            .dependencies
-                            .object_store
-                            .put(&object_key, &segment_bytes)
+                    let flush_result: Result<(), FlushError> = async {
+                        self.maybe_pause_flush_phase(FlushPhase::InputsMarkedFlushing)
                             .await
                             .map_err(FlushError::Storage)?;
-                        durable_segments.push(DurableRemoteCommitLogSegment { object_key, footer });
-                        durable_segments.sort_by_key(|segment| segment.footer.segment_id.get());
-                    }
 
-                    let mut sstable_state = self.sstables_read().clone();
-                    let mut new_live = sstable_state.live.clone();
-                    let next_generation =
-                        ManifestId::new(sstable_state.manifest_generation.get().saturating_add(1));
-                    for immutable in &immutables {
-                        new_live.extend(
-                            self.flush_immutable_remote(config, immutable, next_generation)
-                                .await?,
+                        if !buffered_records.is_empty() {
+                            let (segment_bytes, footer) = encode_segment_bytes(
+                                crate::SegmentId::new(next_segment_id),
+                                &buffered_records,
+                                SegmentOptions::default().records_per_block,
+                            )
+                            .map_err(FlushError::Storage)?;
+                            let object_key =
+                                Self::remote_commit_log_segment_key(config, footer.segment_id);
+                            self.inner
+                                .dependencies
+                                .object_store
+                                .put(&object_key, &segment_bytes)
+                                .await
+                                .map_err(FlushError::Storage)?;
+                            durable_segments
+                                .push(DurableRemoteCommitLogSegment { object_key, footer });
+                            durable_segments.sort_by_key(|segment| segment.footer.segment_id.get());
+                        }
+
+                        let mut sstable_state = self.sstables_read().clone();
+                        let mut new_live = sstable_state.live.clone();
+                        let next_generation = ManifestId::new(
+                            sstable_state.manifest_generation.get().saturating_add(1),
                         );
-                    }
-                    Self::sort_live_sstables(&mut new_live);
+                        for immutable in &immutables {
+                            new_live.extend(
+                                self.flush_immutable_remote(config, immutable, next_generation)
+                                    .await?,
+                            );
+                        }
+                        Self::sort_live_sstables(&mut new_live);
 
-                    let flushed_through = buffered_records
-                        .last()
-                        .map(CommitRecord::sequence)
-                        .into_iter()
-                        .chain(immutables.iter().map(|immutable| immutable.max_sequence))
-                        .max()
-                        .unwrap_or(sstable_state.last_flushed_sequence)
-                        .max(sstable_state.last_flushed_sequence);
-                    self.install_remote_manifest(
-                        config,
-                        next_generation,
-                        flushed_through,
-                        &new_live,
-                        &durable_segments,
-                    )
-                    .await
-                    .map_err(FlushError::Storage)?;
+                        let flushed_through = buffered_records
+                            .last()
+                            .map(CommitRecord::sequence)
+                            .into_iter()
+                            .chain(immutables.iter().map(|immutable| immutable.max_sequence))
+                            .max()
+                            .unwrap_or(sstable_state.last_flushed_sequence)
+                            .max(sstable_state.last_flushed_sequence);
+                        self.install_remote_manifest(
+                            config,
+                            next_generation,
+                            flushed_through,
+                            &new_live,
+                            &durable_segments,
+                        )
+                        .await
+                        .map_err(FlushError::Storage)?;
 
-                    {
-                        let _commit_guard = self.inner.commit_lock.lock().await;
-                        let mut commit_runtime = self.inner.commit_runtime.lock().await;
-                        match &mut commit_runtime.backend {
-                            CommitLogBackend::Memory(log) => {
-                                Arc::make_mut(&mut log.records)
-                                    .retain(|record| record.sequence() > flushed_through);
-                                log.durable_commit_log_segments = durable_segments.clone();
-                                if !buffered_records.is_empty() {
-                                    log.next_segment_id = next_segment_id.saturating_add(1);
+                        {
+                            let _commit_guard = self.inner.commit_lock.lock().await;
+                            let mut commit_runtime = self.inner.commit_runtime.lock().await;
+                            match &mut commit_runtime.backend {
+                                CommitLogBackend::Memory(log) => {
+                                    Arc::make_mut(&mut log.records)
+                                        .retain(|record| record.sequence() > flushed_through);
+                                    log.durable_commit_log_segments = durable_segments.clone();
+                                    if !buffered_records.is_empty() {
+                                        log.next_segment_id = next_segment_id.saturating_add(1);
+                                    }
+                                }
+                                CommitLogBackend::Local(_) => {
+                                    return Err(FlushError::Storage(StorageError::unsupported(
+                                        "s3-primary flush requires the memory commit-log backend",
+                                    )));
                                 }
                             }
-                            CommitLogBackend::Local(_) => {
-                                return Err(FlushError::Storage(StorageError::unsupported(
-                                    "s3-primary flush requires the memory commit-log backend",
-                                )));
+
+                            if !immutables.is_empty() {
+                                self.memtables_write()
+                                    .remove_flushing_immutables(immutables.len());
                             }
+
+                            self.mark_commits_durable_through(flushed_through);
+                            self.publish_watermarks();
                         }
 
-                        if !immutables.is_empty() {
-                            let mut memtables = self.memtables_write();
-                            memtables.immutables.drain(0..immutables.len());
-                        }
-
-                        self.mark_commits_durable_through(flushed_through);
-                        self.publish_watermarks();
+                        sstable_state.live = new_live;
+                        sstable_state.manifest_generation = next_generation;
+                        sstable_state.last_flushed_sequence = flushed_through;
+                        *self.sstables_write() = sstable_state;
+                        self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
+                        Ok(())
                     }
+                    .await;
 
-                    sstable_state.live = new_live;
-                    sstable_state.manifest_generation = next_generation;
-                    sstable_state.last_flushed_sequence = flushed_through;
-                    *self.sstables_write() = sstable_state;
-                    self.retain_compact_to_wide_stats_for_live(&self.sstables_read().live);
+                    if flush_result.is_err() {
+                        self.memtables_write().restore_flushing_immutables();
+                    }
+                    flush_result?;
                 }
             }
 
@@ -1365,35 +1428,71 @@ impl Db {
         }
     }
 
-    fn total_pressure_bytes(memtables: &MemtableState) -> PressureBytes {
+    fn total_pressure_accounting(memtables: &MemtableState) -> PressureAccountingSnapshot {
         let mutable_dirty_bytes = memtables.mutable.total_pending_flush_bytes();
         let immutable_queued_bytes = memtables
-            .immutables
-            .iter()
-            .map(|immutable| immutable.memtable.total_pending_flush_bytes())
+            .immutable_flush_backlog_by_table()
+            .values()
+            .copied()
             .sum::<u64>();
-
-        PressureBytes {
+        let immutable_flushing_bytes = memtables
+            .immutable_flushing_bytes_by_table()
+            .values()
+            .copied()
+            .sum::<u64>();
+        let bytes = PressureBytes {
             mutable_dirty_bytes,
             immutable_queued_bytes,
-            immutable_flushing_bytes: 0,
-            unified_log_pinned_bytes: mutable_dirty_bytes.saturating_add(immutable_queued_bytes),
+            immutable_flushing_bytes,
+            unified_log_pinned_bytes: mutable_dirty_bytes
+                .saturating_add(immutable_queued_bytes)
+                .saturating_add(immutable_flushing_bytes),
+        };
+        let (oldest_unflushed_sequence, newest_unflushed_sequence) =
+            memtables.total_sequence_range().unzip();
+
+        PressureAccountingSnapshot {
+            bytes,
+            oldest_unflushed_sequence,
+            newest_unflushed_sequence,
+            queued_immutable_memtables: memtables.queued_immutable_memtable_count(None),
+            flushing_immutable_memtables: memtables.flushing_immutable_memtable_count(None),
         }
     }
 
-    fn table_pressure_bytes(memtables: &MemtableState, table_id: TableId) -> PressureBytes {
+    fn table_pressure_accounting(
+        memtables: &MemtableState,
+        table_id: TableId,
+    ) -> PressureAccountingSnapshot {
         let mutable_dirty_bytes = memtables.mutable.pending_flush_bytes(table_id);
         let immutable_queued_bytes = memtables
-            .immutables
-            .iter()
-            .map(|immutable| immutable.memtable.pending_flush_bytes(table_id))
-            .sum::<u64>();
-
-        PressureBytes {
+            .immutable_flush_backlog_by_table()
+            .get(&table_id)
+            .copied()
+            .unwrap_or_default();
+        let immutable_flushing_bytes = memtables
+            .immutable_flushing_bytes_by_table()
+            .get(&table_id)
+            .copied()
+            .unwrap_or_default();
+        let bytes = PressureBytes {
             mutable_dirty_bytes,
             immutable_queued_bytes,
-            immutable_flushing_bytes: 0,
-            unified_log_pinned_bytes: mutable_dirty_bytes.saturating_add(immutable_queued_bytes),
+            immutable_flushing_bytes,
+            unified_log_pinned_bytes: mutable_dirty_bytes
+                .saturating_add(immutable_queued_bytes)
+                .saturating_add(immutable_flushing_bytes),
+        };
+        let (oldest_unflushed_sequence, newest_unflushed_sequence) =
+            memtables.pending_flush_sequence_range(table_id).unzip();
+
+        PressureAccountingSnapshot {
+            bytes,
+            oldest_unflushed_sequence,
+            newest_unflushed_sequence,
+            queued_immutable_memtables: memtables.queued_immutable_memtable_count(Some(table_id)),
+            flushing_immutable_memtables: memtables
+                .flushing_immutable_memtable_count(Some(table_id)),
         }
     }
 
@@ -1409,52 +1508,53 @@ impl Db {
     }
 
     pub async fn process_pressure_stats(&self) -> PressureStats {
-        let total = Self::total_pressure_bytes(&self.memtables_read());
+        let total = Self::total_pressure_accounting(&self.memtables_read());
         PressureStats {
             scope: PressureScope::Process,
-            local: total,
-            domain_total: Some(total),
-            process_total: Some(total),
+            local: total.bytes,
+            domain_total: Some(total.bytes),
+            process_total: Some(total.bytes),
             oldest_unflushed_age: None,
             budget: self.pressure_budget(None),
-            metadata: BTreeMap::new(),
+            metadata: total.metadata(),
         }
     }
 
     pub async fn domain_pressure_stats(&self, path: &ExecutionDomainPath) -> PressureStats {
-        let total = Self::total_pressure_bytes(&self.memtables_read());
-        let local = self
-            .domain_tracks_db_pressure(path)
-            .then_some(total)
-            .unwrap_or_default();
+        let total = Self::total_pressure_accounting(&self.memtables_read());
+        let local = if self.domain_tracks_db_pressure(path) {
+            total.clone()
+        } else {
+            PressureAccountingSnapshot::default()
+        };
 
         PressureStats {
             scope: PressureScope::Domain(path.clone()),
-            local,
-            domain_total: Some(local),
-            process_total: Some(total),
+            local: local.bytes,
+            domain_total: Some(local.bytes),
+            process_total: Some(total.bytes),
             oldest_unflushed_age: None,
             budget: self.pressure_budget(self.execution_domain_budget(path)),
-            metadata: BTreeMap::new(),
+            metadata: local.metadata(),
         }
     }
 
     pub async fn table_pressure_stats(&self, table: &Table) -> PressureStats {
         let memtables = self.memtables_read();
-        let total = Self::total_pressure_bytes(&memtables);
+        let total = Self::total_pressure_accounting(&memtables);
         let local = table
             .resolve_id()
-            .map(|table_id| Self::table_pressure_bytes(&memtables, table_id))
+            .map(|table_id| Self::table_pressure_accounting(&memtables, table_id))
             .unwrap_or_default();
 
         PressureStats {
             scope: PressureScope::Table(table.name().to_string()),
-            local,
+            local: local.bytes,
             domain_total: None,
-            process_total: Some(total),
+            process_total: Some(total.bytes),
             oldest_unflushed_age: None,
             budget: self.pressure_budget(None),
-            metadata: BTreeMap::new(),
+            metadata: local.metadata(),
         }
     }
 
@@ -2302,6 +2402,16 @@ impl Db {
     }
 
     #[cfg(test)]
+    pub(super) fn block_next_flush_phase(&self, phase: FlushPhase) -> FlushPhaseBlocker {
+        FlushPhaseBlocker {
+            handle: self.inner.dependencies.__failpoint_registry().arm_pause(
+                phase.failpoint_name(),
+                crate::failpoints::FailpointMode::Once,
+            ),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn block_next_compaction_phase(
         &self,
         phase: CompactionPhase,
@@ -2332,6 +2442,16 @@ impl Db {
         let metadata = BTreeMap::from([("sequence".to_string(), sequence.get().to_string())]);
         let _ = self
             .__run_failpoint(phase.failpoint_name(), metadata)
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn maybe_pause_flush_phase(
+        &self,
+        phase: FlushPhase,
+    ) -> Result<(), StorageError> {
+        let _ = self
+            .__run_failpoint(phase.failpoint_name(), BTreeMap::new())
             .await?;
         Ok(())
     }
