@@ -886,6 +886,288 @@ pub struct HybridReadScenario {
     pub cut_points: Vec<ScheduledHybridReadCutPoint>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryReading {
+    pub device_id: String,
+    pub reading_at_ms: u64,
+    pub temperature_c: i64,
+    pub humidity_pct: i64,
+    pub battery_mv: i64,
+    pub alert_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryDeviceState {
+    pub device_id: String,
+    pub latest_reading_at_ms: u64,
+    pub temperature_c: i64,
+    pub humidity_pct: i64,
+    pub battery_mv: i64,
+    pub alert_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryProjectionColumn {
+    TemperatureC,
+    HumidityPct,
+    BatteryMv,
+    AlertActive,
+}
+
+impl TelemetryProjectionColumn {
+    pub const ALL: [Self; 4] = [
+        Self::TemperatureC,
+        Self::HumidityPct,
+        Self::BatteryMv,
+        Self::AlertActive,
+    ];
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryWindow {
+    pub device_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryScanRequest {
+    pub window: TelemetryWindow,
+    pub columns: Vec<TelemetryProjectionColumn>,
+    pub only_alerts: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryProjectedReading {
+    pub device_id: String,
+    pub reading_at_ms: u64,
+    pub temperature_c: Option<i64>,
+    pub humidity_pct: Option<i64>,
+    pub battery_mv: Option<i64>,
+    pub alert_active: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryWindowSummary {
+    pub device_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub reading_count: usize,
+    pub alert_count: usize,
+    pub min_temperature_c: Option<i64>,
+    pub max_temperature_c: Option<i64>,
+    pub average_temperature_c: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryAppOracle {
+    readings_by_device: BTreeMap<String, BTreeMap<u64, TelemetryReading>>,
+}
+
+impl TelemetryAppOracle {
+    pub fn apply_ingest<I>(&mut self, readings: I)
+    where
+        I: IntoIterator<Item = TelemetryReading>,
+    {
+        for reading in readings {
+            self.readings_by_device
+                .entry(reading.device_id.clone())
+                .or_default()
+                .insert(reading.reading_at_ms, reading);
+        }
+    }
+
+    pub fn apply_operation(&mut self, operation: &TelemetryWorkloadOperation) {
+        if let TelemetryWorkloadOperation::Ingest { readings } = operation {
+            self.apply_ingest(readings.clone());
+        }
+    }
+
+    pub fn latest_state(&self, device_id: &str) -> Option<TelemetryDeviceState> {
+        let reading = self
+            .readings_by_device
+            .get(device_id)
+            .and_then(|readings| readings.last_key_value())
+            .map(|(_, reading)| reading)?;
+        Some(TelemetryDeviceState {
+            device_id: reading.device_id.clone(),
+            latest_reading_at_ms: reading.reading_at_ms,
+            temperature_c: reading.temperature_c,
+            humidity_pct: reading.humidity_pct,
+            battery_mv: reading.battery_mv,
+            alert_active: reading.alert_active,
+        })
+    }
+
+    pub fn scan(&self, request: &TelemetryScanRequest) -> Vec<TelemetryProjectedReading> {
+        let readings = self
+            .readings_by_device
+            .get(&request.window.device_id)
+            .into_iter()
+            .flat_map(|device_readings| {
+                device_readings.range(request.window.start_ms..request.window.end_ms)
+            })
+            .map(|(_, reading)| reading)
+            .filter(|reading| !request.only_alerts || reading.alert_active);
+
+        readings
+            .map(|reading| projected_reading(reading, &request.columns))
+            .collect()
+    }
+
+    pub fn summarize(&self, window: &TelemetryWindow) -> TelemetryWindowSummary {
+        let readings = self
+            .readings_by_device
+            .get(&window.device_id)
+            .into_iter()
+            .flat_map(|device_readings| device_readings.range(window.start_ms..window.end_ms))
+            .map(|(_, reading)| reading)
+            .collect::<Vec<_>>();
+        let reading_count = readings.len();
+        let alert_count = readings
+            .iter()
+            .filter(|reading| reading.alert_active)
+            .count();
+        let min_temperature_c = readings.iter().map(|reading| reading.temperature_c).min();
+        let max_temperature_c = readings.iter().map(|reading| reading.temperature_c).max();
+        let average_temperature_c = (!readings.is_empty()).then(|| {
+            readings
+                .iter()
+                .map(|reading| reading.temperature_c as f64)
+                .sum::<f64>()
+                / readings.len() as f64
+        });
+
+        TelemetryWindowSummary {
+            device_id: window.device_id.clone(),
+            start_ms: window.start_ms,
+            end_ms: window.end_ms,
+            reading_count,
+            alert_count,
+            min_temperature_c,
+            max_temperature_c,
+            average_temperature_c,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryWorkloadConfig {
+    pub device_count: usize,
+    pub readings_per_device: usize,
+    pub base_timestamp_ms: u64,
+    pub reading_interval_ms: u64,
+    pub ingest_batch_size: usize,
+    pub scan_columns: Vec<TelemetryProjectionColumn>,
+    pub include_only_alert_queries: bool,
+}
+
+impl Default for TelemetryWorkloadConfig {
+    fn default() -> Self {
+        Self {
+            device_count: 3,
+            readings_per_device: 4,
+            base_timestamp_ms: 1_000,
+            reading_interval_ms: 25,
+            ingest_batch_size: 2,
+            scan_columns: vec![
+                TelemetryProjectionColumn::TemperatureC,
+                TelemetryProjectionColumn::AlertActive,
+            ],
+            include_only_alert_queries: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum TelemetryWorkloadOperation {
+    Ingest { readings: Vec<TelemetryReading> },
+    ReadState { device_id: String },
+    Scan { request: TelemetryScanRequest },
+    Summarize { window: TelemetryWindow },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryWorkloadScenario {
+    pub seed: u64,
+    pub config: TelemetryWorkloadConfig,
+    pub operations: Vec<TelemetryWorkloadOperation>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TelemetryWorkloadGenerator {
+    seed: u64,
+}
+
+impl TelemetryWorkloadGenerator {
+    pub fn new(seed: u64) -> Self {
+        Self { seed }
+    }
+
+    pub fn generate(&self, config: &TelemetryWorkloadConfig) -> TelemetryWorkloadScenario {
+        let rng = DeterministicRng::seeded(self.seed);
+        let mut operations = Vec::new();
+        let mut staged = Vec::new();
+
+        for device_index in 0..config.device_count.max(1) {
+            let device_id = format!("device-{device_index:02}");
+            for reading_index in 0..config.readings_per_device.max(1) {
+                let jitter = choose_index(&rng, 5) as u64;
+                staged.push(TelemetryReading {
+                    device_id: device_id.clone(),
+                    reading_at_ms: config
+                        .base_timestamp_ms
+                        .saturating_add(device_index as u64)
+                        .saturating_add(reading_index as u64 * config.reading_interval_ms.max(1)),
+                    temperature_c: 20 + choose_index(&rng, 10) as i64 + jitter as i64,
+                    humidity_pct: 35 + choose_index(&rng, 30) as i64,
+                    battery_mv: 3600 - (reading_index as i64 * 10),
+                    alert_active: rng.next_u64().is_multiple_of(3),
+                });
+
+                if staged.len() >= config.ingest_batch_size.max(1) {
+                    operations.push(TelemetryWorkloadOperation::Ingest {
+                        readings: std::mem::take(&mut staged),
+                    });
+                }
+            }
+        }
+        if !staged.is_empty() {
+            operations.push(TelemetryWorkloadOperation::Ingest { readings: staged });
+        }
+
+        for device_index in 0..config.device_count.max(1) {
+            let device_id = format!("device-{device_index:02}");
+            let window = TelemetryWindow {
+                device_id: device_id.clone(),
+                start_ms: config.base_timestamp_ms,
+                end_ms: config.base_timestamp_ms.saturating_add(
+                    config.readings_per_device.max(1) as u64 * config.reading_interval_ms.max(1),
+                ),
+            };
+            operations.push(TelemetryWorkloadOperation::ReadState {
+                device_id: device_id.clone(),
+            });
+            operations.push(TelemetryWorkloadOperation::Scan {
+                request: TelemetryScanRequest {
+                    window: window.clone(),
+                    columns: config.scan_columns.clone(),
+                    only_alerts: config.include_only_alert_queries
+                        && rng.next_u64().is_multiple_of(2),
+                },
+            });
+            operations.push(TelemetryWorkloadOperation::Summarize { window });
+        }
+
+        TelemetryWorkloadScenario {
+            seed: self.seed,
+            config: config.clone(),
+            operations,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HybridReadWorkloadGenerator {
     seed: u64,
@@ -952,6 +1234,24 @@ impl HybridReadWorkloadGenerator {
             operations,
             cut_points,
         }
+    }
+}
+
+fn projected_reading(
+    reading: &TelemetryReading,
+    columns: &[TelemetryProjectionColumn],
+) -> TelemetryProjectedReading {
+    let include = |column| columns.contains(&column);
+    TelemetryProjectedReading {
+        device_id: reading.device_id.clone(),
+        reading_at_ms: reading.reading_at_ms,
+        temperature_c: include(TelemetryProjectionColumn::TemperatureC)
+            .then_some(reading.temperature_c),
+        humidity_pct: include(TelemetryProjectionColumn::HumidityPct)
+            .then_some(reading.humidity_pct),
+        battery_mv: include(TelemetryProjectionColumn::BatteryMv).then_some(reading.battery_mv),
+        alert_active: include(TelemetryProjectionColumn::AlertActive)
+            .then_some(reading.alert_active),
     }
 }
 
@@ -1536,5 +1836,110 @@ mod tests {
                 .expect("feature-disabled scan"),
             baseline
         );
+    }
+
+    #[test]
+    fn telemetry_workload_generation_is_seed_stable() {
+        let config = TelemetryWorkloadConfig::default();
+        let first = TelemetryWorkloadGenerator::new(0x5858).generate(&config);
+        let second = TelemetryWorkloadGenerator::new(0x5858).generate(&config);
+        let different = TelemetryWorkloadGenerator::new(0x5859).generate(&config);
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert!(
+            first
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, TelemetryWorkloadOperation::Scan { .. }))
+        );
+    }
+
+    #[test]
+    fn telemetry_oracle_tracks_latest_state_scans_and_summaries() {
+        let mut oracle = TelemetryAppOracle::default();
+        oracle.apply_ingest([
+            TelemetryReading {
+                device_id: "device-01".to_string(),
+                reading_at_ms: 100,
+                temperature_c: 20,
+                humidity_pct: 40,
+                battery_mv: 3600,
+                alert_active: false,
+            },
+            TelemetryReading {
+                device_id: "device-01".to_string(),
+                reading_at_ms: 200,
+                temperature_c: 22,
+                humidity_pct: 42,
+                battery_mv: 3590,
+                alert_active: true,
+            },
+            TelemetryReading {
+                device_id: "device-01".to_string(),
+                reading_at_ms: 300,
+                temperature_c: 24,
+                humidity_pct: 44,
+                battery_mv: 3580,
+                alert_active: true,
+            },
+        ]);
+
+        assert_eq!(
+            oracle.latest_state("device-01"),
+            Some(TelemetryDeviceState {
+                device_id: "device-01".to_string(),
+                latest_reading_at_ms: 300,
+                temperature_c: 24,
+                humidity_pct: 44,
+                battery_mv: 3580,
+                alert_active: true,
+            })
+        );
+
+        let projected = oracle.scan(&TelemetryScanRequest {
+            window: TelemetryWindow {
+                device_id: "device-01".to_string(),
+                start_ms: 100,
+                end_ms: 301,
+            },
+            columns: vec![
+                TelemetryProjectionColumn::TemperatureC,
+                TelemetryProjectionColumn::AlertActive,
+            ],
+            only_alerts: true,
+        });
+        assert_eq!(
+            projected,
+            vec![
+                TelemetryProjectedReading {
+                    device_id: "device-01".to_string(),
+                    reading_at_ms: 200,
+                    temperature_c: Some(22),
+                    humidity_pct: None,
+                    battery_mv: None,
+                    alert_active: Some(true),
+                },
+                TelemetryProjectedReading {
+                    device_id: "device-01".to_string(),
+                    reading_at_ms: 300,
+                    temperature_c: Some(24),
+                    humidity_pct: None,
+                    battery_mv: None,
+                    alert_active: Some(true),
+                },
+            ]
+        );
+
+        let summary = oracle.summarize(&TelemetryWindow {
+            device_id: "device-01".to_string(),
+            start_ms: 100,
+            end_ms: 301,
+        });
+        assert_eq!(summary.reading_count, 3);
+        assert_eq!(summary.alert_count, 2);
+        assert_eq!(summary.min_temperature_c, Some(20));
+        assert_eq!(summary.max_temperature_c, Some(24));
+        assert_eq!(summary.average_temperature_c, Some(22.0));
     }
 }
