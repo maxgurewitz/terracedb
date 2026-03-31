@@ -1,0 +1,16 @@
+[package]
+name = "terracedb-example-retention-api"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+terracedb = { path = "../.." }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+terracedb-simulation = { path = "../../crates/terracedb-simulation" }
+turmoil = "0.7.1"

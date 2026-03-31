@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/terracedb-bricks",
     "crates/terracedb-http",
+    "examples/retention-api",
     "examples/todo-api",
     "crates/terracedb-records",
     "crates/terracedb-relays",
