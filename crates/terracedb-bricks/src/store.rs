@@ -3,6 +3,7 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -132,6 +133,16 @@ fn object_info_from_meta(meta: StandardObjectMeta) -> BlobObjectInfo {
         etag: meta.e_tag,
         last_modified,
     }
+}
+
+fn current_timestamp() -> Timestamp {
+    Timestamp::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64,
+    )
 }
 
 pub const DEFAULT_MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -567,7 +578,7 @@ impl BlobStore for InMemoryBlobStore {
             size_bytes: bytes.len() as u64,
             content_type: opts.content_type,
             etag: Some(format!("mem-{:016x}", bytes.len())),
-            last_modified: None,
+            last_modified: Some(current_timestamp()),
         };
         lock(&self.inner.objects).insert(
             key.to_string(),

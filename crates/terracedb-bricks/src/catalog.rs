@@ -1,13 +1,15 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -21,16 +23,15 @@ use terracedb::{
 #[cfg(test)]
 use parking_lot::Mutex;
 
-use crate::store::stream_from_bytes;
 use crate::{
     BLOB_ACTIVITY_TABLE_NAME, BLOB_ALIAS_TABLE_NAME, BLOB_CATALOG_TABLE_NAME,
     BLOB_OBJECT_GC_TABLE_NAME, BlobActivityEntry, BlobActivityId, BlobActivityKey,
     BlobActivityKind, BlobActivityOptions, BlobActivityReceiver, BlobActivityStream, BlobAlias,
-    BlobAliasKey, BlobCatalogKey, BlobCollection, BlobCollectionConfig, BlobError, BlobHandle,
-    BlobId, BlobIndexState, BlobLocator, BlobMetadata, BlobObjectGcKey, BlobObjectLayout,
-    BlobPutOptions, BlobReadOptions, BlobReadResult, BlobSearchRow, BlobSearchStream, BlobStore,
-    BlobStoreByteStream, BlobStoreError, BlobWrite, BlobWriteData, JsonValue,
-    frozen_table_descriptors,
+    BlobAliasKey, BlobCatalogKey, BlobCollection, BlobCollectionConfig, BlobError, BlobGcOptions,
+    BlobGcResult, BlobHandle, BlobId, BlobIndexState, BlobLocator, BlobMetadata, BlobObjectGcKey,
+    BlobObjectInfo, BlobObjectLayout, BlobPutOptions, BlobReadOptions, BlobReadResult,
+    BlobSearchRow, BlobSearchStream, BlobStore, BlobStoreByteStream, BlobStoreError, BlobWrite,
+    BlobWriteData, JsonValue, frozen_table_descriptors, upload_blob_bytes,
 };
 
 const MAX_METADATA_CONFLICT_RETRIES: usize = 16;
@@ -88,6 +89,8 @@ struct BlobObjectGcRow {
     last_published_at: Timestamp,
     current_blob_id: Option<BlobId>,
     pending_delete_at: Option<Timestamp>,
+    #[serde(default = "default_gc_row_published_once")]
+    published_once: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,6 +108,7 @@ struct BlobActivityRow {
 enum TestFailpoint {
     AfterUploadBeforePublish,
     AfterPublishBeforeAck,
+    AfterGcDeleteBeforeCommit,
 }
 
 #[derive(Clone, Debug)]
@@ -367,11 +371,13 @@ impl TerracedbBlobCollection {
                 content_type: content_type.clone(),
                 first_published_at: existing_new_gc
                     .as_ref()
+                    .filter(|row| row.published_once)
                     .map(|row| row.first_published_at)
                     .unwrap_or(published_at),
                 last_published_at: published_at,
                 current_blob_id: Some(blob_id),
                 pending_delete_at: None,
+                published_once: true,
             };
 
             let mut batch = self.inner.db.write_batch();
@@ -667,6 +673,188 @@ impl TerracedbBlobCollection {
         )))
     }
 
+    async fn record_orphan_candidate_with_retry(
+        &self,
+        object: &BlobObjectInfo,
+        digest: &str,
+    ) -> Result<(), BlobError> {
+        for _attempt in 0..MAX_METADATA_CONFLICT_RETRIES {
+            let snapshot = self.inner.db.snapshot().await;
+            let existing = read_gc_row_at(
+                &snapshot,
+                &self.inner.gc_table,
+                self.inner.config.namespace(),
+                &object.key,
+            )
+            .await?;
+            if existing.is_some() {
+                return Ok(());
+            }
+
+            let observed_at = now_timestamp();
+            let gc_key = BlobObjectGcKey {
+                namespace: self.inner.config.namespace().to_string(),
+                object_key: object.key.clone(),
+            };
+            let gc_row = BlobObjectGcRow {
+                object_key: object.key.clone(),
+                digest: digest.to_string(),
+                size_bytes: object.size_bytes,
+                content_type: object.content_type.clone(),
+                first_published_at: observed_at,
+                last_published_at: observed_at,
+                current_blob_id: None,
+                pending_delete_at: Some(observed_at),
+                published_once: false,
+            };
+
+            let mut batch = self.inner.db.write_batch();
+            let mut read_set = ReadSet::default();
+            batch.put(&self.inner.gc_table, gc_key.encode()?, encode_row(&gc_row)?);
+            read_set.add(&self.inner.gc_table, gc_key.encode()?, snapshot.sequence());
+
+            match self
+                .inner
+                .db
+                .commit(batch, CommitOptions::default().with_read_set(read_set))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(CommitError::Conflict) => continue,
+                Err(error) => return Err(map_commit_error(error)),
+            }
+        }
+
+        Err(BlobError::Storage(StorageError::timeout(
+            "blob orphan-gc bookkeeping conflicted too many times",
+        )))
+    }
+
+    async fn collect_live_object_keys(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<BTreeSet<String>, BlobError> {
+        let prefix = BlobCatalogKey::namespace_prefix(self.inner.config.namespace())?;
+        let mut rows = snapshot
+            .scan_prefix(&self.inner.catalog_table, prefix, ScanOptions::default())
+            .await
+            .map_err(map_read_error)?;
+
+        let mut keys = BTreeSet::new();
+        while let Some((_key, value)) = rows.next().await {
+            let row = decode_row::<BlobCatalogRow>(value, BLOB_CATALOG_TABLE_NAME)?;
+            keys.insert(row.object_key);
+        }
+
+        Ok(keys)
+    }
+
+    async fn collect_gc_rows(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<BlobObjectGcRow>, BlobError> {
+        let prefix = BlobObjectGcKey::namespace_prefix(self.inner.config.namespace())?;
+        let mut rows = snapshot
+            .scan_prefix(&self.inner.gc_table, prefix, ScanOptions::default())
+            .await
+            .map_err(map_read_error)?;
+
+        let mut gc_rows = Vec::new();
+        while let Some((_key, value)) = rows.next().await {
+            gc_rows.push(decode_row::<BlobObjectGcRow>(
+                value,
+                BLOB_OBJECT_GC_TABLE_NAME,
+            )?);
+        }
+
+        Ok(gc_rows)
+    }
+
+    async fn sweep_gc_row_with_retry(&self, object_key: &str) -> Result<bool, BlobError> {
+        for _attempt in 0..MAX_METADATA_CONFLICT_RETRIES {
+            let snapshot = self.inner.db.snapshot().await;
+            if self
+                .find_blob_reference(&snapshot, object_key)
+                .await?
+                .is_some()
+            {
+                return Ok(false);
+            }
+
+            let Some(row) = read_gc_row_at(
+                &snapshot,
+                &self.inner.gc_table,
+                self.inner.config.namespace(),
+                object_key,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            if row.pending_delete_at.is_none() {
+                return Ok(false);
+            }
+
+            match self.inner.blob_store.delete(object_key).await {
+                Ok(()) | Err(BlobStoreError::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            #[cfg(test)]
+            self.trigger_failpoint(TestFailpoint::AfterGcDeleteBeforeCommit)?;
+
+            let gc_key = BlobObjectGcKey {
+                namespace: self.inner.config.namespace().to_string(),
+                object_key: object_key.to_string(),
+            };
+            let mut batch = self.inner.db.write_batch();
+            let mut read_set = ReadSet::default();
+            batch.delete(&self.inner.gc_table, gc_key.encode()?);
+            read_set.add(&self.inner.gc_table, gc_key.encode()?, snapshot.sequence());
+
+            match self
+                .inner
+                .db
+                .commit(batch, CommitOptions::default().with_read_set(read_set))
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(CommitError::Conflict) => continue,
+                Err(error) => return Err(map_commit_error(error)),
+            }
+        }
+
+        Err(BlobError::Storage(StorageError::timeout(
+            "blob object gc conflicted too many times",
+        )))
+    }
+
+    async fn find_blob_reference(
+        &self,
+        snapshot: &Snapshot,
+        object_key: &str,
+    ) -> Result<Option<BlobMetadata>, BlobError> {
+        let prefix = BlobCatalogKey::namespace_prefix(self.inner.config.namespace())?;
+        let mut rows = snapshot
+            .scan_prefix(&self.inner.catalog_table, prefix, ScanOptions::default())
+            .await
+            .map_err(map_read_error)?;
+
+        while let Some((key, value)) = rows.next().await {
+            let catalog_key = decode_catalog_key(&key)?;
+            let row = decode_row::<BlobCatalogRow>(value, BLOB_CATALOG_TABLE_NAME)?;
+            if row.object_key == object_key {
+                return Ok(Some(catalog_row_to_metadata(
+                    self.inner.config.namespace(),
+                    catalog_key.blob_id,
+                    row,
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
     #[cfg(test)]
     fn arm_failpoint(&self, failpoint: TestFailpoint) {
         self.inner.failpoints.lock().push(failpoint);
@@ -697,47 +885,29 @@ impl BlobCollection for TerracedbBlobCollection {
         let tags = input.tags.clone();
         let metadata_fields = input.metadata.clone();
         let bytes = collect_write_bytes(input.data).await?;
-        let digest = compute_stub_digest(&bytes);
         let blob_id = self.next_blob_id();
-        let object_key = self.inner.layout.object_key(&format!("stub/{blob_id}"));
-
-        let info = self
-            .inner
-            .blob_store
-            .put(
-                &object_key,
-                stream_from_bytes(bytes.clone()),
-                BlobPutOptions {
-                    content_type: content_type.clone(),
-                    expected_size: Some(bytes.len() as u64),
-                },
-            )
+        let receipt = upload_blob_bytes(
+            self.inner.blob_store.as_ref(),
+            &self.inner.layout,
+            Bytes::from(bytes),
+            BlobPutOptions {
+                content_type: content_type.clone(),
+                expected_size: None,
+            },
+        )
+        .await?;
+        self.record_orphan_candidate_with_retry(&receipt.object, &receipt.digest)
             .await?;
-
-        if info.key != object_key {
-            return Err(corruption(format!(
-                "blob store acknowledged upload for {} with mismatched key {}",
-                object_key, info.key
-            )));
-        }
-        if info.size_bytes != bytes.len() as u64 {
-            return Err(corruption(format!(
-                "blob store acknowledged upload for {} with mismatched size {} (expected {})",
-                object_key,
-                info.size_bytes,
-                bytes.len()
-            )));
-        }
 
         #[cfg(test)]
         self.trigger_failpoint(TestFailpoint::AfterUploadBeforePublish)?;
 
         self.publish_with_retry(
             blob_id,
-            object_key.clone(),
+            receipt.object.key.clone(),
             alias,
-            digest.clone(),
-            bytes.len() as u64,
+            receipt.digest.clone(),
+            receipt.object.size_bytes,
             content_type,
             tags,
             metadata_fields,
@@ -749,9 +919,9 @@ impl BlobCollection for TerracedbBlobCollection {
 
         Ok(BlobHandle {
             id: blob_id,
-            object_key,
-            digest,
-            size_bytes: bytes.len() as u64,
+            object_key: receipt.object.key,
+            digest: receipt.digest,
+            size_bytes: receipt.object.size_bytes,
         })
     }
 
@@ -804,6 +974,93 @@ impl BlobCollection for TerracedbBlobCollection {
 
     async fn delete(&self, target: BlobLocator) -> Result<(), BlobError> {
         self.delete_with_retry(target).await
+    }
+
+    async fn collect_garbage(&self, opts: BlobGcOptions) -> Result<BlobGcResult, BlobError> {
+        let stats = self.inner.db.table_stats(&self.inner.catalog_table).await;
+        let snapshots_pin_published_gc = stats.active_snapshot_count > 0;
+        let snapshot = self.inner.db.snapshot().await;
+        let live = self.collect_live_object_keys(&snapshot).await?;
+        let gc_rows = self.collect_gc_rows(&snapshot).await?;
+        let tracked_keys = gc_rows
+            .iter()
+            .map(|row| row.object_key.clone())
+            .collect::<BTreeSet<_>>();
+        let listed = self
+            .inner
+            .blob_store
+            .list_prefix(&self.inner.layout.object_prefix())
+            .await?;
+        let now = now_timestamp();
+
+        let mut result = BlobGcResult {
+            live_objects: live.len(),
+            tracked_objects: gc_rows.len(),
+            discovered_orphans: listed
+                .iter()
+                .filter(|info| !live.contains(&info.key) && !tracked_keys.contains(&info.key))
+                .count(),
+            ..BlobGcResult::default()
+        };
+        let mut tracked_candidates = Vec::new();
+
+        for row in gc_rows {
+            if live.contains(&row.object_key) {
+                result.retained_by_reference += 1;
+                continue;
+            }
+            let Some(pending_delete_at) = row.pending_delete_at else {
+                continue;
+            };
+            if !past_grace(Some(pending_delete_at), now, opts.grace_period) {
+                result.retained_by_grace += 1;
+                continue;
+            }
+            if row.published_once && snapshots_pin_published_gc {
+                result.retained_by_snapshots += 1;
+                continue;
+            }
+            tracked_candidates.push(row.object_key);
+        }
+
+        for object_key in tracked_candidates {
+            if opts
+                .max_objects
+                .is_some_and(|limit| result.deleted_objects >= limit)
+            {
+                result.retained_by_grace += 1;
+                continue;
+            }
+            if self.sweep_gc_row_with_retry(&object_key).await? {
+                result.deleted_objects += 1;
+            }
+        }
+
+        for info in listed {
+            if live.contains(&info.key) || tracked_keys.contains(&info.key) {
+                continue;
+            }
+            if !past_grace(info.last_modified, now, opts.grace_period) {
+                result.retained_by_grace += 1;
+                continue;
+            }
+            if opts
+                .max_objects
+                .is_some_and(|limit| result.deleted_objects >= limit)
+            {
+                result.retained_by_grace += 1;
+                continue;
+            }
+
+            match self.inner.blob_store.delete(&info.key).await {
+                Ok(()) | Err(BlobStoreError::NotFound { .. }) => {
+                    result.deleted_objects += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(result)
     }
 
     async fn search(&self, query: crate::BlobQuery) -> Result<BlobSearchStream, BlobError> {
@@ -1074,14 +1331,24 @@ fn updated_gc_row_after_unpublish(
         pending_delete_at: still_referenced
             .map(|_| None)
             .unwrap_or(Some(unpublished_at)),
+        published_once: true,
     }
 }
 
-fn compute_stub_digest(bytes: &[u8]) -> String {
-    let checksum = bytes.iter().fold(0_u64, |acc, byte| {
-        acc.wrapping_mul(1099511628211).wrapping_add(*byte as u64)
-    });
-    format!("stub:{checksum:016x}:{:016x}", bytes.len())
+fn default_gc_row_published_once() -> bool {
+    true
+}
+
+fn past_grace(reference: Option<Timestamp>, now: Timestamp, grace_period: Duration) -> bool {
+    if grace_period.is_zero() {
+        return true;
+    }
+
+    let Some(reference) = reference else {
+        return false;
+    };
+    let grace_micros = grace_period.as_micros().min(u64::MAX as u128) as u64;
+    reference.get().saturating_add(grace_micros) <= now.get()
 }
 
 async fn collect_write_bytes(data: BlobWriteData) -> Result<Vec<u8>, BlobStoreError> {
@@ -1298,7 +1565,10 @@ mod tests {
         StubObjectStore, StubRng, TieredDurabilityMode, TieredStorageConfig,
     };
 
-    use crate::{BlobCollection as _, BlobError, BlobWrite};
+    use crate::{
+        BlobCollection as _, BlobError, BlobGcOptions, BlobObjectLayout, BlobWrite,
+        compute_blob_digest,
+    };
 
     use super::{TerracedbBlobCollection, TestFailpoint};
 
@@ -1370,12 +1640,18 @@ mod tests {
     async fn upload_complete_before_publish_failure_leaves_no_visible_metadata() {
         let harness = TestHarness::new("/bricks-fail-after-upload");
         let collection = harness.open_collection(true).await;
+        let payload = b"hello";
+        let layout = BlobObjectLayout::new("", "docs").expect("layout");
+        let digest = compute_blob_digest(payload);
+        let object_key = layout
+            .content_addressed_key(&digest)
+            .expect("content-addressed key");
         collection.arm_failpoint(TestFailpoint::AfterUploadBeforePublish);
 
         let error = collection
             .put(BlobWrite {
                 alias: Some(BlobAlias::new("docs/latest").expect("alias")),
-                data: crate::BlobWriteData::bytes("hello"),
+                data: crate::BlobWriteData::bytes(payload.as_slice()),
                 content_type: Some("text/plain".to_string()),
                 tags: BTreeMap::new(),
                 metadata: BTreeMap::new(),
@@ -1394,6 +1670,20 @@ mod tests {
             .await
             .expect("collect search");
         assert!(results.is_empty());
+
+        let gc = reopened
+            .collect_garbage(BlobGcOptions::default())
+            .await
+            .expect("gc orphan");
+        assert_eq!(gc.deleted_objects, 1);
+        assert!(
+            harness
+                .blob_store
+                .stat(&object_key)
+                .await
+                .expect("stat reclaimed orphan")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1462,5 +1752,50 @@ mod tests {
                 .expect("stat object")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn gc_recovers_after_interrupting_between_delete_and_gc_row_commit() {
+        let harness = TestHarness::new("/bricks-gc-interrupted-after-delete");
+        let collection = harness.open_collection(true).await;
+        let alias = BlobAlias::new("docs/latest").expect("alias");
+
+        let handle = collection
+            .put(BlobWrite {
+                alias: Some(alias.clone()),
+                data: crate::BlobWriteData::bytes("hello"),
+                content_type: Some("text/plain".to_string()),
+                tags: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("put");
+        collection
+            .delete(crate::BlobLocator::Alias(alias))
+            .await
+            .expect("delete metadata");
+        collection.arm_failpoint(TestFailpoint::AfterGcDeleteBeforeCommit);
+
+        let error = collection
+            .collect_garbage(BlobGcOptions::default())
+            .await
+            .err()
+            .expect("interrupted gc should fail");
+        assert!(matches!(error, BlobError::Storage(_)));
+        assert!(
+            harness
+                .blob_store
+                .stat(&handle.object_key)
+                .await
+                .expect("stat after interrupted delete")
+                .is_none()
+        );
+
+        let reopened = harness.open_collection(false).await;
+        let retried = reopened
+            .collect_garbage(BlobGcOptions::default())
+            .await
+            .expect("retry gc");
+        assert_eq!(retried.deleted_objects, 1);
     }
 }
