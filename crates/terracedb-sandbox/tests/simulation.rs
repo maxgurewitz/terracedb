@@ -4,8 +4,10 @@ use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 
 use terracedb_sandbox::{
-    DefaultSandboxStore, GitProvenance, PackageInstallRequest, ReadonlyViewCut,
+    BashRequest, BashService, DefaultSandboxStore, DeterministicBashService,
+    DeterministicTypeScriptService, GitProvenance, PackageInstallRequest, ReadonlyViewCut,
     ReadonlyViewRequest, ReopenSessionOptions, SandboxConfig, SandboxServices, SandboxStore,
+    TypeCheckRequest, TypeScriptService,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +19,8 @@ struct SandboxSimulationCapture {
     active_view_handles: usize,
     package_names: Vec<String>,
     branch: String,
+    typescript_diagnostics: usize,
+    bash_cwd: String,
 }
 
 fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture> {
@@ -51,6 +55,17 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 )
                 .await
                 .expect("seed base file");
+            base.fs()
+                .write_file(
+                    "/workspace/bad.ts",
+                    b"export const broken: number = \"oops\";".to_vec(),
+                    CreateOptions {
+                        create_parents: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed bad file");
 
             let session = sandbox
                 .open_session(
@@ -58,6 +73,7 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 )
                 .await
                 .expect("open session");
+            let typescript = DeterministicTypeScriptService::default();
             let packages = session
                 .install_packages(PackageInstallRequest {
                     packages: vec!["zod".to_string(), "lodash".to_string()],
@@ -73,6 +89,28 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 })
                 .await
                 .expect("open view");
+            let diagnostics = typescript
+                .check(
+                    &session,
+                    TypeCheckRequest {
+                        roots: vec!["/workspace/bad.ts".to_string()],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("check types");
+            let bash = DeterministicBashService::default();
+            let bash_report = bash
+                .run(
+                    &session,
+                    BashRequest {
+                        command: "mkdir -p scratch && cd scratch && pwd".to_string(),
+                        cwd: "/workspace".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("run bash");
             session
                 .update_provenance(|provenance| {
                     provenance.git = Some(GitProvenance {
@@ -124,6 +162,8 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                     .git
                     .and_then(|git| git.branch)
                     .expect("branch should be set"),
+                typescript_diagnostics: diagnostics.diagnostics.len(),
+                bash_cwd: bash_report.cwd,
             })
         })
 }
@@ -146,8 +186,16 @@ fn seeded_stub_sandbox_replays_open_reopen_close_and_metadata_updates() -> turmo
     assert!(
         first
             .tool_names
+            .contains(&"sandbox.typescript.check".to_string())
+    );
+    assert!(first.tool_names.contains(&"sandbox.bash.exec".to_string()));
+    assert!(
+        first
+            .tool_names
             .contains(&"sandbox.session.close".to_string())
     );
     assert!(first.revision >= 4);
+    assert_eq!(first.typescript_diagnostics, 1);
+    assert_eq!(first.bash_cwd, "/workspace/scratch");
     Ok(())
 }

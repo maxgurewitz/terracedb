@@ -156,7 +156,8 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
         ts.check(
             &session,
             TypeCheckRequest {
-                roots: vec!["/workspace/readme.ts".to_string()]
+                roots: vec!["/workspace/readme.txt".to_string()],
+                ..Default::default()
             }
         )
         .await
@@ -177,7 +178,7 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
         .await
         .expect("run bash")
         .stdout,
-        "pwd\n"
+        "/workspace\n"
     );
 
     let reopened = sandbox_store
