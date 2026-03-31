@@ -22,6 +22,7 @@ fn tiered_config(path: &str) -> DbConfig {
             durability: TieredDurabilityMode::GroupCommit,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }

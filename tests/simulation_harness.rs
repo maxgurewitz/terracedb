@@ -213,6 +213,7 @@ fn simulation_db_config(
             durability: TieredDurabilityMode::GroupCommit,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: Some(scheduler),
     }
 }
@@ -231,6 +232,7 @@ fn simulation_tiered_config(root_path: &str, durability: TieredDurabilityMode) -
             durability,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }
@@ -245,6 +247,7 @@ fn simulation_s3_primary_config(prefix: &str) -> DbConfig {
             mem_cache_size_bytes: 1024 * 1024,
             auto_flush_interval: None,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }
@@ -1747,6 +1750,7 @@ fn occ_transaction_simulation_respects_flush_modes_across_restart() -> turmoil::
                 durability: TieredDurabilityMode::Deferred,
                 local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
+            hybrid_read: Default::default(),
             scheduler: None,
         };
 
@@ -2072,6 +2076,7 @@ fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state
                 durability: TieredDurabilityMode::GroupCommit,
                 local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
+            hybrid_read: Default::default(),
             scheduler: Some(Arc::new(OffloadSimulationScheduler)),
         };
         let config = DbConfig {
@@ -2087,6 +2092,7 @@ fn cold_offload_simulation_retries_after_network_fault_and_recovers_remote_state
                 durability: TieredDurabilityMode::GroupCommit,
                 local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
+            hybrid_read: Default::default(),
             scheduler: Some(Arc::new(OffloadSimulationScheduler)),
         };
 
@@ -2178,6 +2184,7 @@ fn delete_retention_simulation_bypasses_cold_uploads_and_recovers_expired_state(
                     durability: TieredDurabilityMode::GroupCommit,
                     local_retention: terracedb::TieredLocalRetentionMode::Delete,
                 }),
+                hybrid_read: Default::default(),
                 scheduler: Some(Arc::new(OffloadSimulationScheduler)),
             };
             let config = DbConfig {
@@ -2193,6 +2200,7 @@ fn delete_retention_simulation_bypasses_cold_uploads_and_recovers_expired_state(
                     durability: TieredDurabilityMode::GroupCommit,
                     local_retention: terracedb::TieredLocalRetentionMode::Delete,
                 }),
+                hybrid_read: Default::default(),
                 scheduler: Some(Arc::new(OffloadSimulationScheduler)),
             };
 

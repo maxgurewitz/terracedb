@@ -8,6 +8,7 @@ pub mod current_state;
 pub mod engine;
 pub mod error;
 pub mod failpoints;
+pub mod hybrid;
 pub mod ids;
 pub mod io;
 mod metadata_flatbuffers;
@@ -67,6 +68,22 @@ pub use error::{
 pub use failpoints::{
     FailpointAction, FailpointHandle, FailpointHit, FailpointMode, FailpointOutcome,
     FailpointRegistry,
+};
+pub use hybrid::{
+    ByteRange, COLUMNAR_V2_BASE_PART_FORMAT_VERSION, COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION,
+    COLUMNAR_V2_PROJECTION_SIDECAR_FORMAT_VERSION, COLUMNAR_V2_SKIP_INDEX_SIDECAR_FORMAT_VERSION,
+    COLUMNAR_V2_SYNOPSIS_SIDECAR_FORMAT_VERSION, ColumnarFooterPageDirectoryLoader,
+    ColumnarGranuleSynopsis, ColumnarOptionalSidecar, ColumnarSynopsisSidecar,
+    ColumnarV2ArtifactKind, ColumnarV2Compression, ColumnarV2Encoding, ColumnarV2Footer,
+    ColumnarV2FormatTag, ColumnarV2Header, ColumnarV2Mark, ColumnarV2MarkOffset,
+    ColumnarV2PageDirectory, ColumnarV2PageRef, ColumnarV2SubstreamKind, ColumnarV2SubstreamRef,
+    CompactPartDigest, CompactToWidePromotionCandidate, CompactToWidePromotionDecision,
+    CompactToWidePromotionPolicy, ConservativeCompactToWidePolicy, HybridPartDescriptor,
+    HybridReadConfig, HybridRowRef, HybridRuntimeContext, InMemoryRawByteSegmentCache,
+    PartDigestAlgorithm, PartRepairController, ProjectionSidecarDescriptor, RawByteSegmentCache,
+    RepairState, RowProjection, RowRefBatch, RowRefBatchIterator, SelectionMask,
+    SkipIndexSidecarDescriptor, StubColumnarFooterPageDirectoryLoader, StubPartRepairController,
+    SurvivorSet, ZoneMapSynopsis,
 };
 pub use ids::{
     CommitId, FieldId, IdEncodingError, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId,

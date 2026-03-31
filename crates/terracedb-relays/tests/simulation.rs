@@ -28,6 +28,7 @@ fn simulation_config(root_path: &str) -> DbConfig {
             durability: TieredDurabilityMode::Deferred,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }

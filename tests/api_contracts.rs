@@ -275,6 +275,7 @@ async fn smoke_open_uses_fake_dependencies_only() {
             mem_cache_size_bytes: 1024,
             auto_flush_interval: None,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     };
 

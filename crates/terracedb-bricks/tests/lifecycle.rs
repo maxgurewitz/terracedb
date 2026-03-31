@@ -50,6 +50,7 @@ impl Harness {
                     durability: self.durability,
                     local_retention: terracedb::TieredLocalRetentionMode::Offload,
                 }),
+                hybrid_read: Default::default(),
                 scheduler: None,
             },
             DbDependencies::new(

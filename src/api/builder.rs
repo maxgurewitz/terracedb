@@ -3,6 +3,7 @@ use super::*;
 use crate::{
     adapters::{LocalDirObjectStore, SystemClock, SystemRng, TokioFileSystem},
     config::SsdConfig,
+    hybrid::HybridReadConfig,
     io::{Clock, FileSystem, ObjectStore, Rng},
 };
 
@@ -18,11 +19,15 @@ pub const DEFAULT_S3_PRIMARY_MEM_CACHE_SIZE_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbSettings {
     storage: StorageConfig,
+    hybrid_read: HybridReadConfig,
 }
 
 impl DbSettings {
     pub fn storage(storage: StorageConfig) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            hybrid_read: HybridReadConfig::default(),
+        }
     }
 
     pub fn tiered(ssd_path: impl Into<String>, s3: S3Location) -> Self {
@@ -55,6 +60,15 @@ impl DbSettings {
 
     pub fn storage_config(&self) -> &StorageConfig {
         &self.storage
+    }
+
+    pub fn hybrid_read_config(&self) -> &HybridReadConfig {
+        &self.hybrid_read
+    }
+
+    pub fn with_hybrid_read_config(mut self, hybrid_read: HybridReadConfig) -> Self {
+        self.hybrid_read = hybrid_read;
+        self
     }
 
     pub fn into_storage(self) -> StorageConfig {
@@ -227,6 +241,7 @@ impl fmt::Debug for DbComponents {
 #[derive(Clone, Default)]
 pub struct DbBuilder {
     settings: Option<DbSettings>,
+    hybrid_read: Option<HybridReadConfig>,
     file_system: Option<Arc<dyn FileSystem>>,
     object_store: Option<Arc<dyn ObjectStore>>,
     clock: Option<Arc<dyn Clock>>,
@@ -266,6 +281,7 @@ impl DbBuilder {
 
     pub fn config(mut self, config: DbConfig) -> Self {
         self.settings = Some(DbSettings::from(config.storage));
+        self.hybrid_read = Some(config.hybrid_read);
         self.scheduler = config.scheduler;
         self
     }
@@ -312,7 +328,13 @@ impl DbBuilder {
         self
     }
 
+    pub fn hybrid_read_config(mut self, hybrid_read: HybridReadConfig) -> Self {
+        self.hybrid_read = Some(hybrid_read);
+        self
+    }
+
     pub fn into_open_parts(self) -> Result<(DbConfig, DbDependencies), OpenError> {
+        let hybrid_read_override = self.hybrid_read;
         let settings = self.settings.ok_or_else(|| {
             OpenError::InvalidConfig(
                 "db builder requires storage settings; call .tiered(...), .s3_primary(...), \
@@ -334,8 +356,11 @@ impl DbBuilder {
             self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
             self.rng.unwrap_or_else(|| Arc::new(SystemRng::default())),
         );
+        let settings_hybrid_read = settings.hybrid_read.clone();
+        let storage = settings.into_storage();
         let config = DbConfig {
-            storage: settings.into_storage(),
+            storage,
+            hybrid_read: hybrid_read_override.unwrap_or(settings_hybrid_read),
             scheduler: self.scheduler,
         };
         Ok((config, dependencies))
@@ -351,6 +376,7 @@ impl fmt::Debug for DbBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DbBuilder")
             .field("settings", &self.settings)
+            .field("hybrid_read", &self.hybrid_read)
             .field(
                 "file_system",
                 &self.file_system.as_ref().map(|_| "<dyn FileSystem>"),

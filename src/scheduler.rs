@@ -234,6 +234,7 @@ mod tests {
                     durability: TieredDurabilityMode::GroupCommit,
                     local_retention: crate::TieredLocalRetentionMode::Offload,
                 }),
+                hybrid_read: Default::default(),
                 scheduler: None,
             };
             let dependencies = DbDependencies::new(

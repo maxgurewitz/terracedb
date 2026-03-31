@@ -13,6 +13,7 @@ impl Db {
 
         async move {
             Self::validate_storage_config(&config.storage)?;
+            Self::validate_hybrid_read_config(&config.hybrid_read)?;
             let scheduler = config
                 .scheduler
                 .clone()
@@ -235,6 +236,12 @@ impl Db {
                 }
             }
         }
+    }
+
+    pub(super) fn validate_hybrid_read_config(
+        config: &crate::HybridReadConfig,
+    ) -> Result<(), OpenError> {
+        config.validate().map_err(OpenError::InvalidConfig)
     }
 
     pub(super) fn normalize_merge_operand_for_table(
