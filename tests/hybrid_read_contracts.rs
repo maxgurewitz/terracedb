@@ -2,18 +2,20 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use futures::StreamExt;
 use terracedb::{
-    ByteRange, ColumnarFooterPageDirectoryLoader, ColumnarGranuleSynopsis, ColumnarSynopsisSidecar,
-    ColumnarV2Compression, ColumnarV2Encoding, ColumnarV2Footer, ColumnarV2FormatTag,
-    ColumnarV2Header, ColumnarV2Mark, ColumnarV2MarkOffset, ColumnarV2PageDirectory,
-    ColumnarV2PageRef, ColumnarV2SubstreamKind, ColumnarV2SubstreamRef, CompactPartDigest,
-    CompactToWidePromotionCandidate, CompactToWidePromotionDecision, CompactToWidePromotionPolicy,
-    Db, DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue,
-    HybridPartDescriptor, InMemoryRawByteSegmentCache, PartDigestAlgorithm, PartRepairController,
-    ProjectionSidecarDescriptor, RawByteSegmentCache, RepairState, RowProjection, S3Location,
-    ScanOptions, SchemaDefinition, SkipIndexSidecarDescriptor, SsdConfig, StorageConfig,
-    StorageSource, StubClock, StubColumnarFooterPageDirectoryLoader, StubFileSystem,
-    StubObjectStore, StubPartRepairController, StubRng, TableConfig, TableFormat,
-    TieredDurabilityMode, TieredStorageConfig, Value, ZoneMapSynopsis,
+    BaseZoneMapPruner, ByteRange, ColumnarFooterPageDirectoryLoader, ColumnarGranuleSynopsis,
+    ColumnarSequenceBounds, ColumnarSynopsisSidecar, ColumnarV2Compression, ColumnarV2Encoding,
+    ColumnarV2Footer, ColumnarV2FormatTag, ColumnarV2GranuleRef, ColumnarV2Header, ColumnarV2Mark,
+    ColumnarV2MarkOffset, ColumnarV2PageDirectory, ColumnarV2PageRef, ColumnarV2SubstreamKind,
+    ColumnarV2SubstreamRef, CompactPartDigest, CompactToWidePromotionCandidate,
+    CompactToWidePromotionDecision, CompactToWidePromotionPolicy, Db, DbConfig, DbDependencies,
+    FieldDefinition, FieldId, FieldType, FieldValue, HybridKeyRange, HybridPartDescriptor,
+    HybridSynopsisPruner, InMemoryRawByteSegmentCache, LateMaterializationPlan,
+    PartDigestAlgorithm, PartRepairController, ProjectionSidecarDescriptor, RawByteSegmentCache,
+    RepairState, RowProjection, S3Location, ScanOptions, SchemaDefinition,
+    SkipIndexSidecarDescriptor, SsdConfig, StorageConfig, StorageSource, StubClock,
+    StubColumnarFooterPageDirectoryLoader, StubFileSystem, StubObjectStore,
+    StubPartRepairController, StubRng, TableConfig, TableFormat, TieredDurabilityMode,
+    TieredStorageConfig, Value, ZoneMapPredicate, ZoneMapSynopsis,
 };
 use terracedb_projections::{PROJECTION_CURSOR_TABLE_NAME, ProjectionRuntime};
 use terracedb_simulation::{
@@ -198,11 +200,29 @@ fn sample_loader() -> StubColumnarFooterPageDirectoryLoader {
             digests: vec![sample_digest()],
         },
         ColumnarV2PageDirectory {
+            granules: vec![ColumnarV2GranuleRef {
+                granule_index: 0,
+                first_key: b"user:1".to_vec(),
+                row_range: ByteRange::new(0, 2),
+                page_range: ByteRange::new(0, 1),
+                sequence_bounds: ColumnarSequenceBounds {
+                    min_sequence: terracedb::SequenceNumber::new(1),
+                    max_sequence: terracedb::SequenceNumber::new(2),
+                },
+                has_tombstones: false,
+            }],
             pages: vec![ColumnarV2PageRef {
+                granule_index: 0,
                 substream_ordinal: 0,
                 page_ordinal: 0,
+                first_key: b"user:1".to_vec(),
                 range: ByteRange::new(8, 24),
                 row_range: ByteRange::new(0, 2),
+                sequence_bounds: ColumnarSequenceBounds {
+                    min_sequence: terracedb::SequenceNumber::new(1),
+                    max_sequence: terracedb::SequenceNumber::new(2),
+                },
+                has_tombstones: false,
             }],
         },
     )
@@ -461,4 +481,111 @@ async fn hybrid_read_oracle_matches_current_row_and_columnar_behavior() {
     );
     assert!(missing_sidecar.fallback_to_base);
     assert!(corrupt_sidecar.fallback_to_base);
+}
+
+#[test]
+fn hybrid_pruning_and_late_materialization_contracts_compile_together() {
+    let loader = sample_loader();
+    let footer = futures::executor::block_on(loader.load_footer(&StorageSource::remote_object(
+        "cold/table-000009/SST-000009.sst",
+    )))
+    .expect("load footer");
+    let page_directory = futures::executor::block_on(loader.load_page_directory(
+        &StorageSource::remote_object("cold/table-000009/SST-000009.sst"),
+        footer.as_ref(),
+    ))
+    .expect("load page directory");
+    let plan = LateMaterializationPlan::new(
+        RowProjection::Fields(vec![FieldId::new(2)]),
+        RowProjection::Fields(vec![FieldId::new(1), FieldId::new(2), FieldId::new(3)]),
+    );
+    let outcome = BaseZoneMapPruner
+        .prune(
+            page_directory.as_ref(),
+            &footer.synopsis,
+            &HybridKeyRange {
+                start_inclusive: Some(b"user:1".to_vec()),
+                end_exclusive: Some(b"user:9".to_vec()),
+            },
+            &ZoneMapPredicate::Int64AtLeast {
+                field_id: FieldId::new(2),
+                value: 5,
+            },
+        )
+        .expect("prune hybrid metadata");
+
+    assert!(plan.needs_late_materialization());
+    assert_eq!(
+        plan.late_projection,
+        RowProjection::Fields(vec![FieldId::new(1), FieldId::new(3)])
+    );
+    assert_eq!(outcome.selected.len(), 1);
+    assert_eq!(outcome.selected[0].granule.granule_index, 0);
+    assert_eq!(outcome.stats.selected_row_upper_bound, 2);
+}
+
+#[test]
+fn hybrid_oracle_exposes_pruning_and_staged_scan_expectations() {
+    let mut oracle =
+        HybridReadOracle::new(&[HybridTableSpec::columnar("metrics", metric_schema())]);
+    oracle
+        .apply(
+            terracedb::SequenceNumber::new(1),
+            HybridReadMutation::Put {
+                table: "metrics".to_string(),
+                key: b"user:1".to_vec(),
+                value: metric_record("alice", 3, Some(false)),
+            },
+        )
+        .expect("oracle row 1");
+    oracle
+        .apply(
+            terracedb::SequenceNumber::new(2),
+            HybridReadMutation::Put {
+                table: "metrics".to_string(),
+                key: b"user:2".to_vec(),
+                value: metric_record("bob", 8, Some(true)),
+            },
+        )
+        .expect("oracle row 2");
+    oracle
+        .apply(
+            terracedb::SequenceNumber::new(3),
+            HybridReadMutation::Put {
+                table: "metrics".to_string(),
+                key: b"user:3".to_vec(),
+                value: metric_record("carol", 12, None),
+            },
+        )
+        .expect("oracle row 3");
+
+    let pruning = oracle
+        .pruning_expectation(
+            "metrics",
+            terracedb::SequenceNumber::new(3),
+            &HybridPredicate::Int64AtLeast {
+                field_id: FieldId::new(2),
+                value: 8,
+            },
+            2,
+        )
+        .expect("oracle pruning expectation");
+    let staged = oracle
+        .staged_scan_with_selection(
+            "metrics",
+            terracedb::SequenceNumber::new(3),
+            RowProjection::Fields(vec![FieldId::new(2)]),
+            RowProjection::Fields(vec![FieldId::new(1), FieldId::new(2)]),
+            &HybridPredicate::Int64AtLeast {
+                field_id: FieldId::new(2),
+                value: 8,
+            },
+        )
+        .expect("oracle staged scan");
+
+    assert_eq!(pruning.selected_granules, vec![0, 1]);
+    assert_eq!(pruning.survivor_rows, 2);
+    assert!(pruning.overread_rows_upper_bound >= pruning.survivor_rows as u64);
+    assert_eq!(staged.selection.selected_count(), 2);
+    assert_eq!(staged.survivors.len(), 2);
 }

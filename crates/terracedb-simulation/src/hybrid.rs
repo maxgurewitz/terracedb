@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use terracedb::{
-    ByteRange, DeterministicRng, FieldId, FieldValue, HybridReadConfig, Rng, RowProjection,
-    SchemaDefinition, SelectionMask, SequenceNumber, TableFormat, Value,
+    BaseZoneMapPruner, ByteRange, ColumnarGranuleSynopsis, ColumnarSequenceBounds,
+    ColumnarSynopsisSidecar, ColumnarV2FormatTag, ColumnarV2GranuleRef, ColumnarV2PageDirectory,
+    ColumnarV2PageRef, DeterministicRng, FieldId, FieldValue, HybridKeyRange, HybridReadConfig,
+    HybridSynopsisPruner, LateMaterializationPlan, Rng, RowProjection, SchemaDefinition,
+    SelectionMask, SequenceNumber, TableFormat, Value, ZoneMapPredicate, ZoneMapSynopsis,
 };
 use thiserror::Error;
 
@@ -16,6 +19,21 @@ pub struct HybridTableSpec {
 
 pub type HybridReadRows = Vec<(Vec<u8>, Value)>;
 pub type HybridSelectedRows = (SelectionMask, HybridReadRows);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridPruningExpectation {
+    pub total_granules: usize,
+    pub selected_granules: Vec<u32>,
+    pub survivor_rows: usize,
+    pub overread_rows_upper_bound: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HybridStagedScanExpectation {
+    pub plan: LateMaterializationPlan,
+    pub selection: SelectionMask,
+    pub survivors: HybridReadRows,
+}
 
 impl HybridTableSpec {
     pub fn row(name: impl Into<String>) -> Self {
@@ -180,6 +198,124 @@ impl HybridReadOracle {
         Ok((mask, survivors))
     }
 
+    pub fn pruning_expectation(
+        &self,
+        table: &str,
+        sequence: SequenceNumber,
+        predicate: &HybridPredicate,
+        granule_size: usize,
+    ) -> Result<HybridPruningExpectation, HybridReadOracleError> {
+        let visible = self.visible_versions(table, sequence)?;
+        if visible.is_empty() {
+            return Ok(HybridPruningExpectation::default());
+        }
+
+        let granule_size = granule_size.max(1);
+        let mut granules = Vec::new();
+        let mut pages = Vec::new();
+        let mut synopsis_granules = Vec::new();
+
+        for (granule_index, chunk) in visible.chunks(granule_size).enumerate() {
+            let row_start = (granule_index * granule_size) as u64;
+            let row_end = row_start + chunk.len() as u64;
+            let min_sequence = chunk
+                .iter()
+                .map(|(_, version)| version.sequence)
+                .min()
+                .unwrap_or_default();
+            let max_sequence = chunk
+                .iter()
+                .map(|(_, version)| version.sequence)
+                .max()
+                .unwrap_or_default();
+            let has_tombstones = chunk.iter().any(|(_, version)| version.value.is_none());
+            let granule_index = granule_index as u32;
+
+            granules.push(ColumnarV2GranuleRef {
+                granule_index,
+                first_key: chunk[0].0.clone(),
+                row_range: ByteRange::new(row_start, row_end),
+                page_range: ByteRange::new(granule_index as u64, granule_index as u64 + 1),
+                sequence_bounds: ColumnarSequenceBounds {
+                    min_sequence,
+                    max_sequence,
+                },
+                has_tombstones,
+            });
+            pages.push(ColumnarV2PageRef {
+                granule_index,
+                substream_ordinal: 0,
+                page_ordinal: granule_index,
+                first_key: chunk[0].0.clone(),
+                range: ByteRange::new(granule_index as u64, granule_index as u64 + 1),
+                row_range: ByteRange::new(row_start, row_end),
+                sequence_bounds: ColumnarSequenceBounds {
+                    min_sequence,
+                    max_sequence,
+                },
+                has_tombstones,
+            });
+            synopsis_granules.push(ColumnarGranuleSynopsis {
+                granule_index,
+                row_range: ByteRange::new(row_start, row_end),
+                zone_maps: build_zone_maps(chunk),
+            });
+        }
+
+        let outcome = BaseZoneMapPruner
+            .prune(
+                &ColumnarV2PageDirectory { granules, pages },
+                &ColumnarSynopsisSidecar {
+                    format_tag: ColumnarV2FormatTag::synopsis_sidecar(),
+                    part_local_id: format!("{table}-oracle"),
+                    granules: synopsis_granules,
+                    checksum: 0,
+                },
+                &HybridKeyRange::all(),
+                &zone_map_predicate(predicate),
+            )
+            .map_err(|_| HybridReadOracleError::UnsupportedOraclePruning)?;
+
+        Ok(HybridPruningExpectation {
+            total_granules: outcome.stats.inspected_granules,
+            selected_granules: outcome
+                .selected
+                .iter()
+                .map(|selection| selection.granule.granule_index)
+                .collect(),
+            survivor_rows: visible
+                .iter()
+                .filter_map(|(_, version)| version.value.as_ref())
+                .filter(|value| predicate.matches(value))
+                .count(),
+            overread_rows_upper_bound: outcome.stats.overread_row_upper_bound,
+        })
+    }
+
+    pub fn staged_scan_with_selection(
+        &self,
+        table: &str,
+        sequence: SequenceNumber,
+        predicate_projection: RowProjection,
+        final_projection: RowProjection,
+        predicate: &HybridPredicate,
+    ) -> Result<HybridStagedScanExpectation, HybridReadOracleError> {
+        let plan =
+            LateMaterializationPlan::new(predicate_projection.clone(), final_projection.clone());
+        let selection = self.selection_mask(table, sequence, &predicate_projection, predicate)?;
+        let rows = self.scan(table, sequence, &final_projection)?;
+        let survivors = rows
+            .into_iter()
+            .zip(selection.selected.iter().copied())
+            .filter_map(|(row, keep)| keep.then_some(row))
+            .collect();
+        Ok(HybridStagedScanExpectation {
+            plan,
+            selection,
+            survivors,
+        })
+    }
+
     pub fn resolve_sidecar_fallback(
         requested: HybridSidecarKind,
         state: HybridSidecarState,
@@ -222,6 +358,27 @@ impl HybridReadOracle {
             .ok_or_else(|| HybridReadOracleError::UnknownTable {
                 table: table.to_string(),
             })
+    }
+
+    fn visible_versions(
+        &self,
+        table: &str,
+        sequence: SequenceNumber,
+    ) -> Result<Vec<(Vec<u8>, HybridVersion)>, HybridReadOracleError> {
+        self.ensure_table_known(table)?;
+        let mut visible = Vec::new();
+        if let Some(table_versions) = self.versions.get(table) {
+            for (key, versions) in table_versions {
+                if let Some(version) = versions
+                    .iter()
+                    .rev()
+                    .find(|version| version.sequence <= sequence)
+                {
+                    visible.push((key.clone(), version.clone()));
+                }
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -826,6 +983,93 @@ pub enum HybridReadOracleError {
     UnexpectedRecord,
     #[error("columnar-format table unexpectedly produced byte values")]
     UnexpectedBytes,
+    #[error("hybrid oracle could not derive a pruning expectation")]
+    UnsupportedOraclePruning,
+}
+
+fn zone_map_predicate(predicate: &HybridPredicate) -> ZoneMapPredicate {
+    match predicate {
+        HybridPredicate::AlwaysTrue => ZoneMapPredicate::AlwaysTrue,
+        HybridPredicate::FieldEquals { field_id, value } => ZoneMapPredicate::FieldEquals {
+            field_id: *field_id,
+            value: value.clone(),
+        },
+        HybridPredicate::Int64AtLeast { field_id, value } => ZoneMapPredicate::Int64AtLeast {
+            field_id: *field_id,
+            value: *value,
+        },
+        HybridPredicate::BoolEquals { field_id, value } => ZoneMapPredicate::BoolEquals {
+            field_id: *field_id,
+            value: *value,
+        },
+    }
+}
+
+fn build_zone_maps(rows: &[(Vec<u8>, HybridVersion)]) -> Vec<ZoneMapSynopsis> {
+    let mut builders = BTreeMap::<FieldId, ZoneMapBuilder>::new();
+    for (_, version) in rows {
+        let Some(Value::Record(record)) = version.value.as_ref() else {
+            continue;
+        };
+        for (&field_id, value) in record {
+            builders.entry(field_id).or_default().observe(value);
+        }
+    }
+    builders
+        .into_iter()
+        .map(|(field_id, builder)| ZoneMapSynopsis {
+            field_id,
+            min_value: builder.min_value,
+            max_value: builder.max_value,
+            null_count: builder.null_count,
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct ZoneMapBuilder {
+    min_value: Option<FieldValue>,
+    max_value: Option<FieldValue>,
+    null_count: u64,
+}
+
+impl ZoneMapBuilder {
+    fn observe(&mut self, value: &FieldValue) {
+        if matches!(value, FieldValue::Null) {
+            self.null_count = self.null_count.saturating_add(1);
+            return;
+        }
+        match self.min_value.as_ref() {
+            Some(current) if !field_value_lt(value, current) => {}
+            _ => self.min_value = Some(value.clone()),
+        }
+        match self.max_value.as_ref() {
+            Some(current) if !field_value_gt(value, current) => {}
+            _ => self.max_value = Some(value.clone()),
+        }
+    }
+}
+
+fn field_value_lt(left: &FieldValue, right: &FieldValue) -> bool {
+    match (left, right) {
+        (FieldValue::Int64(left), FieldValue::Int64(right)) => left < right,
+        (FieldValue::Float64(left), FieldValue::Float64(right)) => left < right,
+        (FieldValue::String(left), FieldValue::String(right)) => left < right,
+        (FieldValue::Bytes(left), FieldValue::Bytes(right)) => left < right,
+        (FieldValue::Bool(left), FieldValue::Bool(right)) => left < right,
+        _ => false,
+    }
+}
+
+fn field_value_gt(left: &FieldValue, right: &FieldValue) -> bool {
+    match (left, right) {
+        (FieldValue::Int64(left), FieldValue::Int64(right)) => left > right,
+        (FieldValue::Float64(left), FieldValue::Float64(right)) => left > right,
+        (FieldValue::String(left), FieldValue::String(right)) => left > right,
+        (FieldValue::Bytes(left), FieldValue::Bytes(right)) => left > right,
+        (FieldValue::Bool(left), FieldValue::Bool(right)) => left > right,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -939,6 +1183,74 @@ mod tests {
                 Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(8))])),
             )]
         );
+    }
+
+    #[test]
+    fn hybrid_oracle_pruning_and_staged_scan_expectations_are_seed_stable() {
+        let mut oracle =
+            HybridReadOracle::new(&[HybridTableSpec::columnar("metrics", metric_schema())]);
+        oracle
+            .apply(
+                SequenceNumber::new(1),
+                HybridReadMutation::Put {
+                    table: "metrics".to_string(),
+                    key: b"user:1".to_vec(),
+                    value: metric_record("alice", 3),
+                },
+            )
+            .expect("apply first row");
+        oracle
+            .apply(
+                SequenceNumber::new(2),
+                HybridReadMutation::Put {
+                    table: "metrics".to_string(),
+                    key: b"user:2".to_vec(),
+                    value: metric_record("bob", 8),
+                },
+            )
+            .expect("apply second row");
+        oracle
+            .apply(
+                SequenceNumber::new(3),
+                HybridReadMutation::Put {
+                    table: "metrics".to_string(),
+                    key: b"user:3".to_vec(),
+                    value: metric_record("carol", 12),
+                },
+            )
+            .expect("apply third row");
+
+        let pruning = oracle
+            .pruning_expectation(
+                "metrics",
+                SequenceNumber::new(3),
+                &HybridPredicate::Int64AtLeast {
+                    field_id: FieldId::new(2),
+                    value: 8,
+                },
+                2,
+            )
+            .expect("oracle pruning");
+        let staged = oracle
+            .staged_scan_with_selection(
+                "metrics",
+                SequenceNumber::new(3),
+                RowProjection::Fields(vec![FieldId::new(2)]),
+                RowProjection::Fields(vec![FieldId::new(1), FieldId::new(2)]),
+                &HybridPredicate::Int64AtLeast {
+                    field_id: FieldId::new(2),
+                    value: 8,
+                },
+            )
+            .expect("staged scan");
+
+        assert_eq!(pruning.total_granules, 2);
+        assert_eq!(pruning.selected_granules, vec![0, 1]);
+        assert_eq!(pruning.survivor_rows, 2);
+        assert!(pruning.overread_rows_upper_bound >= 2);
+        assert!(staged.plan.needs_late_materialization());
+        assert_eq!(staged.selection.selected, vec![false, true, true]);
+        assert_eq!(staged.survivors.len(), 2);
     }
 
     #[test]
