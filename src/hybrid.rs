@@ -28,6 +28,14 @@ pub const COLUMNAR_V2_COMPACT_DIGEST_FORMAT_VERSION: u32 = COLUMNAR_COMPACT_DIGE
 pub const HYBRID_TABLE_FEATURES_METADATA_KEY: &str = "terracedb.hybrid";
 pub const HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY: &str = "terracedb.hybrid.compact_to_wide";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HybridProfile {
+    #[default]
+    Base,
+    Accelerated,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HybridReadConfig {
     pub raw_segment_cache_bytes: u64,
@@ -56,6 +64,17 @@ impl Default for HybridReadConfig {
 }
 
 impl HybridReadConfig {
+    pub fn for_profile(profile: HybridProfile) -> Self {
+        let mut config = Self::default();
+        if matches!(profile, HybridProfile::Accelerated) {
+            config.skip_indexes_enabled = true;
+            config.projection_sidecars_enabled = true;
+            config.aggressive_background_repair = true;
+            config.compact_to_wide_promotion_enabled = true;
+        }
+        config
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.raw_segment_cache_bytes == 0 {
             return Err("hybrid read config requires raw_segment_cache_bytes > 0".to_string());

@@ -6,6 +6,7 @@ members = [
     "crates/terracedb-http",
     "crates/terracedb-retention",
     "examples/retention-api",
+    "examples/telemetry-api",
     "examples/todo-api",
     "crates/terracedb-records",
     "crates/terracedb-relays",

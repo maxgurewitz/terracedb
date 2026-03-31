@@ -1729,6 +1729,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-example-telemetry-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-http",
+ "terracedb-records",
+ "terracedb-simulation",
+ "thiserror",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-example-todo-api"
 version = "0.1.0"
 dependencies = [

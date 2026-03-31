@@ -1,19 +1,31 @@
-use std::{io, sync::Arc};
+use std::{collections::BTreeMap, io, sync::Arc};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use terracedb::{
-    CompactionStrategy, Db, DbConfig, S3Location, ScanOptions, SsdConfig, StorageConfig,
-    StubFileSystem, StubObjectStore, TableConfig, TableFormat, TieredDurabilityMode,
+    ColumnarRecord, ColumnarTableConfigBuilder, CompactionStrategy, Db, DbConfig, FieldDefinition,
+    FieldId, FieldType, FieldValue, HybridProfile, HybridProjectionSidecarConfig, HybridReadConfig,
+    HybridTableFeatures, S3Location, ScanOptions, ScanPredicate, SchemaDefinition, SsdConfig,
+    StorageConfig, StubFileSystem, StubObjectStore, TableConfig, TableFormat, TieredDurabilityMode,
     TieredStorageConfig, Value,
     test_support::{row_table_config, test_dependencies},
 };
 use terracedb_records::{
-    BigEndianU64Codec, CodecPhase, CodecTarget, JsonValueCodec, RecordReadError, RecordStream,
-    RecordTable, RecordTransaction, RecordWriteError, Utf8StringCodec, ValueCodec,
+    BigEndianU64Codec, CodecPhase, CodecTarget, ColumnarProjection, ColumnarRecordCodec,
+    ColumnarTable, JsonValueCodec, KeyCodec, ProjectionStream, RecordCodecError, RecordReadError,
+    RecordStream, RecordTable, RecordTransaction, RecordWriteError, Utf8StringCodec, ValueCodec,
 };
 
 type JsonStringTable = RecordTable<String, TestRecord, Utf8StringCodec, JsonValueCodec<TestRecord>>;
+type SensorReadingsTable = ColumnarTable<
+    SensorReadingKey,
+    SensorReadingRecord,
+    SensorReadingKeyCodec,
+    SensorReadingRecordCodec,
+>;
+
+const TEMPERATURE_C_FIELD_ID: FieldId = FieldId::new(1);
+const ALERT_ACTIVE_FIELD_ID: FieldId = FieldId::new(2);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TestRecord {
@@ -24,6 +36,110 @@ struct TestRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ValidatedRecord {
     name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SensorReadingKey {
+    device_id: String,
+    reading_at_ms: u64,
+}
+
+impl SensorReadingKey {
+    fn new(device_id: impl Into<String>, reading_at_ms: u64) -> Self {
+        Self {
+            device_id: device_id.into(),
+            reading_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SensorReadingRecord {
+    temperature_c: i64,
+    alert_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TemperatureProjectionRow {
+    device_id: String,
+    reading_at_ms: u64,
+    temperature_c: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SensorReadingKeyCodec;
+
+impl KeyCodec<SensorReadingKey> for SensorReadingKeyCodec {
+    fn encode_key(&self, key: &SensorReadingKey) -> Result<Vec<u8>, RecordCodecError> {
+        Ok(format!("device:{}:{:020}", key.device_id, key.reading_at_ms).into_bytes())
+    }
+
+    fn decode_key(&self, key: &[u8]) -> Result<SensorReadingKey, RecordCodecError> {
+        let key = std::str::from_utf8(key).map_err(RecordCodecError::decode_key)?;
+        let (prefix, timestamp) = key.rsplit_once(':').ok_or_else(|| {
+            RecordCodecError::decode_key(io::Error::other(format!(
+                "sensor key {key} is missing a timestamp"
+            )))
+        })?;
+        let device_id = prefix.strip_prefix("device:").ok_or_else(|| {
+            RecordCodecError::decode_key(io::Error::other(format!(
+                "sensor key {key} is missing the device prefix"
+            )))
+        })?;
+        Ok(SensorReadingKey {
+            device_id: device_id.to_string(),
+            reading_at_ms: timestamp.parse().map_err(RecordCodecError::decode_key)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SensorReadingRecordCodec;
+
+impl ColumnarRecordCodec<SensorReadingRecord> for SensorReadingRecordCodec {
+    fn encode_record(
+        &self,
+        value: &SensorReadingRecord,
+    ) -> Result<ColumnarRecord, RecordCodecError> {
+        Ok(BTreeMap::from([
+            (
+                TEMPERATURE_C_FIELD_ID,
+                FieldValue::Int64(value.temperature_c),
+            ),
+            (ALERT_ACTIVE_FIELD_ID, FieldValue::Bool(value.alert_active)),
+        ]))
+    }
+
+    fn decode_record(
+        &self,
+        record: &ColumnarRecord,
+    ) -> Result<SensorReadingRecord, RecordCodecError> {
+        Ok(SensorReadingRecord {
+            temperature_c: expect_i64(record, TEMPERATURE_C_FIELD_ID, "temperature_c")?,
+            alert_active: expect_bool(record, ALERT_ACTIVE_FIELD_ID, "alert_active")?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TemperatureProjection;
+
+impl ColumnarProjection<SensorReadingKey, TemperatureProjectionRow> for TemperatureProjection {
+    fn columns(&self) -> Vec<String> {
+        vec!["temperature_c".to_string()]
+    }
+
+    fn decode_projection(
+        &self,
+        key: &SensorReadingKey,
+        record: &ColumnarRecord,
+    ) -> Result<TemperatureProjectionRow, RecordCodecError> {
+        Ok(TemperatureProjectionRow {
+            device_id: key.device_id.clone(),
+            reading_at_ms: key.reading_at_ms,
+            temperature_c: expect_i64(record, TEMPERATURE_C_FIELD_ID, "temperature_c")?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -57,7 +173,7 @@ fn validate_record(value: &ValidatedRecord) -> Result<(), terracedb_records::Rec
     Ok(())
 }
 
-fn test_config(path: &str) -> DbConfig {
+fn test_config_with_hybrid(path: &str, hybrid_read: HybridReadConfig) -> DbConfig {
     DbConfig {
         storage: StorageConfig::Tiered(TieredStorageConfig {
             ssd: SsdConfig {
@@ -71,7 +187,7 @@ fn test_config(path: &str) -> DbConfig {
             durability: TieredDurabilityMode::GroupCommit,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
-        hybrid_read: Default::default(),
+        hybrid_read,
         scheduler: None,
     }
 }
@@ -81,8 +197,17 @@ async fn open_db(
     file_system: Arc<StubFileSystem>,
     object_store: Arc<StubObjectStore>,
 ) -> Db {
+    open_db_with_hybrid(path, file_system, object_store, HybridReadConfig::default()).await
+}
+
+async fn open_db_with_hybrid(
+    path: &str,
+    file_system: Arc<StubFileSystem>,
+    object_store: Arc<StubObjectStore>,
+    hybrid_read: HybridReadConfig,
+) -> Db {
     Db::builder()
-        .config(test_config(path))
+        .config(test_config_with_hybrid(path, hybrid_read))
         .dependencies(test_dependencies(file_system, object_store))
         .open()
         .await
@@ -111,6 +236,68 @@ async fn collect_stream<K>(mut stream: RecordStream<K, TestRecord>) -> Vec<TestR
         rows.push(value);
     }
     rows
+}
+
+async fn collect_projection_stream<V>(mut stream: ProjectionStream<V>) -> Vec<V> {
+    let mut rows = Vec::new();
+    while let Some(value) = stream.next().await {
+        rows.push(value);
+    }
+    rows
+}
+
+fn sensor_reading_schema() -> SchemaDefinition {
+    SchemaDefinition {
+        version: 1,
+        fields: vec![
+            FieldDefinition {
+                id: TEMPERATURE_C_FIELD_ID,
+                name: "temperature_c".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                default: None,
+            },
+            FieldDefinition {
+                id: ALERT_ACTIVE_FIELD_ID,
+                name: "alert_active".to_string(),
+                field_type: FieldType::Bool,
+                nullable: false,
+                default: None,
+            },
+        ],
+    }
+}
+
+fn expect_i64(
+    record: &ColumnarRecord,
+    field_id: FieldId,
+    field_name: &str,
+) -> Result<i64, RecordCodecError> {
+    match record.get(&field_id) {
+        Some(FieldValue::Int64(value)) => Ok(*value),
+        Some(other) => Err(RecordCodecError::decode_value(io::Error::other(format!(
+            "{field_name} had unexpected type {other:?}"
+        )))),
+        None => Err(RecordCodecError::decode_value(io::Error::other(format!(
+            "missing {field_name}"
+        )))),
+    }
+}
+
+fn expect_bool(
+    record: &ColumnarRecord,
+    field_id: FieldId,
+    field_name: &str,
+) -> Result<bool, RecordCodecError> {
+    match record.get(&field_id) {
+        Some(FieldValue::Bool(value)) => Ok(*value),
+        Some(other) => Err(RecordCodecError::decode_value(io::Error::other(format!(
+            "{field_name} had unexpected type {other:?}"
+        )))),
+        None => Err(RecordCodecError::decode_value(io::Error::other(format!(
+            "missing {field_name}"
+        )))),
+    }
 }
 
 #[tokio::test]
@@ -334,4 +521,92 @@ async fn direct_table_scan_decodes_all_rows() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].title, "alpha");
     assert_eq!(rows[1].title, "beta");
+}
+
+#[tokio::test]
+async fn columnar_table_projected_scans_push_down_predicates_and_report_execution() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = open_db_with_hybrid(
+        "/records/columnar-projection",
+        file_system,
+        object_store,
+        HybridReadConfig::for_profile(HybridProfile::Accelerated),
+    )
+    .await;
+    let schema = sensor_reading_schema();
+    let raw = db
+        .create_table(
+            ColumnarTableConfigBuilder::new("sensor_readings", schema.clone())
+                .hybrid_features(HybridTableFeatures {
+                    skip_indexes: Vec::new(),
+                    projection_sidecars: vec![HybridProjectionSidecarConfig {
+                        name: "temperature_only".to_string(),
+                        fields: vec!["temperature_c".to_string(), "alert_active".to_string()],
+                    }],
+                })
+                .build_for_profile(HybridProfile::Accelerated),
+        )
+        .await
+        .expect("create columnar table");
+    let table = SensorReadingsTable::with_codecs(
+        raw,
+        schema,
+        SensorReadingKeyCodec,
+        SensorReadingRecordCodec,
+    );
+
+    for (reading_at_ms, temperature_c, alert_active) in
+        [(100, 71, true), (200, 72, false), (300, 73, true)]
+    {
+        table
+            .write(
+                &SensorReadingKey::new("device-01", reading_at_ms),
+                &SensorReadingRecord {
+                    temperature_c,
+                    alert_active,
+                },
+            )
+            .await
+            .expect("write sensor reading");
+    }
+    db.flush().await.expect("flush sensor readings");
+
+    let (stream, execution) = table
+        .scan_projected_with_execution(
+            &SensorReadingKey::new("device-01", 100),
+            &SensorReadingKey::new("device-01", 301),
+            &TemperatureProjection,
+            ScanOptions {
+                predicate: Some(ScanPredicate::bool_equals("alert_active", true)),
+                ..ScanOptions::default()
+            },
+        )
+        .await
+        .expect("scan projected columnar rows");
+    let rows = collect_projection_stream(stream).await;
+    assert_eq!(
+        rows,
+        vec![
+            TemperatureProjectionRow {
+                device_id: "device-01".to_string(),
+                reading_at_ms: 100,
+                temperature_c: 71,
+            },
+            TemperatureProjectionRow {
+                device_id: "device-01".to_string(),
+                reading_at_ms: 300,
+                temperature_c: 73,
+            },
+        ]
+    );
+
+    assert_eq!(execution.rows_returned, rows.len());
+    let columnar = execution
+        .columnar
+        .expect("columnar projected scan should report columnar execution");
+    assert_eq!(columnar.rows_returned, rows.len());
+    assert_eq!(columnar.sstables_considered, 1);
+    assert!(columnar.rows_evaluated >= rows.len());
+    assert!(!columnar.parts.is_empty());
 }

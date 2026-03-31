@@ -73,8 +73,10 @@ impl Table {
         end: Key,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        self.scan_at(start, end, self.db.current_sequence(), opts)
-            .await
+        Ok(self
+            .scan_at_with_execution(start, end, self.db.current_sequence(), opts)
+            .await?
+            .0)
     }
 
     pub async fn scan_prefix(
@@ -82,8 +84,10 @@ impl Table {
         prefix: KeyPrefix,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
-        self.scan_prefix_at(prefix, self.db.current_sequence(), opts)
-            .await
+        Ok(self
+            .scan_prefix_at_with_execution(prefix, self.db.current_sequence(), opts)
+            .await?
+            .0)
     }
 
     pub async fn read_at(
@@ -106,14 +110,46 @@ impl Table {
         sequence: SequenceNumber,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
+        Ok(self
+            .scan_at_with_execution(start, end, sequence, opts)
+            .await?
+            .0)
+    }
+
+    pub async fn scan_with_execution(
+        &self,
+        start: Key,
+        end: Key,
+        opts: ScanOptions,
+    ) -> Result<(KvStream, ScanExecution), ReadError> {
+        self.scan_at_with_execution(start, end, self.db.current_sequence(), opts)
+            .await
+    }
+
+    pub async fn scan_prefix_with_execution(
+        &self,
+        prefix: KeyPrefix,
+        opts: ScanOptions,
+    ) -> Result<(KvStream, ScanExecution), ReadError> {
+        self.scan_prefix_at_with_execution(prefix, self.db.current_sequence(), opts)
+            .await
+    }
+
+    pub async fn scan_at_with_execution(
+        &self,
+        start: Key,
+        end: Key,
+        sequence: SequenceNumber,
+        opts: ScanOptions,
+    ) -> Result<(KvStream, ScanExecution), ReadError> {
         let table_id = self
             .resolve_id()
             .ok_or_else(|| Db::missing_table_error(self.name()))?;
         self.db.validate_historical_read(table_id, sequence)?;
 
-        let rows = self
+        let (rows, execution) = self
             .db
-            .scan_visible(
+            .scan_visible_with_execution(
                 table_id,
                 sequence,
                 KeyMatcher::Range {
@@ -123,7 +159,7 @@ impl Table {
                 &opts,
             )
             .await?;
-        Ok(Box::pin(stream::iter(rows)))
+        Ok((Box::pin(stream::iter(rows)), execution))
     }
 
     pub async fn scan_prefix_at(
@@ -132,16 +168,28 @@ impl Table {
         sequence: SequenceNumber,
         opts: ScanOptions,
     ) -> Result<KvStream, ReadError> {
+        Ok(self
+            .scan_prefix_at_with_execution(prefix, sequence, opts)
+            .await?
+            .0)
+    }
+
+    pub async fn scan_prefix_at_with_execution(
+        &self,
+        prefix: KeyPrefix,
+        sequence: SequenceNumber,
+        opts: ScanOptions,
+    ) -> Result<(KvStream, ScanExecution), ReadError> {
         let table_id = self
             .resolve_id()
             .ok_or_else(|| Db::missing_table_error(self.name()))?;
         self.db.validate_historical_read(table_id, sequence)?;
 
-        let rows = self
+        let (rows, execution) = self
             .db
-            .scan_visible(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts)
+            .scan_visible_with_execution(table_id, sequence, KeyMatcher::Prefix(&prefix), &opts)
             .await?;
-        Ok(Box::pin(stream::iter(rows)))
+        Ok((Box::pin(stream::iter(rows)), execution))
     }
 
     pub async fn probe_skip_indexes(

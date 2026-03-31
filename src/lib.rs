@@ -31,10 +31,11 @@ pub use adapters::{
 };
 pub use api::{
     BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarCacheUsageSnapshot,
-    ColumnarRecord, CommitOptions, Db, DbBuilder, DbComponents, DbSettings, FieldDefinition,
-    FieldType, FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet, ReadSetEntry,
-    ScanOptions, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
-    WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
+    ColumnarRecord, ColumnarScanExecution, ColumnarScanPartExecution, CommitOptions, Db, DbBuilder,
+    DbComponents, DbSettings, FieldDefinition, FieldType, FieldValue, Key, KeyPrefix, KvStream,
+    NamedColumnarRecord, ReadSet, ReadSetEntry, RowScanExecution, ScanExecution,
+    ScanMaterializationSource, ScanOptions, ScanPredicate, SchemaDefinition, Snapshot, Table,
+    Value, WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
 };
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
@@ -42,8 +43,8 @@ pub use composition::{
     decode_outbox_entry,
 };
 pub use config::{
-    CompactionDecision, CompactionDecisionContext, CompactionFilter, CompactionFilterRef,
-    CompactionStrategy, DbConfig, MergeOperator, MergeOperatorRef, S3Location,
+    ColumnarTableConfigBuilder, CompactionDecision, CompactionDecisionContext, CompactionFilter,
+    CompactionFilterRef, CompactionStrategy, DbConfig, MergeOperator, MergeOperatorRef, S3Location,
     S3PrimaryStorageConfig, SsdConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
     TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, TtlCompactionFilter,
     TtlExpiryExtractor,
@@ -114,7 +115,7 @@ pub use hybrid::{
     ColumnarV2SubstreamRef, CompactPartDigest, CompactToWidePromotionCandidate,
     CompactToWidePromotionDecision, CompactToWidePromotionPolicy, ConservativeCompactToWidePolicy,
     HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY, HYBRID_TABLE_FEATURES_METADATA_KEY,
-    HybridCompactToWidePromotionConfig, HybridKeyRange, HybridPartDescriptor,
+    HybridCompactToWidePromotionConfig, HybridKeyRange, HybridPartDescriptor, HybridProfile,
     HybridProjectionSidecarConfig, HybridReadConfig, HybridRowRef, HybridRuntimeContext,
     HybridSkipIndexConfig, HybridSkipIndexFamily, HybridSynopsisPruner, HybridTableFeatures,
     InMemoryRawByteSegmentCache, LateMaterializationPlan, PartDigestAlgorithm,

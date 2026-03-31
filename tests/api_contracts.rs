@@ -219,6 +219,7 @@ async fn public_api_surface_compiles_and_is_instantiable() {
                     reverse: true,
                     limit: Some(10),
                     columns: Some(vec!["amount".to_string()]),
+                    predicate: None,
                 },
             )
             .await

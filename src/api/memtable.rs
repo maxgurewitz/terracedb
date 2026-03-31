@@ -686,9 +686,12 @@ impl ResidentRowSstable {
         projection: &ColumnProjection,
         row_indexes: &BTreeSet<usize>,
         access: ColumnarReadAccessPattern,
-    ) -> Result<BTreeMap<usize, Value>, StorageError> {
+    ) -> Result<ColumnarMaterialization, StorageError> {
         if row_indexes.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(ColumnarMaterialization {
+                rows: BTreeMap::new(),
+                source: ScanMaterializationSource::BasePart,
+            });
         }
 
         let columnar = self.columnar.as_ref().ok_or_else(|| {
@@ -702,6 +705,17 @@ impl ResidentRowSstable {
             .await?;
         let location = self.meta.storage_descriptor();
         let row_count = metadata.key_index.len();
+        let has_projection_sidecar =
+            metadata
+                .footer
+                .optional_sidecars
+                .iter()
+                .any(|descriptor| match descriptor {
+                    PersistedOptionalSidecarDescriptor::Projection(descriptor) => {
+                        Db::sidecar_projection_matches(&descriptor.projected_fields, projection)
+                    }
+                    PersistedOptionalSidecarDescriptor::SkipIndex(_) => false,
+                });
         match self
             .load_projection_sidecar(columnar_read_context, &metadata, projection)
             .await
@@ -734,7 +748,10 @@ impl ResidentRowSstable {
                     };
                     materialized.insert(row_index, value);
                 }
-                return Ok(materialized);
+                return Ok(ColumnarMaterialization {
+                    rows: materialized,
+                    source: ScanMaterializationSource::ProjectionSidecar,
+                });
             }
             Ok(None) => {}
             Err(error) => {
@@ -829,7 +846,14 @@ impl ResidentRowSstable {
             materialized.insert(row_index, Value::Record(record));
         }
 
-        Ok(materialized)
+        Ok(ColumnarMaterialization {
+            rows: materialized,
+            source: if has_projection_sidecar {
+                ScanMaterializationSource::ProjectionFallbackToBase
+            } else {
+                ScanMaterializationSource::BasePart
+            },
+        })
     }
 }
 

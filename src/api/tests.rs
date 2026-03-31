@@ -1013,6 +1013,65 @@ fn compact_to_wide_table_config(name: &str, max_compact_rows: usize) -> TableCon
     config
 }
 
+#[test]
+fn columnar_table_config_builder_applies_hybrid_metadata_only_for_accelerated_profile() {
+    let schema = columnar_all_types_table_config("metrics")
+        .schema
+        .expect("columnar schema");
+    let builder = crate::ColumnarTableConfigBuilder::new("metrics", schema)
+        .bloom_filter_bits_per_key(Some(9))
+        .compaction_strategy(CompactionStrategy::Leveled)
+        .hybrid_features(crate::HybridTableFeatures {
+            skip_indexes: vec![crate::HybridSkipIndexConfig {
+                name: "active_filter".to_string(),
+                family: crate::HybridSkipIndexFamily::FieldValueBloom,
+                field: Some("active".to_string()),
+                max_values: 8,
+            }],
+            projection_sidecars: vec![crate::HybridProjectionSidecarConfig {
+                name: "count_active".to_string(),
+                fields: vec!["count".to_string(), "active".to_string()],
+            }],
+        })
+        .compact_to_wide_promotion(Some(crate::HybridCompactToWidePromotionConfig {
+            max_compact_rows: 8,
+            ..Default::default()
+        }));
+
+    let base = builder
+        .clone()
+        .build_for_profile(crate::HybridProfile::Base);
+    assert_eq!(base.format, TableFormat::Columnar);
+    assert_eq!(base.bloom_filter_bits_per_key, Some(9));
+    assert!(
+        !base
+            .metadata
+            .contains_key(crate::HYBRID_TABLE_FEATURES_METADATA_KEY)
+    );
+    assert!(
+        !base
+            .metadata
+            .contains_key(crate::HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY)
+    );
+
+    let accelerated = builder.build_for_profile(crate::HybridProfile::Accelerated);
+    assert!(
+        accelerated
+            .metadata
+            .contains_key(crate::HYBRID_TABLE_FEATURES_METADATA_KEY)
+    );
+    assert!(
+        accelerated
+            .metadata
+            .contains_key(crate::HYBRID_COMPACT_TO_WIDE_PROMOTION_METADATA_KEY)
+    );
+
+    let read_profile = crate::HybridReadConfig::for_profile(crate::HybridProfile::Accelerated);
+    assert!(read_profile.skip_indexes_enabled);
+    assert!(read_profile.projection_sidecars_enabled);
+    assert!(read_profile.compact_to_wide_promotion_enabled);
+}
+
 fn assert_catalog_entry(table: &StoredTable, expected: &TableConfig) {
     assert_eq!(table.config.name, expected.name);
     assert_eq!(table.config.format, expected.format);
@@ -3160,6 +3219,7 @@ async fn reads_and_scans_span_mutable_and_immutable_memtables() {
                     reverse: true,
                     limit: None,
                     columns: None,
+                    predicate: None,
                 },
             )
             .await
@@ -3294,6 +3354,7 @@ async fn historical_reads_and_scans_span_sstables_and_newer_memtable_versions() 
                     reverse: true,
                     limit: Some(2),
                     columns: None,
+                    predicate: None,
                 },
             )
             .await
@@ -3366,6 +3427,7 @@ async fn row_scan_limit_short_circuits_after_requested_key_groups() {
                 reverse: false,
                 limit: Some(2),
                 columns: None,
+                predicate: None,
             },
         )
         .expect("scan visible rows with state")
@@ -3438,6 +3500,7 @@ async fn reverse_row_scan_limit_short_circuits_after_requested_key_groups() {
                 reverse: true,
                 limit: Some(2),
                 columns: None,
+                predicate: None,
             },
         )
         .expect("reverse scan visible rows with state")
@@ -4895,6 +4958,105 @@ async fn skip_index_probe_prunes_and_falls_back_when_sidecar_is_missing() {
             .await
             .expect("read quarantine marker after deleting sidecar")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn scan_with_execution_pushes_down_predicates_and_reports_materialization() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+
+    let db = Db::open(
+        tiered_config_with_hybrid_read("/scan-with-execution", true, true),
+        dependencies,
+    )
+    .await
+    .expect("open db");
+    let config = with_hybrid_features(
+        columnar_all_types_table_config("metrics"),
+        crate::HybridTableFeatures {
+            skip_indexes: vec![crate::HybridSkipIndexConfig {
+                name: "active_filter".to_string(),
+                family: crate::HybridSkipIndexFamily::FieldValueBloom,
+                field: Some("active".to_string()),
+                max_values: 8,
+            }],
+            projection_sidecars: vec![crate::HybridProjectionSidecarConfig {
+                name: "count_active".to_string(),
+                fields: vec!["count".to_string(), "active".to_string()],
+            }],
+        },
+    );
+    let schema = config.schema.clone().expect("columnar schema");
+    let table = db.create_table(config).await.expect("create table");
+
+    for (key, metric, count, active) in [
+        (b"row:1".to_vec(), "alpha", 1, true),
+        (b"row:2".to_vec(), "bravo", 2, false),
+        (b"row:3".to_vec(), "charlie", 3, true),
+    ] {
+        table
+            .write(
+                key,
+                Value::named_record(
+                    &schema,
+                    [
+                        ("metric", FieldValue::String(metric.to_string())),
+                        ("count", FieldValue::Int64(count)),
+                        ("active", FieldValue::Bool(active)),
+                    ],
+                )
+                .expect("encode columnar row"),
+            )
+            .await
+            .expect("write row");
+        db.flush().await.expect("flush row");
+    }
+
+    let (stream, execution) = table
+        .scan_with_execution(
+            Vec::new(),
+            vec![0xff],
+            ScanOptions {
+                columns: Some(vec!["count".to_string()]),
+                predicate: Some(crate::ScanPredicate::bool_equals("active", true)),
+                ..ScanOptions::default()
+            },
+        )
+        .await
+        .expect("scan with predicate execution");
+    let rows = collect_rows(stream).await;
+    assert_eq!(
+        rows,
+        vec![
+            (
+                b"row:1".to_vec(),
+                Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(1))])),
+            ),
+            (
+                b"row:3".to_vec(),
+                Value::record(BTreeMap::from([(FieldId::new(2), FieldValue::Int64(3))])),
+            ),
+        ]
+    );
+
+    let columnar = execution
+        .columnar
+        .expect("columnar table should report columnar execution");
+    assert_eq!(execution.rows_returned, 2);
+    assert_eq!(columnar.rows_returned, 2);
+    assert_eq!(columnar.sstables_considered, 3);
+    assert!(columnar.sstables_pruned_by_skip_index >= 1);
+    assert!(columnar.parts.iter().any(|part| {
+        part.skip_indexes_used
+            .contains(&"active_filter".to_string())
+    }));
+    assert!(
+        columnar
+            .parts
+            .iter()
+            .any(|part| part.projection_sidecar_reads > 0)
     );
 }
 
@@ -6564,6 +6726,7 @@ async fn columnar_compaction_rewrites_mixed_schema_versions_without_changing_rea
                         reverse: false,
                         limit: None,
                         columns: Some(vec!["account_id".to_string()]),
+                        predicate: None,
                     },
                 )
                 .await
@@ -6580,6 +6743,7 @@ async fn columnar_compaction_rewrites_mixed_schema_versions_without_changing_rea
                 reverse: false,
                 limit: None,
                 columns: Some(vec!["user_id".to_string()]),
+                predicate: None,
             },
         )
         .await
@@ -7164,6 +7328,7 @@ async fn randomized_read_path_matches_shadow_oracle_across_flushes() {
                         reverse: true,
                         limit: Some(reverse_limit),
                         columns: None,
+                        predicate: None,
                     },
                 )
                 .await
@@ -10319,6 +10484,7 @@ async fn randomized_merge_read_path_matches_merge_shadow_oracle_across_flushes_a
                         reverse: true,
                         limit: Some(reverse_limit),
                         columns: None,
+                        predicate: None,
                     },
                 )
                 .await
