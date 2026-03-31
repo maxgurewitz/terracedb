@@ -253,6 +253,8 @@ fn metadata_and_view_uri_round_trip() {
             git_workspace_manager: "deterministic-git".to_string(),
             pull_request_provider: "deterministic-pr".to_string(),
             readonly_view_provider: "deterministic-view".to_string(),
+            typescript_service: "deterministic-typescript".to_string(),
+            bash_service: "deterministic-bash".to_string(),
         },
         provenance,
     };

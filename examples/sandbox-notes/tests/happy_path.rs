@@ -1,52 +1,30 @@
 use std::fs;
 
 use terracedb_example_sandbox_notes::{
-    ExampleHostApp, GENERATED_SUMMARY_PATH, cleanup, create_empty_base, direct_add_comment,
-    emit_example_typescript, guest_add_comment, hoist_companion_project, in_memory_store,
-    install_example_packages, open_generated_view, read_summary_from_session, run_example_bash,
-    run_example_review, typecheck_example, unique_temp_path,
+    ExampleHostApp, GENERATED_SUMMARY_PATH, cleanup, direct_add_comment, emit_example_typescript,
+    guest_add_comment, hoist_companion_project, install_example_packages, open_generated_view,
+    read_summary_from_session, run_example_bash, run_example_review, typecheck_example,
+    unique_temp_path,
 };
 use terracedb_sandbox::{
-    CapabilityRegistry, ConflictPolicy, EjectMode, EjectRequest, PackageCompatibilityMode,
-    SandboxConfig, SandboxStore,
+    CapabilityRegistry, ConflictPolicy, EjectMode, EjectRequest, SandboxHarness,
 };
 use terracedb_vfs::VolumeId;
-
-fn session_config(
-    base_volume_id: VolumeId,
-    session_volume_id: VolumeId,
-    capabilities: terracedb_sandbox::CapabilityManifest,
-) -> SandboxConfig {
-    SandboxConfig {
-        session_volume_id,
-        session_chunk_size: Some(4096),
-        base_volume_id,
-        durable_base: false,
-        workspace_root: "/workspace".to_string(),
-        package_compat: PackageCompatibilityMode::NpmPureJs,
-        conflict_policy: ConflictPolicy::Fail,
-        capabilities,
-        hoisted_source: None,
-        git_provenance: None,
-    }
-}
 
 #[tokio::test]
 async fn documented_happy_path_runs_end_to_end() {
     let app = ExampleHostApp::sample();
-    let (vfs, sandbox) = in_memory_store(10, 71, app.deterministic_services()).await;
+    let harness = SandboxHarness::deterministic(10, 71, app.deterministic_services());
     let base_volume_id = VolumeId::new(0xa100);
     let session_volume_id = VolumeId::new(0xa101);
-    create_empty_base(&vfs, base_volume_id)
-        .await
-        .expect("create base volume");
 
-    let session = sandbox
-        .open_session(session_config(
-            base_volume_id,
-            session_volume_id,
-            app.notes_registry().manifest(),
-        ))
+    let session = harness
+        .open_session_with(base_volume_id, session_volume_id, |config| {
+            config
+                .with_chunk_size(4096)
+                .with_package_compat(terracedb_sandbox::PackageCompatibilityMode::NpmPureJs)
+                .with_capabilities(app.notes_registry().manifest())
+        })
         .await
         .expect("open example session");
 
@@ -56,10 +34,10 @@ async fn documented_happy_path_runs_end_to_end() {
     let packages = install_example_packages(&session)
         .await
         .expect("install example packages");
-    let typescript = typecheck_example(&session)
+    let typecheck = typecheck_example(&session)
         .await
         .expect("typecheck example");
-    let emitted = emit_example_typescript(&typescript, &session)
+    let emitted = emit_example_typescript(&session)
         .await
         .expect("emit typescript");
     let (runtime_summary, runtime_result) = run_example_review(&session)
@@ -94,6 +72,7 @@ async fn documented_happy_path_runs_end_to_end() {
         .map(|run| run.name)
         .collect::<Vec<_>>();
 
+    assert!(typecheck.diagnostics.is_empty());
     assert_eq!(packages, vec!["lodash", "zod"]);
     assert_eq!(runtime_summary, summary);
     assert_eq!(summary.project, "notes-inbox");
@@ -128,6 +107,8 @@ async fn documented_happy_path_runs_end_to_end() {
     );
     assert!(tool_names.contains(&"sandbox.disk.hoist".to_string()));
     assert!(tool_names.contains(&"sandbox.package.install".to_string()));
+    assert!(tool_names.contains(&"sandbox.typescript.check".to_string()));
+    assert!(tool_names.contains(&"sandbox.typescript.emit".to_string()));
     assert!(tool_names.contains(&"sandbox.runtime.exec_module".to_string()));
     assert!(tool_names.contains(&"sandbox.bash.exec".to_string()));
     assert!(tool_names.contains(&"sandbox.view.open".to_string()));
@@ -146,36 +127,24 @@ async fn documented_happy_path_runs_end_to_end() {
 #[tokio::test]
 async fn injected_note_capability_matches_direct_and_guest_calls() {
     let direct_app = ExampleHostApp::sample();
-    let (direct_vfs, direct_sandbox) =
-        in_memory_store(20, 72, direct_app.deterministic_services()).await;
+    let direct_harness = SandboxHarness::deterministic(20, 72, direct_app.deterministic_services());
     let direct_base_volume_id = VolumeId::new(0xa110);
     let direct_session_volume_id = VolumeId::new(0xa111);
-    create_empty_base(&direct_vfs, direct_base_volume_id)
-        .await
-        .expect("create direct base");
-    let direct_session = direct_sandbox
-        .open_session(session_config(
-            direct_base_volume_id,
-            direct_session_volume_id,
-            direct_app.notes_registry().manifest(),
-        ))
+    let direct_session = direct_harness
+        .open_session_with(direct_base_volume_id, direct_session_volume_id, |config| {
+            config.with_capabilities(direct_app.notes_registry().manifest())
+        })
         .await
         .expect("open direct session");
 
     let guest_app = ExampleHostApp::sample();
-    let (guest_vfs, guest_sandbox) =
-        in_memory_store(21, 73, guest_app.deterministic_services()).await;
+    let guest_harness = SandboxHarness::deterministic(21, 73, guest_app.deterministic_services());
     let guest_base_volume_id = VolumeId::new(0xa120);
     let guest_session_volume_id = VolumeId::new(0xa121);
-    create_empty_base(&guest_vfs, guest_base_volume_id)
-        .await
-        .expect("create guest base");
-    let guest_session = guest_sandbox
-        .open_session(session_config(
-            guest_base_volume_id,
-            guest_session_volume_id,
-            guest_app.notes_registry().manifest(),
-        ))
+    let guest_session = guest_harness
+        .open_session_with(guest_base_volume_id, guest_session_volume_id, |config| {
+            config.with_capabilities(guest_app.notes_registry().manifest())
+        })
         .await
         .expect("open guest session");
 

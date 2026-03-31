@@ -2,39 +2,18 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use terracedb_example_sandbox_notes::{
-    ExampleHostApp, cleanup, create_empty_base, install_example_packages, run_example_bash,
-    run_example_review, unique_temp_path, write_companion_project,
+    ExampleHostApp, cleanup, install_example_packages, run_example_bash, run_example_review,
+    unique_temp_path, write_companion_project,
 };
 use terracedb_sandbox::{
-    AuthenticatedReadonlyViewRemoteEndpoint, CapabilityRegistry, ConflictPolicy, HoistMode,
-    HoistRequest, HostGitWorkspaceManager, LocalReadonlyViewBridge, PackageCompatibilityMode,
-    PullRequestRequest, ReadonlyViewCut, ReadonlyViewProtocolRequest, ReadonlyViewProtocolResponse,
-    ReadonlyViewProtocolTransport, ReadonlyViewRequest, RemoteReadonlyViewBridge, SandboxConfig,
-    SandboxServices, SandboxStore, StaticReadonlyViewRegistry,
+    AuthenticatedReadonlyViewRemoteEndpoint, CapabilityRegistry, HoistMode, HoistRequest,
+    ReadonlyViewClient, SandboxHarness, StaticReadonlyViewRegistry,
 };
 use terracedb_vfs::VolumeId;
-
-fn session_config(
-    base_volume_id: VolumeId,
-    session_volume_id: VolumeId,
-    capabilities: terracedb_sandbox::CapabilityManifest,
-) -> SandboxConfig {
-    SandboxConfig {
-        session_volume_id,
-        session_chunk_size: Some(4096),
-        base_volume_id,
-        durable_base: false,
-        workspace_root: "/workspace".to_string(),
-        package_compat: PackageCompatibilityMode::NpmPureJs,
-        conflict_policy: ConflictPolicy::Fail,
-        capabilities,
-        hoisted_source: None,
-        git_provenance: None,
-    }
-}
 
 fn sanitized_git_command() -> Command {
     let mut command = Command::new("git");
@@ -111,12 +90,6 @@ fn init_example_repo(repo: &Path, remote: &Path) {
     git(repo, &["push", "-u", "origin", "main"]);
 }
 
-fn host_git_services(app: &ExampleHostApp) -> SandboxServices {
-    let mut services = app.host_git_services();
-    services.git = std::sync::Arc::new(HostGitWorkspaceManager::default());
-    services
-}
-
 #[tokio::test]
 async fn local_and_remote_view_bridges_browse_the_example_project() {
     let app = ExampleHostApp::sample();
@@ -127,20 +100,16 @@ async fn local_and_remote_view_bridges_browse_the_example_project() {
         .expect("write companion project");
     init_example_repo(&repo, &remote);
 
-    let (vfs, sandbox) =
-        terracedb_example_sandbox_notes::in_memory_store(30, 74, host_git_services(&app)).await;
+    let harness = SandboxHarness::deterministic(30, 74, app.host_git_services());
     let base_volume_id = VolumeId::new(0xa200);
     let session_volume_id = VolumeId::new(0xa201);
-    create_empty_base(&vfs, base_volume_id)
-        .await
-        .expect("create base volume");
 
-    let session = sandbox
-        .open_session(session_config(
-            base_volume_id,
-            session_volume_id,
-            app.notes_registry().manifest(),
-        ))
+    let session = harness
+        .open_session_with(base_volume_id, session_volume_id, |config| {
+            config
+                .with_capabilities(app.notes_registry().manifest())
+                .with_package_compat(terracedb_sandbox::PackageCompatibilityMode::NpmPureJs)
+        })
         .await
         .expect("open session");
     session
@@ -160,82 +129,50 @@ async fn local_and_remote_view_bridges_browse_the_example_project() {
         .expect("run example review");
     run_example_bash(&session).await.expect("run bash");
 
-    let registry = std::sync::Arc::new(StaticReadonlyViewRegistry::new([session.clone()]));
-    let service = std::sync::Arc::new(terracedb_sandbox::ReadonlyViewService::new(registry));
-    let local = LocalReadonlyViewBridge::new(service.clone());
-    let remote_bridge = RemoteReadonlyViewBridge::new(
-        std::sync::Arc::new(AuthenticatedReadonlyViewRemoteEndpoint::new(
-            service.clone(),
-            "sandbox-notes-token",
-        )),
+    let registry = Arc::new(StaticReadonlyViewRegistry::new([session.clone()]));
+    let service = Arc::new(terracedb_sandbox::ReadonlyViewService::new(registry));
+    let local: ReadonlyViewClient<_> = service.local_client();
+    let remote_endpoint = Arc::new(AuthenticatedReadonlyViewRemoteEndpoint::new(
+        service.clone(),
         "sandbox-notes-token",
-    );
+    ));
+    let remote_client: ReadonlyViewClient<_> = remote_endpoint.client("sandbox-notes-token");
 
-    let sessions = local
-        .send(ReadonlyViewProtocolRequest::ListSessions)
-        .await
-        .expect("list local sessions");
-    let ReadonlyViewProtocolResponse::Sessions { sessions } = sessions else {
-        panic!("expected sessions response");
-    };
+    let sessions = local.list_sessions().await.expect("list local sessions");
     assert_eq!(sessions.len(), 1);
 
-    let local_view = local
-        .send(ReadonlyViewProtocolRequest::OpenView {
-            session_volume_id,
-            request: ReadonlyViewRequest {
-                cut: ReadonlyViewCut::Visible,
-                path: "/workspace/generated".to_string(),
-                label: Some("generated".to_string()),
-            },
-        })
+    let handle = local
+        .open_visible(session_volume_id, "/workspace/generated", Some("generated"))
         .await
         .expect("open local view");
-    let ReadonlyViewProtocolResponse::View { handle } = local_view else {
-        panic!("expected view response");
-    };
 
-    let local_dir = local
-        .send(ReadonlyViewProtocolRequest::ReadDir {
-            location: handle.location.clone(),
-        })
+    let entries = local
+        .read_dir(&handle.location)
         .await
         .expect("read generated dir");
-    let ReadonlyViewProtocolResponse::Directory { entries } = local_dir else {
-        panic!("expected directory response");
-    };
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "triage-summary.json");
 
-    let local_file = local
-        .send(ReadonlyViewProtocolRequest::ReadFile {
-            location: entries[0].location.clone(),
-        })
+    let local_bytes = local
+        .read_file(&entries[0].location)
         .await
-        .expect("read generated file");
-    let ReadonlyViewProtocolResponse::File { bytes } = local_file else {
-        panic!("expected file response");
-    };
-    let local_bytes = bytes.expect("summary file should exist");
+        .expect("read generated file")
+        .expect("summary file should exist");
     assert!(String::from_utf8_lossy(&local_bytes).contains("notes-inbox"));
 
-    remote_bridge
+    remote_client
         .reconnect()
         .await
         .expect("reconnect remote bridge");
-    let remote_file = remote_bridge
-        .send(ReadonlyViewProtocolRequest::ReadFile {
-            location: entries[0].location.clone(),
-        })
+    let remote_bytes = remote_client
+        .read_file(&entries[0].location)
         .await
-        .expect("read file over remote bridge");
-    let ReadonlyViewProtocolResponse::File { bytes } = remote_file else {
-        panic!("expected file response");
-    };
-    assert_eq!(bytes.expect("remote bytes"), local_bytes);
+        .expect("read file over remote bridge")
+        .expect("remote bytes");
+    assert_eq!(remote_bytes, local_bytes);
 
     let pr = session
-        .create_pull_request(PullRequestRequest {
+        .create_pull_request(terracedb_sandbox::PullRequestRequest {
             title: "Sandbox notes update".to_string(),
             body: "Generated from the example.".to_string(),
             head_branch: "sandbox/example-notes".to_string(),

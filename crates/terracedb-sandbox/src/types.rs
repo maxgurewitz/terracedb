@@ -69,6 +69,10 @@ pub struct SandboxServiceBindings {
     pub git_workspace_manager: String,
     pub pull_request_provider: String,
     pub readonly_view_provider: String,
+    #[serde(default)]
+    pub typescript_service: String,
+    #[serde(default)]
+    pub bash_service: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -138,6 +142,31 @@ impl SandboxConfig {
 
     pub fn with_package_compat(mut self, package_compat: PackageCompatibilityMode) -> Self {
         self.package_compat = package_compat;
+        self
+    }
+
+    pub fn with_conflict_policy(mut self, conflict_policy: ConflictPolicy) -> Self {
+        self.conflict_policy = conflict_policy;
+        self
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: impl Into<String>) -> Self {
+        self.workspace_root = workspace_root.into();
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: CapabilityManifest) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_hoisted_source(mut self, hoisted_source: HoistedSource) -> Self {
+        self.hoisted_source = Some(hoisted_source);
+        self
+    }
+
+    pub fn with_git_provenance(mut self, git_provenance: GitProvenance) -> Self {
+        self.git_provenance = Some(git_provenance);
         self
     }
 }
