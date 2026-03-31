@@ -3261,6 +3261,49 @@ The important rule is the atomicity boundary: **trigger-sequence allocation, inb
 
 **Note on replay and duplicates:** duplicate timer firings or callbacks are possible. That is acceptable because the inbox row is self-contained, acknowledgement is atomic with the state transition, and the handler is written as a state-guarded/idempotent transition. Missing timer schedule/lookup rows on duplicate timer execution are benign no-ops.
 
+### Sandboxed TypeScript Workflow Handlers
+
+The workflow executor should remain Rust-owned even when workflow logic is authored in TypeScript. A sandbox-authored workflow is therefore a different implementation strategy for `WorkflowHandler`, not a second workflow runtime with different correctness rules.
+
+Recommended layering:
+
+- `terracedb-workflows` remains authoritative for durable inbox ordering, timer admission and firing, outbox persistence and delivery, state commits, and crash recovery,
+- a companion crate such as `terracedb-workflows-sandbox` adapts a draft or published sandbox module into a `WorkflowHandler`, and
+- a workflow registry or deployment layer resolves draft sessions or published bundles, then starts, stops, or upgrades workflows dynamically at runtime without changing executor semantics.
+
+If the current executor surface is too compile-time-oriented for dynamic workflow loading, it is reasonable to extend it with a type-erased handler adapter or factory. That is an implementation detail; the important architectural rule is that TypeScript plugs into the existing executor contract rather than replacing it.
+
+Recommended TypeScript authoring surface:
+
+```typescript
+export default defineWorkflow({
+  name: "payments",
+
+  routeToInstance(entry) {
+    return entry.key.accountId
+  },
+
+  async handle({ instanceId, state, trigger, ctx }) {
+    return {
+      newState: nextState(state, trigger),
+      outboxEntries: buildOutbox(instanceId, state, trigger, ctx),
+      timers: buildTimers(instanceId, state, trigger, ctx),
+    }
+  },
+})
+```
+
+Execution-time workflow APIs should remain much narrower than general sandbox APIs. A sandboxed workflow turn should receive:
+
+- the admitted trigger,
+- the current state,
+- deterministic helpers equivalent to `WorkflowContext`, and
+- optional workflow-scoped observability hooks or narrowly scoped reviewed read capabilities.
+
+It should not receive arbitrary database handles, shell access, live package installation, host-disk writes, or unrestricted network access. Side effects should still be expressed declaratively through `WorkflowOutput`, with the Rust executor applying them atomically. This keeps replay and recovery semantics identical between Rust-authored and TypeScript-authored workflows.
+
+For correctness, workflow execution must not depend on mutable guest-global state. The host may cache transpiled modules or sealed bundles, but each `routeToInstance` and `handle` call must behave as a pure function of admitted input, current state, and deterministic context.
+
 ---
 
 ## Event-Driven Workflows
@@ -4360,7 +4403,9 @@ Sandbox execution should reuse the engine's existing execution-domain model rath
 Recommended sandbox execution policy:
 
 - draft employee query sessions run in a bounded interactive sandbox domain,
+- draft workflow preview sessions run in a bounded workflow-preview domain so preview traffic cannot exhaust either foreground query lanes or the core workflow executor,
 - published procedure invocations run in a request-oriented domain with tighter CPU, memory, and row/byte budgets,
+- deployed published workflow handlers run in workflow execution domains chosen by deployment policy, with per-trigger budgets tighter than authoring sandboxes and isolated from the application's primary request paths,
 - package install, type-check, bash, export, and other heavier helper flows may run in sibling sandbox background domains,
 - publication, catalog updates, procedure registry writes, and auth bookkeeping stay in protected control-plane domains,
 - read-only editor and MCP inspection traffic may use their own low-priority domains so observability traffic cannot starve foreground app work.
@@ -4375,22 +4420,26 @@ Important rules:
 Illustrative mappings:
 
 - a trusted employee draft session might execute guest code in `sandbox.employee.foreground`,
+- a draft workflow preview might execute handler turns in `sandbox.workflow.preview`,
 - the same session's `npm install` may run in `sandbox.employee.packages`,
 - a published customer-facing procedure may run in `sandbox.procedure.invoke`,
+- a deployed reviewed workflow version may execute turns in `workflow.ts.execute`,
 - procedure publication and migration-catalog writes may run in `control.sandbox.publish`, and
 - MCP connections may resolve tools in `sandbox.mcp.foreground` while publication metadata reads stay in control-plane lanes.
 
 This separation is especially important for colocated embeddings. A runaway sandbox or external-agent session should be throttled, shed, or rate-limited by its assigned domains before it can starve core application request handling or database control-plane recovery work.
 
-### Migrations, Draft Queries, and Published Procedures
+### Migrations, Draft Queries, Published Procedures, and Workflows
 
-The same sandbox runtime should support three distinct products with different trust and lifecycle models:
+The same sandbox runtime should support five distinct products with different trust and lifecycle models:
 
 1. **reviewed migrations** for table/catalog setup and app-schema changes,
 2. **draft query sandboxes** for trusted internal users who may run arbitrary code within their granted capabilities, and
-3. **published procedures** for lower-trust or external callers who may invoke only reviewed immutable code artifacts.
+3. **published procedures** for lower-trust or external callers who may invoke only reviewed immutable code artifacts,
+4. **draft workflow sandboxes** for development-time authoring, testing, replay, and preview, and
+5. **published workflow bundles** that plug into the Rust workflow executor in preview or production.
 
-These should be modeled as separate libraries above `terracedb-sandbox`, not as one undifferentiated execution mode.
+These should be modeled as separate libraries above `terracedb-sandbox` and `terracedb-workflows`, not as one undifferentiated execution mode.
 
 #### Migrations
 
@@ -4447,6 +4496,56 @@ Recommended publish flow:
 5. invoke published versions by opening a fresh session from that immutable base.
 
 Invocation should accept caller identity and tenant context, then evaluate the published procedure under the reviewed manifest and host-enforced budgets. The caller should not be able to widen capabilities, modify the code, or reuse a mutable draft session as the invocation target.
+
+#### Draft Workflow Sandboxes
+
+Workflow authoring in development should happen inside mutable sandbox sessions rather than inside the production workflow runtime directly. These draft workflow sandboxes are where teams should:
+
+- edit workflow source and fixtures in a VFS-backed workspace,
+- install supported npm dependencies through the host package service,
+- run `tsc`, local tests, and workflow-specific validation,
+- use `just-bash` helpers for preview, replay, inspection, or publish flows, and
+- iterate on workflow code without first minting a reviewed immutable bundle.
+
+Draft workflow sandboxes are for authoring and preview, not for direct production execution.
+
+Preview should still route through the Rust executor. A preview runner may resolve workflow code from a mutable sandbox session, then create a normal workflow runtime with isolated table names or prefixes for that session, branch, or preview environment. This keeps development aligned with real inbox ordering, timers, outbox delivery, and crash-recovery semantics instead of inventing a second "dev-only" execution path.
+
+#### Published Workflow Bundles
+
+Production should execute immutable reviewed workflow bundles, not mutable draft sandbox sessions. A companion library or registry layer such as `terracedb-workflows-sandbox` plus a workflow deployment manager should:
+
+- bundle the workflow entrypoint together with supported JS or TS dependencies,
+- persist code hash, entrypoint, capability manifest, budgets, reviewer metadata, and execution-domain policy,
+- activate or deactivate specific workflow versions at runtime, and
+- start or stop the corresponding Rust executor bindings dynamically.
+
+Recommended published-workflow metadata:
+
+```typescript
+interface PublishedWorkflowManifest {
+  name: string
+  version: string
+  codeHash: string
+  entrypoint: string
+  capabilities: CapabilityGrant[]
+  budgets: BudgetPolicy
+  executionDomain: string
+  reviewedBy: string
+}
+```
+
+At execution time, published workflows should not receive authoring-only affordances such as `npm install`, `just-bash`, mutable VFS writes, or unrestricted network access. They should run as reviewed sealed artifacts under workflow-specific capabilities and host-chosen execution domains.
+
+#### Development Versus Production Workflow Sandboxes
+
+Development and production should share one TypeScript workflow source format, but they should not share one trust model.
+
+- development sandboxes are mutable, tool-rich, and optimized for authoring velocity,
+- published workflow sandboxes are sealed, reviewable, and optimized for deterministic execution under the Rust workflow runtime, and
+- the publication step converts a draft sandbox into an immutable artifact that can be previewed strictly, deployed, and audited.
+
+This means npm resolution, `just-bash`, and other authoring conveniences belong to draft workflow sessions and publish-time packaging, not to live production handler turns. Applications may still offer a "strict preview" mode in development by running the exact published bundle through the same Rust executor path that production will use.
 
 ### External Agent Adapters and MCP
 
