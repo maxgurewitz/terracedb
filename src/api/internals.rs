@@ -754,12 +754,13 @@ impl DecodedColumnarCache {
         identity: &ColumnarSstableIdentity,
         lane: crate::ExecutionLane,
     ) {
+        let mut owners = self.metadata_owners.write();
         let mut order = self.metadata_order.lock();
         if let Some(position) = order.iter().position(|cached| cached == identity) {
             order.remove(position);
         }
         order.push_back(identity.clone());
-        self.metadata_owners.write().insert(identity.clone(), lane);
+        owners.insert(identity.clone(), lane);
     }
 
     fn trim_metadata_to_limit(&self) {
@@ -774,12 +775,13 @@ impl DecodedColumnarCache {
     }
 
     fn touch_column_key(&self, key: &ColumnarColumnCacheKey, lane: crate::ExecutionLane) {
+        let mut owners = self.column_owners.write();
         let mut order = self.column_order.lock();
         if let Some(position) = order.iter().position(|cached| cached == key) {
             order.remove(position);
         }
         order.push_back(key.clone());
-        self.column_owners.write().insert(key.clone(), lane);
+        owners.insert(key.clone(), lane);
     }
 
     fn trim_column_blocks_to_limit(&self) {

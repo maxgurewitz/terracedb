@@ -34,6 +34,36 @@ That is the cheapest debugging loop we have: reproduce exactly, inspect the
 trace, then add narrower instrumentation only if the trace still leaves multiple
 plausible explanations.
 
+## Prefer A Simulation Repro For Non-Simulation Failures
+
+If a failing test is not already a simulation test, the usual next step should
+be to add one.
+
+The goal is not "write a nearby simulation test that happens to pass." The goal
+is "capture the same failure mode in the cheapest deterministic harness we
+have."
+
+Use this loop:
+
+1. Start from the original failing test and identify the smallest behavior that
+   still looks broken.
+2. Add a simulation test that exercises that behavior through the simulation
+   path closest to the production code you expect is wrong.
+3. Confirm that the new simulation test fails in an equivalent way. If it
+   passes immediately, assume the repro is incomplete and tighten it until it
+   really captures the bug.
+4. Iterate on the implementation using the simulation test first. That is
+   usually faster, cheaper, and more deterministic than repeatedly re-running
+   the original non-simulation test.
+5. Return to the original test and verify that it now passes too.
+6. If the original test still fails, treat that as evidence that the simulation
+   repro is still missing part of the real behavior. Amend the simulation test,
+   then repeat the loop.
+
+In practice this usually produces a better fix, because the simulation test
+forces us to state what behavior is actually broken instead of only chasing a
+slow or noisy harness symptom.
+
 ## Use Tracing As The First Debugger
 
 Turmoil already emits useful network/runtime events through `tracing`. Upstream
