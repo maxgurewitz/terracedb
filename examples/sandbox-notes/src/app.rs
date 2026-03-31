@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -8,24 +7,16 @@ use std::{
     },
 };
 
-use async_trait::async_trait;
-use serde_json::{Value as JsonValue, json};
-use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
+use serde_json::Value as JsonValue;
 use terracedb_sandbox::{
-    BashReport, BashRequest, BashService, CapabilityCallRequest, CapabilityCallResult,
-    CapabilityManifest, CapabilityRegistry, ConflictPolicy, DefaultSandboxStore,
-    DeterministicBashService, DeterministicGitWorkspaceManager, DeterministicPackageInstaller,
-    DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
-    DeterministicRuntimeBackend, DeterministicTypeScriptService, EjectMode, EjectRequest,
-    GitWorkspaceRequest, HoistMode, HoistRequest, HostGitWorkspaceManager,
+    BashReport, BashRequest, CapabilityMethod0, CapabilityMethod1, CapabilityRegistry,
+    ConflictPolicy, EjectMode, EjectRequest, GitWorkspaceRequest, HoistMode, HoistRequest,
     PackageCompatibilityMode, PackageInstallRequest, PullRequestRequest, ReadonlyViewHandle,
-    ReadonlyViewRequest, SandboxCapability, SandboxCapabilityMethod, SandboxCapabilityModule,
-    SandboxConfig, SandboxError, SandboxServices, SandboxSession, SandboxStore, TypeCheckRequest,
-    TypeScriptEmitReport, TypeScriptService,
+    ReadonlyViewRequest, SandboxCapability, SandboxError, SandboxHarness, SandboxServices,
+    SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
+    TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
-use terracedb_vfs::{
-    CreateOptions, InMemoryVfsStore, MkdirOptions, VolumeConfig, VolumeId, VolumeStore,
-};
+use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId, VolumeStore};
 use tokio::sync::Mutex;
 
 use crate::model::{AddCommentInput, DemoReport, ExampleComment, ExampleNote, ReviewSummary};
@@ -59,174 +50,40 @@ const PROJECT_FILES: &[(&str, &str)] = &[
 
 static UNIQUE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Default)]
-pub struct NotesCapabilityRegistry {
-    notes: Arc<Mutex<Vec<ExampleNote>>>,
-}
-
-impl NotesCapabilityRegistry {
-    pub fn new(notes: Vec<ExampleNote>) -> Self {
-        Self {
-            notes: Arc::new(Mutex::new(notes)),
-        }
-    }
-
-    pub async fn snapshot(&self) -> Vec<ExampleNote> {
-        self.notes.lock().await.clone()
-    }
-
-    pub fn capability() -> SandboxCapability {
-        let mut capability = SandboxCapability::host_module("notes");
-        capability.description =
-            Some("Host application note store used by the sandbox-notes example.".to_string());
-        capability.typescript_declarations = Some(
-            [
-                "export type ExampleComment = { author: string; body: string };",
-                "export type ExampleNote = { id: string; title: string; status: string; comments: ExampleComment[] };",
-                "export function listNotes(): ExampleNote[];",
-                "export function addComment(input: { noteId: string; author: string; body: string }): ExampleNote;",
-            ]
-            .join("\n"),
-        );
-        capability
-            .metadata
-            .insert("example".to_string(), JsonValue::from("sandbox-notes"));
-        capability
-    }
-
-    fn capability_module() -> SandboxCapabilityModule {
-        SandboxCapabilityModule {
-            capability: Self::capability(),
-            methods: vec![
-                SandboxCapabilityMethod {
-                    name: "listNotes".to_string(),
-                    description: Some("Return the host application's current notes.".to_string()),
-                },
-                SandboxCapabilityMethod {
-                    name: "addComment".to_string(),
-                    description: Some("Append a host-side comment to a note.".to_string()),
-                },
-            ],
-            metadata: BTreeMap::from([("kind".to_string(), JsonValue::from("example-note-store"))]),
-        }
-    }
-}
-
-#[async_trait]
-impl CapabilityRegistry for NotesCapabilityRegistry {
-    fn manifest(&self) -> CapabilityManifest {
-        CapabilityManifest {
-            capabilities: vec![Self::capability()],
-        }
-    }
-
-    fn resolve(&self, specifier: &str) -> Option<SandboxCapability> {
-        (specifier == NOTES_CAPABILITY_SPECIFIER).then(Self::capability)
-    }
-
-    fn module(&self, specifier: &str) -> Option<SandboxCapabilityModule> {
-        (specifier == NOTES_CAPABILITY_SPECIFIER).then(Self::capability_module)
-    }
-
-    async fn invoke(
-        &self,
-        _session: &SandboxSession,
-        request: CapabilityCallRequest,
-    ) -> Result<CapabilityCallResult, SandboxError> {
-        if request.specifier != NOTES_CAPABILITY_SPECIFIER {
-            return Err(SandboxError::CapabilityUnavailable {
-                specifier: request.specifier,
-            });
-        }
-
-        let value = match request.method.as_str() {
-            "listNotes" => {
-                let notes = self.notes.lock().await.clone();
-                serde_json::to_value(notes)?
-            }
-            "addComment" => {
-                let input: AddCommentInput =
-                    serde_json::from_value(request.args.first().cloned().ok_or_else(|| {
-                        SandboxError::Service {
-                            service: "sandbox-notes",
-                            message: "addComment expects one object argument".to_string(),
-                        }
-                    })?)?;
-                let mut notes = self.notes.lock().await;
-                let note = notes
-                    .iter_mut()
-                    .find(|note| note.id == input.note_id)
-                    .ok_or_else(|| SandboxError::Service {
-                        service: "sandbox-notes",
-                        message: format!("unknown note id: {}", input.note_id),
-                    })?;
-                note.comments.push(ExampleComment {
-                    author: input.author,
-                    body: input.body,
-                });
-                serde_json::to_value(note.clone())?
-            }
-            _ => {
-                return Err(SandboxError::CapabilityMethodNotFound {
-                    specifier: request.specifier,
-                    method: request.method,
-                });
-            }
-        };
-
-        Ok(CapabilityCallResult {
-            specifier: request.specifier,
-            method: request.method,
-            value,
-            metadata: BTreeMap::from([("example".to_string(), JsonValue::from("sandbox-notes"))]),
-        })
-    }
-}
+type NotesState = Arc<Mutex<Vec<ExampleNote>>>;
+type NotesRegistry = TypedCapabilityRegistry<NotesState>;
 
 #[derive(Clone)]
 pub struct ExampleHostApp {
-    notes: Arc<NotesCapabilityRegistry>,
+    notes: NotesState,
+    registry: Arc<NotesRegistry>,
 }
 
 impl ExampleHostApp {
     pub fn new(notes: Vec<ExampleNote>) -> Self {
-        Self {
-            notes: Arc::new(NotesCapabilityRegistry::new(notes)),
-        }
+        let notes = Arc::new(Mutex::new(notes));
+        let registry = Arc::new(build_notes_registry(notes.clone()).expect("build notes registry"));
+        Self { notes, registry }
     }
 
     pub fn sample() -> Self {
         Self::new(sample_notes())
     }
 
-    pub fn notes_registry(&self) -> Arc<NotesCapabilityRegistry> {
-        self.notes.clone()
+    pub fn notes_registry(&self) -> Arc<NotesRegistry> {
+        self.registry.clone()
     }
 
     pub async fn notes_snapshot(&self) -> Vec<ExampleNote> {
-        self.notes.snapshot().await
+        self.notes.lock().await.clone()
     }
 
     pub fn deterministic_services(&self) -> SandboxServices {
-        SandboxServices::new(
-            Arc::new(DeterministicRuntimeBackend::default()),
-            Arc::new(DeterministicPackageInstaller::default()),
-            Arc::new(DeterministicGitWorkspaceManager::default()),
-            Arc::new(DeterministicPullRequestProviderClient::default()),
-            Arc::new(DeterministicReadonlyViewProvider::default()),
-        )
-        .with_capabilities(self.notes.clone())
+        SandboxServices::deterministic_with_capabilities(self.notes_registry())
     }
 
     pub fn host_git_services(&self) -> SandboxServices {
-        SandboxServices::new(
-            Arc::new(DeterministicRuntimeBackend::default()),
-            Arc::new(DeterministicPackageInstaller::default()),
-            Arc::new(HostGitWorkspaceManager::default()),
-            Arc::new(DeterministicPullRequestProviderClient::default()),
-            Arc::new(DeterministicReadonlyViewProvider::default()),
-        )
-        .with_capabilities(self.notes.clone())
+        SandboxServices::deterministic_with_host_git_and_capabilities(self.notes_registry())
     }
 }
 
@@ -277,43 +134,13 @@ pub fn cleanup(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
-pub async fn in_memory_store(
-    now: u64,
-    seed: u64,
-    services: SandboxServices,
-) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
-    let dependencies = DbDependencies::new(
-        Arc::new(StubFileSystem::default()),
-        Arc::new(StubObjectStore::default()),
-        Arc::new(StubClock::new(Timestamp::new(now))),
-        Arc::new(StubRng::seeded(seed)),
-    );
-    let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
-    let sandbox = DefaultSandboxStore::new(Arc::new(vfs.clone()), dependencies.clock, services);
-    (vfs, sandbox)
-}
-
-pub async fn create_empty_base(
-    store: &InMemoryVfsStore,
-    volume_id: VolumeId,
-) -> Result<(), SandboxError> {
-    store
-        .open_volume(
-            VolumeConfig::new(volume_id)
-                .with_chunk_size(4096)
-                .with_create_if_missing(true),
-        )
-        .await?;
-    Ok(())
-}
-
 pub async fn seed_example_project_into_base(
     store: &InMemoryVfsStore,
     volume_id: VolumeId,
 ) -> Result<(), SandboxError> {
     let base = store
         .open_volume(
-            VolumeConfig::new(volume_id)
+            terracedb_vfs::VolumeConfig::new(volume_id)
                 .with_chunk_size(4096)
                 .with_create_if_missing(true),
         )
@@ -376,57 +203,44 @@ pub async fn install_example_packages(
         .packages)
 }
 
-pub async fn typecheck_example(
-    session: &SandboxSession,
-) -> Result<DeterministicTypeScriptService, SandboxError> {
-    let typescript = DeterministicTypeScriptService::default();
-    let diagnostics = typescript
-        .check(
-            session,
-            TypeCheckRequest {
-                roots: vec![TYPESCRIPT_ENTRYPOINT.to_string()],
-                ..Default::default()
-            },
-        )
+pub async fn typecheck_example(session: &SandboxSession) -> Result<TypeCheckReport, SandboxError> {
+    let report = session
+        .typecheck(TypeCheckRequest {
+            roots: vec![TYPESCRIPT_ENTRYPOINT.to_string()],
+            ..Default::default()
+        })
         .await?;
-    if !diagnostics.diagnostics.is_empty() {
+    if !report.diagnostics.is_empty() {
         return Err(SandboxError::Service {
             service: "sandbox-notes",
             message: format!(
                 "expected clean TypeScript example, found {} diagnostics",
-                diagnostics.diagnostics.len()
+                report.diagnostics.len()
             ),
         });
     }
-    Ok(typescript)
+    Ok(report)
 }
 
 pub async fn emit_example_typescript(
-    typescript: &DeterministicTypeScriptService,
     session: &SandboxSession,
 ) -> Result<TypeScriptEmitReport, SandboxError> {
-    typescript
-        .emit(
-            session,
-            TypeCheckRequest {
-                roots: vec![TYPESCRIPT_ENTRYPOINT.to_string()],
-                ..Default::default()
-            },
-        )
+    session
+        .emit_typescript(TypeCheckRequest {
+            roots: vec![TYPESCRIPT_ENTRYPOINT.to_string()],
+            ..Default::default()
+        })
         .await
 }
 
 pub async fn run_example_bash(session: &SandboxSession) -> Result<BashReport, SandboxError> {
-    let bash = DeterministicBashService::default();
-    bash.run(
-        session,
-        BashRequest {
+    session
+        .run_bash(BashRequest {
             command: "mkdir -p docs && printf '# Review Notes\\nGenerated from the sandbox example.\\n' > docs/review-notes.md && pwd".to_string(),
             cwd: "/workspace".to_string(),
             ..Default::default()
-        },
-    )
-    .await
+        })
+        .await
 }
 
 pub async fn run_example_review(
@@ -501,22 +315,22 @@ pub async fn read_summary_from_session(
 
 pub async fn run_demo() -> Result<DemoReport, SandboxError> {
     let app = ExampleHostApp::sample();
-    let (_vfs, sandbox) = in_memory_store(1_000, 41, app.deterministic_services()).await;
+    let harness = SandboxHarness::deterministic(1_000, 41, app.deterministic_services());
     let base_volume_id = VolumeId::new(0x5a00);
     let session_volume_id = VolumeId::new(0x5a01);
-    create_empty_base(&_vfs, base_volume_id).await?;
-
-    let session = sandbox
-        .open_session(
-            SandboxConfig::new(base_volume_id, session_volume_id)
+    let session = harness
+        .open_session_with(base_volume_id, session_volume_id, |config| {
+            config
                 .with_chunk_size(4096)
-                .with_package_compat(PackageCompatibilityMode::NpmPureJs),
-        )
+                .with_package_compat(PackageCompatibilityMode::NpmPureJs)
+                .with_capabilities(app.notes_registry().manifest())
+        })
         .await?;
+
     hoist_companion_project(&session).await?;
     install_example_packages(&session).await?;
-    let typescript = typecheck_example(&session).await?;
-    let emitted = emit_example_typescript(&typescript, &session).await?;
+    typecheck_example(&session).await?;
+    let emitted = emit_example_typescript(&session).await?;
     let (summary, runtime_result) = run_example_review(&session).await?;
     run_example_bash(&session).await?;
     let handle = open_generated_view(&session).await?;
@@ -550,18 +364,17 @@ pub async fn direct_add_comment(
     author: &str,
     body: &str,
 ) -> Result<JsonValue, SandboxError> {
-    Ok(session
-        .invoke_capability(CapabilityCallRequest {
-            specifier: NOTES_CAPABILITY_SPECIFIER.to_string(),
-            method: "addComment".to_string(),
-            args: vec![json!({
-                "noteId": note_id,
-                "author": author,
-                "body": body,
-            })],
-        })
-        .await?
-        .value)
+    let note = add_comment_method()
+        .invoke(
+            session,
+            &AddCommentInput {
+                note_id: note_id.to_string(),
+                author: author.to_string(),
+                body: body.to_string(),
+            },
+        )
+        .await?;
+    serde_json::to_value(note).map_err(Into::into)
 }
 
 pub async fn guest_add_comment(
@@ -590,15 +403,59 @@ pub async fn guest_add_comment(
         })?)
 }
 
-pub async fn ensure_workspace_dir(session: &SandboxSession) -> Result<(), SandboxError> {
-    session
-        .filesystem()
-        .mkdir(
-            "/workspace",
-            MkdirOptions {
-                recursive: true,
-                ..Default::default()
-            },
+fn notes_capability() -> SandboxCapability {
+    SandboxCapability::host_module("notes")
+        .with_description("Host application note store used by the sandbox-notes example.")
+        .with_typescript_declarations(
+            [
+                "export type ExampleComment = { author: string; body: string };",
+                "export type ExampleNote = { id: string; title: string; status: string; comments: ExampleComment[] };",
+                "export function listNotes(): ExampleNote[];",
+                "export function addComment(input: { noteId: string; author: string; body: string }): ExampleNote;",
+            ]
+            .join("\n"),
         )
-        .await
+        .with_metadata("example", JsonValue::from("sandbox-notes"))
+}
+
+fn list_notes_method() -> CapabilityMethod0<Vec<ExampleNote>> {
+    notes_capability().method0("listNotes")
+}
+
+fn add_comment_method() -> CapabilityMethod1<AddCommentInput, ExampleNote> {
+    notes_capability().method1("addComment")
+}
+
+fn build_notes_registry(notes: NotesState) -> Result<NotesRegistry, SandboxError> {
+    let capability = notes_capability();
+    let list_notes = list_notes_method();
+    let add_comment = add_comment_method();
+    let module = TypedCapabilityModuleBuilder::new(capability)?
+        .with_module_metadata("kind", JsonValue::from("example-note-store"))
+        .with_method0(
+            &list_notes,
+            Some("Return the host application's current notes."),
+            move |notes: NotesState, _session| async move { Ok(notes.lock().await.clone()) },
+        )?
+        .with_method1(
+            &add_comment,
+            Some("Append a host-side comment to a note."),
+            move |notes: NotesState, _session, input: AddCommentInput| async move {
+                let mut notes = notes.lock().await;
+                let note = notes
+                    .iter_mut()
+                    .find(|note| note.id == input.note_id)
+                    .ok_or_else(|| SandboxError::Service {
+                        service: "sandbox-notes",
+                        message: format!("unknown note id: {}", input.note_id),
+                    })?;
+                note.comments.push(ExampleComment {
+                    author: input.author,
+                    body: input.body,
+                });
+                Ok(note.clone())
+            },
+        )?
+        .build();
+    TypedCapabilityRegistry::new(notes, vec![module])
 }

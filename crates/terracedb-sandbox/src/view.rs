@@ -410,6 +410,10 @@ where
         Self { registry }
     }
 
+    pub fn local_client(self: &Arc<Self>) -> ReadonlyViewClient<LocalReadonlyViewBridge<R>> {
+        ReadonlyViewClient::new(LocalReadonlyViewBridge::new(self.clone()))
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<ReadonlyViewSessionSummary>, SandboxError> {
         let mut summaries = Vec::new();
         for session in self.registry.list_sessions().await? {
@@ -622,6 +626,191 @@ pub trait ReadonlyViewProtocolTransport: Send + Sync {
 }
 
 #[derive(Clone)]
+pub struct ReadonlyViewClient<T> {
+    transport: T,
+}
+
+impl<T> ReadonlyViewClient<T>
+where
+    T: ReadonlyViewProtocolTransport,
+{
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub async fn refresh(&self) -> Result<(), SandboxError> {
+        self.transport.refresh().await
+    }
+
+    pub async fn reconnect(&self) -> Result<(), SandboxError> {
+        self.transport.reconnect().await
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<ReadonlyViewSessionSummary>, SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::ListSessions)
+            .await?
+        {
+            ReadonlyViewProtocolResponse::Sessions { sessions } => Ok(sessions),
+            response => Err(unexpected_protocol_response("sessions", &response)),
+        }
+    }
+
+    pub async fn list_handles(
+        &self,
+        session_volume_id: VolumeId,
+    ) -> Result<Vec<ReadonlyViewHandle>, SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::ListHandles {
+                session_volume_id: Some(session_volume_id),
+            })
+            .await?
+        {
+            ReadonlyViewProtocolResponse::Handles { handles } => Ok(handles),
+            response => Err(unexpected_protocol_response("handles", &response)),
+        }
+    }
+
+    pub async fn open_view(
+        &self,
+        session_volume_id: VolumeId,
+        request: ReadonlyViewRequest,
+    ) -> Result<ReadonlyViewHandle, SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::OpenView {
+                session_volume_id,
+                request,
+            })
+            .await?
+        {
+            ReadonlyViewProtocolResponse::View { handle } => Ok(handle),
+            response => Err(unexpected_protocol_response("view handle", &response)),
+        }
+    }
+
+    pub async fn open_visible(
+        &self,
+        session_volume_id: VolumeId,
+        path: impl Into<String>,
+        label: Option<impl Into<String>>,
+    ) -> Result<ReadonlyViewHandle, SandboxError> {
+        self.open_view(
+            session_volume_id,
+            ReadonlyViewRequest {
+                cut: ReadonlyViewCut::Visible,
+                path: path.into(),
+                label: label.map(Into::into),
+            },
+        )
+        .await
+    }
+
+    pub async fn open_durable(
+        &self,
+        session_volume_id: VolumeId,
+        path: impl Into<String>,
+        label: Option<impl Into<String>>,
+    ) -> Result<ReadonlyViewHandle, SandboxError> {
+        self.open_view(
+            session_volume_id,
+            ReadonlyViewRequest {
+                cut: ReadonlyViewCut::Durable,
+                path: path.into(),
+                label: label.map(Into::into),
+            },
+        )
+        .await
+    }
+
+    pub async fn reconnect_view(
+        &self,
+        request: ReadonlyViewReconnectRequest,
+    ) -> Result<ReadonlyViewHandle, SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::ReconnectView { request })
+            .await?
+        {
+            ReadonlyViewProtocolResponse::View { handle } => Ok(handle),
+            response => Err(unexpected_protocol_response("view handle", &response)),
+        }
+    }
+
+    pub async fn close_view(
+        &self,
+        session_volume_id: VolumeId,
+        handle_id: impl Into<String>,
+    ) -> Result<(), SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::CloseView {
+                session_volume_id,
+                handle_id: handle_id.into(),
+            })
+            .await?
+        {
+            ReadonlyViewProtocolResponse::Ack => Ok(()),
+            response => Err(unexpected_protocol_response("ack", &response)),
+        }
+    }
+
+    pub async fn stat(
+        &self,
+        location: &ReadonlyViewLocation,
+    ) -> Result<Option<ReadonlyViewStat>, SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::Stat {
+                location: location.clone(),
+            })
+            .await?
+        {
+            ReadonlyViewProtocolResponse::Stat { stat } => Ok(stat),
+            response => Err(unexpected_protocol_response("stat", &response)),
+        }
+    }
+
+    pub async fn read_file(
+        &self,
+        location: &ReadonlyViewLocation,
+    ) -> Result<Option<Vec<u8>>, SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::ReadFile {
+                location: location.clone(),
+            })
+            .await?
+        {
+            ReadonlyViewProtocolResponse::File { bytes } => Ok(bytes),
+            response => Err(unexpected_protocol_response("file bytes", &response)),
+        }
+    }
+
+    pub async fn read_dir(
+        &self,
+        location: &ReadonlyViewLocation,
+    ) -> Result<Vec<ReadonlyViewDirectoryEntry>, SandboxError> {
+        match self
+            .transport
+            .send(ReadonlyViewProtocolRequest::ReadDir {
+                location: location.clone(),
+            })
+            .await?
+        {
+            ReadonlyViewProtocolResponse::Directory { entries } => Ok(entries),
+            response => Err(unexpected_protocol_response("directory entries", &response)),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct LocalReadonlyViewBridge<R> {
     service: Arc<ReadonlyViewService<R>>,
 }
@@ -691,6 +880,13 @@ where
         } else {
             Err(SandboxError::ReadonlyViewUnauthorized)
         }
+    }
+
+    pub fn client(
+        self: &Arc<Self>,
+        token: impl Into<String>,
+    ) -> ReadonlyViewClient<RemoteReadonlyViewBridge<Self>> {
+        ReadonlyViewClient::new(RemoteReadonlyViewBridge::new(self.clone(), token))
     }
 }
 
@@ -776,5 +972,15 @@ async fn validate_location(
         Err(SandboxError::ReadonlyViewSessionNotFound {
             session_volume_id: location.session_volume_id,
         })
+    }
+}
+
+fn unexpected_protocol_response(
+    expected: &str,
+    response: &ReadonlyViewProtocolResponse,
+) -> SandboxError {
+    SandboxError::Service {
+        service: "readonly-view",
+        message: format!("expected {expected}, received {response:?}"),
     }
 }

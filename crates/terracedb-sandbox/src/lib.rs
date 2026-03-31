@@ -4,6 +4,7 @@ pub mod disk;
 pub mod error;
 pub mod fs;
 pub mod git;
+pub mod harness;
 pub mod loader;
 pub mod packages;
 pub mod pr;
@@ -18,10 +19,11 @@ pub use bash::{
     JustBashFilesystemAdapter, TERRACE_BASH_SESSION_STATE_PATH,
 };
 pub use capabilities::{
-    CapabilityCallRequest, CapabilityCallResult, CapabilityManifest, CapabilityRegistry,
-    DeterministicCapabilityMethodBehavior, DeterministicCapabilityModule,
-    DeterministicCapabilityRegistry, SandboxCapability, SandboxCapabilityMethod,
-    SandboxCapabilityModule, StaticCapabilityRegistry,
+    CapabilityCallRequest, CapabilityCallResult, CapabilityManifest, CapabilityMethod0,
+    CapabilityMethod1, CapabilityRegistry, DeterministicCapabilityMethodBehavior,
+    DeterministicCapabilityModule, DeterministicCapabilityRegistry, SandboxCapability,
+    SandboxCapabilityMethod, SandboxCapabilityModule, StaticCapabilityRegistry,
+    TypedCapabilityModule, TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
 pub use disk::{
     ConflictEntry, ConflictReport, EjectMode, EjectReport, EjectRequest, HoistMode, HoistReport,
@@ -33,6 +35,7 @@ pub use git::{
     DeterministicGitWorkspaceManager, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest,
     HostGitWorkspaceManager,
 };
+pub use harness::SandboxHarness;
 pub use loader::{
     HOST_CAPABILITY_PREFIX, LoadedSandboxModule, SANDBOX_BASH_LIBRARY_SPECIFIER,
     SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry,
@@ -74,10 +77,11 @@ pub use typescript::{
 };
 pub use view::{
     AuthenticatedReadonlyViewRemoteEndpoint, DeterministicReadonlyViewProvider,
-    LocalReadonlyViewBridge, READONLY_VIEW_URI_SCHEME, ReadonlyViewCut, ReadonlyViewDirectoryEntry,
-    ReadonlyViewHandle, ReadonlyViewLocation, ReadonlyViewNodeKind, ReadonlyViewProtocolRequest,
-    ReadonlyViewProtocolResponse, ReadonlyViewProtocolTransport, ReadonlyViewProvider,
-    ReadonlyViewReconnectRequest, ReadonlyViewRemoteEndpoint, ReadonlyViewRequest,
-    ReadonlyViewService, ReadonlyViewSessionRegistry, ReadonlyViewSessionSummary, ReadonlyViewStat,
-    RemoteReadonlyViewBridge, StaticReadonlyViewRegistry,
+    LocalReadonlyViewBridge, READONLY_VIEW_URI_SCHEME, ReadonlyViewClient, ReadonlyViewCut,
+    ReadonlyViewDirectoryEntry, ReadonlyViewHandle, ReadonlyViewLocation, ReadonlyViewNodeKind,
+    ReadonlyViewProtocolRequest, ReadonlyViewProtocolResponse, ReadonlyViewProtocolTransport,
+    ReadonlyViewProvider, ReadonlyViewReconnectRequest, ReadonlyViewRemoteEndpoint,
+    ReadonlyViewRequest, ReadonlyViewService, ReadonlyViewSessionRegistry,
+    ReadonlyViewSessionSummary, ReadonlyViewStat, RemoteReadonlyViewBridge,
+    StaticReadonlyViewRegistry,
 };

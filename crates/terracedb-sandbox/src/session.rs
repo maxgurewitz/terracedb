@@ -17,20 +17,24 @@ use crate::disk::{
 };
 use crate::git::{default_export_workspace_path, finalize_git_export};
 use crate::{
-    BaseSnapshotIdentity, CapabilityCallRequest, CapabilityCallResult, CapabilityRegistry,
-    ConflictPolicy, DeterministicGitWorkspaceManager, DeterministicPackageInstaller,
+    BaseSnapshotIdentity, BashReport, BashRequest, BashService, CapabilityCallRequest,
+    CapabilityCallResult, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
+    DeterministicGitWorkspaceManager, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
-    DeterministicRuntimeBackend, EjectMode, EjectReport, EjectRequest, GitWorkspaceManager,
-    GitWorkspaceReport, GitWorkspaceRequest, HoistReport, HoistRequest, HoistedSource,
-    PackageInstallReport, PackageInstallRequest, PackageInstaller, PullRequestProviderClient,
-    PullRequestReport, PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle,
-    ReadonlyViewLocation, ReadonlyViewProvider, ReadonlyViewRequest, SandboxConfig, SandboxError,
+    DeterministicRuntimeBackend, DeterministicTypeScriptService, EjectMode, EjectReport,
+    EjectRequest, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest, HoistReport,
+    HoistRequest, HoistedSource, HostGitWorkspaceManager, PackageInstallReport,
+    PackageInstallRequest, PackageInstaller, PullRequestProviderClient, PullRequestReport,
+    PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle, ReadonlyViewLocation,
+    ReadonlyViewProvider, ReadonlyViewRequest, SandboxConfig, SandboxError,
     SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim, SandboxModuleLoader,
     SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeStateHandle,
     SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
     StaticCapabilityRegistry, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
     TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
-    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, VfsSandboxFilesystemShim,
+    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TypeCheckReport, TypeCheckRequest,
+    TypeScriptEmitReport, TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
+    VfsSandboxFilesystemShim,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +55,8 @@ pub struct SandboxServices {
     pub git: Arc<dyn GitWorkspaceManager>,
     pub pull_requests: Arc<dyn PullRequestProviderClient>,
     pub readonly_views: Arc<dyn ReadonlyViewProvider>,
+    pub typescript: Arc<dyn TypeScriptService>,
+    pub bash: Arc<dyn BashService>,
     pub capabilities: Arc<dyn CapabilityRegistry>,
 }
 
@@ -62,18 +68,40 @@ impl SandboxServices {
         pull_requests: Arc<dyn PullRequestProviderClient>,
         readonly_views: Arc<dyn ReadonlyViewProvider>,
     ) -> Self {
+        let typescript: Arc<dyn TypeScriptService> =
+            Arc::new(DeterministicTypeScriptService::default());
+        let bash: Arc<dyn BashService> = Arc::new(
+            DeterministicBashService::default().with_typescript_service(typescript.clone()),
+        );
         Self {
             runtime,
             packages,
             git,
             pull_requests,
             readonly_views,
+            typescript,
+            bash,
             capabilities: Arc::new(StaticCapabilityRegistry::default()),
         }
     }
 
     pub fn with_capabilities(mut self, capabilities: Arc<dyn CapabilityRegistry>) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_git_workspace_manager(mut self, git: Arc<dyn GitWorkspaceManager>) -> Self {
+        self.git = git;
+        self
+    }
+
+    pub fn with_typescript_service(mut self, typescript: Arc<dyn TypeScriptService>) -> Self {
+        self.typescript = typescript;
+        self
+    }
+
+    pub fn with_bash_service(mut self, bash: Arc<dyn BashService>) -> Self {
+        self.bash = bash;
         self
     }
 
@@ -87,6 +115,21 @@ impl SandboxServices {
         )
     }
 
+    pub fn deterministic_with_capabilities(capabilities: Arc<dyn CapabilityRegistry>) -> Self {
+        Self::deterministic().with_capabilities(capabilities)
+    }
+
+    pub fn deterministic_with_host_git() -> Self {
+        Self::deterministic()
+            .with_git_workspace_manager(Arc::new(HostGitWorkspaceManager::default()))
+    }
+
+    pub fn deterministic_with_host_git_and_capabilities(
+        capabilities: Arc<dyn CapabilityRegistry>,
+    ) -> Self {
+        Self::deterministic_with_host_git().with_capabilities(capabilities)
+    }
+
     pub fn bindings(&self) -> SandboxServiceBindings {
         SandboxServiceBindings {
             runtime_backend: self.runtime.name().to_string(),
@@ -94,6 +137,8 @@ impl SandboxServices {
             git_workspace_manager: self.git.name().to_string(),
             pull_request_provider: self.pull_requests.name().to_string(),
             readonly_view_provider: self.readonly_views.name().to_string(),
+            typescript_service: self.typescript.name().to_string(),
+            bash_service: self.bash.name().to_string(),
         }
     }
 }
@@ -402,6 +447,31 @@ impl SandboxSession {
             SandboxExecutionRequest::eval(source.into()),
         )
         .await
+    }
+
+    pub async fn transpile_typescript(
+        &self,
+        request: TypeScriptTranspileRequest,
+    ) -> Result<TypeScriptTranspileReport, SandboxError> {
+        self.services.typescript.transpile(self, request).await
+    }
+
+    pub async fn typecheck(
+        &self,
+        request: TypeCheckRequest,
+    ) -> Result<TypeCheckReport, SandboxError> {
+        self.services.typescript.check(self, request).await
+    }
+
+    pub async fn emit_typescript(
+        &self,
+        request: TypeCheckRequest,
+    ) -> Result<TypeScriptEmitReport, SandboxError> {
+        self.services.typescript.emit(self, request).await
+    }
+
+    pub async fn run_bash(&self, request: BashRequest) -> Result<BashReport, SandboxError> {
+        self.services.bash.run(self, request).await
     }
 
     pub async fn invoke_capability(
