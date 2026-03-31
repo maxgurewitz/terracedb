@@ -43,6 +43,7 @@ pub fn tiered_test_config_with_durability(
             durability,
             local_retention: TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }

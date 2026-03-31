@@ -22,6 +22,7 @@ fn s3_primary_test_config(prefix: &str) -> DbConfig {
             mem_cache_size_bytes: 1024 * 1024,
             auto_flush_interval: Some(Duration::from_secs(60)),
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }
@@ -44,6 +45,7 @@ fn tiered_test_config_with_budget(
             durability,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }

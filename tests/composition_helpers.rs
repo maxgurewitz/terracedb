@@ -58,6 +58,7 @@ impl TestEnv {
                 durability,
                 local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
+            hybrid_read: Default::default(),
             scheduler: None,
         };
 
@@ -491,6 +492,7 @@ fn simulation_config(root_path: &str, durability: TieredDurabilityMode) -> DbCon
             durability,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }

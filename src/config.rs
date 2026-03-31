@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use crate::{
     api::{ChangeKind, SchemaDefinition, Value},
     error::StorageError,
+    hybrid::HybridReadConfig,
     ids::{SequenceNumber, Timestamp},
     scheduler::Scheduler,
 };
@@ -87,6 +88,7 @@ impl CompactionFilter for TtlCompactionFilter {
 #[derive(Clone)]
 pub struct DbConfig {
     pub storage: StorageConfig,
+    pub hybrid_read: HybridReadConfig,
     pub scheduler: Option<Arc<dyn Scheduler>>,
 }
 
@@ -94,6 +96,7 @@ impl fmt::Debug for DbConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DbConfig")
             .field("storage", &self.storage)
+            .field("hybrid_read", &self.hybrid_read)
             .field(
                 "scheduler",
                 &self.scheduler.as_ref().map(|_| "<dyn Scheduler>"),

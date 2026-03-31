@@ -51,6 +51,7 @@ fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -
             durability,
             local_retention: TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }
@@ -92,6 +93,7 @@ fn tiered_config_with_max_local_bytes_and_retention(
             durability: TieredDurabilityMode::GroupCommit,
             local_retention,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }
@@ -106,6 +108,7 @@ fn s3_primary_config(prefix: &str) -> DbConfig {
             mem_cache_size_bytes: 1024 * 1024,
             auto_flush_interval: None,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }

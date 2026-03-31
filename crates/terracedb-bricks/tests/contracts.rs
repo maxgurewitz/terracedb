@@ -193,6 +193,7 @@ async fn public_bricks_surface_compiles_and_is_instantiable() {
                 durability: TieredDurabilityMode::GroupCommit,
                 local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
+            hybrid_read: Default::default(),
             scheduler: None,
         },
         DbDependencies::new(

@@ -504,6 +504,7 @@ pub fn todo_db_builder(path: &str, prefix: &str) -> DbBuilder {
 pub fn todo_db_config(path: &str, prefix: &str) -> DbConfig {
     DbConfig {
         storage: todo_db_settings(path, prefix).into_storage(),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }

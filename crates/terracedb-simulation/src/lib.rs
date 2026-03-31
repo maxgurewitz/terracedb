@@ -27,6 +27,11 @@ use terracedb::{
     Timestamp, TtlCompactionFilter, Value, WriteError, test_support::FailpointRegistry,
 };
 
+mod hybrid;
+
+#[allow(unused_imports)]
+pub use self::hybrid::*;
+
 const OBJECT_STORE_HOST: &str = "object-store";
 const OBJECT_STORE_PORT: u16 = 9400;
 const STUB_DB_LOG_PATH: &str = "/terracedb/sim/stub-db.log";
@@ -2285,6 +2290,7 @@ fn simulation_db_config(root_path: &str) -> DbConfig {
             durability: TieredDurabilityMode::GroupCommit,
             local_retention: terracedb::TieredLocalRetentionMode::Offload,
         }),
+        hybrid_read: Default::default(),
         scheduler: None,
     }
 }
