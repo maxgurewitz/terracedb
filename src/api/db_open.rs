@@ -28,6 +28,8 @@ impl Db {
                 Self::open_columnar_read_context(
                     &config.storage,
                     &config.hybrid_read,
+                    &execution_profile,
+                    &resource_manager,
                     &dependencies,
                 )
                 .await
@@ -127,6 +129,7 @@ impl Db {
                     )),
                     durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
                     work_deferrals: Mutex::new(BTreeMap::new()),
+                    work_deferral_domains: Mutex::new(BTreeMap::new()),
                     pending_work_budget_state: Mutex::new(PendingWorkBudgetState::default()),
                     scheduler_observability: SchedulerObservabilityStats::default(),
                     compact_to_wide_stats: Mutex::new(BTreeMap::new()),
@@ -796,19 +799,286 @@ impl Db {
             .into_owned()
     }
 
+    fn columnar_cache_domain_paths(
+        execution_profile: &crate::DbExecutionProfile,
+    ) -> BTreeMap<crate::ExecutionLane, crate::ExecutionDomainPath> {
+        BTreeMap::from([
+            (
+                crate::ExecutionLane::UserForeground,
+                execution_profile.foreground.domain.clone(),
+            ),
+            (
+                crate::ExecutionLane::UserBackground,
+                execution_profile.background.domain.clone(),
+            ),
+            (
+                crate::ExecutionLane::ControlPlane,
+                execution_profile.control_plane.domain.clone(),
+            ),
+        ])
+    }
+
+    fn default_columnar_cache_lane_budgets(
+        hybrid_read: &crate::HybridReadConfig,
+    ) -> BTreeMap<crate::ExecutionLane, ColumnarCacheLaneBudget> {
+        let weights = BTreeMap::from([
+            (crate::ExecutionLane::UserForeground, 4_u32),
+            (crate::ExecutionLane::UserBackground, 2_u32),
+            (crate::ExecutionLane::ControlPlane, 1_u32),
+        ]);
+        let raw = Self::distribute_u64_by_weight(hybrid_read.raw_segment_cache_bytes, &weights);
+        let metadata =
+            Self::distribute_usize_by_weight(hybrid_read.decoded_metadata_cache_entries, &weights);
+        let columns =
+            Self::distribute_usize_by_weight(hybrid_read.decoded_column_cache_entries, &weights);
+        weights
+            .keys()
+            .copied()
+            .map(|lane| {
+                (
+                    lane,
+                    ColumnarCacheLaneBudget {
+                        raw_byte_budget_bytes: raw.get(&lane).copied().unwrap_or_default(),
+                        decoded_metadata_entry_limit: metadata
+                            .get(&lane)
+                            .copied()
+                            .unwrap_or_default(),
+                        decoded_column_entry_limit: columns.get(&lane).copied().unwrap_or_default(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn columnar_cache_lane_budgets(
+        hybrid_read: &crate::HybridReadConfig,
+        cache_domain_paths: &BTreeMap<crate::ExecutionLane, crate::ExecutionDomainPath>,
+        resource_manager: &Arc<dyn crate::ResourceManager>,
+    ) -> BTreeMap<crate::ExecutionLane, ColumnarCacheLaneBudget> {
+        let snapshot = resource_manager.snapshot();
+        let default_weights = BTreeMap::from([
+            (crate::ExecutionLane::UserForeground, 4_u32),
+            (crate::ExecutionLane::UserBackground, 2_u32),
+            (crate::ExecutionLane::ControlPlane, 1_u32),
+        ]);
+        let requested_raw = cache_domain_paths
+            .iter()
+            .map(|(lane, path)| {
+                (
+                    *lane,
+                    snapshot
+                        .domains
+                        .get(path)
+                        .and_then(|domain| domain.spec.budget.memory.cache_bytes),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let weights = cache_domain_paths
+            .iter()
+            .map(|(lane, path)| {
+                let weight = snapshot
+                    .domains
+                    .get(path)
+                    .map(|domain| match domain.spec.placement {
+                        crate::ExecutionDomainPlacement::SharedWeighted { weight } => weight,
+                        crate::ExecutionDomainPlacement::Dedicated => {
+                            default_weights.get(lane).copied().unwrap_or(1).max(2)
+                        }
+                    })
+                    .unwrap_or_else(|| default_weights.get(lane).copied().unwrap_or(1));
+                (*lane, weight)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let raw = Self::distribute_u64_with_requests(
+            hybrid_read.raw_segment_cache_bytes,
+            &requested_raw,
+            &weights,
+        );
+        let metadata = Self::distribute_usize_by_budget(
+            hybrid_read.decoded_metadata_cache_entries,
+            &raw,
+            &weights,
+        );
+        let columns = Self::distribute_usize_by_budget(
+            hybrid_read.decoded_column_cache_entries,
+            &raw,
+            &weights,
+        );
+        weights
+            .keys()
+            .copied()
+            .map(|lane| {
+                (
+                    lane,
+                    ColumnarCacheLaneBudget {
+                        raw_byte_budget_bytes: raw.get(&lane).copied().unwrap_or_default(),
+                        decoded_metadata_entry_limit: metadata
+                            .get(&lane)
+                            .copied()
+                            .unwrap_or_default(),
+                        decoded_column_entry_limit: columns.get(&lane).copied().unwrap_or_default(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn distribute_u64_by_weight(
+        total: u64,
+        weights: &BTreeMap<crate::ExecutionLane, u32>,
+    ) -> BTreeMap<crate::ExecutionLane, u64> {
+        let requested = weights
+            .keys()
+            .copied()
+            .map(|lane| (lane, None))
+            .collect::<BTreeMap<_, _>>();
+        Self::distribute_u64_with_requests(total, &requested, weights)
+    }
+
+    fn distribute_u64_with_requests(
+        total: u64,
+        requested: &BTreeMap<crate::ExecutionLane, Option<u64>>,
+        weights: &BTreeMap<crate::ExecutionLane, u32>,
+    ) -> BTreeMap<crate::ExecutionLane, u64> {
+        let mut allocated = requested
+            .keys()
+            .copied()
+            .map(|lane| (lane, 0_u64))
+            .collect::<BTreeMap<_, _>>();
+        let fixed_total = requested.values().flatten().copied().sum::<u64>();
+        if fixed_total > 0 && fixed_total >= total {
+            let mut remaining = total;
+            let fixed_lanes = requested
+                .iter()
+                .filter_map(|(lane, bytes)| bytes.map(|bytes| (*lane, bytes)))
+                .collect::<Vec<_>>();
+            for (index, (lane, bytes)) in fixed_lanes.iter().enumerate() {
+                let share = if index + 1 == fixed_lanes.len() {
+                    remaining
+                } else {
+                    total.saturating_mul(*bytes) / fixed_total
+                };
+                allocated.insert(*lane, share);
+                remaining = remaining.saturating_sub(share);
+            }
+            return allocated;
+        }
+
+        let mut remaining = total;
+        for (&lane, bytes) in requested {
+            if let Some(bytes) = bytes {
+                allocated.insert(lane, *bytes);
+                remaining = remaining.saturating_sub(*bytes);
+            }
+        }
+        let weight_total = requested
+            .iter()
+            .filter(|(_, bytes)| bytes.is_none())
+            .map(|(lane, _)| weights.get(lane).copied().unwrap_or(1))
+            .sum::<u32>();
+        let flexible_lanes = requested
+            .iter()
+            .filter(|(_, bytes)| bytes.is_none())
+            .map(|(lane, _)| *lane)
+            .collect::<Vec<_>>();
+        let mut allocated_flexible = 0_u64;
+        for (index, lane) in flexible_lanes.iter().enumerate() {
+            let share = if index + 1 == flexible_lanes.len() || weight_total == 0 {
+                remaining.saturating_sub(allocated_flexible)
+            } else {
+                remaining.saturating_mul(weights.get(lane).copied().unwrap_or(1) as u64)
+                    / u64::from(weight_total)
+            };
+            allocated.insert(
+                *lane,
+                allocated.get(lane).copied().unwrap_or_default() + share,
+            );
+            allocated_flexible = allocated_flexible.saturating_add(share);
+        }
+        if allocated_flexible < remaining && !flexible_lanes.is_empty() {
+            *allocated
+                .entry(crate::ExecutionLane::UserForeground)
+                .or_default() += remaining.saturating_sub(allocated_flexible);
+        }
+        allocated
+    }
+
+    fn distribute_usize_by_weight(
+        total: usize,
+        weights: &BTreeMap<crate::ExecutionLane, u32>,
+    ) -> BTreeMap<crate::ExecutionLane, usize> {
+        let budget = weights
+            .iter()
+            .map(|(lane, weight)| (*lane, u64::from(*weight)))
+            .collect::<BTreeMap<_, _>>();
+        Self::distribute_usize_by_budget(total, &budget, weights)
+    }
+
+    fn distribute_usize_by_budget(
+        total: usize,
+        budget: &BTreeMap<crate::ExecutionLane, u64>,
+        weights: &BTreeMap<crate::ExecutionLane, u32>,
+    ) -> BTreeMap<crate::ExecutionLane, usize> {
+        let mut allocated = budget
+            .keys()
+            .copied()
+            .map(|lane| (lane, 0_usize))
+            .collect::<BTreeMap<_, _>>();
+        let total_budget = budget.values().copied().sum::<u64>();
+        if total_budget == 0 || total == 0 {
+            return allocated;
+        }
+        let mut allocated_total = 0_usize;
+        let lanes = budget.keys().copied().collect::<Vec<_>>();
+        for (index, lane) in lanes.iter().enumerate() {
+            let share = if index + 1 == lanes.len() {
+                total.saturating_sub(allocated_total)
+            } else if total_budget == 0 {
+                0
+            } else {
+                total.saturating_mul(budget.get(lane).copied().unwrap_or_default() as usize)
+                    / total_budget as usize
+            };
+            allocated.insert(*lane, share);
+            allocated_total = allocated_total.saturating_add(share);
+        }
+        if allocated_total < total {
+            let lane = lanes
+                .into_iter()
+                .max_by_key(|lane| weights.get(lane).copied().unwrap_or(1))
+                .unwrap_or(crate::ExecutionLane::UserForeground);
+            *allocated.entry(lane).or_default() += total.saturating_sub(allocated_total);
+        }
+        allocated
+    }
+
     pub(super) async fn open_columnar_read_context(
         storage: &StorageConfig,
         hybrid_read: &crate::HybridReadConfig,
+        execution_profile: &crate::DbExecutionProfile,
+        resource_manager: &Arc<dyn crate::ResourceManager>,
         dependencies: &DbDependencies,
     ) -> Result<ColumnarReadContext, StorageError> {
+        let cache_domain_paths = Self::columnar_cache_domain_paths(execution_profile);
+        let cache_lane_budgets =
+            Self::columnar_cache_lane_budgets(hybrid_read, &cache_domain_paths, resource_manager);
+        let total_raw_byte_budget = cache_lane_budgets
+            .values()
+            .map(|budget| budget.raw_byte_budget_bytes)
+            .sum::<u64>()
+            .max(1);
+        let background_prefetch_budget = cache_lane_budgets
+            .get(&crate::ExecutionLane::UserBackground)
+            .map(|budget| budget.raw_byte_budget_bytes)
+            .unwrap_or_default();
         let remote_cache_config = match storage {
             StorageConfig::Tiered(config) => Some((
                 Self::join_fs_path(&config.ssd.path, LOCAL_REMOTE_CACHE_RELATIVE_DIR),
-                hybrid_read.raw_segment_cache_bytes,
+                total_raw_byte_budget,
             )),
             StorageConfig::S3Primary(config) => Some((
                 Self::s3_primary_remote_cache_root(config),
-                hybrid_read.raw_segment_cache_bytes,
+                total_raw_byte_budget,
             )),
         };
         let remote_cache = match remote_cache_config {
@@ -818,6 +1088,7 @@ impl Db {
                     root,
                     crate::remote::RemoteCacheConfig {
                         max_bytes,
+                        prefetch_bytes: background_prefetch_budget,
                         ..Default::default()
                     },
                 )
@@ -855,18 +1126,27 @@ impl Db {
             dependencies: dependencies.clone(),
             remote_cache,
             decoded_cache: DecodedColumnarCache::new(
-                hybrid_read.decoded_metadata_cache_entries,
-                hybrid_read.decoded_column_cache_entries,
+                cache_lane_budgets
+                    .iter()
+                    .map(|(lane, budget)| (*lane, budget.decoded_metadata_entry_limit))
+                    .collect(),
+                cache_lane_budgets
+                    .iter()
+                    .map(|(lane, budget)| (*lane, budget.decoded_column_entry_limit))
+                    .collect(),
             ),
             raw_byte_cache_enabled: AtomicBool::new(true),
             raw_byte_cache_population_enabled: AtomicBool::new(true),
             decoded_cache_enabled: AtomicBool::new(true),
-            raw_byte_cache_budget_bytes: hybrid_read.raw_segment_cache_bytes,
+            raw_byte_cache_budget_bytes: total_raw_byte_budget,
             raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState {
                 total_bytes: raw_byte_total,
                 order: raw_byte_order,
                 lengths: raw_byte_lengths,
+                owners: BTreeMap::new(),
             }),
+            cache_domain_paths,
+            cache_lane_budgets,
             skip_indexes_enabled: hybrid_read.skip_indexes_enabled,
             projection_sidecars_enabled: hybrid_read.projection_sidecars_enabled,
             aggressive_background_repair: hybrid_read.aggressive_background_repair,
@@ -880,18 +1160,29 @@ impl Db {
         dependencies: &DbDependencies,
     ) -> ColumnarReadContext {
         let config = crate::HybridReadConfig::default();
+        let cache_lane_budgets = Self::default_columnar_cache_lane_budgets(&config);
         ColumnarReadContext {
             dependencies: dependencies.clone(),
             remote_cache: None,
             decoded_cache: DecodedColumnarCache::new(
-                config.decoded_metadata_cache_entries,
-                config.decoded_column_cache_entries,
+                cache_lane_budgets
+                    .iter()
+                    .map(|(lane, budget)| (*lane, budget.decoded_metadata_entry_limit))
+                    .collect(),
+                cache_lane_budgets
+                    .iter()
+                    .map(|(lane, budget)| (*lane, budget.decoded_column_entry_limit))
+                    .collect(),
             ),
             raw_byte_cache_enabled: AtomicBool::new(false),
             raw_byte_cache_population_enabled: AtomicBool::new(false),
             decoded_cache_enabled: AtomicBool::new(true),
             raw_byte_cache_budget_bytes: 0,
             raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState::default()),
+            cache_domain_paths: Self::columnar_cache_domain_paths(
+                &crate::DbExecutionProfile::default(),
+            ),
+            cache_lane_budgets,
             skip_indexes_enabled: false,
             projection_sidecars_enabled: false,
             aggressive_background_repair: false,

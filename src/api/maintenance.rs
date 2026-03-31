@@ -384,14 +384,16 @@ impl Db {
             .into_iter()
             .filter_map(|(table_id, estimated_bytes)| {
                 let stored = Self::stored_table_by_id(&tables, table_id)?;
+                let tagged = self.tag_pending_work(PendingWork {
+                    id: format!("flush:{}", stored.config.name),
+                    work_type: PendingWorkType::Flush,
+                    table: stored.config.name.clone(),
+                    level: None,
+                    estimated_bytes,
+                });
                 Some(PendingWorkCandidate {
-                    pending: PendingWork {
-                        id: format!("flush:{}", stored.config.name),
-                        work_type: PendingWorkType::Flush,
-                        table: stored.config.name.clone(),
-                        level: None,
-                        estimated_bytes,
-                    },
+                    pending: tagged.work,
+                    tag: tagged.tag,
                     spec: PendingWorkSpec::Flush,
                 })
             })
@@ -469,14 +471,16 @@ impl Db {
                     },
                     &selected,
                 )?;
+                let tagged = self.tag_pending_work(PendingWork {
+                    id: job.id.clone(),
+                    work_type: PendingWorkType::Offload,
+                    table: job.table_name.clone(),
+                    level: None,
+                    estimated_bytes: job.estimated_bytes,
+                });
                 Some(PendingWorkCandidate {
-                    pending: PendingWork {
-                        id: job.id.clone(),
-                        work_type: PendingWorkType::Offload,
-                        table: job.table_name.clone(),
-                        level: None,
-                        estimated_bytes: job.estimated_bytes,
-                    },
+                    pending: tagged.work,
+                    tag: tagged.tag,
                     spec: PendingWorkSpec::Offload(job),
                 })
             })
@@ -493,14 +497,16 @@ impl Db {
     pub(super) fn pending_work_candidates(&self) -> Vec<PendingWorkCandidate> {
         let mut candidates = self.pending_flush_candidates();
         candidates.extend(self.pending_compaction_jobs().into_iter().map(|job| {
+            let tagged = self.tag_pending_work(PendingWork {
+                id: job.id.clone(),
+                work_type: PendingWorkType::Compaction,
+                table: job.table_name.clone(),
+                level: Some(job.source_level),
+                estimated_bytes: job.estimated_bytes,
+            });
             PendingWorkCandidate {
-                pending: PendingWork {
-                    id: job.id.clone(),
-                    work_type: PendingWorkType::Compaction,
-                    table: job.table_name.clone(),
-                    level: Some(job.source_level),
-                    estimated_bytes: job.estimated_bytes,
-                },
+                pending: tagged.work,
+                tag: tagged.tag,
                 spec: PendingWorkSpec::Compaction(job),
             }
         }));
@@ -520,6 +526,8 @@ impl Db {
             .collect::<BTreeSet<_>>();
         mutex_lock(&self.inner.work_deferrals)
             .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
+        mutex_lock(&self.inner.work_deferral_domains)
+            .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
     }
 
     pub(super) fn record_deferred_work(
@@ -528,6 +536,7 @@ impl Db {
         decisions: &BTreeMap<String, ScheduleAction>,
     ) {
         let mut deferrals = mutex_lock(&self.inner.work_deferrals);
+        let mut domains = mutex_lock(&self.inner.work_deferral_domains);
         for candidate in candidates {
             match decisions
                 .get(&candidate.pending.id)
@@ -536,9 +545,11 @@ impl Db {
             {
                 ScheduleAction::Execute => {
                     deferrals.remove(&candidate.pending.id);
+                    domains.remove(&candidate.pending.id);
                 }
                 ScheduleAction::Defer => {
                     *deferrals.entry(candidate.pending.id.clone()).or_default() += 1;
+                    domains.insert(candidate.pending.id.clone(), candidate.tag.domain.clone());
                 }
             }
         }
@@ -546,6 +557,7 @@ impl Db {
 
     pub(super) fn reset_work_deferral(&self, work_id: &str) {
         mutex_lock(&self.inner.work_deferrals).remove(work_id);
+        mutex_lock(&self.inner.work_deferral_domains).remove(work_id);
     }
 
     pub(super) fn work_deferral_cycles(&self, work_id: &str) -> u32 {
@@ -576,14 +588,22 @@ impl Db {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn record_budget_blocked_execution(&self) {
+    pub(super) fn record_budget_blocked_execution(&self, tag: &crate::WorkRuntimeTag) {
         self.inner
             .scheduler_observability
             .budget_blocked_executions
             .fetch_add(1, Ordering::Relaxed);
+        *mutex_lock(
+            &self
+                .inner
+                .scheduler_observability
+                .budget_blocked_executions_by_domain,
+        )
+        .entry(tag.domain.clone())
+        .or_default() += 1;
     }
 
-    pub(super) fn record_background_delay(&self, delay: Duration) {
+    pub(super) fn record_background_delay(&self, tag: &crate::WorkRuntimeTag, delay: Duration) {
         if delay.is_zero() {
             return;
         }
@@ -595,42 +615,87 @@ impl Db {
             .scheduler_observability
             .background_delay_millis
             .fetch_add(delay.as_millis() as u64, Ordering::Relaxed);
+        *mutex_lock(
+            &self
+                .inner
+                .scheduler_observability
+                .background_delay_events_by_domain,
+        )
+        .entry(tag.domain.clone())
+        .or_default() += 1;
+        *mutex_lock(
+            &self
+                .inner
+                .scheduler_observability
+                .background_delay_millis_by_domain,
+        )
+        .entry(tag.domain.clone())
+        .or_default() += delay.as_millis() as u64;
     }
 
     pub(super) fn pending_work_budget_block_reason(
         &self,
-        work: &PendingWork,
+        candidate: &PendingWorkCandidate,
         budget: PendingWorkBudget,
     ) -> Option<PendingWorkBudgetBlockReason> {
         let state = mutex_lock(&self.inner.pending_work_budget_state);
-        let work_type = work.work_type;
+        let work_type = candidate.pending.work_type;
+        let work_state = state.by_work_type.get(&work_type);
+        let domain_state = state.by_domain.get(&candidate.tag.domain);
+        if budget.max_domain_concurrency.is_some_and(|max| {
+            domain_state
+                .map(|usage| usage.concurrency)
+                .unwrap_or_default()
+                >= max
+        }) {
+            return Some(PendingWorkBudgetBlockReason::DomainConcurrency);
+        }
+        if budget.max_domain_local_requests.is_some_and(|max| {
+            domain_state
+                .map(|usage| usage.local_requests)
+                .unwrap_or_default()
+                >= max
+        }) {
+            return Some(PendingWorkBudgetBlockReason::DomainLocalRequests);
+        }
+        if budget.max_domain_remote_requests.is_some_and(|max| {
+            domain_state
+                .map(|usage| usage.remote_requests)
+                .unwrap_or_default()
+                >= max
+        }) {
+            return Some(PendingWorkBudgetBlockReason::DomainRemoteRequests);
+        }
+        if budget.max_domain_in_flight_bytes.is_some_and(|max| {
+            domain_state
+                .map(|usage| usage.in_flight_bytes)
+                .unwrap_or_default()
+                .saturating_add(candidate.pending.estimated_bytes)
+                > max
+        }) {
+            return Some(PendingWorkBudgetBlockReason::DomainInFlightBytes);
+        }
         if budget.max_concurrency.is_some_and(|max| {
-            state
-                .concurrency
-                .get(&work_type)
-                .copied()
+            work_state
+                .map(|usage| usage.concurrency)
                 .unwrap_or_default()
                 >= max
         }) {
             return Some(PendingWorkBudgetBlockReason::Concurrency);
         }
         if budget.max_in_flight_requests.is_some_and(|max| {
-            state
-                .in_flight_requests
-                .get(&work_type)
-                .copied()
+            work_state
+                .map(|usage| usage.in_flight_requests)
                 .unwrap_or_default()
                 >= max
         }) {
             return Some(PendingWorkBudgetBlockReason::InFlightRequests);
         }
         if budget.max_in_flight_bytes.is_some_and(|max| {
-            state
-                .in_flight_bytes
-                .get(&work_type)
-                .copied()
+            work_state
+                .map(|usage| usage.in_flight_bytes)
                 .unwrap_or_default()
-                .saturating_add(work.estimated_bytes)
+                .saturating_add(candidate.pending.estimated_bytes)
                 > max
         }) {
             return Some(PendingWorkBudgetBlockReason::InFlightBytes);
@@ -638,47 +703,64 @@ impl Db {
         None
     }
 
-    pub(super) fn reserve_pending_work_budget(&self, work: &PendingWork) {
+    pub(super) fn reserve_pending_work_budget(&self, candidate: &PendingWorkCandidate) {
         let mut state = mutex_lock(&self.inner.pending_work_budget_state);
-        *state.in_flight_bytes.entry(work.work_type).or_default() = state
+        let usage = state
+            .by_work_type
+            .entry(candidate.pending.work_type)
+            .or_default();
+        usage.in_flight_bytes = usage
             .in_flight_bytes
-            .get(&work.work_type)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(work.estimated_bytes);
-        *state.in_flight_requests.entry(work.work_type).or_default() = state
-            .in_flight_requests
-            .get(&work.work_type)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(1);
-        *state.concurrency.entry(work.work_type).or_default() = state
-            .concurrency
-            .get(&work.work_type)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(1);
+            .saturating_add(candidate.pending.estimated_bytes);
+        usage.in_flight_requests = usage.in_flight_requests.saturating_add(1);
+        usage.concurrency = usage.concurrency.saturating_add(1);
+
+        let domain_usage = state
+            .by_domain
+            .entry(candidate.tag.domain.clone())
+            .or_default();
+        domain_usage.in_flight_bytes = domain_usage
+            .in_flight_bytes
+            .saturating_add(candidate.pending.estimated_bytes);
+        domain_usage.concurrency = domain_usage.concurrency.saturating_add(1);
+        if self.pending_work_uses_remote_io(candidate.pending.work_type) {
+            domain_usage.remote_requests = domain_usage.remote_requests.saturating_add(1);
+        } else {
+            domain_usage.local_requests = domain_usage.local_requests.saturating_add(1);
+        }
     }
 
-    pub(super) fn release_pending_work_budget(&self, work: &PendingWork) {
+    pub(super) fn release_pending_work_budget(&self, candidate: &PendingWorkCandidate) {
         let mut state = mutex_lock(&self.inner.pending_work_budget_state);
-        let work_type = work.work_type;
-        if let Some(bytes) = state.in_flight_bytes.get_mut(&work_type) {
-            *bytes = bytes.saturating_sub(work.estimated_bytes);
-            if *bytes == 0 {
-                state.in_flight_bytes.remove(&work_type);
+        let work_type = candidate.pending.work_type;
+        if let Some(usage) = state.by_work_type.get_mut(&work_type) {
+            usage.in_flight_bytes = usage
+                .in_flight_bytes
+                .saturating_sub(candidate.pending.estimated_bytes);
+            usage.in_flight_requests = usage.in_flight_requests.saturating_sub(1);
+            usage.concurrency = usage.concurrency.saturating_sub(1);
+            if usage.in_flight_bytes == 0 && usage.in_flight_requests == 0 && usage.concurrency == 0
+            {
+                state.by_work_type.remove(&work_type);
             }
         }
-        if let Some(requests) = state.in_flight_requests.get_mut(&work_type) {
-            *requests = requests.saturating_sub(1);
-            if *requests == 0 {
-                state.in_flight_requests.remove(&work_type);
+
+        if let Some(domain_usage) = state.by_domain.get_mut(&candidate.tag.domain) {
+            domain_usage.in_flight_bytes = domain_usage
+                .in_flight_bytes
+                .saturating_sub(candidate.pending.estimated_bytes);
+            domain_usage.concurrency = domain_usage.concurrency.saturating_sub(1);
+            if self.pending_work_uses_remote_io(candidate.pending.work_type) {
+                domain_usage.remote_requests = domain_usage.remote_requests.saturating_sub(1);
+            } else {
+                domain_usage.local_requests = domain_usage.local_requests.saturating_sub(1);
             }
-        }
-        if let Some(concurrency) = state.concurrency.get_mut(&work_type) {
-            *concurrency = concurrency.saturating_sub(1);
-            if *concurrency == 0 {
-                state.concurrency.remove(&work_type);
+            if domain_usage.in_flight_bytes == 0
+                && domain_usage.concurrency == 0
+                && domain_usage.local_requests == 0
+                && domain_usage.remote_requests == 0
+            {
+                state.by_domain.remove(&candidate.tag.domain);
             }
         }
     }
@@ -705,7 +787,15 @@ impl Db {
             return PendingWorkBudget::default();
         };
         let stats = self.table_stats(&table).await;
-        self.inner.scheduler.work_budget(&candidate.pending, &stats)
+        let tagged = crate::DomainTaggedWork::new(candidate.pending.clone(), candidate.tag.clone());
+        let domain_budget = self.execution_domain_budget(&candidate.tag.domain);
+        let priority_override = crate::scheduler::pending_work_domain_priority_override(&tagged);
+        self.inner.scheduler.domain_work_budget(
+            &tagged,
+            &stats,
+            domain_budget.as_ref(),
+            priority_override,
+        )
     }
 
     pub(super) fn deferred_work_candidate(
@@ -778,15 +868,15 @@ impl Db {
                 rate,
                 self.work_deferral_cycles(&candidate.pending.id),
             );
-            self.record_background_delay(delay);
+            self.record_background_delay(&candidate.tag, delay);
             self.inner.dependencies.clock.sleep(delay).await;
         }
 
-        self.reserve_pending_work_budget(&candidate.pending);
+        self.reserve_pending_work_budget(&candidate);
         let result = self
             .execute_pending_work(local_root, candidate.clone())
             .await;
-        self.release_pending_work_budget(&candidate.pending);
+        self.release_pending_work_budget(&candidate);
         result
     }
 
@@ -826,12 +916,14 @@ impl Db {
 
             let pending = candidates
                 .iter()
-                .map(|candidate| candidate.pending.clone())
+                .map(|candidate| {
+                    crate::DomainTaggedWork::new(candidate.pending.clone(), candidate.tag.clone())
+                })
                 .collect::<Vec<_>>();
             let mut decisions = self
                 .inner
                 .scheduler
-                .on_work_available(&pending)
+                .on_domain_work_available(&pending)
                 .into_iter()
                 .map(|decision| (decision.work_id, decision.action))
                 .collect::<BTreeMap<_, _>>();
@@ -851,11 +943,11 @@ impl Db {
             for candidate in &scheduled {
                 let budget = self.scheduler_budget_for_candidate(candidate).await;
                 if self
-                    .pending_work_budget_block_reason(&candidate.pending, budget)
+                    .pending_work_budget_block_reason(candidate, budget)
                     .is_some()
                 {
                     decisions.insert(candidate.pending.id.clone(), ScheduleAction::Defer);
-                    self.record_budget_blocked_execution();
+                    self.record_budget_blocked_execution(&candidate.tag);
                     continue;
                 }
 
@@ -881,6 +973,13 @@ impl Db {
         }
 
         Ok(false)
+    }
+
+    fn pending_work_uses_remote_io(&self, work_type: PendingWorkType) -> bool {
+        matches!(
+            work_type,
+            PendingWorkType::Backup | PendingWorkType::Offload | PendingWorkType::Prefetch
+        )
     }
 
     #[cfg(test)]
@@ -955,7 +1054,7 @@ impl Db {
             let metadata = sstable
                 .load_columnar_metadata(
                     &self.inner.columnar_read_context,
-                    ColumnarReadAccessPattern::Scan,
+                    ColumnarReadAccessPattern::Background,
                 )
                 .await?;
             let location = sstable.meta.storage_descriptor();
@@ -978,7 +1077,7 @@ impl Db {
                     &self.inner.columnar_read_context,
                     projection,
                     &row_indexes,
-                    ColumnarReadAccessPattern::Scan,
+                    ColumnarReadAccessPattern::Background,
                 )
                 .await?;
 
@@ -1050,7 +1149,7 @@ impl Db {
                         columnar_projection
                             .as_ref()
                             .expect("columnar projection should exist"),
-                        ColumnarReadAccessPattern::Scan,
+                        ColumnarReadAccessPattern::Background,
                     )
                     .await?
                     .0

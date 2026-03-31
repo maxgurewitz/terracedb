@@ -2,7 +2,15 @@ use std::{collections::BTreeMap, fmt, sync::Mutex};
 
 use serde_json::Value as JsonValue;
 
-use crate::{api::Table, current_state::CurrentStateRetentionStats, ids::SequenceNumber};
+use crate::{
+    api::Table,
+    current_state::CurrentStateRetentionStats,
+    execution::{
+        ContentionClass, DomainTaggedWork, DurabilityClass, ExecutionDomainBudget,
+        ExecutionDomainPath, ExecutionLane, WorkRuntimeTag,
+    },
+    ids::SequenceNumber,
+};
 
 pub const DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT: u32 = 3;
 pub const DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT: u32 = 4;
@@ -10,8 +18,38 @@ pub const DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT: u32 = 4;
 pub trait Scheduler: Send + Sync {
     fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision>;
     fn should_throttle(&self, table: &Table, stats: &TableStats) -> ThrottleDecision;
+    fn on_domain_work_available(
+        &self,
+        work: &[DomainTaggedWork<PendingWork>],
+    ) -> Vec<ScheduleDecision> {
+        let untagged = work
+            .iter()
+            .map(|item| item.work.clone())
+            .collect::<Vec<_>>();
+        self.on_work_available(&untagged)
+    }
+    fn should_throttle_in_domain(
+        &self,
+        table: &Table,
+        stats: &TableStats,
+        _tag: &WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        self.should_throttle(table, stats)
+    }
     fn work_budget(&self, _work: &PendingWork, _stats: &TableStats) -> PendingWorkBudget {
         PendingWorkBudget::default()
+    }
+    fn domain_work_budget(
+        &self,
+        work: &DomainTaggedWork<PendingWork>,
+        stats: &TableStats,
+        domain_budget: Option<&ExecutionDomainBudget>,
+        priority_override: DomainPriorityOverride,
+    ) -> PendingWorkBudget {
+        let mut budget = self.work_budget(&work.work, stats);
+        apply_domain_budget_overrides(&mut budget, work, domain_budget, priority_override);
+        budget
     }
 }
 
@@ -59,6 +97,10 @@ pub struct PendingWorkBudget {
     pub max_in_flight_bytes: Option<u64>,
     pub max_in_flight_requests: Option<u32>,
     pub max_concurrency: Option<u32>,
+    pub max_domain_in_flight_bytes: Option<u64>,
+    pub max_domain_concurrency: Option<u32>,
+    pub max_domain_local_requests: Option<u32>,
+    pub max_domain_remote_requests: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,17 +108,35 @@ pub enum PendingWorkBudgetBlockReason {
     InFlightBytes,
     InFlightRequests,
     Concurrency,
+    DomainInFlightBytes,
+    DomainConcurrency,
+    DomainLocalRequests,
+    DomainRemoteRequests,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DomainPriorityOverride {
+    #[default]
+    None,
+    EmergencyMaintenanceReserved,
+    ControlPlaneReserved,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchedulerObservabilitySnapshot {
     pub deferred_work: BTreeMap<String, u32>,
+    pub deferred_work_by_domain: BTreeMap<ExecutionDomainPath, u32>,
+    pub starved_domains: BTreeMap<ExecutionDomainPath, u32>,
     pub forced_executions: u64,
     pub forced_flushes: u64,
     pub forced_l0_compactions: u64,
     pub budget_blocked_executions: u64,
+    pub budget_blocked_executions_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub background_delay_events: u64,
     pub background_delay_millis: u64,
+    pub background_delay_events_by_domain: BTreeMap<ExecutionDomainPath, u64>,
+    pub background_delay_millis_by_domain: BTreeMap<ExecutionDomainPath, u64>,
+    pub throttled_writes_by_domain: BTreeMap<ExecutionDomainPath, u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,33 +190,70 @@ pub struct RoundRobinScheduler {
 
 #[derive(Default)]
 struct RoundRobinSchedulerState {
-    last_table: Option<String>,
+    last_domain: Option<ExecutionDomainPath>,
+    last_table_by_domain: BTreeMap<ExecutionDomainPath, String>,
 }
 
 impl Scheduler for RoundRobinScheduler {
     fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        let tagged = work
+            .iter()
+            .cloned()
+            .map(|work| DomainTaggedWork::new(work, default_scheduler_work_tag()))
+            .collect::<Vec<_>>();
+        self.on_domain_work_available(&tagged)
+    }
+
+    fn on_domain_work_available(
+        &self,
+        work: &[DomainTaggedWork<PendingWork>],
+    ) -> Vec<ScheduleDecision> {
         if work.is_empty() {
             return Vec::new();
         }
 
         let mut ordered = work.iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| {
-            pending_work_priority(left)
-                .cmp(&pending_work_priority(right))
-                .then_with(|| left.table.cmp(&right.table))
-                .then_with(|| left.level.cmp(&right.level))
-                .then_with(|| left.id.cmp(&right.id))
+            tagged_pending_work_priority(left)
+                .cmp(&tagged_pending_work_priority(right))
+                .then_with(|| left.tag.domain.cmp(&right.tag.domain))
+                .then_with(|| left.work.table.cmp(&right.work.table))
+                .then_with(|| left.work.level.cmp(&right.work.level))
+                .then_with(|| left.work.id.cmp(&right.work.id))
         });
 
-        let top_priority = pending_work_priority(ordered[0]);
+        let top_priority = tagged_pending_work_priority(ordered[0]);
         let top_priority_work = ordered
             .into_iter()
-            .filter(|work| pending_work_priority(work) == top_priority)
+            .filter(|work| tagged_pending_work_priority(work) == top_priority)
             .collect::<Vec<_>>();
+
+        let mut domains = top_priority_work
+            .iter()
+            .map(|work| work.tag.domain.clone())
+            .collect::<Vec<_>>();
+        domains.sort_unstable();
+        domains.dedup();
+
+        let selected_domain = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("round-robin scheduler mutex should not be poisoned");
+            let next_index = state
+                .last_domain
+                .as_ref()
+                .and_then(|last| domains.iter().position(|domain| domain > last))
+                .unwrap_or(0);
+            let domain = domains[next_index].clone();
+            state.last_domain = Some(domain.clone());
+            domain
+        };
 
         let mut tables = top_priority_work
             .iter()
-            .map(|work| work.table.as_str())
+            .filter(|work| work.tag.domain == selected_domain)
+            .map(|work| work.work.table.as_str())
             .collect::<Vec<_>>();
         tables.sort_unstable();
         tables.dedup();
@@ -167,30 +264,33 @@ impl Scheduler for RoundRobinScheduler {
                 .lock()
                 .expect("round-robin scheduler mutex should not be poisoned");
             let next_index = state
-                .last_table
-                .as_deref()
-                .and_then(|last| tables.iter().position(|table| *table > last))
+                .last_table_by_domain
+                .get(&selected_domain)
+                .and_then(|last| tables.iter().position(|table| *table > last.as_str()))
                 .unwrap_or(0);
             let table = tables[next_index].to_string();
-            state.last_table = Some(table.clone());
+            state
+                .last_table_by_domain
+                .insert(selected_domain.clone(), table.clone());
             table
         };
 
         let selected_work_id = top_priority_work
             .into_iter()
-            .filter(|work| work.table == selected_table)
+            .filter(|work| work.tag.domain == selected_domain && work.work.table == selected_table)
             .min_by(|left, right| {
-                left.level
-                    .cmp(&right.level)
-                    .then_with(|| left.id.cmp(&right.id))
+                left.work
+                    .level
+                    .cmp(&right.work.level)
+                    .then_with(|| left.work.id.cmp(&right.work.id))
             })
-            .map(|work| work.id.clone())
+            .map(|work| work.work.id.clone())
             .expect("top-priority work should contain at least one item for the selected table");
 
         work.iter()
             .map(|work| ScheduleDecision {
-                work_id: work.id.clone(),
-                action: if work.id == selected_work_id {
+                work_id: work.work.id.clone(),
+                action: if work.work.id == selected_work_id {
                     ScheduleAction::Execute
                 } else {
                     ScheduleAction::Defer
@@ -231,6 +331,16 @@ impl Scheduler for RoundRobinScheduler {
 
         ThrottleDecision::default()
     }
+
+    fn should_throttle_in_domain(
+        &self,
+        table: &Table,
+        stats: &TableStats,
+        _tag: &WorkRuntimeTag,
+        _domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        self.should_throttle(table, stats)
+    }
 }
 
 impl fmt::Debug for RoundRobinScheduler {
@@ -250,6 +360,115 @@ fn pending_work_priority(work: &PendingWork) -> (u8, u32) {
     }
 }
 
+pub(crate) fn pending_work_domain_priority_override(
+    work: &DomainTaggedWork<PendingWork>,
+) -> DomainPriorityOverride {
+    match work.tag.contention_class {
+        ContentionClass::ControlPlane => DomainPriorityOverride::ControlPlaneReserved,
+        ContentionClass::EmergencyMaintenance => {
+            DomainPriorityOverride::EmergencyMaintenanceReserved
+        }
+        ContentionClass::Recovery | ContentionClass::UserData => DomainPriorityOverride::None,
+    }
+}
+
+pub(crate) fn apply_domain_budget_overrides(
+    budget: &mut PendingWorkBudget,
+    work: &DomainTaggedWork<PendingWork>,
+    domain_budget: Option<&ExecutionDomainBudget>,
+    priority_override: DomainPriorityOverride,
+) {
+    let Some(domain_budget) = domain_budget else {
+        return;
+    };
+
+    merge_min_u64(
+        &mut budget.max_domain_in_flight_bytes,
+        domain_budget.background.max_in_flight_bytes,
+    );
+    merge_min_u32(
+        &mut budget.max_domain_concurrency,
+        domain_budget.background.task_slots,
+    );
+    if pending_work_uses_remote_io(work.work.work_type) {
+        merge_min_u32(
+            &mut budget.max_domain_remote_requests,
+            domain_budget.io.remote_concurrency,
+        );
+    } else {
+        merge_min_u32(
+            &mut budget.max_domain_local_requests,
+            domain_budget.io.local_concurrency,
+        );
+    }
+
+    if matches!(
+        priority_override,
+        DomainPriorityOverride::EmergencyMaintenanceReserved
+            | DomainPriorityOverride::ControlPlaneReserved
+    ) {
+        budget.max_domain_concurrency = Some(budget.max_domain_concurrency.unwrap_or(0).max(1));
+        budget.max_domain_in_flight_bytes = Some(
+            budget
+                .max_domain_in_flight_bytes
+                .unwrap_or(0)
+                .max(work.work.estimated_bytes.max(1)),
+        );
+        if pending_work_uses_remote_io(work.work.work_type) {
+            budget.max_domain_remote_requests =
+                Some(budget.max_domain_remote_requests.unwrap_or(0).max(1));
+        } else {
+            budget.max_domain_local_requests =
+                Some(budget.max_domain_local_requests.unwrap_or(0).max(1));
+        }
+    }
+}
+
+fn pending_work_uses_remote_io(work_type: PendingWorkType) -> bool {
+    matches!(
+        work_type,
+        PendingWorkType::Backup | PendingWorkType::Offload | PendingWorkType::Prefetch
+    )
+}
+
+fn merge_min_u32(target: &mut Option<u32>, candidate: Option<u32>) {
+    *target = match (*target, candidate) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+}
+
+fn merge_min_u64(target: &mut Option<u64>, candidate: Option<u64>) {
+    *target = match (*target, candidate) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+}
+
+fn default_scheduler_work_tag() -> WorkRuntimeTag {
+    WorkRuntimeTag {
+        owner: crate::ExecutionDomainOwner::ProcessControl,
+        lane: ExecutionLane::UserBackground,
+        contention_class: ContentionClass::UserData,
+        domain: ExecutionDomainPath::new(["process", "scheduler", "default"]),
+        durability_class: DurabilityClass::UserData,
+    }
+}
+
+fn tagged_pending_work_priority(work: &DomainTaggedWork<PendingWork>) -> (u8, u8, u32) {
+    let override_priority = match pending_work_domain_priority_override(work) {
+        DomainPriorityOverride::ControlPlaneReserved => 0,
+        DomainPriorityOverride::EmergencyMaintenanceReserved => 1,
+        DomainPriorityOverride::None => 2,
+    };
+    let (kind_priority, level_priority) = pending_work_priority(&work.work);
+    (override_priority, kind_priority, level_priority)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
@@ -257,15 +476,17 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, PendingWork,
-        PendingWorkType, RoundRobinScheduler, ScheduleAction, Scheduler, TableStats,
+        DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT,
+        DomainPriorityOverride, PendingWork, PendingWorkType, RoundRobinScheduler, ScheduleAction,
+        Scheduler, TableStats, default_scheduler_work_tag,
     };
     use crate::{
         CurrentStateEffectiveMode, CurrentStateRetainedSetSummary,
         CurrentStateRetentionBackpressure, CurrentStateRetentionBackpressureSignal,
         CurrentStateRetentionCoordinationStats, CurrentStateRetentionEvaluationCost,
         CurrentStateRetentionMembershipChanges, CurrentStateRetentionStats,
-        CurrentStateRetentionStatus, Db, DbConfig, DbDependencies, S3Location, SsdConfig,
+        CurrentStateRetentionStatus, Db, DbConfig, DbDependencies, DomainTaggedWork,
+        ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane, S3Location, SsdConfig,
         StorageConfig, StubClock, StubFileSystem, StubObjectStore, StubRng, Table,
         TieredDurabilityMode, TieredStorageConfig,
     };
@@ -468,5 +689,90 @@ mod tests {
         assert!(decision.throttle);
         assert!(!decision.stall);
         assert_eq!(decision.max_write_bytes_per_second, Some(64));
+    }
+
+    #[test]
+    fn round_robin_scheduler_prioritizes_control_plane_domains_before_user_background() {
+        let scheduler = RoundRobinScheduler::default();
+        let mut background_tag = default_scheduler_work_tag();
+        background_tag.domain = ExecutionDomainPath::new(["process", "db", "background"]);
+        background_tag.lane = ExecutionLane::UserBackground;
+
+        let mut control_tag = default_scheduler_work_tag();
+        control_tag.domain = ExecutionDomainPath::new(["process", "db", "control"]);
+        control_tag.lane = ExecutionLane::ControlPlane;
+        control_tag.contention_class = crate::ContentionClass::ControlPlane;
+        control_tag.durability_class = crate::DurabilityClass::ControlPlane;
+
+        let work = vec![
+            DomainTaggedWork::new(
+                PendingWork {
+                    id: "compaction:events".to_string(),
+                    work_type: PendingWorkType::Compaction,
+                    table: "events".to_string(),
+                    level: Some(0),
+                    estimated_bytes: 128,
+                },
+                background_tag,
+            ),
+            DomainTaggedWork::new(
+                PendingWork {
+                    id: "backup:catalog".to_string(),
+                    work_type: PendingWorkType::Backup,
+                    table: "_internal".to_string(),
+                    level: None,
+                    estimated_bytes: 64,
+                },
+                control_tag,
+            ),
+        ];
+
+        let decisions = scheduler.on_domain_work_available(&work);
+        let executed = decisions
+            .into_iter()
+            .find(|decision| decision.action == ScheduleAction::Execute)
+            .expect("one domain-tagged item should be selected");
+        assert_eq!(executed.work_id, "backup:catalog");
+    }
+
+    #[test]
+    fn domain_work_budget_reserves_minimum_progress_for_control_plane_work() {
+        let scheduler = RoundRobinScheduler::default();
+        let mut control_tag = default_scheduler_work_tag();
+        control_tag.domain = ExecutionDomainPath::new(["process", "db", "control"]);
+        control_tag.lane = ExecutionLane::ControlPlane;
+        control_tag.contention_class = crate::ContentionClass::ControlPlane;
+        control_tag.durability_class = crate::DurabilityClass::ControlPlane;
+        let work = DomainTaggedWork::new(
+            PendingWork {
+                id: "backup:catalog".to_string(),
+                work_type: PendingWorkType::Backup,
+                table: "_internal".to_string(),
+                level: None,
+                estimated_bytes: 64,
+            },
+            control_tag,
+        );
+
+        let budget = scheduler.domain_work_budget(
+            &work,
+            &TableStats::default(),
+            Some(&ExecutionDomainBudget {
+                background: crate::DomainBackgroundBudget {
+                    task_slots: Some(0),
+                    max_in_flight_bytes: Some(0),
+                },
+                io: crate::DomainIoBudget {
+                    remote_concurrency: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            DomainPriorityOverride::ControlPlaneReserved,
+        );
+
+        assert_eq!(budget.max_domain_concurrency, Some(1));
+        assert_eq!(budget.max_domain_remote_requests, Some(1));
+        assert_eq!(budget.max_domain_in_flight_bytes, Some(64));
     }
 }

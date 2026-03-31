@@ -2,8 +2,8 @@ use super::*;
 
 use crate::ZoneMapPredicate;
 use crate::execution::{
-    DbExecutionProfile, DomainTaggedWork, ExecutionDomainOwner, ExecutionLane, ResourceManager,
-    ResourceManagerSnapshot,
+    DbExecutionProfile, DomainTaggedWork, ExecutionDomainBudget, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionLane, ResourceManager, ResourceManagerSnapshot, WorkRuntimeTag,
 };
 
 #[derive(Clone, Debug)]
@@ -529,6 +529,18 @@ impl Db {
 
     pub fn resource_manager_snapshot(&self) -> ResourceManagerSnapshot {
         self.inner.resource_manager.snapshot()
+    }
+
+    pub(super) fn execution_domain_budget(
+        &self,
+        path: &ExecutionDomainPath,
+    ) -> Option<ExecutionDomainBudget> {
+        self.inner
+            .resource_manager
+            .snapshot()
+            .domains
+            .get(path)
+            .map(|snapshot| snapshot.spec.budget)
     }
 
     pub fn tag_user_foreground_work<T>(&self, work: T) -> DomainTaggedWork<T> {
@@ -1147,6 +1159,8 @@ impl Db {
     ) -> Result<(), CommitError> {
         let batch_bytes_by_table = Self::estimated_batch_bytes_by_table(operations);
         let total_batch_bytes = batch_bytes_by_table.values().copied().sum::<u64>();
+        let foreground_tag = self.tag_user_foreground_work(()).tag;
+        let foreground_budget = self.execution_domain_budget(&foreground_tag.domain);
         if self.memtable_budget_exceeded_by(total_batch_bytes) {
             self.record_forced_execution();
             self.record_forced_flush();
@@ -1178,7 +1192,12 @@ impl Db {
 
             for table in &touched_tables {
                 let stats = self.table_stats(table).await;
-                let decision = self.inner.scheduler.should_throttle(table, &stats);
+                let decision = self.inner.scheduler.should_throttle_in_domain(
+                    table,
+                    &stats,
+                    &foreground_tag,
+                    foreground_budget.as_ref(),
+                );
                 let table_bytes = table
                     .id()
                     .and_then(|table_id| batch_bytes_by_table.get(&table_id).copied())
@@ -1188,10 +1207,12 @@ impl Db {
                     max_delay = max_delay.max(Self::throttle_delay(table_bytes, rate));
                 }
                 if decision.throttle {
+                    self.record_throttled_write_domain(&foreground_tag);
                     should_run_maintenance = true;
                 }
                 if decision.stall || stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
                 {
+                    self.record_throttled_write_domain(&foreground_tag);
                     should_run_maintenance = true;
                     must_stall = true;
                 }
@@ -1221,7 +1242,12 @@ impl Db {
 
     pub(super) fn memtable_budget_bytes(&self) -> Option<u64> {
         match &self.inner.config.storage {
-            StorageConfig::Tiered(config) => Some(config.max_local_bytes),
+            StorageConfig::Tiered(config) => Some(
+                self.execution_domain_budget(&self.execution_profile().foreground.domain)
+                    .and_then(|budget| budget.memory.mutable_bytes)
+                    .map(|budget| budget.min(config.max_local_bytes))
+                    .unwrap_or(config.max_local_bytes),
+            ),
             StorageConfig::S3Primary(_) => None,
         }
     }
@@ -3572,8 +3598,23 @@ impl Db {
     }
 
     pub fn scheduler_observability_snapshot(&self) -> SchedulerObservabilitySnapshot {
+        let deferred_work = mutex_lock(&self.inner.work_deferrals).clone();
+        let deferred_domains = mutex_lock(&self.inner.work_deferral_domains).clone();
+        let mut deferred_work_by_domain = BTreeMap::new();
+        let mut starved_domains = BTreeMap::new();
+        for (work_id, cycles) in &deferred_work {
+            let Some(domain) = deferred_domains.get(work_id) else {
+                continue;
+            };
+            *deferred_work_by_domain.entry(domain.clone()).or_default() += *cycles;
+            if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
+                *starved_domains.entry(domain.clone()).or_default() += 1;
+            }
+        }
         SchedulerObservabilitySnapshot {
-            deferred_work: mutex_lock(&self.inner.work_deferrals).clone(),
+            deferred_work,
+            deferred_work_by_domain,
+            starved_domains,
             forced_executions: self
                 .inner
                 .scheduler_observability
@@ -3594,6 +3635,12 @@ impl Db {
                 .scheduler_observability
                 .budget_blocked_executions
                 .load(Ordering::Relaxed),
+            budget_blocked_executions_by_domain: self
+                .inner
+                .scheduler_observability
+                .budget_blocked_executions_by_domain
+                .lock()
+                .clone(),
             background_delay_events: self
                 .inner
                 .scheduler_observability
@@ -3604,7 +3651,36 @@ impl Db {
                 .scheduler_observability
                 .background_delay_millis
                 .load(Ordering::Relaxed),
+            background_delay_events_by_domain: self
+                .inner
+                .scheduler_observability
+                .background_delay_events_by_domain
+                .lock()
+                .clone(),
+            background_delay_millis_by_domain: self
+                .inner
+                .scheduler_observability
+                .background_delay_millis_by_domain
+                .lock()
+                .clone(),
+            throttled_writes_by_domain: self
+                .inner
+                .scheduler_observability
+                .throttled_writes_by_domain
+                .lock()
+                .clone(),
         }
+    }
+
+    pub(super) fn record_throttled_write_domain(&self, tag: &WorkRuntimeTag) {
+        *mutex_lock(
+            &self
+                .inner
+                .scheduler_observability
+                .throttled_writes_by_domain,
+        )
+        .entry(tag.domain.clone())
+        .or_default() += 1;
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

@@ -14,12 +14,33 @@ enum ColumnarOutputLayout {
 
 impl ColumnarReadContext {
     pub(super) fn cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
-        let mut usage = self
-            .decoded_cache
-            .usage_snapshot(self.raw_byte_cache_budget_bytes);
+        let mut usage = self.decoded_cache.usage_snapshot(
+            self.raw_byte_cache_budget_bytes,
+            &self.cache_domain_paths,
+            &self.cache_lane_budgets,
+        );
         let state = self.raw_byte_cache_budget_state.lock();
         usage.raw_byte_entries = state.lengths.len();
         usage.raw_byte_bytes = state.total_bytes;
+        for (domain, domain_usage) in &mut usage.by_domain {
+            if let Some((lane, _)) = self
+                .cache_domain_paths
+                .iter()
+                .find(|(_, mapped_domain)| *mapped_domain == domain)
+            {
+                domain_usage.raw_byte_entries = state
+                    .owners
+                    .values()
+                    .filter(|owner| **owner == *lane)
+                    .count();
+                domain_usage.raw_byte_bytes = state
+                    .owners
+                    .iter()
+                    .filter(|(_, owner)| **owner == *lane)
+                    .map(|(key, _)| state.lengths.get(key).copied().unwrap_or_default())
+                    .sum();
+            }
+        }
         usage
     }
 
@@ -77,7 +98,9 @@ impl ColumnarReadContext {
     ) -> bool {
         matches!(
             access,
-            ColumnarReadAccessPattern::Scan | ColumnarReadAccessPattern::Recovery
+            ColumnarReadAccessPattern::Scan
+                | ColumnarReadAccessPattern::Background
+                | ColumnarReadAccessPattern::Recovery
         ) && matches!(
             artifact,
             ColumnarReadArtifact::Footer | ColumnarReadArtifact::Metadata
@@ -90,6 +113,7 @@ impl ColumnarReadContext {
         source: &StorageSource,
         range: std::ops::Range<u64>,
         populate_raw_byte_cache: bool,
+        access: ColumnarReadAccessPattern,
     ) -> Result<Vec<u8>, StorageError> {
         let bytes = UnifiedStorage::new(
             self.dependencies.file_system.clone(),
@@ -110,7 +134,8 @@ impl ColumnarReadContext {
                     &bytes,
                 )
                 .await?;
-            self.admit_raw_byte_cache_range(key, range, &bytes).await?;
+            self.admit_raw_byte_cache_range(key, range, &bytes, access)
+                .await?;
         }
         Ok(bytes)
     }
@@ -145,6 +170,7 @@ impl ColumnarReadContext {
                         source,
                         range,
                         policy.populate_raw_byte_cache,
+                        access,
                     )
                     .await;
             }
@@ -165,7 +191,7 @@ impl ColumnarReadContext {
         if let StorageSource::RemoteObject { key } = source
             && policy.populate_raw_byte_cache
         {
-            self.admit_raw_byte_cache_range(key, range.clone(), &bytes)
+            self.admit_raw_byte_cache_range(key, range.clone(), &bytes, access)
                 .await?;
         }
         Ok(bytes)
@@ -185,9 +211,10 @@ impl ColumnarReadContext {
 
     async fn admit_raw_byte_cache_range(
         &self,
-        _object_key: &str,
-        _range: std::ops::Range<u64>,
+        object_key: &str,
+        range: std::ops::Range<u64>,
         _bytes: &[u8],
+        access: ColumnarReadAccessPattern,
     ) -> Result<(), StorageError> {
         let Some(cache) = &self.remote_cache else {
             return Ok(());
@@ -214,11 +241,46 @@ impl ColumnarReadContext {
             })
             .collect::<VecDeque<_>>();
 
-        let mut state = self.raw_byte_cache_budget_state.lock();
-        state.total_bytes = cache.total_cached_bytes();
-        state.order = order;
-        state.lengths = lengths;
+        let evictions = {
+            let mut state = self.raw_byte_cache_budget_state.lock();
+            state.total_bytes = cache.total_cached_bytes();
+            state.order = order;
+            state.lengths = lengths;
+            let lane = self.cache_lane(access);
+            let matching_keys = state
+                .lengths
+                .keys()
+                .filter(|key| {
+                    key.object_key == object_key
+                        && matches!(
+                            key.span,
+                            crate::remote::CacheSpan::Range { start, end }
+                                if start < range.end && end > range.start
+                        )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let live_keys = state.lengths.keys().cloned().collect::<BTreeSet<_>>();
+            state.owners.retain(|key, _| live_keys.contains(key));
+            for key in matching_keys {
+                state.owners.insert(key, lane);
+            }
+            self.collect_raw_byte_cache_evictions(&mut state, None)
+        };
+        for evicted in evictions {
+            cache.remove_span(&evicted.object_key, evicted.span).await?;
+        }
         Ok(())
+    }
+
+    fn cache_lane(&self, access: ColumnarReadAccessPattern) -> crate::ExecutionLane {
+        match access {
+            ColumnarReadAccessPattern::Point | ColumnarReadAccessPattern::Scan => {
+                crate::ExecutionLane::UserForeground
+            }
+            ColumnarReadAccessPattern::Background => crate::ExecutionLane::UserBackground,
+            ColumnarReadAccessPattern::Recovery => crate::ExecutionLane::ControlPlane,
+        }
     }
 
     fn collect_raw_byte_cache_evictions(
@@ -227,6 +289,33 @@ impl ColumnarReadContext {
         preserve: Option<&RawByteCacheBudgetKey>,
     ) -> Vec<RawByteCacheBudgetKey> {
         let mut evictions = Vec::new();
+        for (&lane, budget) in &self.cache_lane_budgets {
+            loop {
+                let lane_bytes = state
+                    .owners
+                    .iter()
+                    .filter(|(_, owner)| **owner == lane)
+                    .map(|(key, _)| state.lengths.get(key).copied().unwrap_or_default())
+                    .sum::<u64>();
+                if lane_bytes <= budget.raw_byte_budget_bytes {
+                    break;
+                }
+                let position = state.order.iter().position(|key| {
+                    preserve != Some(key) && state.owners.get(key).copied() == Some(lane)
+                });
+                let Some(position) = position else {
+                    break;
+                };
+                let Some(next) = state.order.remove(position) else {
+                    break;
+                };
+                if let Some(bytes) = state.lengths.remove(&next) {
+                    state.total_bytes = state.total_bytes.saturating_sub(bytes);
+                    state.owners.remove(&next);
+                    evictions.push(next);
+                }
+            }
+        }
         while state.total_bytes > self.raw_byte_cache_budget_bytes {
             let Some(next) = state.order.pop_front() else {
                 break;
@@ -240,6 +329,7 @@ impl ColumnarReadContext {
             }
             if let Some(bytes) = state.lengths.remove(&next) {
                 state.total_bytes = state.total_bytes.saturating_sub(bytes);
+                state.owners.remove(&next);
                 evictions.push(next);
             }
         }
@@ -329,7 +419,8 @@ impl ColumnarReadContext {
             footer_start,
         };
         if policy.populate_decoded_cache {
-            self.decoded_cache.insert_footer(identity, cached.clone());
+            self.decoded_cache
+                .insert_footer(identity, cached.clone(), self.cache_lane(access));
         }
         Ok(cached)
     }
@@ -380,7 +471,7 @@ impl ColumnarReadContext {
         );
         if policy.populate_decoded_cache {
             self.decoded_cache
-                .insert_key_index(identity, values.clone());
+                .insert_key_index(identity, values.clone(), self.cache_lane(access));
         }
         Ok(values)
     }
@@ -430,8 +521,11 @@ impl ColumnarReadContext {
             })?,
         );
         if policy.populate_decoded_cache {
-            self.decoded_cache
-                .insert_sequence_column(identity, values.clone());
+            self.decoded_cache.insert_sequence_column(
+                identity,
+                values.clone(),
+                self.cache_lane(access),
+            );
         }
         Ok(values)
     }
@@ -481,8 +575,11 @@ impl ColumnarReadContext {
             })?,
         );
         if policy.populate_decoded_cache {
-            self.decoded_cache
-                .insert_tombstone_bitmap(identity, values.clone());
+            self.decoded_cache.insert_tombstone_bitmap(
+                identity,
+                values.clone(),
+                self.cache_lane(access),
+            );
         }
         Ok(values)
     }
@@ -532,8 +629,11 @@ impl ColumnarReadContext {
             })?,
         );
         if policy.populate_decoded_cache {
-            self.decoded_cache
-                .insert_row_kind_column(identity, values.clone());
+            self.decoded_cache.insert_row_kind_column(
+                identity,
+                values.clone(),
+                self.cache_lane(access),
+            );
         }
         Ok(values)
     }
@@ -573,7 +673,8 @@ impl ColumnarReadContext {
             &bytes,
         )?);
         if policy.populate_decoded_cache {
-            self.decoded_cache.insert_column_block(key, values.clone());
+            self.decoded_cache
+                .insert_column_block(key, values.clone(), self.cache_lane(access));
         }
         Ok(values)
     }

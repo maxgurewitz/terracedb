@@ -32,10 +32,11 @@ pub use adapters::{
 pub use api::{
     BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarCacheUsageSnapshot,
     ColumnarRecord, ColumnarScanExecution, ColumnarScanPartExecution, CommitOptions, Db, DbBuilder,
-    DbComponents, DbSettings, FieldDefinition, FieldType, FieldValue, Key, KeyPrefix, KvStream,
-    NamedColumnarRecord, ReadSet, ReadSetEntry, RowScanExecution, ScanExecution,
-    ScanMaterializationSource, ScanOptions, ScanPredicate, SchemaDefinition, Snapshot, Table,
-    Value, WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
+    DbComponents, DbSettings, DomainColumnarCacheUsageSnapshot, FieldDefinition, FieldType,
+    FieldValue, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet, ReadSetEntry,
+    RowScanExecution, ScanExecution, ScanMaterializationSource, ScanOptions, ScanPredicate,
+    SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver, WatermarkSubscriptionSet,
+    WatermarkUpdate, WriteBatch,
 };
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
@@ -137,10 +138,10 @@ pub use remote::{
     RemoteStorageError, StorageSource, UnifiedStorage, UnifiedStorageError,
 };
 pub use scheduler::{
-    DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, NoopScheduler,
-    PendingWork, PendingWorkBudget, PendingWorkBudgetBlockReason, PendingWorkType,
-    RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
-    SchedulerObservabilitySnapshot, TableStats, ThrottleDecision,
+    DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT,
+    DomainPriorityOverride, NoopScheduler, PendingWork, PendingWorkBudget,
+    PendingWorkBudgetBlockReason, PendingWorkType, RoundRobinScheduler, ScheduleAction,
+    ScheduleDecision, Scheduler, SchedulerObservabilitySnapshot, TableStats, ThrottleDecision,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{
