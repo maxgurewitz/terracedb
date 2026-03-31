@@ -1,6 +1,11 @@
-use std::{collections::BTreeMap, fmt, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use serde_json::Value as JsonValue;
+use tokio::sync::{broadcast, watch};
 
 use crate::{
     Timestamp,
@@ -190,6 +195,86 @@ pub struct SchedulerObservabilitySnapshot {
         BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
     pub last_non_open_admission_by_domain:
         BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionObservation {
+    pub domain: ExecutionDomainPath,
+    pub current: RecordedAdmissionDiagnostics,
+    pub last_non_open: Option<RecordedAdmissionDiagnostics>,
+}
+
+#[derive(Debug)]
+pub struct AdmissionObservationReceiver {
+    inner: broadcast::Receiver<AdmissionObservation>,
+}
+
+impl AdmissionObservationReceiver {
+    pub(crate) fn new(inner: broadcast::Receiver<AdmissionObservation>) -> Self {
+        Self { inner }
+    }
+
+    pub async fn recv(
+        &mut self,
+    ) -> Result<AdmissionObservation, crate::AdmissionObservationRecvError> {
+        match self.inner.recv().await {
+            Ok(observation) => Ok(observation),
+            Err(broadcast::error::RecvError::Closed) => {
+                Err(crate::AdmissionObservationRecvError::Closed)
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(crate::AdmissionObservationRecvError::Lagged(skipped))
+            }
+        }
+    }
+
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<Option<AdmissionObservation>, crate::AdmissionObservationRecvError> {
+        match self.inner.try_recv() {
+            Ok(observation) => Ok(Some(observation)),
+            Err(broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(broadcast::error::TryRecvError::Closed) => {
+                Err(crate::AdmissionObservationRecvError::Closed)
+            }
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                Err(crate::AdmissionObservationRecvError::Lagged(skipped))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SchedulerObservabilitySubscription {
+    inner: watch::Receiver<Arc<SchedulerObservabilitySnapshot>>,
+}
+
+impl SchedulerObservabilitySubscription {
+    pub(crate) fn new(inner: watch::Receiver<Arc<SchedulerObservabilitySnapshot>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn current(&self) -> SchedulerObservabilitySnapshot {
+        self.inner.borrow().as_ref().clone()
+    }
+
+    pub async fn changed(
+        &mut self,
+    ) -> Result<SchedulerObservabilitySnapshot, crate::SubscriptionClosed> {
+        self.inner
+            .changed()
+            .await
+            .map_err(|_| crate::SubscriptionClosed)?;
+        Ok(self.current())
+    }
+}
+
+impl Clone for SchedulerObservabilitySubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -3175,6 +3175,73 @@ Teach the existing runtime controls to respect execution-domain boundaries. This
 - Mixed-workload simulation tests where one domain runs scan-heavy or compaction-heavy traffic and cannot starve protected foreground or control-plane domains.
 - Cache/admission tests proving per-domain ceilings stay bounded and observable under both local and remote-read pressure.
 
+### T66a. Publish immutable scheduler and admission observability snapshots
+
+**Depends on:** T66
+
+**Description**
+
+Replace reader-side observability assembly with published immutable snapshots so the scheduler/admission surfaces are safe to inspect from single-threaded simulated runtimes and other async callers. This task owns the internal dataflow change from many mutex-backed maps to one mutable state that publishes immutable snapshots and update notifications.
+
+**Implementation steps**
+
+1. Move scheduler/admission observability state behind one internal mutable state object rather than assembling snapshots by locking multiple maps at read time.
+2. Publish immutable snapshots after each observability mutation and make synchronous reads load the latest published snapshot instead of reconstructing one.
+3. Expose a subscription/update surface so simulation tests and libraries can wait for specific observability transitions without blocking the runtime thread.
+4. Fold derived fields such as deferred-work-by-domain and starvation summaries into publication-time computation so readers consume already-shaped state.
+
+**Verification**
+
+- Simulation tests proving in-flight write throttling/stall transitions can be observed through the published update stream without polling retry loops.
+- Regression tests proving current and historical admission state remain coherent across recovery writes, multi-table writes, and background pressure updates.
+- Tests proving the synchronous snapshot API no longer requires reader-side locking of multiple observability maps.
+
+### T66b. Audit async-facing introspection for blocking reads and convert them to published snapshots or event streams
+
+**Depends on:** T66a
+
+**Description**
+
+Apply the same simulation-safe inspection model across the engine and adjacent libraries. This task owns the audit of synchronous snapshot/introspection APIs reachable from async or simulated runtimes and converts the risky ones to published immutable snapshots, event streams, or explicit step/poll helpers.
+
+**Implementation steps**
+
+1. Audit `parking_lot` / `std::sync`-backed state that is read from async code paths, tests, or simulation harnesses.
+2. Classify each surface as one of:
+   - synchronous operator snapshot only,
+   - published immutable snapshot,
+   - event/update stream, or
+   - explicit step/poll helper.
+3. Convert high-value async-facing surfaces first: scheduler/backpressure, cache usage/introspection, maintenance backlog, and any library/runtime status surfaces used in deterministic tests.
+4. Delete transitional retry-based helpers once equivalent published/event-driven APIs exist.
+
+**Verification**
+
+- Deterministic tests proving async/simulation callers can inspect the targeted surfaces without blocking the runtime thread.
+- Coverage proving converted surfaces preserve logical values while changing only the inspection mechanism.
+- Focused liveness regressions around previously risky inspection points.
+
+### T66c. Add simulation-first observation helpers and stream-based regressions
+
+**Depends on:** T66a
+
+**Description**
+
+Standardize the simulation harness around subscription-based observation and explicit progress helpers instead of ad hoc yields and snapshot polling. This task owns the test ergonomics needed to make richer deterministic liveness and observability assertions cheap to write.
+
+**Implementation steps**
+
+1. Add shared harness helpers that wait for published snapshots or event-stream predicates.
+2. Prefer long-lived subscriptions in simulations when asserting transition sequences rather than sampling after the fact.
+3. Add explicit progress helpers where needed for scheduler/maintenance/background work so tests can observe causal steps instead of relying on sleep-heavy timing.
+4. Extend the docs/debugging guidance with the preferred inspection patterns for deterministic simulation debugging.
+
+**Verification**
+
+- Simulation regressions proving multi-step observability transitions can be asserted on one subscription.
+- Harness-level tests proving the helpers remain deterministic across repeated same-seed runs.
+- Documentation/examples showing how to debug and assert against published updates rather than blocking snapshots.
+
 ---
 
 ### T67. Add multi-DB colocated deployment support and placement policy wiring
@@ -3532,6 +3599,75 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
 - Large-seed deterministic simulation campaigns proving pressure-aware flushing and admission remain reproducible across restart, failure, and multi-tenant contention scenarios.
 - Cross-feature chaos tests proving flush stalls, retry paths, and budget tightening still preserve deterministic recovery and liveness.
 - End-to-end invariant tests proving the subsystem changes performance behavior only, not logical DB outcomes.
+
+---
+
+### T76a. Publish simulation-safe scheduler observability snapshots and admission streams
+
+**Depends on:** T76
+
+**Description**
+
+Refactor scheduler/admission observability away from reader-side locking and into published immutable state. This task owns the simulation-facing introspection layer for pressure/admission behavior: snapshots must be cheap to sample from a single-threaded simulated runtime, and ordered admission transitions must be assertable without polling shared mutable maps.
+
+**Implementation steps**
+
+1. Replace lock-on-read scheduler observability assembly with published immutable snapshots that writers update whenever the underlying counters or per-domain diagnostics change.
+2. Add ordered admission observation streams so tests can assert transitions like `RateLimit -> Open` or "one aggregated event per write" directly, instead of inferring them from eventual shared-state samples.
+3. Delete polling/try-lock style scheduler snapshot helpers that only existed to avoid deadlocking the simulated runtime, and move simulation tests onto the published snapshot / stream APIs.
+4. Keep the synchronous operator-facing snapshot API as a thin clone of the published state so CLI/debugging callers still have a one-shot read surface.
+
+**Verification**
+
+- Simulation regressions proving in-flight rate-limited writes are observable through the published snapshot subscription without blocking the runtime.
+- Simulation regressions proving admission streams emit ordered write-level transitions and do not duplicate per-table diagnostics for one logical write.
+- Unit tests proving the synchronous snapshot API returns the same data as the published stream state after representative observability updates.
+
+---
+
+### T76b. Audit and convert remaining simulation-hostile inspection APIs
+
+**Depends on:** T76a
+
+**Description**
+
+Finish the simulation-safety pass across introspection surfaces that may still block the runtime thread or hide ordering behind shared mutable state. This task is broader than admission: it covers any synchronous snapshot or inspection helper that a deterministic simulation test would reasonably want to call while work is in flight.
+
+**Implementation steps**
+
+1. Inventory remaining snapshot/introspection APIs that take `parking_lot` or `std::sync` locks from async contexts or simulation helpers.
+2. Convert the high-value surfaces to published immutable snapshots, subscriptions, or explicit poll/step interfaces, depending on whether tests need sampled state, ordered events, or deterministic progress control.
+3. Remove test-only retry loops that compensate for blocking inspection, and replace them with direct subscription- or progress-driven assertions.
+4. Extend the debugging guide with the preferred simulation-safe observation patterns so future work does not regress into blocking shared-state reads.
+
+**Verification**
+
+- Targeted simulation tests proving the converted APIs can be used while related work remains in flight.
+- A focused audit diff showing the removed blocking inspection paths and the new subscription/poll surfaces that replaced them.
+- Debugging-guide updates demonstrating the canonical way to observe runtime state inside deterministic simulations.
+
+---
+
+### T76c. Add deterministic progress probes for background scheduler work
+
+**Depends on:** T76b
+
+**Description**
+
+Expose explicit progress probes for scheduler-driven background work so simulations can assert "one step happened" or "the system is idle" without depending on arbitrary sleeps or repeated `yield_now()`. This task turns background maintenance from a mostly implicit runtime effect into a testable deterministic interface.
+
+**Implementation steps**
+
+1. Identify the highest-value background loops whose progress is currently only inferable through side effects or eventual snapshots.
+2. Introduce poll/step helpers or bounded "wait until idle" probes where that can be done without weakening production invariants.
+3. Rewrite representative simulation tests to use the new probes instead of time-based heuristics.
+4. Keep the new probes clearly test/debug oriented so they do not become accidental correctness boundaries in production code.
+
+**Verification**
+
+- Simulation tests showing background progress can be asserted without arbitrary sleep-based retries.
+- Regression coverage for at least one maintenance or scheduler scenario that previously required yield-heavy timing assumptions.
+- Documentation updates that spell out when to use progress probes vs snapshots vs event streams.
 
 ---
 

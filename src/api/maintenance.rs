@@ -524,11 +524,9 @@ impl Db {
             .iter()
             .map(|candidate| candidate.pending.id.as_str())
             .collect::<BTreeSet<_>>();
-        mutex_lock(&self.inner.work_deferrals)
-            .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
-        mutex_lock(&self.inner.work_deferral_domains)
-            .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
-        self.notify_scheduler_observability_changed();
+        self.inner
+            .scheduler_observability
+            .prune_deferred_work(&live_work_ids);
     }
 
     pub(super) fn record_deferred_work(
@@ -536,111 +534,47 @@ impl Db {
         candidates: &[PendingWorkCandidate],
         decisions: &BTreeMap<String, ScheduleAction>,
     ) {
-        let mut deferrals = mutex_lock(&self.inner.work_deferrals);
-        let mut domains = mutex_lock(&self.inner.work_deferral_domains);
-        for candidate in candidates {
-            match decisions
-                .get(&candidate.pending.id)
-                .copied()
-                .unwrap_or(ScheduleAction::Defer)
-            {
-                ScheduleAction::Execute => {
-                    deferrals.remove(&candidate.pending.id);
-                    domains.remove(&candidate.pending.id);
-                }
-                ScheduleAction::Defer => {
-                    *deferrals.entry(candidate.pending.id.clone()).or_default() += 1;
-                    domains.insert(candidate.pending.id.clone(), candidate.tag.domain.clone());
-                }
-            }
-        }
-        drop(domains);
-        drop(deferrals);
-        self.notify_scheduler_observability_changed();
+        self.inner
+            .scheduler_observability
+            .record_deferred_work(candidates, decisions);
     }
 
     pub(super) fn reset_work_deferral(&self, work_id: &str) {
-        mutex_lock(&self.inner.work_deferrals).remove(work_id);
-        mutex_lock(&self.inner.work_deferral_domains).remove(work_id);
-        self.notify_scheduler_observability_changed();
+        self.inner
+            .scheduler_observability
+            .reset_work_deferral(work_id);
     }
 
     pub(super) fn work_deferral_cycles(&self, work_id: &str) -> u32 {
-        mutex_lock(&self.inner.work_deferrals)
-            .get(work_id)
-            .copied()
-            .unwrap_or_default()
+        self.inner
+            .scheduler_observability
+            .work_deferral_cycles(work_id)
     }
 
     pub(super) fn record_forced_execution(&self) {
-        self.inner
-            .scheduler_observability
-            .forced_executions
-            .fetch_add(1, Ordering::Relaxed);
-        self.notify_scheduler_observability_changed();
+        self.inner.scheduler_observability.record_forced_execution();
     }
 
     pub(super) fn record_forced_flush(&self) {
-        self.inner
-            .scheduler_observability
-            .forced_flushes
-            .fetch_add(1, Ordering::Relaxed);
-        self.notify_scheduler_observability_changed();
+        self.inner.scheduler_observability.record_forced_flush();
     }
 
     pub(super) fn record_forced_l0_compaction(&self) {
         self.inner
             .scheduler_observability
-            .forced_l0_compactions
-            .fetch_add(1, Ordering::Relaxed);
-        self.notify_scheduler_observability_changed();
+            .record_forced_l0_compaction();
     }
 
     pub(super) fn record_budget_blocked_execution(&self, tag: &crate::WorkRuntimeTag) {
         self.inner
             .scheduler_observability
-            .budget_blocked_executions
-            .fetch_add(1, Ordering::Relaxed);
-        *mutex_lock(
-            &self
-                .inner
-                .scheduler_observability
-                .budget_blocked_executions_by_domain,
-        )
-        .entry(tag.domain.clone())
-        .or_default() += 1;
-        self.notify_scheduler_observability_changed();
+            .record_budget_blocked_execution(tag);
     }
 
     pub(super) fn record_background_delay(&self, tag: &crate::WorkRuntimeTag, delay: Duration) {
-        if delay.is_zero() {
-            return;
-        }
         self.inner
             .scheduler_observability
-            .background_delay_events
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .scheduler_observability
-            .background_delay_millis
-            .fetch_add(delay.as_millis() as u64, Ordering::Relaxed);
-        *mutex_lock(
-            &self
-                .inner
-                .scheduler_observability
-                .background_delay_events_by_domain,
-        )
-        .entry(tag.domain.clone())
-        .or_default() += 1;
-        *mutex_lock(
-            &self
-                .inner
-                .scheduler_observability
-                .background_delay_millis_by_domain,
-        )
-        .entry(tag.domain.clone())
-        .or_default() += delay.as_millis() as u64;
-        self.notify_scheduler_observability_changed();
+            .record_background_delay(tag, delay);
     }
 
     pub(super) fn pending_work_budget_block_reason(
@@ -812,15 +746,10 @@ impl Db {
         &self,
         candidates: &[PendingWorkCandidate],
     ) -> Option<PendingWorkCandidate> {
-        let deferrals = mutex_lock(&self.inner.work_deferrals);
         candidates
             .iter()
             .find(|candidate| {
-                deferrals
-                    .get(&candidate.pending.id)
-                    .copied()
-                    .unwrap_or_default()
-                    >= MAX_SCHEDULER_DEFER_CYCLES
+                self.work_deferral_cycles(&candidate.pending.id) >= MAX_SCHEDULER_DEFER_CYCLES
             })
             .cloned()
     }

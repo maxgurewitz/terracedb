@@ -79,8 +79,9 @@ pub use current_state::{
     CurrentStateThresholdCutoff, CurrentStateThresholdRetentionPolicy,
 };
 pub use error::{
-    ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
-    SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
+    AdmissionObservationRecvError, ChangeFeedError, CommitError, CreateTableError, FlushError,
+    OpenError, ReadError, SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed,
+    WriteError,
 };
 pub use execution::{
     ColocatedDatabasePlacement, ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec,
@@ -152,11 +153,12 @@ pub use remote::{
     RemoteStorageError, StorageSource, UnifiedStorage, UnifiedStorageError,
 };
 pub use scheduler::{
-    DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT,
-    DomainPriorityOverride, NoopScheduler, PendingWork, PendingWorkBudget,
-    PendingWorkBudgetBlockReason, PendingWorkType, RecordedAdmissionDiagnostics,
+    AdmissionObservation, AdmissionObservationReceiver, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+    DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, DomainPriorityOverride, NoopScheduler, PendingWork,
+    PendingWorkBudget, PendingWorkBudgetBlockReason, PendingWorkType, RecordedAdmissionDiagnostics,
     RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
-    SchedulerObservabilitySnapshot, TableStats, ThrottleDecision,
+    SchedulerObservabilitySnapshot, SchedulerObservabilitySubscription, TableStats,
+    ThrottleDecision,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{

@@ -1,5 +1,6 @@
 use super::*;
 use crate::Timestamp;
+use arc_swap::ArcSwap;
 
 pub(super) const CATALOG_FORMAT_VERSION: u32 = 1;
 pub(super) const CATALOG_READ_CHUNK_LEN: usize = 8 * 1024;
@@ -62,8 +63,6 @@ pub(super) struct DbInner {
     pub(super) compaction_filter_stats: Mutex<BTreeMap<TableId, CompactionFilterStats>>,
     pub(super) visible_watchers: Arc<WatermarkRegistry>,
     pub(super) durable_watchers: Arc<WatermarkRegistry>,
-    pub(super) work_deferrals: Mutex<BTreeMap<String, u32>>,
-    pub(super) work_deferral_domains: Mutex<BTreeMap<String, crate::ExecutionDomainPath>>,
     pub(super) pending_work_budget_state: Mutex<PendingWorkBudgetState>,
     pub(super) scheduler_observability: SchedulerObservabilityStats,
     pub(super) compact_to_wide_stats: Mutex<BTreeMap<CompactToWideStatsKey, CompactToWideStats>>,
@@ -286,52 +285,224 @@ pub(super) struct ColumnarCacheStats {
     pub(super) decoded_column_block_admissions: AtomicU64,
 }
 
+#[derive(Default)]
+struct SchedulerObservabilityState {
+    snapshot: crate::SchedulerObservabilitySnapshot,
+    deferred_work_domains: BTreeMap<String, crate::ExecutionDomainPath>,
+}
+
 pub(super) struct SchedulerObservabilityStats {
-    pub(super) forced_executions: AtomicU64,
-    pub(super) forced_flushes: AtomicU64,
-    pub(super) forced_l0_compactions: AtomicU64,
-    pub(super) budget_blocked_executions: AtomicU64,
-    pub(super) budget_blocked_executions_by_domain:
-        Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
-    pub(super) background_delay_events: AtomicU64,
-    pub(super) background_delay_millis: AtomicU64,
-    pub(super) background_delay_events_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
-    pub(super) background_delay_millis_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
-    pub(super) throttled_writes_by_domain: Mutex<BTreeMap<crate::ExecutionDomainPath, u64>>,
-    pub(super) current_admission_diagnostics_by_domain:
-        Mutex<BTreeMap<crate::ExecutionDomainPath, crate::RecordedAdmissionDiagnostics>>,
-    pub(super) last_non_open_admission_by_domain:
-        Mutex<BTreeMap<crate::ExecutionDomainPath, crate::RecordedAdmissionDiagnostics>>,
-    pub(super) pulse: watch::Sender<u64>,
+    state: Mutex<SchedulerObservabilityState>,
+    latest_snapshot: ArcSwap<crate::SchedulerObservabilitySnapshot>,
+    published_snapshot: watch::Sender<Arc<crate::SchedulerObservabilitySnapshot>>,
+    admission_observations: tokio::sync::broadcast::Sender<crate::AdmissionObservation>,
 }
 
 impl SchedulerObservabilityStats {
     pub(super) fn new() -> Self {
-        let (pulse, _receiver) = watch::channel(0);
+        let initial_snapshot = Arc::new(crate::SchedulerObservabilitySnapshot::default());
+        let (published_snapshot, _receiver) = watch::channel(initial_snapshot.clone());
+        let (admission_observations, _receiver) = tokio::sync::broadcast::channel(1024);
         Self {
-            forced_executions: AtomicU64::default(),
-            forced_flushes: AtomicU64::default(),
-            forced_l0_compactions: AtomicU64::default(),
-            budget_blocked_executions: AtomicU64::default(),
-            budget_blocked_executions_by_domain: Mutex::default(),
-            background_delay_events: AtomicU64::default(),
-            background_delay_millis: AtomicU64::default(),
-            background_delay_events_by_domain: Mutex::default(),
-            background_delay_millis_by_domain: Mutex::default(),
-            throttled_writes_by_domain: Mutex::default(),
-            current_admission_diagnostics_by_domain: Mutex::default(),
-            last_non_open_admission_by_domain: Mutex::default(),
-            pulse,
+            state: Mutex::default(),
+            latest_snapshot: ArcSwap::from(initial_snapshot),
+            published_snapshot,
+            admission_observations,
         }
     }
 
-    pub(super) fn notify(&self) {
-        let next = (*self.pulse.borrow()).wrapping_add(1);
-        self.pulse.send_replace(next);
+    fn refresh_deferred_work(state: &mut SchedulerObservabilityState) {
+        let snapshot = &mut state.snapshot;
+        let domains = &state.deferred_work_domains;
+        snapshot.deferred_work_by_domain.clear();
+        snapshot.starved_domains.clear();
+        for (work_id, cycles) in &snapshot.deferred_work {
+            let Some(domain) = domains.get(work_id) else {
+                continue;
+            };
+            *snapshot
+                .deferred_work_by_domain
+                .entry(domain.clone())
+                .or_default() += *cycles;
+            if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
+                *snapshot.starved_domains.entry(domain.clone()).or_default() += 1;
+            }
+        }
     }
 
-    pub(super) fn pulse(&self) -> watch::Receiver<u64> {
-        self.pulse.subscribe()
+    fn publish_locked(&self, state: &SchedulerObservabilityState) {
+        let snapshot = Arc::new(state.snapshot.clone());
+        self.latest_snapshot.store(snapshot.clone());
+        self.published_snapshot.send_replace(snapshot);
+    }
+
+    pub(super) fn snapshot(&self) -> crate::SchedulerObservabilitySnapshot {
+        self.latest_snapshot.load_full().as_ref().clone()
+    }
+
+    pub(super) fn subscribe(&self) -> watch::Receiver<Arc<crate::SchedulerObservabilitySnapshot>> {
+        self.published_snapshot.subscribe()
+    }
+
+    pub(super) fn subscribe_admission_observations(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::AdmissionObservation> {
+        self.admission_observations.subscribe()
+    }
+
+    pub(super) fn prune_deferred_work(&self, live_work_ids: &BTreeSet<&str>) {
+        let mut state = mutex_lock(&self.state);
+        state
+            .snapshot
+            .deferred_work
+            .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
+        state
+            .deferred_work_domains
+            .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
+        Self::refresh_deferred_work(&mut state);
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn record_deferred_work(
+        &self,
+        candidates: &[PendingWorkCandidate],
+        decisions: &BTreeMap<String, ScheduleAction>,
+    ) {
+        let mut state = mutex_lock(&self.state);
+        for candidate in candidates {
+            match decisions
+                .get(&candidate.pending.id)
+                .copied()
+                .unwrap_or(ScheduleAction::Defer)
+            {
+                ScheduleAction::Execute => {
+                    state.snapshot.deferred_work.remove(&candidate.pending.id);
+                    state.deferred_work_domains.remove(&candidate.pending.id);
+                }
+                ScheduleAction::Defer => {
+                    *state
+                        .snapshot
+                        .deferred_work
+                        .entry(candidate.pending.id.clone())
+                        .or_default() += 1;
+                    state
+                        .deferred_work_domains
+                        .insert(candidate.pending.id.clone(), candidate.tag.domain.clone());
+                }
+            }
+        }
+        Self::refresh_deferred_work(&mut state);
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn reset_work_deferral(&self, work_id: &str) {
+        let mut state = mutex_lock(&self.state);
+        state.snapshot.deferred_work.remove(work_id);
+        state.deferred_work_domains.remove(work_id);
+        Self::refresh_deferred_work(&mut state);
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn work_deferral_cycles(&self, work_id: &str) -> u32 {
+        mutex_lock(&self.state)
+            .snapshot
+            .deferred_work
+            .get(work_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn record_forced_execution(&self) {
+        let mut state = mutex_lock(&self.state);
+        state.snapshot.forced_executions += 1;
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn record_forced_flush(&self) {
+        let mut state = mutex_lock(&self.state);
+        state.snapshot.forced_flushes += 1;
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn record_forced_l0_compaction(&self) {
+        let mut state = mutex_lock(&self.state);
+        state.snapshot.forced_l0_compactions += 1;
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn record_budget_blocked_execution(&self, tag: &crate::WorkRuntimeTag) {
+        let mut state = mutex_lock(&self.state);
+        state.snapshot.budget_blocked_executions += 1;
+        *state
+            .snapshot
+            .budget_blocked_executions_by_domain
+            .entry(tag.domain.clone())
+            .or_default() += 1;
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn record_background_delay(&self, tag: &crate::WorkRuntimeTag, delay: Duration) {
+        if delay.is_zero() {
+            return;
+        }
+        let mut state = mutex_lock(&self.state);
+        state.snapshot.background_delay_events += 1;
+        state.snapshot.background_delay_millis += delay.as_millis() as u64;
+        *state
+            .snapshot
+            .background_delay_events_by_domain
+            .entry(tag.domain.clone())
+            .or_default() += 1;
+        *state
+            .snapshot
+            .background_delay_millis_by_domain
+            .entry(tag.domain.clone())
+            .or_default() += delay.as_millis() as u64;
+        self.publish_locked(&state);
+    }
+
+    pub(super) fn record_admission_diagnostics(
+        &self,
+        tag: &crate::WorkRuntimeTag,
+        recorded: crate::RecordedAdmissionDiagnostics,
+    ) {
+        let mut state = mutex_lock(&self.state);
+        state
+            .snapshot
+            .current_admission_diagnostics_by_domain
+            .insert(tag.domain.clone(), recorded.clone());
+        let last_non_open = if recorded.diagnostics.level != crate::AdmissionPressureLevel::Open {
+            state
+                .snapshot
+                .last_non_open_admission_by_domain
+                .insert(tag.domain.clone(), recorded.clone());
+            Some(recorded.clone())
+        } else {
+            state
+                .snapshot
+                .last_non_open_admission_by_domain
+                .get(&tag.domain)
+                .cloned()
+        };
+        self.publish_locked(&state);
+        drop(state);
+        let _ = self
+            .admission_observations
+            .send(crate::AdmissionObservation {
+                domain: tag.domain.clone(),
+                current: recorded,
+                last_non_open,
+            });
+    }
+
+    pub(super) fn record_throttled_write_domain(&self, tag: &crate::WorkRuntimeTag) {
+        let mut state = mutex_lock(&self.state);
+        *state
+            .snapshot
+            .throttled_writes_by_domain
+            .entry(tag.domain.clone())
+            .or_default() += 1;
+        self.publish_locked(&state);
     }
 }
 

@@ -151,8 +151,6 @@ impl Db {
                         initial_table_watermarks.clone(),
                     )),
                     durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
-                    work_deferrals: Mutex::new(BTreeMap::new()),
-                    work_deferral_domains: Mutex::new(BTreeMap::new()),
                     pending_work_budget_state: Mutex::new(PendingWorkBudgetState::default()),
                     scheduler_observability: SchedulerObservabilityStats::default(),
                     compact_to_wide_stats: Mutex::new(BTreeMap::new()),

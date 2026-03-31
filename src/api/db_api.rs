@@ -1,12 +1,12 @@
 use super::*;
-use crate::Timestamp;
-
-use crate::ZoneMapPredicate;
 use crate::execution::{
     DbExecutionProfile, DomainTaggedWork, ExecutionBacklogGuard, ExecutionDomainBudget,
     ExecutionDomainOwner, ExecutionDomainPath, ExecutionLane, ExecutionResourceUsage,
     ExecutionUsageLease, ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot,
     WorkRuntimeTag,
+};
+use crate::{
+    AdmissionObservationReceiver, SchedulerObservabilitySubscription, Timestamp, ZoneMapPredicate,
 };
 use serde_json::Value as JsonValue;
 
@@ -4415,212 +4415,20 @@ impl Db {
         self.inner.columnar_read_context.cache_usage_snapshot()
     }
 
-    pub fn try_scheduler_observability_snapshot(&self) -> Option<SchedulerObservabilitySnapshot> {
-        let deferred_work = mutex_try_lock(&self.inner.work_deferrals)?.clone();
-        let deferred_domains = mutex_try_lock(&self.inner.work_deferral_domains)?.clone();
-        let budget_blocked_executions_by_domain = self
-            .inner
-            .scheduler_observability
-            .budget_blocked_executions_by_domain
-            .try_lock()?
-            .clone();
-        let background_delay_events_by_domain = self
-            .inner
-            .scheduler_observability
-            .background_delay_events_by_domain
-            .try_lock()?
-            .clone();
-        let background_delay_millis_by_domain = self
-            .inner
-            .scheduler_observability
-            .background_delay_millis_by_domain
-            .try_lock()?
-            .clone();
-        let throttled_writes_by_domain = self
-            .inner
-            .scheduler_observability
-            .throttled_writes_by_domain
-            .try_lock()?
-            .clone();
-        let current_admission_diagnostics_by_domain = self
-            .inner
-            .scheduler_observability
-            .current_admission_diagnostics_by_domain
-            .try_lock()?
-            .clone();
-        let last_non_open_admission_by_domain = self
-            .inner
-            .scheduler_observability
-            .last_non_open_admission_by_domain
-            .try_lock()?
-            .clone();
-        let mut deferred_work_by_domain = BTreeMap::new();
-        let mut starved_domains = BTreeMap::new();
-        for (work_id, cycles) in &deferred_work {
-            let Some(domain) = deferred_domains.get(work_id) else {
-                continue;
-            };
-            *deferred_work_by_domain.entry(domain.clone()).or_default() += *cycles;
-            if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
-                *starved_domains.entry(domain.clone()).or_default() += 1;
-            }
-        }
-
-        Some(SchedulerObservabilitySnapshot {
-            deferred_work,
-            deferred_work_by_domain,
-            starved_domains,
-            forced_executions: self
-                .inner
-                .scheduler_observability
-                .forced_executions
-                .load(Ordering::Relaxed),
-            forced_flushes: self
-                .inner
-                .scheduler_observability
-                .forced_flushes
-                .load(Ordering::Relaxed),
-            forced_l0_compactions: self
-                .inner
-                .scheduler_observability
-                .forced_l0_compactions
-                .load(Ordering::Relaxed),
-            budget_blocked_executions: self
-                .inner
-                .scheduler_observability
-                .budget_blocked_executions
-                .load(Ordering::Relaxed),
-            budget_blocked_executions_by_domain,
-            background_delay_events: self
-                .inner
-                .scheduler_observability
-                .background_delay_events
-                .load(Ordering::Relaxed),
-            background_delay_millis: self
-                .inner
-                .scheduler_observability
-                .background_delay_millis
-                .load(Ordering::Relaxed),
-            background_delay_events_by_domain,
-            background_delay_millis_by_domain,
-            throttled_writes_by_domain,
-            current_admission_diagnostics_by_domain,
-            last_non_open_admission_by_domain,
-        })
+    pub fn subscribe_scheduler_observability(&self) -> SchedulerObservabilitySubscription {
+        SchedulerObservabilitySubscription::new(self.inner.scheduler_observability.subscribe())
     }
 
-    fn subscribe_scheduler_observability_pulse(&self) -> watch::Receiver<u64> {
-        self.inner.scheduler_observability.pulse()
-    }
-
-    pub async fn scheduler_observability_snapshot_async(&self) -> SchedulerObservabilitySnapshot {
-        let mut pulse = self.subscribe_scheduler_observability_pulse();
-        loop {
-            if let Some(snapshot) = self.try_scheduler_observability_snapshot() {
-                return snapshot;
-            }
-            if pulse.has_changed().unwrap_or(false) {
-                pulse.borrow_and_update();
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
-    pub(super) fn notify_scheduler_observability_changed(&self) {
-        self.inner.scheduler_observability.notify();
+    pub fn subscribe_admission_observations(&self) -> AdmissionObservationReceiver {
+        AdmissionObservationReceiver::new(
+            self.inner
+                .scheduler_observability
+                .subscribe_admission_observations(),
+        )
     }
 
     pub fn scheduler_observability_snapshot(&self) -> SchedulerObservabilitySnapshot {
-        let deferred_work = mutex_lock(&self.inner.work_deferrals).clone();
-        let deferred_domains = mutex_lock(&self.inner.work_deferral_domains).clone();
-        let budget_blocked_executions_by_domain = self
-            .inner
-            .scheduler_observability
-            .budget_blocked_executions_by_domain
-            .lock()
-            .clone();
-        let background_delay_events_by_domain = self
-            .inner
-            .scheduler_observability
-            .background_delay_events_by_domain
-            .lock()
-            .clone();
-        let background_delay_millis_by_domain = self
-            .inner
-            .scheduler_observability
-            .background_delay_millis_by_domain
-            .lock()
-            .clone();
-        let throttled_writes_by_domain = self
-            .inner
-            .scheduler_observability
-            .throttled_writes_by_domain
-            .lock()
-            .clone();
-        let current_admission_diagnostics_by_domain = self
-            .inner
-            .scheduler_observability
-            .current_admission_diagnostics_by_domain
-            .lock()
-            .clone();
-        let last_non_open_admission_by_domain = self
-            .inner
-            .scheduler_observability
-            .last_non_open_admission_by_domain
-            .lock()
-            .clone();
-        let mut deferred_work_by_domain = BTreeMap::new();
-        let mut starved_domains = BTreeMap::new();
-        for (work_id, cycles) in &deferred_work {
-            let Some(domain) = deferred_domains.get(work_id) else {
-                continue;
-            };
-            *deferred_work_by_domain.entry(domain.clone()).or_default() += *cycles;
-            if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
-                *starved_domains.entry(domain.clone()).or_default() += 1;
-            }
-        }
-        SchedulerObservabilitySnapshot {
-            deferred_work,
-            deferred_work_by_domain,
-            starved_domains,
-            forced_executions: self
-                .inner
-                .scheduler_observability
-                .forced_executions
-                .load(Ordering::Relaxed),
-            forced_flushes: self
-                .inner
-                .scheduler_observability
-                .forced_flushes
-                .load(Ordering::Relaxed),
-            forced_l0_compactions: self
-                .inner
-                .scheduler_observability
-                .forced_l0_compactions
-                .load(Ordering::Relaxed),
-            budget_blocked_executions: self
-                .inner
-                .scheduler_observability
-                .budget_blocked_executions
-                .load(Ordering::Relaxed),
-            budget_blocked_executions_by_domain,
-            background_delay_events: self
-                .inner
-                .scheduler_observability
-                .background_delay_events
-                .load(Ordering::Relaxed),
-            background_delay_millis: self
-                .inner
-                .scheduler_observability
-                .background_delay_millis
-                .load(Ordering::Relaxed),
-            background_delay_events_by_domain,
-            background_delay_millis_by_domain,
-            throttled_writes_by_domain,
-            current_admission_diagnostics_by_domain,
-            last_non_open_admission_by_domain,
-        }
+        self.inner.scheduler_observability.snapshot()
     }
 
     pub(super) fn record_admission_diagnostics(
@@ -4632,35 +4440,15 @@ impl Db {
             diagnostics,
             recorded_at: self.inner.dependencies.clock.now(),
         };
-        mutex_lock(
-            &self
-                .inner
-                .scheduler_observability
-                .current_admission_diagnostics_by_domain,
-        )
-        .insert(tag.domain.clone(), recorded.clone());
-        if recorded.diagnostics.level != crate::AdmissionPressureLevel::Open {
-            mutex_lock(
-                &self
-                    .inner
-                    .scheduler_observability
-                    .last_non_open_admission_by_domain,
-            )
-            .insert(tag.domain.clone(), recorded);
-        }
-        self.notify_scheduler_observability_changed();
+        self.inner
+            .scheduler_observability
+            .record_admission_diagnostics(tag, recorded);
     }
 
     pub(super) fn record_throttled_write_domain(&self, tag: &WorkRuntimeTag) {
-        *mutex_lock(
-            &self
-                .inner
-                .scheduler_observability
-                .throttled_writes_by_domain,
-        )
-        .entry(tag.domain.clone())
-        .or_default() += 1;
-        self.notify_scheduler_observability_changed();
+        self.inner
+            .scheduler_observability
+            .record_throttled_write_domain(tag);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
