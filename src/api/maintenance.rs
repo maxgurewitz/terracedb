@@ -548,6 +548,166 @@ impl Db {
         mutex_lock(&self.inner.work_deferrals).remove(work_id);
     }
 
+    pub(super) fn work_deferral_cycles(&self, work_id: &str) -> u32 {
+        mutex_lock(&self.inner.work_deferrals)
+            .get(work_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn record_forced_execution(&self) {
+        self.inner
+            .scheduler_observability
+            .forced_executions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_forced_flush(&self) {
+        self.inner
+            .scheduler_observability
+            .forced_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_forced_l0_compaction(&self) {
+        self.inner
+            .scheduler_observability
+            .forced_l0_compactions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_budget_blocked_execution(&self) {
+        self.inner
+            .scheduler_observability
+            .budget_blocked_executions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_background_delay(&self, delay: Duration) {
+        if delay.is_zero() {
+            return;
+        }
+        self.inner
+            .scheduler_observability
+            .background_delay_events
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .scheduler_observability
+            .background_delay_millis
+            .fetch_add(delay.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn pending_work_budget_block_reason(
+        &self,
+        work: &PendingWork,
+        budget: PendingWorkBudget,
+    ) -> Option<PendingWorkBudgetBlockReason> {
+        let state = mutex_lock(&self.inner.pending_work_budget_state);
+        let work_type = work.work_type;
+        if budget.max_concurrency.is_some_and(|max| {
+            state
+                .concurrency
+                .get(&work_type)
+                .copied()
+                .unwrap_or_default()
+                >= max
+        }) {
+            return Some(PendingWorkBudgetBlockReason::Concurrency);
+        }
+        if budget.max_in_flight_requests.is_some_and(|max| {
+            state
+                .in_flight_requests
+                .get(&work_type)
+                .copied()
+                .unwrap_or_default()
+                >= max
+        }) {
+            return Some(PendingWorkBudgetBlockReason::InFlightRequests);
+        }
+        if budget.max_in_flight_bytes.is_some_and(|max| {
+            state
+                .in_flight_bytes
+                .get(&work_type)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(work.estimated_bytes)
+                > max
+        }) {
+            return Some(PendingWorkBudgetBlockReason::InFlightBytes);
+        }
+        None
+    }
+
+    pub(super) fn reserve_pending_work_budget(&self, work: &PendingWork) {
+        let mut state = mutex_lock(&self.inner.pending_work_budget_state);
+        *state.in_flight_bytes.entry(work.work_type).or_default() = state
+            .in_flight_bytes
+            .get(&work.work_type)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(work.estimated_bytes);
+        *state.in_flight_requests.entry(work.work_type).or_default() = state
+            .in_flight_requests
+            .get(&work.work_type)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+        *state.concurrency.entry(work.work_type).or_default() = state
+            .concurrency
+            .get(&work.work_type)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+    }
+
+    pub(super) fn release_pending_work_budget(&self, work: &PendingWork) {
+        let mut state = mutex_lock(&self.inner.pending_work_budget_state);
+        let work_type = work.work_type;
+        if let Some(bytes) = state.in_flight_bytes.get_mut(&work_type) {
+            *bytes = bytes.saturating_sub(work.estimated_bytes);
+            if *bytes == 0 {
+                state.in_flight_bytes.remove(&work_type);
+            }
+        }
+        if let Some(requests) = state.in_flight_requests.get_mut(&work_type) {
+            *requests = requests.saturating_sub(1);
+            if *requests == 0 {
+                state.in_flight_requests.remove(&work_type);
+            }
+        }
+        if let Some(concurrency) = state.concurrency.get_mut(&work_type) {
+            *concurrency = concurrency.saturating_sub(1);
+            if *concurrency == 0 {
+                state.concurrency.remove(&work_type);
+            }
+        }
+    }
+
+    pub(super) fn adaptive_pending_work_delay(
+        estimated_bytes: u64,
+        max_bytes_per_second: u64,
+        deferred_cycles: u32,
+    ) -> Duration {
+        let base = Self::throttle_delay(estimated_bytes, max_bytes_per_second);
+        if base.is_zero() {
+            return Duration::ZERO;
+        }
+        let divisor = u64::from(deferred_cycles.saturating_add(1));
+        let base_millis = base.as_millis() as u64;
+        Duration::from_millis(base_millis.div_ceil(divisor))
+    }
+
+    pub(super) async fn scheduler_budget_for_candidate(
+        &self,
+        candidate: &PendingWorkCandidate,
+    ) -> PendingWorkBudget {
+        let Some(table) = self.try_table(candidate.pending.table.clone()) else {
+            return PendingWorkBudget::default();
+        };
+        let stats = self.table_stats(&table).await;
+        self.inner.scheduler.work_budget(&candidate.pending, &stats)
+    }
+
     pub(super) fn deferred_work_candidate(
         &self,
         candidates: &[PendingWorkCandidate],
@@ -605,6 +765,31 @@ impl Db {
         }
     }
 
+    pub(super) async fn execute_pending_work_budgeted(
+        &self,
+        local_root: &str,
+        candidate: PendingWorkCandidate,
+        budget: PendingWorkBudget,
+        forced: bool,
+    ) -> Result<(), StorageError> {
+        if !forced && let Some(rate) = budget.max_bytes_per_second {
+            let delay = Self::adaptive_pending_work_delay(
+                candidate.pending.estimated_bytes,
+                rate,
+                self.work_deferral_cycles(&candidate.pending.id),
+            );
+            self.record_background_delay(delay);
+            self.inner.dependencies.clock.sleep(delay).await;
+        }
+
+        self.reserve_pending_work_budget(&candidate.pending);
+        let result = self
+            .execute_pending_work(local_root, candidate.clone())
+            .await;
+        self.release_pending_work_budget(&candidate.pending);
+        result
+    }
+
     pub(super) async fn run_scheduler_pass(
         &self,
         allow_forced_execution: bool,
@@ -627,7 +812,15 @@ impl Db {
             }
 
             if let Some(candidate) = self.forced_l0_compaction_candidate(&candidates) {
-                self.execute_pending_work(&local_root, candidate).await?;
+                self.record_forced_execution();
+                self.record_forced_l0_compaction();
+                self.execute_pending_work_budgeted(
+                    &local_root,
+                    candidate,
+                    PendingWorkBudget::default(),
+                    true,
+                )
+                .await?;
                 return Ok(true);
             }
 
@@ -635,7 +828,7 @@ impl Db {
                 .iter()
                 .map(|candidate| candidate.pending.clone())
                 .collect::<Vec<_>>();
-            let decisions = self
+            let mut decisions = self
                 .inner
                 .scheduler
                 .on_work_available(&pending)
@@ -643,9 +836,9 @@ impl Db {
                 .map(|decision| (decision.work_id, decision.action))
                 .collect::<BTreeMap<_, _>>();
 
-            if let Some(candidate) = candidates
+            let scheduled = candidates
                 .iter()
-                .find(|candidate| {
+                .filter(|candidate| {
                     decisions
                         .get(&candidate.pending.id)
                         .copied()
@@ -653,8 +846,21 @@ impl Db {
                         == ScheduleAction::Execute
                 })
                 .cloned()
-            {
-                self.execute_pending_work(&local_root, candidate).await?;
+                .collect::<Vec<_>>();
+
+            for candidate in &scheduled {
+                let budget = self.scheduler_budget_for_candidate(candidate).await;
+                if self
+                    .pending_work_budget_block_reason(&candidate.pending, budget)
+                    .is_some()
+                {
+                    decisions.insert(candidate.pending.id.clone(), ScheduleAction::Defer);
+                    self.record_budget_blocked_execution();
+                    continue;
+                }
+
+                self.execute_pending_work_budgeted(&local_root, candidate.clone(), budget, false)
+                    .await?;
                 return Ok(true);
             }
 
@@ -662,7 +868,14 @@ impl Db {
             if allow_forced_execution
                 && let Some(candidate) = self.deferred_work_candidate(&candidates)
             {
-                self.execute_pending_work(&local_root, candidate).await?;
+                self.record_forced_execution();
+                self.execute_pending_work_budgeted(
+                    &local_root,
+                    candidate,
+                    PendingWorkBudget::default(),
+                    true,
+                )
+                .await?;
                 return Ok(true);
             }
         }

@@ -254,7 +254,7 @@ impl ObjectKeyLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CacheSpan {
     Full,
     Range { start: u64, end: u64 },
@@ -294,6 +294,13 @@ struct CacheIndexEntry {
     record: CacheEntryRecord,
     metadata_path: String,
     data_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteCacheEntryInfo {
+    pub(crate) object_key: String,
+    pub(crate) span: CacheSpan,
+    pub(crate) data_len: u64,
 }
 
 fn encode_cache_span_flatbuffer(span: CacheSpan) -> (u8, u64, u64) {
@@ -397,6 +404,32 @@ impl RemoteCache {
 
     pub fn entry_count(&self) -> usize {
         lock(&self.entries).values().map(Vec::len).sum()
+    }
+
+    pub(crate) fn total_cached_bytes(&self) -> u64 {
+        lock(&self.entries)
+            .values()
+            .flatten()
+            .map(|entry| entry.record.data_len)
+            .sum()
+    }
+
+    pub(crate) fn entries_snapshot(&self) -> Vec<RemoteCacheEntryInfo> {
+        let mut entries = lock(&self.entries)
+            .values()
+            .flatten()
+            .map(|entry| RemoteCacheEntryInfo {
+                object_key: entry.record.object_key.clone(),
+                span: entry.record.span,
+                data_len: entry.record.data_len,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.object_key
+                .cmp(&right.object_key)
+                .then_with(|| left.span.suffix().cmp(&right.span.suffix()))
+        });
+        entries
     }
 
     async fn rebuild_index(&self) -> Result<(), StorageError> {
@@ -560,6 +593,37 @@ impl RemoteCache {
             metadata_path,
             data_path,
         });
+        Ok(())
+    }
+
+    pub(crate) async fn remove_span(
+        &self,
+        object_key: &str,
+        span: CacheSpan,
+    ) -> Result<(), StorageError> {
+        let removed = {
+            let mut entries = lock(&self.entries);
+            let object_entries = entries.entry(object_key.to_string()).or_default();
+            let mut removed = Vec::new();
+            object_entries.retain(|entry| {
+                let matches = entry.record.span == span;
+                if matches {
+                    removed.push(entry.clone());
+                }
+                !matches
+            });
+            if object_entries.is_empty() {
+                entries.remove(object_key);
+            }
+            removed
+        };
+
+        for entry in removed {
+            self.file_system.delete(&entry.data_path).await?;
+            self.file_system.delete(&entry.metadata_path).await?;
+        }
+        self.file_system.sync_dir(&self.data_dir).await?;
+        self.file_system.sync_dir(&self.metadata_dir).await?;
         Ok(())
     }
 

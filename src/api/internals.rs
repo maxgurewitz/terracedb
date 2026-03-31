@@ -59,6 +59,8 @@ pub(super) struct DbInner {
     pub(super) visible_watchers: Arc<WatermarkRegistry>,
     pub(super) durable_watchers: Arc<WatermarkRegistry>,
     pub(super) work_deferrals: Mutex<BTreeMap<String, u32>>,
+    pub(super) pending_work_budget_state: Mutex<PendingWorkBudgetState>,
+    pub(super) scheduler_observability: SchedulerObservabilityStats,
 }
 
 #[derive(Clone)]
@@ -179,15 +181,29 @@ pub(super) struct ColumnarCacheStatsSnapshot {
     pub(super) decoded_column_block_admissions: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColumnarCacheUsageSnapshot {
+    pub raw_byte_entries: usize,
+    pub raw_byte_bytes: u64,
+    pub raw_byte_budget_bytes: u64,
+    pub decoded_metadata_entries: usize,
+    pub decoded_metadata_entry_limit: usize,
+    pub decoded_metadata_bytes: u64,
+    pub decoded_column_entries: usize,
+    pub decoded_column_entry_limit: usize,
+    pub decoded_column_bytes: u64,
+}
+
 pub(super) struct ColumnarReadContext {
     pub(super) dependencies: DbDependencies,
     pub(super) remote_cache: Option<Arc<RemoteCache>>,
     pub(super) decoded_cache: DecodedColumnarCache,
     pub(super) raw_byte_cache_enabled: AtomicBool,
     pub(super) decoded_cache_enabled: AtomicBool,
+    pub(super) raw_byte_cache_budget_bytes: u64,
+    pub(super) raw_byte_cache_budget_state: Mutex<RawByteCacheBudgetState>,
 }
 
-#[derive(Default)]
 pub(super) struct DecodedColumnarCache {
     pub(super) footers: RwLock<BTreeMap<ColumnarSstableIdentity, CachedColumnarFooter>>,
     pub(super) key_indexes: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<Key>>>>,
@@ -197,6 +213,10 @@ pub(super) struct DecodedColumnarCache {
     pub(super) row_kind_columns: RwLock<BTreeMap<ColumnarSstableIdentity, Arc<Vec<ChangeKind>>>>,
     pub(super) column_blocks: RwLock<BTreeMap<ColumnarColumnCacheKey, Arc<Vec<FieldValue>>>>,
     pub(super) stats: ColumnarCacheStats,
+    pub(super) metadata_entry_limit: usize,
+    pub(super) column_entry_limit: usize,
+    pub(super) metadata_order: Mutex<VecDeque<ColumnarSstableIdentity>>,
+    pub(super) column_order: Mutex<VecDeque<ColumnarColumnCacheKey>>,
 }
 
 #[derive(Default)]
@@ -212,6 +232,36 @@ pub(super) struct ColumnarCacheStats {
     pub(super) decoded_column_block_hits: AtomicU64,
     pub(super) decoded_column_block_misses: AtomicU64,
     pub(super) decoded_column_block_admissions: AtomicU64,
+}
+
+#[derive(Default)]
+pub(super) struct SchedulerObservabilityStats {
+    pub(super) forced_executions: AtomicU64,
+    pub(super) forced_flushes: AtomicU64,
+    pub(super) forced_l0_compactions: AtomicU64,
+    pub(super) budget_blocked_executions: AtomicU64,
+    pub(super) background_delay_events: AtomicU64,
+    pub(super) background_delay_millis: AtomicU64,
+}
+
+#[derive(Default)]
+pub(super) struct PendingWorkBudgetState {
+    pub(super) in_flight_bytes: BTreeMap<PendingWorkType, u64>,
+    pub(super) in_flight_requests: BTreeMap<PendingWorkType, u32>,
+    pub(super) concurrency: BTreeMap<PendingWorkType, u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct RawByteCacheBudgetKey {
+    pub(super) object_key: String,
+    pub(super) span: crate::remote::CacheSpan,
+}
+
+#[derive(Default)]
+pub(super) struct RawByteCacheBudgetState {
+    pub(super) total_bytes: u64,
+    pub(super) order: VecDeque<RawByteCacheBudgetKey>,
+    pub(super) lengths: BTreeMap<RawByteCacheBudgetKey, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +337,22 @@ impl PersistedManifestSstable {
 }
 
 impl DecodedColumnarCache {
+    pub(super) fn new(metadata_entry_limit: usize, column_entry_limit: usize) -> Self {
+        Self {
+            footers: RwLock::new(BTreeMap::new()),
+            key_indexes: RwLock::new(BTreeMap::new()),
+            sequence_columns: RwLock::new(BTreeMap::new()),
+            tombstone_bitmaps: RwLock::new(BTreeMap::new()),
+            row_kind_columns: RwLock::new(BTreeMap::new()),
+            column_blocks: RwLock::new(BTreeMap::new()),
+            stats: ColumnarCacheStats::default(),
+            metadata_entry_limit,
+            column_entry_limit,
+            metadata_order: Mutex::new(VecDeque::new()),
+            column_order: Mutex::new(VecDeque::new()),
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn snapshot(&self) -> ColumnarCacheStatsSnapshot {
         ColumnarCacheStatsSnapshot {
@@ -310,6 +376,20 @@ impl DecodedColumnarCache {
                 .stats
                 .decoded_column_block_admissions
                 .load(Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn usage_snapshot(&self, raw_byte_budget_bytes: u64) -> ColumnarCacheUsageSnapshot {
+        ColumnarCacheUsageSnapshot {
+            raw_byte_entries: 0,
+            raw_byte_bytes: 0,
+            raw_byte_budget_bytes,
+            decoded_metadata_entries: self.metadata_order.lock().len(),
+            decoded_metadata_entry_limit: self.metadata_entry_limit,
+            decoded_metadata_bytes: self.metadata_usage_bytes(),
+            decoded_column_entries: self.column_order.lock().len(),
+            decoded_column_entry_limit: self.column_entry_limit,
+            decoded_column_bytes: self.column_usage_bytes(),
         }
     }
 
@@ -348,6 +428,8 @@ impl DecodedColumnarCache {
         self.tombstone_bitmaps.write().clear();
         self.row_kind_columns.write().clear();
         self.column_blocks.write().clear();
+        self.metadata_order.lock().clear();
+        self.column_order.lock().clear();
     }
 
     pub(super) fn footer(
@@ -372,7 +454,9 @@ impl DecodedColumnarCache {
         identity: ColumnarSstableIdentity,
         footer: CachedColumnarFooter,
     ) {
-        self.footers.write().insert(identity, footer);
+        self.footers.write().insert(identity.clone(), footer);
+        self.touch_metadata_identity(&identity);
+        self.trim_metadata_to_limit();
         self.stats
             .decoded_footer_admissions
             .fetch_add(1, Ordering::Relaxed);
@@ -397,7 +481,9 @@ impl DecodedColumnarCache {
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<Key>>,
     ) {
-        self.key_indexes.write().insert(identity, values);
+        self.key_indexes.write().insert(identity.clone(), values);
+        self.touch_metadata_identity(&identity);
+        self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
             .fetch_add(1, Ordering::Relaxed);
@@ -425,7 +511,11 @@ impl DecodedColumnarCache {
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<SequenceNumber>>,
     ) {
-        self.sequence_columns.write().insert(identity, values);
+        self.sequence_columns
+            .write()
+            .insert(identity.clone(), values);
+        self.touch_metadata_identity(&identity);
+        self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
             .fetch_add(1, Ordering::Relaxed);
@@ -453,7 +543,11 @@ impl DecodedColumnarCache {
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<bool>>,
     ) {
-        self.tombstone_bitmaps.write().insert(identity, values);
+        self.tombstone_bitmaps
+            .write()
+            .insert(identity.clone(), values);
+        self.touch_metadata_identity(&identity);
+        self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
             .fetch_add(1, Ordering::Relaxed);
@@ -481,7 +575,11 @@ impl DecodedColumnarCache {
         identity: ColumnarSstableIdentity,
         values: Arc<Vec<ChangeKind>>,
     ) {
-        self.row_kind_columns.write().insert(identity, values);
+        self.row_kind_columns
+            .write()
+            .insert(identity.clone(), values);
+        self.touch_metadata_identity(&identity);
+        self.trim_metadata_to_limit();
         self.stats
             .decoded_metadata_admissions
             .fetch_add(1, Ordering::Relaxed);
@@ -509,10 +607,151 @@ impl DecodedColumnarCache {
         key: ColumnarColumnCacheKey,
         values: Arc<Vec<FieldValue>>,
     ) {
-        self.column_blocks.write().insert(key, values);
+        self.column_blocks.write().insert(key.clone(), values);
+        self.touch_column_key(&key);
+        self.trim_column_blocks_to_limit();
         self.stats
             .decoded_column_block_admissions
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn touch_metadata_identity(&self, identity: &ColumnarSstableIdentity) {
+        let mut order = self.metadata_order.lock();
+        if let Some(position) = order.iter().position(|cached| cached == identity) {
+            order.remove(position);
+        }
+        order.push_back(identity.clone());
+    }
+
+    fn trim_metadata_to_limit(&self) {
+        loop {
+            let next = {
+                let mut order = self.metadata_order.lock();
+                if order.len() <= self.metadata_entry_limit {
+                    None
+                } else {
+                    order.pop_front()
+                }
+            };
+            let Some(identity) = next else {
+                break;
+            };
+            self.footers.write().remove(&identity);
+            self.key_indexes.write().remove(&identity);
+            self.sequence_columns.write().remove(&identity);
+            self.tombstone_bitmaps.write().remove(&identity);
+            self.row_kind_columns.write().remove(&identity);
+        }
+    }
+
+    fn touch_column_key(&self, key: &ColumnarColumnCacheKey) {
+        let mut order = self.column_order.lock();
+        if let Some(position) = order.iter().position(|cached| cached == key) {
+            order.remove(position);
+        }
+        order.push_back(key.clone());
+    }
+
+    fn trim_column_blocks_to_limit(&self) {
+        loop {
+            let next = {
+                let mut order = self.column_order.lock();
+                if order.len() <= self.column_entry_limit {
+                    None
+                } else {
+                    order.pop_front()
+                }
+            };
+            let Some(key) = next else {
+                break;
+            };
+            self.column_blocks.write().remove(&key);
+        }
+    }
+
+    fn metadata_usage_bytes(&self) -> u64 {
+        let footer_bytes = self
+            .footers
+            .read()
+            .values()
+            .map(|footer| estimate_cached_footer_bytes(footer))
+            .sum::<u64>();
+        let key_index_bytes = self
+            .key_indexes
+            .read()
+            .values()
+            .map(|values| estimate_keys_bytes(values.as_ref().as_slice()))
+            .sum::<u64>();
+        let sequence_bytes = self
+            .sequence_columns
+            .read()
+            .values()
+            .map(|values| (values.len() as u64).saturating_mul(std::mem::size_of::<u64>() as u64))
+            .sum::<u64>();
+        let tombstone_bytes = self
+            .tombstone_bitmaps
+            .read()
+            .values()
+            .map(|values| values.len() as u64)
+            .sum::<u64>();
+        let row_kind_bytes = self
+            .row_kind_columns
+            .read()
+            .values()
+            .map(|values| values.len() as u64)
+            .sum::<u64>();
+        footer_bytes
+            .saturating_add(key_index_bytes)
+            .saturating_add(sequence_bytes)
+            .saturating_add(tombstone_bytes)
+            .saturating_add(row_kind_bytes)
+    }
+
+    fn column_usage_bytes(&self) -> u64 {
+        self.column_blocks
+            .read()
+            .values()
+            .map(|values| estimate_field_values_bytes(values.as_ref().as_slice()))
+            .sum()
+    }
+}
+
+impl Default for DecodedColumnarCache {
+    fn default() -> Self {
+        let config = crate::HybridReadConfig::default();
+        Self::new(
+            config.decoded_metadata_cache_entries,
+            config.decoded_column_cache_entries,
+        )
+    }
+}
+
+fn estimate_cached_footer_bytes(footer: &CachedColumnarFooter) -> u64 {
+    serde_json::to_vec(footer.footer.as_ref())
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or_default()
+        .saturating_add(std::mem::size_of::<usize>() as u64)
+}
+
+fn estimate_keys_bytes(values: &[Key]) -> u64 {
+    values
+        .iter()
+        .map(|key| key.len() as u64 + std::mem::size_of::<Key>() as u64)
+        .sum()
+}
+
+fn estimate_field_values_bytes(values: &[FieldValue]) -> u64 {
+    values.iter().map(estimate_field_value_bytes).sum()
+}
+
+fn estimate_field_value_bytes(value: &FieldValue) -> u64 {
+    match value {
+        FieldValue::Null => 0,
+        FieldValue::String(value) => value.len() as u64 + std::mem::size_of::<String>() as u64,
+        FieldValue::Int64(_) => std::mem::size_of::<i64>() as u64,
+        FieldValue::Float64(_) => std::mem::size_of::<f64>() as u64,
+        FieldValue::Bytes(value) => value.len() as u64 + std::mem::size_of::<Vec<u8>>() as u64,
+        FieldValue::Bool(_) => std::mem::size_of::<bool>() as u64,
     }
 }
 

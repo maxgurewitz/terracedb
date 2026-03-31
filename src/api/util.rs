@@ -6,6 +6,7 @@ pub(super) fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32
         PendingWorkType::Compaction => 1,
         PendingWorkType::Backup => 2,
         PendingWorkType::Offload => 3,
+        PendingWorkType::Prefetch => 4,
     };
     (priority, work.table.as_str(), work.level)
 }

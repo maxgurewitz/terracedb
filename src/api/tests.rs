@@ -27,12 +27,12 @@ use crate::{
     DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
     FileSystemFailure, FileSystemOperation, LogCursor, MergeOperator, MergeOperatorRef,
     NoopScheduler, ObjectKeyLayout, ObjectStore, ObjectStoreFailure, ObjectStoreOperation,
-    PendingWork, PendingWorkType, ReadError, Rng, S3Location, S3PrimaryStorageConfig, ScanOptions,
-    ScheduleAction, ScheduleDecision, Scheduler, SegmentId, SequenceNumber, SsdConfig,
-    StorageConfig, StorageError, StorageErrorKind, StubClock, StubObjectStore, StubRng, Table,
-    TableConfig, TableFormat, TableId, TableStats, ThrottleDecision, TieredDurabilityMode,
-    TieredLocalRetentionMode, TieredStorageConfig, Timestamp, Transaction, TtlCompactionFilter,
-    Value,
+    PendingWork, PendingWorkBudget, PendingWorkType, ReadError, Rng, S3Location,
+    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler, SegmentId,
+    SequenceNumber, SsdConfig, StorageConfig, StorageError, StorageErrorKind, StubClock,
+    StubObjectStore, StubRng, Table, TableConfig, TableFormat, TableId, TableStats,
+    ThrottleDecision, TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig,
+    Timestamp, Transaction, TtlCompactionFilter, Value,
     engine::commit_log::{BlockIndexEntry, SegmentFooter, TableSegmentMeta},
     metadata_flatbuffers as metadata_fb,
 };
@@ -492,6 +492,46 @@ impl Scheduler for TableRateLimitScheduler {
                 stall: false,
             })
             .unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+struct TinyCompactionBudgetScheduler;
+
+impl Scheduler for TinyCompactionBudgetScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        let selected = work
+            .iter()
+            .find(|item| item.work_type == PendingWorkType::Compaction)
+            .or_else(|| work.first())
+            .map(|item| item.id.clone());
+        work.iter()
+            .map(|item| ScheduleDecision {
+                work_id: item.id.clone(),
+                action: if selected.as_ref() == Some(&item.id) {
+                    ScheduleAction::Execute
+                } else {
+                    ScheduleAction::Defer
+                },
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn work_budget(&self, work: &PendingWork, _stats: &TableStats) -> PendingWorkBudget {
+        match work.work_type {
+            PendingWorkType::Compaction => PendingWorkBudget {
+                max_in_flight_bytes: Some(1),
+                ..PendingWorkBudget::default()
+            },
+            PendingWorkType::Flush
+            | PendingWorkType::Backup
+            | PendingWorkType::Offload
+            | PendingWorkType::Prefetch => PendingWorkBudget::default(),
+        }
     }
 }
 
@@ -2006,6 +2046,16 @@ async fn forced_flush_ignores_scheduler_deferrals_when_memtable_budget_is_exhaus
     assert!(!db.sstables_read().live.is_empty());
 }
 
+#[test]
+fn adaptive_pending_work_delay_shrinks_with_repeated_deferrals() {
+    let first = Db::adaptive_pending_work_delay(4 * 1024, 1024, 0);
+    let fourth = Db::adaptive_pending_work_delay(4 * 1024, 1024, 3);
+
+    assert_eq!(first, Duration::from_secs(4));
+    assert_eq!(fourth, Duration::from_secs(1));
+    assert!(fourth < first);
+}
+
 #[tokio::test]
 async fn forced_l0_compaction_ignores_scheduler_deferrals_at_the_hard_ceiling() {
     let file_system = Arc::new(crate::StubFileSystem::default());
@@ -2043,6 +2093,55 @@ async fn forced_l0_compaction_ignores_scheduler_deferrals_at_the_hard_ceiling() 
         stats.l0_sstable_count < crate::DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
         "forced compaction should reduce L0 pressure before accepting more writes"
     );
+}
+
+#[tokio::test]
+async fn budget_blocked_compaction_is_forced_and_reported() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/budget-blocked-compaction",
+            Arc::new(TinyCompactionBudgetScheduler),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+
+    for index in 0..2 {
+        table
+            .write(format!("seed-{index}").into_bytes(), Value::bytes("v"))
+            .await
+            .expect("write seed");
+        db.flush().await.expect("flush seed");
+    }
+
+    assert!(
+        db.pending_work()
+            .await
+            .iter()
+            .any(|work| work.work_type == PendingWorkType::Compaction),
+        "fixture should create compaction backlog",
+    );
+    assert!(
+        db.run_next_scheduled_work()
+            .await
+            .expect("run budgeted scheduler pass"),
+        "scheduler pass should force some work to execute",
+    );
+
+    let stats = db.table_stats(&table).await;
+    assert_eq!(stats.compaction_debt, 0);
+    assert_eq!(stats.l0_sstable_count, 0);
+
+    let snapshot = db.scheduler_observability_snapshot();
+    assert!(snapshot.budget_blocked_executions >= 1);
+    assert!(snapshot.forced_executions >= 1);
 }
 
 #[tokio::test]
@@ -4636,6 +4735,80 @@ async fn remote_columnar_point_reads_reuse_raw_byte_cache_in_tiered_cold_mode() 
         "second cold point read should hit the raw-byte cache instead of refetching ranges",
     );
     assert!(reopened.columnar_cache_stats_snapshot().raw_byte_hits > 0);
+}
+
+#[tokio::test]
+async fn columnar_cache_usage_snapshot_respects_configured_bounds() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let inner_store = Arc::new(StubObjectStore::default());
+    let recording_store = Arc::new(RecordingObjectStore::new(inner_store));
+    let dependencies = DbDependencies::new(
+        file_system,
+        recording_store,
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(7)),
+    );
+    let mut config = s3_primary_config("columnar-cache-usage-bounds");
+    config.hybrid_read.raw_segment_cache_bytes = 256;
+    config.hybrid_read.decoded_metadata_cache_entries = 1;
+    config.hybrid_read.decoded_column_cache_entries = 1;
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open db");
+    let table_config = columnar_table_config("metrics");
+    let schema = table_config.schema.clone().expect("columnar schema");
+    let table = db
+        .create_table(table_config)
+        .await
+        .expect("create columnar table");
+
+    for (key, user, count) in [("user:1", "alice", 3_i64), ("user:2", "bob", 7_i64)] {
+        table
+            .write(
+                key.as_bytes().to_vec(),
+                Value::named_record(
+                    &schema,
+                    vec![
+                        ("user_id", FieldValue::String(user.to_string())),
+                        ("count", FieldValue::Int64(count)),
+                    ],
+                )
+                .expect("encode columnar row"),
+            )
+            .await
+            .expect("write row");
+        db.flush().await.expect("flush row");
+    }
+
+    let reopened = Db::open(config, dependencies).await.expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+
+    assert!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read first row")
+            .is_some()
+    );
+    assert!(
+        reopened_table
+            .read(b"user:2".to_vec())
+            .await
+            .expect("read second row")
+            .is_some()
+    );
+
+    let usage = reopened.columnar_cache_usage_snapshot();
+    assert_eq!(usage.raw_byte_budget_bytes, 256);
+    assert!(usage.raw_byte_entries > 0);
+    assert!(usage.raw_byte_bytes <= usage.raw_byte_budget_bytes);
+    assert_eq!(usage.decoded_metadata_entry_limit, 1);
+    assert_eq!(usage.decoded_column_entry_limit, 1);
+    assert!(usage.decoded_metadata_entries <= 1);
+    assert!(usage.decoded_column_entries <= 1);
 }
 
 #[tokio::test]

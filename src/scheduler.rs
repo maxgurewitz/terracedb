@@ -1,4 +1,4 @@
-use std::{fmt, sync::Mutex};
+use std::{collections::BTreeMap, fmt, sync::Mutex};
 
 use serde_json::Value as JsonValue;
 
@@ -10,14 +10,18 @@ pub const DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT: u32 = 4;
 pub trait Scheduler: Send + Sync {
     fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision>;
     fn should_throttle(&self, table: &Table, stats: &TableStats) -> ThrottleDecision;
+    fn work_budget(&self, _work: &PendingWork, _stats: &TableStats) -> PendingWorkBudget {
+        PendingWorkBudget::default()
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PendingWorkType {
     Flush,
     Compaction,
     Backup,
     Offload,
+    Prefetch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +50,32 @@ pub struct ThrottleDecision {
     pub throttle: bool,
     pub max_write_bytes_per_second: Option<u64>,
     pub stall: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingWorkBudget {
+    pub max_bytes_per_second: Option<u64>,
+    pub max_in_flight_bytes: Option<u64>,
+    pub max_in_flight_requests: Option<u32>,
+    pub max_concurrency: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingWorkBudgetBlockReason {
+    InFlightBytes,
+    InFlightRequests,
+    Concurrency,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerObservabilitySnapshot {
+    pub deferred_work: BTreeMap<String, u32>,
+    pub forced_executions: u64,
+    pub forced_flushes: u64,
+    pub forced_l0_compactions: u64,
+    pub budget_blocked_executions: u64,
+    pub background_delay_events: u64,
+    pub background_delay_millis: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -201,6 +231,7 @@ fn pending_work_priority(work: &PendingWork) -> (u8, u32) {
         PendingWorkType::Compaction => (1, work.level.unwrap_or(u32::MAX)),
         PendingWorkType::Backup => (2, 0),
         PendingWorkType::Offload => (3, 0),
+        PendingWorkType::Prefetch => (4, 0),
     }
 }
 

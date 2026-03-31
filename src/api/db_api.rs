@@ -678,6 +678,8 @@ impl Db {
         let batch_bytes_by_table = Self::estimated_batch_bytes_by_table(operations);
         let total_batch_bytes = batch_bytes_by_table.values().copied().sum::<u64>();
         if self.memtable_budget_exceeded_by(total_batch_bytes) {
+            self.record_forced_execution();
+            self.record_forced_flush();
             self.flush_internal(false)
                 .await
                 .map_err(|error| CommitError::Storage(Self::flush_error_into_storage(error)))?;
@@ -2529,6 +2531,46 @@ impl Db {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn columnar_cache_stats_snapshot(&self) -> ColumnarCacheStatsSnapshot {
         self.inner.columnar_read_context.decoded_cache.snapshot()
+    }
+
+    pub fn columnar_cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
+        self.inner.columnar_read_context.cache_usage_snapshot()
+    }
+
+    pub fn scheduler_observability_snapshot(&self) -> SchedulerObservabilitySnapshot {
+        SchedulerObservabilitySnapshot {
+            deferred_work: mutex_lock(&self.inner.work_deferrals).clone(),
+            forced_executions: self
+                .inner
+                .scheduler_observability
+                .forced_executions
+                .load(Ordering::Relaxed),
+            forced_flushes: self
+                .inner
+                .scheduler_observability
+                .forced_flushes
+                .load(Ordering::Relaxed),
+            forced_l0_compactions: self
+                .inner
+                .scheduler_observability
+                .forced_l0_compactions
+                .load(Ordering::Relaxed),
+            budget_blocked_executions: self
+                .inner
+                .scheduler_observability
+                .budget_blocked_executions
+                .load(Ordering::Relaxed),
+            background_delay_events: self
+                .inner
+                .scheduler_observability
+                .background_delay_events
+                .load(Ordering::Relaxed),
+            background_delay_millis: self
+                .inner
+                .scheduler_observability
+                .background_delay_millis
+                .load(Ordering::Relaxed),
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
