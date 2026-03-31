@@ -2297,6 +2297,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-example-sandbox-notes"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-sandbox",
+ "terracedb-simulation",
+ "terracedb-vfs",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-example-telemetry-api"
 version = "0.1.0"
 dependencies = [
