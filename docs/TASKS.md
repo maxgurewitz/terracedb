@@ -19,6 +19,7 @@ Included in this plan:
 - row and columnar table formats,
 - unified commit log and change capture,
 - tiered and s3-primary storage modes,
+- opt-in physical per-table sharding and resharding via virtual partitions,
 - scheduler integration,
 - composition primitives built on top of the engine,
 - projection and workflow libraries,
@@ -29,7 +30,6 @@ Included in this plan:
 
 Explicitly excluded from the main execution plan:
 
-- physical sharding,
 - mount/protocol adapters that expose the embedded virtual filesystem as a real host filesystem or network service,
 - zero-downtime upgrade handoff,
 - deployment choreography/platform rollout details,
@@ -61,10 +61,13 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 10** adds an optional Arrow-ecosystem analytical export crate on top of Terracedb.
 - **Phase 11** hardens the hybrid OLTP/OLAP path with columnar-v2 layout contracts, selective-read execution, segmented remote caching, stronger publish/recovery semantics, and a small analytically shaped example app.
 - **Phase 12** adds generalized current-state retention and ranking policies.
+- **Phase 13** adds execution domains, control-plane isolation, and colocated multi-DB foundations.
+- **Phase 14** adds unified-log pressure, flush reclamation, and adaptive write admission.
+- **Phase 15** adds opt-in physical sharding, resharding via virtual partitions, and a small sharded example app.
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into twelve mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into fifteen mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -78,6 +81,9 @@ Once Phase 0 is complete, the work naturally splits into twelve mostly independe
 - **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
 - **Track K — hybrid-read and columnar-v2 hardening:** T48 first; T49 follows T48; then T50, T51, T53, T55, and T56 can proceed in parallel; T52 depends on T50 + T51; T54 depends on T51 + T52 + T55; T57 depends on T50 + T51 + T52 + T53 + T55 + T56; T58 depends on T52 + T53 + T54 + T55 + T56 + T57
 - **Track L — generalized current-state retention and ranking:** T59 first; T60 and T61 proceed in parallel once the contracts and shared simulation/oracle seams from T59 exist; T62 follows once both policy families exist and can be coordinated with scheduler/offload behavior
+- **Track M — execution domains and colocated multi-DB:** T63 first; T64, T65, and T66 can proceed in parallel; T67 depends on T64 + T65 + T66; T68 depends on T64 + T66 + T67; T69 depends on T64 + T65 + T66 + T67 + T68; T70 depends on T64 + T65 + T66 + T67
+- **Track N — pressure-aware flushing and adaptive admission:** T71 first; T72, T73, and T74 can proceed in parallel; T75 depends on T73 + T74 + T70; T76 depends on T72 + T73 + T74 + T75
+- **Track O — physical sharding and resharding:** T77 first; T78, T79, and T80 can proceed in parallel; T81 depends on T78 + T79 + T80; T82 depends on T78 + T79 + T80 + T81; T83 depends on T78 + T79 + T80 + T81
 
 ---
 
@@ -3138,6 +3144,266 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
 
 ---
 
+## Phase 15 — Opt-in physical sharding, virtual-partition resharding, and shard-local execution
+
+**Parallelization:** T77 first. After that, T78, T79, and T80 can proceed in parallel against the frozen interfaces and shared simulation/oracle seams. T81 depends on T78 + T79 + T80. T82 depends on T78 + T79 + T80 + T81. T83 depends on T78 + T79 + T80 + T81 and can proceed in parallel with T82 once the core sharding surfaces are stable.
+
+**Phase rule:** T77 freezes shard-routing, virtual-partition, and shard-local storage interfaces first, and the rest of the phase should maximize parallel implementation against those fixed seams rather than re-opening the contracts. Physical sharding is a storage-layout and correctness feature; execution domains remain placement and budgeting only. Shard ownership must be defined by catalog/control-plane metadata, not by scheduler placement, domain names, or whichever worker happened to process a request.
+
+**Simulation rule:** Every task in this phase must extend the relevant deterministic oracle/cut-point/simulation harness in the same change as the production-path change. Do not defer task-local verification to the capstone; T82 is additive whole-system hardening, not a substitute for self-contained simulation in T78-T81 and T83.
+
+**Adoption rule:** Treat sharding as opt-in per table, with unsharded tables continuing to use shard `0000` exactly as they do today. The first implementation should prefer conservative, explicit behavior: fixed virtual-partition count at table creation, deterministic hash/routing, fail-closed cross-shard batch rejection, and a conservative reshard cutover for affected partitions rather than an optimistic always-live migration protocol.
+
+**Layout rule:** Anything persisted for a sharded table must record enough virtual-partition coverage to make “move data to another physical shard without rehashing keys or rewriting row/column payloads” real. Do not rely on approximate user-key ranges or best-effort heuristics where exact partition coverage is required for safe resharding.
+
+### T77. Freeze sharding, virtual-partition, and shard-local service contracts
+
+**Depends on:** T23b, T69, T76
+
+**Description**
+
+Define the long-term abstraction for physical per-table sharding before implementation branches diverge. The goal is to freeze the contracts up front: sharded tables opt into a fixed hash-to-virtual-partition function, catalog metadata maps virtual partitions to physical shards, shard-local storage lanes own the actual data, and execution domains remain a placement layer rather than a correctness boundary.
+
+**Implementation steps**
+
+1. Define a `ShardingConfig` / `VirtualPartitionId` / `PhysicalShardId` / `ShardMapRevision`-style contract covering:
+   - opt-in sharding in `TableConfig`,
+   - fixed virtual-partition count and hash identity at table creation,
+   - mutable virtual-partition-to-physical-shard mapping metadata, and
+   - unsharded compatibility via shard `0000`.
+2. Freeze the routing contract for reads, writes, and batches:
+   - how a key resolves to a virtual partition,
+   - how that partition resolves to a physical shard,
+   - how `WriteBatch` grouping validates shard locality, and
+   - how cross-shard batches on the same sharded table fail closed.
+3. Freeze the shard-local storage/control-plane seams for:
+   - commit-log lane identity,
+   - shard-local memtables and SSTable ownership,
+   - manifest/catalog metadata for sharded tables,
+   - per-shard recovery/open hooks, and
+   - change-feed / cursor / `CommitId` behavior for sharded tables.
+4. Freeze the partition-locality/layout contract needed to support no-rewrite resharding, for example by requiring partition-bounded flush/compaction outputs or equally precise virtual-partition coverage metadata on persisted artifacts.
+5. Freeze the execution-domain integration seam so shard-local foreground/background/control-plane work can be placed in domains such as `db.orders.shard_3.foreground` without letting domain assignment define logical shard ownership.
+6. Add shared routing/oracle/simulation scaffolding immediately for:
+   - stable key-to-partition mapping,
+   - mapping revision changes,
+   - shard-local failure/recovery cut points, and
+   - reshard-plan skeletons that later tasks will extend rather than re-invent.
+7. Add compile-time stubs and placeholder types so routing, storage, scheduler, and resharding work can proceed in parallel against the same fixed interfaces.
+
+**Verification**
+
+- Compile-only tests proving the new sharding contracts compose with `TableConfig`, `WriteBatch`, `CommitId`, manifest metadata, scheduler/domain APIs, and remote-storage metadata.
+- Deterministic unit tests proving the hash-to-virtual-partition mapping is stable across reruns and independent of execution-domain placement.
+- Oracle tests for stub routing and reshard-plan helpers before production storage logic lands.
+- Simulation smoke tests that create sharded and unsharded tables together, route synthetic traffic, and verify identical same-seed traces across replay.
+
+---
+
+### T78. Implement sharded table metadata, routing, and batch-locality validation
+
+**Depends on:** T77
+
+**Description**
+
+Implement the table-level control plane for sharding: durable metadata, key routing, and commit-time validation. This task owns the logical routing surface and catalog persistence, not the shard-local storage engine internals.
+
+**Implementation steps**
+
+1. Extend the shared simulation/oracle harness first with a concrete reference model for:
+   - fixed key-to-virtual-partition routing,
+   - virtual-partition-to-physical-shard lookup by revision,
+   - unsharded `0000` compatibility, and
+   - fail-closed cross-shard batch detection.
+2. Extend `TableConfig` and catalog persistence to support opt-in sharding, including:
+   - virtual-partition count,
+   - hash identity/configuration,
+   - current shard-map revision, and
+   - initial physical-shard assignment metadata.
+3. Implement durable control-plane APIs for loading, validating, and atomically publishing shard maps for a table without yet moving data.
+4. Implement the routing layer that resolves each read/write key to a virtual partition and then to a physical shard using the persisted shard map.
+5. Implement `WriteBatch` grouping and validation so a sharded table rejects batches that would span multiple physical shards of that table, while preserving existing behavior for unsharded tables and for batches that touch multiple different tables.
+6. Add introspection for table sharding state, effective shard-map revision, partition counts per physical shard, and explicit reasons a batch was rejected for violating shard locality.
+
+**Verification**
+
+- Catalog/restart tests proving sharding metadata survives reopen exactly and unsharded tables continue to default to shard `0000`.
+- Routing tests proving the same key always resolves to the same virtual partition and physical shard for a fixed mapping revision.
+- Validation tests proving cross-shard batches on a sharded table fail closed while legal single-shard batches continue to commit.
+- Deterministic simulation tests, landed in the same task, covering mixed sharded/unsharded workloads, mapping reload on restart, and repeated same-seed routing behavior.
+
+---
+
+### T79. Implement shard-local commit lanes, partition-aware storage layout, and recovery
+
+**Depends on:** T77
+
+**Description**
+
+Implement the shard-local data path for sharded tables: independent commit-log lanes, memtables, flush outputs, and recovery state per physical shard. This task owns making shard `0000` the compatibility path and additional shard directories the real execution path for sharded tables.
+
+**Implementation steps**
+
+1. Extend the deterministic simulation/oracle harness first so it can model shard-local:
+   - commit-log lanes,
+   - mutable/immutable memtables,
+   - flush/recovery cut points,
+   - `CommitId` / cursor behavior, and
+   - partition-coverage metadata on persisted artifacts.
+2. Implement per-shard local-storage and remote-storage layout for sharded tables using the architecture's shard directories, while preserving shard `0000` as the exact compatibility path for unsharded data.
+3. Implement shard-local commit-lane append/read machinery, sequence/cursor handling, and memtable ownership according to the T77 contracts.
+4. Implement partition-aware flush/compaction outputs so persisted artifacts are either partition-bounded or carry exact virtual-partition coverage metadata sufficient for later reshard movement without rewriting user payload bytes.
+5. Implement per-shard manifest/recovery/open behavior, including deterministic reconstruction of shard-local state after crash or restart.
+6. Preserve the single-shard fast path so a table that remains on `0000` does not pay unnecessary complexity costs in the steady state.
+
+**Verification**
+
+- Storage-layout tests proving shard-local directories, manifests, and remote object keys are written and reopened consistently for both sharded tables and shard-`0000` compatibility tables.
+- Concurrency tests proving traffic to independent physical shards can make progress without corrupting each other's shard-local state.
+- Crash/recovery tests at shard-local append, flush, publish, and reopen cut points proving recovery fails closed and reconstructs the same shard-local state deterministically.
+- Deterministic simulation tests, introduced in the same task, covering repeated same-seed shard-local write/flush/restart behavior and verifying persisted partition coverage matches the oracle.
+
+---
+
+### T80. Make scheduler, maintenance, pressure control, and observability shard-aware
+
+**Depends on:** T77
+
+**Description**
+
+Teach the runtime controls to treat physical shards as first-class work units without conflating shard ownership with domain placement. This task owns shard-local scheduling, maintenance, pressure accounting, and diagnostics.
+
+**Implementation steps**
+
+1. Extend the deterministic scheduler/admission harness first with shard-local foreground/background/control-plane work items, hot-shard contention, and domain-aware shard placement scenarios before the production integration lands.
+2. Extend pending-work, scheduler, and maintenance pipelines so shard-local flush, compaction, backup, offload, and recovery work carry physical-shard identity plus optional execution-domain placement metadata.
+3. Integrate sharding with the resource-manager and pressure-aware admission work so one hot shard can be throttled or drained without implicitly redefining logical shard ownership or starving protected control-plane work.
+4. Route shard-map publication, reshard-plan metadata, and other recovery-critical sharding control work through the protected control-plane domain and internal durability lane when enabled.
+5. Add per-shard observability for backlog, pressure, mutable memory, unified-log pinning, flush/compaction debt, and current placement decisions.
+6. Keep the default profile conservative: simple single-DB and single-shard embeddings should continue to work without explicit shard-aware domain configuration.
+
+**Verification**
+
+- Deterministic tests proving shard-aware scheduling changes resource distribution and backlog behavior but not logical DB outcomes.
+- Mixed-workload simulation tests where one hot shard cannot starve unrelated shards or the protected control-plane path.
+- Pressure/accounting tests proving per-shard stats remain bounded and reconstruct deterministically after restart.
+- Domain-equivalence tests proving moving a shard's work between execution domains changes placement/isolation behavior only, not routing or commit results.
+
+---
+
+### T81. Implement virtual-partition resharding and conservative cutover without data rewriting
+
+**Depends on:** T78, T79, T80
+
+**Description**
+
+Implement resharding as a control-plane change plus physical artifact movement, not a key rewrite. This task owns the conservative first cut of reassignment: move virtual partitions between physical shards by updating mapping metadata and moving the affected persisted state, while keeping the protocol deterministic, restartable, and fail closed.
+
+**Implementation steps**
+
+1. Extend the shared oracle/simulation harness first with:
+   - virtual-partition reassignment plans,
+   - source/target physical shards,
+   - mapping revision cutover,
+   - crash/restart during movement, and
+   - validation that user keys and row/column payload bytes are not rehashed or rewritten.
+2. Implement durable reshard-plan metadata and control-plane APIs covering plan creation, in-flight status, revision publication, completion, and explicit abort/failure reporting.
+3. Implement a conservative cutover protocol for affected virtual partitions that prioritizes correctness first, for example by briefly quiescing writes to the affected partitions while their shard-local state is moved and the new mapping revision is published.
+4. Move persisted shard-local artifacts by virtual-partition coverage from the source shard directory to the target shard directory without rehashing keys or re-encoding row/column payload bytes.
+5. Ensure restart/recovery can resume, roll back, or fail closed on interrupted reshard plans without producing split ownership, duplicate visibility, or silent data loss.
+6. Add operator-facing introspection for current shard-map revision, partitions in motion, bytes/artifacts moved, cutover progress, and any partitions temporarily paused for correctness.
+
+**Verification**
+
+- Resharding tests proving the same logical data is visible before and after reassignment and that keys retain the same virtual-partition identity throughout.
+- Crash/restart tests proving interrupted reshard plans resume or fail closed without split-brain ownership between source and target shards.
+- Structural tests proving affected artifacts move between shard directories without user-key rehashing or payload rewrite.
+- Deterministic simulation tests, added with the task, covering hot-partition reassignment, restart during cutover, mapping revision replay, and mixed sharded/unsharded workloads.
+
+---
+
+### T82. Build the capstone whole-system simulation and chaos suite for physical sharding
+
+**Depends on:** T78, T79, T80, T81
+
+**Description**
+
+Add the post-implementation cross-cutting hardening pass for the sharding subsystem. This task owns the whole-system deterministic matrix across routing, shard-local storage, scheduler/resource domains, resharding, crash/recovery, and mixed sharded/unsharded operation. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact.
+
+**Implementation steps**
+
+1. Compose the per-task sharding oracle helpers into a whole-system harness that can run:
+   - multiple sharded tables,
+   - mixed sharded and unsharded tables,
+   - hot-shard skew,
+   - resharding under load, and
+   - restart/recovery during or after mapping changes.
+2. Add long-running deterministic campaigns that combine:
+   - write-heavy and scan-heavy shard skews,
+   - shard-local flush/compaction/offload pressure,
+   - control-plane shard-map churn,
+   - execution-domain reassignment of shard-local work, and
+   - reshard cutovers while unrelated shards continue serving traffic.
+3. Add a real-runtime chaos layer where appropriate, including injected shard-local stalls, delayed control-plane publication, and movement interruptions that complement the deterministic harness without weakening reproducibility requirements.
+4. Verify the full invariants matrix:
+   - routing remains stable for a fixed mapping revision,
+   - execution-domain movement changes placement only, not ownership,
+   - resharding preserves logical contents without key rehashing or payload rewrite,
+   - shard-local failures remain isolated and recover deterministically, and
+   - unsharded tables continue to behave exactly as before on shard `0000`.
+
+**Verification**
+
+- Large-seed deterministic simulation campaigns proving physical sharding and resharding remain reproducible across restart, failure, and hot-shard scenarios.
+- Cross-feature chaos tests proving mapping publication, shard-local stalls, and movement interruptions still preserve deterministic recovery and fail-closed behavior.
+- End-to-end invariant tests proving mixed sharded/unsharded deployments change parallelism and placement behavior only where expected, not logical DB results.
+
+---
+
+### T83. Build a small example app that demonstrates a sharded database
+
+**Depends on:** T78, T79, T80, T81
+
+**Description**
+
+Add a sibling example to `examples/todo-api` that demonstrates the intended sharded-table model with a simplified workload. A good fit here is a small `chat-rooms-api`: each room is an independent entity, every write is naturally scoped to one room, messages and room state can share the same shard key, and resharding can move busy rooms without teaching users a complicated multi-entity transaction story.
+
+**Implementation steps**
+
+1. Extend the phase-local simulation/example harness first with an example-oriented workload model covering:
+   - many rooms spread across virtual partitions,
+   - a few hot rooms that create shard skew,
+   - room-local writes that must stay single-shard, and
+   - a simple reshard operation that moves a hot room's virtual partition to another physical shard.
+2. Create `examples/chat-rooms-api` with a minimal HTTP surface and README, using the TODO example's structure as a template while keeping the data model sharding-friendly:
+   - a sharded `rooms` or `room_state` table keyed by `room_id`,
+   - a sharded `messages` table keyed so all messages for a room live with that room, and
+   - typed helpers that make the shard key explicit in application code.
+3. Add the smallest API that still teaches the sharding model:
+   - create a room,
+   - post a message to one room,
+   - read recent messages for one room,
+   - inspect which physical shard a room currently maps to, and
+   - trigger or simulate a reshard of one room's virtual partition for demo/testing purposes.
+4. Surface observability that shows:
+   - the room-to-virtual-partition-to-physical-shard mapping,
+   - shard-local backlog/pressure,
+   - any temporary pause during conservative cutover, and
+   - optional execution-domain placement for shard-local work.
+5. Document clearly:
+   - why room-scoped batches are valid,
+   - why cross-room batches are intentionally not the teaching path,
+   - how unsharded tables would differ, and
+   - that execution domains affect placement/isolation while shard maps define logical ownership.
+
+**Verification**
+
+- End-to-end deterministic simulation tests for the example workload proving room-local writes/readbacks remain correct across hot-shard skew and resharding.
+- Example integration tests proving shard introspection, conservative cutover, restart/reopen, and shard-`0000` compatibility all behave as documented.
+- Example-level equivalence tests proving changing execution-domain placement alters latency/backlog behavior but not room contents, while resharding changes ownership/location without changing logical answers.
+
+---
+
 ## Suggested execution milestones
 
 These are not separate tasks; they are useful “stop and validate” points before opening more parallel work.
@@ -3291,13 +3557,23 @@ At this point the system should additionally support:
 - whole-system deterministic simulation and chaos coverage for pressure spikes, failed flushes, and recovery, and
 - an example app that demonstrates pressure-aware flushing and admission without changing logical answers.
 
+### Milestone O — Opt-in physical sharding and virtual-partition resharding
+Complete: T77–T83
+
+At this point the system should additionally support:
+- opt-in physical per-table sharding with fixed virtual-partition routing and shard `0000` compatibility for unsharded tables,
+- durable shard-map metadata that defines logical ownership separately from execution-domain placement,
+- shard-local commit-log lanes, memtables, flush outputs, maintenance work, and recovery behavior,
+- conservative resharding that moves virtual partitions between physical shards without rehashing keys or rewriting row/column payload bytes,
+- whole-system deterministic simulation and chaos coverage for routing, hot-shard skew, reshard cutover, and mixed sharded/unsharded operation, and
+- a small `chat-rooms-api` example that demonstrates how to build a sharded application around a clear single-entity shard key.
+
 ---
 
 ## Deferred items from the architecture
 
 The following architecture sections are intentionally **not** decomposed into implementation tasks here because they are either explicitly future work or outside the requested scope:
 
-- full physical per-table sharding,
 - mount/protocol adapters for exposing the embedded virtual filesystem outside the process,
 - zero-downtime upgrade handoff library,
 - platform-specific deployment recipes and rollout automation.
