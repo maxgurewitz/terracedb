@@ -12,6 +12,8 @@ thiserror = "2.0.17"
 [dev-dependencies]
 async-trait = "0.1.89"
 futures = "0.3.31"
+serde = { version = "1.0.228", features = ["derive"] }
 terracedb = { path = "../..", features = ["test-support"] }
+terracedb-fuzz = { path = "../terracedb-fuzz" }
 terracedb-simulation = { path = "../terracedb-simulation" }
 turmoil = "0.7.1"

@@ -9,9 +9,14 @@ use std::{
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use terracedb::{
     Key, ReadError, ScanOptions, Table, Transaction, Value,
     test_support::{row_table_config, tiered_test_config},
+};
+use terracedb_fuzz::{
+    GeneratedScenarioHarness, SeedCampaign, assert_seed_variation, decode_json_artifact,
+    encode_json_artifact, run_campaign,
 };
 use terracedb_kafka::{
     DeterministicKafkaBroker, DeterministicKafkaBrokerTraceEvent, DeterministicKafkaFetchOutcome,
@@ -322,6 +327,39 @@ struct KafkaIngressCampaignCapture {
     broker_trace: Vec<DeterministicKafkaBrokerTraceEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KafkaIngressCampaignScenario {
+    seed: u64,
+    partition: u32,
+    mid_delay_polls: u8,
+    final_delay_polls: u8,
+}
+
+struct KafkaIngressCampaignHarness;
+
+impl GeneratedScenarioHarness for KafkaIngressCampaignHarness {
+    type Scenario = KafkaIngressCampaignScenario;
+    type Outcome = KafkaIngressCampaignCapture;
+    type Error = Box<dyn std::error::Error>;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        generate_ingress_campaign(seed)
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        Ok(run_generated_ingress_campaign(scenario)?)
+    }
+}
+
+fn generate_ingress_campaign(seed: u64) -> KafkaIngressCampaignScenario {
+    KafkaIngressCampaignScenario {
+        seed,
+        partition: 10,
+        mid_delay_polls: (seed & 1) as u8,
+        final_delay_polls: ((seed >> 1) & 1) as u8,
+    }
+}
+
 fn campaign_batch(partition: u32, start_offset: u64) -> Vec<KafkaRecord> {
     [start_offset, start_offset + 1]
         .into_iter()
@@ -353,40 +391,46 @@ fn delayed_fetch_plan(
     responses
 }
 
-fn build_campaign_broker(seed: u64, partition: u32) -> DeterministicKafkaBroker {
-    let mid_delay_polls = (seed & 1) as usize;
-    let final_delay_polls = ((seed >> 1) & 1) as usize;
-    let topic_partition = terracedb_kafka::KafkaTopicPartition::new("orders", partition);
+fn build_campaign_broker(scenario: &KafkaIngressCampaignScenario) -> DeterministicKafkaBroker {
+    let topic_partition = terracedb_kafka::KafkaTopicPartition::new("orders", scenario.partition);
     let script = DeterministicKafkaPartitionScript::new(KafkaOffset::new(0), KafkaOffset::new(6))
         .with_fetch_responses(
             KafkaOffset::new(0),
             [DeterministicKafkaFetchResponse::batch(
-                KafkaFetchedBatch::new(campaign_batch(partition, 0), Some(KafkaOffset::new(6))),
+                KafkaFetchedBatch::new(
+                    campaign_batch(scenario.partition, 0),
+                    Some(KafkaOffset::new(6)),
+                ),
             )],
         )
         .with_fetch_responses(
             KafkaOffset::new(2),
-            delayed_fetch_plan(partition, 2, mid_delay_polls),
+            delayed_fetch_plan(scenario.partition, 2, scenario.mid_delay_polls as usize),
         )
         .with_fetch_responses(
             KafkaOffset::new(4),
-            delayed_fetch_plan(partition, 4, final_delay_polls),
+            delayed_fetch_plan(scenario.partition, 4, scenario.final_delay_polls as usize),
         );
     DeterministicKafkaBroker::new([(topic_partition, script)])
 }
 
-fn run_seeded_ingress_campaign(seed: u64) -> turmoil::Result<KafkaIngressCampaignCapture> {
-    SeededSimulationRunner::new(seed).run_with(move |context| async move {
-        let config = tiered_test_config(&format!("/kafka/t91/campaign-{seed}"));
+fn run_generated_ingress_campaign(
+    scenario: KafkaIngressCampaignScenario,
+) -> turmoil::Result<KafkaIngressCampaignCapture> {
+    SeededSimulationRunner::new(scenario.seed).run_with(move |context| {
+        let scenario = scenario.clone();
+        async move {
+        let config = tiered_test_config(&format!("/kafka/t91/campaign-{}", scenario.seed));
         let db = context.open_db(config.clone()).await?;
         let append = db.create_table(row_table_config("append")).await?;
         let mirror = db.create_table(row_table_config("mirror")).await?;
         let progress_table = db.create_table(row_table_config("kafka_progress")).await?;
         let conflict = db.create_table(row_table_config("conflict_guard")).await?;
         let progress_store = TableKafkaProgressStore::new(progress_table);
-        let source = KafkaPartitionSource::new("orders", 10, KafkaBootstrapPolicy::Earliest);
+        let source =
+            KafkaPartitionSource::new("orders", scenario.partition, KafkaBootstrapPolicy::Earliest);
         let claim = KafkaPartitionClaim::new(source.source_id("consumer-g"), source.bootstrap, 11);
-        let broker = build_campaign_broker(seed, 10);
+        let broker = build_campaign_broker(&scenario);
         let observer = RecordingObserver::default();
         let telemetry = RecordingTelemetrySink::default();
         let triggered = Arc::new(AtomicBool::new(false));
@@ -535,6 +579,7 @@ fn run_seeded_ingress_campaign(seed: u64) -> turmoil::Result<KafkaIngressCampaig
             telemetry_snapshots: telemetry.snapshots(),
             broker_trace: broker.trace(),
         })
+    }
     })
 }
 
@@ -1209,57 +1254,63 @@ fn corrupt_progress_row_is_reported_before_broker_fetch() -> turmoil::Result {
 }
 
 #[test]
-fn seeded_kafka_ingress_campaign_is_reproducible() -> turmoil::Result {
-    let seeds = [0x91_10_u64, 0x91_11, 0x91_12];
+fn seeded_kafka_ingress_campaign_is_reproducible() -> Result<(), Box<dyn std::error::Error>> {
+    let harness = KafkaIngressCampaignHarness;
+    let campaign = SeedCampaign::new([0x91_10_u64, 0x91_11, 0x91_12]);
 
-    let first_pass = seeds
-        .into_iter()
-        .map(|seed| run_seeded_ingress_campaign(seed).map(|capture| (seed, capture)))
-        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
-    let second_pass = seeds
-        .into_iter()
-        .map(|seed| run_seeded_ingress_campaign(seed).map(|capture| (seed, capture)))
-        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+    let first_pass = run_campaign(&harness, &campaign)?;
+    let second_pass = run_campaign(&harness, &campaign)?;
+    let encoded = encode_json_artifact(&first_pass[0].scenario)?;
+    let decoded: KafkaIngressCampaignScenario = decode_json_artifact(&encoded)?;
 
     assert_eq!(first_pass, second_pass);
+    assert_eq!(decoded, first_pass[0].scenario);
+    assert!(
+        first_pass.iter().all(|capture| capture.outcome.progress
+            == Some(KafkaSourceProgress::new(KafkaOffset::new(6))))
+    );
     assert!(
         first_pass
-            .values()
-            .all(|capture| capture.progress == Some(KafkaSourceProgress::new(KafkaOffset::new(6))))
+            .iter()
+            .all(|capture| capture.outcome.append_offsets
+                == vec![
+                    KafkaOffset::new(0),
+                    KafkaOffset::new(2),
+                    KafkaOffset::new(4),
+                ])
     );
-    assert!(first_pass.values().all(|capture| capture.append_offsets
-        == vec![
-            KafkaOffset::new(0),
-            KafkaOffset::new(2),
-            KafkaOffset::new(4),
-        ]));
-    assert!(first_pass.values().all(|capture| capture.append_values
-        == vec![
-            b"payload-0".to_vec(),
-            b"payload-2".to_vec(),
-            b"payload-4".to_vec(),
-        ]));
     assert!(
-        first_pass.values().all(
-            |capture| capture.runtime_events.iter().any(|event| matches!(
+        first_pass
+            .iter()
+            .all(|capture| capture.outcome.append_values
+                == vec![
+                    b"payload-0".to_vec(),
+                    b"payload-2".to_vec(),
+                    b"payload-4".to_vec(),
+                ])
+    );
+    assert!(first_pass.iter().all(|capture| {
+        capture.outcome.runtime_events.iter().any(|event| {
+            matches!(
                 event,
                 KafkaRuntimeEvent::SimulationSeam(KafkaSimulationSeam::DuplicateDelivery { .. })
-            ))
-        )
-    );
-    assert!(
-        first_pass.values().all(
-            |capture| capture.runtime_events.iter().any(|event| matches!(
+            )
+        })
+    }));
+    assert!(first_pass.iter().all(|capture| {
+        capture.outcome.runtime_events.iter().any(|event| {
+            matches!(
                 event,
                 KafkaRuntimeEvent::SimulationSeam(KafkaSimulationSeam::RestartFromOffset {
                     next_offset,
                     ..
                 }) if *next_offset == KafkaOffset::new(4)
-            ))
-        )
-    );
-    assert!(first_pass.values().all(|capture| {
+            )
+        })
+    }));
+    assert!(first_pass.iter().all(|capture| {
         capture
+            .outcome
             .runtime_events
             .iter()
             .filter_map(|event| match event {
@@ -1275,7 +1326,7 @@ fn seeded_kafka_ingress_campaign_is_reproducible() -> turmoil::Result {
                 KafkaOffset::new(5),
             ])
     }));
-    assert!(first_pass.values().all(|capture| capture.mirror_rows
+    assert!(first_pass.iter().all(|capture| capture.outcome.mirror_rows
         == vec![
             (b"order-0".to_vec(), b"payload-0".to_vec()),
             (b"order-2".to_vec(), b"payload-2".to_vec()),
@@ -1285,11 +1336,23 @@ fn seeded_kafka_ingress_campaign_is_reproducible() -> turmoil::Result {
 }
 
 #[test]
-fn seeded_kafka_ingress_campaign_changes_shape_for_different_seeds() -> turmoil::Result {
-    let left = run_seeded_ingress_campaign(0x91_20)?;
-    let right = run_seeded_ingress_campaign(0x91_21)?;
+fn seeded_kafka_ingress_campaign_changes_shape_for_different_seeds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (left, right) = assert_seed_variation(
+        &KafkaIngressCampaignHarness,
+        0x91_20,
+        0x91_21,
+        |left, right| {
+            left.scenario != right.scenario
+                || left.outcome.broker_trace != right.outcome.broker_trace
+                || left.outcome.telemetry_snapshots != right.outcome.telemetry_snapshots
+        },
+    )?;
 
-    assert_ne!(left.broker_trace, right.broker_trace);
-    assert_ne!(left.telemetry_snapshots, right.telemetry_snapshots);
+    assert_ne!(left.outcome.broker_trace, right.outcome.broker_trace);
+    assert_ne!(
+        left.outcome.telemetry_snapshots,
+        right.outcome.telemetry_snapshots
+    );
     Ok(())
 }
