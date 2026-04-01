@@ -20,6 +20,15 @@ This document proposes an architecture that fits the current repo:
 7. Treat host-disk hoist/eject as first-class operations with provenance metadata, not as an afterthought.
 8. Make PR creation flow through git-aware export logic, preferably using ephemeral worktrees instead of mutating the user's checkout directly.
 
+## Policy And Domain Separation
+
+Capability policy and execution-domain policy are separate and composable:
+
+- capability policy answers what a sandbox session, reviewed procedure, migration, or MCP adapter is allowed to touch,
+- execution-domain policy answers where the work runs and which resource budgets apply once the capability check has succeeded.
+
+Neither policy layer substitutes for the other. Authority must stay explicit in capability manifests and grants, while placement, concurrency, and budget decisions stay explicit in execution-domain policy.
+
 ## Why This Fits TerraceDB
 
 The existing VFS architecture already describes the intended shape of an embedded sandbox:
@@ -52,6 +61,15 @@ crates/terracedb-sandbox/
   src/host_api.rs
   src/permissions.rs
   src/cache.rs
+```
+
+Reserve shared control-plane crates alongside the sandbox:
+
+```text
+crates/terracedb-capabilities/  capability templates, grants, manifests, presets, execution policy
+crates/terracedb-migrate/       migration plan and migration history contracts
+crates/terracedb-procedures/    reviewed procedure publication and invocation contracts
+crates/terracedb-mcp/           external SSE-based MCP tool/resource and session contracts
 ```
 
 Suggested top-level API:

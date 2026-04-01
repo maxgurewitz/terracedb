@@ -1,10 +1,14 @@
 [workspace]
 members = [
     ".",
+    "crates/terracedb-capabilities",
     "crates/terracedb-bricks",
     "crates/terracedb-debezium",
     "crates/terracedb-kafka",
     "crates/terracedb-http",
+    "crates/terracedb-mcp",
+    "crates/terracedb-migrate",
+    "crates/terracedb-procedures",
     "crates/terracedb-retention",
     "examples/domains-api",
     "examples/order-watch",
