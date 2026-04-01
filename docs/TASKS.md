@@ -3580,12 +3580,12 @@ Finish the simulation-safety pass across introspection surfaces that may still b
 2. Convert the high-value surfaces to published immutable snapshots, subscriptions, or explicit poll/step interfaces, depending on whether tests need sampled state, ordered events, or deterministic progress control.
 3. Remove test-only retry loops that compensate for blocking inspection, and replace them with direct subscription- or progress-driven assertions.
 4. Extend the debugging guide with the preferred simulation-safe observation patterns so future work does not regress into blocking shared-state reads.
-5. Prioritize the next slices that are already identified by the current refactor, in dependency order:
-   - DB progress subscriptions first, so async and simulation tests stop sampling `current_sequence()` / `current_durable_sequence()` directly when they need in-flight visibility.
-   - Remaining resource-manager snapshot callsites next, once the published subscription path is stable enough to replace in-flight polling.
-   - Columnar cache usage observability after that, because the public usage snapshot still assembles live state from locks and should become publish-on-change state.
-   - Failpoint polling helpers, once the event/probe surfaces exist to replace repeated `yield_now()` loops.
-   - Remote cache / prefetch progress events last, so range-cache and dedupe tests can wait on explicit completion instead of ad hoc sleeps.
+5. Prioritize the concluding downstream-adoption slices in dependency order:
+   - workflow-native wait surfaces first, so async and simulation tests stop polling `load_state()` / `load_source_progress()` with sleeps;
+   - projection terminal/frontier waits next, so failure tests stop sleeping before `shutdown()`;
+   - relay and downstream crate migrations after that, using native wait surfaces or backing-table watermark publications instead of row-count polling;
+   - example-app readiness/progress publication next, so example simulations stop depending on server-startup sleeps or projection polling loops; and
+   - simulation-runner startup cleanup last, once the remaining hosts use explicit readiness signals and the driver-side `yield_now()` shim can be deleted.
 
 **Candidate refactor slices**
 

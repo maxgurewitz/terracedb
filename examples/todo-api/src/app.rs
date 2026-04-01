@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -15,8 +15,9 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use terracedb::{
     Clock, CommitError, CompactionStrategy, CreateTableError, Db, DbBuilder, DbConfig, DbSettings,
-    OpenError, S3Location, ScanOptions, StorageError, Table, TableConfig, TableFormat,
-    TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction, TransactionCommitError,
+    OpenError, S3Location, ScanOptions, SequenceNumber, StorageError, Table, TableConfig,
+    TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction,
+    TransactionCommitError,
 };
 use terracedb_projections::{
     ProjectionContext, ProjectionError, ProjectionHandle, ProjectionHandler,
@@ -171,6 +172,7 @@ pub struct TodoAppState {
     db: Db,
     clock: Arc<dyn Clock>,
     tables: TodoTables,
+    recent_todos_frontier: watch::Receiver<BTreeMap<String, SequenceNumber>>,
 }
 
 impl std::fmt::Debug for TodoAppState {
@@ -187,6 +189,7 @@ pub struct TodoApp {
     projection_handle: ProjectionHandle,
     _workflow_runtime: RecurringWorkflowRuntime<WeeklyPlannerWorkflow>,
     workflow_handle: RecurringWorkflowHandle,
+    planner_ready: watch::Receiver<bool>,
     dispatcher_shutdown: watch::Sender<bool>,
     dispatcher_task: JoinHandle<Result<(), TodoAppError>>,
 }
@@ -202,12 +205,6 @@ impl TodoApp {
         options: TodoAppOptions,
     ) -> Result<Self, TodoAppError> {
         let tables = ensure_todo_tables(&db).await?;
-        let state = TodoAppState {
-            db: db.clone(),
-            clock: clock.clone(),
-            tables: tables.clone(),
-        };
-
         let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
         let projection_handle = projection_runtime
             .start_single_source(
@@ -223,6 +220,12 @@ impl TodoApp {
                 .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
             )
             .await?;
+        let state = TodoAppState {
+            db: db.clone(),
+            clock: clock.clone(),
+            tables: tables.clone(),
+            recent_todos_frontier: projection_handle.frontier_receiver(),
+        };
 
         let planner_schedule = options.planner_schedule;
         let workflow_runtime = RecurringWorkflowRuntime::open(
@@ -253,6 +256,18 @@ impl TodoApp {
         )
         .await?;
         let workflow_handle = workflow_runtime.start().await?;
+        let planner_ready_count = planner_schedule.days_per_week as usize;
+        let (planner_ready_tx, planner_ready_rx) = watch::channel(false);
+        let planner_state = state.clone();
+        tokio::spawn(async move {
+            if planner_state
+                .wait_for_todos_count(planner_ready_count)
+                .await
+                .is_ok()
+            {
+                let _ = planner_ready_tx.send(true);
+            }
+        });
 
         let (dispatcher_shutdown, dispatcher_rx) = watch::channel(false);
         let planner_outbox_table = workflow_runtime.tables().outbox_table().clone();
@@ -275,6 +290,7 @@ impl TodoApp {
             projection_handle,
             _workflow_runtime: workflow_runtime,
             workflow_handle,
+            planner_ready: planner_ready_rx,
             dispatcher_shutdown,
             dispatcher_task,
         })
@@ -319,6 +335,10 @@ impl TodoApp {
             .map(|next_fire_at| PlannerState {
                 next_fire_at_ms: next_fire_at.get(),
             }))
+    }
+
+    pub fn planner_ready(&self) -> watch::Receiver<bool> {
+        self.planner_ready.clone()
     }
 
     pub async fn shutdown(self) -> Result<(), TodoAppError> {
@@ -371,7 +391,9 @@ impl TodoAppState {
 
         tx.write_str(&self.tables.todos, &todo_id, &todo)
             .map_err(TodoAppError::from)?;
-        tx.commit().await.map_err(TodoAppError::from)?;
+        let commit_sequence = tx.commit().await.map_err(TodoAppError::from)?;
+        self.wait_for_recent_todos_projection(commit_sequence)
+            .await?;
         Ok(todo)
     }
 
@@ -411,7 +433,9 @@ impl TodoAppState {
 
         tx.write_str(&self.tables.todos, todo_id, &todo)
             .map_err(TodoAppError::from)?;
-        tx.commit().await.map_err(TodoAppError::from)?;
+        let commit_sequence = tx.commit().await.map_err(TodoAppError::from)?;
+        self.wait_for_recent_todos_projection(commit_sequence)
+            .await?;
         Ok(Some(todo))
     }
 
@@ -430,7 +454,9 @@ impl TodoAppState {
         todo.updated_at_ms = self.clock.now().get();
         tx.write_str(&self.tables.todos, todo_id, &todo)
             .map_err(TodoAppError::from)?;
-        tx.commit().await.map_err(TodoAppError::from)?;
+        let commit_sequence = tx.commit().await.map_err(TodoAppError::from)?;
+        self.wait_for_recent_todos_projection(commit_sequence)
+            .await?;
         Ok(Some(todo))
     }
 
@@ -479,6 +505,40 @@ impl TodoAppState {
             }
         }
         Ok(())
+    }
+
+    async fn wait_for_recent_todos_projection(
+        &self,
+        target: SequenceNumber,
+    ) -> Result<(), TodoAppError> {
+        let mut frontier = self.recent_todos_frontier.clone();
+        loop {
+            let current = frontier
+                .borrow()
+                .get(TODOS_TABLE_NAME)
+                .copied()
+                .unwrap_or_default();
+            if current >= target {
+                return Ok(());
+            }
+            frontier
+                .changed()
+                .await
+                .map_err(|_| std::io::Error::other("recent todos projection closed"))?;
+        }
+    }
+
+    async fn wait_for_todos_count(&self, target: usize) -> Result<(), TodoAppError> {
+        let mut durable_wakes = self.db.subscribe_durable(self.tables.todos_raw());
+        loop {
+            if self.list_todos().await?.len() >= target {
+                return Ok(());
+            }
+            durable_wakes
+                .changed()
+                .await
+                .map_err(|_| std::io::Error::other("todos table closed"))?;
+        }
     }
 }
 

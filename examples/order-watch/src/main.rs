@@ -330,32 +330,17 @@ async fn wait_for_state(
     expected: usize,
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let current = runtime
-            .load_state(instance_id)
-            .await?
-            .map(|value| decode_state_count(Some(value)))
-            .unwrap_or(0);
-        if current == expected {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let telemetry = runtime.telemetry_snapshot().await.ok();
-            let attach_mode = telemetry
-                .as_ref()
-                .and_then(|snapshot| snapshot.source_lags.first())
-                .and_then(|lag| lag.attach_mode);
-            let lag = telemetry
-                .as_ref()
-                .and_then(|snapshot| snapshot.source_lags.first())
-                .map(|lag| lag.lag);
-            return Err(Box::new(io::Error::other(format!(
-                "workflow state for {instance_id} did not reach {expected} before timeout (current={current}, attach_mode={attach_mode:?}, lag={lag:?})"
-            ))));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(
+        timeout,
+        runtime.wait_for_state(instance_id, Value::bytes(expected.to_string())),
+    )
+    .await
+    .map_err(|_| {
+        Box::new(io::Error::other(format!(
+            "workflow state for {instance_id} did not reach {expected} before timeout"
+        ))) as Box<dyn Error>
+    })??;
+    Ok(())
 }
 
 async fn wait_for_attach_mode(
@@ -363,23 +348,22 @@ async fn wait_for_attach_mode(
     expected: WorkflowSourceAttachMode,
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let telemetry = runtime.telemetry_snapshot().await?;
-        if telemetry
-            .source_lags
-            .iter()
-            .any(|lag| lag.attach_mode == Some(expected))
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(Box::new(io::Error::other(format!(
-                "workflow did not report attach mode {expected:?} before timeout"
-            ))));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(
+        timeout,
+        runtime.wait_for_telemetry(|telemetry| {
+            telemetry
+                .source_lags
+                .iter()
+                .any(|lag| lag.attach_mode == Some(expected))
+        }),
+    )
+    .await
+    .map_err(|_| {
+        Box::new(io::Error::other(format!(
+            "workflow did not report attach mode {expected:?} before timeout"
+        ))) as Box<dyn Error>
+    })??;
+    Ok(())
 }
 
 async fn collect_attention_orders(

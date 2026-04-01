@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, DbConfig, OutboxEntry, S3Location, ScanOptions,
+    Clock, CommitOptions, CompactionStrategy, Db, DbConfig, OutboxEntry, S3Location, ScanOptions,
     SsdConfig, StorageConfig, Table, TableConfig, TableFormat, TieredDurabilityMode,
     TieredStorageConfig, Transaction, Value,
 };
@@ -108,6 +108,25 @@ async fn count_rows(table: &Table) -> Result<usize, terracedb::ReadError> {
     Ok(count)
 }
 
+async fn observe_row_counts_until(
+    db: &Db,
+    table: &Table,
+    expected: usize,
+) -> Result<Vec<usize>, terracedb::ReadError> {
+    let mut visible = db.subscribe(table);
+    let mut last_seen = visible.current();
+    let mut observed = vec![count_rows(table).await?];
+    while observed.last().copied().unwrap_or_default() != expected {
+        let target = last_seen;
+        last_seen = visible
+            .wait_for(|sequence| sequence > target)
+            .await
+            .expect("relay output subscription should remain open");
+        observed.push(count_rows(table).await?);
+    }
+    Ok(observed)
+}
+
 async fn collect_rows(table: &Table) -> Result<Vec<String>, terracedb::ReadError> {
     let mut rows = table
         .scan(Vec::new(), vec![0xff], ScanOptions::default())
@@ -161,15 +180,7 @@ fn relay_simulation_applies_placeholder_batch_atomically() -> turmoil::Result {
             }
             db.commit(batch, CommitOptions::default()).await?;
 
-            let mut observed = Vec::new();
-            for _ in 0..64 {
-                let count = count_rows(&todos).await?;
-                observed.push(count);
-                if count == 7 {
-                    break;
-                }
-                clock.sleep(Duration::from_millis(1)).await;
-            }
+            let observed = observe_row_counts_until(&db, &todos, 7).await?;
 
             assert_eq!(count_rows(&todos).await?, 7);
             assert_eq!(count_rows(&outbox_table).await?, 0);
@@ -220,15 +231,8 @@ fn relay_simulation_processes_later_batches_after_idle() -> turmoil::Result {
             }
             db.commit(first, CommitOptions::default()).await?;
 
-            for _ in 0..32 {
-                if count_rows(&todos).await? == 2 {
-                    break;
-                }
-                clock.sleep(Duration::from_millis(1)).await;
-            }
+            observe_row_counts_until(&db, &todos, 2).await?;
             assert_eq!(count_rows(&todos).await?, 2);
-
-            clock.sleep(Duration::from_millis(3)).await;
 
             let mut second = db.write_batch();
             for day in 0..3 {
@@ -243,12 +247,7 @@ fn relay_simulation_processes_later_batches_after_idle() -> turmoil::Result {
             }
             db.commit(second, CommitOptions::default()).await?;
 
-            for _ in 0..128 {
-                if count_rows(&todos).await? == 5 {
-                    break;
-                }
-                clock.sleep(Duration::from_millis(1)).await;
-            }
+            observe_row_counts_until(&db, &todos, 5).await?;
 
             assert_eq!(count_rows(&todos).await?, 5);
             assert_eq!(

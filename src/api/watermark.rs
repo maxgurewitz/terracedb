@@ -29,6 +29,26 @@ impl WatermarkReceiver {
         Ok(*self.inner.borrow_and_update())
     }
 
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<SequenceNumber, SubscriptionClosed>
+    where
+        F: FnMut(SequenceNumber) -> bool,
+    {
+        let current = self.current();
+        if predicate(current) {
+            return Ok(current);
+        }
+
+        loop {
+            let current = self.changed().await?;
+            if predicate(current) {
+                return Ok(current);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn has_changed(&self) -> Result<bool, SubscriptionClosed> {
         self.inner.has_changed().map_err(|_| SubscriptionClosed)

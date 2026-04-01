@@ -290,7 +290,7 @@ async fn projection_failpoint_before_commit_preserves_cursor_until_retry() {
     let runtime = ProjectionRuntime::open(db.clone())
         .await
         .expect("open projection runtime");
-    let handle = runtime
+    let mut handle = runtime
         .start_single_source(
             SingleSourceProjection::new(
                 "mirror-with-failpoint",
@@ -315,7 +315,10 @@ async fn projection_failpoint_before_commit_preserves_cursor_until_retry() {
         .await
         .expect("write source value");
     db.flush().await.expect("flush source value");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("projection failure should be observed")
+        .expect("projection should terminate after the injected failpoint");
 
     let error = handle
         .shutdown()
@@ -692,7 +695,7 @@ async fn projection_runtime_surfaces_typed_change_feed_storage_errors() {
     let runtime = ProjectionRuntime::open(db.clone())
         .await
         .expect("open projection runtime");
-    let handle = runtime
+    let mut handle = runtime
         .start_single_source(
             SingleSourceProjection::new(
                 "mirror",
@@ -706,7 +709,10 @@ async fn projection_runtime_surfaces_typed_change_feed_storage_errors() {
         .await
         .expect("start projection");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("projection failure should be observed")
+        .expect("projection should terminate after the injected scan failure");
 
     let error = handle
         .shutdown()

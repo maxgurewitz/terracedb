@@ -425,9 +425,12 @@ async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
     )
     .await
     .expect("open workflow runtime");
-    let handle = runtime.start().await.expect("start workflow runtime");
+    let mut handle = runtime.start().await.expect("start workflow runtime");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("workflow failure should be observed")
+        .expect("workflow should terminate after the injected failpoint");
 
     let error = handle
         .shutdown()
@@ -497,21 +500,13 @@ async fn callback_admission_failpoint_surfaces_storage_error_before_commit() {
     assert_eq!(sequence, terracedb::SequenceNumber::new(1));
 
     let handle = runtime.start().await.expect("start workflow runtime");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if runtime
-                .load_state("order-1")
-                .await
-                .expect("load callback workflow state")
-                == Some(Value::bytes("processed:cb-1"))
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
     .await
-    .expect("workflow should process the retried callback");
+    .expect("workflow should process the retried callback")
+    .expect("workflow state wait should not fail");
 
     handle.shutdown().await.expect("shutdown workflow runtime");
 }
@@ -930,20 +925,9 @@ async fn wait_for_runtime_state<H>(
 where
     H: WorkflowHandler + 'static,
 {
-    let expected = Value::bytes(expected);
-    for _ in 0..200 {
-        if runtime.load_state(instance_id).await? == Some(expected.clone()) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    Err(WorkflowError::Handler {
-        name: runtime.name().to_string(),
-        source: WorkflowHandlerError::new(std::io::Error::other(
-            "timed out waiting for workflow state",
-        )),
-    })
+    runtime
+        .wait_for_state(instance_id, Value::bytes(expected))
+        .await
 }
 
 async fn scan_table_rows(table: &Table) -> Result<Vec<(Vec<u8>, Value)>, terracedb::ReadError> {
@@ -1064,21 +1048,7 @@ where
     H: RecurringWorkflowHandler + 'static,
     P: Fn(&RecurringWorkflowState) -> bool,
 {
-    for _ in 0..100 {
-        if let Some(state) = runtime.load_state().await? {
-            if predicate(&state) {
-                return Ok(state);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    Err(WorkflowError::Handler {
-        name: runtime.name().to_string(),
-        source: WorkflowHandlerError::new(std::io::Error::other(
-            "timed out waiting for recurring state",
-        )),
-    })
+    runtime.wait_for_state(predicate).await
 }
 
 async fn wait_for_simulation_recurring_tick_count<H>(
@@ -1641,8 +1611,11 @@ async fn workflow_fail_closed_recovery_surfaces_snapshot_too_old_without_fast_fo
         .await
         .expect("persist stale workflow source progress");
 
-    let handle = runtime.start().await.expect("start workflow runtime");
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("workflow failure should be observed")
+        .expect("workflow should terminate after the fail-closed recovery");
     let error = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
         .await
         .expect("workflow shutdown should return promptly")
@@ -1709,21 +1682,14 @@ async fn workflow_current_durable_bootstrap_processes_multiple_live_events_for_o
     .expect("open workflow runtime");
     let handle = runtime.start().await.expect("start workflow runtime");
 
-    for _ in 0..100 {
-        let progress = runtime
-            .load_source_progress(&source)
-            .await
-            .expect("load source progress");
-        if progress.origin() == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
-            && progress.resume_point()
-                == (WorkflowSourceResumePoint::DurableSequenceFence {
-                    sequence: durable_before_start,
-                })
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_source_progress(
+            &source,
+            WorkflowSourceProgress::from_durable_sequence(durable_before_start)
+                .with_origin(WorkflowSourceProgressOrigin::CurrentDurableBootstrap),
+        )
+        .await
+        .expect("bootstrap source progress should publish the current-durable fence");
 
     source
         .write(b"live-1:entered".to_vec(), Value::bytes("entered"))
@@ -1734,17 +1700,10 @@ async fn workflow_current_durable_bootstrap_processes_multiple_live_events_for_o
         .await
         .expect("write second live event");
 
-    for _ in 0..100 {
-        if runtime
-            .load_state("live-1")
-            .await
-            .expect("load live workflow state")
-            .is_some_and(|state| decode_count(Some(state)) == 2)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_state("live-1", Value::bytes("2"))
+        .await
+        .expect("live workflow state should publish the final value");
 
     assert_eq!(
         runtime
@@ -1807,30 +1766,26 @@ async fn workflow_current_durable_bootstrap_fails_closed_without_retained_histor
     )
     .await
     .expect("open workflow runtime");
-    let handle = runtime.start().await.expect("start workflow runtime");
+    let mut handle = runtime.start().await.expect("start workflow runtime");
 
-    for _ in 0..100 {
-        let progress = runtime
-            .load_source_progress(&source)
-            .await
-            .expect("load source progress");
-        if progress.origin() == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
-            && progress.resume_point()
-                == (WorkflowSourceResumePoint::DurableSequenceFence {
-                    sequence: durable_before_start,
-                })
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_source_progress(
+            &source,
+            WorkflowSourceProgress::from_durable_sequence(durable_before_start)
+                .with_origin(WorkflowSourceProgressOrigin::CurrentDurableBootstrap),
+        )
+        .await
+        .expect("bootstrap source progress should publish the current-durable fence");
 
     let mut tx = Transaction::begin(&db).await;
     tx.write(&source, b"live-1:entered".to_vec(), Value::bytes("entered"));
     tx.write(&source, b"live-1:exited".to_vec(), Value::bytes("exited"));
     tx.commit().await.expect("commit live event batch");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("workflow failure should be observed")
+        .expect("workflow should terminate after the durable fence falls behind");
 
     let shutdown_error = handle
         .shutdown()
@@ -1892,38 +1847,24 @@ async fn workflow_current_durable_bootstrap_processes_multiple_live_events_in_on
     .expect("open workflow runtime");
     let handle = runtime.start().await.expect("start workflow runtime");
 
-    for _ in 0..100 {
-        let progress = runtime
-            .load_source_progress(&source)
-            .await
-            .expect("load source progress");
-        if progress.origin() == WorkflowSourceProgressOrigin::CurrentDurableBootstrap
-            && progress.resume_point()
-                == (WorkflowSourceResumePoint::DurableSequenceFence {
-                    sequence: durable_before_start,
-                })
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_source_progress(
+            &source,
+            WorkflowSourceProgress::from_durable_sequence(durable_before_start)
+                .with_origin(WorkflowSourceProgressOrigin::CurrentDurableBootstrap),
+        )
+        .await
+        .expect("bootstrap source progress should publish the current-durable fence");
 
     let mut tx = Transaction::begin(&db).await;
     tx.write(&source, b"live-1:entered".to_vec(), Value::bytes("entered"));
     tx.write(&source, b"live-1:exited".to_vec(), Value::bytes("exited"));
     tx.commit().await.expect("commit live event batch");
 
-    for _ in 0..100 {
-        if runtime
-            .load_state("live-1")
-            .await
-            .expect("load live workflow state")
-            .is_some_and(|state| decode_count(Some(state)) == 2)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_state("live-1", Value::bytes("2"))
+        .await
+        .expect("live workflow state should publish the final value");
 
     assert_eq!(
         runtime
@@ -1966,6 +1907,7 @@ async fn workflow_fast_forward_recovery_skips_stale_backlog_and_processes_new_ev
         .write(b"skipped-2:created".to_vec(), Value::bytes("created"))
         .await
         .expect("write retained stale source event");
+    let durable_before_start = db.current_durable_sequence();
 
     let runtime = WorkflowRuntime::open(
         db,
@@ -1998,18 +1940,14 @@ async fn workflow_fast_forward_recovery_skips_stale_backlog_and_processes_new_ev
         .expect("persist stale workflow source progress");
 
     let handle = runtime.start().await.expect("start workflow runtime");
-    for _ in 0..100 {
-        if runtime
-            .load_source_progress(&source)
-            .await
-            .expect("load fast-forwarded source progress")
-            .origin()
-            == WorkflowSourceProgressOrigin::FastForwardToCurrentDurable
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_source_progress(
+            &source,
+            WorkflowSourceProgress::from_durable_sequence(durable_before_start)
+                .with_origin(WorkflowSourceProgressOrigin::FastForwardToCurrentDurable),
+        )
+        .await
+        .expect("fast-forward source progress should publish the durable fence");
 
     assert_eq!(
         runtime
@@ -2105,8 +2043,11 @@ async fn workflow_non_replayable_sources_cannot_opt_into_replay_from_history_rec
         .await
         .expect("persist stale workflow source progress");
 
-    let handle = runtime.start().await.expect("start workflow runtime");
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("workflow failure should be observed")
+        .expect("workflow should terminate after the injected change-feed error");
     let error = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
         .await
         .expect("workflow shutdown should return promptly")
@@ -2766,18 +2707,14 @@ async fn workflow_checkpoint_bootstrap_restores_checkpointed_state_and_retags_pr
         .await
         .expect("start bootstrap-restore runtime");
 
-    for _ in 0..100 {
-        if restored_runtime
-            .load_source_progress(&reopened_source)
-            .await
-            .expect("load source progress after bootstrap restore")
-            .origin()
-            == WorkflowSourceProgressOrigin::CheckpointRestore
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    restored_runtime
+        .wait_for_state("order-1", Value::bytes("event:order-1:created"))
+        .await
+        .expect("bootstrap restore should restore checkpointed workflow state");
+    let telemetry = restored_runtime
+        .telemetry_snapshot()
+        .await
+        .expect("capture restored telemetry");
 
     assert_eq!(
         restored_runtime
@@ -2805,10 +2742,6 @@ async fn workflow_checkpoint_bootstrap_restores_checkpointed_state_and_retags_pr
         "checkpoint bootstrap should restore the durable timer schedule",
     );
 
-    let telemetry = restored_runtime
-        .telemetry_snapshot()
-        .await
-        .expect("capture restored telemetry");
     assert_eq!(
         telemetry.source_lags[0].progress_origin,
         WorkflowSourceProgressOrigin::CheckpointRestore,
@@ -2818,10 +2751,7 @@ async fn workflow_checkpoint_bootstrap_restores_checkpointed_state_and_retags_pr
         Some(WorkflowSourceAttachMode::Historical),
     );
 
-    handle
-        .abort()
-        .await
-        .expect("abort bootstrap-restore runtime");
+    drop(handle);
 }
 
 #[tokio::test]
@@ -3174,9 +3104,12 @@ async fn workflow_runtime_surfaces_change_feed_scan_failures_without_panicking()
     )
     .await
     .expect("open workflow runtime");
-    let handle = runtime.start().await.expect("start workflow runtime");
+    let mut handle = runtime.start().await.expect("start workflow runtime");
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("workflow failure should be observed")
+        .expect("workflow should terminate after the injected change-feed error");
 
     match tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
         .await

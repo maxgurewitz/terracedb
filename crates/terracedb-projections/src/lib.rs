@@ -1520,6 +1520,10 @@ impl ProjectionHandle {
         self.frontier.borrow().clone()
     }
 
+    pub fn frontier_receiver(&self) -> watch::Receiver<BTreeMap<String, SequenceNumber>> {
+        self.frontier.clone()
+    }
+
     pub async fn wait_for_watermark(
         &mut self,
         target: SequenceNumber,
@@ -1533,6 +1537,22 @@ impl ProjectionHandle {
         I: IntoIterator<Item = (&'a Table, SequenceNumber)>,
     {
         self.runtime.wait_for_frontier(&self.name, targets).await
+    }
+
+    pub async fn wait_until_terminal(&mut self) -> Result<(), ProjectionError> {
+        if !matches!(self.status.borrow().clone(), ProjectionTaskStatus::Running) {
+            return Ok(());
+        }
+
+        loop {
+            self.status
+                .changed()
+                .await
+                .map_err(|_| ProjectionError::SubscriptionClosed)?;
+            if !matches!(self.status.borrow().clone(), ProjectionTaskStatus::Running) {
+                return Ok(());
+            }
+        }
     }
 
     pub async fn shutdown(self) -> Result<(), ProjectionError> {

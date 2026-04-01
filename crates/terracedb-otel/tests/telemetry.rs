@@ -322,15 +322,10 @@ async fn wait_for_workflow_state<H>(
 where
     H: WorkflowHandler + 'static,
 {
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if runtime.load_state(instance_id).await.ok() == Some(Some(Value::bytes(expected))) {
-                return;
-            }
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state(instance_id, Value::bytes(expected)),
+    )
     .await;
     if result.is_err() {
         let snapshot = runtime
@@ -343,6 +338,7 @@ where
         ))
         .into());
     }
+    result.expect("timeout should be handled above")?;
     Ok(())
 }
 

@@ -469,42 +469,28 @@ async fn wait_for_state(
     instance_id: &str,
     expected: usize,
 ) -> Result<(), WorkflowError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let current = runtime
-            .load_state(instance_id)
-            .await?
-            .map(|value| decode_state_count(Some(value)))
-            .unwrap_or(0);
-        if current == expected {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("workflow state did not reach {expected} before timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_state(instance_id, Value::bytes(expected.to_string()))
+        .await
+        .map(|_| ())
 }
 
 async fn wait_for_attach_mode(
     runtime: &WorkflowRuntime<AlertWorkflowHandler>,
     expected: WorkflowSourceAttachMode,
 ) -> Result<(), WorkflowError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let telemetry = runtime.telemetry_snapshot().await?;
-        if telemetry
-            .source_lags
-            .iter()
-            .any(|lag| lag.attach_mode == Some(expected))
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("workflow did not report attach mode {expected:?} before timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_telemetry(|telemetry| {
+            telemetry
+                .source_lags
+                .iter()
+                .any(|lag| lag.attach_mode == Some(expected))
+        }),
+    )
+    .await
+    .expect("workflow did not report attach mode before timeout")?;
+    Ok(())
 }
 
 async fn collect_attention_orders(

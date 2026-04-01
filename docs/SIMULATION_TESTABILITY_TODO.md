@@ -43,6 +43,19 @@ simulation probes.
   - event streams when the tests care about ordered transitions,
   - published snapshots when they care about the latest state, and
   - poll/step helpers only when the test is asserting background progress.
+- [x] Add workflow-native wait surfaces so async tests stop polling
+  `load_state` / `load_source_progress` with sleeps:
+  - `WorkflowRuntime::wait_for_state(...)`
+  - `WorkflowRuntime::wait_for_source_progress(...)`
+  - `WorkflowRuntime::wait_for_telemetry(...)`
+  - `RecurringWorkflowRuntime::wait_for_state(...)`
+- [x] Expose projection-runtime terminal/frontier observation directly so
+  failure tests can wait on the published runtime state instead of sleeping
+  before shutdown.
+- [x] Migrate downstream crates (`terracedb-debezium`, `terracedb-otel`,
+  `terracedb-relays`) onto those observation surfaces or DB watermark waits.
+- [x] Migrate example-app simulations onto explicit readiness/progress signals
+  so they no longer depend on startup sleeps or projection polling loops.
 - [x] Remove old blocking helpers once the new surface is available; do not
   keep compatibility shims in the test path.
 - [x] Extend the debugging guide with the preferred simulation-safe
@@ -70,3 +83,7 @@ simulation probes.
 - [x] Include `direct_backlog()`-style lock-backed helper reads here only when
   they are truly progress probes, not when a published subscription can carry
   the same signal.
+- [x] Remove the driver-side startup `yield_now()` shim from the simulation
+  runner once the remaining hosts/tests use explicit readiness signals.
+- [x] Leave only deliberate scenario-time advances or probe internals as the
+  remaining uses of `sleep(...)` / `yield_now()` in tests and examples.

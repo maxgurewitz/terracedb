@@ -52,6 +52,16 @@ async fn wait_for_done(mut done: watch::Receiver<bool>) -> io::Result<()> {
     Ok(())
 }
 
+async fn wait_for_ready(mut ready: watch::Receiver<bool>) -> io::Result<()> {
+    if !*ready.borrow() {
+        ready
+            .changed()
+            .await
+            .map_err(|_| io::Error::other("simulation server did not become ready"))?;
+    }
+    Ok(())
+}
+
 #[test]
 fn simulated_http_happy_path_supports_create_read_and_list() -> turmoil::Result {
     let store = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
@@ -97,6 +107,7 @@ fn simulated_http_happy_path_supports_create_read_and_list() -> turmoil::Result 
             }
         }
     });
+    let ready = server.ready();
     let client = SimulatedHttpClient::new(SERVER_HOST, SERVER_PORT);
 
     SeededSimulationRunner::new(0x3205)
@@ -106,8 +117,9 @@ fn simulated_http_happy_path_supports_create_read_and_list() -> turmoil::Result 
         .with_host(SimulationHost::new(CLIENT_HOST, move || {
             let client = client.clone();
             let done_tx = done_tx.clone();
+            let ready = ready.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                wait_for_ready(ready).await?;
 
                 let create = TodoItem {
                     id: "1".to_string(),
@@ -161,6 +173,7 @@ fn simulated_http_fault_injection_handles_partitions_and_delayed_responses() -> 
             )
         },
     );
+    let ready = server.ready();
     let client = SimulatedHttpClient::new(SERVER_HOST, SERVER_PORT)
         .with_request_timeout(Duration::from_millis(5))
         .with_connect_retries(50, Duration::from_millis(1));
@@ -172,7 +185,9 @@ fn simulated_http_fault_injection_handles_partitions_and_delayed_responses() -> 
         .with_host(SimulationHost::new(CLIENT_HOST, move || {
             let client = client.clone();
             let done_tx = done_tx.clone();
+            let ready = ready.clone();
             async move {
+                wait_for_ready(ready).await?;
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 let first_error = client
                     .request_json::<Ack, Ack>(Method::GET, "/slow", None)
@@ -235,6 +250,7 @@ fn simulated_http_fault_injection_handles_dropped_connections_restart_and_retry(
             )
         },
     );
+    let ready = first_server.ready();
 
     let host = SimulationHost::new(SERVER_HOST, move || {
         let first_server = first_server.clone();
@@ -258,8 +274,9 @@ fn simulated_http_fault_injection_handles_dropped_connections_restart_and_retry(
             let done_tx = done_tx.clone();
             let first_shutdown_tx = first_shutdown_tx.clone();
             let second_shutdown_tx = second_shutdown_tx.clone();
+            let ready = ready.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                wait_for_ready(ready).await?;
                 let request = Request::builder()
                     .method(Method::GET)
                     .uri("/retry")
@@ -302,6 +319,7 @@ fn axum_adapter_serves_routes_through_the_same_http_harness() -> turmoil::Result
         }),
     );
     let server = axum_router_server_with_shutdown(SERVER_HOST, SERVER_PORT, router, shutdown_rx);
+    let ready = server.ready();
     let client = SimulatedHttpClient::new(SERVER_HOST, SERVER_PORT);
 
     SeededSimulationRunner::new(0x3208)
@@ -311,8 +329,9 @@ fn axum_adapter_serves_routes_through_the_same_http_harness() -> turmoil::Result
         .with_host(SimulationHost::new(CLIENT_HOST, move || {
             let client = client.clone();
             let done_tx = done_tx.clone();
+            let ready = ready.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                wait_for_ready(ready).await?;
                 let (status, ack): (StatusCode, Ack) = client
                     .request_json::<Ack, Ack>(Method::GET, "/ping", None)
                     .await?;
@@ -359,6 +378,7 @@ fn run_trace_scenario(seed: u64) -> turmoil::Result<ReproOutcome> {
             )
         },
     );
+    let ready = server.ready();
     let client = SimulatedHttpClient::new(SERVER_HOST, SERVER_PORT);
     let client_host_client = client.clone();
 
@@ -369,8 +389,9 @@ fn run_trace_scenario(seed: u64) -> turmoil::Result<ReproOutcome> {
         .with_host(SimulationHost::new(CLIENT_HOST, move || {
             let client = client_host_client.clone();
             let done_tx = done_tx.clone();
+            let ready = ready.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                wait_for_ready(ready).await?;
                 let (status, ack): (StatusCode, Ack) = client
                     .request_json::<Ack, Ack>(Method::GET, "/trace", None)
                     .await?;

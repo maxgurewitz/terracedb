@@ -140,6 +140,38 @@ use an event stream instead of a latest-state snapshot.
   Use these when the semantic question is monotonic publication order for a
   table rather than a whole-DB status summary.
 
+### Use Runtime Wait Surfaces For Workflow And Projection Progress
+
+When the runtime already owns the semantic concept you care about, prefer its
+wait surface over ad hoc table polling:
+
+- `WorkflowRuntime::wait_for_state(...)`
+  Use this when a workflow test cares about a particular instance state value.
+- `WorkflowRuntime::wait_for_source_progress(...)`
+  Use this when a workflow test cares about bootstrap or recovery progress
+  rather than the final state row.
+- `WorkflowRuntime::wait_for_telemetry(...)`
+  Use this when the assertion is phrased in terms of attach mode, lag, or other
+  published workflow telemetry.
+- `RecurringWorkflowRuntime::wait_for_state(...)`
+  Use this for recurring tick-count and next-fire assertions.
+- `ProjectionHandle::wait_for_watermark(...)` / `wait_for_sources(...)`
+  Use these for projection catch-up assertions.
+- `ProjectionHandle::wait_until_terminal()` and `WorkflowHandle::wait_until_terminal()`
+  Use these for fail-closed and failpoint cases instead of sleeping and then
+  calling `shutdown()`.
+
+If a library does not yet expose a native wait surface, wait on the backing DB
+publication channel that owns the truth:
+
+- use table watermark subscriptions for relay and projection outputs; and
+- use `TerracedbSimulationHarness::wait_for_change(...)` /
+  `wait_for_visible(...)` when a simulation already has a harness and the
+  product surface does not yet expose a narrower publisher.
+
+The rule is the same either way: react to a real publication edge, not to
+elapsed simulated time.
+
 ### Use Bounded Progress Helpers For Liveness
 
 Some tests are not about state at all; they are about whether background work
@@ -154,6 +186,16 @@ progress helper over sleeps or incidental yields:
 If a test has to call `tokio::task::yield_now()` in a loop to see whether
 something happened, treat that as a smell. Usually the right fix is to expose a
 published snapshot, an event stream, or a bounded progress helper instead.
+
+### Make Example Simulations Explicit About Readiness
+
+Example-app simulations should follow the same rules as library tests:
+
+1. Publish a ready signal once the server or runtime can actually answer work.
+2. Have the client host wait on that signal before issuing requests.
+3. Use app/runtime progress signals for projections, planners, or workflows.
+4. Reserve `sleep(...)` only for deliberate scenario time travel, such as
+   advancing a recurring schedule or modeling a slow response.
 
 ### Keep Synchronous Snapshots For Quiescent Reads
 
