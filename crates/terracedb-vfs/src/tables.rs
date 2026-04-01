@@ -48,6 +48,7 @@ impl ReservedTableDescriptor {
                 CompactionStrategy::Leveled
             },
             schema: None,
+            sharding: Default::default(),
             metadata,
         }
     }

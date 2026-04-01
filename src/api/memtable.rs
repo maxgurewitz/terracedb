@@ -1761,6 +1761,7 @@ impl PersistedCatalogEntry {
                 history_retention_sequences: table.config.history_retention_sequences,
                 compaction_strategy: table.config.compaction_strategy,
                 schema: table.config.schema.clone(),
+                sharding: table.config.sharding.clone(),
                 metadata: table.config.metadata.clone(),
             },
         }
@@ -1779,6 +1780,7 @@ impl PersistedCatalogEntry {
                 history_retention_sequences: self.config.history_retention_sequences,
                 compaction_strategy: self.config.compaction_strategy,
                 schema: self.config.schema,
+                sharding: self.config.sharding,
                 metadata: self.config.metadata,
             },
         }

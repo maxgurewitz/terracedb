@@ -16,6 +16,7 @@ mod metadata_flatbuffers;
 pub mod pressure;
 pub mod remote;
 pub mod scheduler;
+pub mod sharding;
 #[cfg(test)]
 #[allow(dead_code)]
 mod simulation;
@@ -162,6 +163,14 @@ pub use scheduler::{
     RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler, SchedulerIdleWaitResult,
     SchedulerObservabilitySnapshot, SchedulerObservabilitySubscription, SchedulerProgressSnapshot,
     SchedulerProgressStepResult, TableStats, ThrottleDecision,
+};
+pub use sharding::{
+    BatchShardLocalityError, HashShardingConfig, KeyShardRoute, PhysicalShardId,
+    ReshardPartitionMove, ReshardPlanSkeleton, ShardAssignment, ShardChangeCursor,
+    ShardCommitLaneId, ShardExecutionPlacement, ShardHashAlgorithm, ShardMapRevision,
+    ShardMemtableOwner, ShardOpenRequest, ShardSstableOwnership, ShardingConfig, ShardingError,
+    TableBatchShardingPlan, TableShardingState, VirtualPartitionCoverage, VirtualPartitionId,
+    VirtualPartitionRange, WriteBatchShardingError, WriteBatchShardingPlan,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{

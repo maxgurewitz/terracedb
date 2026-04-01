@@ -16,6 +16,18 @@ impl Table {
         self.id
     }
 
+    pub fn sharding_state(&self) -> Option<crate::TableShardingState> {
+        let stored = self.db.resolve_stored_table(self)?;
+        Some(
+            crate::TableShardingState::new(stored.id, &stored.config)
+                .expect("stored table sharding configs should already be validated"),
+        )
+    }
+
+    pub fn route_key(&self, key: &[u8]) -> Option<crate::KeyShardRoute> {
+        Some(self.sharding_state()?.route_key(key))
+    }
+
     pub async fn read(&self, key: Key) -> Result<Option<Value>, ReadError> {
         self.read_at(key, self.db.current_sequence()).await
     }

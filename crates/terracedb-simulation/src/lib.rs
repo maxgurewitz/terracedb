@@ -1327,6 +1327,7 @@ impl SimulationTableSpec {
             history_retention_sequences: self.history_retention_sequences,
             compaction_strategy: self.compaction_strategy,
             schema: None,
+            sharding: Default::default(),
             metadata: Default::default(),
         }
     }

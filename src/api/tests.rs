@@ -913,6 +913,7 @@ fn merge_columnar_table_config(
                 default: Some(FieldValue::Int64(0)),
             }],
         }),
+        sharding: Default::default(),
         metadata: BTreeMap::from([("mode".to_string(), json!("merge"))]),
     }
 }
@@ -1062,6 +1063,7 @@ fn row_table_config_with_strategy(
         history_retention_sequences: None,
         compaction_strategy,
         schema: None,
+        sharding: Default::default(),
         metadata: BTreeMap::from([
             ("priority".to_string(), json!("high")),
             ("tenant".to_string(), json!("alpha")),
@@ -1104,6 +1106,7 @@ fn columnar_table_config(name: &str) -> TableConfig {
                 },
             ],
         }),
+        sharding: Default::default(),
         metadata: BTreeMap::from([
             ("retention".to_string(), json!("30d")),
             ("schedule_group".to_string(), json!("metrics")),
@@ -1161,6 +1164,7 @@ fn columnar_all_types_table_config(name: &str) -> TableConfig {
                 },
             ],
         }),
+        sharding: Default::default(),
         metadata: BTreeMap::from([("retention".to_string(), json!("16h"))]),
     }
 }
@@ -1625,6 +1629,7 @@ fn durable_format_tables() -> BTreeMap<String, StoredTable> {
                     history_retention_sequences: Some(128),
                     compaction_strategy: CompactionStrategy::Leveled,
                     schema: None,
+                    sharding: Default::default(),
                     metadata: [
                         ("owner".to_string(), json!("local-dev")),
                         ("stream".to_string(), json!("event-log")),
@@ -1648,6 +1653,7 @@ fn durable_format_tables() -> BTreeMap<String, StoredTable> {
                     history_retention_sequences: Some(512),
                     compaction_strategy: CompactionStrategy::Tiered,
                     schema: Some(schema),
+                    sharding: Default::default(),
                     metadata: [
                         ("owner".to_string(), json!("analytics")),
                         ("retention".to_string(), json!("durable")),

@@ -429,6 +429,9 @@ impl Db {
                 })?;
             }
         }
+        crate::sharding::validate_user_table_metadata(&config.metadata)
+            .and_then(|_| config.sharding.validate())
+            .map_err(|error| CreateTableError::InvalidConfig(error.to_string()))?;
         Self::validate_hybrid_table_features(config)
             .map_err(|error| CreateTableError::InvalidConfig(error.message().to_string()))?;
 
@@ -612,6 +615,7 @@ impl Db {
             && left.history_retention_sequences == right.history_retention_sequences
             && left.compaction_strategy == right.compaction_strategy
             && left.schema == right.schema
+            && left.sharding == right.sharding
             && left.metadata == right.metadata
     }
 
@@ -952,11 +956,31 @@ impl Db {
     }
 
     pub(super) fn local_sstable_path(root: &str, table_id: TableId, local_id: &str) -> String {
+        Self::local_sstable_path_in_shard(
+            root,
+            table_id,
+            crate::PhysicalShardId::UNSHARDED,
+            local_id,
+        )
+    }
+
+    pub(super) fn local_sstable_path_in_shard(
+        root: &str,
+        table_id: TableId,
+        shard: crate::PhysicalShardId,
+        local_id: &str,
+    ) -> String {
+        let shard_dir = if shard == crate::PhysicalShardId::UNSHARDED {
+            LOCAL_SSTABLE_SHARD_DIR.to_string()
+        } else {
+            shard.as_dir_name()
+        };
         Self::join_fs_path(
             root,
             &format!(
-                "{LOCAL_SSTABLE_RELATIVE_DIR}/table-{:06}/{LOCAL_SSTABLE_SHARD_DIR}/{local_id}.sst",
-                table_id.get()
+                "{LOCAL_SSTABLE_RELATIVE_DIR}/table-{:06}/{}/{local_id}.sst",
+                table_id.get(),
+                shard_dir
             ),
         )
     }
@@ -1535,7 +1559,21 @@ impl Db {
         table_id: TableId,
         local_id: &str,
     ) -> String {
-        Self::remote_object_layout(config).backup_sstable(table_id, 0, local_id)
+        Self::remote_sstable_key_in_shard(
+            config,
+            table_id,
+            crate::PhysicalShardId::UNSHARDED,
+            local_id,
+        )
+    }
+
+    pub(super) fn remote_sstable_key_in_shard(
+        config: &S3PrimaryStorageConfig,
+        table_id: TableId,
+        shard: crate::PhysicalShardId,
+        local_id: &str,
+    ) -> String {
+        Self::remote_object_layout(config).backup_sstable_in_shard(table_id, shard, local_id)
     }
 
     pub(super) async fn load_remote_manifest(
