@@ -53,7 +53,7 @@ This repository includes a shared pre-commit script at `scripts/pre-commit.sh`.
 The Git hook at `.githooks/pre-commit` calls that script, which runs:
 
 - `scripts/check-durable-format-fixtures.sh`
-- `cargo test --workspace`
+- `cargo nextest run --workspace`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 

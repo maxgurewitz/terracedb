@@ -4344,108 +4344,144 @@ fn simulation_db_progress_subscription_tracks_visible_then_durable_frontiers() -
 }
 
 #[test]
-fn whole_system_execution_domain_simulation_seed_campaign_is_reproducible() -> turmoil::Result {
+fn whole_system_execution_domain_simulation_seed_0x6901_is_reproducible() -> turmoil::Result {
     let first = run_simulated_whole_system_execution_domain_seed(0x6901)?;
-    let first_replay = run_simulated_whole_system_execution_domain_seed(0x6901)?;
-    let second = run_simulated_whole_system_execution_domain_seed(0x6902)?;
+    let replay = run_simulated_whole_system_execution_domain_seed(0x6901)?;
 
-    assert_eq!(first, first_replay);
-
-    assert!(
-        first.database_order != second.database_order
-            || first.durable_rows_by_db != second.durable_rows_by_db
-            || first.oracle_cpu_millis_by_domain != second.oracle_cpu_millis_by_domain,
-        "different seeds should change the whole-system simulation shape"
-    );
-
-    for (seed, outcome) in [(0x6901_u64, &first), (0x6902_u64, &second)] {
-        assert!(
-            outcome.observed_budget_publication,
-            "seed {seed:#x} should publish tightened mutable budgets through the resource-manager subscription"
-        );
-        assert!(
-            outcome.observed_backlog_publication,
-            "seed {seed:#x} should publish warehouse backlog through the resource-manager subscription"
-        );
-        assert!(
-            outcome.observed_analytics_throttle_publication,
-            "seed {seed:#x} should publish analytics throttling through scheduler observability"
-        );
-        assert!(
-            outcome.admissions["warehouse-shared-overflow-blocked"],
-            "seed {seed:#x} should block extra shard-ready background work after tightening budgets"
-        );
-        assert!(
-            outcome.admissions["primary-control-plane"],
-            "seed {seed:#x} should keep the protected control-plane domain progressing"
-        );
-        assert_eq!(
-            outcome.mutable_budget_by_domain["process/dbs/analytics/foreground"],
-            Some(64)
-        );
-        assert_eq!(
-            outcome.background_slots_by_domain["process/shards/warehouse/background"],
-            Some(1)
-        );
-        assert_eq!(
-            outcome.backlog_items_by_domain["process/shards/warehouse/background"],
-            2
-        );
-        assert_eq!(
-            outcome.backlog_bytes_by_domain["process/shards/warehouse/background"],
-            256
-        );
-        assert!(
-            outcome
-                .throttled_writes_by_domain
-                .contains_key("process/dbs/analytics/foreground"),
-            "seed {seed:#x} should observe analytics foreground throttling after the mutable budget tightens"
-        );
-        for db_name in ["primary", "analytics", "warehouse"] {
-            let transitions = outcome
-                .progress_transitions_by_db
-                .get(db_name)
-                .expect("progress transitions for campaign database");
-            assert!(
-                !transitions.is_empty(),
-                "seed {seed:#x} should publish DB progress transitions for {db_name}"
-            );
-            for transition in transitions {
-                assert!(
-                    transition.reserved_sequence >= transition.current_sequence,
-                    "seed {seed:#x} should keep reserved >= current for {db_name}: {transition:?}"
-                );
-                assert!(
-                    transition.current_sequence >= transition.durable_sequence,
-                    "seed {seed:#x} should keep current >= durable for {db_name}: {transition:?}"
-                );
-            }
-            for window in transitions.windows(2) {
-                let previous = &window[0];
-                let next = &window[1];
-                assert!(
-                    next.reserved_sequence >= previous.reserved_sequence,
-                    "seed {seed:#x} should publish monotonic reserved progress for {db_name}: {previous:?} -> {next:?}"
-                );
-                assert!(
-                    next.current_sequence >= previous.current_sequence,
-                    "seed {seed:#x} should publish monotonic current progress for {db_name}: {previous:?} -> {next:?}"
-                );
-                assert!(
-                    next.durable_sequence >= previous.durable_sequence,
-                    "seed {seed:#x} should publish monotonic durable progress for {db_name}: {previous:?} -> {next:?}"
-                );
-            }
-        }
-        assert!(
-            outcome.progress_transitions_by_db["analytics"]
-                .iter()
-                .any(|transition| transition.current_sequence > transition.durable_sequence),
-            "seed {seed:#x} should publish at least one analytics in-flight frontier before recovery"
-        );
-    }
+    assert_eq!(first, replay);
+    assert_whole_system_execution_domain_simulation_outcome(0x6901, &first);
 
     Ok(())
+}
+
+#[test]
+fn whole_system_execution_domain_simulation_seed_0x6902_matches_expected_campaign_shape()
+-> turmoil::Result {
+    let outcome = run_simulated_whole_system_execution_domain_seed(0x6902)?;
+    assert_whole_system_execution_domain_simulation_outcome(0x6902, &outcome);
+
+    Ok(())
+}
+
+fn expected_whole_system_execution_domain_database_order(seed: u64) -> &'static [&'static str] {
+    match seed {
+        0x6901 => &[
+            "analytics",
+            "analytics",
+            "analytics",
+            "analytics",
+            "warehouse",
+            "warehouse",
+        ],
+        0x6902 => &[
+            "warehouse",
+            "analytics",
+            "primary",
+            "analytics",
+            "primary",
+            "analytics",
+        ],
+        _ => panic!("unexpected whole-system simulation seed: {seed:#x}"),
+    }
+}
+
+fn assert_whole_system_execution_domain_simulation_outcome(
+    seed: u64,
+    outcome: &WholeSystemSimulationCampaignOutcome,
+) {
+    let expected_order = expected_whole_system_execution_domain_database_order(seed)
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcome.database_order, expected_order,
+        "seed {seed:#x} should preserve the scripted whole-system campaign order"
+    );
+
+    assert!(
+        outcome.observed_budget_publication,
+        "seed {seed:#x} should publish tightened mutable budgets through the resource-manager subscription"
+    );
+    assert!(
+        outcome.observed_backlog_publication,
+        "seed {seed:#x} should publish warehouse backlog through the resource-manager subscription"
+    );
+    assert!(
+        outcome.observed_analytics_throttle_publication,
+        "seed {seed:#x} should publish analytics throttling through scheduler observability"
+    );
+    assert!(
+        outcome.admissions["warehouse-shared-overflow-blocked"],
+        "seed {seed:#x} should block extra shard-ready background work after tightening budgets"
+    );
+    assert!(
+        outcome.admissions["primary-control-plane"],
+        "seed {seed:#x} should keep the protected control-plane domain progressing"
+    );
+    assert_eq!(
+        outcome.mutable_budget_by_domain["process/dbs/analytics/foreground"],
+        Some(64)
+    );
+    assert_eq!(
+        outcome.background_slots_by_domain["process/shards/warehouse/background"],
+        Some(1)
+    );
+    assert_eq!(
+        outcome.backlog_items_by_domain["process/shards/warehouse/background"],
+        2
+    );
+    assert_eq!(
+        outcome.backlog_bytes_by_domain["process/shards/warehouse/background"],
+        256
+    );
+    assert!(
+        outcome
+            .throttled_writes_by_domain
+            .contains_key("process/dbs/analytics/foreground"),
+        "seed {seed:#x} should observe analytics foreground throttling after the mutable budget tightens"
+    );
+    for db_name in ["primary", "analytics", "warehouse"] {
+        let transitions = outcome
+            .progress_transitions_by_db
+            .get(db_name)
+            .expect("progress transitions for campaign database");
+        assert!(
+            !transitions.is_empty(),
+            "seed {seed:#x} should publish DB progress transitions for {db_name}"
+        );
+        for transition in transitions {
+            assert!(
+                transition.reserved_sequence >= transition.current_sequence,
+                "seed {seed:#x} should keep reserved >= current for {db_name}: {transition:?}"
+            );
+            assert!(
+                transition.current_sequence >= transition.durable_sequence,
+                "seed {seed:#x} should keep current >= durable for {db_name}: {transition:?}"
+            );
+        }
+        for window in transitions.windows(2) {
+            let previous = &window[0];
+            let next = &window[1];
+            assert!(
+                next.reserved_sequence >= previous.reserved_sequence,
+                "seed {seed:#x} should publish monotonic reserved progress for {db_name}: {previous:?} -> {next:?}"
+            );
+            assert!(
+                next.current_sequence >= previous.current_sequence,
+                "seed {seed:#x} should publish monotonic current progress for {db_name}: {previous:?} -> {next:?}"
+            );
+            assert!(
+                next.durable_sequence >= previous.durable_sequence,
+                "seed {seed:#x} should publish monotonic durable progress for {db_name}: {previous:?} -> {next:?}"
+            );
+        }
+    }
+    assert!(
+        outcome.progress_transitions_by_db["analytics"]
+            .iter()
+            .any(|transition| transition.current_sequence > transition.durable_sequence),
+        "seed {seed:#x} should publish at least one analytics in-flight frontier before recovery"
+    );
 }
 
 #[test]
