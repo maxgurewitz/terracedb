@@ -16,6 +16,21 @@ T23a currently covers:
 
 Hot row/columnar SSTable layout evolution stays with the SSTable tasks and is intentionally out of scope here.
 
+Session capability manifests and reviewed-procedure policy blobs are not part of the T23a
+fixture set yet, but they are still persisted control-plane state. Contract changes in those
+Serde-encoded policy records must therefore keep older durable bytes readable unless the change
+also ships an explicit migration/recovery plan.
+
+Current compatibility note:
+
+- `ResourcePolicy.row_scope_binding` and `ResourcePolicy.visibility_index` now write structured
+  T101a objects, but recovery still accepts the earlier string-placeholder form.
+- Legacy string `row_scope_binding` values decode into an explicit `legacy_placeholder`
+  row-scope policy that remains non-executable until a host migration rewrites it into a
+  structured T101a contract.
+- Legacy string `visibility_index` values decode into a placeholder `VisibilityIndexSpec`
+  carrying the original name in metadata so hosts can migrate forward deliberately.
+
 ## Policy
 
 All T23a-owned formats are treated as explicit local contracts.

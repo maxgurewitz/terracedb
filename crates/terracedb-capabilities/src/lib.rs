@@ -7,7 +7,7 @@
 //!
 //! The two layers compose, but neither replaces the other.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -29,6 +29,471 @@ pub struct PolicySubject {
     pub groups: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PolicyContext {
+    pub subject_id: String,
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, JsonValue>,
+}
+
+impl From<&PolicySubject> for PolicyContext {
+    fn from(subject: &PolicySubject) -> Self {
+        Self {
+            subject_id: subject.subject_id.clone(),
+            tenant_id: subject.tenant_id.clone(),
+            group_ids: subject.groups.clone(),
+            attributes: subject
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), JsonValue::String(value.clone())))
+                .collect(),
+        }
+    }
+}
+
+impl From<PolicySubject> for PolicyContext {
+    fn from(subject: PolicySubject) -> Self {
+        Self::from(&subject)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowQueryShape {
+    PointRead,
+    BoundedPrefixScan,
+    WriteMutation,
+    MultiTableQuery,
+    Aggregate,
+}
+
+impl RowQueryShape {
+    pub const ALL: [Self; 5] = [
+        Self::PointRead,
+        Self::BoundedPrefixScan,
+        Self::WriteMutation,
+        Self::MultiTableQuery,
+        Self::Aggregate,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowScopeFamily {
+    LegacyPlaceholder,
+    KeyPrefix,
+    TypedRowPredicate,
+    VisibilityIndex,
+    ProcedureOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisibilityIndexSubjectKey {
+    Subject,
+    Tenant,
+    Group,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VisibilityIndexSpec {
+    pub index_name: String,
+    pub index_table: String,
+    pub subject_key: VisibilityIndexSubjectKey,
+    pub row_id_field: String,
+    pub membership_source: Option<String>,
+    pub read_mirror_table: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authoritative_sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+impl VisibilityIndexSpec {
+    pub fn lookup_keys(&self, context: &PolicyContext) -> Vec<String> {
+        match self.subject_key {
+            VisibilityIndexSubjectKey::Subject => (!context.subject_id.is_empty())
+                .then(|| vec![context.subject_id.clone()])
+                .unwrap_or_default(),
+            VisibilityIndexSubjectKey::Tenant => context
+                .tenant_id
+                .iter()
+                .filter(|tenant_id| !tenant_id.is_empty())
+                .cloned()
+                .collect(),
+            VisibilityIndexSubjectKey::Group => context
+                .group_ids
+                .iter()
+                .filter(|group_id| !group_id.is_empty())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RowScopePolicy {
+    LegacyPlaceholder {
+        legacy_binding: String,
+    },
+    KeyPrefix {
+        prefix_template: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_fields: Vec<String>,
+    },
+    TypedRowPredicate {
+        predicate_id: String,
+        row_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        referenced_fields: Vec<String>,
+    },
+    VisibilityIndex {
+        index_name: String,
+    },
+    ProcedureOnly {
+        reason: Option<String>,
+    },
+}
+
+impl RowScopePolicy {
+    pub fn family(&self) -> RowScopeFamily {
+        match self {
+            Self::LegacyPlaceholder { .. } => RowScopeFamily::LegacyPlaceholder,
+            Self::KeyPrefix { .. } => RowScopeFamily::KeyPrefix,
+            Self::TypedRowPredicate { .. } => RowScopeFamily::TypedRowPredicate,
+            Self::VisibilityIndex { .. } => RowScopeFamily::VisibilityIndex,
+            Self::ProcedureOnly { .. } => RowScopeFamily::ProcedureOnly,
+        }
+    }
+
+    pub fn supported_query_shapes(&self) -> &'static [RowQueryShape] {
+        match self {
+            Self::LegacyPlaceholder { .. } => &[],
+            Self::KeyPrefix { .. } => &[
+                RowQueryShape::PointRead,
+                RowQueryShape::BoundedPrefixScan,
+                RowQueryShape::WriteMutation,
+            ],
+            Self::TypedRowPredicate { .. } => &[
+                RowQueryShape::PointRead,
+                RowQueryShape::BoundedPrefixScan,
+                RowQueryShape::WriteMutation,
+            ],
+            Self::VisibilityIndex { .. } => {
+                &[RowQueryShape::PointRead, RowQueryShape::BoundedPrefixScan]
+            }
+            Self::ProcedureOnly { .. } => &[],
+        }
+    }
+
+    pub fn supports_query_shape(&self, shape: RowQueryShape) -> bool {
+        self.supported_query_shapes().contains(&shape)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowBudgetAccounting {
+    #[serde(default = "default_true")]
+    pub charge_scanned_rows: bool,
+    #[serde(default = "default_true")]
+    pub charge_returned_rows: bool,
+}
+
+impl Default for RowBudgetAccounting {
+    fn default() -> Self {
+        Self {
+            charge_scanned_rows: true,
+            charge_returned_rows: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowWriteSemantics {
+    #[serde(default = "default_true")]
+    pub evaluate_preimage: bool,
+    #[serde(default = "default_true")]
+    pub evaluate_postimage: bool,
+    #[serde(default = "default_true")]
+    pub reject_scope_escaping_writes: bool,
+    #[serde(default = "default_true")]
+    pub require_occ_read_set: bool,
+    #[serde(default)]
+    pub budget_accounting: RowBudgetAccounting,
+}
+
+impl Default for RowWriteSemantics {
+    fn default() -> Self {
+        Self {
+            evaluate_preimage: true,
+            evaluate_postimage: true,
+            reject_scope_escaping_writes: true,
+            require_occ_read_set: true,
+            budget_accounting: RowBudgetAccounting::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowVisibilityOutcomeKind {
+    Visible,
+    NotVisible,
+    ExplicitlyDenied,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowDenialContract {
+    #[serde(default = "default_true")]
+    pub conceal_not_visible_as_not_found: bool,
+    #[serde(default = "default_true")]
+    pub explicit_denial_reveals_reason: bool,
+}
+
+impl Default for RowDenialContract {
+    fn default() -> Self {
+        Self {
+            conceal_not_visible_as_not_found: true,
+            explicit_denial_reveals_reason: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RowVisibilityAuditRecord {
+    pub outcome: RowVisibilityOutcomeKind,
+    pub family: RowScopeFamily,
+    pub query_shape: RowQueryShape,
+    pub surface_as_not_found: bool,
+    pub index_name: Option<String>,
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RowScopeBinding {
+    pub binding_id: String,
+    pub policy: RowScopePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_query_shapes: Vec<RowQueryShape>,
+    #[serde(default)]
+    pub write_semantics: RowWriteSemantics,
+    #[serde(default)]
+    pub denial_contract: RowDenialContract,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+impl RowScopeBinding {
+    pub fn effective_query_shapes(&self) -> Vec<RowQueryShape> {
+        let supported = self.policy.supported_query_shapes();
+        if self.allowed_query_shapes.is_empty() {
+            return supported.to_vec();
+        }
+
+        supported
+            .iter()
+            .copied()
+            .filter(|shape| self.allowed_query_shapes.contains(shape))
+            .collect()
+    }
+
+    pub fn supports_query_shape(&self, shape: RowQueryShape) -> bool {
+        self.policy.supports_query_shape(shape)
+            && (self.allowed_query_shapes.is_empty() || self.allowed_query_shapes.contains(&shape))
+    }
+
+    pub fn not_visible_audit(
+        &self,
+        query_shape: RowQueryShape,
+        reason: Option<String>,
+    ) -> RowVisibilityAuditRecord {
+        RowVisibilityAuditRecord {
+            outcome: RowVisibilityOutcomeKind::NotVisible,
+            family: self.policy.family(),
+            query_shape,
+            surface_as_not_found: self.denial_contract.conceal_not_visible_as_not_found,
+            index_name: self.visibility_index_name(),
+            reason,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn explicit_denial_audit(
+        &self,
+        query_shape: RowQueryShape,
+        reason: Option<String>,
+    ) -> RowVisibilityAuditRecord {
+        RowVisibilityAuditRecord {
+            outcome: RowVisibilityOutcomeKind::ExplicitlyDenied,
+            family: self.policy.family(),
+            query_shape,
+            surface_as_not_found: false,
+            index_name: self.visibility_index_name(),
+            reason: self
+                .denial_contract
+                .explicit_denial_reveals_reason
+                .then_some(reason)
+                .flatten(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn visibility_index_name(&self) -> Option<String> {
+        match &self.policy {
+            RowScopePolicy::LegacyPlaceholder { .. } => None,
+            RowScopePolicy::VisibilityIndex { index_name } => Some(index_name.clone()),
+            RowScopePolicy::KeyPrefix { .. }
+            | RowScopePolicy::TypedRowPredicate { .. }
+            | RowScopePolicy::ProcedureOnly { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisibilityMembershipTransition {
+    pub index_name: String,
+    pub lookup_key: String,
+    pub row_id: String,
+    pub from_visible: bool,
+    pub to_visible: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FilteredScanResumeToken {
+    pub version: u8,
+    pub binding_name: String,
+    pub query_shape: RowQueryShape,
+    pub family: RowScopeFamily,
+    pub last_primary_key: Option<String>,
+    pub last_visibility_key: Option<String>,
+    #[serde(default)]
+    pub scanned_rows: u64,
+    #[serde(default)]
+    pub returned_rows: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VisibilityLookupResult {
+    pub index_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lookup_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_row_ids: Vec<String>,
+    pub resume_token: Option<FilteredScanResumeToken>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EffectiveRowScopeBinding {
+    pub binding_id: String,
+    pub context: PolicyContext,
+    pub policy: RowScopePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_query_shapes: Vec<RowQueryShape>,
+    pub write_semantics: RowWriteSemantics,
+    pub denial_contract: RowDenialContract,
+    pub visibility_lookup: Option<VisibilityLookupResult>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+pub trait VisibilityIndexReader {
+    fn lookup(&self, spec: &VisibilityIndexSpec, context: &PolicyContext)
+    -> VisibilityLookupResult;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicVisibilityIndexStore {
+    rows_by_index_and_key: BTreeMap<(String, String), Vec<String>>,
+}
+
+impl DeterministicVisibilityIndexStore {
+    pub fn with_visible_row(
+        mut self,
+        index_name: impl Into<String>,
+        lookup_key: impl Into<String>,
+        row_id: impl Into<String>,
+    ) -> Self {
+        let transition = VisibilityMembershipTransition {
+            index_name: index_name.into(),
+            lookup_key: lookup_key.into(),
+            row_id: row_id.into(),
+            from_visible: false,
+            to_visible: true,
+            metadata: BTreeMap::new(),
+        };
+        self.apply_transition(&transition);
+        self
+    }
+
+    pub fn with_transition(mut self, transition: VisibilityMembershipTransition) -> Self {
+        self.apply_transition(&transition);
+        self
+    }
+
+    fn apply_transition(&mut self, transition: &VisibilityMembershipTransition) {
+        let key = (transition.index_name.clone(), transition.lookup_key.clone());
+        let rows = self.rows_by_index_and_key.entry(key).or_default();
+        rows.retain(|row_id| row_id != &transition.row_id);
+        if transition.to_visible {
+            rows.push(transition.row_id.clone());
+            rows.sort();
+            rows.dedup();
+        }
+    }
+}
+
+impl VisibilityIndexReader for DeterministicVisibilityIndexStore {
+    fn lookup(
+        &self,
+        spec: &VisibilityIndexSpec,
+        context: &PolicyContext,
+    ) -> VisibilityLookupResult {
+        let lookup_keys = spec.lookup_keys(context);
+        let mut visible_row_ids = BTreeSet::new();
+        for lookup_key in &lookup_keys {
+            if let Some(rows) = self
+                .rows_by_index_and_key
+                .get(&(spec.index_name.clone(), lookup_key.clone()))
+            {
+                visible_row_ids.extend(rows.iter().cloned());
+            }
+        }
+
+        VisibilityLookupResult {
+            index_name: spec.index_name.clone(),
+            lookup_keys,
+            visible_row_ids: visible_row_ids.into_iter().collect(),
+            resume_token: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RowScopeResolutionError {
+    #[error(
+        "row scope binding {binding_id} requires visibility index {index_name}, but no matching spec was attached"
+    )]
+    MissingVisibilityIndex {
+        binding_id: String,
+        index_name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,10 +551,64 @@ pub struct ResourcePolicy {
     pub deny: Vec<ResourceSelector>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tenant_scopes: Vec<String>,
-    pub row_scope_binding: Option<String>,
-    pub visibility_index: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_row_scope_binding",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub row_scope_binding: Option<RowScopeBinding>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_visibility_index_spec",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub visibility_index: Option<VisibilityIndexSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, JsonValue>,
+}
+
+impl ResourcePolicy {
+    pub fn resolve_row_scope<R>(
+        &self,
+        context: PolicyContext,
+        visibility_indexes: &R,
+    ) -> Result<Option<EffectiveRowScopeBinding>, RowScopeResolutionError>
+    where
+        R: VisibilityIndexReader,
+    {
+        let Some(binding) = self.row_scope_binding.as_ref() else {
+            return Ok(None);
+        };
+
+        let visibility_lookup = match &binding.policy {
+            RowScopePolicy::LegacyPlaceholder { .. } => None,
+            RowScopePolicy::VisibilityIndex { index_name } => {
+                let spec = self
+                    .visibility_index
+                    .as_ref()
+                    .filter(|spec| spec.index_name == *index_name)
+                    .ok_or_else(|| RowScopeResolutionError::MissingVisibilityIndex {
+                        binding_id: binding.binding_id.clone(),
+                        index_name: index_name.clone(),
+                    })?;
+                Some(visibility_indexes.lookup(spec, &context))
+            }
+            RowScopePolicy::KeyPrefix { .. }
+            | RowScopePolicy::TypedRowPredicate { .. }
+            | RowScopePolicy::ProcedureOnly { .. } => None,
+        };
+
+        Ok(Some(EffectiveRowScopeBinding {
+            binding_id: binding.binding_id.clone(),
+            context,
+            policy: binding.policy.clone(),
+            allowed_query_shapes: binding.effective_query_shapes(),
+            write_semantics: binding.write_semantics.clone(),
+            denial_contract: binding.denial_contract.clone(),
+            visibility_lookup,
+            metadata: binding.metadata.clone(),
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +802,8 @@ pub struct PolicyOutcomeRecord {
     pub outcome: PolicyOutcomeKind,
     pub message: Option<String>,
     pub observed_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_visibility: Option<RowVisibilityAuditRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, JsonValue>,
 }
@@ -841,6 +1362,7 @@ impl ResolvedSessionPolicy {
                 outcome,
                 message,
                 observed_at: request.requested_at,
+                row_visibility: None,
                 metadata: policy_outcome_metadata(
                     request,
                     &assignment,
@@ -1861,6 +2383,10 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_call_count() -> u64 {
     1
 }
@@ -1898,6 +2424,73 @@ fn capability_family_matches(left: Option<&str>, right: Option<&str>) -> bool {
         (Some(left), Some(right)) => left == right,
         _ => true,
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RowScopeBindingRepr {
+    Structured(RowScopeBinding),
+    Legacy(String),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum VisibilityIndexSpecRepr {
+    Structured(VisibilityIndexSpec),
+    Legacy(String),
+}
+
+fn deserialize_optional_row_scope_binding<'de, D>(
+    deserializer: D,
+) -> Result<Option<RowScopeBinding>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let repr = Option::<RowScopeBindingRepr>::deserialize(deserializer)?;
+    Ok(repr.map(|repr| match repr {
+        RowScopeBindingRepr::Structured(binding) => binding,
+        RowScopeBindingRepr::Legacy(binding_id) => RowScopeBinding {
+            binding_id: binding_id.clone(),
+            // Legacy manifests only stored a label here. Preserve that representation as
+            // an explicit compatibility placeholder rather than reinterpreting it as a
+            // narrower version-1 contract during recovery.
+            policy: RowScopePolicy::LegacyPlaceholder {
+                legacy_binding: binding_id.clone(),
+            },
+            allowed_query_shapes: Vec::new(),
+            write_semantics: RowWriteSemantics::default(),
+            denial_contract: RowDenialContract::default(),
+            metadata: BTreeMap::from([(
+                "legacy_row_scope_binding".to_string(),
+                JsonValue::String(binding_id),
+            )]),
+        },
+    }))
+}
+
+fn deserialize_optional_visibility_index_spec<'de, D>(
+    deserializer: D,
+) -> Result<Option<VisibilityIndexSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let repr = Option::<VisibilityIndexSpecRepr>::deserialize(deserializer)?;
+    Ok(repr.map(|repr| match repr {
+        VisibilityIndexSpecRepr::Structured(spec) => spec,
+        VisibilityIndexSpecRepr::Legacy(index_name) => VisibilityIndexSpec {
+            index_name: index_name.clone(),
+            index_table: index_name.clone(),
+            subject_key: VisibilityIndexSubjectKey::Subject,
+            row_id_field: "row_id".to_string(),
+            membership_source: None,
+            read_mirror_table: None,
+            authoritative_sources: Vec::new(),
+            metadata: BTreeMap::from([(
+                "legacy_visibility_index".to_string(),
+                JsonValue::String(index_name),
+            )]),
+        },
+    }))
 }
 
 fn tenant_scope_denies(subject: &PolicySubject, policy: &ResourcePolicy) -> bool {
