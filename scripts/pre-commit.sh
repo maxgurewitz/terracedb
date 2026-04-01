@@ -8,6 +8,11 @@ while IFS= read -r git_env_var; do
 done < <(git rev-parse --local-env-vars)
 cd "$repo_root"
 
+if [[ "${CODEX_REVIEW_ENABLED:-1}" == "1" && "${SKIP_CODEX_REVIEW:-0}" != "1" ]]; then
+    echo "Running Codex review..."
+    "$repo_root/scripts/run-codex-review.sh"
+fi
+
 if ! command -v cargo-nextest >/dev/null 2>&1; then
     echo "cargo-nextest is required; install it with 'cargo install cargo-nextest --locked'" >&2
     exit 1

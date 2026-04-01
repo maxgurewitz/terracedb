@@ -46,27 +46,7 @@ Its scope is intentionally narrow: provide an in-process virtual filesystem, sma
 
 The name **terracedb** is inspired by FoundationDB’s emphasis on small, composable primitives. The aim is similar in spirit for the single-node embedded setting: keep the core narrow, make higher-level behavior explicit, and let applications assemble the pieces they actually need.
 
-## Development
+## Contributing
 
-This repository includes a shared pre-commit script at `scripts/pre-commit.sh`.
-
-The Git hook at `.githooks/pre-commit` calls that script, which runs:
-
-- `scripts/check-durable-format-fixtures.sh`
-- `cargo nextest run --workspace`
-- `cargo fmt --all -- --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-
-Durable-format policy, fixture inventory, and the checked FlatBuffers schema reference live in `docs/DURABLE_FORMATS.md` and `schemas/durable_metadata.fbs`.
-
-When an intentional durable-format change updates canonical bytes, regenerate the reviewed fixtures with:
-
-```bash
-scripts/regenerate-durable-format-fixtures.sh
-```
-
-Enable it locally with:
-
-```bash
-git config core.hooksPath .githooks
-```
+Contributor workflow, local hook setup, Codex review behavior, and durable
+format fixture guidance live in [CONTRIBUTING.md](./CONTRIBUTING.md).
