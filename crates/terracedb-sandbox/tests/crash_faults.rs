@@ -610,6 +610,7 @@ async fn pr_export_bookkeeping_tool_runs_only_survive_durable_recovery_after_flu
             package_compat: PackageCompatibilityMode::NpmPureJs,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: Default::default(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: Some(GitProvenance {
                 repo_root: repo.to_string_lossy().into_owned(),

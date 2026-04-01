@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use terracedb::Clock;
+use terracedb_capabilities::{ExecutionOperation, ExecutionPolicy};
 use terracedb_vfs::{
     CompletedToolRun, CompletedToolRunOutcome, CreateOptions, DirEntry, MkdirOptions,
-    ReadOnlyVfsFileSystem, SnapshotOptions, Stats, ToolRunId, VfsError, VfsKvStore, VfsStoreExt,
-    Volume, VolumeConfig, VolumeSnapshot, VolumeStore,
+    ReadOnlyVfsFileSystem, SnapshotOptions, Stats, ToolRunId, ToolRunStatus, VfsError, VfsKvStore,
+    VfsStoreExt, Volume, VolumeConfig, VolumeSnapshot, VolumeStore,
 };
 use tokio::sync::Mutex;
 
@@ -16,6 +17,10 @@ use crate::disk::{
     replace_vfs_tree, write_hoist_manifest,
 };
 use crate::git::{default_export_workspace_path, finalize_git_export};
+use crate::routing::{
+    RoutedBashService, RoutedPackageInstaller, RoutedRuntimeBackend, RoutedTypeScriptService,
+    SandboxExecutionRouter,
+};
 use crate::{
     BaseSnapshotIdentity, BashReport, BashRequest, BashService, CapabilityCallRequest,
     CapabilityCallResult, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
@@ -26,11 +31,12 @@ use crate::{
     HoistRequest, HoistedSource, HostGitWorkspaceManager, PackageInstallReport,
     PackageInstallRequest, PackageInstaller, PullRequestProviderClient, PullRequestReport,
     PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle, ReadonlyViewLocation,
-    ReadonlyViewProvider, ReadonlyViewRequest, SandboxConfig, SandboxError,
-    SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim, SandboxModuleLoader,
-    SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeStateHandle,
-    SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
-    StaticCapabilityRegistry, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
+    ReadonlyViewProvider, ReadonlyViewRequest, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION,
+    SandboxConfig, SandboxError, SandboxExecutionRequest, SandboxExecutionResult,
+    SandboxFilesystemShim, SandboxModuleLoader, SandboxRuntimeActor, SandboxRuntimeBackend,
+    SandboxRuntimeHandle, SandboxRuntimeStateHandle, SandboxServiceBindings, SandboxSessionInfo,
+    SandboxSessionProvenance, SandboxSessionState, StaticCapabilityRegistry,
+    TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
     TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
     TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TypeCheckReport, TypeCheckRequest,
     TypeScriptEmitReport, TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
@@ -58,6 +64,7 @@ pub struct SandboxServices {
     pub typescript: Arc<dyn TypeScriptService>,
     pub bash: Arc<dyn BashService>,
     pub capabilities: Arc<dyn CapabilityRegistry>,
+    execution_router: Option<Arc<SandboxExecutionRouter>>,
 }
 
 impl SandboxServices {
@@ -82,6 +89,7 @@ impl SandboxServices {
             typescript,
             bash,
             capabilities: Arc::new(StaticCapabilityRegistry::default()),
+            execution_router: None,
         }
     }
 
@@ -130,6 +138,25 @@ impl SandboxServices {
         Self::deterministic_with_host_git().with_capabilities(capabilities)
     }
 
+    pub fn with_execution_router(mut self, router: SandboxExecutionRouter) -> Self {
+        let router = Arc::new(router);
+        self.runtime = Arc::new(RoutedRuntimeBackend::new(
+            self.runtime.clone(),
+            router.clone(),
+        ));
+        self.packages = Arc::new(RoutedPackageInstaller::new(
+            self.packages.clone(),
+            router.clone(),
+        ));
+        self.typescript = Arc::new(RoutedTypeScriptService::new(
+            self.typescript.clone(),
+            router.clone(),
+        ));
+        self.bash = Arc::new(RoutedBashService::new(self.bash.clone(), router.clone()));
+        self.execution_router = Some(router);
+        self
+    }
+
     pub fn bindings(&self) -> SandboxServiceBindings {
         SandboxServiceBindings {
             runtime_backend: self.runtime.name().to_string(),
@@ -139,6 +166,26 @@ impl SandboxServices {
             readonly_view_provider: self.readonly_views.name().to_string(),
             typescript_service: self.typescript.name().to_string(),
             bash_service: self.bash.name().to_string(),
+            execution_bindings: BTreeMap::new(),
+        }
+    }
+
+    pub fn bindings_for_policy(
+        &self,
+        execution_policy: Option<&ExecutionPolicy>,
+    ) -> Result<SandboxServiceBindings, SandboxError> {
+        let legacy = self.bindings();
+        match execution_policy {
+            Some(policy) => self
+                .execution_router
+                .as_ref()
+                .ok_or(SandboxError::Service {
+                    service: "execution-policy",
+                    message: "sandbox execution policy requires a sandbox execution router"
+                        .to_string(),
+                })?
+                .bindings_for_policy(policy, &legacy),
+            None => Ok(legacy),
         }
     }
 }
@@ -178,13 +225,25 @@ impl<S> DefaultSandboxStore<S> {
         if let Some(config) = expected_config {
             validate_existing_session(&info, config)?;
         }
+        let resolved_bindings = self
+            .services
+            .bindings_for_policy(info.provenance.execution_policy.as_ref())?;
+        let mut changed = false;
+        if info.services != resolved_bindings {
+            info.services = resolved_bindings;
+            changed = true;
+        }
         if info.state == SandboxSessionState::Closed {
             info.state = SandboxSessionState::Open;
             info.closed_at = None;
+            changed = true;
+        }
+        if changed {
             info.updated_at = self.clock.now();
             info.revision = info.revision.saturating_add(1);
             write_session_info_exact(volume.as_ref(), &info).await?;
         }
+        let execution_counts = load_execution_counts(volume.as_ref()).await?;
         let runtime = self.services.runtime.resume_session(&info).await?;
         let params = json!({
             "mode": "reopen",
@@ -208,6 +267,7 @@ impl<S> DefaultSandboxStore<S> {
             self.clock.clone(),
             self.services.clone(),
             info,
+            execution_counts,
             runtime,
         ))
     }
@@ -235,6 +295,9 @@ impl<S> DefaultSandboxStore<S> {
         let volume: Arc<dyn Volume> = overlay;
         seed_session_layout(volume.as_ref(), &config.workspace_root).await?;
         let now = self.clock.now();
+        let services = self
+            .services
+            .bindings_for_policy(config.execution_policy.as_ref())?;
         let info = SandboxSessionInfo {
             format_version: crate::SANDBOX_SESSION_FORMAT_VERSION,
             revision: 1,
@@ -245,7 +308,7 @@ impl<S> DefaultSandboxStore<S> {
             updated_at: now,
             closed_at: None,
             conflict_policy: config.conflict_policy,
-            services: self.services.bindings(),
+            services,
             provenance: SandboxSessionProvenance {
                 base_snapshot: BaseSnapshotIdentity {
                     volume_id: base_snapshot.volume_id(),
@@ -256,10 +319,12 @@ impl<S> DefaultSandboxStore<S> {
                 git: config.git_provenance.clone(),
                 package_compat: config.package_compat,
                 capabilities: config.capabilities.clone(),
+                execution_policy: config.execution_policy.clone(),
                 active_view_handles: Vec::new(),
             },
         };
         write_session_info_exact(volume.as_ref(), &info).await?;
+        let execution_counts = BTreeMap::new();
         let runtime = self.services.runtime.start_session(&info).await?;
         let params = json!({
             "mode": "create",
@@ -286,6 +351,7 @@ impl<S> DefaultSandboxStore<S> {
             self.clock.clone(),
             self.services.clone(),
             info,
+            execution_counts,
             runtime,
         ))
     }
@@ -339,6 +405,8 @@ pub struct SandboxSession {
     services: SandboxServices,
     info: Arc<Mutex<SandboxSessionInfo>>,
     operation_lock: Arc<Mutex<()>>,
+    execution_counts: Arc<Mutex<ExecutionCountState>>,
+    execution_count_persist_lock: Arc<Mutex<()>>,
     runtime: SandboxRuntimeHandle,
     runtime_actor: SandboxRuntimeActor,
 }
@@ -349,6 +417,7 @@ impl SandboxSession {
         clock: Arc<dyn Clock>,
         services: SandboxServices,
         info: SandboxSessionInfo,
+        execution_counts: BTreeMap<ExecutionOperation, u64>,
         runtime: SandboxRuntimeHandle,
     ) -> Self {
         Self {
@@ -358,6 +427,8 @@ impl SandboxSession {
             services,
             info: Arc::new(Mutex::new(info)),
             operation_lock: Arc::new(Mutex::new(())),
+            execution_counts: Arc::new(Mutex::new(ExecutionCountState::new(execution_counts))),
+            execution_count_persist_lock: Arc::new(Mutex::new(())),
             runtime,
         }
     }
@@ -384,6 +455,59 @@ impl SandboxSession {
 
     pub fn capability_registry(&self) -> Arc<dyn CapabilityRegistry> {
         self.services.capabilities.clone()
+    }
+
+    pub(crate) async fn execution_policy(&self) -> Option<ExecutionPolicy> {
+        self.info().await.provenance.execution_policy
+    }
+
+    pub(crate) async fn reserve_execution_call_count(&self, operation: ExecutionOperation) -> u64 {
+        let mut counts = self.execution_counts.lock().await;
+        let next = counts
+            .committed
+            .get(&operation)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(counts.inflight.get(&operation).copied().unwrap_or_default())
+            .saturating_add(1);
+        counts
+            .inflight
+            .entry(operation)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        next
+    }
+
+    pub(crate) async fn release_execution_call_count(&self, operation: ExecutionOperation) {
+        let mut counts = self.execution_counts.lock().await;
+        decrement_execution_count(&mut counts.inflight, operation);
+    }
+
+    pub(crate) async fn commit_execution_call_count(&self, operation: ExecutionOperation) -> u64 {
+        let (call_count, snapshot) = {
+            let mut counts = self.execution_counts.lock().await;
+            decrement_execution_count(&mut counts.inflight, operation);
+            let next = counts
+                .committed
+                .entry(operation)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            (*next, counts.committed.clone())
+        };
+        let _ = self.persist_execution_counts_snapshot(snapshot).await;
+        call_count
+    }
+
+    async fn persist_execution_counts_snapshot(
+        &self,
+        snapshot: BTreeMap<ExecutionOperation, u64>,
+    ) -> Result<(), SandboxError> {
+        let _guard = self.execution_count_persist_lock.lock().await;
+        let merged = merge_execution_counts(
+            load_persisted_execution_counts(self.volume.as_ref()).await?,
+            snapshot,
+        );
+        persist_execution_counts(self.volume.as_ref(), &merged).await
     }
 
     pub fn kv(&self) -> Arc<dyn VfsKvStore> {
@@ -453,25 +577,189 @@ impl SandboxSession {
         &self,
         request: TypeScriptTranspileRequest,
     ) -> Result<TypeScriptTranspileReport, SandboxError> {
-        self.services.typescript.transpile(self, request).await
+        let counted = self.execution_policy().await.is_some();
+        if !counted {
+            return self.services.typescript.transpile(self, request).await;
+        }
+        let params = Some(serde_json::to_value(&request)?);
+        match self.services.typescript.transpile(self, request).await {
+            Ok(report) => {
+                let outcome = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.typescript.transpile",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&report)?),
+                    },
+                )
+                .await;
+                match outcome {
+                    Ok(_) => {
+                        self.commit_execution_call_count(ExecutionOperation::TypeCheck)
+                            .await;
+                        Ok(report)
+                    }
+                    Err(error) => {
+                        self.release_execution_call_count(ExecutionOperation::TypeCheck)
+                            .await;
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.typescript.transpile",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn typecheck(
         &self,
         request: TypeCheckRequest,
     ) -> Result<TypeCheckReport, SandboxError> {
-        self.services.typescript.check(self, request).await
+        let counted = self.execution_policy().await.is_some();
+        if !counted {
+            return self.services.typescript.check(self, request).await;
+        }
+        let params = Some(serde_json::to_value(&request)?);
+        match self.services.typescript.check(self, request).await {
+            Ok(report) => {
+                let outcome = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.typescript.check",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&report)?),
+                    },
+                )
+                .await;
+                match outcome {
+                    Ok(_) => {
+                        self.commit_execution_call_count(ExecutionOperation::TypeCheck)
+                            .await;
+                        Ok(report)
+                    }
+                    Err(error) => {
+                        self.release_execution_call_count(ExecutionOperation::TypeCheck)
+                            .await;
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.typescript.check",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn emit_typescript(
         &self,
         request: TypeCheckRequest,
     ) -> Result<TypeScriptEmitReport, SandboxError> {
-        self.services.typescript.emit(self, request).await
+        let counted = self.execution_policy().await.is_some();
+        if !counted {
+            return self.services.typescript.emit(self, request).await;
+        }
+        let params = Some(serde_json::to_value(&request)?);
+        match self.services.typescript.emit(self, request).await {
+            Ok(report) => {
+                let outcome = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.typescript.emit",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&report)?),
+                    },
+                )
+                .await;
+                match outcome {
+                    Ok(_) => {
+                        self.commit_execution_call_count(ExecutionOperation::TypeCheck)
+                            .await;
+                        Ok(report)
+                    }
+                    Err(error) => {
+                        self.release_execution_call_count(ExecutionOperation::TypeCheck)
+                            .await;
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.typescript.emit",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn run_bash(&self, request: BashRequest) -> Result<BashReport, SandboxError> {
-        self.services.bash.run(self, request).await
+        let counted = self.execution_policy().await.is_some();
+        if !counted {
+            return self.services.bash.run(self, request).await;
+        }
+        let params = Some(serde_json::to_value(&request)?);
+        match self.services.bash.run(self, request).await {
+            Ok(report) => {
+                let outcome = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.bash.exec",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&report)?),
+                    },
+                )
+                .await;
+                match outcome {
+                    Ok(_) => {
+                        self.commit_execution_call_count(ExecutionOperation::BashHelper)
+                            .await;
+                        Ok(report)
+                    }
+                    Err(error) => {
+                        self.release_execution_call_count(ExecutionOperation::BashHelper)
+                            .await;
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.bash.exec",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn invoke_capability(
@@ -562,10 +850,11 @@ impl SandboxSession {
         &self,
         request: PackageInstallRequest,
     ) -> Result<PackageInstallReport, SandboxError> {
+        let counted = self.execution_policy().await.is_some();
         let params = Some(serde_json::to_value(&request)?);
         match self.services.packages.install(self, request).await {
             Ok(report) => {
-                record_completed_tool_run(
+                let outcome = record_completed_tool_run(
                     self.volume.as_ref(),
                     "sandbox.package.install",
                     params,
@@ -573,8 +862,23 @@ impl SandboxSession {
                         result: Some(serde_json::to_value(&report)?),
                     },
                 )
-                .await?;
-                Ok(report)
+                .await;
+                match outcome {
+                    Ok(_) => {
+                        if counted {
+                            self.commit_execution_call_count(ExecutionOperation::PackageInstall)
+                                .await;
+                        }
+                        Ok(report)
+                    }
+                    Err(error) => {
+                        if counted {
+                            self.release_execution_call_count(ExecutionOperation::PackageInstall)
+                                .await;
+                        }
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
                 let _ = record_completed_tool_run(
@@ -1005,10 +1309,11 @@ impl SandboxSession {
         operation_name: &str,
         request: SandboxExecutionRequest,
     ) -> Result<SandboxExecutionResult, SandboxError> {
+        let counted = self.execution_policy().await.is_some();
         let params = Some(serde_json::to_value(&request)?);
         match self.runtime_actor.execute(self, request).await {
             Ok(result) => {
-                record_completed_tool_run(
+                let outcome = record_completed_tool_run(
                     self.volume.as_ref(),
                     operation_name,
                     params,
@@ -1016,8 +1321,23 @@ impl SandboxSession {
                         result: Some(serde_json::to_value(&result)?),
                     },
                 )
-                .await?;
-                Ok(result)
+                .await;
+                match outcome {
+                    Ok(_) => {
+                        if counted {
+                            self.commit_execution_call_count(ExecutionOperation::DraftSession)
+                                .await;
+                        }
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        if counted {
+                            self.release_execution_call_count(ExecutionOperation::DraftSession)
+                                .await;
+                        }
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
                 let _ = record_completed_tool_run(
@@ -1154,6 +1474,159 @@ async fn load_session_info(volume: &dyn Volume) -> Result<SandboxSessionInfo, Sa
     Ok(selected)
 }
 
+async fn load_execution_counts(
+    volume: &dyn Volume,
+) -> Result<BTreeMap<ExecutionOperation, u64>, SandboxError> {
+    let mut tool_counts = BTreeMap::new();
+    for run in volume.tools().recent(None).await? {
+        if run.status == ToolRunStatus::Success
+            && let Some(operation) = execution_operation_for_tool_run(&run.name)
+        {
+            tool_counts
+                .entry(operation)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        }
+    }
+
+    if let Some(persisted) = load_persisted_execution_counts(volume).await? {
+        let mut reconciled = tool_counts.clone();
+        for (operation, persisted_count) in persisted.counts {
+            let count = tool_counts
+                .get(&operation)
+                .copied()
+                .map_or(0, |tool_count| persisted_count.min(tool_count));
+            if count > 0 {
+                reconciled.insert(operation, count);
+            } else {
+                reconciled.remove(&operation);
+            }
+        }
+        return Ok(reconciled);
+    }
+
+    Ok(tool_counts)
+}
+
+async fn load_persisted_execution_counts(
+    volume: &dyn Volume,
+) -> Result<Option<PersistedExecutionPolicyState>, SandboxError> {
+    let Some(bytes) = volume
+        .fs()
+        .read_file(TERRACE_EXECUTION_POLICY_STATE_PATH)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let persisted = serde_json::from_slice::<PersistedExecutionPolicyState>(&bytes)?;
+    if persisted.format_version != SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION {
+        return Err(SandboxError::InvalidSessionMetadata {
+            path: TERRACE_EXECUTION_POLICY_STATE_PATH.to_string(),
+            reason: format!(
+                "unsupported execution policy state format version {}",
+                persisted.format_version
+            ),
+        });
+    }
+    Ok(Some(persisted))
+}
+
+async fn persist_execution_counts(
+    volume: &dyn Volume,
+    counts: &BTreeMap<ExecutionOperation, u64>,
+) -> Result<(), SandboxError> {
+    let bytes = serde_json::to_vec_pretty(&PersistedExecutionPolicyState {
+        format_version: SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION,
+        counts: counts.clone(),
+    })?;
+    volume
+        .fs()
+        .write_file(
+            TERRACE_EXECUTION_POLICY_STATE_PATH,
+            bytes,
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn merge_execution_counts(
+    persisted: Option<PersistedExecutionPolicyState>,
+    snapshot: BTreeMap<ExecutionOperation, u64>,
+) -> BTreeMap<ExecutionOperation, u64> {
+    let mut merged = snapshot;
+    for (operation, persisted_count) in persisted.unwrap_or_default().counts {
+        merged
+            .entry(operation)
+            .and_modify(|count| *count = (*count).max(persisted_count))
+            .or_insert(persisted_count);
+    }
+    merged
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExecutionCountState {
+    committed: BTreeMap<ExecutionOperation, u64>,
+    inflight: BTreeMap<ExecutionOperation, u64>,
+}
+
+impl ExecutionCountState {
+    fn new(committed: BTreeMap<ExecutionOperation, u64>) -> Self {
+        Self {
+            committed,
+            inflight: BTreeMap::new(),
+        }
+    }
+}
+
+fn decrement_execution_count(
+    counts: &mut BTreeMap<ExecutionOperation, u64>,
+    operation: ExecutionOperation,
+) {
+    let mut remove = false;
+    if let Some(count) = counts.get_mut(&operation) {
+        *count = count.saturating_sub(1);
+        remove = *count == 0;
+    }
+    if remove {
+        counts.remove(&operation);
+    }
+}
+
+fn execution_operation_for_tool_run(name: &str) -> Option<ExecutionOperation> {
+    match name {
+        "sandbox.runtime.exec_module" | "sandbox.runtime.eval" => {
+            Some(ExecutionOperation::DraftSession)
+        }
+        "sandbox.package.install" => Some(ExecutionOperation::PackageInstall),
+        "sandbox.typescript.transpile" | "sandbox.typescript.check" | "sandbox.typescript.emit" => {
+            Some(ExecutionOperation::TypeCheck)
+        }
+        "sandbox.bash.exec" => Some(ExecutionOperation::BashHelper),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedExecutionPolicyState {
+    format_version: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    counts: BTreeMap<ExecutionOperation, u64>,
+}
+
+impl Default for PersistedExecutionPolicyState {
+    fn default() -> Self {
+        Self {
+            format_version: SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION,
+            counts: BTreeMap::new(),
+        }
+    }
+}
+
 async fn write_session_info_exact(
     volume: &dyn Volume,
     info: &SandboxSessionInfo,
@@ -1232,6 +1705,13 @@ fn validate_existing_session(
             field: "capabilities",
             expected: serde_json::to_string(&config.capabilities)?,
             found: serde_json::to_string(&info.provenance.capabilities)?,
+        });
+    }
+    if info.provenance.execution_policy != config.execution_policy {
+        return Err(SandboxError::SessionConfigMismatch {
+            field: "execution_policy",
+            expected: serde_json::to_string(&config.execution_policy)?,
+            found: serde_json::to_string(&info.provenance.execution_policy)?,
         });
     }
     Ok(())

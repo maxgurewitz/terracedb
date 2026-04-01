@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use terracedb::{ExecutionDomainPath, ExecutionResourceKind};
+use terracedb_capabilities::{ExecutionDomain, ExecutionOperation};
 use terracedb_vfs::{VfsError, VolumeId};
 
 use crate::ConflictReport;
@@ -34,6 +36,27 @@ pub enum SandboxError {
     UnsupportedPackage { package: String, reason: String },
     #[error("sandbox package is not installed: {package}")]
     PackageNotInstalled { package: String },
+    #[error("sandbox execution policy has no route for {operation:?} in domain {domain:?}")]
+    MissingExecutionRoute {
+        operation: ExecutionOperation,
+        domain: ExecutionDomain,
+    },
+    #[error(
+        "sandbox execution policy routed {operation:?} to {domain:?}, but no {service} backend is registered"
+    )]
+    MissingExecutionBackend {
+        operation: ExecutionOperation,
+        domain: ExecutionDomain,
+        service: &'static str,
+    },
+    #[error(
+        "sandbox execution-domain admission denied for {operation:?} on {path}: blocked by {blocked_by:?}"
+    )]
+    ExecutionDomainOverloaded {
+        operation: ExecutionOperation,
+        path: ExecutionDomainPath,
+        blocked_by: Vec<ExecutionResourceKind>,
+    },
     #[error("readonly view uri is invalid: {uri}")]
     InvalidReadonlyViewUri { uri: String },
     #[error("readonly view handle {handle_id} not found")]

@@ -1,5 +1,6 @@
 use std::fs;
 
+use terracedb_capabilities::ExecutionOperation;
 use terracedb_example_sandbox_notes::{
     ExampleHostApp, GENERATED_SUMMARY_PATH, cleanup, direct_add_comment, emit_example_typescript,
     guest_add_comment, hoist_companion_project, install_example_packages, open_generated_view,
@@ -30,6 +31,7 @@ async fn documented_happy_path_runs_end_to_end() {
                 .with_chunk_size(4096)
                 .with_package_compat(terracedb_sandbox::PackageCompatibilityMode::NpmPureJs)
                 .with_capabilities(sandbox_manifest)
+                .with_execution_policy(prepared.resolved.execution_policy.clone())
         })
         .await
         .expect("open example session");
@@ -107,6 +109,34 @@ async fn documented_happy_path_runs_end_to_end() {
         session_info.services.bash_service,
         "notes-bash-owner-foreground"
     );
+    assert_eq!(
+        session_info.provenance.execution_policy,
+        Some(prepared.resolved.execution_policy.clone())
+    );
+    assert_eq!(
+        session_info.services.execution_bindings[&ExecutionOperation::DraftSession]
+            .domain_path
+            .as_string(),
+        "process/sandbox-notes/dedicated-sandbox"
+    );
+    assert_eq!(
+        session_info.services.execution_bindings[&ExecutionOperation::PackageInstall]
+            .domain_path
+            .as_string(),
+        "process/sandbox-notes/dedicated-sandbox"
+    );
+    assert_eq!(
+        session_info.services.execution_bindings[&ExecutionOperation::TypeCheck]
+            .domain_path
+            .as_string(),
+        "process/sandbox-notes/owner-foreground"
+    );
+    assert_eq!(
+        session_info.services.execution_bindings[&ExecutionOperation::BashHelper]
+            .domain_path
+            .as_string(),
+        "process/sandbox-notes/owner-foreground"
+    );
     assert!(typecheck.diagnostics.is_empty());
     assert_eq!(packages, vec!["lodash", "zod"]);
     assert_eq!(runtime_summary, summary);
@@ -126,6 +156,10 @@ async fn documented_happy_path_runs_end_to_end() {
     assert_eq!(
         runtime_result["summary"]["openCount"],
         serde_json::json!(summary.open_count)
+    );
+    assert_eq!(
+        session.runtime_handle().metadata["execution_domain_path"],
+        serde_json::json!("process/sandbox-notes/dedicated-sandbox")
     );
     assert_eq!(
         app.notes_snapshot()
@@ -175,7 +209,9 @@ async fn injected_note_capability_matches_direct_and_guest_calls() {
     let direct_harness = SandboxHarness::deterministic(20, 72, direct_services);
     let direct_session = direct_harness
         .open_session_with(direct_base_volume_id, direct_session_volume_id, |config| {
-            config.with_capabilities(direct_manifest)
+            config
+                .with_capabilities(direct_manifest)
+                .with_execution_policy(direct_prepared.resolved.execution_policy.clone())
         })
         .await
         .expect("open direct session");
@@ -194,7 +230,9 @@ async fn injected_note_capability_matches_direct_and_guest_calls() {
     let guest_harness = SandboxHarness::deterministic(21, 73, guest_services);
     let guest_session = guest_harness
         .open_session_with(guest_base_volume_id, guest_session_volume_id, |config| {
-            config.with_capabilities(guest_manifest)
+            config
+                .with_capabilities(guest_manifest)
+                .with_execution_policy(guest_prepared.resolved.execution_policy.clone())
         })
         .await
         .expect("open guest session");
@@ -234,7 +272,9 @@ async fn prepared_preset_budget_is_enforced_for_host_capability_calls() {
     let harness = SandboxHarness::deterministic(22, 74, services);
     let session = harness
         .open_session_with(base_volume_id, session_volume_id, |config| {
-            config.with_capabilities(manifest)
+            config
+                .with_capabilities(manifest)
+                .with_execution_policy(prepared.resolved.execution_policy.clone())
         })
         .await
         .expect("open budget session");

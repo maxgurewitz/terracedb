@@ -50,6 +50,7 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
                     config
                         .with_capabilities(sandbox_manifest)
                         .with_package_compat(terracedb_sandbox::PackageCompatibilityMode::NpmPureJs)
+                        .with_execution_policy(prepared.resolved.execution_policy.clone())
                 })
                 .await
                 .expect("open session");

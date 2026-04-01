@@ -9,6 +9,7 @@ T23a currently covers:
 - the catalog file at `catalog/CATALOG.json`
 - commit-record frames in the commit log
 - commit-log segment footers
+- sandbox session control files under `/.terrace/`
 - local manifest files
 - remote manifest files
 - remote-cache metadata files
@@ -38,6 +39,7 @@ The current per-format policy is:
 | Catalog FlatBuffer | `catalog/CATALOG.json` | Exact emitted bytes are stable within the current `format_version` 1 fixture set. | Bump `format_version` when new code should reject earlier bytes rather than risk misreading them. | `Db::open` / catalog decode must reject invalid FlatBuffers or unsupported versions. |
 | Commit-record frame | commit-log record payload/frame bytes | Exact frame bytes are stable for the current record format version only. Terracedb is still greenfield here, so older commit-record versions are not supported once the current version changes. | Bump the record payload version for layout changes that should replace the previous durable path. | Frame decode rejects bad magic, length mismatch, checksum mismatch, trailing bytes, and any version other than the current one. |
 | Segment footer | sealed segment footer bytes | Exact footer bytes are stable within the footer format version. | Bump the footer version for incompatible footer layout changes. | Footer decode rejects checksum mismatch, trailing bytes, and unknown versions. |
+| Sandbox session control JSON | `/.terrace/session.json`, `/.terrace/execution-policy-state.json` | Exact JSON bytes are not fixture-locked, but the required fields and current `format_version` values are reviewed durable contracts for reopen/recovery. | Bump `format_version` when reopen should reject earlier session-control layouts instead of guessing. | Reopen must reject malformed JSON, missing required version markers, and unsupported `format_version` values. |
 | Local manifest FlatBuffer | `manifest/MANIFEST-*` | Exact emitted bytes are stable within `format_version` 1, including persisted SSTable shard ownership when present. | Bump `format_version` when local recovery should reject earlier bodies. | Local manifest load rejects invalid FlatBuffers, bad checksums, unsupported versions, and shard-ownership mismatches against reopened SSTables. |
 | Remote manifest FlatBuffer | `backup/manifest/MANIFEST-*` | Exact emitted bytes are stable within `format_version` 1, including persisted SSTable shard ownership when present. | Bump `format_version` when remote recovery should reject earlier bodies. | Remote manifest load rejects invalid FlatBuffers, bad checksums, unsupported versions, and shard-ownership mismatches against reopened SSTables. |
 | Remote-cache metadata FlatBuffer | cache `meta/*` records | Exact emitted bytes are stable within `format_version` 1. | Bump `format_version` when rebuilt cache state should no longer trust earlier metadata bytes. | Cache rebuild must ignore invalid/unsupported metadata and fetch from remote again instead of trusting it. |

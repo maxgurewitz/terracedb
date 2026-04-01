@@ -72,6 +72,7 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
             package_compat: PackageCompatibilityMode::NpmPureJs,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: capabilities.clone(),
+            execution_policy: None,
             hoisted_source: Some(HoistedSource {
                 source_path: "/repo".to_string(),
                 mode: HoistMode::GitHead,
@@ -235,6 +236,7 @@ fn metadata_and_view_uri_round_trip() {
         capabilities: CapabilityManifest {
             capabilities: vec![SandboxCapability::host_module("tickets")],
         },
+        execution_policy: None,
         active_view_handles: vec![handle.clone()],
     };
     let info = SandboxSessionInfo {
@@ -255,6 +257,7 @@ fn metadata_and_view_uri_round_trip() {
             readonly_view_provider: "deterministic-view".to_string(),
             typescript_service: "deterministic-typescript".to_string(),
             bash_service: "deterministic-bash".to_string(),
+            execution_bindings: Default::default(),
         },
         provenance,
     };

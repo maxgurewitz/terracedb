@@ -295,6 +295,7 @@ fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulation
                     package_compat: terracedb_sandbox::PackageCompatibilityMode::TerraceOnly,
                     conflict_policy: terracedb_sandbox::ConflictPolicy::Fail,
                     capabilities: capabilities.manifest(),
+                    execution_policy: None,
                     hoisted_source: None,
                     git_provenance: None,
                 })

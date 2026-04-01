@@ -8,6 +8,7 @@ pub mod harness;
 pub mod loader;
 pub mod packages;
 pub mod pr;
+pub mod routing;
 pub mod runtime;
 pub mod session;
 pub mod types;
@@ -54,6 +55,7 @@ pub use pr::{
     DeterministicPullRequestProviderClient, PullRequestProviderClient, PullRequestReport,
     PullRequestRequest,
 };
+pub use routing::{SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter};
 pub use runtime::{
     DeterministicRuntimeBackend, SandboxExecutionKind, SandboxExecutionRequest,
     SandboxExecutionResult, SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle,
@@ -65,11 +67,13 @@ pub use session::{
 };
 pub use types::{
     BaseSnapshotIdentity, ConflictPolicy, DEFAULT_WORKSPACE_ROOT, GitProvenance, HoistedSource,
-    PackageCompatibilityMode, SANDBOX_SESSION_FORMAT_VERSION, SandboxConfig,
-    SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
-    TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT, TERRACE_NPM_DIR,
-    TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
-    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
+    PackageCompatibilityMode, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION,
+    SANDBOX_SESSION_FORMAT_VERSION, SandboxConfig, SandboxExecutionBinding, SandboxServiceBindings,
+    SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
+    TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
+    TERRACE_NPM_DIR, TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_NPM_SESSION_CACHE_DIR,
+    TERRACE_RUNTIME_CACHE_DIR, TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY,
+    TERRACE_SESSION_METADATA_PATH,
 };
 pub use typescript::{
     DeterministicTypeScriptService, TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,

@@ -395,6 +395,9 @@ impl TypeScriptService for DeterministicTypeScriptService {
     ) -> Result<TypeScriptTranspileReport, SandboxError> {
         let operation_lock = session.operation_lock();
         let _guard = operation_lock.lock().await;
+        if session.execution_policy().await.is_some() {
+            return self.transpile_inner(session, &request).await;
+        }
         let params = Some(serde_json::to_value(&request)?);
         match self.transpile_inner(session, &request).await {
             Ok(report) => {
@@ -431,6 +434,9 @@ impl TypeScriptService for DeterministicTypeScriptService {
     ) -> Result<TypeCheckReport, SandboxError> {
         let operation_lock = session.operation_lock();
         let _guard = operation_lock.lock().await;
+        if session.execution_policy().await.is_some() {
+            return self.check_inner(session, &request).await;
+        }
         let params = Some(serde_json::to_value(&request)?);
         match self.check_inner(session, &request).await {
             Ok(report) => {
@@ -467,6 +473,9 @@ impl TypeScriptService for DeterministicTypeScriptService {
     ) -> Result<TypeScriptEmitReport, SandboxError> {
         let operation_lock = session.operation_lock();
         let _guard = operation_lock.lock().await;
+        if session.execution_policy().await.is_some() {
+            return self.emit_inner(session, &request).await;
+        }
         let params = Some(serde_json::to_value(&request)?);
         match self.emit_inner(session, &request).await {
             Ok(report) => {

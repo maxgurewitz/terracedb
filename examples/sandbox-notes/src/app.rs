@@ -10,6 +10,11 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
+use terracedb::{
+    DomainBackgroundBudget, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget,
+    ExecutionDomainBudget, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionResourceUsage,
+    InMemoryResourceManager,
+};
 use terracedb_capabilities::{
     BudgetPolicy, CapabilityGrant, CapabilityPresetDescriptor, CapabilityProfileDescriptor,
     CapabilityTemplate, CapabilityUseMetrics, CapabilityUseRequest, DeterministicPolicyEngine,
@@ -20,18 +25,15 @@ use terracedb_capabilities::{
     StaticExecutionPolicyResolver, SubjectSelector,
 };
 use terracedb_sandbox::{
-    BashReport, BashRequest, BashService, CapabilityManifest as SandboxCapabilityManifest,
-    CapabilityMethod0, CapabilityMethod1, CapabilityRegistry, ConflictPolicy,
-    DeterministicBashService, DeterministicPackageInstaller, DeterministicRuntimeBackend,
-    DeterministicTypeScriptService, EjectMode, EjectRequest, GitWorkspaceRequest, HoistMode,
-    HoistRequest, PackageCompatibilityMode, PackageInstallReport, PackageInstallRequest,
-    PackageInstaller, PullRequestRequest, ReadonlyViewHandle, ReadonlyViewRequest,
-    SandboxCapability, SandboxCapabilityModule, SandboxError, SandboxExecutionRequest,
-    SandboxExecutionResult, SandboxHarness, SandboxRuntimeBackend, SandboxRuntimeHandle,
-    SandboxRuntimeStateHandle, SandboxServices, SandboxSession, SandboxSessionInfo,
-    TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport, TypeScriptService,
-    TypeScriptTranspileReport, TypeScriptTranspileRequest, TypedCapabilityModuleBuilder,
-    TypedCapabilityRegistry,
+    BashReport, BashRequest, CapabilityManifest as SandboxCapabilityManifest, CapabilityMethod0,
+    CapabilityMethod1, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
+    DeterministicPackageInstaller, DeterministicRuntimeBackend, DeterministicTypeScriptService,
+    EjectMode, EjectRequest, GitWorkspaceRequest, HoistMode, HoistRequest,
+    PackageCompatibilityMode, PackageInstallRequest, PullRequestRequest, ReadonlyViewHandle,
+    ReadonlyViewRequest, SandboxCapability, SandboxCapabilityModule, SandboxError,
+    SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter, SandboxHarness,
+    SandboxServices, SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
+    TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId, VolumeStore};
 use tokio::sync::Mutex;
@@ -114,11 +116,10 @@ impl ExampleHostApp {
         session_id: impl Into<String>,
         prepared: &PreparedSessionPreset,
     ) -> Result<SandboxServices, SandboxError> {
-        let mut services = SandboxServices::deterministic_with_capabilities(
+        Ok(SandboxServices::deterministic_with_capabilities(
             self.prepared_notes_registry(session_id, prepared)?,
-        );
-        apply_prepared_execution_policy(&mut services, prepared);
-        Ok(services)
+        )
+        .with_execution_router(notes_execution_router()))
     }
 
     pub fn host_git_services_for_prepared_session(
@@ -126,11 +127,12 @@ impl ExampleHostApp {
         session_id: impl Into<String>,
         prepared: &PreparedSessionPreset,
     ) -> Result<SandboxServices, SandboxError> {
-        let mut services = SandboxServices::deterministic_with_host_git_and_capabilities(
-            self.prepared_notes_registry(session_id, prepared)?,
-        );
-        apply_prepared_execution_policy(&mut services, prepared);
-        Ok(services)
+        Ok(
+            SandboxServices::deterministic_with_host_git_and_capabilities(
+                self.prepared_notes_registry(session_id, prepared)?,
+            )
+            .with_execution_router(notes_execution_router()),
+        )
     }
 
     pub fn notes_policy_engine(&self, session_id: impl Into<String>) -> DeterministicPolicyEngine {
@@ -366,307 +368,155 @@ impl CapabilityRegistry for PreparedNotesPolicyRegistry {
     }
 }
 
-#[derive(Clone)]
-struct PreparedExecutionPolicyController {
-    prepared: PreparedSessionPreset,
-    operation_counts: Arc<Mutex<BTreeMap<ExecutionOperation, u64>>>,
-}
+fn notes_execution_router() -> SandboxExecutionRouter {
+    let process_budget = ExecutionDomainBudget {
+        cpu: DomainCpuBudget {
+            worker_slots: Some(8),
+            weight: Some(1),
+        },
+        memory: DomainMemoryBudget {
+            total_bytes: Some(8 * 1024 * 1024),
+            ..Default::default()
+        },
+        io: DomainIoBudget {
+            local_concurrency: Some(8),
+            ..Default::default()
+        },
+        background: DomainBackgroundBudget {
+            task_slots: Some(8),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let resource_manager = Arc::new(InMemoryResourceManager::new(process_budget));
 
-impl PreparedExecutionPolicyController {
-    fn new(prepared: &PreparedSessionPreset) -> Self {
-        Self {
-            prepared: prepared.clone(),
-            operation_counts: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    async fn begin_operation(
-        &self,
-        operation: ExecutionOperation,
-    ) -> Result<BTreeMap<String, JsonValue>, SandboxError> {
-        let call_count = {
-            let mut counts = self.operation_counts.lock().await;
-            let next = counts
-                .entry(operation)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            *next
-        };
-        let assignment = self
-            .prepared
-            .resolved
-            .execution_policy
-            .assignment_for(operation)
-            .clone();
-        let budget = assignment.budget.clone().or_else(|| {
-            self.prepared
-                .resolved
-                .execution_policy
-                .default_assignment
-                .budget
-                .clone()
-        });
-        if let Some(max_calls) = budget.as_ref().and_then(|budget| budget.max_calls)
-            && call_count > max_calls
-        {
-            return Err(SandboxError::Service {
-                service: "sandbox-notes",
-                message: format!(
-                    "execution policy for {operation:?} exceeded max_calls {max_calls}"
-                ),
-            });
-        }
-
-        let mut metadata = BTreeMap::from([
-            ("operation".to_string(), serde_json::to_value(operation)?),
-            (
-                "execution_domain".to_string(),
-                serde_json::to_value(&assignment.domain)?,
-            ),
-            (
-                "placement_tags".to_string(),
-                serde_json::to_value(&assignment.placement_tags)?,
-            ),
-            (
-                "execution_call_count".to_string(),
-                JsonValue::from(call_count),
-            ),
-            (
-                "execution_policy".to_string(),
-                serde_json::to_value(&self.prepared.resolved.execution_policy)?,
-            ),
-        ]);
-        if let Some(budget) = budget {
-            metadata.insert(
-                "execution_budget".to_string(),
-                serde_json::to_value(&budget)?,
-            );
-        }
-        Ok(metadata)
-    }
-}
-
-#[derive(Clone)]
-struct PreparedPolicyPackageInstaller {
-    inner: Arc<dyn PackageInstaller>,
-    controller: PreparedExecutionPolicyController,
-}
-
-#[async_trait]
-impl PackageInstaller for PreparedPolicyPackageInstaller {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    async fn install(
-        &self,
-        session: &SandboxSession,
-        request: PackageInstallRequest,
-    ) -> Result<PackageInstallReport, SandboxError> {
-        let metadata = self
-            .controller
-            .begin_operation(ExecutionOperation::PackageInstall)
-            .await?;
-        let mut report = self.inner.install(session, request).await?;
-        report.metadata.extend(metadata);
-        Ok(report)
-    }
-}
-
-#[derive(Clone)]
-struct PreparedPolicyTypeScriptService {
-    inner: Arc<dyn TypeScriptService>,
-    controller: PreparedExecutionPolicyController,
-}
-
-#[async_trait]
-impl TypeScriptService for PreparedPolicyTypeScriptService {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    async fn transpile(
-        &self,
-        session: &SandboxSession,
-        request: TypeScriptTranspileRequest,
-    ) -> Result<TypeScriptTranspileReport, SandboxError> {
-        self.controller
-            .begin_operation(ExecutionOperation::TypeCheck)
-            .await?;
-        self.inner.transpile(session, request).await
-    }
-
-    async fn check(
-        &self,
-        session: &SandboxSession,
-        request: TypeCheckRequest,
-    ) -> Result<TypeCheckReport, SandboxError> {
-        self.controller
-            .begin_operation(ExecutionOperation::TypeCheck)
-            .await?;
-        self.inner.check(session, request).await
-    }
-
-    async fn emit(
-        &self,
-        session: &SandboxSession,
-        request: TypeCheckRequest,
-    ) -> Result<TypeScriptEmitReport, SandboxError> {
-        self.controller
-            .begin_operation(ExecutionOperation::TypeCheck)
-            .await?;
-        self.inner.emit(session, request).await
-    }
-}
-
-#[derive(Clone)]
-struct PreparedPolicyBashService {
-    inner: Arc<dyn BashService>,
-    controller: PreparedExecutionPolicyController,
-}
-
-#[async_trait]
-impl BashService for PreparedPolicyBashService {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    async fn run(
-        &self,
-        session: &SandboxSession,
-        request: BashRequest,
-    ) -> Result<BashReport, SandboxError> {
-        self.controller
-            .begin_operation(ExecutionOperation::BashHelper)
-            .await?;
-        self.inner.run(session, request).await
-    }
-}
-
-#[derive(Clone)]
-struct PreparedPolicyRuntimeBackend {
-    inner: Arc<dyn SandboxRuntimeBackend>,
-    controller: PreparedExecutionPolicyController,
-}
-
-#[async_trait(?Send)]
-impl SandboxRuntimeBackend for PreparedPolicyRuntimeBackend {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    async fn start_session(
-        &self,
-        session: &SandboxSessionInfo,
-    ) -> Result<SandboxRuntimeHandle, SandboxError> {
-        let mut handle = self.inner.start_session(session).await?;
-        handle.metadata.extend(
-            self.controller
-                .begin_operation(ExecutionOperation::DraftSession)
-                .await?,
-        );
-        Ok(handle)
-    }
-
-    async fn resume_session(
-        &self,
-        session: &SandboxSessionInfo,
-    ) -> Result<SandboxRuntimeHandle, SandboxError> {
-        let mut handle = self.inner.resume_session(session).await?;
-        handle.metadata.extend(
-            self.controller
-                .begin_operation(ExecutionOperation::DraftSession)
-                .await?,
-        );
-        Ok(handle)
-    }
-
-    async fn execute(
-        &self,
-        session: &SandboxSession,
-        handle: &SandboxRuntimeHandle,
-        request: SandboxExecutionRequest,
-        state: SandboxRuntimeStateHandle,
-    ) -> Result<SandboxExecutionResult, SandboxError> {
-        let metadata = self
-            .controller
-            .begin_operation(ExecutionOperation::DraftSession)
-            .await?;
-        let mut result = self.inner.execute(session, handle, request, state).await?;
-        result.metadata.extend(metadata);
-        Ok(result)
-    }
-
-    async fn close_session(
-        &self,
-        session: &SandboxSessionInfo,
-        handle: &SandboxRuntimeHandle,
-    ) -> Result<(), SandboxError> {
-        self.inner.close_session(session, handle).await
-    }
-}
-
-fn apply_prepared_execution_policy(
-    services: &mut SandboxServices,
-    prepared: &PreparedSessionPreset,
-) {
-    let controller = PreparedExecutionPolicyController::new(prepared);
-    let package_domain = prepared
-        .resolved
-        .execution_policy
-        .assignment_for(ExecutionOperation::PackageInstall)
-        .domain;
-    let typecheck_domain = prepared
-        .resolved
-        .execution_policy
-        .assignment_for(ExecutionOperation::TypeCheck)
-        .domain;
-    let bash_domain = prepared
-        .resolved
-        .execution_policy
-        .assignment_for(ExecutionOperation::BashHelper)
-        .domain;
-    let runtime_domain = prepared
-        .resolved
-        .execution_policy
-        .assignment_for(ExecutionOperation::DraftSession)
-        .domain;
-
-    let typescript_backend: Arc<dyn TypeScriptService> =
-        Arc::new(DeterministicTypeScriptService::new(format!(
-            "notes-typescript-{}",
-            execution_domain_label(typecheck_domain)
-        )));
-    let bash_backend: Arc<dyn BashService> = Arc::new(
-        DeterministicBashService::new(format!(
-            "notes-bash-{}",
-            execution_domain_label(bash_domain)
-        ))
-        .with_typescript_service(typescript_backend.clone()),
+    let dedicated_runtime_domain = ExecutionDomain::DedicatedSandbox;
+    let dedicated_runtime_name = format!(
+        "notes-runtime-{}",
+        execution_domain_label(dedicated_runtime_domain)
+    );
+    let dedicated_package_name = format!(
+        "notes-packages-{}",
+        execution_domain_label(dedicated_runtime_domain)
     );
 
-    services.packages = Arc::new(PreparedPolicyPackageInstaller {
-        inner: Arc::new(DeterministicPackageInstaller::new(format!(
-            "notes-packages-{}",
-            execution_domain_label(package_domain)
-        ))),
-        controller: controller.clone(),
-    });
-    services.typescript = Arc::new(PreparedPolicyTypeScriptService {
-        inner: typescript_backend,
-        controller: controller.clone(),
-    });
-    services.bash = Arc::new(PreparedPolicyBashService {
-        inner: bash_backend,
-        controller: controller.clone(),
-    });
-    services.runtime = Arc::new(PreparedPolicyRuntimeBackend {
-        inner: Arc::new(DeterministicRuntimeBackend::new(format!(
-            "notes-runtime-{}",
-            execution_domain_label(runtime_domain)
-        ))),
-        controller,
-    });
+    let owner_foreground_domain = ExecutionDomain::OwnerForeground;
+    let owner_typescript_name = format!(
+        "notes-typescript-{}",
+        execution_domain_label(owner_foreground_domain)
+    );
+    let owner_bash_name = format!(
+        "notes-bash-{}",
+        execution_domain_label(owner_foreground_domain)
+    );
+
+    let owner_typescript: Arc<dyn terracedb_sandbox::TypeScriptService> =
+        Arc::new(DeterministicTypeScriptService::new(owner_typescript_name));
+    let owner_bash = Arc::new(
+        DeterministicBashService::new(owner_bash_name)
+            .with_typescript_service(owner_typescript.clone()),
+    );
+
+    SandboxExecutionRouter::new(resource_manager)
+        .with_domain(
+            ExecutionDomain::DedicatedSandbox,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-notes",
+                    "dedicated-sandbox",
+                ]))
+                .with_placement(ExecutionDomainPlacement::Dedicated)
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(1),
+                        weight: Some(1),
+                    },
+                    memory: DomainMemoryBudget {
+                        total_bytes: Some(512 * 1024),
+                        ..Default::default()
+                    },
+                    io: DomainIoBudget {
+                        local_concurrency: Some(2),
+                        ..Default::default()
+                    },
+                    background: DomainBackgroundBudget {
+                        task_slots: Some(2),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::DraftSession,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        memory_bytes: 256 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_usage(
+                    ExecutionOperation::PackageInstall,
+                    ExecutionResourceUsage {
+                        background_tasks: 1,
+                        local_io_concurrency: 1,
+                        memory_bytes: 128 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_metadata("terracedb.execution.class", "dedicated-sandbox"),
+            )
+            .with_runtime(Arc::new(DeterministicRuntimeBackend::new(
+                dedicated_runtime_name,
+            )))
+            .with_packages(Arc::new(DeterministicPackageInstaller::new(
+                dedicated_package_name,
+            ))),
+        )
+        .with_domain(
+            ExecutionDomain::OwnerForeground,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-notes",
+                    "owner-foreground",
+                ]))
+                .with_placement(ExecutionDomainPlacement::SharedWeighted { weight: 3 })
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(2),
+                        weight: Some(3),
+                    },
+                    memory: DomainMemoryBudget {
+                        total_bytes: Some(512 * 1024),
+                        ..Default::default()
+                    },
+                    io: DomainIoBudget {
+                        local_concurrency: Some(4),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::TypeCheck,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        memory_bytes: 96 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_usage(
+                    ExecutionOperation::BashHelper,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        memory_bytes: 32 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_metadata("terracedb.execution.class", "owner-foreground"),
+            )
+            .with_typescript(owner_typescript)
+            .with_bash(owner_bash),
+        )
 }
 
 fn execution_domain_label(domain: ExecutionDomain) -> &'static str {
@@ -920,6 +770,7 @@ pub async fn run_demo() -> Result<DemoReport, SandboxError> {
                 .with_chunk_size(4096)
                 .with_package_compat(PackageCompatibilityMode::NpmPureJs)
                 .with_capabilities(sandbox_manifest)
+                .with_execution_policy(prepared.resolved.execution_policy.clone())
         })
         .await?;
 

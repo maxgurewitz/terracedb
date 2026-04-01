@@ -61,6 +61,7 @@ fn session_config(
         package_compat,
         conflict_policy: ConflictPolicy::Fail,
         capabilities: Default::default(),
+        execution_policy: None,
         hoisted_source: None,
         git_provenance: None,
     }

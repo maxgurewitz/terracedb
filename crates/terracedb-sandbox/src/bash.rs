@@ -385,6 +385,9 @@ impl BashService for DeterministicBashService {
         session: &SandboxSession,
         request: BashRequest,
     ) -> Result<BashReport, SandboxError> {
+        if session.execution_policy().await.is_some() {
+            return self.run_inner(session, &request).await;
+        }
         let params = Some(serde_json::to_value(&request)?);
         match self.run_inner(session, &request).await {
             Ok(report) => {

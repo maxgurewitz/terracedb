@@ -72,6 +72,7 @@ async fn reopen_preserves_session_metadata_and_provenance() {
             capabilities: CapabilityManifest {
                 capabilities: vec![SandboxCapability::host_module("tickets")],
             },
+            execution_policy: None,
             hoisted_source: Some(HoistedSource {
                 source_path: "/repo".to_string(),
                 mode: HoistMode::DirectorySnapshot,
