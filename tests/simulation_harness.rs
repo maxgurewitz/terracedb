@@ -25,6 +25,9 @@ use terracedb::{
     TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage, Value,
     WorkPlacementRequest,
 };
+use terracedb_fuzz::{
+    DbScenarioHarness, SeedCampaign, assert_seed_replays, assert_seed_variation, run_campaign,
+};
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
     DbSimulationScenarioConfig, DbWorkloadOperation, ObjectStoreFaultSpec, OperationResult,
@@ -2757,14 +2760,20 @@ fn db_merge_simulation_replays_same_seed() -> turmoil::Result {
         key_count: 3,
         max_payload_len: 6,
     };
+    let harness = DbScenarioHarness::new(config);
 
-    let first = SeededSimulationRunner::new(0x4141).run_db_generated(config.clone())?;
-    let second = SeededSimulationRunner::new(0x4141).run_db_generated(config)?;
+    let replay = assert_seed_replays(&harness, 0x4141)?;
 
-    assert_eq!(first.scenario, second.scenario);
-    assert_eq!(first.trace, second.trace);
     assert!(
-        first
+        replay
+            .outcome
+            .trace
+            .iter()
+            .any(|event| matches!(event, TraceEvent::DbStepResult { .. })),
+        "generated db replay should retain db step results"
+    );
+    assert!(
+        replay
             .scenario
             .workload
             .iter()
@@ -2788,15 +2797,12 @@ fn db_merge_simulation_changes_shape_for_different_seeds() -> turmoil::Result {
         key_count: 3,
         max_payload_len: 6,
     };
-
-    let left = SeededSimulationRunner::new(7).run_db_generated(config.clone())?;
-    let right = SeededSimulationRunner::new(8).run_db_generated(config)?;
-
-    assert!(
+    let harness = DbScenarioHarness::new(config);
+    let _ = assert_seed_variation(&harness, 7, 8, |left, right| {
         left.scenario.workload != right.scenario.workload
             || left.scenario.faults != right.scenario.faults
-            || left.trace != right.trace
-    );
+            || left.outcome.trace != right.outcome.trace
+    })?;
 
     Ok(())
 }
@@ -2814,25 +2820,19 @@ fn db_merge_simulation_seed_campaign_is_reproducible() -> turmoil::Result {
         key_count: 4,
         max_payload_len: 8,
     };
-    let seeds = [0x5101_u64, 0x5102, 0x5103];
+    let harness = DbScenarioHarness::new(config);
+    let campaign = SeedCampaign::smoke();
 
-    let first_pass = seeds
+    let first_pass = run_campaign(&harness, &campaign)?
         .into_iter()
-        .map(|seed| {
-            SeededSimulationRunner::new(seed)
-                .run_db_generated(config.clone())
-                .map(|outcome| (seed, outcome))
-        })
-        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
-    let second_pass = seeds
+        .map(|capture| (capture.seed, capture.outcome))
+        .collect::<BTreeMap<_, _>>();
+    let second_pass = run_campaign(&harness, &campaign)?
         .into_iter()
-        .map(|seed| {
-            SeededSimulationRunner::new(seed)
-                .run_db_generated(config.clone())
-                .map(|outcome| (seed, outcome))
-        })
-        .collect::<turmoil::Result<BTreeMap<_, _>>>()?;
+        .map(|capture| (capture.seed, capture.outcome))
+        .collect::<BTreeMap<_, _>>();
 
+    assert_eq!(campaign.seeds(), &[0x5101, 0x5102, 0x5103]);
     assert_eq!(first_pass, second_pass);
     assert!(
         first_pass.values().all(|outcome| outcome

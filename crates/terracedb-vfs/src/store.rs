@@ -1240,25 +1240,14 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                     return Err(VfsError::DirectoryNotEmpty { path: target_path });
                 }
                 if target_was_base {
-                    if target_kind == FileKind::Directory {
-                        ensure_overlay_existing_path(
-                            state,
-                            base.as_ref(),
-                            &merged,
-                            &target_path,
-                            false,
-                            now,
-                        )?;
-                    } else {
-                        ensure_overlay_existing_path(
-                            state,
-                            base.as_ref(),
-                            &merged,
-                            &target_path,
-                            false,
-                            now,
-                        )?;
-                    }
+                    ensure_overlay_existing_path(
+                        state,
+                        base.as_ref(),
+                        &merged,
+                        &target_path,
+                        false,
+                        now,
+                    )?;
                 }
             } else {
                 materialize_overlay_parent_chain(
@@ -2836,10 +2825,10 @@ fn copy_up_overlay_directory_exact(
     record.stats.nlink = visible_directory_nlink(merged, path)?;
     state.paths.insert(path.to_string(), inode_id);
     state.inodes.insert(inode_id, record);
-    if inode_id != ROOT_INODE_ID {
-        if let Some(origin) = overlay_origin_record(state, base_inode_id) {
-            state.origins.insert(inode_id, origin);
-        }
+    if inode_id != ROOT_INODE_ID
+        && let Some(origin) = overlay_origin_record(state, base_inode_id)
+    {
+        state.origins.insert(inode_id, origin);
     }
     Ok(inode_id)
 }

@@ -16,6 +16,7 @@ use terracedb::{
         test_dependencies_with_clock, tiered_test_config_with_durability,
     },
 };
+use terracedb_fuzz::{assert_seed_replays, assert_seed_variation};
 use terracedb_simulation::{
     CutPoint, SeededSimulationRunner, SimulationStackBuilder, TerracedbSimulationHarness,
 };
@@ -33,6 +34,27 @@ use terracedb_workflows::{
     WorkflowSourceResumePoint, WorkflowStateMutation, WorkflowTables, WorkflowTimerCommand,
     failpoints::names as workflow_failpoint_names,
 };
+
+struct GeneratedSeedHarness<T> {
+    generate: fn(u64) -> T,
+}
+
+impl<T> terracedb_fuzz::GeneratedScenarioHarness for GeneratedSeedHarness<T>
+where
+    T: Clone + std::fmt::Debug + PartialEq + Eq,
+{
+    type Scenario = u64;
+    type Outcome = T;
+    type Error = std::convert::Infallible;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        seed
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        Ok((self.generate)(scenario))
+    }
+}
 use tokio::sync::Notify;
 
 const WORKFLOW_SIMULATION_DURATION: Duration = Duration::from_millis(600);
@@ -1296,12 +1318,17 @@ fn workflow_historical_scenarios_round_trip_through_simulation_checkpoints() -> 
 
 #[test]
 fn workflow_historical_campaign_generator_is_reproducible_and_varies_historical_choices() {
-    let first = generated_historical_campaign(0x8701);
-    let second = generated_historical_campaign(0x8701);
-    let different = generated_historical_campaign(0x8702);
+    let harness = GeneratedSeedHarness {
+        generate: generated_historical_campaign,
+    };
+    let first = assert_seed_replays(&harness, 0x8701)
+        .expect("historical generator replay should not fail")
+        .outcome;
+    let _ = assert_seed_variation(&harness, 0x8701, 0x8702, |left, right| {
+        left.outcome != right.outcome
+    })
+    .expect("historical generator variance should not fail");
 
-    assert_eq!(first, second);
-    assert_ne!(first, different);
     assert!(first.iter().any(|case| case.has_timers));
     assert!(first.iter().any(|case| case.has_callbacks));
     assert!(first.iter().any(|case| case.has_pending_outbox));

@@ -2,11 +2,33 @@ use std::time::Duration;
 
 use futures::{TryStreamExt, future::join_all};
 use terracedb::{Clock, LogCursor};
+use terracedb_fuzz::{assert_seed_replays, assert_seed_variation};
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{
     ActivityOptions, CompletedToolRun, CompletedToolRunOutcome, CreateOptions, InMemoryVfsStore,
     MkdirOptions, SnapshotOptions, VolumeConfig, VolumeId, VolumeStore,
 };
+
+struct VfsSeedHarness<T> {
+    run: fn(u64) -> turmoil::Result<T>,
+}
+
+impl<T> terracedb_fuzz::GeneratedScenarioHarness for VfsSeedHarness<T>
+where
+    T: Clone + std::fmt::Debug + PartialEq + Eq,
+{
+    type Scenario = u64;
+    type Outcome = T;
+    type Error = Box<dyn std::error::Error>;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        seed
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        Ok((self.run)(scenario)?)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VfsSimulationCapture {
@@ -496,10 +518,14 @@ fn run_overlay_simulation(seed: u64) -> turmoil::Result<OverlaySimulationCapture
 
 #[test]
 fn vfs_seeded_simulation_replays_same_seed_and_respects_durable_cut() -> turmoil::Result {
-    let first = run_vfs_simulation(0x3535)?;
-    let second = run_vfs_simulation(0x3535)?;
+    let first = assert_seed_replays(
+        &VfsSeedHarness {
+            run: run_vfs_simulation,
+        },
+        0x3535,
+    )?
+    .outcome;
 
-    assert_eq!(first, second);
     assert_eq!(first.visible_before.len(), 6);
     assert!(first.durable_before.is_empty());
     assert_eq!(first.snapshot_names, first.visible_before);
@@ -522,11 +548,28 @@ fn vfs_seeded_simulation_replays_same_seed_and_respects_durable_cut() -> turmoil
 }
 
 #[test]
-fn overlay_seeded_simulation_replays_whiteouts_copy_up_and_durable_exports() -> turmoil::Result {
-    let first = run_overlay_simulation(0x4545)?;
-    let second = run_overlay_simulation(0x4545)?;
+fn overlay_seeded_simulation_changes_shape_for_different_seeds() -> turmoil::Result {
+    let _ = assert_seed_variation(
+        &VfsSeedHarness {
+            run: run_overlay_simulation,
+        },
+        0x4545,
+        0x4546,
+        |left, right| left.outcome != right.outcome,
+    )?;
+    Ok(())
+}
 
-    assert_eq!(first, second);
+#[test]
+fn overlay_seeded_simulation_replays_whiteouts_copy_up_and_durable_exports() -> turmoil::Result {
+    let first = assert_seed_replays(
+        &VfsSeedHarness {
+            run: run_overlay_simulation,
+        },
+        0x4545,
+    )?
+    .outcome;
+
     assert_eq!(
         first.overlay_names_before_flush,
         vec![

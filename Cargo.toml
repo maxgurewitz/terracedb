@@ -5,6 +5,7 @@ members = [
     "crates/terracedb-bricks",
     "crates/terracedb-debezium",
     "crates/terracedb-git",
+    "crates/terracedb-fuzz",
     "crates/terracedb-kafka",
     "crates/terracedb-js",
     "crates/terracedb-http",
@@ -71,6 +72,7 @@ zstd = "0.13.3"
 insta = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
+terracedb-fuzz = { path = "crates/terracedb-fuzz" }
 terracedb-otel = { path = "crates/terracedb-otel" }
 terracedb-simulation = { path = "crates/terracedb-simulation" }
 terracedb-projections = { path = "crates/terracedb-projections" }

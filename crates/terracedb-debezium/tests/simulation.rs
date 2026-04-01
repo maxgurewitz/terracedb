@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use terracedb::{
     ChangeEntry, Db, LogCursor, ScanOptions, SequenceNumber, StubClock, StubFileSystem,
@@ -14,6 +15,10 @@ use terracedb_debezium::{
     DebeziumPartitionedTableLayout, DebeziumPrimaryKey, DebeziumRowPredicate, DebeziumSourceTable,
     DebeziumTableFilter, DebeziumWorkflowEventPolicy, PostgresDebeziumDecoder,
     mirror_workflow_source_config,
+};
+use terracedb_fuzz::{
+    GeneratedScenarioHarness, assert_seed_replays, assert_seed_variation, decode_json_artifact,
+    encode_json_artifact,
 };
 use terracedb_kafka::{
     DeterministicKafkaBroker, DeterministicKafkaFetchResponse, DeterministicKafkaPartitionScript,
@@ -37,13 +42,46 @@ use terracedb_workflows::{
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DebeziumCampaignCapture {
-    cdc_rows: BTreeMap<String, Vec<DebeziumEvent>>,
-    current_rows: Vec<(DebeziumPrimaryKey, DebeziumMirrorRow)>,
+    cdc_rows: BTreeMap<String, Vec<Vec<u8>>>,
+    current_rows: Vec<(Vec<u8>, Vec<u8>)>,
     projection_rows: Vec<(Vec<u8>, Vec<u8>)>,
     workflow_states: BTreeMap<String, Option<Vec<u8>>>,
     progress: BTreeMap<u32, KafkaSourceProgress>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DebeziumCampaignScenario {
+    seed: u64,
+    snapshot_delay_polls: u8,
+    live_delay_polls: u8,
+    second_partition_delay_polls: u8,
+}
+
+struct DebeziumCampaignHarness;
+
+impl GeneratedScenarioHarness for DebeziumCampaignHarness {
+    type Scenario = DebeziumCampaignScenario;
+    type Outcome = DebeziumCampaignCapture;
+    type Error = Box<dyn std::error::Error>;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        generate_debezium_campaign(seed)
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        Ok(run_generated_campaign(scenario)?)
+    }
+}
+
+fn generate_debezium_campaign(seed: u64) -> DebeziumCampaignScenario {
+    DebeziumCampaignScenario {
+        seed,
+        snapshot_delay_polls: (seed & 1) as u8,
+        live_delay_polls: ((seed >> 1) & 1) as u8,
+        second_partition_delay_polls: ((seed >> 2) & 1) as u8,
+    }
 }
 
 struct WestOrderProjection {
@@ -214,17 +252,16 @@ fn delayed_single(
     responses
 }
 
-fn build_campaign_broker(seed: u64, topic: &str) -> DeterministicKafkaBroker {
-    let snapshot_delay = (seed & 1) as usize;
-    let live_delay = ((seed >> 1) & 1) as usize;
-    let second_partition_delay = ((seed >> 2) & 1) as usize;
-
+fn build_campaign_broker(
+    scenario: &DebeziumCampaignScenario,
+    topic: &str,
+) -> DeterministicKafkaBroker {
     let partition0 =
         DeterministicKafkaPartitionScript::new(KafkaOffset::new(0), KafkaOffset::new(3))
             .with_fetch_responses(
                 KafkaOffset::new(0),
                 delayed_single(
-                    snapshot_delay,
+                    scenario.snapshot_delay_polls as usize,
                     change_record(
                         topic,
                         0,
@@ -273,7 +310,7 @@ fn build_campaign_broker(seed: u64, topic: &str) -> DeterministicKafkaBroker {
             .with_fetch_responses(
                 KafkaOffset::new(2),
                 delayed_single(
-                    live_delay,
+                    scenario.live_delay_polls as usize,
                     change_record(
                         topic,
                         0,
@@ -298,7 +335,7 @@ fn build_campaign_broker(seed: u64, topic: &str) -> DeterministicKafkaBroker {
             .with_fetch_responses(
                 KafkaOffset::new(0),
                 delayed_single(
-                    second_partition_delay,
+                    scenario.second_partition_delay_polls as usize,
                     change_record(
                         topic,
                         1,
@@ -382,7 +419,7 @@ async fn collect_bytes_rows(
     Ok(out)
 }
 
-async fn collect_event_rows(table: &Table) -> Result<Vec<DebeziumEvent>, terracedb::ReadError> {
+async fn collect_event_rows(table: &Table) -> Result<Vec<Vec<u8>>, terracedb::ReadError> {
     let mut rows = table
         .scan(
             FULL_SCAN_START.to_vec(),
@@ -392,14 +429,17 @@ async fn collect_event_rows(table: &Table) -> Result<Vec<DebeziumEvent>, terrace
         .await?;
     let mut out = Vec::new();
     while let Some((_key, value)) = rows.next().await {
-        out.push(DebeziumEvent::from_value(&value).expect("cdc value should decode"));
+        let Value::Bytes(bytes) = value else {
+            panic!("cdc fixtures should store byte values");
+        };
+        out.push(bytes);
     }
     Ok(out)
 }
 
 async fn collect_current_rows(
     table: &Table,
-) -> Result<Vec<(DebeziumPrimaryKey, DebeziumMirrorRow)>, terracedb::ReadError> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, terracedb::ReadError> {
     let mut rows = table
         .scan(
             FULL_SCAN_START.to_vec(),
@@ -409,10 +449,10 @@ async fn collect_current_rows(
         .await?;
     let mut out = Vec::new();
     while let Some((key, value)) = rows.next().await {
-        out.push((
-            DebeziumPrimaryKey::decode(&key).expect("mirror key should decode"),
-            DebeziumMirrorRow::from_value(&value).expect("mirror row should decode"),
-        ));
+        let Value::Bytes(bytes) = value else {
+            panic!("mirror fixtures should store byte values");
+        };
+        out.push((key, bytes));
     }
     Ok(out)
 }
@@ -439,245 +479,253 @@ async fn wait_for_state(
         .await
 }
 
-fn run_seeded_campaign(seed: u64) -> turmoil::Result<DebeziumCampaignCapture> {
-    SeededSimulationRunner::new(seed).run_with(move |context| async move {
-        let db = context
-            .open_db(tiered_test_config(&format!("/debezium/campaign-{seed}")))
-            .await?;
-        let layout = DebeziumPartitionedTableLayout::new(
-            "debezium",
-            "dbserver1.public.orders",
-            DebeziumSourceTable::new("app", "public", "orders"),
-            [0_u32, 1_u32],
-        );
-
-        for table_name in layout.cdc_table_names() {
-            db.create_table(row_table_config(&table_name)).await?;
-        }
-        let current = db
-            .create_table(row_table_config(layout.current_table_name()))
-            .await?;
-        let progress_table = db.create_table(row_table_config("kafka_progress")).await?;
-        let projection_output = db.create_table(row_table_config("attention")).await?;
-
-        let progress_store = TableKafkaProgressStore::new(progress_table);
-        let event_log = DebeziumEventLogTables::from_layouts(&db, [&layout])?;
-        let mirror = DebeziumMirrorTables::from_layouts(&db, [&layout])?;
-        let materializer = DebeziumMaterializer::hybrid(event_log, mirror)
-            .with_table_filter(DebeziumTableFilter::allow_only([layout
-                .source_table()
-                .clone()]))
-            .with_row_predicate(DebeziumRowPredicate::ColumnEquals {
-                column: "region".to_string(),
-                value: json!("west"),
-            })
-            .with_column_projection(
-                DebeziumColumnProjection::default()
-                    .include_only(["id", "region", "status"])
-                    .with_redaction("status", json!("redacted")),
+fn run_generated_campaign(
+    scenario: DebeziumCampaignScenario,
+) -> turmoil::Result<DebeziumCampaignCapture> {
+    SeededSimulationRunner::new(scenario.seed).run_with(move |context| {
+        let scenario = scenario.clone();
+        async move {
+            let db = context
+                .open_db(tiered_test_config(&format!(
+                    "/debezium/campaign-{}",
+                    scenario.seed
+                )))
+                .await?;
+            let layout = DebeziumPartitionedTableLayout::new(
+                "debezium",
+                "dbserver1.public.orders",
+                DebeziumSourceTable::new("app", "public", "orders"),
+                [0_u32, 1_u32],
             );
-        let handler = DebeziumIngressHandler::new(
-            PostgresDebeziumDecoder::new().with_layouts([&layout]),
-            materializer,
-        );
-        let broker = build_campaign_broker(seed, layout.topic());
-        let claim0 = KafkaPartitionClaim::new(
-            KafkaPartitionSource::new(layout.topic(), 0, KafkaBootstrapPolicy::Earliest)
-                .source_id("orders-cg"),
-            KafkaBootstrapPolicy::Earliest,
-            1,
-        );
-        let claim1 = KafkaPartitionClaim::new(
-            KafkaPartitionSource::new(layout.topic(), 1, KafkaBootstrapPolicy::Earliest)
-                .source_id("orders-cg"),
-            KafkaBootstrapPolicy::Earliest,
-            1,
-        );
 
-        let observer = NoopKafkaRuntimeObserver;
-        let telemetry = NoopKafkaTelemetrySink;
-        let worker = terracedb_kafka::KafkaWorkerOptions {
-            batch_limit: 1,
-            ..terracedb_kafka::KafkaWorkerOptions::default()
-        };
-
-        let mut last_sequence_by_partition = BTreeMap::<u32, SequenceNumber>::new();
-
-        while progress_store
-            .load(&claim0.source)
-            .await?
-            .map(|progress| progress.next_offset.get())
-            .unwrap_or(0)
-            < 2
-        {
-            let outcome = drive_partition_once(
-                &db,
-                &broker,
-                &progress_store,
-                &claim0,
-                worker,
-                &KeepAllKafkaRecords,
-                &handler,
-                &observer,
-                &telemetry,
-            )
-            .await?;
-            if let Some(sequence) = outcome.telemetry.committed_sequence {
-                last_sequence_by_partition.insert(0, sequence);
+            for table_name in layout.cdc_table_names() {
+                db.create_table(row_table_config(&table_name)).await?;
             }
-        }
+            let current = db
+                .create_table(row_table_config(layout.current_table_name()))
+                .await?;
+            let progress_table = db.create_table(row_table_config("kafka_progress")).await?;
+            let projection_output = db.create_table(row_table_config("attention")).await?;
 
-        while progress_store
-            .load(&claim1.source)
-            .await?
-            .map(|progress| progress.next_offset.get())
-            .unwrap_or(0)
-            < 3
-        {
-            let outcome = drive_partition_once(
-                &db,
-                &broker,
-                &progress_store,
-                &claim1,
-                worker,
-                &KeepAllKafkaRecords,
-                &handler,
-                &observer,
-                &telemetry,
-            )
-            .await?;
-            if let Some(sequence) = outcome.telemetry.committed_sequence {
-                last_sequence_by_partition.insert(1, sequence);
-            }
-        }
+            let progress_store = TableKafkaProgressStore::new(progress_table);
+            let event_log = DebeziumEventLogTables::from_layouts(&db, [&layout])?;
+            let mirror = DebeziumMirrorTables::from_layouts(&db, [&layout])?;
+            let materializer = DebeziumMaterializer::hybrid(event_log, mirror)
+                .with_table_filter(DebeziumTableFilter::allow_only([layout
+                    .source_table()
+                    .clone()]))
+                .with_row_predicate(DebeziumRowPredicate::ColumnEquals {
+                    column: "region".to_string(),
+                    value: json!("west"),
+                })
+                .with_column_projection(
+                    DebeziumColumnProjection::default()
+                        .include_only(["id", "region", "status"])
+                        .with_redaction("status", json!("redacted")),
+                );
+            let handler = DebeziumIngressHandler::new(
+                PostgresDebeziumDecoder::new().with_layouts([&layout]),
+                materializer,
+            );
+            let broker = build_campaign_broker(&scenario, layout.topic());
+            let claim0 = KafkaPartitionClaim::new(
+                KafkaPartitionSource::new(layout.topic(), 0, KafkaBootstrapPolicy::Earliest)
+                    .source_id("orders-cg"),
+                KafkaBootstrapPolicy::Earliest,
+                1,
+            );
+            let claim1 = KafkaPartitionClaim::new(
+                KafkaPartitionSource::new(layout.topic(), 1, KafkaBootstrapPolicy::Earliest)
+                    .source_id("orders-cg"),
+                KafkaBootstrapPolicy::Earliest,
+                1,
+            );
 
-        let workflow_runtime = WorkflowRuntime::open(
-            db.clone(),
-            context.clock(),
-            WorkflowDefinition::new(
-                "mirror-orders",
-                [layout.mirror_workflow_source(&db)],
-                MirrorWorkflowHandler,
-            ),
-        )
-        .await?;
-        let workflow_handle = workflow_runtime.start().await?;
+            let observer = NoopKafkaRuntimeObserver;
+            let telemetry = NoopKafkaTelemetrySink;
+            let worker = terracedb_kafka::KafkaWorkerOptions {
+                batch_limit: 1,
+                ..terracedb_kafka::KafkaWorkerOptions::default()
+            };
 
-        while progress_store
-            .load(&claim0.source)
-            .await?
-            .map(|progress| progress.next_offset.get())
-            .unwrap_or(0)
-            < 3
-        {
-            let outcome = drive_partition_once(
-                &db,
-                &broker,
-                &progress_store,
-                &claim0,
-                worker,
-                &KeepAllKafkaRecords,
-                &handler,
-                &observer,
-                &telemetry,
-            )
-            .await?;
-            if let Some(sequence) = outcome.telemetry.committed_sequence {
-                last_sequence_by_partition.insert(0, sequence);
-            }
-        }
+            let mut last_sequence_by_partition = BTreeMap::<u32, SequenceNumber>::new();
 
-        wait_for_state(&workflow_runtime, "3", "1").await?;
-
-        let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
-        let sources = layout.projection_sources(&db);
-        let mut projection_handle = projection_runtime
-            .start_multi_source(
-                MultiSourceProjection::new(
-                    "west-orders",
-                    sources.clone(),
-                    WestOrderProjection {
-                        output: projection_output.clone(),
-                    },
+            while progress_store
+                .load(&claim0.source)
+                .await?
+                .map(|progress| progress.next_offset.get())
+                .unwrap_or(0)
+                < 2
+            {
+                let outcome = drive_partition_once(
+                    &db,
+                    &broker,
+                    &progress_store,
+                    &claim0,
+                    worker,
+                    &KeepAllKafkaRecords,
+                    &handler,
+                    &observer,
+                    &telemetry,
                 )
-                .with_outputs([projection_output.clone()])
-                .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+                .await?;
+                if let Some(sequence) = outcome.telemetry.committed_sequence {
+                    last_sequence_by_partition.insert(0, sequence);
+                }
+            }
+
+            while progress_store
+                .load(&claim1.source)
+                .await?
+                .map(|progress| progress.next_offset.get())
+                .unwrap_or(0)
+                < 3
+            {
+                let outcome = drive_partition_once(
+                    &db,
+                    &broker,
+                    &progress_store,
+                    &claim1,
+                    worker,
+                    &KeepAllKafkaRecords,
+                    &handler,
+                    &observer,
+                    &telemetry,
+                )
+                .await?;
+                if let Some(sequence) = outcome.telemetry.committed_sequence {
+                    last_sequence_by_partition.insert(1, sequence);
+                }
+            }
+
+            let workflow_runtime = WorkflowRuntime::open(
+                db.clone(),
+                context.clock(),
+                WorkflowDefinition::new(
+                    "mirror-orders",
+                    [layout.mirror_workflow_source(&db)],
+                    MirrorWorkflowHandler,
+                ),
             )
             .await?;
-        wait_for_projection(
-            &mut projection_handle,
-            [
-                (
-                    &sources[0],
-                    *last_sequence_by_partition.get(&0).expect("p0 sequence"),
-                ),
-                (
-                    &sources[1],
-                    *last_sequence_by_partition.get(&1).expect("p1 sequence"),
-                ),
-            ],
-        )
-        .await?;
+            let workflow_handle = workflow_runtime.start().await?;
 
-        let mut cdc_rows = BTreeMap::new();
-        for table_name in layout.cdc_table_names() {
-            cdc_rows.insert(
-                table_name.clone(),
-                collect_event_rows(&db.table(table_name)).await?,
-            );
+            while progress_store
+                .load(&claim0.source)
+                .await?
+                .map(|progress| progress.next_offset.get())
+                .unwrap_or(0)
+                < 3
+            {
+                let outcome = drive_partition_once(
+                    &db,
+                    &broker,
+                    &progress_store,
+                    &claim0,
+                    worker,
+                    &KeepAllKafkaRecords,
+                    &handler,
+                    &observer,
+                    &telemetry,
+                )
+                .await?;
+                if let Some(sequence) = outcome.telemetry.committed_sequence {
+                    last_sequence_by_partition.insert(0, sequence);
+                }
+            }
+
+            wait_for_state(&workflow_runtime, "3", "1").await?;
+
+            let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
+            let sources = layout.projection_sources(&db);
+            let mut projection_handle = projection_runtime
+                .start_multi_source(
+                    MultiSourceProjection::new(
+                        "west-orders",
+                        sources.clone(),
+                        WestOrderProjection {
+                            output: projection_output.clone(),
+                        },
+                    )
+                    .with_outputs([projection_output.clone()])
+                    .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+                )
+                .await?;
+            wait_for_projection(
+                &mut projection_handle,
+                [
+                    (
+                        &sources[0],
+                        *last_sequence_by_partition.get(&0).expect("p0 sequence"),
+                    ),
+                    (
+                        &sources[1],
+                        *last_sequence_by_partition.get(&1).expect("p1 sequence"),
+                    ),
+                ],
+            )
+            .await?;
+
+            let mut cdc_rows = BTreeMap::new();
+            for table_name in layout.cdc_table_names() {
+                cdc_rows.insert(
+                    table_name.clone(),
+                    collect_event_rows(&db.table(table_name)).await?,
+                );
+            }
+            let current_rows = collect_current_rows(&current).await?;
+            let projection_rows = collect_bytes_rows(&projection_output).await?;
+            let workflow_states = BTreeMap::from([
+                (
+                    "1".to_string(),
+                    workflow_runtime
+                        .load_state("1")
+                        .await?
+                        .map(expect_bytes_value),
+                ),
+                (
+                    "2".to_string(),
+                    workflow_runtime
+                        .load_state("2")
+                        .await?
+                        .map(expect_bytes_value),
+                ),
+                (
+                    "3".to_string(),
+                    workflow_runtime
+                        .load_state("3")
+                        .await?
+                        .map(expect_bytes_value),
+                ),
+            ]);
+            let progress = BTreeMap::from([
+                (
+                    0_u32,
+                    progress_store
+                        .load(&claim0.source)
+                        .await?
+                        .expect("partition 0 progress should exist"),
+                ),
+                (
+                    1_u32,
+                    progress_store
+                        .load(&claim1.source)
+                        .await?
+                        .expect("partition 1 progress should exist"),
+                ),
+            ]);
+
+            projection_handle.shutdown().await?;
+            workflow_handle.shutdown().await?;
+
+            Ok(DebeziumCampaignCapture {
+                cdc_rows,
+                current_rows,
+                projection_rows,
+                workflow_states,
+                progress,
+            })
         }
-        let current_rows = collect_current_rows(&current).await?;
-        let projection_rows = collect_bytes_rows(&projection_output).await?;
-        let workflow_states = BTreeMap::from([
-            (
-                "1".to_string(),
-                workflow_runtime
-                    .load_state("1")
-                    .await?
-                    .map(expect_bytes_value),
-            ),
-            (
-                "2".to_string(),
-                workflow_runtime
-                    .load_state("2")
-                    .await?
-                    .map(expect_bytes_value),
-            ),
-            (
-                "3".to_string(),
-                workflow_runtime
-                    .load_state("3")
-                    .await?
-                    .map(expect_bytes_value),
-            ),
-        ]);
-        let progress = BTreeMap::from([
-            (
-                0_u32,
-                progress_store
-                    .load(&claim0.source)
-                    .await?
-                    .expect("partition 0 progress should exist"),
-            ),
-            (
-                1_u32,
-                progress_store
-                    .load(&claim1.source)
-                    .await?
-                    .expect("partition 1 progress should exist"),
-            ),
-        ]);
-
-        projection_handle.shutdown().await?;
-        workflow_handle.shutdown().await?;
-
-        Ok(DebeziumCampaignCapture {
-            cdc_rows,
-            current_rows,
-            projection_rows,
-            workflow_states,
-            progress,
-        })
     })
 }
 
@@ -689,32 +737,55 @@ fn expect_bytes_value(value: Value) -> Vec<u8> {
 }
 
 #[test]
-fn hybrid_ingress_projection_and_workflow_campaign_is_seed_stable() -> turmoil::Result {
-    let first = run_seeded_campaign(0xd9_25)?;
-    let second = run_seeded_campaign(0xd9_25)?;
-    assert_eq!(first, second);
+fn hybrid_ingress_projection_and_workflow_campaign_is_seed_stable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let replay = assert_seed_replays(&DebeziumCampaignHarness, 0xd9_25)?;
+    let encoded = encode_json_artifact(&replay.scenario)?;
+    let decoded: DebeziumCampaignScenario = decode_json_artifact(&encoded)?;
+    let current_key =
+        DebeziumPrimaryKey::decode(&replay.outcome.current_rows[0].0).expect("decode mirror key");
+
+    assert_eq!(decoded, replay.scenario);
 
     assert_eq!(
-        first
+        replay
+            .outcome
             .progress
             .get(&0)
             .map(|progress| progress.next_offset.get()),
         Some(3)
     );
     assert_eq!(
-        first
+        replay
+            .outcome
             .progress
             .get(&1)
             .map(|progress| progress.next_offset.get()),
         Some(3)
     );
-    assert_eq!(first.current_rows.len(), 1);
-    assert_eq!(first.current_rows[0].0.fields.get("id"), Some(&json!(3)));
-    assert_eq!(first.workflow_states.get("1"), Some(&None));
-    assert_eq!(first.workflow_states.get("2"), Some(&None));
-    assert_eq!(first.workflow_states.get("3"), Some(&Some(b"1".to_vec())));
-    assert_eq!(first.projection_rows.len(), 1);
-    assert_eq!(first.projection_rows[0].0, b"order-3".to_vec());
+    assert_eq!(replay.outcome.current_rows.len(), 1);
+    assert_eq!(current_key.fields.get("id"), Some(&json!(3)));
+    assert_eq!(replay.outcome.workflow_states.get("1"), Some(&None));
+    assert_eq!(replay.outcome.workflow_states.get("2"), Some(&None));
+    assert_eq!(
+        replay.outcome.workflow_states.get("3"),
+        Some(&Some(b"1".to_vec()))
+    );
+    assert_eq!(replay.outcome.projection_rows.len(), 1);
+    assert_eq!(replay.outcome.projection_rows[0].0, b"order-3".to_vec());
+    Ok(())
+}
+
+#[test]
+fn hybrid_ingress_projection_and_workflow_campaign_keeps_outputs_across_delay_variants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (left, right) =
+        assert_seed_variation(&DebeziumCampaignHarness, 0xd9_25, 0xd9_26, |left, right| {
+            left.scenario != right.scenario
+        })?;
+
+    assert_ne!(left.scenario, right.scenario);
+    assert_eq!(left.outcome, right.outcome);
     Ok(())
 }
 

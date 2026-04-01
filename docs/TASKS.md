@@ -4687,7 +4687,7 @@ Add the Debezium-specific deterministic hardening pass. This phase-local capston
 
 ## Phase 19 — End-to-end CDC hardening and example app
 
-**Parallelization:** T96 lands first to freeze the example boundary, cross-cutting harness, and oracle seams. T97 then implements the example app itself. T98 follows once the example and the three underlying feature phases exist, and T99 hardens the example with restart/fault suites and polished documentation.
+**Parallelization:** T96 lands first to freeze the example boundary, cross-cutting harness, and oracle seams. T97 then implements the example app itself. T98 follows once the example and the three underlying feature phases exist, T99 hardens the example with restart/fault suites and polished documentation, and T99a follows once that CDC stack and the broader HTTP/VFS/sandbox-facing surfaces needed by the omnistack harness are available.
 
 ### T96. Freeze the end-to-end CDC harness, oracle seams, and example-app boundary
 
@@ -4831,6 +4831,51 @@ Finish the capstone work by hardening the new example app under failure/restart 
 - Example-level deterministic fault suites proving the documented operational modes survive restart and duplicate delivery as intended.
 - Smoke tests or docs checks proving the example can be run and understood without hidden setup.
 - Regression tests ensuring the example remains aligned with the supported crate APIs rather than drifting into bespoke internals.
+
+---
+
+### T99a. Build omnistack generated simulation/fuzz suites for the full first-party stack, with optional CDC ingress modes
+
+**Depends on:** T29, T32b, T32e, T33e, T33f, T40, T40h, T40q, T98, T99
+
+**Description**
+
+Add the capstone broad-input suite that intentionally spans the full first-party Terracedb stack rather than only one vertical slice at a time. This harness should compose the real production code paths for the core DB, projections, workflows, relays/outbox flows, VFS, HTTP-facing application surfaces, telemetry capture, and sandbox/VFS-native authoring surfaces where practical, and then drive them from one shared generated-scenario vocabulary. CDC should be included, but explicitly as an optional ingress mode layered onto the same downstream stack rather than as the default path for every generated run: most users will not use Kafka/Debezium, but we still want a few high-value omnistack suites that prove the optional CDC path does not break the broader system.
+
+**Implementation steps**
+
+1. Add a top-level omnistack harness (for example under `tests/` plus shared `tests/support/`) that consumes the shared T33e fuzz/simulation support layer and defines one serializable scenario language covering:
+   - direct application writes,
+   - projection/workflow/relay progress and drains,
+   - timer/clock advancement,
+   - flush/restart/fault schedules,
+   - VFS or sandbox-visible file/activity operations,
+   - HTTP requests against an application-facing surface, and
+   - optional CDC delivery steps.
+2. Build a default non-CDC omnistack mode that spans, in one run:
+   - core DB state changes,
+   - projections,
+   - workflows,
+   - relay/outbox delivery,
+   - VFS-backed or sandbox-visible artifacts,
+   - HTTP-visible read/write behavior, and
+   - emitted telemetry/observability shapes where deterministic capture is supported.
+3. Extend the oracle/shadow model so one scenario can assert cross-layer invariants such as:
+   - projection outputs match the modeled retained state,
+   - workflow state, timers, and outbox effects remain idempotent across restart,
+   - relay-delivered effects match durable committed outbox entries,
+   - VFS/sandbox-visible artifacts match the same logical actions seen by the DB-facing model, and
+   - HTTP-visible responses and telemetry snapshots remain consistent with the underlying logical state.
+4. Add a small number of CDC-mode omnistack suites that reuse the same downstream harness but swap ingress to Kafka + Debezium, varying duplicate delivery, partition/batch boundaries, Debezium materialization mode, and restart timing.
+5. Add at least one direct-ingest versus CDC-ingest equivalence suite for scenarios where the logical semantics should match, comparing final projection/workflow/relay/application-visible outputs rather than low-level traces.
+6. Keep the checked-in local/pre-commit slice bounded and parallel-friendly, and reserve wider omnistack seed matrices for CI/nightly runs where larger minimized scenario artifacts and longer traces are acceptable.
+
+**Verification**
+
+- Saved omnistack scenarios replay deterministically across the full first-party stack and can be minimized into stable local repros.
+- At least one generated suite spans core DB, projections, workflows, relays, VFS, HTTP-facing surfaces, and sandbox/VFS-native authoring behavior in one harness rather than as separate crate-local tests.
+- CDC-mode omnistack suites prove the optional Kafka/Debezium path preserves downstream logical invariants and remains diagnosable under duplicate delivery, restart, and replay/live-mode variation.
+- Direct-ingest and CDC-ingest equivalence suites prove that, where semantics are intended to match, optional CDC ingress changes only the ingest path and not the final user-visible logical state.
 
 ---
 
