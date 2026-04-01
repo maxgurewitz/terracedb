@@ -19,22 +19,31 @@ use terracedb::{
     ReadError, ReadSet, ScanOptions, Snapshot, StorageError, StorageErrorKind, Table, Timestamp,
     Value,
 };
+use terracedb_projections::{
+    ProjectionContext, ProjectionError, ProjectionHandler, ProjectionHandlerError,
+    ProjectionRuntime, ProjectionSequenceRun, ProjectionTransaction, RecomputeStrategy,
+    SingleSourceProjection,
+};
 
 #[cfg(test)]
 use parking_lot::Mutex;
 
 use crate::{
     BLOB_ACTIVITY_TABLE_NAME, BLOB_ALIAS_TABLE_NAME, BLOB_CATALOG_TABLE_NAME,
-    BLOB_OBJECT_GC_TABLE_NAME, BlobActivityEntry, BlobActivityId, BlobActivityKey,
-    BlobActivityKind, BlobActivityOptions, BlobActivityReceiver, BlobActivityStream, BlobAlias,
-    BlobAliasKey, BlobCatalogKey, BlobCollection, BlobCollectionConfig, BlobError, BlobGcOptions,
+    BLOB_OBJECT_GC_TABLE_NAME, BLOB_TERM_INDEX_TABLE_NAME, BLOB_TEXT_CHUNK_TABLE_NAME,
+    BlobActivityEntry, BlobActivityId, BlobActivityKey, BlobActivityKind, BlobActivityOptions,
+    BlobActivityReceiver, BlobActivityStream, BlobAlias, BlobAliasKey, BlobCatalogKey,
+    BlobCollection, BlobCollectionConfig, BlobError, BlobExtractedTextQuery, BlobGcOptions,
     BlobGcResult, BlobHandle, BlobId, BlobIndexState, BlobLocator, BlobMetadata, BlobObjectGcKey,
-    BlobObjectInfo, BlobObjectLayout, BlobPutOptions, BlobReadOptions, BlobReadResult,
-    BlobSearchRow, BlobSearchStream, BlobStore, BlobStoreByteStream, BlobStoreError, BlobWrite,
-    BlobWriteData, JsonValue, frozen_table_descriptors, upload_blob_bytes,
+    BlobObjectInfo, BlobObjectLayout, BlobPutOptions, BlobQuery, BlobReadOptions, BlobReadResult,
+    BlobSearchRow, BlobSearchStream, BlobStore, BlobStoreByteStream, BlobStoreError,
+    BlobTermIndexKey, BlobTextChunkKey, BlobTextExtractionConfig, BlobWrite, BlobWriteData,
+    JsonValue, frozen_table, frozen_table_descriptors, upload_blob_bytes,
 };
 
 const MAX_METADATA_CONFLICT_RETRIES: usize = 16;
+const METADATA_INDEX_EXTRACTOR: &str = "metadata";
+const ALL_BLOBS_TERM: &str = "__all__";
 
 #[cfg(test)]
 const INJECTED_FAILPOINT_MESSAGE: &str = "injected terracedb-bricks failpoint";
@@ -103,6 +112,16 @@ struct BlobActivityRow {
     metadata: BTreeMap<String, JsonValue>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BlobTextChunkRow {
+    text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BlobTermIndexRow {
+    source: String,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestFailpoint {
@@ -114,6 +133,16 @@ enum TestFailpoint {
 #[derive(Clone, Debug)]
 struct ResolvedBlob {
     metadata: BlobMetadata,
+}
+
+#[derive(Clone)]
+struct BlobSearchIndexProjection {
+    namespace: String,
+    catalog_table: Table,
+    text_chunk_table: Table,
+    term_index_table: Table,
+    blob_store: Arc<dyn BlobStore>,
+    extraction: Option<BlobTextExtractionConfig>,
 }
 
 impl std::fmt::Debug for TerracedbBlobCollection {
@@ -1064,43 +1093,31 @@ impl BlobCollection for TerracedbBlobCollection {
     }
 
     async fn search(&self, query: crate::BlobQuery) -> Result<BlobSearchStream, BlobError> {
-        let snapshot = self.inner.db.snapshot().await;
-        let prefix = BlobCatalogKey::namespace_prefix(self.inner.config.namespace())?;
-        let mut rows = snapshot
-            .scan_prefix(&self.inner.catalog_table, prefix, ScanOptions::default())
-            .await
-            .map_err(map_read_error)?;
-
-        let mut matches = Vec::new();
-        while let Some((key, value)) = rows.next().await {
-            let catalog_key = decode_catalog_key(&key)?;
-            let catalog_row = decode_row::<BlobCatalogRow>(value, BLOB_CATALOG_TABLE_NAME)?;
-            let metadata = catalog_row_to_metadata(
-                self.inner.config.namespace(),
-                catalog_key.blob_id,
-                catalog_row,
-            );
-            if !matches_query(&metadata, &query) {
-                continue;
-            }
-
-            matches.push(Ok(BlobSearchRow {
-                snippet: query
-                    .terms
-                    .first()
-                    .filter(|term| searchable_text(&metadata).contains(&term.to_lowercase()))
-                    .map(|term| format!("matched:{term}")),
-                metadata,
-            }));
-
-            if let Some(limit) = query.limit
-                && matches.len() >= limit
-            {
-                break;
-            }
-        }
-
-        Ok(Box::pin(futures::stream::iter(matches)))
+        let (text_chunk_table, term_index_table) =
+            ensure_search_tables(&self.inner.db, self.inner.config.create_if_missing).await?;
+        sync_search_indexes(
+            &self.inner.db,
+            &self.inner.catalog_table,
+            &term_index_table,
+            &text_chunk_table,
+            self.inner.config.namespace(),
+            self.inner.blob_store.clone(),
+            self.inner.config.text_extraction().cloned(),
+        )
+        .await?;
+        let rows = query_search_indexes(
+            &self.inner.db,
+            &self.inner.catalog_table,
+            &term_index_table,
+            &text_chunk_table,
+            self.inner.config.namespace(),
+            self.inner.config.text_extraction(),
+            &query,
+        )
+        .await?;
+        Ok(Box::pin(futures::stream::iter(
+            rows.into_iter().map(Ok::<_, BlobError>),
+        )))
     }
 
     async fn activity_since(
@@ -1171,6 +1188,748 @@ fn now_timestamp() -> Timestamp {
         .as_micros()
         .min(u64::MAX as u128) as u64;
     Timestamp::new(micros)
+}
+
+#[async_trait]
+impl ProjectionHandler for BlobSearchIndexProjection {
+    async fn apply_with_context(
+        &self,
+        _run: &ProjectionSequenceRun,
+        ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        clear_output_namespace(&self.term_index_table, &self.namespace, tx).await?;
+        clear_output_namespace(&self.text_chunk_table, &self.namespace, tx).await?;
+
+        let (catalog_start, catalog_end) =
+            namespace_scan_range(&self.namespace).map_err(wrap_handler_blob_error)?;
+        let mut rows = ctx
+            .scan(
+                &self.catalog_table,
+                catalog_start,
+                catalog_end,
+                ScanOptions::default(),
+            )
+            .await?;
+
+        while let Some((key, value)) = rows.next().await {
+            let catalog_key = decode_catalog_key(&key).map_err(wrap_handler_blob_error)?;
+            let catalog_row = decode_row::<BlobCatalogRow>(value, BLOB_CATALOG_TABLE_NAME)
+                .map_err(wrap_handler_blob_error)?;
+            let metadata =
+                catalog_row_to_metadata(&self.namespace, catalog_key.blob_id, catalog_row);
+            index_blob_metadata(
+                &self.term_index_table,
+                &self.text_chunk_table,
+                self.blob_store.as_ref(),
+                self.extraction.as_ref(),
+                &metadata,
+                tx,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+}
+
+async fn sync_search_indexes(
+    db: &Db,
+    catalog_table: &Table,
+    term_index_table: &Table,
+    text_chunk_table: &Table,
+    namespace: &str,
+    blob_store: Arc<dyn BlobStore>,
+    extraction: Option<BlobTextExtractionConfig>,
+) -> Result<(), BlobError> {
+    let runtime = ProjectionRuntime::open(db.clone())
+        .await
+        .map_err(map_projection_error)?;
+    let projection_name = search_projection_name(namespace, extraction.as_ref());
+    let mut handle = runtime
+        .start_single_source(
+            SingleSourceProjection::new(
+                projection_name.clone(),
+                catalog_table.clone(),
+                BlobSearchIndexProjection {
+                    namespace: namespace.to_string(),
+                    catalog_table: catalog_table.clone(),
+                    text_chunk_table: text_chunk_table.clone(),
+                    term_index_table: term_index_table.clone(),
+                    blob_store,
+                    extraction,
+                },
+            )
+            .with_outputs([term_index_table.clone(), text_chunk_table.clone()])
+            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+        )
+        .await
+        .map_err(map_projection_error)?;
+    let target = db.subscribe_durable(catalog_table).current();
+    let wait_result = handle.wait_for_sources([(catalog_table, target)]).await;
+    let shutdown_result = handle.shutdown().await;
+
+    match (wait_result, shutdown_result) {
+        (Err(_wait_error), Err(shutdown_error)) => Err(map_projection_error(shutdown_error)),
+        (Err(wait_error), _) => Err(map_projection_error(wait_error)),
+        (Ok(_), Err(shutdown_error)) => Err(map_projection_error(shutdown_error)),
+        (Ok(_), Ok(())) => Ok(()),
+    }
+}
+
+async fn query_search_indexes(
+    db: &Db,
+    catalog_table: &Table,
+    term_index_table: &Table,
+    text_chunk_table: &Table,
+    namespace: &str,
+    extraction: Option<&BlobTextExtractionConfig>,
+    query: &BlobQuery,
+) -> Result<Vec<BlobSearchRow>, BlobError> {
+    let snapshot = db.snapshot().await;
+    let extracted_text =
+        require_supported_extracted_text_query(extraction, query.extracted_text.as_ref())?;
+    let mut candidate_ids: Option<BTreeSet<BlobId>> = None;
+
+    if let Some(alias_prefix) = query.alias_prefix.as_ref() {
+        let alias_term_prefix = alias_index_term(alias_prefix);
+        let ids = collect_blob_ids_in_term_prefix(
+            &snapshot,
+            term_index_table,
+            namespace,
+            &alias_term_prefix,
+            METADATA_INDEX_EXTRACTOR,
+        )
+        .await?;
+        intersect_candidates(&mut candidate_ids, ids);
+    }
+
+    if let Some(content_type) = query.content_type.as_ref() {
+        let ids = collect_blob_ids_for_exact_term(
+            &snapshot,
+            term_index_table,
+            namespace,
+            &content_type_index_term(content_type),
+            METADATA_INDEX_EXTRACTOR,
+        )
+        .await?;
+        intersect_candidates(&mut candidate_ids, ids);
+    }
+
+    for (key, value) in &query.required_tags {
+        let ids = collect_blob_ids_for_exact_term(
+            &snapshot,
+            term_index_table,
+            namespace,
+            &tag_index_term(key, value),
+            METADATA_INDEX_EXTRACTOR,
+        )
+        .await?;
+        intersect_candidates(&mut candidate_ids, ids);
+    }
+
+    for (key, value) in &query.required_metadata {
+        let ids = collect_blob_ids_for_exact_term(
+            &snapshot,
+            term_index_table,
+            namespace,
+            &metadata_exact_index_term(key, value),
+            METADATA_INDEX_EXTRACTOR,
+        )
+        .await?;
+        intersect_candidates(&mut candidate_ids, ids);
+    }
+
+    for term in normalize_query_terms(&query.terms) {
+        let ids = collect_blob_ids_for_exact_term(
+            &snapshot,
+            term_index_table,
+            namespace,
+            &term,
+            METADATA_INDEX_EXTRACTOR,
+        )
+        .await?;
+        intersect_candidates(&mut candidate_ids, ids);
+    }
+
+    if let Some(extracted) = extracted_text {
+        for term in normalize_query_terms(&extracted.terms) {
+            let ids = collect_blob_ids_for_exact_term(
+                &snapshot,
+                term_index_table,
+                namespace,
+                &term,
+                &extracted.extractor,
+            )
+            .await?;
+            intersect_candidates(&mut candidate_ids, ids);
+        }
+    }
+
+    if query.min_size_bytes.is_some() || query.max_size_bytes.is_some() {
+        let ids = collect_blob_ids_in_numeric_term_range(
+            &snapshot,
+            term_index_table,
+            namespace,
+            "size",
+            query.min_size_bytes.unwrap_or(0),
+            query.max_size_bytes.unwrap_or(u64::MAX),
+            METADATA_INDEX_EXTRACTOR,
+        )
+        .await?;
+        intersect_candidates(&mut candidate_ids, ids);
+    }
+
+    if query.created_after.is_some() || query.created_before.is_some() {
+        let ids = collect_blob_ids_in_numeric_term_range(
+            &snapshot,
+            term_index_table,
+            namespace,
+            "created_at",
+            query.created_after.map(Timestamp::get).unwrap_or(0),
+            query.created_before.map(Timestamp::get).unwrap_or(u64::MAX),
+            METADATA_INDEX_EXTRACTOR,
+        )
+        .await?;
+        intersect_candidates(&mut candidate_ids, ids);
+    }
+
+    let candidate_ids = match candidate_ids {
+        Some(ids) => ids,
+        None => {
+            collect_blob_ids_for_exact_term(
+                &snapshot,
+                term_index_table,
+                namespace,
+                ALL_BLOBS_TERM,
+                METADATA_INDEX_EXTRACTOR,
+            )
+            .await?
+        }
+    };
+
+    let metadata_terms = normalize_query_terms(&query.terms);
+    let extracted_terms = extracted_text
+        .map(|value| normalize_query_terms(&value.terms))
+        .unwrap_or_default();
+
+    let mut rows = Vec::new();
+    for blob_id in candidate_ids {
+        let Some(catalog_row) =
+            read_catalog_row_at(&snapshot, catalog_table, namespace, blob_id).await?
+        else {
+            continue;
+        };
+        let metadata = catalog_row_to_metadata(namespace, blob_id, catalog_row);
+        if !matches_query(&metadata, query) {
+            continue;
+        }
+
+        let snippet = if let Some(extracted) = extracted_text {
+            find_text_snippet(
+                &snapshot,
+                text_chunk_table,
+                namespace,
+                blob_id,
+                &extracted.extractor,
+                &extracted_terms,
+            )
+            .await?
+        } else {
+            metadata_terms.first().map(|term| format!("matched:{term}"))
+        };
+
+        rows.push(BlobSearchRow { metadata, snippet });
+    }
+
+    rows.sort_by(|left, right| {
+        left.metadata
+            .created_at
+            .get()
+            .cmp(&right.metadata.created_at.get())
+            .then_with(|| left.metadata.id.cmp(&right.metadata.id))
+    });
+    if let Some(limit) = query.limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
+}
+
+async fn ensure_search_tables(
+    db: &Db,
+    _create_if_missing: bool,
+) -> Result<(Table, Table), BlobError> {
+    let text_chunk_descriptor = frozen_table(BLOB_TEXT_CHUNK_TABLE_NAME)
+        .expect("blob text chunk table descriptor should exist");
+    let term_index_descriptor = frozen_table(BLOB_TERM_INDEX_TABLE_NAME)
+        .expect("blob term index table descriptor should exist");
+    let text_chunk_table = ensure_reserved_table(db, text_chunk_descriptor, true).await?;
+    let term_index_table = ensure_reserved_table(db, term_index_descriptor, true).await?;
+    Ok((text_chunk_table, term_index_table))
+}
+
+async fn ensure_reserved_table(
+    db: &Db,
+    descriptor: &crate::FrozenTableDescriptor,
+    create_if_missing: bool,
+) -> Result<Table, BlobError> {
+    if let Some(table) = db.try_table(descriptor.name) {
+        return Ok(table);
+    }
+
+    if !create_if_missing {
+        return Err(BlobError::Storage(StorageError::not_found(format!(
+            "missing terracedb-bricks reserved table {}",
+            descriptor.name
+        ))));
+    }
+
+    match db.create_table(descriptor.table_config()).await {
+        Ok(table) => Ok(table),
+        Err(CreateTableError::AlreadyExists(_)) => db.try_table(descriptor.name).ok_or_else(|| {
+            BlobError::Storage(StorageError::corruption(format!(
+                "terracedb-bricks reserved table {} raced into existence but cannot be opened",
+                descriptor.name
+            )))
+        }),
+        Err(error) => Err(map_create_table_error(error)),
+    }
+}
+
+async fn clear_output_namespace(
+    table: &Table,
+    namespace: &str,
+    tx: &mut ProjectionTransaction,
+) -> Result<(), ProjectionHandlerError> {
+    let (start, end) = namespace_scan_range(namespace).map_err(wrap_handler_blob_error)?;
+    let mut rows = table
+        .scan(start, end, ScanOptions::default())
+        .await
+        .map_err(ProjectionHandlerError::from)?;
+    while let Some((key, _value)) = rows.next().await {
+        tx.delete(table, key);
+    }
+    Ok(())
+}
+
+async fn index_blob_metadata(
+    term_index_table: &Table,
+    text_chunk_table: &Table,
+    blob_store: &dyn BlobStore,
+    extraction: Option<&BlobTextExtractionConfig>,
+    metadata: &BlobMetadata,
+    tx: &mut ProjectionTransaction,
+) -> Result<(), ProjectionHandlerError> {
+    for term in metadata_index_terms(metadata) {
+        tx.put(
+            term_index_table,
+            BlobTermIndexKey {
+                namespace: metadata.namespace.clone(),
+                term,
+                blob_id: metadata.id,
+                extractor: METADATA_INDEX_EXTRACTOR.to_string(),
+                chunk_index: 0,
+            }
+            .encode()
+            .map_err(BlobError::from)
+            .map_err(wrap_handler_blob_error)?,
+            encode_row(&BlobTermIndexRow {
+                source: METADATA_INDEX_EXTRACTOR.to_string(),
+            })
+            .map_err(wrap_handler_blob_error)?,
+        );
+    }
+
+    let Some(extraction) = extraction else {
+        return Ok(());
+    };
+
+    let extracted_chunks = extract_text_chunks(blob_store, metadata, extraction).await?;
+    for (chunk_index, chunk) in extracted_chunks.into_iter().enumerate() {
+        let chunk_index = u32::try_from(chunk_index).map_err(|_| {
+            ProjectionHandlerError::new(std::io::Error::other(
+                "blob extraction produced too many chunks for u32 chunk indexes",
+            ))
+        })?;
+        tx.put(
+            text_chunk_table,
+            BlobTextChunkKey {
+                namespace: metadata.namespace.clone(),
+                blob_id: metadata.id,
+                extractor: extraction.extractor.clone(),
+                chunk_index,
+            }
+            .encode()
+            .map_err(BlobError::from)
+            .map_err(wrap_handler_blob_error)?,
+            encode_row(&BlobTextChunkRow {
+                text: chunk.clone(),
+            })
+            .map_err(wrap_handler_blob_error)?,
+        );
+        for term in tokenize_terms(&chunk) {
+            tx.put(
+                term_index_table,
+                BlobTermIndexKey {
+                    namespace: metadata.namespace.clone(),
+                    term,
+                    blob_id: metadata.id,
+                    extractor: extraction.extractor.clone(),
+                    chunk_index,
+                }
+                .encode()
+                .map_err(BlobError::from)
+                .map_err(wrap_handler_blob_error)?,
+                encode_row(&BlobTermIndexRow {
+                    source: extraction.extractor.clone(),
+                })
+                .map_err(wrap_handler_blob_error)?,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn extract_text_chunks(
+    blob_store: &dyn BlobStore,
+    metadata: &BlobMetadata,
+    extraction: &BlobTextExtractionConfig,
+) -> Result<Vec<String>, ProjectionHandlerError> {
+    let mut stream = blob_store
+        .get(&metadata.object_key, crate::BlobGetOptions::default())
+        .await
+        .map_err(ProjectionHandlerError::new)?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ProjectionHandlerError::new)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ok(Vec::new());
+    };
+    Ok(split_text_chunks(&text, extraction.chunk_bytes.max(1)))
+}
+
+async fn collect_blob_ids_for_exact_term(
+    snapshot: &Snapshot,
+    table: &Table,
+    namespace: &str,
+    term: &str,
+    extractor: &str,
+) -> Result<BTreeSet<BlobId>, BlobError> {
+    let prefix = exact_term_prefix(namespace, term)?;
+    let mut rows = snapshot
+        .scan_prefix(table, prefix, ScanOptions::default())
+        .await
+        .map_err(map_read_error)?;
+    let mut ids = BTreeSet::new();
+    while let Some((key, _value)) = rows.next().await {
+        let term_key = decode_term_index_key(&key)?;
+        if term_key.extractor == extractor {
+            ids.insert(term_key.blob_id);
+        }
+    }
+    Ok(ids)
+}
+
+async fn collect_blob_ids_in_term_prefix(
+    snapshot: &Snapshot,
+    table: &Table,
+    namespace: &str,
+    term_prefix: &str,
+    extractor: &str,
+) -> Result<BTreeSet<BlobId>, BlobError> {
+    let start = term_prefix_start(namespace, term_prefix)?;
+    let end = prefix_end(&start);
+    collect_blob_ids_in_term_range(snapshot, table, start, end, extractor).await
+}
+
+async fn collect_blob_ids_in_numeric_term_range(
+    snapshot: &Snapshot,
+    table: &Table,
+    namespace: &str,
+    label: &str,
+    minimum: u64,
+    maximum: u64,
+    extractor: &str,
+) -> Result<BTreeSet<BlobId>, BlobError> {
+    if minimum > maximum {
+        return Ok(BTreeSet::new());
+    }
+    let start = term_prefix_start(namespace, &numeric_index_term(label, minimum))?;
+    let end = prefix_end(&term_prefix_start(
+        namespace,
+        &numeric_index_term(label, maximum),
+    )?);
+    collect_blob_ids_in_term_range(snapshot, table, start, end, extractor).await
+}
+
+async fn collect_blob_ids_in_term_range(
+    snapshot: &Snapshot,
+    table: &Table,
+    start: Vec<u8>,
+    end: Vec<u8>,
+    extractor: &str,
+) -> Result<BTreeSet<BlobId>, BlobError> {
+    let mut rows = snapshot
+        .scan(table, start, end, ScanOptions::default())
+        .await
+        .map_err(map_read_error)?;
+    let mut ids = BTreeSet::new();
+    while let Some((key, _value)) = rows.next().await {
+        let term_key = decode_term_index_key(&key)?;
+        if term_key.extractor == extractor {
+            ids.insert(term_key.blob_id);
+        }
+    }
+    Ok(ids)
+}
+
+async fn find_text_snippet(
+    snapshot: &Snapshot,
+    text_chunk_table: &Table,
+    namespace: &str,
+    blob_id: BlobId,
+    extractor: &str,
+    normalized_terms: &[String],
+) -> Result<Option<String>, BlobError> {
+    if normalized_terms.is_empty() {
+        return Ok(None);
+    }
+
+    let prefix = text_chunk_prefix(namespace, blob_id, extractor)?;
+    let mut rows = snapshot
+        .scan_prefix(text_chunk_table, prefix, ScanOptions::default())
+        .await
+        .map_err(map_read_error)?;
+    while let Some((key, value)) = rows.next().await {
+        let chunk_key = decode_text_chunk_key(&key)?;
+        if chunk_key.extractor != extractor {
+            continue;
+        }
+        let row = decode_row::<BlobTextChunkRow>(value, BLOB_TEXT_CHUNK_TABLE_NAME)?;
+        let normalized = row.text.to_lowercase();
+        if normalized_terms
+            .iter()
+            .all(|term| normalized.contains(term.as_str()))
+        {
+            return Ok(Some(compact_snippet(&row.text)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn require_supported_extracted_text_query<'a>(
+    extraction: Option<&'a BlobTextExtractionConfig>,
+    query: Option<&'a BlobExtractedTextQuery>,
+) -> Result<Option<&'a BlobExtractedTextQuery>, BlobError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let Some(extraction) = extraction else {
+        return Err(BlobError::UnsupportedOperation {
+            operation: "blob extracted-text search requires an enabled extractor",
+        });
+    };
+    if extraction.extractor != query.extractor {
+        return Err(BlobError::UnsupportedOperation {
+            operation: "blob extracted-text search requested an unsupported extractor",
+        });
+    }
+    Ok(Some(query))
+}
+
+fn metadata_index_terms(metadata: &BlobMetadata) -> BTreeSet<String> {
+    let mut terms = BTreeSet::from([
+        ALL_BLOBS_TERM.to_string(),
+        numeric_index_term("size", metadata.size_bytes),
+        numeric_index_term("created_at", metadata.created_at.get()),
+        numeric_index_term("updated_at", metadata.updated_at.get()),
+    ]);
+    if let Some(alias) = metadata.alias.as_ref() {
+        terms.insert(alias_index_term(alias.as_str()));
+        terms.extend(tokenize_terms(alias.as_str()));
+    }
+    if let Some(content_type) = metadata.content_type.as_ref() {
+        terms.insert(content_type_index_term(content_type));
+        terms.extend(tokenize_terms(content_type));
+    }
+    terms.insert(format!("digest:{}", metadata.digest.to_lowercase()));
+    terms.insert(metadata.digest.to_lowercase());
+
+    for (key, value) in &metadata.tags {
+        terms.insert(tag_index_term(key, value));
+        terms.extend(tokenize_terms(key));
+        terms.extend(tokenize_terms(value));
+    }
+    for (key, value) in &metadata.metadata {
+        terms.insert(metadata_exact_index_term(key, value));
+        terms.extend(tokenize_terms(key));
+        terms.extend(tokenize_terms(&canonical_json(value)));
+    }
+    terms
+}
+
+fn alias_index_term(alias: &str) -> String {
+    format!("alias:{}", alias.to_lowercase())
+}
+
+fn content_type_index_term(content_type: &str) -> String {
+    format!("content_type:{}", content_type.to_lowercase())
+}
+
+fn tag_index_term(key: &str, value: &str) -> String {
+    format!("tag:{}={}", key.to_lowercase(), value.to_lowercase())
+}
+
+fn metadata_exact_index_term(key: &str, value: &JsonValue) -> String {
+    format!(
+        "metadata:{}={}",
+        key.to_lowercase(),
+        canonical_json(value).to_lowercase()
+    )
+}
+
+fn numeric_index_term(label: &str, value: u64) -> String {
+    format!("{label}:{value:020}")
+}
+
+fn canonical_json(value: &JsonValue) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn tokenize_terms(text: &str) -> BTreeSet<String> {
+    text.split(|char: char| !char.is_ascii_alphanumeric())
+        .filter_map(normalize_term)
+        .collect()
+}
+
+fn normalize_query_terms(terms: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for term in terms.iter().filter_map(|term| normalize_term(term)) {
+        if seen.insert(term.clone()) {
+            normalized.push(term);
+        }
+    }
+    normalized
+}
+
+fn normalize_term(term: &str) -> Option<String> {
+    let trimmed = term.trim().to_lowercase();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn split_text_chunks(text: &str, chunk_bytes: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if !current.is_empty() && current.len() + ch.len_utf8() > chunk_bytes {
+            chunks.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn compact_snippet(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snippet = String::new();
+    for ch in compact.trim().chars().take(120) {
+        snippet.push(ch);
+    }
+    snippet
+}
+
+fn search_projection_name(
+    namespace: &str,
+    extraction: Option<&BlobTextExtractionConfig>,
+) -> String {
+    format!(
+        "terracedb-bricks-search-v1-{}-{}",
+        namespace,
+        extraction
+            .map(|config| config.extractor.as_str())
+            .unwrap_or("metadata-only")
+    )
+}
+
+fn intersect_candidates(candidates: &mut Option<BTreeSet<BlobId>>, next: BTreeSet<BlobId>) {
+    match candidates {
+        Some(existing) => {
+            *existing = existing.intersection(&next).copied().collect();
+        }
+        None => *candidates = Some(next),
+    }
+}
+
+fn namespace_scan_range(namespace: &str) -> Result<(Vec<u8>, Vec<u8>), BlobError> {
+    let prefix = BlobCatalogKey::namespace_prefix(namespace)?;
+    let end = prefix_end(&prefix);
+    Ok((prefix, end))
+}
+
+fn exact_term_prefix(namespace: &str, term: &str) -> Result<Vec<u8>, BlobError> {
+    let mut prefix = BlobCatalogKey::namespace_prefix(namespace)?;
+    prefix.extend_from_slice(term.as_bytes());
+    prefix.push(0);
+    Ok(prefix)
+}
+
+fn term_prefix_start(namespace: &str, term_prefix: &str) -> Result<Vec<u8>, BlobError> {
+    let mut start = BlobCatalogKey::namespace_prefix(namespace)?;
+    start.extend_from_slice(term_prefix.as_bytes());
+    Ok(start)
+}
+
+fn text_chunk_prefix(
+    namespace: &str,
+    blob_id: BlobId,
+    extractor: &str,
+) -> Result<Vec<u8>, BlobError> {
+    let mut prefix = BlobCatalogKey::namespace_prefix(namespace)?;
+    prefix.extend_from_slice(&blob_id.encode());
+    prefix.extend_from_slice(extractor.as_bytes());
+    prefix.push(0);
+    Ok(prefix)
+}
+
+fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    end.push(0xff);
+    end
+}
+
+fn decode_term_index_key(bytes: &[u8]) -> Result<BlobTermIndexKey, BlobError> {
+    BlobTermIndexKey::decode(bytes).map_err(|error| {
+        corruption(format!(
+            "invalid terracedb-bricks term index key in {}: {error}",
+            BLOB_TERM_INDEX_TABLE_NAME
+        ))
+    })
+}
+
+fn decode_text_chunk_key(bytes: &[u8]) -> Result<BlobTextChunkKey, BlobError> {
+    BlobTextChunkKey::decode(bytes).map_err(|error| {
+        corruption(format!(
+            "invalid terracedb-bricks text chunk key in {}: {error}",
+            BLOB_TEXT_CHUNK_TABLE_NAME
+        ))
+    })
+}
+
+fn wrap_handler_blob_error(error: BlobError) -> ProjectionHandlerError {
+    ProjectionHandlerError::new(std::io::Error::other(error.to_string()))
 }
 
 async fn ensure_bootstrap_table(
@@ -1412,6 +2171,20 @@ fn map_create_table_error(error: CreateTableError) -> BlobError {
     }
 }
 
+fn map_projection_error(error: ProjectionError) -> BlobError {
+    match error {
+        ProjectionError::CreateTable(error) => map_create_table_error(error),
+        ProjectionError::Commit(error) => map_commit_error(error),
+        ProjectionError::Read(error) => map_read_error(error),
+        ProjectionError::SnapshotTooOld(error) => BlobError::SnapshotTooOld(error),
+        ProjectionError::ChangeFeed(error) => map_change_feed_error(error),
+        ProjectionError::Storage(error) => BlobError::Storage(error),
+        other => BlobError::Storage(StorageError::unsupported(format!(
+            "terracedb-bricks search index runtime failed: {other}"
+        ))),
+    }
+}
+
 fn map_commit_error(error: CommitError) -> BlobError {
     match error {
         CommitError::Conflict => BlobError::Storage(StorageError::timeout(
@@ -1558,21 +2331,30 @@ fn searchable_text(metadata: &BlobMetadata) -> String {
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
 
     use terracedb::{
-        Db, DbConfig, DbDependencies, S3Location, StorageConfig, StubClock, StubFileSystem,
-        StubObjectStore, StubRng, TieredDurabilityMode, TieredStorageConfig,
+        Db, DbConfig, DbDependencies, S3Location, ScanOptions, StorageConfig, StubClock,
+        StubFileSystem, StubObjectStore, StubRng, Table, TieredDurabilityMode, TieredStorageConfig,
+        test_support::{FailpointMode, db_failpoint_registry, row_table_config},
+    };
+    use terracedb_projections::{
+        PROJECTION_CURSOR_TABLE_NAME, ProjectionRuntime, RecomputeStrategy, SingleSourceProjection,
+        failpoints::names as projection_failpoint_names,
     };
 
     use crate::{
-        BlobCollection as _, BlobError, BlobGcOptions, BlobObjectLayout, BlobWrite,
-        compute_blob_digest,
+        BLOB_TERM_INDEX_TABLE_NAME, BLOB_TEXT_CHUNK_TABLE_NAME, BlobCatalogKey,
+        BlobCollection as _, BlobError, BlobExtractedTextQuery, BlobGcOptions, BlobObjectLayout,
+        BlobQuery, BlobTextExtractionConfig, BlobWrite, compute_blob_digest,
     };
 
-    use super::{TerracedbBlobCollection, TestFailpoint};
+    use super::{
+        BlobCatalogRow, BlobSearchIndexProjection, TerracedbBlobCollection, TestFailpoint,
+        encode_row, ensure_search_tables, query_search_indexes, search_projection_name,
+    };
 
-    fn test_db_config(path: &str) -> DbConfig {
+    fn test_db_config(path: &str, durability: TieredDurabilityMode) -> DbConfig {
         DbConfig {
             storage: StorageConfig::Tiered(TieredStorageConfig {
                 ssd: terracedb::SsdConfig {
@@ -1583,7 +2365,7 @@ mod tests {
                     prefix: "dev".to_string(),
                 },
                 max_local_bytes: 1024 * 1024,
-                durability: TieredDurabilityMode::GroupCommit,
+                durability,
                 local_retention: terracedb::TieredLocalRetentionMode::Offload,
             }),
             hybrid_read: Default::default(),
@@ -1593,6 +2375,7 @@ mod tests {
 
     struct TestHarness {
         path: &'static str,
+        durability: TieredDurabilityMode,
         file_system: Arc<StubFileSystem>,
         object_store: Arc<StubObjectStore>,
         clock: Arc<StubClock>,
@@ -1603,6 +2386,7 @@ mod tests {
         fn new(path: &'static str) -> Self {
             Self {
                 path,
+                durability: TieredDurabilityMode::GroupCommit,
                 file_system: Arc::new(StubFileSystem::default()),
                 object_store: Arc::new(StubObjectStore::default()),
                 clock: Arc::new(StubClock::default()),
@@ -1610,9 +2394,9 @@ mod tests {
             }
         }
 
-        async fn open_collection(&self, create_if_missing: bool) -> TerracedbBlobCollection {
-            let db = Db::open(
-                test_db_config(self.path),
+        async fn open_db(&self) -> Db {
+            Db::open(
+                test_db_config(self.path, self.durability),
                 DbDependencies::new(
                     self.file_system.clone(),
                     self.object_store.clone(),
@@ -1621,17 +2405,66 @@ mod tests {
                 ),
             )
             .await
-            .expect("open db");
-            TerracedbBlobCollection::open(
-                db,
+            .expect("open db")
+        }
+
+        async fn open_collection(&self, create_if_missing: bool) -> TerracedbBlobCollection {
+            self.open_collection_with_config(
                 crate::BlobCollectionConfig::new("docs")
                     .expect("namespace")
                     .with_create_if_missing(create_if_missing),
-                self.blob_store.clone(),
             )
             .await
-            .expect("open bricks collection")
         }
+
+        async fn open_collection_and_db(
+            &self,
+            config: crate::BlobCollectionConfig,
+        ) -> (Db, TerracedbBlobCollection) {
+            let db = self.open_db().await;
+            let collection =
+                TerracedbBlobCollection::open(db.clone(), config, self.blob_store.clone())
+                    .await
+                    .expect("open bricks collection");
+            (db, collection)
+        }
+
+        async fn open_collection_with_config(
+            &self,
+            config: crate::BlobCollectionConfig,
+        ) -> TerracedbBlobCollection {
+            let db = self.open_db().await;
+            TerracedbBlobCollection::open(db, config, self.blob_store.clone())
+                .await
+                .expect("open bricks collection")
+        }
+    }
+
+    async fn collect_search(
+        collection: &TerracedbBlobCollection,
+        query: BlobQuery,
+    ) -> Vec<crate::BlobSearchRow> {
+        collection
+            .search(query)
+            .await
+            .expect("search")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect search rows")
+    }
+
+    async fn collect_keys(table: &Table, prefix: Vec<u8>) -> Vec<Vec<u8>> {
+        table
+            .scan(
+                prefix.clone(),
+                super::prefix_end(&prefix),
+                ScanOptions::default(),
+            )
+            .await
+            .expect("scan reserved table")
+            .map(|(key, _value)| key)
+            .collect()
+            .await
     }
 
     use crate::{BlobAlias, BlobStore, InMemoryBlobStore};
@@ -1713,6 +2546,429 @@ mod tests {
             .expect("stat after reopen")
             .expect("metadata should survive");
         assert_eq!(metadata.size_bytes, 5);
+    }
+
+    #[tokio::test]
+    async fn search_rebuilds_from_current_catalog_and_stays_deterministic_across_reopen() {
+        let harness = TestHarness::new("/bricks-search-rebuild");
+        let initial_config = crate::BlobCollectionConfig::new("docs")
+            .expect("namespace")
+            .with_create_if_missing(true)
+            .with_text_extraction(BlobTextExtractionConfig::plain_text());
+        let collection = harness.open_collection_with_config(initial_config).await;
+
+        collection
+            .put(BlobWrite {
+                alias: Some(BlobAlias::new("guide/one").expect("alias")),
+                data: crate::BlobWriteData::bytes("hello terracedb"),
+                content_type: Some("text/plain".to_string()),
+                tags: [("kind".to_string(), "doc".to_string())]
+                    .into_iter()
+                    .collect(),
+                metadata: [("title".to_string(), serde_json::json!("Guide One"))]
+                    .into_iter()
+                    .collect(),
+            })
+            .await
+            .expect("put guide one");
+        collection
+            .put(BlobWrite {
+                alias: Some(BlobAlias::new("guide/two").expect("alias")),
+                data: crate::BlobWriteData::bytes("deterministic terracedb indexing"),
+                content_type: Some("text/plain".to_string()),
+                tags: [("kind".to_string(), "doc".to_string())]
+                    .into_iter()
+                    .collect(),
+                metadata: [("title".to_string(), serde_json::json!("Guide Two"))]
+                    .into_iter()
+                    .collect(),
+            })
+            .await
+            .expect("put guide two");
+        collection
+            .put(BlobWrite {
+                alias: Some(BlobAlias::new("notes/three").expect("alias")),
+                data: crate::BlobWriteData::bytes("notes only"),
+                content_type: Some("text/plain".to_string()),
+                tags: [("kind".to_string(), "note".to_string())]
+                    .into_iter()
+                    .collect(),
+                metadata: [("title".to_string(), serde_json::json!("Note Three"))]
+                    .into_iter()
+                    .collect(),
+            })
+            .await
+            .expect("put note three");
+
+        let metadata_rows = collect_search(
+            &collection,
+            BlobQuery {
+                alias_prefix: Some("guide/".to_string()),
+                content_type: Some("text/plain".to_string()),
+                required_tags: [("kind".to_string(), "doc".to_string())]
+                    .into_iter()
+                    .collect(),
+                terms: vec!["guide".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            metadata_rows
+                .iter()
+                .map(|row| {
+                    row.metadata
+                        .alias
+                        .as_ref()
+                        .expect("guide row should have alias")
+                        .to_string()
+                })
+                .collect::<Vec<_>>(),
+            vec!["guide/one".to_string(), "guide/two".to_string()]
+        );
+
+        let text_rows = collect_search(
+            &collection,
+            BlobQuery {
+                extracted_text: Some(BlobExtractedTextQuery::plain_text(["deterministic"])),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(text_rows.len(), 1);
+        assert_eq!(
+            text_rows[0]
+                .metadata
+                .alias
+                .as_ref()
+                .expect("text match should have alias")
+                .as_str(),
+            "guide/two"
+        );
+        assert!(
+            text_rows[0]
+                .snippet
+                .as_deref()
+                .expect("text search should return snippet")
+                .contains("deterministic")
+        );
+
+        let reopened_config = crate::BlobCollectionConfig::new("docs")
+            .expect("namespace")
+            .with_text_extraction(BlobTextExtractionConfig::plain_text());
+        let reopened = harness.open_collection_with_config(reopened_config).await;
+        let reopened_metadata_rows = collect_search(
+            &reopened,
+            BlobQuery {
+                alias_prefix: Some("guide/".to_string()),
+                content_type: Some("text/plain".to_string()),
+                required_tags: [("kind".to_string(), "doc".to_string())]
+                    .into_iter()
+                    .collect(),
+                terms: vec!["guide".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            reopened_metadata_rows
+                .iter()
+                .map(|row| row.metadata.id)
+                .collect::<Vec<_>>(),
+            metadata_rows
+                .iter()
+                .map(|row| row.metadata.id)
+                .collect::<Vec<_>>()
+        );
+
+        let reopened_text_rows = collect_search(
+            &reopened,
+            BlobQuery {
+                extracted_text: Some(BlobExtractedTextQuery::plain_text(["deterministic"])),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            reopened_text_rows
+                .iter()
+                .map(|row| row.metadata.id)
+                .collect::<Vec<_>>(),
+            text_rows
+                .iter()
+                .map(|row| row.metadata.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reopened_text_rows[0].snippet.as_deref(),
+            text_rows[0].snippet.as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_runtime_rebuilds_search_indexes_from_current_catalog_state() {
+        let harness = TestHarness::new("/bricks-search-runtime-rebuild");
+        let config = crate::BlobCollectionConfig::new("docs")
+            .expect("namespace")
+            .with_create_if_missing(true)
+            .with_text_extraction(BlobTextExtractionConfig::plain_text());
+        let (db, collection) = harness.open_collection_and_db(config).await;
+
+        for (alias, body) in [
+            ("guide/one", "hello world"),
+            ("guide/two", "rebuild path"),
+            ("notes/three", "ignored"),
+        ] {
+            collection
+                .put(BlobWrite {
+                    alias: Some(BlobAlias::new(alias).expect("alias")),
+                    data: crate::BlobWriteData::bytes(body),
+                    content_type: Some("text/plain".to_string()),
+                    tags: BTreeMap::new(),
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .expect("put blob");
+        }
+
+        let rebuild_source = {
+            let mut config = row_table_config("blob_catalog_rebuild_source");
+            config.history_retention_sequences = Some(1);
+            db.create_table(config)
+                .await
+                .expect("create retained rebuild source")
+        };
+
+        let mut target_sequence = terracedb::SequenceNumber::new(0);
+        for alias in ["guide/one", "guide/two", "notes/three"] {
+            let metadata = collection
+                .stat(crate::BlobLocator::Alias(
+                    BlobAlias::new(alias).expect("alias"),
+                ))
+                .await
+                .expect("stat blob")
+                .expect("metadata should exist");
+            let row = BlobCatalogRow {
+                alias: metadata.alias.clone(),
+                object_key: metadata.object_key.clone(),
+                digest: metadata.digest.clone(),
+                size_bytes: metadata.size_bytes,
+                content_type: metadata.content_type.clone(),
+                tags: metadata.tags.clone(),
+                metadata: metadata.metadata.clone(),
+                created_at: metadata.created_at,
+                updated_at: metadata.updated_at,
+                index_state: metadata.index_state,
+            };
+            target_sequence = rebuild_source
+                .write(
+                    BlobCatalogKey {
+                        namespace: "docs".to_string(),
+                        blob_id: metadata.id,
+                    }
+                    .encode()
+                    .expect("encode rebuild source key"),
+                    encode_row(&row).expect("encode rebuild source row"),
+                )
+                .await
+                .expect("write rebuild source row");
+        }
+
+        let (text_chunk_table, term_index_table) = ensure_search_tables(&db, true)
+            .await
+            .expect("ensure search tables");
+        let runtime = ProjectionRuntime::open(db.clone())
+            .await
+            .expect("open projection runtime");
+        let mut handle = runtime
+            .start_single_source(
+                SingleSourceProjection::new(
+                    "custom-search-rebuild",
+                    rebuild_source.clone(),
+                    BlobSearchIndexProjection {
+                        namespace: "docs".to_string(),
+                        catalog_table: rebuild_source.clone(),
+                        text_chunk_table: text_chunk_table.clone(),
+                        term_index_table: term_index_table.clone(),
+                        blob_store: harness.blob_store.clone(),
+                        extraction: Some(BlobTextExtractionConfig::plain_text()),
+                    },
+                )
+                .with_outputs([term_index_table.clone(), text_chunk_table.clone()])
+                .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+            )
+            .await
+            .expect("start search rebuild projection");
+        handle
+            .wait_for_sources([(&rebuild_source, target_sequence)])
+            .await
+            .expect("projection should rebuild from current source state");
+
+        let rows = query_search_indexes(
+            &db,
+            &rebuild_source,
+            &term_index_table,
+            &text_chunk_table,
+            "docs",
+            Some(&BlobTextExtractionConfig::plain_text()),
+            &BlobQuery {
+                alias_prefix: Some("guide/".to_string()),
+                extracted_text: Some(BlobExtractedTextQuery::plain_text(["rebuild"])),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query rebuilt index state");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .metadata
+                .alias
+                .as_ref()
+                .expect("rebuilt row should have alias")
+                .as_str(),
+            "guide/two"
+        );
+        assert!(
+            rows[0]
+                .snippet
+                .as_deref()
+                .expect("rebuilt text search should return snippet")
+                .contains("rebuild")
+        );
+
+        handle
+            .shutdown()
+            .await
+            .expect("stop custom rebuild projection");
+    }
+
+    #[tokio::test]
+    async fn extracted_text_search_requires_explicit_opt_in() {
+        let harness = TestHarness::new("/bricks-search-opt-in");
+        let collection = harness.open_collection(true).await;
+
+        collection
+            .put(BlobWrite {
+                alias: Some(BlobAlias::new("docs/plain").expect("alias")),
+                data: crate::BlobWriteData::bytes("search me"),
+                content_type: Some("text/plain".to_string()),
+                tags: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("put text blob");
+
+        let error = match collection
+            .search(BlobQuery {
+                extracted_text: Some(BlobExtractedTextQuery::plain_text(["search"])),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => panic!("extracted-text search should fail closed without explicit extractor"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            BlobError::UnsupportedOperation { operation }
+                if operation.contains("extracted-text search")
+        ));
+    }
+
+    #[tokio::test]
+    async fn projection_failpoint_preserves_search_cursor_and_output_until_retry() {
+        let harness = TestHarness::new("/bricks-search-failpoint");
+        let config = crate::BlobCollectionConfig::new("docs")
+            .expect("namespace")
+            .with_create_if_missing(true)
+            .with_text_extraction(BlobTextExtractionConfig::plain_text());
+        let (db, collection) = harness.open_collection_and_db(config).await;
+
+        collection
+            .put(BlobWrite {
+                alias: Some(BlobAlias::new("guide/failpoint").expect("alias")),
+                data: crate::BlobWriteData::bytes("atomic deterministic indexing"),
+                content_type: Some("text/plain".to_string()),
+                tags: [("kind".to_string(), "doc".to_string())]
+                    .into_iter()
+                    .collect(),
+                metadata: [("title".to_string(), serde_json::json!("Failpoint"))]
+                    .into_iter()
+                    .collect(),
+            })
+            .await
+            .expect("put blob");
+
+        db_failpoint_registry(&db).arm_error(
+            projection_failpoint_names::PROJECTION_APPLY_BEFORE_COMMIT,
+            terracedb::StorageError::io("simulated projection failpoint"),
+            FailpointMode::Once,
+        );
+
+        let error = match collection
+            .search(BlobQuery {
+                extracted_text: Some(BlobExtractedTextQuery::plain_text(["atomic"])),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => panic!("search should surface the projection failpoint"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, BlobError::Storage(_)));
+
+        let namespace_prefix =
+            crate::BlobCatalogKey::namespace_prefix("docs").expect("namespace prefix");
+        let term_keys = collect_keys(
+            &db.table(BLOB_TERM_INDEX_TABLE_NAME),
+            namespace_prefix.clone(),
+        )
+        .await;
+        let text_keys = collect_keys(&db.table(BLOB_TEXT_CHUNK_TABLE_NAME), namespace_prefix).await;
+        assert!(term_keys.is_empty());
+        assert!(text_keys.is_empty());
+
+        let runtime = ProjectionRuntime::open(db.clone())
+            .await
+            .expect("open projection runtime");
+        assert_eq!(
+            runtime
+                .load_projection_cursor(&search_projection_name(
+                    "docs",
+                    Some(&BlobTextExtractionConfig::plain_text()),
+                ))
+                .await
+                .expect("load search projection cursor"),
+            terracedb::LogCursor::beginning()
+        );
+        assert!(
+            db.table(PROJECTION_CURSOR_TABLE_NAME)
+                .scan(Vec::new(), vec![0xff], ScanOptions::default())
+                .await
+                .expect("scan projection cursor table")
+                .count()
+                .await
+                == 0
+        );
+
+        let rows = collect_search(
+            &collection,
+            BlobQuery {
+                extracted_text: Some(BlobExtractedTextQuery::plain_text(["atomic"])),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !collect_keys(
+                &db.table(BLOB_TERM_INDEX_TABLE_NAME),
+                crate::BlobCatalogKey::namespace_prefix("docs").expect("namespace prefix"),
+            )
+            .await
+            .is_empty()
+        );
     }
 
     #[tokio::test]

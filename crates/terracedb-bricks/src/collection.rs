@@ -31,6 +31,7 @@ pub type BlobSearchStream =
 pub struct BlobCollectionConfig {
     namespace: String,
     pub create_if_missing: bool,
+    text_extraction: Option<BlobTextExtractionConfig>,
 }
 
 pub type BlobLibraryConfig = BlobCollectionConfig;
@@ -48,6 +49,7 @@ impl BlobCollectionConfig {
         Ok(Self {
             namespace,
             create_if_missing: false,
+            text_extraction: None,
         })
     }
 
@@ -58,6 +60,55 @@ impl BlobCollectionConfig {
     pub fn with_create_if_missing(mut self, create_if_missing: bool) -> Self {
         self.create_if_missing = create_if_missing;
         self
+    }
+
+    pub fn with_text_extraction(mut self, config: BlobTextExtractionConfig) -> Self {
+        self.text_extraction = Some(config);
+        self
+    }
+
+    pub fn with_plain_text_extraction(self) -> Self {
+        self.with_text_extraction(BlobTextExtractionConfig::plain_text())
+    }
+
+    pub fn text_extraction(&self) -> Option<&BlobTextExtractionConfig> {
+        self.text_extraction.as_ref()
+    }
+}
+
+pub const PLAIN_TEXT_EXTRACTOR_NAME: &str = "plain_text_v1";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobTextExtractionConfig {
+    pub extractor: String,
+    pub chunk_bytes: usize,
+}
+
+impl BlobTextExtractionConfig {
+    pub fn plain_text() -> Self {
+        Self {
+            extractor: PLAIN_TEXT_EXTRACTOR_NAME.to_string(),
+            chunk_bytes: 256,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobExtractedTextQuery {
+    pub extractor: String,
+    pub terms: Vec<String>,
+}
+
+impl BlobExtractedTextQuery {
+    pub fn plain_text<I, S>(terms: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            extractor: PLAIN_TEXT_EXTRACTOR_NAME.to_string(),
+            terms: terms.into_iter().map(Into::into).collect(),
+        }
     }
 }
 
@@ -265,6 +316,7 @@ pub struct BlobQuery {
     pub required_tags: BTreeMap<String, String>,
     pub required_metadata: BTreeMap<String, JsonValue>,
     pub terms: Vec<String>,
+    pub extracted_text: Option<BlobExtractedTextQuery>,
     pub min_size_bytes: Option<u64>,
     pub max_size_bytes: Option<u64>,
     pub created_after: Option<Timestamp>,
@@ -694,27 +746,53 @@ impl BlobCollection for InMemoryBlobCollection {
     }
 
     async fn search(&self, query: BlobQuery) -> Result<BlobSearchStream, BlobError> {
-        let mut rows = {
+        let extracted_text = validate_extracted_text_query(
+            self.inner.config.text_extraction(),
+            query.extracted_text.as_ref(),
+        )?;
+        let metadata_rows = {
             let state = lock(&self.inner.state);
             state
                 .blobs
                 .values()
                 .filter(|metadata| matches_query(metadata, &query))
                 .cloned()
-                .map(|metadata| {
-                    Ok(BlobSearchRow {
-                        snippet: query
-                            .terms
-                            .first()
-                            .filter(|term| {
-                                searchable_text(&metadata).contains(&term.to_lowercase())
-                            })
-                            .map(|term| format!("matched:{term}")),
-                        metadata,
-                    })
-                })
                 .collect::<Vec<_>>()
         };
+
+        let extracted_terms = extracted_text
+            .map(|query| normalize_query_terms(&query.terms))
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        for metadata in metadata_rows {
+            let snippet = if extracted_text.is_some() {
+                let bytes = crate::read_blob_bytes(
+                    self.inner.blob_store.as_ref(),
+                    &metadata.object_key,
+                    crate::BlobGetOptions::default(),
+                )
+                .await?;
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                let normalized = text.to_lowercase();
+                if !extracted_terms
+                    .iter()
+                    .all(|term| normalized.contains(term.as_str()))
+                {
+                    continue;
+                }
+                Some(compact_snippet(&text))
+            } else {
+                query
+                    .terms
+                    .first()
+                    .filter(|term| searchable_text(&metadata).contains(&term.to_lowercase()))
+                    .map(|term| format!("matched:{term}"))
+            };
+
+            rows.push(Ok(BlobSearchRow { metadata, snippet }));
+        }
         if let Some(limit) = query.limit {
             rows.truncate(limit);
         }
@@ -856,4 +934,48 @@ fn past_grace(reference: Option<Timestamp>, now: Timestamp, grace_period: Durati
     };
     let grace_micros = grace_period.as_micros().min(u64::MAX as u128) as u64;
     reference.get().saturating_add(grace_micros) <= now.get()
+}
+
+fn validate_extracted_text_query<'a>(
+    extraction: Option<&'a BlobTextExtractionConfig>,
+    query: Option<&'a BlobExtractedTextQuery>,
+) -> Result<Option<&'a BlobExtractedTextQuery>, BlobError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let Some(extraction) = extraction else {
+        return Err(BlobError::UnsupportedOperation {
+            operation: "blob extracted-text search requires an enabled extractor",
+        });
+    };
+    if extraction.extractor != query.extractor {
+        return Err(BlobError::UnsupportedOperation {
+            operation: "blob extracted-text search requested an unsupported extractor",
+        });
+    }
+    Ok(Some(query))
+}
+
+fn normalize_query_terms(terms: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for term in terms
+        .iter()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+    {
+        if seen.insert(term.clone()) {
+            normalized.push(term);
+        }
+    }
+    normalized
+}
+
+fn compact_snippet(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect()
 }

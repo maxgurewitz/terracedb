@@ -8,12 +8,12 @@ use terracedb::{
     StubObjectStore, StubRng, TieredDurabilityMode, TieredStorageConfig,
 };
 use terracedb_bricks::{
-    BlobAlias, BlobCollection, BlobCollectionConfig, BlobHandle, BlobLocator, BlobObjectLayout,
-    BlobPutOptions, BlobQuery, BlobReadOptions, BlobStore, BlobStoreFailure, BlobWrite,
-    BlobWriteData, InMemoryBlobStore, TerracedbBlobCollection, compute_blob_digest,
-    read_blob_bytes, upload_blob_bytes,
+    BlobAlias, BlobCollection, BlobCollectionConfig, BlobExtractedTextQuery, BlobHandle,
+    BlobLocator, BlobObjectLayout, BlobPutOptions, BlobQuery, BlobReadOptions, BlobStore,
+    BlobStoreFailure, BlobWrite, BlobWriteData, InMemoryBlobStore, TerracedbBlobCollection,
+    compute_blob_digest, read_blob_bytes, upload_blob_bytes,
 };
-use terracedb_simulation::SeededSimulationRunner;
+use terracedb_simulation::{CutPoint, SeededSimulationRunner};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BlobStoreSimulationCapture {
@@ -101,6 +101,172 @@ fn blob_store_simulation_changes_shape_for_different_seeds() -> turmoil::Result 
     assert_ne!(left.digest, right.digest);
     assert_eq!(left.listed_keys, vec![left.object_key.clone()]);
     assert_eq!(right.listed_keys, vec![right.object_key.clone()]);
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexedSearchSimulationCapture {
+    alias_hits: Vec<String>,
+    text_hits: Vec<(String, Option<String>)>,
+}
+
+fn tiered_simulation_config(path: &str) -> DbConfig {
+    DbConfig {
+        storage: StorageConfig::Tiered(TieredStorageConfig {
+            ssd: terracedb::SsdConfig {
+                path: path.to_string(),
+            },
+            s3: S3Location {
+                bucket: "terracedb-bricks-test".to_string(),
+                prefix: "simulation".to_string(),
+            },
+            max_local_bytes: 1024 * 1024,
+            durability: TieredDurabilityMode::GroupCommit,
+            local_retention: terracedb::TieredLocalRetentionMode::Offload,
+        }),
+        hybrid_read: Default::default(),
+        scheduler: None,
+    }
+}
+
+async fn collect_alias_hits(collection: &TerracedbBlobCollection) -> Vec<String> {
+    collection
+        .search(BlobQuery {
+            alias_prefix: Some("guide/".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("search current aliases")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect alias hits")
+        .into_iter()
+        .map(|row| {
+            row.metadata
+                .alias
+                .expect("search hit should keep alias")
+                .to_string()
+        })
+        .collect()
+}
+
+async fn collect_text_hits(collection: &TerracedbBlobCollection) -> Vec<(String, Option<String>)> {
+    collection
+        .search(BlobQuery {
+            extracted_text: Some(BlobExtractedTextQuery::plain_text(["deterministic"])),
+            ..Default::default()
+        })
+        .await
+        .expect("search extracted text")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect text hits")
+        .into_iter()
+        .map(|row| {
+            let alias = row
+                .metadata
+                .alias
+                .expect("search hit should keep alias")
+                .to_string();
+            (alias, row.snippet)
+        })
+        .collect()
+}
+
+fn run_indexed_search_simulation(seed: u64) -> turmoil::Result<IndexedSearchSimulationCapture> {
+    SeededSimulationRunner::new(seed)
+        .with_simulation_duration(Duration::from_secs(1))
+        .run_with(move |context| async move {
+            let config = tiered_simulation_config(&format!("/terracedb-bricks-search-{seed}"));
+            let blob_store = Arc::new(InMemoryBlobStore::new());
+            let collection_config = BlobCollectionConfig::new("docs")
+                .expect("namespace")
+                .with_create_if_missing(true)
+                .with_plain_text_extraction();
+
+            let db = context.open_db(config.clone()).await.expect("open db");
+            let collection =
+                TerracedbBlobCollection::open(db, collection_config.clone(), blob_store.clone())
+                    .await
+                    .expect("open collection");
+
+            for (alias, body) in [
+                (
+                    "guide/latest",
+                    format!(
+                        "deterministic search guide {seed:x} {}",
+                        context.rng().next_u64() % 10_000
+                    ),
+                ),
+                (
+                    "guide/reference",
+                    format!(
+                        "deterministic reference notes {seed:x} {}",
+                        context.rng().next_u64() % 10_000
+                    ),
+                ),
+                (
+                    "notes/today",
+                    format!(
+                        "private note {seed:x} {}",
+                        context.rng().next_u64() % 10_000
+                    ),
+                ),
+            ] {
+                collection
+                    .put(BlobWrite {
+                        alias: Some(BlobAlias::new(alias).expect("alias")),
+                        data: BlobWriteData::bytes(body.into_bytes()),
+                        content_type: Some("text/plain".to_string()),
+                        tags: BTreeMap::new(),
+                        metadata: BTreeMap::new(),
+                    })
+                    .await
+                    .expect("put blob");
+            }
+
+            let alias_hits = collect_alias_hits(&collection).await;
+            let text_hits = collect_text_hits(&collection).await;
+
+            let reopened_db = context
+                .restart_db(config, CutPoint::AfterDurabilityBoundary)
+                .await
+                .expect("restart db");
+            let reopened =
+                TerracedbBlobCollection::open(reopened_db, collection_config, blob_store)
+                    .await
+                    .expect("reopen collection");
+
+            let reopened_alias_hits = collect_alias_hits(&reopened).await;
+            let reopened_text_hits = collect_text_hits(&reopened).await;
+
+            assert_eq!(reopened_alias_hits, alias_hits);
+            assert_eq!(reopened_text_hits, text_hits);
+
+            Ok(IndexedSearchSimulationCapture {
+                alias_hits,
+                text_hits,
+            })
+        })
+}
+
+#[test]
+fn blob_search_index_simulation_replays_same_seed_across_restart() -> turmoil::Result {
+    let first = run_indexed_search_simulation(0x4420)?;
+    let second = run_indexed_search_simulation(0x4420)?;
+
+    assert_eq!(first, second);
+    assert_eq!(
+        first.alias_hits,
+        vec!["guide/latest".to_string(), "guide/reference".to_string()]
+    );
+    assert_eq!(first.text_hits.len(), 2);
+    assert!(
+        first
+            .text_hits
+            .iter()
+            .all(|(alias, snippet)| alias.starts_with("guide/") && snippet.is_some())
+    );
     Ok(())
 }
 
