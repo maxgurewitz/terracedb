@@ -2007,11 +2007,11 @@ async fn pending_work_reports_flush_and_compaction_backlog() {
     let flush_stats = db.table_stats(&table).await;
     assert_eq!(flush_stats.immutable_memtable_count, 1);
     assert!(flush_stats.pending_flush_bytes > 0);
-    let flush_work = db.pending_work().await;
-    assert!(flush_work.iter().any(|work| {
-        work.work_type == PendingWorkType::Flush
-            && work.table == "events"
-            && work.estimated_bytes > 0
+    let flush_work = db.scheduler_progress_snapshot().await;
+    assert!(flush_work.pending_work.iter().any(|work| {
+        work.work.work_type == PendingWorkType::Flush
+            && work.work.table == "events"
+            && work.work.estimated_bytes > 0
     }));
 
     db.flush().await.expect("flush immutable backlog");
@@ -2021,12 +2021,10 @@ async fn pending_work_reports_flush_and_compaction_backlog() {
         .expect("write second value");
     db.flush().await.expect("flush second l0");
 
-    let compaction_work = db.pending_work().await;
-    assert!(
-        compaction_work.iter().any(|work| {
-            work.work_type == PendingWorkType::Compaction && work.table == "events"
-        })
-    );
+    let compaction_work = db.scheduler_progress_snapshot().await;
+    assert!(compaction_work.pending_work.iter().any(|work| {
+        work.work.work_type == PendingWorkType::Compaction && work.work.table == "events"
+    }));
 }
 
 #[tokio::test]
@@ -3002,9 +3000,10 @@ async fn scheduler_choice_controls_which_compaction_runs_first() {
     assert!(db.table_stats(&alpha).await.compaction_debt > 0);
     assert!(db.table_stats(&beta).await.compaction_debt > 0);
     assert!(
-        db.run_next_scheduled_work()
+        db.step_scheduler_background_work()
             .await
             .expect("run scheduled work")
+            .progressed
     );
 
     assert!(db.table_stats(&alpha).await.compaction_debt > 0);
@@ -3056,45 +3055,100 @@ async fn round_robin_scheduler_services_three_backlogged_tables_within_three_pas
     assert!(db.table_stats(&beta).await.compaction_debt > 0);
     assert!(db.table_stats(&gamma).await.compaction_debt > 0);
 
-    assert!(
-        db.run_next_scheduled_work()
-            .await
-            .expect("run first scheduled work")
-    );
+    let first = db
+        .step_scheduler_background_work()
+        .await
+        .expect("run first scheduled work");
+    assert!(first.progressed);
     assert_eq!(db.table_stats(&alpha).await.compaction_debt, 0);
     assert!(db.table_stats(&beta).await.compaction_debt > 0);
     assert!(db.table_stats(&gamma).await.compaction_debt > 0);
-    let mut remaining = db
-        .pending_work()
-        .await
+    let mut remaining = first
+        .snapshot
+        .pending_work
         .into_iter()
-        .map(|work| work.table)
+        .map(|work| work.work.table)
         .collect::<Vec<_>>();
     remaining.sort();
     assert_eq!(remaining, vec!["beta".to_string(), "gamma".to_string()]);
 
-    assert!(
-        db.run_next_scheduled_work()
-            .await
-            .expect("run second scheduled work")
-    );
+    let second = db
+        .step_scheduler_background_work()
+        .await
+        .expect("run second scheduled work");
+    assert!(second.progressed);
     assert_eq!(db.table_stats(&beta).await.compaction_debt, 0);
     assert!(db.table_stats(&gamma).await.compaction_debt > 0);
-    let remaining = db
-        .pending_work()
-        .await
+    let remaining = second
+        .snapshot
+        .pending_work
         .into_iter()
-        .map(|work| work.table)
+        .map(|work| work.work.table)
         .collect::<Vec<_>>();
     assert_eq!(remaining, vec!["gamma".to_string()]);
 
-    assert!(
-        db.run_next_scheduled_work()
-            .await
-            .expect("run third scheduled work")
-    );
+    let third = db
+        .step_scheduler_background_work()
+        .await
+        .expect("run third scheduled work");
+    assert!(third.progressed);
     assert_eq!(db.table_stats(&gamma).await.compaction_debt, 0);
-    assert!(db.pending_work().await.is_empty());
+    assert!(third.is_idle());
+}
+
+#[tokio::test]
+async fn scheduler_wait_for_idle_reports_step_count_and_drains_pending_work() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/scheduler-wait-idle",
+            Arc::new(crate::RoundRobinScheduler::default()),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let alpha = db
+        .create_table(row_table_config("alpha"))
+        .await
+        .expect("create alpha");
+    let beta = db
+        .create_table(row_table_config("beta"))
+        .await
+        .expect("create beta");
+    let gamma = db
+        .create_table(row_table_config("gamma"))
+        .await
+        .expect("create gamma");
+
+    for round in 0..2_u8 {
+        alpha
+            .write(vec![b'a', round], Value::Bytes(vec![round]))
+            .await
+            .expect("write alpha");
+        beta.write(vec![b'b', round], Value::Bytes(vec![round]))
+            .await
+            .expect("write beta");
+        gamma
+            .write(vec![b'g', round], Value::Bytes(vec![round]))
+            .await
+            .expect("write gamma");
+        db.flush().await.expect("flush round");
+    }
+
+    let before = db.scheduler_progress_snapshot().await;
+    assert!(!before.is_idle());
+
+    let idle = db
+        .wait_for_scheduler_idle(3)
+        .await
+        .expect("drain scheduler background work");
+    assert!(idle.is_idle());
+    assert_eq!(idle.steps, 3);
+    assert_eq!(db.table_stats(&alpha).await.compaction_debt, 0);
+    assert_eq!(db.table_stats(&beta).await.compaction_debt, 0);
+    assert_eq!(db.table_stats(&gamma).await.compaction_debt, 0);
 }
 
 #[tokio::test]
@@ -3548,16 +3602,18 @@ async fn budget_blocked_compaction_is_forced_and_reported() {
     }
 
     assert!(
-        db.pending_work()
+        db.scheduler_progress_snapshot()
             .await
+            .pending_work
             .iter()
-            .any(|work| work.work_type == PendingWorkType::Compaction),
+            .any(|work| work.work.work_type == PendingWorkType::Compaction),
         "fixture should create compaction backlog",
     );
     assert!(
-        db.run_next_scheduled_work()
+        db.step_scheduler_background_work()
             .await
-            .expect("run budgeted scheduler pass"),
+            .expect("run budgeted scheduler pass")
+            .progressed,
         "scheduler pass should force some work to execute",
     );
 

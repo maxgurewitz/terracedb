@@ -178,6 +178,10 @@ Some tests are not about state at all; they are about whether background work
 or delayed work eventually makes progress. In those cases, prefer a bounded
 progress helper over sleeps or incidental yields:
 
+- `Db::run_next_scheduled_work()` / `Db::wait_for_scheduler_idle(...)`
+  Use these for scheduler-driven flush/compaction/offload progress when the
+  test needs to assert "one background step happened" or "the scheduler is now
+  idle" without open-coding trigger writes, repeated polling, or yield loops.
 - `ClockProgressProbe`
   Use this when a test needs bounded virtual-time advancement to drive a task,
   wait for a failpoint, or make a single explicit clock/progress step without
@@ -225,11 +229,14 @@ categories:
   `Db::subscribe_admission_observations()` plus table watermark receivers.
   Use these when ordering matters more than the latest state.
 - Bounded progress helpers
+  `Db::run_next_scheduled_work()`, `Db::wait_for_scheduler_idle(...)`, and
   `ClockProgressProbe`.
-  This is for liveness and virtual-time advancement, not for state sampling.
+  These are for liveness and explicit stepping, not for in-flight state
+  sampling.
 - Operator/debug-only reads
-  Anything that still reaches directly into quiescent state for one-off
-  inspection rather than participating in the published subscription surfaces.
+  `Db::scheduler_progress_snapshot()` plus anything else that still reaches
+  directly into quiescent state for one-off inspection rather than
+  participating in the published subscription surfaces.
   Prefer not to introduce new async tests that depend on these when a published
   surface already exists.
 
