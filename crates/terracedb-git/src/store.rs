@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use terracedb_vfs::{FileKind, ReadOnlyVfsFileSystem, VolumeSnapshot};
+use terracedb_vfs::{FileKind, ReadOnlyVfsFileSystem, SnapshotOptions, Volume, VolumeSnapshot};
 
 use crate::{
     GitCheckoutReport, GitCheckoutRequest, GitDiscoverReport, GitDiscoverRequest, GitHeadState,
@@ -37,7 +37,15 @@ pub trait GitExecutionHooks: Send + Sync {
         Ok(())
     }
 
+    async fn on_read_head(&self, _head: &GitHeadState) -> Result<(), GitSubstrateError> {
+        Ok(())
+    }
+
     async fn on_read_object(&self, _object: &GitObject) -> Result<(), GitSubstrateError> {
+        Ok(())
+    }
+
+    async fn on_checkout(&self, _report: &GitCheckoutReport) -> Result<(), GitSubstrateError> {
         Ok(())
     }
 }
@@ -62,10 +70,19 @@ pub struct VfsGitRepositoryImage {
 
 impl VfsGitRepositoryImage {
     pub fn new(snapshot: Arc<dyn VolumeSnapshot>, root_path: impl Into<Arc<str>>) -> Self {
+        let root_path = root_path.into();
         Self {
-            root_path: root_path.into(),
+            root_path: Arc::from(normalize_path(root_path.as_ref())),
             snapshot,
         }
+    }
+
+    pub async fn from_volume(
+        volume: Arc<dyn Volume>,
+        root_path: impl Into<Arc<str>>,
+        snapshot: SnapshotOptions,
+    ) -> Result<Self, GitSubstrateError> {
+        Ok(Self::new(volume.snapshot(snapshot).await?, root_path))
     }
 }
 
@@ -201,12 +218,13 @@ impl GitRepositoryStore for DeterministicGitRepositoryStore {
         request: crate::GitOpenRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<Arc<dyn GitRepository>, GitSubstrateError> {
+        let repository_id = request.repository_id.clone();
         if cancellation.is_cancelled() {
-            return Err(GitSubstrateError::Cancelled {
-                repository_id: request.repository_id,
-            });
+            return Err(GitSubstrateError::Cancelled { repository_id });
         }
-        let root = request.repository_image.root_path.clone();
+        let image_descriptor = image.descriptor();
+        validate_image_descriptor(&request.repository_image, &image_descriptor)?;
+        let root = image_descriptor.root_path.clone();
         let head_path = join_virtual(&root, ".git/HEAD");
         if image.snapshot().fs().read_file(&head_path).await?.is_none() {
             return Err(GitSubstrateError::RepositoryNotFound { path: root });
@@ -214,7 +232,7 @@ impl GitRepositoryStore for DeterministicGitRepositoryStore {
         let handle = GitRepositoryHandle {
             repository_id: request.repository_id,
             store: self.name.to_string(),
-            root_path: request.repository_image.root_path,
+            root_path: image_descriptor.root_path,
             policy: request.policy,
             provenance: request.provenance,
             metadata: request.metadata,
@@ -310,15 +328,19 @@ impl GitRepository for DeterministicGitRepository {
                 .read_file(&ref_path)
                 .await?
                 .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string());
-            Ok(GitHeadState {
+            let state = GitHeadState {
                 symbolic_ref: Some(reference),
                 oid,
-            })
+            };
+            self.hooks.on_read_head(&state).await?;
+            Ok(state)
         } else {
-            Ok(GitHeadState {
+            let state = GitHeadState {
                 symbolic_ref: None,
                 oid: Some(head_text),
-            })
+            };
+            self.hooks.on_read_head(&state).await?;
+            Ok(state)
         }
     }
 
@@ -336,7 +358,12 @@ impl GitRepository for DeterministicGitRepository {
                 repository_id: self.handle.repository_id.clone(),
             });
         }
-        self.materializer.materialize(request).await
+        let report = self
+            .materializer
+            .materialize(&self.handle.repository_id, request, cancellation)
+            .await?;
+        self.hooks.on_checkout(&report).await?;
+        Ok(report)
     }
 }
 
@@ -346,7 +373,12 @@ async fn discover_repository_root(
     start_path: &str,
 ) -> Result<Option<String>, GitSubstrateError> {
     let normalized_root = normalize_path(image_root);
-    for candidate in ancestor_paths(start_path, &normalized_root) {
+    let start_path = if start_path.starts_with('/') {
+        normalize_path(start_path)
+    } else {
+        join_virtual(&normalized_root, start_path)
+    };
+    for candidate in ancestor_paths(&start_path, &normalized_root) {
         let head = join_virtual(&candidate, ".git/HEAD");
         if fs.read_file(&head).await?.is_some() {
             return Ok(Some(candidate));
@@ -414,7 +446,10 @@ fn ancestor_paths(start_path: &str, root: &str) -> Vec<String> {
     let mut current = normalize_path(start_path);
     let root = normalize_path(root);
     let mut result = Vec::new();
-    while current.starts_with(&root) {
+    if !path_is_within_root(&current, &root) {
+        return result;
+    }
+    while path_is_within_root(&current, &root) {
         result.push(current.clone());
         if current == root {
             break;
@@ -430,10 +465,56 @@ fn ancestor_paths(start_path: &str, root: &str) -> Vec<String> {
             })
             .unwrap_or_else(|| root.clone());
     }
-    if !result.iter().any(|candidate| candidate == &root) {
-        result.push(root);
-    }
     result
+}
+
+fn path_is_within_root(path: &str, root: &str) -> bool {
+    let normalized_path = normalize_path(path);
+    let normalized_root = normalize_path(root);
+    if normalized_root == "/" {
+        return normalized_path.starts_with('/');
+    }
+    normalized_path == normalized_root
+        || normalized_path
+            .strip_prefix(&normalized_root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn validate_image_descriptor(
+    requested: &GitRepositoryImageDescriptor,
+    actual: &GitRepositoryImageDescriptor,
+) -> Result<(), GitSubstrateError> {
+    let requested_root = normalize_path(&requested.root_path);
+    let actual_root = normalize_path(&actual.root_path);
+    if requested_root != actual_root {
+        return Err(GitSubstrateError::RepositoryImageDescriptorMismatch {
+            field: "root_path",
+            expected: actual_root,
+            found: requested_root,
+        });
+    }
+    if requested.volume_id != actual.volume_id {
+        return Err(GitSubstrateError::RepositoryImageDescriptorMismatch {
+            field: "volume_id",
+            expected: format!("{:?}", actual.volume_id),
+            found: format!("{:?}", requested.volume_id),
+        });
+    }
+    if requested.snapshot_sequence != actual.snapshot_sequence {
+        return Err(GitSubstrateError::RepositoryImageDescriptorMismatch {
+            field: "snapshot_sequence",
+            expected: format!("{:?}", actual.snapshot_sequence),
+            found: format!("{:?}", requested.snapshot_sequence),
+        });
+    }
+    if requested.durable_snapshot != actual.durable_snapshot {
+        return Err(GitSubstrateError::RepositoryImageDescriptorMismatch {
+            field: "durable_snapshot",
+            expected: actual.durable_snapshot.to_string(),
+            found: requested.durable_snapshot.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn join_virtual(base: &str, child: &str) -> String {
