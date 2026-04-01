@@ -637,6 +637,23 @@ fn legacy_resource_policy_strings_recover_inside_persisted_manifest_and_publicat
         }],
         metadata: BTreeMap::new(),
     };
+    let migration_plan = MigrationPlan {
+        plan_id: "plan-1".to_string(),
+        application_id: "notes-app".to_string(),
+        created_at: Timestamp::new(10),
+        requested_manifest: manifest.clone(),
+        execution_policy: sample_execution_policy(),
+        steps: vec![MigrationStep {
+            step_id: "01".to_string(),
+            label: "create tickets".to_string(),
+            module_specifier: "terrace:/workspace/migrations/01-create-tickets.ts".to_string(),
+            checksum: "sha256:1234".to_string(),
+            kind: MigrationStepKind::SchemaChange,
+            requested_bindings: vec!["tickets".to_string()],
+            metadata: BTreeMap::new(),
+        }],
+        metadata: BTreeMap::new(),
+    };
     let publication = ReviewedProcedurePublication {
         publication: ProcedureVersionRef {
             procedure_id: "sync-ticket".to_string(),
@@ -666,6 +683,26 @@ fn legacy_resource_policy_strings_recover_inside_persisted_manifest_and_publicat
         serde_json::from_value(legacy_manifest_json).expect("decode legacy manifest");
     assert_eq!(
         decoded_manifest.bindings[0]
+            .resource_policy
+            .row_scope_binding
+            .as_ref()
+            .map(|binding| binding.policy.clone()),
+        Some(RowScopePolicy::LegacyPlaceholder {
+            legacy_binding: "tenant_id".to_string()
+        })
+    );
+
+    let mut legacy_migration_plan_json = serde_json::to_value(&migration_plan)
+        .expect("encode migration plan to mutate legacy fields");
+    legacy_migration_plan_json["requested_manifest"]["bindings"][0]["resource_policy"]["row_scope_binding"] =
+        serde_json::json!("tenant_id");
+    legacy_migration_plan_json["requested_manifest"]["bindings"][0]["resource_policy"]["visibility_index"] =
+        serde_json::json!("visible_by_subject");
+
+    let decoded_migration_plan: MigrationPlan =
+        serde_json::from_value(legacy_migration_plan_json).expect("decode legacy migration plan");
+    assert_eq!(
+        decoded_migration_plan.requested_manifest.bindings[0]
             .resource_policy
             .row_scope_binding
             .as_ref()
