@@ -625,6 +625,55 @@ impl Db {
         self.plan_write_batch_sharding(batch.operations())
     }
 
+    pub fn validate_table_shard_map(
+        &self,
+        table: &Table,
+        sharding: &crate::ShardingConfig,
+    ) -> Result<crate::TableShardingState, crate::PublishShardMapError> {
+        let stored = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::PublishShardMapError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        self.validate_table_shard_map_update(&stored, sharding)
+    }
+
+    pub async fn publish_table_shard_map(
+        &self,
+        table: &Table,
+        sharding: crate::ShardingConfig,
+    ) -> Result<crate::TableShardingState, crate::PublishShardMapError> {
+        let _catalog_guard = self.inner.catalog_write_lock.lock().await;
+        let stored = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::PublishShardMapError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        let projected = self.validate_table_shard_map_update(&stored, &sharding)?;
+
+        if stored.config.sharding == sharding {
+            return Ok(projected);
+        }
+
+        let mut updated_tables = self.tables_read().clone();
+        let mut updated_config = stored.config.clone();
+        updated_config.sharding = sharding;
+        updated_tables.insert(
+            updated_config.name.clone(),
+            StoredTable {
+                id: stored.id,
+                config: updated_config,
+            },
+        );
+        self.persist_tables(&updated_tables)
+            .await
+            .map_err(Self::publish_shard_map_error_from_persist_error)?;
+        *self.tables_write() = updated_tables;
+
+        let _ = self.sync_tiered_backup_catalog().await;
+        Ok(projected)
+    }
+
     /// Returns the lane bindings configured for this database.
     pub fn execution_profile(&self) -> &DbExecutionProfile {
         &self.inner.execution_profile
@@ -2987,6 +3036,80 @@ impl Db {
 
         tables.sort_by(|left, right| left.table_name.cmp(&right.table_name));
         Ok(crate::WriteBatchShardingPlan { tables })
+    }
+
+    fn validate_stored_table_shard_map_update(
+        stored: &StoredTable,
+        sharding: &crate::ShardingConfig,
+    ) -> Result<crate::TableShardingState, crate::ShardingError> {
+        stored.config.sharding.validate_shard_map_update(sharding)?;
+        let mut updated_config = stored.config.clone();
+        updated_config.sharding = sharding.clone();
+        crate::TableShardingState::new(stored.id, &updated_config)
+    }
+
+    fn validate_table_shard_map_update(
+        &self,
+        stored: &StoredTable,
+        sharding: &crate::ShardingConfig,
+    ) -> Result<crate::TableShardingState, crate::PublishShardMapError> {
+        let projected =
+            Self::validate_stored_table_shard_map_update(stored, sharding).map_err(|error| {
+                crate::PublishShardMapError::InvalidShardMap {
+                    table_name: stored.config.name.clone(),
+                    error,
+                }
+            })?;
+        let assignments_preserved = stored
+            .config
+            .sharding
+            .preserves_physical_assignments(sharding)
+            .map_err(|error| crate::PublishShardMapError::InvalidShardMap {
+                table_name: stored.config.name.clone(),
+                error,
+            })?;
+        if !assignments_preserved && self.table_contains_published_data(stored.id) {
+            return Err(crate::PublishShardMapError::DataMovementRequired {
+                table_name: stored.config.name.clone(),
+                current_revision: stored.config.sharding.current_revision(),
+                published_revision: sharding.current_revision(),
+            });
+        }
+        Ok(projected)
+    }
+
+    fn table_contains_published_data(&self, table_id: TableId) -> bool {
+        let memtables = self.memtables_read();
+        if memtables.mutable.has_entries_for_table(table_id)
+            || memtables.immutable_memtable_count(table_id) > 0
+        {
+            return true;
+        }
+        drop(memtables);
+
+        self.sstables_read()
+            .live
+            .iter()
+            .any(|sstable| sstable.meta.table_id == table_id)
+    }
+
+    fn publish_shard_map_error_from_persist_error(
+        error: CreateTableError,
+    ) -> crate::PublishShardMapError {
+        match error {
+            CreateTableError::Storage(error) => crate::PublishShardMapError::Storage(error),
+            CreateTableError::InvalidConfig(message) => {
+                crate::PublishShardMapError::Storage(StorageError::unsupported(message))
+            }
+            CreateTableError::AlreadyExists(table_name) => {
+                crate::PublishShardMapError::Storage(StorageError::unsupported(format!(
+                    "catalog persist unexpectedly reported duplicate table {table_name}"
+                )))
+            }
+            CreateTableError::Unimplemented(message) => {
+                crate::PublishShardMapError::Storage(StorageError::unsupported(message))
+            }
+        }
     }
 
     pub(super) fn resolve_stored_table(&self, table: &Table) -> Option<StoredTable> {
