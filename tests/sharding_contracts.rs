@@ -1,18 +1,51 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use terracedb::{
-    BatchShardLocalityError, CommitId, CommitOptions, Db, ExecutionDomainOwner,
-    ExecutionDomainPath, LogCursor, ObjectKeyLayout, PhysicalShardId, PublishShardMapError,
-    ReshardPlanSkeleton, S3Location, SequenceNumber, ShardChangeCursor, ShardCommitLaneId,
-    ShardHashAlgorithm, ShardMapRevision, ShardMemtableOwner, ShardOpenRequest,
-    ShardReadyPlacementLayout, ShardSstableOwnership, ShardingConfig, ShardingError, TableConfig,
-    TableId, Value, VirtualPartitionCoverage, VirtualPartitionId, WriteBatchShardingError,
+    AdmissionDiagnostics, AdmissionPressureLevel, BatchShardLocalityError,
+    ColocatedDatabasePlacement, CommitId, CommitOptions, Db, DurabilityClass, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionLane, LogCursor, ObjectKeyLayout, PendingWork, PhysicalShardId,
+    PublishShardMapError, ReshardPlanSkeleton, S3Location, ScheduleDecision, Scheduler,
+    SequenceNumber, ShardChangeCursor, ShardCommitLaneId, ShardHashAlgorithm, ShardMapRevision,
+    ShardMemtableOwner, ShardOpenRequest, ShardReadyPlacementLayout, ShardSstableOwnership,
+    ShardingConfig, ShardingError, TableConfig, TableId, TableStats, Value,
+    VirtualPartitionCoverage, VirtualPartitionId, WriteBatchShardingError,
 };
 use terracedb_simulation::SeededSimulationRunner;
 
 #[cfg(any(test, feature = "test-support"))]
 use terracedb::test_support::{row_table_config, test_dependencies, tiered_test_config};
 use terracedb::{StubFileSystem, StubObjectStore};
+
+#[derive(Default)]
+struct ShardThrottleScheduler;
+
+impl Scheduler for ShardThrottleScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+    ) -> terracedb::ThrottleDecision {
+        terracedb::ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+        _signals: &terracedb::AdmissionSignals,
+        _tag: &terracedb::WorkRuntimeTag,
+        _domain_budget: Option<&terracedb::ExecutionDomainBudget>,
+    ) -> Option<AdmissionDiagnostics> {
+        Some(AdmissionDiagnostics {
+            level: AdmissionPressureLevel::RateLimit,
+            ..AdmissionDiagnostics::default()
+        })
+    }
+}
 
 fn sharded_row_table_config(name: &str) -> TableConfig {
     let mut config = row_table_config(name);
@@ -68,6 +101,110 @@ async fn open_test_db(
     )
     .await
     .expect("open test db")
+}
+
+#[tokio::test]
+async fn shard_ready_tagging_uses_future_shard_paths_without_breaking_unsharded_fast_path() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let profile = ColocatedDatabasePlacement::shard_ready("warehouse").execution_profile();
+    let layout = ShardReadyPlacementLayout::new("warehouse");
+    let db = Db::open(
+        tiered_test_config("/sharding-contracts-shard-tagging"),
+        test_dependencies(file_system, object_store)
+            .with_execution_profile(profile.clone())
+            .with_execution_identity("warehouse"),
+    )
+    .await
+    .expect("open shard-ready db");
+
+    let background = db.tag_shard_background_work("flush", PhysicalShardId::new(3));
+    assert_eq!(
+        background.tag.owner,
+        ExecutionDomainOwner::Shard {
+            database: "warehouse".to_string(),
+            shard: "0003".to_string(),
+        }
+    );
+    assert_eq!(
+        background.tag.domain,
+        layout.future_shard_lane_path("0003", ExecutionLane::UserBackground)
+    );
+    assert_eq!(background.tag.durability_class, DurabilityClass::UserData);
+
+    let control = db.tag_shard_control_plane_work("recovery", PhysicalShardId::new(3));
+    assert_eq!(
+        control.tag.domain,
+        layout.future_shard_lane_path("0003", ExecutionLane::ControlPlane)
+    );
+    assert_eq!(control.tag.durability_class, DurabilityClass::ControlPlane);
+
+    let compat = db.tag_shard_background_work("compat", PhysicalShardId::UNSHARDED);
+    assert_eq!(compat.tag.owner, layout.database_owner());
+    assert_eq!(compat.tag.domain, profile.background.domain);
+    assert_eq!(compat.tag.durability_class, DurabilityClass::UserData);
+}
+
+#[tokio::test]
+async fn shard_scoped_write_throttling_is_published_by_physical_shard() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let profile = ColocatedDatabasePlacement::shard_ready("warehouse").execution_profile();
+    let layout = ShardReadyPlacementLayout::new("warehouse");
+    let db = Db::open(
+        terracedb::DbConfig {
+            scheduler: Some(Arc::new(ShardThrottleScheduler)),
+            ..tiered_test_config("/sharding-contracts-shard-throttle")
+        },
+        test_dependencies(file_system, object_store)
+            .with_execution_profile(profile)
+            .with_execution_identity("warehouse"),
+    )
+    .await
+    .expect("open shard-aware throttle db");
+
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let shard_one = find_key_for_shard(
+        &table.sharding_state().expect("table sharding").config,
+        PhysicalShardId::new(1),
+        "hot",
+    );
+
+    table
+        .write(shard_one, Value::bytes("payload"))
+        .await
+        .expect("single-shard write should succeed");
+
+    let snapshot = db.scheduler_observability_snapshot();
+    assert_eq!(
+        snapshot
+            .throttled_writes_by_physical_shard
+            .get(&PhysicalShardId::new(1)),
+        Some(&1)
+    );
+    assert_eq!(
+        snapshot
+            .throttled_writes_by_domain
+            .get(&layout.future_shard_lane_path("0001", ExecutionLane::UserForeground)),
+        Some(&1)
+    );
+
+    let current = snapshot
+        .current_admission_diagnostics_by_physical_shard
+        .get(&PhysicalShardId::new(1))
+        .expect("current shard admission should be published");
+    assert_eq!(current.diagnostics.level, AdmissionPressureLevel::RateLimit);
+    assert_eq!(
+        current
+            .diagnostics
+            .metadata
+            .get(terracedb::telemetry_attrs::PHYSICAL_SHARD)
+            .and_then(serde_json::Value::as_str),
+        Some("0001")
+    );
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use crate::{
     execution::{ExecutionDomainBudget, ExecutionDomainPath, WorkRuntimeTag},
     ids::SequenceNumber,
     scheduler::PendingWork,
+    sharding::PhysicalShardId,
 };
 
 /// Byte-oriented pressure counters kept distinct from correctness metadata.
@@ -237,6 +238,7 @@ pub struct PressureStats {
     pub local: PressureBytes,
     pub domain_total: Option<PressureBytes>,
     pub process_total: Option<PressureBytes>,
+    pub physical_shard: Option<PhysicalShardId>,
     pub oldest_unflushed_age: Option<Duration>,
     pub budget: PressureBudget,
     pub metadata: BTreeMap<String, JsonValue>,

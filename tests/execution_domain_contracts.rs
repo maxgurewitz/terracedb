@@ -713,6 +713,7 @@ async fn execution_contracts_compose_with_builder_scheduler_maintenance_and_simu
         id: "compaction:1".to_string(),
         work_type: PendingWorkType::Compaction,
         table: "events".to_string(),
+        physical_shard: None,
         level: Some(1),
         estimated_bytes: 64,
     });
@@ -766,6 +767,7 @@ async fn fake_runtimes_can_tag_work_and_account_domain_budgets_hierarchically() 
         id: "flush:1".to_string(),
         work_type: PendingWorkType::Flush,
         table: "events".to_string(),
+        physical_shard: None,
         level: None,
         estimated_bytes: 256,
     });

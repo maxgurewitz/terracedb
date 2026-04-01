@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::{broadcast, watch};
 
 use crate::{
-    Timestamp,
+    PhysicalShardId, Timestamp,
     api::Table,
     current_state::CurrentStateRetentionStats,
     execution::{
@@ -117,6 +117,7 @@ pub struct PendingWork {
     pub id: String,
     pub work_type: PendingWorkType,
     pub table: String,
+    pub physical_shard: Option<PhysicalShardId>,
     pub level: Option<u32>,
     pub estimated_bytes: u64,
 }
@@ -181,26 +182,37 @@ pub struct RecordedAdmissionDiagnostics {
 pub struct SchedulerObservabilitySnapshot {
     pub deferred_work: BTreeMap<String, u32>,
     pub deferred_work_by_domain: BTreeMap<ExecutionDomainPath, u32>,
+    pub deferred_work_by_physical_shard: BTreeMap<PhysicalShardId, u32>,
     pub starved_domains: BTreeMap<ExecutionDomainPath, u32>,
+    pub starved_physical_shards: BTreeMap<PhysicalShardId, u32>,
     pub forced_executions: u64,
     pub forced_flushes: u64,
     pub forced_l0_compactions: u64,
     pub budget_blocked_executions: u64,
     pub budget_blocked_executions_by_domain: BTreeMap<ExecutionDomainPath, u64>,
+    pub budget_blocked_executions_by_physical_shard: BTreeMap<PhysicalShardId, u64>,
     pub background_delay_events: u64,
     pub background_delay_millis: u64,
     pub background_delay_events_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub background_delay_millis_by_domain: BTreeMap<ExecutionDomainPath, u64>,
+    pub background_delay_events_by_physical_shard: BTreeMap<PhysicalShardId, u64>,
+    pub background_delay_millis_by_physical_shard: BTreeMap<PhysicalShardId, u64>,
     pub throttled_writes_by_domain: BTreeMap<ExecutionDomainPath, u64>,
+    pub throttled_writes_by_physical_shard: BTreeMap<PhysicalShardId, u64>,
     pub current_admission_diagnostics_by_domain:
         BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
+    pub current_admission_diagnostics_by_physical_shard:
+        BTreeMap<PhysicalShardId, RecordedAdmissionDiagnostics>,
     pub last_non_open_admission_by_domain:
         BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
+    pub last_non_open_admission_by_physical_shard:
+        BTreeMap<PhysicalShardId, RecordedAdmissionDiagnostics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionObservation {
     pub domain: ExecutionDomainPath,
+    pub physical_shard: Option<PhysicalShardId>,
     pub current: RecordedAdmissionDiagnostics,
     pub last_non_open: Option<RecordedAdmissionDiagnostics>,
 }
@@ -406,6 +418,8 @@ pub struct RoundRobinScheduler {
 struct RoundRobinSchedulerState {
     last_domain: Option<ExecutionDomainPath>,
     last_table_by_domain: BTreeMap<ExecutionDomainPath, String>,
+    last_physical_shard_by_domain_table:
+        BTreeMap<(ExecutionDomainPath, String), Option<PhysicalShardId>>,
 }
 
 impl Scheduler for RoundRobinScheduler {
@@ -432,6 +446,7 @@ impl Scheduler for RoundRobinScheduler {
                 .cmp(&tagged_pending_work_priority(right))
                 .then_with(|| left.tag.domain.cmp(&right.tag.domain))
                 .then_with(|| left.work.table.cmp(&right.work.table))
+                .then_with(|| left.work.physical_shard.cmp(&right.work.physical_shard))
                 .then_with(|| left.work.level.cmp(&right.work.level))
                 .then_with(|| left.work.id.cmp(&right.work.id))
         });
@@ -489,9 +504,39 @@ impl Scheduler for RoundRobinScheduler {
             table
         };
 
+        let mut physical_shards = top_priority_work
+            .iter()
+            .filter(|work| work.tag.domain == selected_domain && work.work.table == selected_table)
+            .map(|work| work.work.physical_shard)
+            .collect::<Vec<_>>();
+        physical_shards.sort_unstable();
+        physical_shards.dedup();
+
+        let selected_physical_shard = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("round-robin scheduler mutex should not be poisoned");
+            let key = (selected_domain.clone(), selected_table.clone());
+            let next_index = state
+                .last_physical_shard_by_domain_table
+                .get(&key)
+                .and_then(|last| physical_shards.iter().position(|shard| shard > last))
+                .unwrap_or(0);
+            let physical_shard = physical_shards[next_index];
+            state
+                .last_physical_shard_by_domain_table
+                .insert(key, physical_shard);
+            physical_shard
+        };
+
         let selected_work_id = top_priority_work
             .into_iter()
-            .filter(|work| work.tag.domain == selected_domain && work.work.table == selected_table)
+            .filter(|work| {
+                work.tag.domain == selected_domain
+                    && work.work.table == selected_table
+                    && work.work.physical_shard == selected_physical_shard
+            })
             .min_by(|left, right| {
                 left.work
                     .level
@@ -527,6 +572,12 @@ impl Scheduler for RoundRobinScheduler {
                 .cmp(&crate::pressure::flush_candidate_priority_key(&left.work))
                 .then_with(|| left.tag.domain.cmp(&right.tag.domain))
                 .then_with(|| left.work.work.table.cmp(&right.work.work.table))
+                .then_with(|| {
+                    left.work
+                        .work
+                        .physical_shard
+                        .cmp(&right.work.work.physical_shard)
+                })
                 .then_with(|| left.work.work.id.cmp(&right.work.work.id))
         });
 
@@ -585,11 +636,41 @@ impl Scheduler for RoundRobinScheduler {
             table
         };
 
+        let mut physical_shards = top_priority_work
+            .iter()
+            .filter(|candidate| {
+                candidate.tag.domain == selected_domain
+                    && candidate.work.work.table == selected_table
+            })
+            .map(|candidate| candidate.work.work.physical_shard)
+            .collect::<Vec<_>>();
+        physical_shards.sort_unstable();
+        physical_shards.dedup();
+
+        let selected_physical_shard = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("round-robin scheduler mutex should not be poisoned");
+            let key = (selected_domain.clone(), selected_table.clone());
+            let next_index = state
+                .last_physical_shard_by_domain_table
+                .get(&key)
+                .and_then(|last| physical_shards.iter().position(|shard| shard > last))
+                .unwrap_or(0);
+            let physical_shard = physical_shards[next_index];
+            state
+                .last_physical_shard_by_domain_table
+                .insert(key, physical_shard);
+            physical_shard
+        };
+
         let selected_work_id = top_priority_work
             .into_iter()
             .filter(|candidate| {
                 candidate.tag.domain == selected_domain
                     && candidate.work.work.table == selected_table
+                    && candidate.work.work.physical_shard == selected_physical_shard
             })
             .min_by(|left, right| left.work.work.id.cmp(&right.work.work.id))
             .map(|candidate| candidate.work.work.id.clone())
@@ -866,8 +947,8 @@ mod tests {
         CurrentStateRetentionMembershipChanges, CurrentStateRetentionStats,
         CurrentStateRetentionStatus, Db, DbConfig, DbDependencies, DomainTaggedWork,
         ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane, FlushPressureCandidate,
-        PressureBudget, PressureBytes, PressureScope, PressureStats, S3Location, SsdConfig,
-        StorageConfig, StubClock, StubFileSystem, StubObjectStore, StubRng, Table,
+        PhysicalShardId, PressureBudget, PressureBytes, PressureScope, PressureStats, S3Location,
+        SsdConfig, StorageConfig, StubClock, StubFileSystem, StubObjectStore, StubRng, Table,
         TieredDurabilityMode, TieredStorageConfig,
     };
 
@@ -959,6 +1040,7 @@ mod tests {
                     id: format!("flush:{table}"),
                     work_type: PendingWorkType::Flush,
                     table: table.to_string(),
+                    physical_shard: None,
                     level: None,
                     estimated_bytes: 64,
                 },
@@ -995,6 +1077,7 @@ mod tests {
                 id: "compaction:events".to_string(),
                 work_type: PendingWorkType::Compaction,
                 table: "events".to_string(),
+                physical_shard: None,
                 level: Some(0),
                 estimated_bytes: 128,
             },
@@ -1002,6 +1085,7 @@ mod tests {
                 id: "flush:metrics".to_string(),
                 work_type: PendingWorkType::Flush,
                 table: "metrics".to_string(),
+                physical_shard: None,
                 level: None,
                 estimated_bytes: 64,
             },
@@ -1009,6 +1093,7 @@ mod tests {
                 id: "flush:events".to_string(),
                 work_type: PendingWorkType::Flush,
                 table: "events".to_string(),
+                physical_shard: None,
                 level: None,
                 estimated_bytes: 32,
             },
@@ -1091,6 +1176,7 @@ mod tests {
                 id: "compaction:events".to_string(),
                 work_type: PendingWorkType::Compaction,
                 table: "events".to_string(),
+                physical_shard: None,
                 level: Some(0),
                 estimated_bytes: 128,
             },
@@ -1098,6 +1184,7 @@ mod tests {
                 id: "retention:events".to_string(),
                 work_type: PendingWorkType::CurrentStateRetention,
                 table: "events".to_string(),
+                physical_shard: None,
                 level: None,
                 estimated_bytes: 96,
             },
@@ -1105,6 +1192,7 @@ mod tests {
                 id: "retention:metrics".to_string(),
                 work_type: PendingWorkType::CurrentStateRetention,
                 table: "metrics".to_string(),
+                physical_shard: None,
                 level: None,
                 estimated_bytes: 64,
             },
@@ -1161,6 +1249,7 @@ mod tests {
                     id: "compaction:events".to_string(),
                     work_type: PendingWorkType::Compaction,
                     table: "events".to_string(),
+                    physical_shard: None,
                     level: Some(0),
                     estimated_bytes: 128,
                 },
@@ -1171,6 +1260,7 @@ mod tests {
                     id: "backup:catalog".to_string(),
                     work_type: PendingWorkType::Backup,
                     table: "_internal".to_string(),
+                    physical_shard: None,
                     level: None,
                     estimated_bytes: 64,
                 },
@@ -1199,6 +1289,7 @@ mod tests {
                 id: "backup:catalog".to_string(),
                 work_type: PendingWorkType::Backup,
                 table: "_internal".to_string(),
+                physical_shard: None,
                 level: None,
                 estimated_bytes: 64,
             },
@@ -1225,5 +1316,51 @@ mod tests {
         assert_eq!(budget.max_domain_concurrency, Some(1));
         assert_eq!(budget.max_domain_remote_requests, Some(1));
         assert_eq!(budget.max_domain_in_flight_bytes, Some(64));
+    }
+
+    #[test]
+    fn round_robin_scheduler_rotates_physical_shards_within_one_table_and_domain() {
+        let scheduler = RoundRobinScheduler::default();
+        let mut shard_tag = default_scheduler_work_tag();
+        shard_tag.domain = ExecutionDomainPath::new(["process", "db", "background"]);
+
+        let work = vec![
+            DomainTaggedWork::new(
+                PendingWork {
+                    id: "flush:events:0000".to_string(),
+                    work_type: PendingWorkType::Flush,
+                    table: "events".to_string(),
+                    physical_shard: Some(PhysicalShardId::new(0)),
+                    level: None,
+                    estimated_bytes: 64,
+                },
+                shard_tag.clone(),
+            ),
+            DomainTaggedWork::new(
+                PendingWork {
+                    id: "flush:events:0001".to_string(),
+                    work_type: PendingWorkType::Flush,
+                    table: "events".to_string(),
+                    physical_shard: Some(PhysicalShardId::new(1)),
+                    level: None,
+                    estimated_bytes: 64,
+                },
+                shard_tag,
+            ),
+        ];
+
+        let first = scheduler.on_domain_work_available(&work);
+        let first_executed = first
+            .iter()
+            .find(|decision| decision.action == ScheduleAction::Execute)
+            .expect("one shard should be selected");
+        assert_eq!(first_executed.work_id, "flush:events:0000");
+
+        let second = scheduler.on_domain_work_available(&work);
+        let second_executed = second
+            .iter()
+            .find(|decision| decision.action == ScheduleAction::Execute)
+            .expect("one shard should be selected");
+        assert_eq!(second_executed.work_id, "flush:events:0001");
     }
 }

@@ -1,6 +1,8 @@
 use super::*;
 
-pub(super) fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32>) {
+pub(super) fn pending_work_sort_key(
+    work: &PendingWork,
+) -> (u8, &str, Option<crate::PhysicalShardId>, Option<u32>) {
     let priority = match work.work_type {
         PendingWorkType::Flush => 0,
         PendingWorkType::CurrentStateRetention => 1,
@@ -9,7 +11,12 @@ pub(super) fn pending_work_sort_key(work: &PendingWork) -> (u8, &str, Option<u32
         PendingWorkType::Offload => 4,
         PendingWorkType::Prefetch => 5,
     };
-    (priority, work.table.as_str(), work.level)
+    (
+        priority,
+        work.table.as_str(),
+        work.physical_shard,
+        work.level,
+    )
 }
 
 pub(super) fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

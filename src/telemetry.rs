@@ -17,6 +17,7 @@ pub mod telemetry_attrs {
     pub const DB_INSTANCE: &str = "terracedb.db.instance";
     pub const STORAGE_MODE: &str = "terracedb.storage.mode";
     pub const TABLE: &str = "terracedb.table";
+    pub const PHYSICAL_SHARD: &str = "terracedb.physical_shard";
     pub const SEQUENCE: &str = "terracedb.sequence";
     pub const DURABLE_SEQUENCE: &str = "terracedb.durable_sequence";
     pub const LOG_CURSOR: &str = "terracedb.log_cursor";

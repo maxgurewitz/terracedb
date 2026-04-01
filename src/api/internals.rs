@@ -454,6 +454,7 @@ pub(super) struct ColumnarCacheStats {
 struct SchedulerObservabilityState {
     snapshot: crate::SchedulerObservabilitySnapshot,
     deferred_work_domains: BTreeMap<String, crate::ExecutionDomainPath>,
+    deferred_work_physical_shards: BTreeMap<String, crate::PhysicalShardId>,
 }
 
 pub(super) struct SchedulerObservabilityStats {
@@ -479,20 +480,56 @@ impl SchedulerObservabilityStats {
     fn refresh_deferred_work(state: &mut SchedulerObservabilityState) {
         let snapshot = &mut state.snapshot;
         let domains = &state.deferred_work_domains;
+        let physical_shards = &state.deferred_work_physical_shards;
         snapshot.deferred_work_by_domain.clear();
+        snapshot.deferred_work_by_physical_shard.clear();
         snapshot.starved_domains.clear();
+        snapshot.starved_physical_shards.clear();
         for (work_id, cycles) in &snapshot.deferred_work {
             let Some(domain) = domains.get(work_id) else {
+                if let Some(physical_shard) = physical_shards.get(work_id) {
+                    *snapshot
+                        .deferred_work_by_physical_shard
+                        .entry(*physical_shard)
+                        .or_default() += *cycles;
+                    if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
+                        *snapshot
+                            .starved_physical_shards
+                            .entry(*physical_shard)
+                            .or_default() += 1;
+                    }
+                }
                 continue;
             };
             *snapshot
                 .deferred_work_by_domain
                 .entry(domain.clone())
                 .or_default() += *cycles;
+            if let Some(physical_shard) = physical_shards.get(work_id) {
+                *snapshot
+                    .deferred_work_by_physical_shard
+                    .entry(*physical_shard)
+                    .or_default() += *cycles;
+            }
             if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
                 *snapshot.starved_domains.entry(domain.clone()).or_default() += 1;
+                if let Some(physical_shard) = physical_shards.get(work_id) {
+                    *snapshot
+                        .starved_physical_shards
+                        .entry(*physical_shard)
+                        .or_default() += 1;
+                }
             }
         }
+    }
+
+    fn pending_work_physical_shard(
+        candidate: &PendingWorkCandidate,
+    ) -> Option<crate::PhysicalShardId> {
+        candidate
+            .pending
+            .physical_shard
+            .or_else(|| candidate.tag.physical_shard())
     }
 
     fn publish_locked(&self, state: &SchedulerObservabilityState) {
@@ -524,6 +561,9 @@ impl SchedulerObservabilityStats {
         state
             .deferred_work_domains
             .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
+        state
+            .deferred_work_physical_shards
+            .retain(|work_id, _| live_work_ids.contains(work_id.as_str()));
         Self::refresh_deferred_work(&mut state);
         self.publish_locked(&state);
     }
@@ -543,6 +583,9 @@ impl SchedulerObservabilityStats {
                 ScheduleAction::Execute => {
                     state.snapshot.deferred_work.remove(&candidate.pending.id);
                     state.deferred_work_domains.remove(&candidate.pending.id);
+                    state
+                        .deferred_work_physical_shards
+                        .remove(&candidate.pending.id);
                 }
                 ScheduleAction::Defer => {
                     *state
@@ -553,6 +596,15 @@ impl SchedulerObservabilityStats {
                     state
                         .deferred_work_domains
                         .insert(candidate.pending.id.clone(), candidate.tag.domain.clone());
+                    if let Some(physical_shard) = Self::pending_work_physical_shard(candidate) {
+                        state
+                            .deferred_work_physical_shards
+                            .insert(candidate.pending.id.clone(), physical_shard);
+                    } else {
+                        state
+                            .deferred_work_physical_shards
+                            .remove(&candidate.pending.id);
+                    }
                 }
             }
         }
@@ -564,6 +616,7 @@ impl SchedulerObservabilityStats {
         let mut state = mutex_lock(&self.state);
         state.snapshot.deferred_work.remove(work_id);
         state.deferred_work_domains.remove(work_id);
+        state.deferred_work_physical_shards.remove(work_id);
         Self::refresh_deferred_work(&mut state);
         self.publish_locked(&state);
     }
@@ -603,6 +656,13 @@ impl SchedulerObservabilityStats {
             .budget_blocked_executions_by_domain
             .entry(tag.domain.clone())
             .or_default() += 1;
+        if let Some(physical_shard) = tag.physical_shard() {
+            *state
+                .snapshot
+                .budget_blocked_executions_by_physical_shard
+                .entry(physical_shard)
+                .or_default() += 1;
+        }
         self.publish_locked(&state);
     }
 
@@ -623,31 +683,72 @@ impl SchedulerObservabilityStats {
             .background_delay_millis_by_domain
             .entry(tag.domain.clone())
             .or_default() += delay.as_millis() as u64;
+        if let Some(physical_shard) = tag.physical_shard() {
+            *state
+                .snapshot
+                .background_delay_events_by_physical_shard
+                .entry(physical_shard)
+                .or_default() += 1;
+            *state
+                .snapshot
+                .background_delay_millis_by_physical_shard
+                .entry(physical_shard)
+                .or_default() += delay.as_millis() as u64;
+        }
         self.publish_locked(&state);
     }
 
     pub(super) fn record_admission_diagnostics(
         &self,
         tag: &crate::WorkRuntimeTag,
-        recorded: crate::RecordedAdmissionDiagnostics,
+        mut recorded: crate::RecordedAdmissionDiagnostics,
     ) {
+        let physical_shard = tag.physical_shard();
+        if let Some(physical_shard) = physical_shard {
+            recorded.diagnostics.metadata.insert(
+                crate::telemetry_attrs::PHYSICAL_SHARD.to_string(),
+                serde_json::Value::String(physical_shard.to_string()),
+            );
+        }
         let mut state = mutex_lock(&self.state);
         state
             .snapshot
             .current_admission_diagnostics_by_domain
             .insert(tag.domain.clone(), recorded.clone());
+        if let Some(physical_shard) = physical_shard {
+            state
+                .snapshot
+                .current_admission_diagnostics_by_physical_shard
+                .insert(physical_shard, recorded.clone());
+        }
         let last_non_open = if recorded.diagnostics.level != crate::AdmissionPressureLevel::Open {
             state
                 .snapshot
                 .last_non_open_admission_by_domain
                 .insert(tag.domain.clone(), recorded.clone());
+            if let Some(physical_shard) = physical_shard {
+                state
+                    .snapshot
+                    .last_non_open_admission_by_physical_shard
+                    .insert(physical_shard, recorded.clone());
+            }
             Some(recorded.clone())
         } else {
-            state
-                .snapshot
-                .last_non_open_admission_by_domain
-                .get(&tag.domain)
-                .cloned()
+            physical_shard
+                .and_then(|physical_shard| {
+                    state
+                        .snapshot
+                        .last_non_open_admission_by_physical_shard
+                        .get(&physical_shard)
+                        .cloned()
+                })
+                .or_else(|| {
+                    state
+                        .snapshot
+                        .last_non_open_admission_by_domain
+                        .get(&tag.domain)
+                        .cloned()
+                })
         };
         self.publish_locked(&state);
         drop(state);
@@ -655,6 +756,7 @@ impl SchedulerObservabilityStats {
             .admission_observations
             .send(crate::AdmissionObservation {
                 domain: tag.domain.clone(),
+                physical_shard,
                 current: recorded,
                 last_non_open,
             });
@@ -667,6 +769,13 @@ impl SchedulerObservabilityStats {
             .throttled_writes_by_domain
             .entry(tag.domain.clone())
             .or_default() += 1;
+        if let Some(physical_shard) = tag.physical_shard() {
+            *state
+                .snapshot
+                .throttled_writes_by_physical_shard
+                .entry(physical_shard)
+                .or_default() += 1;
+        }
         self.publish_locked(&state);
     }
 }
@@ -1678,6 +1787,7 @@ pub(super) struct CompactionJob {
     pub(super) id: String,
     pub(super) table_id: TableId,
     pub(super) table_name: String,
+    pub(super) physical_shard: Option<crate::PhysicalShardId>,
     pub(super) source_level: u32,
     pub(super) target_level: u32,
     pub(super) kind: CompactionJobKind,
@@ -1690,6 +1800,7 @@ pub(super) struct OffloadJob {
     pub(super) id: String,
     pub(super) table_id: TableId,
     pub(super) table_name: String,
+    pub(super) physical_shard: Option<crate::PhysicalShardId>,
     pub(super) kind: OffloadJobKind,
     pub(super) input_local_ids: Vec<String>,
     pub(super) estimated_bytes: u64,
