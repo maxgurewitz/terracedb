@@ -24,7 +24,7 @@ simulation probes.
 
 ## T76b: Remaining Blocking Inspection Surfaces
 
-- [ ] Classify every remaining synchronous snapshot/introspection helper as
+- [x] Classify every remaining synchronous snapshot/introspection helper as
   one of:
   - operator-only blocking read,
   - runtime-safe published snapshot,
@@ -45,7 +45,7 @@ simulation probes.
   - poll/step helpers only when the test is asserting background progress.
 - [ ] Remove old blocking helpers once the new surface is available; do not
   keep compatibility shims in the test path.
-- [ ] Extend the debugging guide with the preferred simulation-safe
+- [x] Extend the debugging guide with the preferred simulation-safe
   observation patterns and examples of when to choose snapshots versus
   subscriptions versus progress probes.
 - [x] Add remote cache / prefetch progress events so range-cache and dedupe
@@ -73,13 +73,7 @@ simulation probes.
 
 ## Highest-Value Follow-Ups
 
-- [ ] [tests/execution_domain_contracts.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/tests/execution_domain_contracts.rs):
-  replace remaining resource-manager polling patterns with subscription-based
-  waits where assertions are about in-flight state.
 - [ ] [src/api/watermark.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/watermark.rs):
   decide whether any remaining watermark-facing test helpers want ordered event
   semantics instead of latest-snapshot semantics now that `reserved_sequence`
   is published.
-- [ ] [tests/simulation_harness.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/tests/simulation_harness.rs):
-  extend whole-system scenarios so they assert observability transitions
-  through subscriptions/events, not only end-of-test snapshots.

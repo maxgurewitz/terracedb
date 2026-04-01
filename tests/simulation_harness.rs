@@ -10,16 +10,16 @@ use futures::{StreamExt, TryStreamExt};
 use terracedb::{
     CacheSpan, Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
     CommitOptions, CompactionStrategy, ContentionClass, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db,
-    DbComponents, DbConfig, DbProgressSnapshot, DbSettings, DomainBackgroundBudget,
-    DomainBudgetCharge, DomainBudgetOracle, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget,
-    DurabilityClass, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainOwner,
-    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane,
-    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceUsage, FieldDefinition,
-    FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure, FileSystemOperation,
-    InMemoryDomainBudgetOracle, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore,
-    ObjectStoreOperation, OpenError, PendingWork, PendingWorkType, RemoteCache,
-    RemoteCacheFetchKind, RemoteRecoveryHint, ResourceManager, RoundRobinScheduler, S3Location,
-    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+    DbComponents, DbConfig, DbProgressSnapshot, DbProgressSubscription, DbSettings,
+    DomainBackgroundBudget, DomainBudgetCharge, DomainBudgetOracle, DomainCpuBudget,
+    DomainIoBudget, DomainMemoryBudget, DurabilityClass, ExecutionDomainBacklogSnapshot,
+    ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement,
+    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, ExecutionLanePlacementConfig,
+    ExecutionResourceUsage, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
+    FileSystemFailure, FileSystemOperation, InMemoryDomainBudgetOracle, LogCursor, ManifestId,
+    ObjectKeyLayout, ObjectStore, ObjectStoreOperation, OpenError, PendingWork, PendingWorkType,
+    RemoteCache, RemoteCacheFetchKind, RemoteRecoveryHint, ResourceManager, RoundRobinScheduler,
+    S3Location, S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
     SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
     StorageSource, StubRng, TableConfig, TableFormat, TableStats, ThrottleDecision,
     TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage, Value,
@@ -439,13 +439,24 @@ type DurableRow = (Vec<u8>, Vec<u8>);
 type DurableRowsByDb = BTreeMap<String, Vec<DurableRow>>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PublishedDbProgressFrontier {
+    current_sequence: u64,
+    durable_sequence: u64,
+    reserved_sequence: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WholeSystemSimulationCampaignOutcome {
     database_order: Vec<String>,
     durable_rows_by_db: DurableRowsByDb,
     control_tables_by_db: BTreeMap<String, Vec<String>>,
+    progress_transitions_by_db: BTreeMap<String, Vec<PublishedDbProgressFrontier>>,
     visible_sequence_by_db: BTreeMap<String, u64>,
     durable_sequence_by_db: BTreeMap<String, u64>,
     throttled_writes_by_domain: BTreeMap<String, u64>,
+    observed_budget_publication: bool,
+    observed_backlog_publication: bool,
+    observed_analytics_throttle_publication: bool,
     mutable_budget_by_domain: BTreeMap<String, Option<u64>>,
     background_slots_by_domain: BTreeMap<String, Option<u32>>,
     backlog_items_by_domain: BTreeMap<String, u64>,
@@ -472,6 +483,52 @@ impl WholeSystemCampaignRng {
         self.state = next;
         next
     }
+}
+
+fn published_db_progress(snapshot: &DbProgressSnapshot) -> PublishedDbProgressFrontier {
+    PublishedDbProgressFrontier {
+        current_sequence: snapshot.current_sequence.get(),
+        durable_sequence: snapshot.durable_sequence.get(),
+        reserved_sequence: snapshot.reserved_sequence.get(),
+    }
+}
+
+fn record_campaign_progress(
+    progress_transitions_by_db: &mut BTreeMap<String, Vec<PublishedDbProgressFrontier>>,
+    db_name: &str,
+    snapshot: &DbProgressSnapshot,
+) {
+    let frontier = published_db_progress(snapshot);
+    let transitions = progress_transitions_by_db
+        .entry(db_name.to_string())
+        .or_default();
+    if transitions.last() != Some(&frontier) {
+        transitions.push(frontier);
+    }
+}
+
+async fn wait_for_visible_progress(
+    progress: &mut DbProgressSubscription,
+    sequence: SequenceNumber,
+) -> DbProgressSnapshot {
+    progress
+        .wait_for(|snapshot| {
+            snapshot.current_sequence >= sequence && snapshot.reserved_sequence >= sequence
+        })
+        .await
+        .expect("db progress update")
+}
+
+async fn wait_for_durable_progress(
+    progress: &mut DbProgressSubscription,
+    sequence: SequenceNumber,
+) -> DbProgressSnapshot {
+    progress
+        .wait_for(|snapshot| {
+            snapshot.durable_sequence >= sequence && snapshot.reserved_sequence >= sequence
+        })
+        .await
+        .expect("db progress update")
 }
 
 #[derive(Debug, Default)]
@@ -877,9 +934,12 @@ async fn run_simulated_whole_system_execution_domain_campaign(
     let warehouse_events = warehouse
         .create_table(SimulationTableSpec::row("events").table_config())
         .await?;
-    let primary_progress = primary.subscribe_progress();
-    let analytics_progress = analytics.subscribe_progress();
-    let warehouse_progress = warehouse.subscribe_progress();
+    let mut primary_progress = primary.subscribe_progress();
+    let mut analytics_progress = analytics.subscribe_progress();
+    let mut warehouse_progress = warehouse.subscribe_progress();
+    let resource_manager_updates = primary.subscribe_resource_manager();
+    let analytics_observability = analytics.subscribe_scheduler_observability();
+    let mut progress_transitions_by_db = BTreeMap::new();
 
     let oracle = InMemoryDomainBudgetOracle::default();
     let mut pending = BTreeMap::from([
@@ -912,7 +972,7 @@ async fn run_simulated_whole_system_execution_domain_campaign(
         );
 
         let value = format!("{name}-bootstrap-{seed:04x}").into_bytes();
-        table
+        let sequence = table
             .write(b"bootstrap".to_vec(), Value::bytes(value.clone()))
             .await?;
         pending
@@ -920,12 +980,13 @@ async fn run_simulated_whole_system_execution_domain_campaign(
             .expect("bootstrap pending domain")
             .insert(b"bootstrap".to_vec(), value.clone());
         let progress = match name {
-            "primary" => &primary_progress,
-            "analytics" => &analytics_progress,
-            "warehouse" => &warehouse_progress,
+            "primary" => &mut primary_progress,
+            "analytics" => &mut analytics_progress,
+            "warehouse" => &mut warehouse_progress,
             _ => unreachable!("bootstrap only targets declared databases"),
         };
-        let snapshot = progress.current();
+        let snapshot = wait_for_visible_progress(progress, sequence).await;
+        record_campaign_progress(&mut progress_transitions_by_db, name, &snapshot);
         if snapshot.current_sequence == snapshot.durable_sequence {
             durable
                 .get_mut(name)
@@ -937,6 +998,8 @@ async fn run_simulated_whole_system_execution_domain_campaign(
                 .clear();
         }
         db.flush().await?;
+        let durable_snapshot = wait_for_durable_progress(progress, sequence).await;
+        record_campaign_progress(&mut progress_transitions_by_db, name, &durable_snapshot);
         durable
             .get_mut(name)
             .expect("bootstrap durable domain")
@@ -983,7 +1046,7 @@ async fn run_simulated_whole_system_execution_domain_campaign(
         };
         let key = format!("seed-{seed:04x}-round-{round}").into_bytes();
         let value = format!("{target}-{:016x}", rng.next_u64()).into_bytes();
-        table
+        let sequence = table
             .write(key.clone(), Value::bytes(value.clone()))
             .await?;
         pending
@@ -991,12 +1054,13 @@ async fn run_simulated_whole_system_execution_domain_campaign(
             .expect("seeded pending domain")
             .insert(key, value.clone());
         let progress = match target {
-            "primary" => &primary_progress,
-            "analytics" => &analytics_progress,
-            "warehouse" => &warehouse_progress,
+            "primary" => &mut primary_progress,
+            "analytics" => &mut analytics_progress,
+            "warehouse" => &mut warehouse_progress,
             _ => unreachable!("campaign only targets declared databases"),
         };
-        let snapshot = progress.current();
+        let snapshot = wait_for_visible_progress(progress, sequence).await;
+        record_campaign_progress(&mut progress_transitions_by_db, target, &snapshot);
         if snapshot.current_sequence == snapshot.durable_sequence {
             durable
                 .get_mut(target)
@@ -1020,6 +1084,8 @@ async fn run_simulated_whole_system_execution_domain_campaign(
 
         if round % 2 == 0 && target != "analytics" {
             db.flush().await?;
+            let durable_snapshot = wait_for_durable_progress(progress, sequence).await;
+            record_campaign_progress(&mut progress_transitions_by_db, target, &durable_snapshot);
             durable
                 .get_mut(target)
                 .expect("round durable domain")
@@ -1135,14 +1201,16 @@ async fn run_simulated_whole_system_execution_domain_campaign(
     for burst in 0..3_usize {
         let key = format!("analytics-burst-{seed:04x}-{burst}").into_bytes();
         let value = vec![b'a'; 48 + (burst * 8)];
-        analytics_events
+        let sequence = analytics_events
             .write(key.clone(), Value::bytes(value.clone()))
             .await?;
         pending
             .get_mut("analytics")
             .expect("analytics pending domain")
             .insert(key, value.clone());
-        if analytics.current_durable_sequence() == analytics.current_sequence() {
+        let snapshot = wait_for_visible_progress(&mut analytics_progress, sequence).await;
+        record_campaign_progress(&mut progress_transitions_by_db, "analytics", &snapshot);
+        if snapshot.current_sequence == snapshot.durable_sequence {
             durable
                 .get_mut("analytics")
                 .expect("analytics durable domain")
@@ -1188,6 +1256,21 @@ async fn run_simulated_whole_system_execution_domain_campaign(
             },
         )
         .admitted;
+    let published_manager_snapshot = resource_manager_updates.current();
+    let observed_budget_publication = published_manager_snapshot.domains[&analytics_foreground]
+        .spec
+        .budget
+        .memory
+        .mutable_bytes
+        == Some(64);
+    let observed_backlog_publication = published_manager_snapshot.domains[&warehouse_background]
+        .backlog
+        .queued_work_items
+        == 2
+        && published_manager_snapshot.domains[&warehouse_background]
+            .backlog
+            .queued_bytes
+            == 256;
 
     let maintenance_tag = manager.placement_tag(WorkPlacementRequest {
         owner: ExecutionDomainOwner::Subsystem {
@@ -1230,6 +1313,13 @@ async fn run_simulated_whole_system_execution_domain_campaign(
         .admitted;
 
     primary.flush().await?;
+    let primary_snapshot =
+        wait_for_durable_progress(&mut primary_progress, primary.current_sequence()).await;
+    record_campaign_progress(
+        &mut progress_transitions_by_db,
+        "primary",
+        &primary_snapshot,
+    );
     durable
         .get_mut("primary")
         .expect("final primary durable domain")
@@ -1244,6 +1334,13 @@ async fn run_simulated_whole_system_execution_domain_campaign(
         .expect("clear final primary pending state")
         .clear();
     warehouse.flush().await?;
+    let warehouse_snapshot =
+        wait_for_durable_progress(&mut warehouse_progress, warehouse.current_sequence()).await;
+    record_campaign_progress(
+        &mut progress_transitions_by_db,
+        "warehouse",
+        &warehouse_snapshot,
+    );
     durable
         .get_mut("warehouse")
         .expect("final warehouse durable domain")
@@ -1269,6 +1366,13 @@ async fn run_simulated_whole_system_execution_domain_campaign(
                 .or_insert(0) += count;
         }
     }
+    let analytics_throttle_snapshot = analytics_observability.current();
+    let observed_analytics_throttle_publication = analytics_throttle_snapshot
+        .throttled_writes_by_domain
+        .get(&analytics_foreground)
+        .copied()
+        .unwrap_or_default()
+        > 0;
 
     context.crash_filesystem(CutPoint::AfterStep);
     drop(primary_events);
@@ -1334,6 +1438,7 @@ async fn run_simulated_whole_system_execution_domain_campaign(
             ("warehouse".to_string(), actual_warehouse_rows),
         ]),
         control_tables_by_db: control_tables,
+        progress_transitions_by_db,
         visible_sequence_by_db: BTreeMap::from([
             (
                 "primary".to_string(),
@@ -1363,6 +1468,9 @@ async fn run_simulated_whole_system_execution_domain_campaign(
             ),
         ]),
         throttled_writes_by_domain,
+        observed_budget_publication,
+        observed_backlog_publication,
+        observed_analytics_throttle_publication,
         mutable_budget_by_domain: BTreeMap::from([
             (
                 analytics_foreground.as_string(),
@@ -4252,6 +4360,18 @@ fn whole_system_execution_domain_simulation_seed_campaign_is_reproducible() -> t
 
     for (seed, outcome) in [(0x6901_u64, &first), (0x6902_u64, &second)] {
         assert!(
+            outcome.observed_budget_publication,
+            "seed {seed:#x} should publish tightened mutable budgets through the resource-manager subscription"
+        );
+        assert!(
+            outcome.observed_backlog_publication,
+            "seed {seed:#x} should publish warehouse backlog through the resource-manager subscription"
+        );
+        assert!(
+            outcome.observed_analytics_throttle_publication,
+            "seed {seed:#x} should publish analytics throttling through scheduler observability"
+        );
+        assert!(
             outcome.admissions["warehouse-shared-overflow-blocked"],
             "seed {seed:#x} should block extra shard-ready background work after tightening budgets"
         );
@@ -4280,6 +4400,48 @@ fn whole_system_execution_domain_simulation_seed_campaign_is_reproducible() -> t
                 .throttled_writes_by_domain
                 .contains_key("process/dbs/analytics/foreground"),
             "seed {seed:#x} should observe analytics foreground throttling after the mutable budget tightens"
+        );
+        for db_name in ["primary", "analytics", "warehouse"] {
+            let transitions = outcome
+                .progress_transitions_by_db
+                .get(db_name)
+                .expect("progress transitions for campaign database");
+            assert!(
+                !transitions.is_empty(),
+                "seed {seed:#x} should publish DB progress transitions for {db_name}"
+            );
+            for transition in transitions {
+                assert!(
+                    transition.reserved_sequence >= transition.current_sequence,
+                    "seed {seed:#x} should keep reserved >= current for {db_name}: {transition:?}"
+                );
+                assert!(
+                    transition.current_sequence >= transition.durable_sequence,
+                    "seed {seed:#x} should keep current >= durable for {db_name}: {transition:?}"
+                );
+            }
+            for window in transitions.windows(2) {
+                let previous = &window[0];
+                let next = &window[1];
+                assert!(
+                    next.reserved_sequence >= previous.reserved_sequence,
+                    "seed {seed:#x} should publish monotonic reserved progress for {db_name}: {previous:?} -> {next:?}"
+                );
+                assert!(
+                    next.current_sequence >= previous.current_sequence,
+                    "seed {seed:#x} should publish monotonic current progress for {db_name}: {previous:?} -> {next:?}"
+                );
+                assert!(
+                    next.durable_sequence >= previous.durable_sequence,
+                    "seed {seed:#x} should publish monotonic durable progress for {db_name}: {previous:?} -> {next:?}"
+                );
+            }
+        }
+        assert!(
+            outcome.progress_transitions_by_db["analytics"]
+                .iter()
+                .any(|transition| transition.current_sequence > transition.durable_sequence),
+            "seed {seed:#x} should publish at least one analytics in-flight frontier before recovery"
         );
     }
 
