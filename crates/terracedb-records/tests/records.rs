@@ -360,6 +360,7 @@ async fn transaction_scans_include_local_writes_and_preserve_codec_order() {
             history_retention_sequences: None,
             compaction_strategy: CompactionStrategy::Leveled,
             schema: None,
+            sharding: Default::default(),
             metadata: Default::default(),
         })
         .await

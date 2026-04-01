@@ -3,6 +3,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::sharding::PhysicalShardId;
+
 macro_rules! id_newtype {
     ($name:ident, $inner:ty) => {
         #[derive(
@@ -64,9 +66,13 @@ impl CommitId {
     pub const ENCODED_LEN: usize = 16;
 
     pub const fn new(sequence: SequenceNumber) -> Self {
+        Self::with_shard_hint(sequence, PhysicalShardId::UNSHARDED)
+    }
+
+    pub const fn with_shard_hint(sequence: SequenceNumber, shard_hint: PhysicalShardId) -> Self {
         Self {
             sequence,
-            shard_hint: 0,
+            shard_hint: shard_hint.get(),
             reserved: 0,
         }
     }
@@ -77,6 +83,10 @@ impl CommitId {
 
     pub const fn shard_hint(self) -> u32 {
         self.shard_hint
+    }
+
+    pub const fn physical_shard_hint(self) -> PhysicalShardId {
+        PhysicalShardId::new(self.shard_hint)
     }
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {

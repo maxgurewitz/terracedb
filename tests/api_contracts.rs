@@ -107,6 +107,7 @@ async fn public_api_surface_compiles_and_is_instantiable() {
             history_retention_sequences: None,
             compaction_strategy: CompactionStrategy::Leveled,
             schema: None,
+            sharding: Default::default(),
             metadata: Default::default(),
         })
         .await
@@ -143,6 +144,7 @@ async fn public_api_surface_compiles_and_is_instantiable() {
             history_retention_sequences: Some(128),
             compaction_strategy: CompactionStrategy::Tiered,
             schema: Some(metrics_schema.clone()),
+            sharding: Default::default(),
             metadata: Default::default(),
         })
         .await

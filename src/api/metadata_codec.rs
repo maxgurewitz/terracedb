@@ -276,8 +276,11 @@ impl Db {
         fbb: &mut flatbuffers::FlatBufferBuilder<'fbb>,
         entry: &PersistedCatalogEntry,
     ) -> Result<flatbuffers::WIPOffset<metadata_fb::CatalogEntry<'fbb>>, StorageError> {
-        let metadata_entries =
-            Self::encode_metadata_entries_flatbuffer(fbb, &entry.config.metadata)?;
+        let persisted_metadata = crate::sharding::encode_persisted_table_metadata(
+            &entry.config.metadata,
+            &entry.config.sharding,
+        )?;
+        let metadata_entries = Self::encode_metadata_entries_flatbuffer(fbb, &persisted_metadata)?;
         let schema = match &entry.config.schema {
             Some(schema) => Some(Self::encode_schema_flatbuffer(fbb, schema)?),
             None => None,
@@ -324,6 +327,12 @@ impl Db {
         entry: metadata_fb::CatalogEntry<'_>,
     ) -> Result<PersistedCatalogEntry, StorageError> {
         let config = entry.config();
+        let encoded_metadata =
+            Self::decode_metadata_entries_flatbuffer(config.metadata_entries().ok_or_else(
+                || StorageError::corruption("catalog entry is missing metadata entries"),
+            )?)?;
+        let (metadata, sharding) =
+            crate::sharding::decode_persisted_table_metadata(encoded_metadata)?;
         Ok(PersistedCatalogEntry {
             id: TableId::new(entry.id()),
             config: PersistedTableConfig {
@@ -345,11 +354,8 @@ impl Db {
                     Some(schema) => Some(Self::decode_schema_flatbuffer(schema)?),
                     None => None,
                 },
-                metadata: Self::decode_metadata_entries_flatbuffer(
-                    config.metadata_entries().ok_or_else(|| {
-                        StorageError::corruption("catalog entry is missing metadata entries")
-                    })?,
-                )?,
+                sharding,
+                metadata,
             },
         })
     }

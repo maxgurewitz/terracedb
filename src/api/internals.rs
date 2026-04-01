@@ -109,6 +109,8 @@ pub(super) struct PersistedTableConfig {
     pub(super) history_retention_sequences: Option<u64>,
     pub(super) compaction_strategy: CompactionStrategy,
     pub(super) schema: Option<SchemaDefinition>,
+    #[serde(default)]
+    pub(super) sharding: crate::ShardingConfig,
     pub(super) metadata: TableMetadata,
 }
 

@@ -573,6 +573,7 @@ fn row_table_config(name: &str) -> TableConfig {
         history_retention_sequences: None,
         compaction_strategy: CompactionStrategy::Leveled,
         schema: None,
+        sharding: Default::default(),
         metadata: Default::default(),
     }
 }

@@ -2201,6 +2201,7 @@ fn projection_cursor_table_config() -> TableConfig {
         history_retention_sequences: None,
         compaction_strategy: CompactionStrategy::Leveled,
         schema: None,
+        sharding: Default::default(),
         metadata: BTreeMap::new(),
     }
 }

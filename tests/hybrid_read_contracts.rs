@@ -63,6 +63,7 @@ fn row_table_config(name: &str) -> TableConfig {
         history_retention_sequences: None,
         compaction_strategy: terracedb::CompactionStrategy::Leveled,
         schema: None,
+        sharding: Default::default(),
         metadata: Default::default(),
     }
 }
@@ -107,6 +108,7 @@ fn columnar_table_config(name: &str) -> TableConfig {
         history_retention_sequences: None,
         compaction_strategy: terracedb::CompactionStrategy::Tiered,
         schema: Some(metric_schema()),
+        sharding: Default::default(),
         metadata: Default::default(),
     }
 }

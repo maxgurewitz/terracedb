@@ -1815,6 +1815,7 @@ fn columnar_schema_and_normalized_records_survive_simulated_restart() -> turmoil
                 history_retention_sequences: Some(16),
                 compaction_strategy: CompactionStrategy::Tiered,
                 schema: Some(schema.clone()),
+                sharding: Default::default(),
                 metadata: Default::default(),
             })
             .await
@@ -4760,6 +4761,7 @@ fn remote_columnar_cache_survives_simulated_restart_and_masks_warmed_range_fault
                 history_retention_sequences: Some(16),
                 compaction_strategy: CompactionStrategy::Tiered,
                 schema: Some(schema.clone()),
+                sharding: Default::default(),
                 metadata: Default::default(),
             })
             .await
@@ -4893,6 +4895,7 @@ fn wide_columnar_point_reads_complete_after_simulated_restart() -> turmoil::Resu
                 history_retention_sequences: Some(16),
                 compaction_strategy: CompactionStrategy::Tiered,
                 schema: Some(schema.clone()),
+                sharding: Default::default(),
                 metadata: Default::default(),
             })
             .await

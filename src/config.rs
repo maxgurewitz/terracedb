@@ -12,6 +12,7 @@ use crate::{
     },
     ids::{SequenceNumber, Timestamp},
     scheduler::Scheduler,
+    sharding::ShardingConfig,
 };
 
 pub type TableMetadata = BTreeMap<String, JsonValue>;
@@ -181,6 +182,7 @@ pub struct TableConfig {
     pub history_retention_sequences: Option<u64>,
     pub compaction_strategy: CompactionStrategy,
     pub schema: Option<SchemaDefinition>,
+    pub sharding: ShardingConfig,
     pub metadata: TableMetadata,
 }
 
@@ -211,6 +213,7 @@ impl fmt::Debug for TableConfig {
             )
             .field("compaction_strategy", &self.compaction_strategy)
             .field("schema", &self.schema)
+            .field("sharding", &self.sharding)
             .field("metadata", &self.metadata)
             .finish()
     }
@@ -226,6 +229,7 @@ pub struct ColumnarTableConfigBuilder {
     history_retention_sequences: Option<u64>,
     compaction_strategy: CompactionStrategy,
     schema: SchemaDefinition,
+    sharding: ShardingConfig,
     hybrid_features: HybridTableFeatures,
     compact_to_wide_promotion: Option<HybridCompactToWidePromotionConfig>,
 }
@@ -256,6 +260,7 @@ impl fmt::Debug for ColumnarTableConfigBuilder {
             )
             .field("compaction_strategy", &self.compaction_strategy)
             .field("schema", &self.schema)
+            .field("sharding", &self.sharding)
             .field("hybrid_features", &self.hybrid_features)
             .field("compact_to_wide_promotion", &self.compact_to_wide_promotion)
             .finish()
@@ -273,6 +278,7 @@ impl ColumnarTableConfigBuilder {
             history_retention_sequences: None,
             compaction_strategy: CompactionStrategy::Leveled,
             schema,
+            sharding: ShardingConfig::default(),
             hybrid_features: HybridTableFeatures::default(),
             compact_to_wide_promotion: None,
         }
@@ -305,6 +311,11 @@ impl ColumnarTableConfigBuilder {
 
     pub fn compaction_strategy(mut self, strategy: CompactionStrategy) -> Self {
         self.compaction_strategy = strategy;
+        self
+    }
+
+    pub fn sharding(mut self, sharding: ShardingConfig) -> Self {
+        self.sharding = sharding;
         self
     }
 
@@ -356,6 +367,7 @@ impl ColumnarTableConfigBuilder {
             history_retention_sequences: self.history_retention_sequences,
             compaction_strategy: self.compaction_strategy,
             schema: Some(self.schema),
+            sharding: self.sharding,
             metadata,
         }
     }

@@ -21,6 +21,7 @@ use crate::{
     ids::{ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOptions},
     metadata_flatbuffers as metadata_fb,
+    sharding::PhysicalShardId,
 };
 
 const LOCAL_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -250,8 +251,17 @@ impl ObjectKeyLayout {
     }
 
     pub fn backup_sstable(&self, table_id: TableId, shard: u32, local_id: &str) -> String {
+        self.backup_sstable_in_shard(table_id, PhysicalShardId::new(shard), local_id)
+    }
+
+    pub fn backup_sstable_in_shard(
+        &self,
+        table_id: TableId,
+        shard: PhysicalShardId,
+        local_id: &str,
+    ) -> String {
         self.key(&format!(
-            "backup/sst/table-{:06}/{shard:04}/{local_id}.sst",
+            "backup/sst/table-{:06}/{shard}/{local_id}.sst",
             table_id.get()
         ))
     }
@@ -279,8 +289,25 @@ impl ObjectKeyLayout {
         max_sequence: SequenceNumber,
         local_id: &str,
     ) -> String {
+        self.cold_sstable_in_shard(
+            table_id,
+            PhysicalShardId::new(shard),
+            min_sequence,
+            max_sequence,
+            local_id,
+        )
+    }
+
+    pub fn cold_sstable_in_shard(
+        &self,
+        table_id: TableId,
+        shard: PhysicalShardId,
+        min_sequence: SequenceNumber,
+        max_sequence: SequenceNumber,
+        local_id: &str,
+    ) -> String {
         self.key(&format!(
-            "cold/table-{:06}/{shard:04}/{:020}-{:020}/{local_id}.sst",
+            "cold/table-{:06}/{shard}/{:020}-{:020}/{local_id}.sst",
             table_id.get(),
             min_sequence.get(),
             max_sequence.get()

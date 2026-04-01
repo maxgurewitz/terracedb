@@ -618,6 +618,13 @@ impl Db {
         ReadSet::default()
     }
 
+    pub fn explain_write_batch_sharding(
+        &self,
+        batch: &WriteBatch,
+    ) -> Result<crate::WriteBatchShardingPlan, crate::WriteBatchShardingError> {
+        self.plan_write_batch_sharding(batch.operations())
+    }
+
     /// Returns the lane bindings configured for this database.
     pub fn execution_profile(&self) -> &DbExecutionProfile {
         &self.inner.execution_profile
@@ -860,6 +867,9 @@ impl Db {
         if batch.is_empty() {
             return Err(CommitError::EmptyBatch);
         }
+        let sharding_plan = self
+            .explain_write_batch_sharding(&batch)
+            .map_err(Self::commit_error_from_write_batch_sharding_error)?;
 
         let span = tracing::info_span!("terracedb.db.commit");
         apply_db_span_attributes(
@@ -903,8 +913,14 @@ impl Db {
                     .clone()
                     .or_else(|| Some(OperationContext::current()))
                     .filter(|context| !context.is_empty());
-                let record =
-                    Self::build_commit_record(sequence, &resolved_operations, operation_context)?;
+                let record = Self::build_commit_record(
+                    sequence,
+                    &resolved_operations,
+                    operation_context,
+                    sharding_plan
+                        .commit_shard_hint()
+                        .unwrap_or(crate::PhysicalShardId::UNSHARDED),
+                )?;
                 let participant = if self.durable_on_commit() {
                     let participant = self.register_commit(sequence, resolved_operations.clone());
                     participant
@@ -2182,6 +2198,7 @@ impl Db {
         sequence: SequenceNumber,
         operations: &[ResolvedBatchOperation],
         operation_context: Option<OperationContext>,
+        shard_hint: crate::PhysicalShardId,
     ) -> Result<CommitRecord, CommitError> {
         let entries = operations
             .iter()
@@ -2204,9 +2221,25 @@ impl Db {
             .collect::<Result<Vec<_>, CommitError>>()?;
 
         Ok(CommitRecord {
-            id: CommitId::new(sequence),
+            id: CommitId::with_shard_hint(sequence, shard_hint),
             entries,
         })
+    }
+
+    fn commit_error_from_write_batch_sharding_error(
+        error: crate::WriteBatchShardingError,
+    ) -> CommitError {
+        match error {
+            crate::WriteBatchShardingError::MissingTable { table_name } => {
+                CommitError::Storage(Self::missing_table_error(&table_name))
+            }
+            crate::WriteBatchShardingError::InvalidTableConfig { message, .. } => {
+                CommitError::Storage(StorageError::unsupported(message))
+            }
+            crate::WriteBatchShardingError::Locality(error) => {
+                CommitError::Storage(StorageError::unsupported(error.to_string()))
+            }
+        }
     }
 
     pub(super) fn register_commit(
@@ -2839,6 +2872,80 @@ impl Db {
                 }
             })
             .collect()
+    }
+
+    fn plan_write_batch_sharding(
+        &self,
+        operations: &[BatchOperation],
+    ) -> Result<crate::WriteBatchShardingPlan, crate::WriteBatchShardingError> {
+        #[derive(Clone, Copy)]
+        struct PendingPlan {
+            first_route: crate::KeyShardRoute,
+            table_index: usize,
+            is_sharded: bool,
+        }
+
+        let mut tables = Vec::<crate::TableBatchShardingPlan>::new();
+        let mut by_table = BTreeMap::<TableId, PendingPlan>::new();
+
+        for operation in operations {
+            let (table, key) = match operation {
+                BatchOperation::Put { table, key, .. }
+                | BatchOperation::Merge { table, key, .. }
+                | BatchOperation::Delete { table, key } => (table, key),
+            };
+            let stored = self.resolve_stored_table(table).ok_or_else(|| {
+                crate::WriteBatchShardingError::MissingTable {
+                    table_name: table.name().to_string(),
+                }
+            })?;
+            let route = stored.config.sharding.route_key(key).map_err(|error| {
+                crate::WriteBatchShardingError::InvalidTableConfig {
+                    table_name: table.name().to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+
+            if let Some(existing) = by_table.get(&stored.id).copied() {
+                if existing.is_sharded
+                    && existing.first_route.physical_shard != route.physical_shard
+                {
+                    return Err(crate::BatchShardLocalityError {
+                        table_name: table.name().to_string(),
+                        first_shard: existing.first_route.physical_shard,
+                        conflicting_shard: route.physical_shard,
+                        first_virtual_partition: existing.first_route.virtual_partition,
+                        conflicting_virtual_partition: route.virtual_partition,
+                    }
+                    .into());
+                }
+                let plan = &mut tables[existing.table_index];
+                plan.physical_shards.insert(route.physical_shard);
+                plan.virtual_partitions.insert(route.virtual_partition);
+                plan.shard_map_revision = route.shard_map_revision;
+            } else {
+                let mut plan = crate::TableBatchShardingPlan {
+                    table_id: stored.id,
+                    table_name: table.name().to_string(),
+                    shard_map_revision: route.shard_map_revision,
+                    ..crate::TableBatchShardingPlan::default()
+                };
+                plan.physical_shards.insert(route.physical_shard);
+                plan.virtual_partitions.insert(route.virtual_partition);
+                tables.push(plan);
+                by_table.insert(
+                    stored.id,
+                    PendingPlan {
+                        first_route: route,
+                        table_index: tables.len() - 1,
+                        is_sharded: stored.config.sharding.is_sharded(),
+                    },
+                );
+            }
+        }
+
+        tables.sort_by(|left, right| left.table_name.cmp(&right.table_name));
+        Ok(crate::WriteBatchShardingPlan { tables })
     }
 
     pub(super) fn resolve_stored_table(&self, table: &Table) -> Option<StoredTable> {

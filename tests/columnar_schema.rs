@@ -272,6 +272,7 @@ async fn columnar_tables_normalize_record_writes_and_reject_bytes() {
             history_retention_sequences: Some(32),
             compaction_strategy: CompactionStrategy::Tiered,
             schema: Some(schema.clone()),
+            sharding: Default::default(),
             metadata: Default::default(),
         })
         .await
@@ -334,6 +335,7 @@ async fn table_creation_rejects_row_schemas_and_accepts_columnar_merge_config() 
         history_retention_sequences: None,
         compaction_strategy: CompactionStrategy::Leveled,
         schema: Some(schema_with_nullable_defaults()),
+        sharding: Default::default(),
         metadata: Default::default(),
     };
     let error = db
@@ -363,6 +365,7 @@ async fn table_creation_rejects_row_schemas_and_accepts_columnar_merge_config() 
             history_retention_sequences: Some(16),
             compaction_strategy: CompactionStrategy::Tiered,
             schema: Some(schema_with_nullable_defaults()),
+            sharding: Default::default(),
             metadata: Default::default(),
         })
         .await
