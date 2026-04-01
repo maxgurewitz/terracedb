@@ -52,10 +52,21 @@ This repository includes a shared pre-commit script at `scripts/pre-commit.sh`.
 
 The Git hook at `.githooks/pre-commit` calls that script, which runs:
 
+- `scripts/run-codex-review.sh`
 - `scripts/check-durable-format-fixtures.sh`
 - `cargo nextest run --workspace`
+- `cargo test --workspace --doc`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
+
+By default, the Codex review step evaluates the staged diff against
+`docs/GUIDELINES.md`, writes a full Markdown review under `.tmp/codex-review/`,
+prints the absolute review path, and blocks the commit only when Codex returns
+blocking findings. Set `CODEX_REVIEW_ENABLED=0` to disable it, set
+`CODEX_REVIEW_STRICT=1` to also fail the commit on Codex tooling/setup errors,
+use `SKIP_CODEX_REVIEW=1` to bypass the review step for a single commit, and
+set `CODEX_REVIEW_REASONING_EFFORT` to override the default low reasoning mode.
+The hook also expects `jq` to be installed locally.
 
 Durable-format policy, fixture inventory, and the checked FlatBuffers schema reference live in `docs/DURABLE_FORMATS.md` and `schemas/durable_metadata.fbs`.
 
