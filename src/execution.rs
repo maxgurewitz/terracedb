@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::scheduler::PendingWorkType;
+use crate::sharding::PhysicalShardId;
 
 /// Hierarchical name for an execution domain.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -135,6 +136,18 @@ pub enum ExecutionDomainOwner {
         kind: String,
         name: String,
     },
+}
+
+impl ExecutionDomainOwner {
+    pub fn physical_shard(&self) -> Option<PhysicalShardId> {
+        match self {
+            Self::Shard { shard, .. } => shard.parse().ok(),
+            Self::ProcessControl
+            | Self::Database { .. }
+            | Self::Subsystem { .. }
+            | Self::Custom { .. } => None,
+        }
+    }
 }
 
 /// CPU budget contract for one execution domain.
@@ -707,6 +720,12 @@ pub struct WorkRuntimeTag {
     pub contention_class: ContentionClass,
     pub domain: ExecutionDomainPath,
     pub durability_class: DurabilityClass,
+}
+
+impl WorkRuntimeTag {
+    pub fn physical_shard(&self) -> Option<PhysicalShardId> {
+        self.owner.physical_shard()
+    }
 }
 
 /// Work value paired with a runtime execution tag.

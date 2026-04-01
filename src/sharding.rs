@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::ParseIntError,
 };
 
 use crc32fast::hash as crc32_hash;
@@ -77,6 +78,14 @@ impl PhysicalShardId {
 impl fmt::Display for PhysicalShardId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:04}", self.0)
+    }
+}
+
+impl std::str::FromStr for PhysicalShardId {
+    type Err = ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.parse()?))
     }
 }
 

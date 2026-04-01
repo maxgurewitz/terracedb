@@ -142,6 +142,7 @@ impl DeterministicPressureOracle {
             local: total,
             domain_total: Some(total),
             process_total: Some(total),
+            physical_shard: None,
             oldest_unflushed_age: self.oldest_unflushed_age(),
             budget: self.process_budget,
             metadata: BTreeMap::new(),
@@ -155,6 +156,7 @@ impl DeterministicPressureOracle {
             local,
             domain_total: Some(local),
             process_total: Some(self.process_total()),
+            physical_shard: None,
             oldest_unflushed_age: self.oldest_unflushed_age_for_domain(path),
             budget: self
                 .domain_budgets
@@ -172,6 +174,7 @@ impl DeterministicPressureOracle {
             local: state.pressure,
             domain_total: state.domain.as_ref().map(|path| self.domain_total(path)),
             process_total: Some(self.process_total()),
+            physical_shard: None,
             oldest_unflushed_age: self.age_since(state.oldest_unflushed_since),
             budget: state
                 .domain
@@ -220,6 +223,7 @@ impl DeterministicPressureOracle {
                 id: format!("flush:{table}"),
                 work_type: PendingWorkType::Flush,
                 table: table.to_string(),
+                physical_shard: None,
                 level: None,
                 estimated_bytes,
             },

@@ -715,16 +715,43 @@ impl Db {
         )
     }
 
+    fn shard_ready_layout(&self) -> Option<crate::ShardReadyPlacementLayout> {
+        let layout = crate::ShardReadyPlacementLayout::new(self.execution_identity().to_string());
+        (self.execution_profile().foreground.domain
+            == layout.database_lane_path(ExecutionLane::UserForeground)
+            && self.execution_profile().background.domain
+                == layout.database_lane_path(ExecutionLane::UserBackground)
+            && self.execution_profile().control_plane.domain
+                == layout.database_lane_path(ExecutionLane::ControlPlane))
+        .then_some(layout)
+    }
+
+    fn fallback_execution_domain_path(
+        &self,
+        path: &ExecutionDomainPath,
+    ) -> Option<ExecutionDomainPath> {
+        let layout = self.shard_ready_layout()?;
+        if !path.is_same_or_descendant_of(&layout.future_shard_namespace) {
+            return None;
+        }
+
+        match path.segments().last().map(String::as_str) {
+            Some("foreground") => Some(self.execution_profile().foreground.domain.clone()),
+            Some("background") => Some(self.execution_profile().background.domain.clone()),
+            Some("control") => Some(self.execution_profile().control_plane.domain.clone()),
+            _ => None,
+        }
+    }
+
     pub(super) fn execution_domain_snapshot(
         &self,
         path: &ExecutionDomainPath,
     ) -> Option<crate::ExecutionDomainSnapshot> {
-        self.inner
-            .resource_manager
-            .snapshot()
-            .domains
-            .get(path)
-            .cloned()
+        let snapshot = self.inner.resource_manager.snapshot();
+        snapshot.domains.get(path).cloned().or_else(|| {
+            self.fallback_execution_domain_path(path)
+                .and_then(|fallback| snapshot.domains.get(&fallback).cloned())
+        })
     }
 
     pub(super) fn execution_domain_budget(
@@ -733,6 +760,41 @@ impl Db {
     ) -> Option<ExecutionDomainBudget> {
         self.execution_domain_snapshot(path)
             .map(|snapshot| snapshot.spec.budget)
+    }
+
+    fn shard_lane_owner(
+        &self,
+        physical_shard: crate::PhysicalShardId,
+        lane: ExecutionLane,
+    ) -> ExecutionDomainOwner {
+        if physical_shard == crate::PhysicalShardId::UNSHARDED {
+            return self.default_execution_owner(lane);
+        }
+
+        ExecutionDomainOwner::Shard {
+            database: self.execution_identity().to_string(),
+            shard: physical_shard.to_string(),
+        }
+    }
+
+    fn shard_lane_binding(
+        &self,
+        physical_shard: crate::PhysicalShardId,
+        lane: ExecutionLane,
+    ) -> crate::ExecutionLaneBinding {
+        let base = self.execution_lane_binding(lane);
+        if physical_shard == crate::PhysicalShardId::UNSHARDED {
+            return base.clone();
+        }
+
+        self.shard_ready_layout()
+            .map(|layout| {
+                crate::ExecutionLaneBinding::new(
+                    layout.future_shard_lane_path(physical_shard.to_string(), lane),
+                    base.durability_class.clone(),
+                )
+            })
+            .unwrap_or_else(|| base.clone())
     }
 
     /// Tags work with an explicit owner, lane, and contention class.
@@ -785,12 +847,77 @@ impl Db {
         )
     }
 
+    /// Tags foreground user work for one physical shard.
+    pub fn tag_shard_foreground_work<T>(
+        &self,
+        work: T,
+        physical_shard: crate::PhysicalShardId,
+    ) -> DomainTaggedWork<T> {
+        self.tag_shard_lane_work(
+            work,
+            physical_shard,
+            ExecutionLane::UserForeground,
+            crate::ContentionClass::UserData,
+        )
+    }
+
+    /// Tags background user work for one physical shard.
+    pub fn tag_shard_background_work<T>(
+        &self,
+        work: T,
+        physical_shard: crate::PhysicalShardId,
+    ) -> DomainTaggedWork<T> {
+        self.tag_shard_lane_work(
+            work,
+            physical_shard,
+            ExecutionLane::UserBackground,
+            crate::ContentionClass::UserData,
+        )
+    }
+
     /// Tags control-plane work for this database.
     pub fn tag_control_plane_work<T>(&self, work: T) -> DomainTaggedWork<T> {
         self.tag_lane_work(
             work,
             ExecutionLane::ControlPlane,
             crate::ContentionClass::ControlPlane,
+        )
+    }
+
+    /// Tags shard-local control-plane work while preserving the protected control-plane lane.
+    pub fn tag_shard_control_plane_work<T>(
+        &self,
+        work: T,
+        physical_shard: crate::PhysicalShardId,
+    ) -> DomainTaggedWork<T> {
+        self.tag_shard_lane_work(
+            work,
+            physical_shard,
+            ExecutionLane::ControlPlane,
+            crate::ContentionClass::ControlPlane,
+        )
+    }
+
+    /// Tags work for one physical shard, falling back to the database-wide lane when needed.
+    pub fn tag_shard_lane_work<T>(
+        &self,
+        work: T,
+        physical_shard: crate::PhysicalShardId,
+        lane: ExecutionLane,
+        contention_class: crate::ContentionClass,
+    ) -> DomainTaggedWork<T> {
+        let owner = self.shard_lane_owner(physical_shard, lane);
+        let binding = self.shard_lane_binding(physical_shard, lane);
+        DomainTaggedWork::new(
+            work,
+            self.inner
+                .resource_manager
+                .placement_tag(crate::WorkPlacementRequest {
+                    owner,
+                    lane,
+                    contention_class,
+                    binding,
+                }),
         )
     }
 
@@ -941,12 +1068,22 @@ impl Db {
                 .map(|read_set| read_set.entries().len() as u64)
                 .unwrap_or(0),
         );
+        if let Some(physical_shard) = sharding_plan.commit_shard_hint()
+            && physical_shard != crate::PhysicalShardId::UNSHARDED
+        {
+            crate::set_span_attribute(
+                &span,
+                crate::telemetry_attrs::PHYSICAL_SHARD,
+                physical_shard.to_string(),
+            );
+        }
         let span_for_attrs = span.clone();
 
         async move {
             let resolved_operations = self.resolve_batch_operations(batch.operations())?;
             let resolved_read_set = self.resolve_read_set_entries(opts.read_set.as_ref())?;
-            self.apply_write_backpressure(&resolved_operations).await?;
+            self.apply_write_backpressure(&resolved_operations, sharding_plan.commit_shard_hint())
+                .await?;
 
             let participant = {
                 let _commit_guard = self.inner.commit_lock.lock().await;
@@ -1692,7 +1829,9 @@ impl Db {
         .into_iter()
         .any(|configured| {
             configured.is_same_or_descendant_of(path) || path.is_same_or_descendant_of(configured)
-        })
+        }) || self
+            .shard_ready_layout()
+            .is_some_and(|layout| path.is_same_or_descendant_of(&layout.future_shard_namespace))
     }
 
     pub async fn process_pressure_stats(&self) -> PressureStats {
@@ -1706,6 +1845,7 @@ impl Db {
             local: total.bytes,
             domain_total: Some(total.bytes),
             process_total: Some(total.bytes),
+            physical_shard: None,
             oldest_unflushed_age: self.pressure_age_since(memtables.oldest_unflushed_at()),
             budget: self.pressure_budget(None, None),
             metadata,
@@ -1730,6 +1870,7 @@ impl Db {
             local: local.bytes,
             domain_total: Some(local.bytes),
             process_total: Some(total.bytes),
+            physical_shard: None,
             oldest_unflushed_age: self
                 .domain_tracks_db_pressure(path)
                 .then(|| self.pressure_age_since(memtables.oldest_unflushed_at()))
@@ -1755,6 +1896,7 @@ impl Db {
             local: local.bytes,
             domain_total: None,
             process_total: Some(total.bytes),
+            physical_shard: None,
             oldest_unflushed_age: table.id().and_then(|table_id| {
                 self.pressure_age_since(memtables.oldest_unflushed_at_for_table(table_id))
             }),
@@ -1779,6 +1921,17 @@ impl Db {
                 Some(&candidate.tag.domain),
                 self.execution_domain_budget(&candidate.tag.domain),
             );
+            if let Some(physical_shard) = candidate
+                .pending
+                .physical_shard
+                .or_else(|| candidate.tag.physical_shard())
+            {
+                pressure.physical_shard = Some(physical_shard);
+                pressure.metadata.insert(
+                    crate::telemetry_attrs::PHYSICAL_SHARD.to_string(),
+                    JsonValue::String(physical_shard.to_string()),
+                );
+            }
             let policy = self.admission_policy_for_domain(Some(&candidate.tag.domain));
             let policy_metadata = self.pressure_metadata(Some(&candidate.tag.domain), policy);
             let mut pressure_metadata = pressure.metadata.clone();
@@ -1843,6 +1996,13 @@ impl Db {
         pressure.budget = self.pressure_budget(Some(&runtime_tag.domain), domain_budget);
         let mut metadata = pressure.metadata.clone();
         metadata.extend(self.pressure_metadata(Some(&runtime_tag.domain), policy));
+        if let Some(physical_shard) = runtime_tag.physical_shard() {
+            pressure.physical_shard = Some(physical_shard);
+            metadata.insert(
+                crate::telemetry_attrs::PHYSICAL_SHARD.to_string(),
+                JsonValue::String(physical_shard.to_string()),
+            );
+        }
         pressure.metadata = metadata;
         let metadata = pressure.metadata.clone();
 
@@ -1922,6 +2082,17 @@ impl Db {
     }
 
     pub fn tag_pending_work(&self, work: PendingWork) -> DomainTaggedWork<PendingWork> {
+        if let Some(physical_shard) = work.physical_shard {
+            return match work.work_type {
+                PendingWorkType::Backup => self.tag_shard_control_plane_work(work, physical_shard),
+                PendingWorkType::Flush
+                | PendingWorkType::CurrentStateRetention
+                | PendingWorkType::Compaction
+                | PendingWorkType::Offload
+                | PendingWorkType::Prefetch => self.tag_shard_background_work(work, physical_shard),
+            };
+        }
+
         let owner = if work.work_type == PendingWorkType::Backup {
             ExecutionDomainOwner::Subsystem {
                 database: Some(self.execution_identity().to_string()),
@@ -1955,10 +2126,14 @@ impl Db {
     pub(super) async fn apply_write_backpressure(
         &self,
         operations: &[ResolvedBatchOperation],
+        commit_physical_shard: Option<crate::PhysicalShardId>,
     ) -> Result<(), CommitError> {
         let batch_bytes_by_table = Self::estimated_batch_bytes_by_table(operations);
         let total_batch_bytes = batch_bytes_by_table.values().copied().sum::<u64>();
-        let foreground_tag = self.tag_user_foreground_work(()).tag;
+        let foreground_tag = commit_physical_shard
+            .filter(|shard| *shard != crate::PhysicalShardId::UNSHARDED)
+            .map(|shard| self.tag_shard_foreground_work((), shard).tag)
+            .unwrap_or_else(|| self.tag_user_foreground_work(()).tag);
         let foreground_budget = self.execution_domain_budget(&foreground_tag.domain);
         let flush_guardrail = self
             .flush_pressure_guardrail_for_domain(&foreground_tag.domain, total_batch_bytes)

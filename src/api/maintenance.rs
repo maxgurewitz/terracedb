@@ -1,6 +1,15 @@
 use super::*;
 
 impl Db {
+    fn conservative_table_work_physical_shard(
+        table: &StoredTable,
+    ) -> Option<crate::PhysicalShardId> {
+        let mut physical_shards = table.config.sharding.physical_shards().ok()?;
+        (physical_shards.len() == 1)
+            .then(|| physical_shards.pop_first())
+            .flatten()
+    }
+
     pub(super) fn sort_live_sstables(live: &mut [ResidentRowSstable]) {
         live.sort_by(|left, right| {
             (
@@ -283,6 +292,7 @@ impl Db {
             ),
             table_id: table.id,
             table_name: table.config.name.clone(),
+            physical_shard: Self::conservative_table_work_physical_shard(table),
             source_level,
             target_level,
             kind,
@@ -319,6 +329,7 @@ impl Db {
             ),
             table_id: table.id,
             table_name: table.config.name.clone(),
+            physical_shard: Self::conservative_table_work_physical_shard(table),
             kind,
             estimated_bytes: inputs
                 .iter()
@@ -388,6 +399,7 @@ impl Db {
                     id: format!("flush:{}", stored.config.name),
                     work_type: PendingWorkType::Flush,
                     table: stored.config.name.clone(),
+                    physical_shard: Self::conservative_table_work_physical_shard(stored),
                     level: None,
                     estimated_bytes,
                 });
@@ -402,6 +414,11 @@ impl Db {
             left.pending
                 .table
                 .cmp(&right.pending.table)
+                .then_with(|| {
+                    left.pending
+                        .physical_shard
+                        .cmp(&right.pending.physical_shard)
+                })
                 .then_with(|| left.pending.id.cmp(&right.pending.id))
         });
         candidates
@@ -475,6 +492,7 @@ impl Db {
                     id: job.id.clone(),
                     work_type: PendingWorkType::Offload,
                     table: job.table_name.clone(),
+                    physical_shard: job.physical_shard,
                     level: None,
                     estimated_bytes: job.estimated_bytes,
                 });
@@ -489,6 +507,11 @@ impl Db {
             left.pending
                 .table
                 .cmp(&right.pending.table)
+                .then_with(|| {
+                    left.pending
+                        .physical_shard
+                        .cmp(&right.pending.physical_shard)
+                })
                 .then_with(|| left.pending.id.cmp(&right.pending.id))
         });
         candidates
@@ -501,6 +524,7 @@ impl Db {
                 id: job.id.clone(),
                 work_type: PendingWorkType::Compaction,
                 table: job.table_name.clone(),
+                physical_shard: job.physical_shard,
                 level: Some(job.source_level),
                 estimated_bytes: job.estimated_bytes,
             });
@@ -799,6 +823,12 @@ impl Db {
                 .cmp(&crate::pressure::flush_candidate_priority_key(&left.work))
                 .then_with(|| left.tag.domain.cmp(&right.tag.domain))
                 .then_with(|| left.work.work.table.cmp(&right.work.work.table))
+                .then_with(|| {
+                    left.work
+                        .work
+                        .physical_shard
+                        .cmp(&right.work.work.physical_shard)
+                })
                 .then_with(|| left.work.work.id.cmp(&right.work.work.id))
         });
 
@@ -1383,6 +1413,13 @@ impl Db {
                 return Ok(false);
             };
             apply_table_span_attribute(&span_for_attrs, &job.table_name);
+            if let Some(physical_shard) = job.physical_shard {
+                crate::set_span_attribute(
+                    &span_for_attrs,
+                    crate::telemetry_attrs::PHYSICAL_SHARD,
+                    physical_shard.to_string(),
+                );
+            }
             crate::set_span_attribute(
                 &span_for_attrs,
                 "terracedb.compaction.target_level",
@@ -1416,6 +1453,13 @@ impl Db {
             opentelemetry::Value::String("offload".into()),
         );
         apply_table_span_attribute(&span, &job.table_name);
+        if let Some(physical_shard) = job.physical_shard {
+            crate::set_span_attribute(
+                &span,
+                crate::telemetry_attrs::PHYSICAL_SHARD,
+                physical_shard.to_string(),
+            );
+        }
         crate::set_span_attribute(
             &span,
             "terracedb.offload.input_count",
@@ -1606,6 +1650,13 @@ impl Db {
             opentelemetry::Value::String("compaction".into()),
         );
         apply_table_span_attribute(&span, &job.table_name);
+        if let Some(physical_shard) = job.physical_shard {
+            crate::set_span_attribute(
+                &span,
+                crate::telemetry_attrs::PHYSICAL_SHARD,
+                physical_shard.to_string(),
+            );
+        }
         crate::set_span_attribute(&span, "terracedb.compaction.target_level", job.target_level);
         crate::set_span_attribute(
             &span,
