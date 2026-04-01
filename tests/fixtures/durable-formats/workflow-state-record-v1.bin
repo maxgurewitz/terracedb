@@ -1,0 +1,1 @@
+{"run_id":"run:orders:order-1:1","bundle_id":"native:orders","workflow_name":"orders","instance_id":"order-1","lifecycle":"running","current_task_id":"task:order-1:1","history_len":3,"state":{"encoding":"application/octet-stream","bytes":[99,117,114,114,101,110,116,45,115,116,97,116,101]},"updated_at_millis":11}

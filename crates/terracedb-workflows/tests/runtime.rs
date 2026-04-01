@@ -39,7 +39,11 @@ use terracedb_workflows::{
     WorkflowSourceAttachMode, WorkflowSourceBootstrapPolicy, WorkflowSourceConfig,
     WorkflowSourceProgress, WorkflowSourceProgressOrigin, WorkflowSourceRecoveryPolicy,
     WorkflowSourceResumePoint, WorkflowStateMutation, WorkflowTables, WorkflowTimerCommand,
-    contracts, failpoints::names as workflow_failpoint_names,
+    contracts::{
+        self, WorkflowHistoryEvent, WorkflowLifecycleRecord, WorkflowLifecycleState,
+        WorkflowPayload, WorkflowRunId, WorkflowStateRecord, WorkflowVisibilityRecord,
+    },
+    failpoints::names as workflow_failpoint_names,
     sandbox_contracts::SandboxModuleWorkflowTaskV1Handler,
 };
 
@@ -819,6 +823,1208 @@ async fn callback_admission_failpoint_surfaces_storage_error_before_commit() {
     handle.shutdown().await.expect("shutdown workflow runtime");
 }
 
+#[tokio::test]
+async fn workflow_processing_fails_closed_when_active_run_metadata_is_missing() {
+    for (case, expected_error) in [
+        ("run", "workflow run record missing"),
+        ("lifecycle", "workflow lifecycle record missing"),
+        ("visibility", "workflow visibility record missing"),
+        ("history", "workflow history event"),
+    ] {
+        let clock = Arc::new(StubClock::default());
+        let file_system = Arc::new(StubFileSystem::default());
+        let object_store = Arc::new(StubObjectStore::default());
+        let db = Db::open(
+            tiered_test_config_with_durability(
+                &format!("/workflow-active-run-metadata-missing-{case}"),
+                TieredDurabilityMode::GroupCommit,
+            ),
+            test_dependencies_with_clock(file_system, object_store, clock.clone()),
+        )
+        .await
+        .expect("open db");
+
+        let runtime = WorkflowRuntime::open(
+            db,
+            clock,
+            WorkflowDefinition::new(
+                "callbacks",
+                std::iter::empty::<Table>(),
+                CallbackReplayHandler,
+            ),
+        )
+        .await
+        .expect("open callback workflow runtime");
+
+        runtime
+            .admit_callback("order-1", "cb-1", b"approved".to_vec())
+            .await
+            .expect("admit initial callback");
+        let handle = runtime.start().await.expect("start workflow runtime");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+        )
+        .await
+        .expect("initial callback should be processed")
+        .expect("initial workflow state wait should not fail");
+        handle
+            .shutdown()
+            .await
+            .expect("shutdown healthy workflow runtime");
+
+        let state = runtime
+            .load_state_record("order-1")
+            .await
+            .expect("load active state record")
+            .expect("active state record should exist");
+
+        match case {
+            "run" => {
+                let (key, _) = scan_table_rows(runtime.tables().run_table())
+                    .await
+                    .expect("scan run table")
+                    .into_iter()
+                    .next()
+                    .expect("run record should exist");
+                runtime
+                    .tables()
+                    .run_table()
+                    .delete(key)
+                    .await
+                    .expect("delete active run record");
+            }
+            "lifecycle" => {
+                let (key, _) = scan_table_rows(runtime.tables().lifecycle_table())
+                    .await
+                    .expect("scan lifecycle table")
+                    .into_iter()
+                    .next()
+                    .expect("lifecycle record should exist");
+                runtime
+                    .tables()
+                    .lifecycle_table()
+                    .delete(key)
+                    .await
+                    .expect("delete active lifecycle record");
+            }
+            "visibility" => {
+                let (key, _) = scan_table_rows(runtime.tables().visibility_table())
+                    .await
+                    .expect("scan visibility table")
+                    .into_iter()
+                    .next()
+                    .expect("visibility record should exist");
+                runtime
+                    .tables()
+                    .visibility_table()
+                    .delete(key)
+                    .await
+                    .expect("delete active visibility record");
+            }
+            "history" => {
+                let (key, _) = scan_table_rows(runtime.tables().history_table())
+                    .await
+                    .expect("scan history table")
+                    .into_iter()
+                    .last()
+                    .expect("history record should exist");
+                runtime
+                    .tables()
+                    .history_table()
+                    .delete(key)
+                    .await
+                    .expect("delete latest history record");
+            }
+            other => panic!("unexpected metadata case {other}"),
+        }
+
+        let mut handle = runtime.start().await.expect("restart workflow runtime");
+        runtime
+            .admit_callback("order-1", "cb-2", b"approved".to_vec())
+            .await
+            .expect("admit callback with missing metadata");
+        tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+            .await
+            .expect("runtime should fail closed on missing metadata")
+            .expect("wait for workflow termination");
+
+        let error = handle
+            .shutdown()
+            .await
+            .expect_err("workflow runtime should fail closed on missing metadata");
+        match error {
+            WorkflowError::Storage(storage) => {
+                assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+                assert!(
+                    storage.to_string().contains(expected_error),
+                    "expected corruption containing {expected_error}, got {storage}",
+                );
+                assert!(
+                    storage.to_string().contains(state.run_id.as_str()),
+                    "expected corruption to name the active run id, got {storage}",
+                );
+            }
+            other => panic!("expected workflow corruption from missing metadata, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn workflow_state_load_and_processing_fail_closed_on_unknown_payload_encoding() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-unknown-payload-encoding",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    let state = runtime
+        .load_state_record("order-1")
+        .await
+        .expect("load active state record")
+        .expect("active state record should exist");
+    let mutated = WorkflowStateRecord {
+        state: Some(WorkflowPayload::with_encoding(
+            "application/x.terracedb-workflow-state",
+            b"corrupt".to_vec(),
+        )),
+        ..state
+    };
+    runtime
+        .tables()
+        .state_table()
+        .write(
+            mutated.instance_id.as_bytes().to_vec(),
+            encode_versioned_workflow_contract(&mutated),
+        )
+        .await
+        .expect("persist unsupported workflow payload encoding");
+
+    let load_error = runtime
+        .load_state("order-1")
+        .await
+        .expect_err("load_state should fail closed on unsupported payload encoding");
+    match load_error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage.to_string().contains(
+                    "workflow state encoding application/x.terracedb-workflow-state is unsupported"
+                ),
+                "expected unsupported-encoding corruption, got {storage}",
+            );
+        }
+        other => panic!("expected workflow corruption from unsupported encoding, got {other:?}"),
+    }
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback with unsupported payload encoding");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed on unsupported payload encoding")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed on unsupported payload encoding");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage.to_string().contains(
+                    "workflow state encoding application/x.terracedb-workflow-state is unsupported"
+                ),
+                "expected unsupported-encoding corruption, got {storage}",
+            );
+        }
+        other => panic!("expected workflow corruption from unsupported encoding, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn workflow_new_run_admission_fails_closed_when_terminal_run_metadata_is_missing() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-terminal-run-metadata-missing",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    let state = runtime
+        .load_state_record("order-1")
+        .await
+        .expect("load active state record")
+        .expect("active state record should exist");
+    let lifecycle = runtime
+        .load_lifecycle_record(&state.run_id)
+        .await
+        .expect("load lifecycle record")
+        .expect("lifecycle record should exist");
+    let visibility = runtime
+        .load_visibility_record(&state.run_id)
+        .await
+        .expect("load visibility record")
+        .expect("visibility record should exist");
+
+    let terminal_updated_at = state.updated_at_millis.saturating_add(1);
+    let terminal_state = WorkflowStateRecord {
+        lifecycle: WorkflowLifecycleState::Completed,
+        updated_at_millis: terminal_updated_at,
+        ..state.clone()
+    };
+    let terminal_lifecycle = WorkflowLifecycleRecord {
+        lifecycle: WorkflowLifecycleState::Completed,
+        updated_at_millis: terminal_updated_at,
+        ..lifecycle
+    };
+    let mut terminal_summary = visibility.summary.clone();
+    terminal_summary.insert("lifecycle".to_string(), "completed".to_string());
+    let terminal_visibility = WorkflowVisibilityRecord {
+        lifecycle: WorkflowLifecycleState::Completed,
+        updated_at_millis: terminal_updated_at,
+        summary: terminal_summary,
+        ..visibility
+    };
+
+    runtime
+        .tables()
+        .state_table()
+        .write(
+            terminal_state.instance_id.as_bytes().to_vec(),
+            encode_versioned_workflow_contract(&terminal_state),
+        )
+        .await
+        .expect("persist terminal workflow state");
+
+    let (lifecycle_key, _) = scan_table_rows(runtime.tables().lifecycle_table())
+        .await
+        .expect("scan lifecycle table")
+        .into_iter()
+        .next()
+        .expect("lifecycle row should exist");
+    runtime
+        .tables()
+        .lifecycle_table()
+        .write(
+            lifecycle_key,
+            encode_versioned_workflow_contract(&terminal_lifecycle),
+        )
+        .await
+        .expect("persist terminal lifecycle record");
+
+    let (visibility_key, _) = scan_table_rows(runtime.tables().visibility_table())
+        .await
+        .expect("scan visibility table")
+        .into_iter()
+        .next()
+        .expect("visibility row should exist");
+    runtime
+        .tables()
+        .visibility_table()
+        .write(
+            visibility_key,
+            encode_versioned_workflow_contract(&terminal_visibility),
+        )
+        .await
+        .expect("persist terminal visibility record");
+
+    let (history_key, _) = scan_table_rows(runtime.tables().history_table())
+        .await
+        .expect("scan history table")
+        .into_iter()
+        .last()
+        .expect("history row should exist");
+    runtime
+        .tables()
+        .history_table()
+        .write(
+            history_key,
+            encode_versioned_workflow_contract(&WorkflowHistoryEvent::VisibilityUpdated {
+                record: terminal_visibility.clone(),
+            }),
+        )
+        .await
+        .expect("persist terminal history tail");
+
+    let (run_key, _) = scan_table_rows(runtime.tables().run_table())
+        .await
+        .expect("scan run table")
+        .into_iter()
+        .next()
+        .expect("run row should exist");
+    runtime
+        .tables()
+        .run_table()
+        .delete(run_key)
+        .await
+        .expect("delete terminal run record");
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback after terminal-state corruption");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed on missing terminal-run metadata")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed on missing terminal-run metadata");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage.to_string().contains("workflow run record missing"),
+                "expected missing-run corruption, got {storage}",
+            );
+            assert!(
+                storage.to_string().contains(state.run_id.as_str()),
+                "expected corruption to name the terminal run id, got {storage}",
+            );
+        }
+        other => {
+            panic!("expected workflow corruption from missing terminal-run metadata, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn workflow_processing_fails_closed_when_state_row_is_missing_but_run_metadata_remains() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-missing-state-row",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    runtime
+        .tables()
+        .state_table()
+        .delete(b"order-1".to_vec())
+        .await
+        .expect("delete workflow state row");
+
+    assert!(
+        runtime
+            .load_state_record("order-1")
+            .await
+            .expect("load state after deletion")
+            .is_none(),
+        "state row should be absent after deletion",
+    );
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback after deleting state row");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed when the state row is missing")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed when the state row is missing");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("workflow state record is missing while run"),
+                "expected missing-state corruption, got {storage}",
+            );
+            assert!(
+                storage.to_string().contains("workflow instance order-1"),
+                "expected corruption to name the instance, got {storage}",
+            );
+        }
+        other => panic!("expected workflow corruption from missing state row, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn workflow_processing_fails_closed_on_gapped_extra_history_events() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-gapped-extra-history",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    let state = runtime
+        .load_state_record("order-1")
+        .await
+        .expect("load active state record")
+        .expect("active state record should exist");
+    let visibility = runtime
+        .load_visibility_record(&state.run_id)
+        .await
+        .expect("load visibility record")
+        .expect("visibility record should exist");
+    let (last_history_key, _) = scan_table_rows(runtime.tables().history_table())
+        .await
+        .expect("scan history table")
+        .into_iter()
+        .last()
+        .expect("history row should exist");
+    let mut extra_history_key = last_history_key;
+    let extra_sequence = state.history_len.saturating_add(2);
+    let key_len = extra_history_key.len();
+    extra_history_key[key_len - 8..].copy_from_slice(&extra_sequence.to_be_bytes());
+    runtime
+        .tables()
+        .history_table()
+        .write(
+            extra_history_key,
+            encode_versioned_workflow_contract(&WorkflowHistoryEvent::VisibilityUpdated {
+                record: visibility.clone(),
+            }),
+        )
+        .await
+        .expect("persist gapped extra history event");
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback with extra history event");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed on gapped extra history")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed on gapped extra history");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains(&format!("workflow history sequence {extra_sequence}")),
+                "expected gapped-history corruption, got {storage}",
+            );
+        }
+        other => panic!("expected workflow corruption from gapped extra history, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn workflow_processing_fails_closed_when_state_row_is_missing_but_history_and_lifecycle_remain()
+ {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-missing-state-row-history-lifecycle",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    runtime
+        .tables()
+        .state_table()
+        .delete(b"order-1".to_vec())
+        .await
+        .expect("delete workflow state row");
+    let (run_key, _) = scan_table_rows(runtime.tables().run_table())
+        .await
+        .expect("scan run table")
+        .into_iter()
+        .next()
+        .expect("run row should exist");
+    runtime
+        .tables()
+        .run_table()
+        .delete(run_key)
+        .await
+        .expect("delete run row");
+    let (visibility_key, _) = scan_table_rows(runtime.tables().visibility_table())
+        .await
+        .expect("scan visibility table")
+        .into_iter()
+        .next()
+        .expect("visibility row should exist");
+    runtime
+        .tables()
+        .visibility_table()
+        .delete(visibility_key)
+        .await
+        .expect("delete visibility row");
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback after deleting state, run, and visibility");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed when history and lifecycle remain")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed when history and lifecycle remain");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("workflow state record is missing while history for run")
+                    || storage
+                        .to_string()
+                        .contains("workflow state record is missing while lifecycle for run"),
+                "expected missing-state history or lifecycle corruption, got {storage}",
+            );
+            assert!(
+                storage.to_string().contains("workflow instance order-1"),
+                "expected corruption to name the instance, got {storage}",
+            );
+        }
+        other => panic!(
+            "expected workflow corruption from missing state row with history remaining, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn workflow_processing_fails_closed_when_state_row_is_missing_and_only_lifecycle_remains() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-missing-state-row-lifecycle-only",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    runtime
+        .tables()
+        .state_table()
+        .delete(b"order-1".to_vec())
+        .await
+        .expect("delete workflow state row");
+    let (run_key, _) = scan_table_rows(runtime.tables().run_table())
+        .await
+        .expect("scan run table")
+        .into_iter()
+        .next()
+        .expect("run row should exist");
+    runtime
+        .tables()
+        .run_table()
+        .delete(run_key)
+        .await
+        .expect("delete run row");
+    let (visibility_key, _) = scan_table_rows(runtime.tables().visibility_table())
+        .await
+        .expect("scan visibility table")
+        .into_iter()
+        .next()
+        .expect("visibility row should exist");
+    runtime
+        .tables()
+        .visibility_table()
+        .delete(visibility_key)
+        .await
+        .expect("delete visibility row");
+    for (key, _) in scan_table_rows(runtime.tables().history_table())
+        .await
+        .expect("scan history table")
+    {
+        runtime
+            .tables()
+            .history_table()
+            .delete(key)
+            .await
+            .expect("delete history row");
+    }
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback after deleting state, run, visibility, and history");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed when only lifecycle remains")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed when only lifecycle remains");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("workflow state record is missing while lifecycle for run"),
+                "expected missing-state lifecycle corruption, got {storage}",
+            );
+        }
+        other => panic!(
+            "expected workflow corruption from missing state row with only lifecycle remaining, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn workflow_processing_fails_closed_when_state_row_is_missing_and_only_history_remains() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-missing-state-row-history-only",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    runtime
+        .tables()
+        .state_table()
+        .delete(b"order-1".to_vec())
+        .await
+        .expect("delete workflow state row");
+    let (run_key, _) = scan_table_rows(runtime.tables().run_table())
+        .await
+        .expect("scan run table")
+        .into_iter()
+        .next()
+        .expect("run row should exist");
+    runtime
+        .tables()
+        .run_table()
+        .delete(run_key)
+        .await
+        .expect("delete run row");
+    let (visibility_key, _) = scan_table_rows(runtime.tables().visibility_table())
+        .await
+        .expect("scan visibility table")
+        .into_iter()
+        .next()
+        .expect("visibility row should exist");
+    runtime
+        .tables()
+        .visibility_table()
+        .delete(visibility_key)
+        .await
+        .expect("delete visibility row");
+    let (lifecycle_key, _) = scan_table_rows(runtime.tables().lifecycle_table())
+        .await
+        .expect("scan lifecycle table")
+        .into_iter()
+        .next()
+        .expect("lifecycle row should exist");
+    runtime
+        .tables()
+        .lifecycle_table()
+        .delete(lifecycle_key)
+        .await
+        .expect("delete lifecycle row");
+    let history_rows = scan_table_rows(runtime.tables().history_table())
+        .await
+        .expect("scan history table");
+    let (run_created_key, _) = history_rows
+        .first()
+        .cloned()
+        .expect("run-created history row should exist");
+    runtime
+        .tables()
+        .history_table()
+        .delete(run_created_key)
+        .await
+        .expect("delete run-created history row");
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback after leaving history-only leftovers");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed when only history remains")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed when only history remains");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("workflow state record is missing while history for run"),
+                "expected missing-state history corruption, got {storage}",
+            );
+        }
+        other => panic!(
+            "expected workflow corruption from missing state row with only history remaining, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn workflow_processing_fails_closed_on_custom_run_id_lifecycle_orphans_when_state_is_missing()
+{
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-custom-run-id-lifecycle-orphan",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    clear_workflow_tables(runtime.tables())
+        .await
+        .expect("clear workflow-owned tables before injecting orphan lifecycle");
+
+    let custom_run_id = WorkflowRunId::new("custom-run-id-lifecycle").expect("custom run id");
+    let lifecycle = WorkflowLifecycleRecord {
+        run_id: custom_run_id.clone(),
+        lifecycle: WorkflowLifecycleState::Running,
+        updated_at_millis: 1,
+        reason: Some("custom-orphan".to_string()),
+        task_id: None,
+        attempt: 0,
+    };
+    runtime
+        .tables()
+        .lifecycle_table()
+        .write(
+            custom_run_id.as_str().as_bytes().to_vec(),
+            encode_versioned_workflow_contract(&lifecycle),
+        )
+        .await
+        .expect("persist orphan lifecycle record");
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback with orphan custom lifecycle");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed on orphan custom lifecycle")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed on orphan custom lifecycle");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("workflow state record is missing while orphan lifecycle for run"),
+                "expected orphan-lifecycle corruption, got {storage}",
+            );
+            assert!(
+                storage.to_string().contains(custom_run_id.as_str()),
+                "expected corruption to name the custom run id, got {storage}",
+            );
+        }
+        other => panic!("expected workflow corruption from orphan custom lifecycle, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn workflow_processing_fails_closed_on_custom_run_id_history_orphans_when_state_is_missing() {
+    let clock = Arc::new(StubClock::default());
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-custom-run-id-history-orphan",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "callbacks",
+            std::iter::empty::<Table>(),
+            CallbackReplayHandler,
+        ),
+    )
+    .await
+    .expect("open callback workflow runtime");
+
+    runtime
+        .admit_callback("order-1", "cb-1", b"approved".to_vec())
+        .await
+        .expect("admit initial callback");
+    let handle = runtime.start().await.expect("start workflow runtime");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-1")),
+    )
+    .await
+    .expect("initial callback should be processed")
+    .expect("initial workflow state wait should not fail");
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown healthy workflow runtime");
+
+    clear_workflow_tables(runtime.tables())
+        .await
+        .expect("clear workflow-owned tables before injecting orphan history");
+
+    let custom_run_id = WorkflowRunId::new("custom-run-id-history").expect("custom run id");
+    let lifecycle = WorkflowLifecycleRecord {
+        run_id: custom_run_id.clone(),
+        lifecycle: WorkflowLifecycleState::Running,
+        updated_at_millis: 1,
+        reason: Some("custom-orphan".to_string()),
+        task_id: None,
+        attempt: 0,
+    };
+    let mut history_key = custom_run_id.as_str().as_bytes().to_vec();
+    history_key.push(0);
+    history_key.extend_from_slice(&1_u64.to_be_bytes());
+    runtime
+        .tables()
+        .history_table()
+        .write(
+            history_key,
+            encode_versioned_workflow_contract(&WorkflowHistoryEvent::LifecycleChanged {
+                record: lifecycle,
+            }),
+        )
+        .await
+        .expect("persist orphan history record");
+
+    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    runtime
+        .admit_callback("order-1", "cb-2", b"approved".to_vec())
+        .await
+        .expect("admit callback with orphan custom history");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("runtime should fail closed on orphan custom history")
+        .expect("wait for workflow termination");
+
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("workflow runtime should fail closed on orphan custom history");
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("workflow state record is missing while orphan history for run"),
+                "expected orphan-history corruption, got {storage}",
+            );
+            assert!(
+                storage.to_string().contains(custom_run_id.as_str()),
+                "expected corruption to name the custom run id, got {storage}",
+            );
+        }
+        other => panic!("expected workflow corruption from orphan custom history, got {other:?}"),
+    }
+}
+
 struct WorkflowStack<H> {
     runtime: WorkflowRuntime<H>,
     handle: Option<WorkflowHandle>,
@@ -1249,13 +2455,56 @@ async fn scan_table_rows(table: &Table) -> Result<Vec<(Vec<u8>, Value)>, terrace
     Ok(captured)
 }
 
+fn encode_versioned_workflow_contract<T: serde::Serialize>(value: &T) -> Value {
+    let mut bytes = vec![1];
+    bytes.extend(
+        serde_json::to_vec(value)
+            .expect("workflow contract value should serialize deterministically"),
+    );
+    Value::bytes(bytes)
+}
+
+async fn write_mutated_state_record(
+    table: &Table,
+    record: &WorkflowStateRecord,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mutated = WorkflowStateRecord {
+        state: Some(WorkflowPayload::bytes("mutated")),
+        updated_at_millis: record.updated_at_millis.saturating_add(1),
+        ..record.clone()
+    };
+    table
+        .write(
+            mutated.instance_id.as_bytes().to_vec(),
+            encode_versioned_workflow_contract(&mutated),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn snapshot_workflow_tables(
     tables: &WorkflowTables,
 ) -> Result<WorkflowTablesSnapshot, terracedb::ReadError> {
     let mut rows = BTreeMap::new();
     rows.insert(
+        tables.run_table().name().to_string(),
+        scan_table_rows(tables.run_table()).await?,
+    );
+    rows.insert(
         tables.state_table().name().to_string(),
         scan_table_rows(tables.state_table()).await?,
+    );
+    rows.insert(
+        tables.history_table().name().to_string(),
+        scan_table_rows(tables.history_table()).await?,
+    );
+    rows.insert(
+        tables.lifecycle_table().name().to_string(),
+        scan_table_rows(tables.lifecycle_table()).await?,
+    );
+    rows.insert(
+        tables.visibility_table().name().to_string(),
+        scan_table_rows(tables.visibility_table()).await?,
     );
     rows.insert(
         tables.inbox_table().name().to_string(),
@@ -1299,7 +2548,11 @@ async fn clear_table(table: &Table) -> Result<(), Box<dyn std::error::Error + Se
 async fn clear_workflow_tables(
     tables: &WorkflowTables,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    clear_table(tables.run_table()).await?;
     clear_table(tables.state_table()).await?;
+    clear_table(tables.history_table()).await?;
+    clear_table(tables.lifecycle_table()).await?;
+    clear_table(tables.visibility_table()).await?;
     clear_table(tables.inbox_table()).await?;
     clear_table(tables.trigger_order_table()).await?;
     clear_table(tables.source_progress_table()).await?;
@@ -2698,6 +3951,46 @@ async fn workflow_checkpoints_restore_workflow_owned_tables_exactly() {
         .admit_callback("order-1", "cb-1", b"approved".to_vec())
         .await
         .expect("admit callback after shutdown");
+    let checkpointed_state = runtime
+        .load_state_record("order-1")
+        .await
+        .expect("load checkpointed state record")
+        .expect("checkpointed state record should exist");
+    let checkpointed_run = runtime
+        .load_run_record(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed run record")
+        .expect("checkpointed run record should exist");
+    let checkpointed_history = runtime
+        .load_run_history(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed run history");
+    let checkpointed_lifecycle = runtime
+        .load_lifecycle_record(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed lifecycle")
+        .expect("checkpointed lifecycle record should exist");
+    let checkpointed_visibility = runtime
+        .load_visibility_record(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed visibility")
+        .expect("checkpointed visibility record should exist");
+    assert_eq!(
+        checkpointed_state.lifecycle,
+        WorkflowLifecycleState::Running
+    );
+    assert_eq!(
+        checkpointed_lifecycle.lifecycle,
+        checkpointed_state.lifecycle
+    );
+    assert_eq!(
+        checkpointed_visibility.lifecycle,
+        checkpointed_state.lifecycle
+    );
+    assert_eq!(
+        checkpointed_history.last().map(|record| record.sequence),
+        Some(checkpointed_state.history_len)
+    );
 
     let expected_snapshot = snapshot_workflow_tables(runtime.tables())
         .await
@@ -2717,10 +4010,7 @@ async fn workflow_checkpoints_restore_workflow_owned_tables_exactly() {
     clear_workflow_tables(runtime.tables())
         .await
         .expect("clear local workflow tables");
-    runtime
-        .tables()
-        .state_table()
-        .write(b"order-1".to_vec(), Value::bytes("mutated"))
+    write_mutated_state_record(runtime.tables().state_table(), &checkpointed_state)
         .await
         .expect("write mutated local state");
     let mutated_snapshot = snapshot_workflow_tables(runtime.tables())
@@ -2747,6 +4037,45 @@ async fn workflow_checkpoints_restore_workflow_owned_tables_exactly() {
         .await
         .expect("capture restored workflow tables");
     assert_eq!(restored_snapshot, expected_snapshot);
+    assert_eq!(
+        restored_runtime
+            .load_state_record("order-1")
+            .await
+            .expect("load restored state record")
+            .expect("restored state record should exist"),
+        checkpointed_state
+    );
+    assert_eq!(
+        restored_runtime
+            .load_run_record(&checkpointed_run.run_id)
+            .await
+            .expect("load restored run record")
+            .expect("restored run record should exist"),
+        checkpointed_run
+    );
+    assert_eq!(
+        restored_runtime
+            .load_lifecycle_record(&checkpointed_run.run_id)
+            .await
+            .expect("load restored lifecycle")
+            .expect("restored lifecycle should exist"),
+        checkpointed_lifecycle
+    );
+    assert_eq!(
+        restored_runtime
+            .load_visibility_record(&checkpointed_run.run_id)
+            .await
+            .expect("load restored visibility")
+            .expect("restored visibility should exist"),
+        checkpointed_visibility
+    );
+    assert_eq!(
+        restored_runtime
+            .load_run_history(&checkpointed_run.run_id)
+            .await
+            .expect("load restored run history"),
+        checkpointed_history
+    );
 }
 
 #[tokio::test]
@@ -2879,6 +4208,11 @@ async fn workflow_checkpoint_restore_failpoint_leaves_existing_local_state_untou
     let expected_snapshot = snapshot_workflow_tables(runtime.tables())
         .await
         .expect("capture expected workflow tables");
+    let checkpointed_state = runtime
+        .load_state_record("order-1")
+        .await
+        .expect("load checkpointed state record before restore failpoint")
+        .expect("checkpointed state record should exist before restore failpoint");
     runtime
         .capture_checkpoint(WorkflowCheckpointId::new(3))
         .await
@@ -2887,10 +4221,7 @@ async fn workflow_checkpoint_restore_failpoint_leaves_existing_local_state_untou
     clear_workflow_tables(runtime.tables())
         .await
         .expect("clear workflow tables before restore");
-    runtime
-        .tables()
-        .state_table()
-        .write(b"order-1".to_vec(), Value::bytes("mutated"))
+    write_mutated_state_record(runtime.tables().state_table(), &checkpointed_state)
         .await
         .expect("write mutated state");
     let mutated_snapshot = snapshot_workflow_tables(runtime.tables())
@@ -3134,6 +4465,30 @@ async fn workflow_restore_checkpoint_recovery_replays_restored_callback_and_new_
         .admit_callback("order-1", "cb-1", b"approved".to_vec())
         .await
         .expect("admit callback before checkpoint");
+    let checkpointed_state = runtime
+        .load_state_record("order-1")
+        .await
+        .expect("load checkpointed state record")
+        .expect("checkpointed state record should exist");
+    let checkpointed_run = runtime
+        .load_run_record(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed run record")
+        .expect("checkpointed run record should exist");
+    let checkpointed_history = runtime
+        .load_run_history(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed history");
+    let checkpointed_lifecycle = runtime
+        .load_lifecycle_record(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed lifecycle")
+        .expect("checkpointed lifecycle should exist");
+    let checkpointed_visibility = runtime
+        .load_visibility_record(&checkpointed_state.run_id)
+        .await
+        .expect("load checkpointed visibility")
+        .expect("checkpointed visibility should exist");
     runtime
         .capture_checkpoint(WorkflowCheckpointId::new(22))
         .await
@@ -3148,10 +4503,7 @@ async fn workflow_restore_checkpoint_recovery_replays_restored_callback_and_new_
     clear_workflow_tables(runtime.tables())
         .await
         .expect("clear workflow tables before stale-progress recovery");
-    runtime
-        .tables()
-        .state_table()
-        .write(b"order-1".to_vec(), Value::bytes("mutated"))
+    write_mutated_state_record(runtime.tables().state_table(), &checkpointed_state)
         .await
         .expect("write mutated local state");
     runtime
@@ -3208,6 +4560,74 @@ async fn workflow_restore_checkpoint_recovery_replays_restored_callback_and_new_
             .expect("read replayed callback outbox entry")
             .is_some(),
         "checkpoint recovery should replay restored callback work",
+    );
+    let recovered_state = recovery_runtime
+        .load_state_record("order-1")
+        .await
+        .expect("load recovered state record")
+        .expect("recovered state record should exist");
+    let recovered_run = recovery_runtime
+        .load_run_record(&checkpointed_run.run_id)
+        .await
+        .expect("load recovered run record")
+        .expect("recovered run record should exist");
+    let recovered_history = recovery_runtime
+        .load_run_history(&checkpointed_run.run_id)
+        .await
+        .expect("load recovered run history");
+    let recovered_lifecycle = recovery_runtime
+        .load_lifecycle_record(&checkpointed_run.run_id)
+        .await
+        .expect("load recovered lifecycle")
+        .expect("recovered lifecycle should exist");
+    let recovered_visibility = recovery_runtime
+        .load_visibility_record(&checkpointed_run.run_id)
+        .await
+        .expect("load recovered visibility")
+        .expect("recovered visibility should exist");
+
+    assert_eq!(recovered_state.run_id, checkpointed_state.run_id);
+    assert_eq!(recovered_run, checkpointed_run);
+    assert_eq!(recovered_lifecycle.run_id, recovered_state.run_id);
+    assert_eq!(recovered_lifecycle.lifecycle, recovered_state.lifecycle);
+    assert_eq!(recovered_visibility.run_id, recovered_state.run_id);
+    assert_eq!(recovered_visibility.lifecycle, recovered_state.lifecycle);
+    assert_eq!(
+        recovered_visibility.history_len,
+        recovered_state.history_len
+    );
+    assert_eq!(
+        recovered_visibility.last_task_id,
+        recovered_state.current_task_id
+    );
+    assert!(recovered_state.history_len > checkpointed_state.history_len);
+    assert!(
+        recovered_history
+            .as_slice()
+            .starts_with(checkpointed_history.as_slice())
+    );
+    assert_eq!(
+        recovered_history
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        (1..=recovered_history.len() as u64).collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        recovered_history[checkpointed_history.len()].event,
+        WorkflowHistoryEvent::TaskAdmitted { .. }
+    ));
+    assert!(matches!(
+        recovered_history[checkpointed_history.len() + 1].event,
+        WorkflowHistoryEvent::TaskApplied { .. }
+    ));
+    assert_eq!(
+        checkpointed_lifecycle.lifecycle,
+        checkpointed_state.lifecycle
+    );
+    assert_eq!(
+        checkpointed_visibility.lifecycle,
+        checkpointed_state.lifecycle
     );
     assert_eq!(
         recovery_runtime
@@ -3316,7 +4736,7 @@ async fn recurring_workflow_skips_duplicate_bootstrap_callbacks_and_updates_stat
 #[test]
 fn recurring_workflow_recovers_after_restart_with_custom_schedule() -> turmoil::Result {
     SeededSimulationRunner::new(0x4105)
-        .with_simulation_duration(WORKFLOW_TIMER_SIMULATION_DURATION)
+        .with_simulation_duration(Duration::from_millis(2_500))
         .with_message_latency(
             SIMULATION_MIN_MESSAGE_LATENCY,
             SIMULATION_MAX_MESSAGE_LATENCY,

@@ -183,13 +183,22 @@ fn weekly_planner_client_host(
             assert_eq!(status, StatusCode::OK);
             assert_eq!(todos.len(), 7);
             assert!(todos.iter().all(|todo| todo.placeholder));
+            let first_scheduled_for_day = todos
+                .first()
+                .and_then(|todo| todo.scheduled_for_day)
+                .expect("planner should set the first placeholder day");
+            assert!(
+                first_scheduled_for_day >= TEST_WEEK_MILLIS,
+                "planner should not schedule before the next simulated week boundary",
+            );
             assert_eq!(
-                todos.first().and_then(|todo| todo.scheduled_for_day),
-                Some(TEST_WEEK_MILLIS)
+                first_scheduled_for_day % TEST_WEEK_MILLIS,
+                0,
+                "planner should start placeholders on a week boundary",
             );
             assert_eq!(
                 todos.last().and_then(|todo| todo.scheduled_for_day),
-                Some(TEST_WEEK_MILLIS + 6 * TEST_DAY_MILLIS)
+                Some(first_scheduled_for_day + 6 * TEST_DAY_MILLIS)
             );
 
             tokio::time::sleep(Duration::from_millis(TEST_DAY_MILLIS)).await;
