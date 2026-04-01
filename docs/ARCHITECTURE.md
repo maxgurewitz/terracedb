@@ -4957,6 +4957,14 @@ A useful rule of thumb is:
 - `terracedb-js` owns **guest-observable JavaScript semantics inside the virtual world**,
 - `terracedb-js-host-services` owns **explicit boundary crossings between the virtual world and the host world**.
 
+### Current Backend Split
+
+The current substrate is expected to expose two runtime-host shapes:
+
+- `DeterministicJsRuntimeHost` is the default simulation/oracle backend when a test, loader, or host seam may need real async progress under seeded replay.
+- `BoaJsRuntimeHost` is the real `boa_engine` execution backend for guest-visible JavaScript semantics and uses TerraceDB-owned scheduler, host-service, and module-loader seams.
+- `ImmediateBoaModuleLoader` is only a bridge for loaders whose `JsModuleLoader` futures complete without yielding; loaders that need broader async progress should stay on the deterministic backend or implement the Boa-specific loader boundary directly.
+
 ### Runtime Actor Model
 
 Each sandbox JavaScript instance should behave like a logically serialized actor:

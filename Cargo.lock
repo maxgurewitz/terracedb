@@ -2601,6 +2601,8 @@ name = "terracedb-js"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "boa_engine",
+ "futures",
  "serde",
  "serde_json",
  "terracedb",

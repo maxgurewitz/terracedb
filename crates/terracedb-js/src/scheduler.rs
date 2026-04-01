@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -35,15 +35,17 @@ pub trait JsScheduler: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct DeterministicJsScheduler {
-    name: Arc<str>,
-    scheduled_tasks: Arc<Mutex<Vec<JsScheduledTask>>>,
+    pub(crate) name: Arc<str>,
+    pub(crate) gate: Arc<Mutex<()>>,
+    pub(crate) scheduled_tasks: Arc<StdMutex<Vec<JsScheduledTask>>>,
 }
 
 impl DeterministicJsScheduler {
     pub fn new(name: impl Into<Arc<str>>) -> Self {
         Self {
             name: name.into(),
-            scheduled_tasks: Arc::new(Mutex::new(Vec::new())),
+            gate: Arc::new(Mutex::new(())),
+            scheduled_tasks: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 }
@@ -61,18 +63,31 @@ impl JsScheduler for DeterministicJsScheduler {
     }
 
     async fn schedule(&self, task: JsScheduledTask) {
-        self.scheduled_tasks.lock().await.push(task);
+        let _guard = self.gate.lock().await;
+        self.scheduled_tasks
+            .lock()
+            .expect("deterministic scheduler mutex poisoned")
+            .push(task);
     }
 
     async fn drain(&self) -> Vec<JsScheduledTask> {
-        let mut tasks = self.scheduled_tasks.lock().await;
+        let _guard = self.gate.lock().await;
+        let mut tasks = self
+            .scheduled_tasks
+            .lock()
+            .expect("deterministic scheduler mutex poisoned");
         std::mem::take(tasks.as_mut())
     }
 
     async fn snapshot(&self) -> JsSchedulerSnapshot {
+        let _guard = self.gate.lock().await;
         JsSchedulerSnapshot {
             scheduler: self.name.to_string(),
-            scheduled_tasks: self.scheduled_tasks.lock().await.clone(),
+            scheduled_tasks: self
+                .scheduled_tasks
+                .lock()
+                .expect("deterministic scheduler mutex poisoned")
+                .clone(),
         }
     }
 }

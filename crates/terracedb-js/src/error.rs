@@ -2,12 +2,20 @@ use thiserror::Error;
 
 use terracedb_vfs::VfsError;
 
+use crate::loader::JsModuleKind;
+
 #[derive(Debug, Error)]
 pub enum JsSubstrateError {
     #[error("unsupported js module specifier: {specifier}")]
     UnsupportedSpecifier { specifier: String },
     #[error("js module not found: {specifier}")]
     ModuleNotFound { specifier: String },
+    #[error("js module kind {kind:?} is disabled by policy for {specifier}: {message}")]
+    ModulePolicyDenied {
+        specifier: String,
+        kind: JsModuleKind,
+        message: String,
+    },
     #[error("js host service is unavailable: {service}::{operation}")]
     HostServiceUnavailable { service: String, operation: String },
     #[error("js host service denied {service}::{operation}: {message}")]

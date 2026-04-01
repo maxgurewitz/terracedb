@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::scheduler::JsScheduledTask;
+use crate::{loader::JsModuleKind, scheduler::JsScheduledTask};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,6 +167,14 @@ impl JsRuntimePolicy {
         self.visible_host_services
             .iter()
             .any(|candidate| candidate == &key)
+    }
+
+    pub fn allows_module_kind(&self, kind: JsModuleKind) -> bool {
+        match kind {
+            JsModuleKind::Workspace => self.allow_workspace_modules,
+            JsModuleKind::HostCapability => self.allow_host_modules,
+            JsModuleKind::Package => self.allow_package_modules,
+        }
     }
 }
 

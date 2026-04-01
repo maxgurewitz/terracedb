@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -33,8 +36,9 @@ pub enum DeterministicJsServiceOutcome {
 
 #[derive(Clone, Debug, Default)]
 pub struct DeterministicJsHostServices {
-    outcomes: Arc<Mutex<BTreeMap<(String, String), DeterministicJsServiceOutcome>>>,
-    calls: Arc<Mutex<Vec<JsHostServiceCallRecord>>>,
+    pub(crate) gate: Arc<Mutex<()>>,
+    pub(crate) outcomes: Arc<StdMutex<BTreeMap<(String, String), DeterministicJsServiceOutcome>>>,
+    pub(crate) calls: Arc<StdMutex<Vec<JsHostServiceCallRecord>>>,
 }
 
 impl DeterministicJsHostServices {
@@ -48,9 +52,10 @@ impl DeterministicJsHostServices {
         operation: impl Into<String>,
         outcome: DeterministicJsServiceOutcome,
     ) {
+        let _guard = self.gate.lock().await;
         self.outcomes
             .lock()
-            .await
+            .expect("deterministic host outcomes mutex poisoned")
             .insert((service.into(), operation.into()), outcome);
     }
 }
@@ -61,11 +66,12 @@ impl JsHostServices for DeterministicJsHostServices {
         &self,
         request: JsHostServiceRequest,
     ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        let _guard = self.gate.lock().await;
         let key = (request.service.clone(), request.operation.clone());
         let outcome = self
             .outcomes
             .lock()
-            .await
+            .expect("deterministic host outcomes mutex poisoned")
             .get(&key)
             .cloned()
             .unwrap_or(DeterministicJsServiceOutcome::Unavailable);
@@ -75,13 +81,16 @@ impl JsHostServices for DeterministicJsHostServices {
                     result: Some(result),
                     metadata,
                 };
-                self.calls.lock().await.push(JsHostServiceCallRecord {
-                    service: request.service,
-                    operation: request.operation,
-                    arguments: request.arguments,
-                    result: response.result.clone(),
-                    metadata: response.metadata.clone(),
-                });
+                self.calls
+                    .lock()
+                    .expect("deterministic host calls mutex poisoned")
+                    .push(JsHostServiceCallRecord {
+                        service: request.service,
+                        operation: request.operation,
+                        arguments: request.arguments,
+                        result: response.result.clone(),
+                        metadata: response.metadata.clone(),
+                    });
                 Ok(response)
             }
             DeterministicJsServiceOutcome::Denied { message } => {
@@ -101,6 +110,10 @@ impl JsHostServices for DeterministicJsHostServices {
     }
 
     async fn calls(&self) -> Vec<JsHostServiceCallRecord> {
-        self.calls.lock().await.clone()
+        let _guard = self.gate.lock().await;
+        self.calls
+            .lock()
+            .expect("deterministic host calls mutex poisoned")
+            .clone()
     }
 }
