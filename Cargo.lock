@@ -2539,12 +2539,10 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
- "terracedb-fuzz",
- "terracedb-http",
  "terracedb-projections",
  "terracedb-records",
  "terracedb-relays",
- "terracedb-simulation",
+ "terracedb-systemtest",
  "terracedb-workflows",
  "thiserror 2.0.18",
  "tokio",
@@ -2762,6 +2760,17 @@ dependencies = [
  "tokio",
  "turmoil",
  "turmoil-determinism",
+]
+
+[[package]]
+name = "terracedb-systemtest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "terracedb-fuzz",
+ "terracedb-http",
+ "terracedb-simulation",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

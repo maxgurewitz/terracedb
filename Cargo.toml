@@ -24,6 +24,7 @@ members = [
     "crates/terracedb-simulation",
     "crates/terracedb-vfs",
     "crates/terracedb-sandbox",
+    "crates/terracedb-systemtest",
     "crates/turmoil-determinism",
     "crates/terracedb-projections",
     "crates/terracedb-workflows",

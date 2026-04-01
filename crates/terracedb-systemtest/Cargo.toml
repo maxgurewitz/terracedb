@@ -1,0 +1,12 @@
+[package]
+name = "terracedb-systemtest"
+version = "0.1.0"
+edition = "2024"
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+terracedb-fuzz = { path = "../terracedb-fuzz" }
+terracedb-http = { path = "../terracedb-http", features = ["axum"] }
+terracedb-simulation = { path = "../terracedb-simulation" }
+thiserror = "2.0.17"
