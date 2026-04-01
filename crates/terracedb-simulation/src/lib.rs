@@ -2040,8 +2040,6 @@ impl SeededSimulationRunner {
             );
 
             context.record(TraceEvent::ScenarioStarted { seed });
-            // Let hosts finish binding before the driver starts issuing zero-latency requests.
-            tokio::task::yield_now().await;
             let user_result = run(context.clone()).await;
             let shutdown_result = context.object_store().shutdown().await;
             *lock(&result_cell) = Some(match user_result {

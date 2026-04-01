@@ -434,18 +434,9 @@ async fn wait_for_state(
     instance_id: &str,
     expected: &str,
 ) -> Result<(), WorkflowError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    loop {
-        if let Some(Value::Bytes(bytes)) = runtime.load_state(instance_id).await? {
-            if bytes == expected.as_bytes() {
-                return Ok(());
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("workflow state did not reach {expected} before timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    runtime
+        .wait_for_state(instance_id, Value::bytes(expected))
+        .await
 }
 
 fn run_seeded_campaign(seed: u64) -> turmoil::Result<DebeziumCampaignCapture> {
@@ -831,8 +822,11 @@ async fn mirror_sources_fail_closed_when_replay_from_history_is_requested() {
         .await
         .expect("persist stale workflow progress");
 
-    let handle = runtime.start().await.expect("start workflow");
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut handle = runtime.start().await.expect("start workflow");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+        .await
+        .expect("workflow failure should be observed")
+        .expect("mirror workflow should terminate after replay-from-history failure");
     let error = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
         .await
         .expect("workflow shutdown should finish")

@@ -6,10 +6,14 @@ use std::{
     sync::Arc,
 };
 
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{sync::Notify, task};
+use tokio::{
+    sync::{Notify, watch},
+    task,
+};
 
 use crate::{
     config::S3Location,
@@ -310,6 +314,88 @@ impl CacheSpan {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteCacheEntrySnapshot {
+    pub object_key: String,
+    pub span: CacheSpan,
+    pub data_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteCacheFetchKind {
+    Demand,
+    Prefetch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteCacheInFlightSnapshot {
+    pub object_key: String,
+    pub span: CacheSpan,
+    pub fetch_kind: RemoteCacheFetchKind,
+    pub waiter_count: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteCacheProgressSnapshot {
+    pub entry_count: usize,
+    pub total_cached_bytes: u64,
+    pub entries: Vec<RemoteCacheEntrySnapshot>,
+    pub in_flight: Vec<RemoteCacheInFlightSnapshot>,
+}
+
+#[derive(Debug)]
+pub struct RemoteCacheProgressSubscription {
+    inner: watch::Receiver<Arc<RemoteCacheProgressSnapshot>>,
+}
+
+impl RemoteCacheProgressSubscription {
+    fn new(inner: watch::Receiver<Arc<RemoteCacheProgressSnapshot>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn current(&self) -> RemoteCacheProgressSnapshot {
+        self.inner.borrow().as_ref().clone()
+    }
+
+    pub async fn changed(
+        &mut self,
+    ) -> Result<RemoteCacheProgressSnapshot, crate::SubscriptionClosed> {
+        self.inner
+            .changed()
+            .await
+            .map_err(|_| crate::SubscriptionClosed)?;
+        Ok(self.current())
+    }
+
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<RemoteCacheProgressSnapshot, crate::SubscriptionClosed>
+    where
+        F: FnMut(&RemoteCacheProgressSnapshot) -> bool,
+    {
+        let snapshot = self.current();
+        if predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+
+        loop {
+            let snapshot = self.changed().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
+    }
+}
+
+impl Clone for RemoteCacheProgressSubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct CacheEntryRecord {
     object_key: String,
@@ -340,6 +426,8 @@ struct CoalescedReadRange {
 #[derive(Clone, Debug)]
 struct InFlightSegment {
     notify: Arc<Notify>,
+    fetch_kind: RemoteCacheFetchKind,
+    waiter_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,13 +470,6 @@ struct RemoteCacheState {
     in_flight: BTreeMap<(String, CacheSpan), InFlightSegment>,
     total_bytes: u64,
     next_access_tick: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteCacheEntryInfo {
-    pub(crate) object_key: String,
-    pub(crate) span: CacheSpan,
-    pub(crate) data_len: u64,
 }
 
 fn encode_cache_span_flatbuffer(span: CacheSpan) -> (u8, u64, u64) {
@@ -452,6 +533,8 @@ pub struct RemoteCache {
     metadata_dir: String,
     config: RemoteCacheConfig,
     state: Mutex<RemoteCacheState>,
+    latest_progress_snapshot: ArcSwap<RemoteCacheProgressSnapshot>,
+    published_progress_snapshot: watch::Sender<Arc<RemoteCacheProgressSnapshot>>,
 }
 
 impl fmt::Debug for RemoteCache {
@@ -467,6 +550,53 @@ impl fmt::Debug for RemoteCache {
 }
 
 impl RemoteCache {
+    fn build_progress_snapshot_locked(state: &RemoteCacheState) -> RemoteCacheProgressSnapshot {
+        let mut entries = state
+            .entries
+            .values()
+            .flatten()
+            .map(|entry| RemoteCacheEntrySnapshot {
+                object_key: entry.record.object_key.clone(),
+                span: entry.record.span,
+                data_len: entry.record.data_len,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.object_key
+                .cmp(&right.object_key)
+                .then_with(|| left.span.suffix().cmp(&right.span.suffix()))
+        });
+        let mut in_flight = state
+            .in_flight
+            .iter()
+            .map(
+                |((object_key, span), segment)| RemoteCacheInFlightSnapshot {
+                    object_key: object_key.clone(),
+                    span: *span,
+                    fetch_kind: segment.fetch_kind,
+                    waiter_count: segment.waiter_count,
+                },
+            )
+            .collect::<Vec<_>>();
+        in_flight.sort_by(|left, right| {
+            left.object_key
+                .cmp(&right.object_key)
+                .then_with(|| left.span.suffix().cmp(&right.span.suffix()))
+        });
+        RemoteCacheProgressSnapshot {
+            entry_count: entries.len(),
+            total_cached_bytes: state.total_bytes,
+            entries,
+            in_flight,
+        }
+    }
+
+    fn publish_progress_locked(&self, state: &RemoteCacheState) {
+        let snapshot = Arc::new(Self::build_progress_snapshot_locked(state));
+        self.latest_progress_snapshot.store(snapshot.clone());
+        self.published_progress_snapshot.send_replace(snapshot);
+    }
+
     pub async fn open(
         file_system: Arc<dyn FileSystem>,
         root: impl Into<String>,
@@ -492,6 +622,12 @@ impl RemoteCache {
             metadata_dir,
             config: config.normalized(),
             state: Mutex::new(RemoteCacheState::default()),
+            latest_progress_snapshot: ArcSwap::from_pointee(RemoteCacheProgressSnapshot::default()),
+            published_progress_snapshot: {
+                let (sender, _receiver) =
+                    watch::channel(Arc::new(RemoteCacheProgressSnapshot::default()));
+                sender
+            },
         };
         cache.rebuild_index().await?;
         Ok(cache)
@@ -502,35 +638,19 @@ impl RemoteCache {
     }
 
     pub fn entry_count(&self) -> usize {
-        lock(&self.state).entries.values().map(Vec::len).sum()
+        self.progress_snapshot().entry_count
     }
 
     pub(crate) fn total_cached_bytes(&self) -> u64 {
-        lock(&self.state)
-            .entries
-            .values()
-            .flatten()
-            .map(|entry| entry.record.data_len)
-            .sum()
+        self.progress_snapshot().total_cached_bytes
     }
 
-    pub(crate) fn entries_snapshot(&self) -> Vec<RemoteCacheEntryInfo> {
-        let mut entries = lock(&self.state)
-            .entries
-            .values()
-            .flatten()
-            .map(|entry| RemoteCacheEntryInfo {
-                object_key: entry.record.object_key.clone(),
-                span: entry.record.span,
-                data_len: entry.record.data_len,
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| {
-            left.object_key
-                .cmp(&right.object_key)
-                .then_with(|| left.span.suffix().cmp(&right.span.suffix()))
-        });
-        entries
+    pub fn progress_snapshot(&self) -> RemoteCacheProgressSnapshot {
+        self.latest_progress_snapshot.load_full().as_ref().clone()
+    }
+
+    pub fn subscribe_progress(&self) -> RemoteCacheProgressSubscription {
+        RemoteCacheProgressSubscription::new(self.published_progress_snapshot.subscribe())
     }
 
     async fn rebuild_index(&self) -> Result<(), StorageError> {
@@ -574,7 +694,9 @@ impl RemoteCache {
             state.in_flight.clear();
             state.total_bytes = total_bytes;
             state.next_access_tick = next_access_tick;
-            self.plan_budget_evictions_locked(&mut state)
+            let evicted = self.plan_budget_evictions_locked(&mut state);
+            self.publish_progress_locked(&state);
+            evicted
         };
         self.delete_entries(evicted).await?;
         Ok(())
@@ -828,24 +950,36 @@ impl RemoteCache {
         let mut to_download = Vec::new();
         let mut background = Vec::new();
         let mut waiters = Vec::new();
+        let mut progress_changed = false;
 
         for &span in required {
             if Self::can_satisfy_segment_locked(&state, object_key, span) {
                 continue;
             }
             let key = (object_key.to_string(), span);
-            if let Some(in_flight) = state.in_flight.get(&key) {
+            if let Some(segment) = state.in_flight.get_mut(&key) {
+                segment.waiter_count = segment.waiter_count.saturating_add(1);
+                let notify = segment.notify.clone();
                 if !waiters
                     .iter()
-                    .any(|notify: &Arc<Notify>| Arc::ptr_eq(notify, &in_flight.notify))
+                    .any(|existing: &Arc<Notify>| Arc::ptr_eq(existing, &notify))
                 {
-                    waiters.push(in_flight.notify.clone());
+                    waiters.push(notify);
                 }
+                progress_changed = true;
                 continue;
             }
             let notify = Arc::new(Notify::new());
-            state.in_flight.insert(key, InFlightSegment { notify });
+            state.in_flight.insert(
+                key,
+                InFlightSegment {
+                    notify,
+                    fetch_kind: RemoteCacheFetchKind::Demand,
+                    waiter_count: 0,
+                },
+            );
             to_download.push(span);
+            progress_changed = true;
         }
 
         for &span in prefetch {
@@ -857,8 +991,20 @@ impl RemoteCache {
                 continue;
             }
             let notify = Arc::new(Notify::new());
-            state.in_flight.insert(key, InFlightSegment { notify });
+            state.in_flight.insert(
+                key,
+                InFlightSegment {
+                    notify,
+                    fetch_kind: RemoteCacheFetchKind::Prefetch,
+                    waiter_count: 0,
+                },
+            );
             background.push(span);
+            progress_changed = true;
+        }
+
+        if progress_changed {
+            self.publish_progress_locked(&state);
         }
 
         (to_download, background, waiters)
@@ -867,10 +1013,15 @@ impl RemoteCache {
     fn finish_in_flight_segments(&self, object_key: &str, spans: &[CacheSpan]) -> Vec<Arc<Notify>> {
         let mut state = lock(&self.state);
         let mut notifies = Vec::new();
+        let mut progress_changed = false;
         for &span in spans {
             if let Some(in_flight) = state.in_flight.remove(&(object_key.to_string(), span)) {
                 notifies.push(in_flight.notify);
+                progress_changed = true;
             }
+        }
+        if progress_changed {
+            self.publish_progress_locked(&state);
         }
         notifies
     }
@@ -1296,7 +1447,9 @@ impl RemoteCache {
                 last_access_tick: tick,
             });
             state.total_bytes = state.total_bytes.saturating_add(metadata.record.data_len);
-            self.plan_budget_evictions_locked(&mut state)
+            let evicted = self.plan_budget_evictions_locked(&mut state);
+            self.publish_progress_locked(&state);
+            evicted
         };
         self.delete_entries(evicted).await?;
         Ok(())
@@ -1331,6 +1484,7 @@ impl RemoteCache {
             if remove_object {
                 state.entries.remove(object_key);
             }
+            self.publish_progress_locked(&state);
             removed
         };
 
@@ -1356,6 +1510,7 @@ impl RemoteCache {
                     notifies.push(in_flight.notify);
                 }
             }
+            self.publish_progress_locked(&state);
             (removed, notifies)
         };
         for notify in notifies {
@@ -1711,6 +1866,7 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use proptest::prelude::*;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
@@ -1721,13 +1877,44 @@ mod tests {
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_test_dir(name: &str) -> PathBuf {
-        let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "terracedb-remote-{name}-{}-{id}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        path
+        let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seed = format!("terracedb-remote:{name}:{}:{counter}", std::process::id());
+        std::env::temp_dir().join(format!("terracedb-remote-{}", uuid_from_seed(&seed)))
+    }
+
+    fn uuid_from_seed(seed: &str) -> Uuid {
+        let mut first = 0xcbf2_9ce4_8422_2325u64;
+        let mut second = 0x9e37_79b9_7f4a_7c15u64;
+        for byte in seed.bytes() {
+            first ^= byte as u64;
+            first = first.wrapping_mul(0x1000_0000_01b3);
+            second ^= first.rotate_left(13) ^ byte as u64;
+            second = second.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        }
+        let bytes = [
+            (first >> 24) as u8,
+            (first >> 16) as u8,
+            (first >> 8) as u8,
+            first as u8,
+            (first >> 56) as u8,
+            (first >> 48) as u8,
+            (first >> 40) as u8,
+            (first >> 32) as u8,
+            (second >> 56) as u8,
+            (second >> 48) as u8,
+            (second >> 40) as u8,
+            (second >> 32) as u8,
+            (second >> 24) as u8,
+            (second >> 16) as u8,
+            (second >> 8) as u8,
+            second as u8,
+        ];
+        Uuid::from_fields(
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u16::from_be_bytes([bytes[4], bytes[5]]),
+            u16::from_be_bytes([bytes[6], bytes[7]]),
+            &bytes[8..16].try_into().expect("uuid tail"),
+        )
     }
 
     fn cleanup(path: &Path) {
@@ -2313,6 +2500,7 @@ mod tests {
             .await
             .expect("open cache"),
         );
+        let mut progress = cache.subscribe_progress();
         let storage = Arc::new(UnifiedStorage::new(file_system, store.clone(), Some(cache)));
         let key = "backup/sst/table-000001/0000/SST-000654.sst";
         store
@@ -2329,9 +2517,17 @@ mod tests {
         let storage_b = storage.clone();
         let source_b = source.clone();
         let second = tokio::spawn(async move { storage_b.read_range(&source_b, 2..6).await });
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
+        let _ = progress
+            .wait_for(|snapshot| {
+                snapshot.in_flight.iter().any(|entry| {
+                    entry.object_key == key
+                        && entry.span == CacheSpan::Range { start: 0, end: 8 }
+                        && entry.fetch_kind == RemoteCacheFetchKind::Demand
+                        && entry.waiter_count >= 1
+                })
+            })
+            .await
+            .expect("wait for duplicate download waiter");
         assert_eq!(store.range_calls(), vec![(key.to_string(), 0, 8)]);
 
         store.release();
@@ -2366,6 +2562,7 @@ mod tests {
             .expect("open cache"),
         );
         let storage = UnifiedStorage::new(file_system, store.clone(), Some(cache.clone()));
+        let mut progress = cache.subscribe_progress();
         let key = "backup/sst/table-000001/0000/SST-000888.sst";
         store
             .put(key, b"abcdefghijklmnopqrstuvwxyz")
@@ -2376,23 +2573,45 @@ mod tests {
         let first = storage.read_range(&source, 2..6).await.expect("first read");
         assert_eq!(first, b"cdef");
 
-        let mut prefetched = false;
-        for _ in 0..50 {
-            if store.range_calls().len() >= 2
-                && cache
-                    .read_range(key, 8..12)
-                    .await
-                    .expect("prefetch lookup")
-                    .is_some()
-            {
-                prefetched = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let in_flight = progress
+            .wait_for(|snapshot| {
+                snapshot.in_flight.iter().any(|entry| {
+                    entry.object_key == key
+                        && entry.span == CacheSpan::Range { start: 8, end: 16 }
+                        && entry.fetch_kind == RemoteCacheFetchKind::Prefetch
+                })
+            })
+            .await
+            .expect("background prefetch progress");
+        assert!(in_flight.in_flight.iter().any(|entry| {
+            entry.object_key == key
+                && entry.span == CacheSpan::Range { start: 8, end: 16 }
+                && entry.fetch_kind == RemoteCacheFetchKind::Prefetch
+        }));
+        let warmed = progress
+            .wait_for(|snapshot| {
+                snapshot.entries.iter().any(|entry| {
+                    entry.object_key == key && entry.span == CacheSpan::Range { start: 8, end: 16 }
+                })
+            })
+            .await
+            .expect("background prefetch warmed entry");
         assert!(
-            prefetched,
+            warmed.entries.iter().any(|entry| {
+                entry.object_key == key && entry.span == CacheSpan::Range { start: 8, end: 16 }
+            }),
+            "background prefetch should publish the warmed segment once stored"
+        );
+        assert!(
+            cache.entry_count() >= 2,
             "background prefetch should warm the next segment"
+        );
+        assert!(
+            cache
+                .read_range(key, 8..12)
+                .await
+                .expect("prefetch lookup")
+                .is_some()
         );
 
         let second = storage

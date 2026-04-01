@@ -3533,6 +3533,98 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
 - Cross-feature chaos tests proving flush stalls, retry paths, and budget tightening still preserve deterministic recovery and liveness.
 - End-to-end invariant tests proving the subsystem changes performance behavior only, not logical DB outcomes.
 
+**Refactor slices**
+
+1. Slice the observability surfaces first so the whole-system harness can read published snapshots and ordered events without blocking the simulation runtime.
+2. Then migrate the remaining in-flight progress assertions to explicit subscriptions or progress probes.
+3. Only after those surfaces exist, add the capstone multi-tenant and failure campaigns that compose them.
+
+---
+
+### T76a. Publish simulation-safe scheduler observability snapshots and admission streams
+
+**Depends on:** T76
+
+**Description**
+
+Refactor scheduler/admission observability away from reader-side locking and into published immutable state. This task owns the simulation-facing introspection layer for pressure/admission behavior: snapshots must be cheap to sample from a single-threaded simulated runtime, and ordered admission transitions must be assertable without polling shared mutable maps.
+
+**Implementation steps**
+
+1. Replace lock-on-read scheduler observability assembly with published immutable snapshots that writers update whenever the underlying counters or per-domain diagnostics change.
+2. Add ordered admission observation streams so tests can assert transitions like `RateLimit -> Open` or "one aggregated event per write" directly, instead of inferring them from eventual shared-state samples.
+3. Make current-versus-historical admission state explicit, with the published snapshot carrying the live view and the last-non-open state preserved separately for debugging.
+4. Delete polling/try-lock style scheduler snapshot helpers that only existed to avoid deadlocking the simulated runtime, and move simulation tests onto the published snapshot / stream APIs.
+5. Keep the synchronous operator-facing snapshot API as a thin clone of the published state so CLI/debugging callers still have a one-shot read surface.
+
+**Verification**
+
+- Simulation regressions proving in-flight rate-limited writes are observable through the published snapshot subscription without blocking the runtime.
+- Simulation regressions proving admission streams emit ordered write-level transitions and do not duplicate per-table diagnostics for one logical write.
+- Unit tests proving the synchronous snapshot API returns the same data as the published stream state after representative observability updates.
+- Unit tests proving the historical last-non-open diagnostic survives recovery writes while the live state returns `Open`.
+
+---
+
+### T76b. Audit and convert remaining simulation-hostile inspection APIs
+
+**Depends on:** T76a
+
+**Description**
+
+Finish the simulation-safety pass across introspection surfaces that may still block the runtime thread or hide ordering behind shared mutable state. This task is broader than admission: it covers any synchronous snapshot or inspection helper that a deterministic simulation test would reasonably want to call while work is in flight.
+
+**Implementation steps**
+
+1. Inventory remaining snapshot/introspection APIs that take `parking_lot` or `std::sync` locks from async contexts or simulation helpers.
+2. Convert the high-value surfaces to published immutable snapshots, subscriptions, or explicit poll/step interfaces, depending on whether tests need sampled state, ordered events, or deterministic progress control.
+3. Remove test-only retry loops that compensate for blocking inspection, and replace them with direct subscription- or progress-driven assertions.
+4. Extend the debugging guide with the preferred simulation-safe observation patterns so future work does not regress into blocking shared-state reads.
+5. Prioritize the concluding downstream-adoption slices in dependency order:
+   - workflow-native wait surfaces first, so async and simulation tests stop polling `load_state()` / `load_source_progress()` with sleeps;
+   - projection terminal/frontier waits next, so failure tests stop sleeping before `shutdown()`;
+   - relay and downstream crate migrations after that, using native wait surfaces or backing-table watermark publications instead of row-count polling;
+   - example-app readiness/progress publication next, so example simulations stop depending on server-startup sleeps or projection polling loops; and
+   - simulation-runner startup cleanup last, once the remaining hosts use explicit readiness signals and the driver-side `yield_now()` shim can be deleted.
+
+**Candidate refactor slices**
+
+1. Publish immutable progress snapshots for state that is read frequently but mutated by background work, such as DB progress and resource-manager pressure.
+2. Convert ordered transitions to event streams where the test needs the sequence of state changes, not just the latest state.
+3. Convert liveness and drain assertions to poll/step helpers where the test needs to prove the background system moved forward.
+4. Delete the old blocking reader-side helpers once each replacement slice has landed.
+
+**Verification**
+
+- Targeted simulation tests proving the converted APIs can be used while related work remains in flight.
+- A focused audit diff showing the removed blocking inspection paths and the new subscription/poll surfaces that replaced them.
+- Debugging-guide updates demonstrating the canonical way to observe runtime state inside deterministic simulations.
+
+---
+
+### T76c. Add deterministic progress probes for background scheduler work
+
+**Depends on:** T76b
+
+**Description**
+
+Expose explicit progress probes for scheduler-driven background work so simulations can assert "one step happened" or "the system is idle" without depending on arbitrary sleeps or repeated `yield_now()`. This task turns background maintenance from a mostly implicit runtime effect into a testable deterministic interface.
+
+**Implementation steps**
+
+1. Identify the highest-value background loops whose progress is currently only inferable through side effects or eventual snapshots.
+2. Introduce poll/step helpers or bounded "wait until idle" probes where that can be done without weakening production invariants.
+3. Rewrite representative simulation tests to use the new probes instead of time-based heuristics.
+4. Keep the new probes clearly test/debug oriented so they do not become accidental correctness boundaries in production code.
+5. Treat `direct_backlog()` and similar lock-backed helper reads as candidates for this bucket when they are only needed to drive simulation progress or backlog assertions.
+6. Prefer a small explicit progress API over incidental `yield_now()` loops whenever the system can expose "made one step" or "fully idle" semantics safely.
+
+**Verification**
+
+- Simulation tests showing background progress can be asserted without arbitrary sleep-based retries.
+- Regression coverage for at least one maintenance or scheduler scenario that previously required yield-heavy timing assumptions.
+- Documentation updates that spell out when to use progress probes vs snapshots vs event streams.
+
 ---
 
 ## Phase 15 — Opt-in physical sharding, virtual-partition resharding, and shard-local execution

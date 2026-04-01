@@ -464,25 +464,37 @@ where
         .expect("projection should settle")
 }
 
-async fn wait_for_state(
+async fn wait_for_state<P>(
     runtime: &WorkflowRuntime<AlertWorkflowHandler>,
     instance_id: &str,
-    expected: usize,
-) -> Result<(), WorkflowError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let current = runtime
-            .load_state(instance_id)
-            .await?
-            .map(|value| decode_state_count(Some(value)))
-            .unwrap_or(0);
-        if current == expected {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("workflow state did not reach {expected} before timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    predicate: P,
+    description: &str,
+) -> Result<(), io::Error>
+where
+    P: Fn(Option<&Value>) -> bool,
+{
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state_where(instance_id, predicate),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::other(format!(
+            "workflow state for {instance_id} did not satisfy {description} before timeout"
+        ))
+    })?
+    .map_err(io::Error::other)?;
+    Ok(())
+}
+
+fn decode_state_count_ref(state: Option<&Value>) -> usize {
+    match state {
+        None => 0,
+        Some(Value::Bytes(bytes)) => std::str::from_utf8(bytes)
+            .expect("workflow state should be utf-8")
+            .parse()
+            .expect("workflow state should encode a count"),
+        Some(Value::Record(_)) => panic!("order-watch only stores byte workflow state"),
     }
 }
 
@@ -490,21 +502,18 @@ async fn wait_for_attach_mode(
     runtime: &WorkflowRuntime<AlertWorkflowHandler>,
     expected: WorkflowSourceAttachMode,
 ) -> Result<(), WorkflowError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let telemetry = runtime.telemetry_snapshot().await?;
-        if telemetry
-            .source_lags
-            .iter()
-            .any(|lag| lag.attach_mode == Some(expected))
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("workflow did not report attach mode {expected:?} before timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_telemetry(|telemetry| {
+            telemetry
+                .source_lags
+                .iter()
+                .any(|lag| lag.attach_mode == Some(expected))
+        }),
+    )
+    .await
+    .expect("workflow did not report attach mode before timeout")?;
+    Ok(())
 }
 
 async fn collect_attention_orders(
@@ -729,8 +738,20 @@ fn run_campaign_with_materialization(
                     let workflow_handle = workflow_runtime.start().await?;
                     wait_for_attach_mode(&workflow_runtime, WorkflowSourceAttachMode::Historical)
                         .await?;
-                    wait_for_state(&workflow_runtime, BACKLOG_ALERT_ORDER_ID, 1).await?;
-                    wait_for_state(&workflow_runtime, LIVE_TRANSITION_ORDER_ID, 2).await?;
+                    wait_for_state(
+                        &workflow_runtime,
+                        BACKLOG_ALERT_ORDER_ID,
+                        |state| decode_state_count_ref(state) == 1,
+                        "state count == 1",
+                    )
+                    .await?;
+                    wait_for_state(
+                        &workflow_runtime,
+                        LIVE_TRANSITION_ORDER_ID,
+                        |state| decode_state_count_ref(state) == 2,
+                        "state count == 2",
+                    )
+                    .await?;
 
                     let telemetry = workflow_runtime.telemetry_snapshot().await?;
                     let states = state_count_map(
@@ -808,7 +829,13 @@ fn run_campaign_with_materialization(
                     )
                     .await?;
 
-                    wait_for_state(&workflow_runtime, LIVE_TRANSITION_ORDER_ID, 2).await?;
+                    wait_for_state(
+                        &workflow_runtime,
+                        LIVE_TRANSITION_ORDER_ID,
+                        |state| decode_state_count_ref(state) == 2,
+                        "state count == 2",
+                    )
+                    .await?;
 
                     let telemetry = workflow_runtime.telemetry_snapshot().await?;
                     let states = state_count_map(
@@ -1062,7 +1089,12 @@ async fn run_restart_resume_campaign(
     wait_for_state(
         &workflow_runtime,
         BACKLOG_ALERT_ORDER_ID,
-        expected_backlog_count,
+        |state| decode_state_count_ref(state) == expected_backlog_count,
+        if expected_backlog_count == 0 {
+            "state absent or count == 0"
+        } else {
+            "state count == 1"
+        },
     )
     .await?;
 
@@ -1271,7 +1303,12 @@ async fn run_restart_resume_campaign(
     wait_for_state(
         &reopened_workflow_runtime,
         BACKLOG_ALERT_ORDER_ID,
-        expected_backlog_count,
+        |state| decode_state_count_ref(state) == expected_backlog_count,
+        if expected_backlog_count == 0 {
+            "state absent or count == 0"
+        } else {
+            "state count == 1"
+        },
     )
     .await?;
 
@@ -1295,7 +1332,13 @@ async fn run_restart_resume_campaign(
         ],
     )
     .await?;
-    wait_for_state(&reopened_workflow_runtime, LIVE_TRANSITION_ORDER_ID, 2).await?;
+    wait_for_state(
+        &reopened_workflow_runtime,
+        LIVE_TRANSITION_ORDER_ID,
+        |state| decode_state_count_ref(state) == 2,
+        "state count == 2",
+    )
+    .await?;
 
     let telemetry = reopened_workflow_runtime.telemetry_snapshot().await?;
     let snapshot = OrderWatchOracleSnapshot {

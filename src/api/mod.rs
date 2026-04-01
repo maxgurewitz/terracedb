@@ -130,18 +130,24 @@ mod watermark;
 
 pub use self::builder::*;
 pub use self::db_api::FlushStatus;
-pub use self::internals::{ColumnarCacheUsageSnapshot, DomainColumnarCacheUsageSnapshot};
+pub use self::internals::{
+    ColumnarCacheUsageSnapshot, ColumnarCacheUsageSubscription, DomainColumnarCacheUsageSnapshot,
+};
 pub use self::operations::*;
 pub use self::schema::*;
 pub use self::snapshot::Snapshot;
 pub use self::table::Table;
-pub use self::watermark::{WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate};
+pub use self::watermark::{
+    DbProgressSnapshot, DbProgressSubscription, WatermarkReceiver, WatermarkSubscriptionSet,
+    WatermarkUpdate,
+};
+pub use crate::execution::ResourceManagerSubscription;
 
 use self::internals::*;
 use self::memtable::*;
 use self::snapshot::SnapshotRegistration;
 use self::util::*;
-use self::watermark::{WatermarkAdvance, WatermarkRegistry};
+use self::watermark::{DbProgressPublisher, WatermarkAdvance, WatermarkRegistry};
 #[cfg(test)]
 mod property_tests;
 #[cfg(test)]

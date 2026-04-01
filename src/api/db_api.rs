@@ -1,12 +1,13 @@
+use super::watermark::{DbProgressSnapshot, DbProgressSubscription};
 use super::*;
-use crate::Timestamp;
-
-use crate::ZoneMapPredicate;
 use crate::execution::{
     DbExecutionProfile, DomainTaggedWork, ExecutionBacklogGuard, ExecutionDomainBudget,
     ExecutionDomainOwner, ExecutionDomainPath, ExecutionLane, ExecutionResourceUsage,
     ExecutionUsageLease, ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot,
-    WorkRuntimeTag,
+    ResourceManagerSubscription, WorkRuntimeTag,
+};
+use crate::{
+    AdmissionObservationReceiver, SchedulerObservabilitySubscription, Timestamp, ZoneMapPredicate,
 };
 use serde_json::Value as JsonValue;
 
@@ -599,6 +600,16 @@ impl Db {
         SequenceNumber::new(self.inner.current_durable_sequence.load(Ordering::SeqCst))
     }
 
+    /// Returns the latest published database progress snapshot.
+    pub fn progress_snapshot(&self) -> DbProgressSnapshot {
+        self.inner.db_progress.snapshot()
+    }
+
+    /// Subscribes to published database progress updates.
+    pub fn subscribe_progress(&self) -> DbProgressSubscription {
+        self.inner.db_progress.subscribe()
+    }
+
     pub fn write_batch(&self) -> WriteBatch {
         WriteBatch::default()
     }
@@ -632,6 +643,11 @@ impl Db {
     /// Returns a snapshot of the full colocated resource manager state.
     pub fn resource_manager_snapshot(&self) -> ResourceManagerSnapshot {
         self.inner.resource_manager.snapshot()
+    }
+
+    /// Subscribes to updates of the full colocated resource manager state.
+    pub fn subscribe_resource_manager(&self) -> ResourceManagerSubscription {
+        self.inner.resource_manager.subscribe()
     }
 
     /// Returns a placement report for this database and any attached subsystems.
@@ -910,6 +926,11 @@ impl Db {
                 self.inner
                     .next_sequence
                     .store(sequence.get(), Ordering::SeqCst);
+                self.inner.db_progress.publish(
+                    self.current_sequence(),
+                    self.current_durable_sequence(),
+                    sequence,
+                );
                 participant
             };
 
@@ -1876,6 +1897,8 @@ impl Db {
                 .await;
             let mut should_run_maintenance = flush_guardrail.soft_triggered;
             let mut must_stall = flush_guardrail.force_triggered;
+            let mut aggregated_diagnostics = crate::AdmissionDiagnostics::default();
+            let mut saw_admission = false;
 
             for table in &touched_tables {
                 let stats = self.table_stats(table).await;
@@ -1906,6 +1929,9 @@ impl Db {
                     &foreground_tag,
                     foreground_budget.as_ref(),
                 );
+                let hard_l0_stall = stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT;
+                let effective_diagnostics =
+                    Self::effective_admission_diagnostics(&decision, diagnostics, hard_l0_stall);
 
                 let table_delay = decision
                     .max_write_bytes_per_second
@@ -1914,26 +1940,32 @@ impl Db {
                 max_delay = max_delay.max(table_delay);
                 let carry_delay = crate::carry_write_delay_across_maintenance(
                     decision.max_write_bytes_per_second,
-                    diagnostics.as_ref(),
+                    Some(&effective_diagnostics),
                 );
-                if decision.throttle {
-                    if let Some(diagnostics) = diagnostics.clone() {
-                        self.record_admission_diagnostics(&foreground_tag, diagnostics);
-                    }
-                    self.record_throttled_write_domain(&foreground_tag);
+                if !saw_admission {
+                    aggregated_diagnostics = effective_diagnostics.clone();
+                    saw_admission = true;
+                } else {
+                    aggregated_diagnostics = Self::stronger_admission_diagnostics(
+                        aggregated_diagnostics,
+                        effective_diagnostics.clone(),
+                    );
+                }
+                if effective_diagnostics.level != crate::AdmissionPressureLevel::Open {
                     should_run_maintenance = true;
                 }
-                if decision.stall || stats.l0_sstable_count >= DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT
-                {
-                    if let Some(diagnostics) = diagnostics {
-                        self.record_admission_diagnostics(&foreground_tag, diagnostics);
-                    }
-                    self.record_throttled_write_domain(&foreground_tag);
-                    should_run_maintenance = true;
+                if effective_diagnostics.level == crate::AdmissionPressureLevel::Stall {
                     must_stall = true;
                 }
                 if carry_delay {
                     pending_delay = pending_delay.max(table_delay);
+                }
+            }
+
+            if saw_admission {
+                self.record_admission_diagnostics(&foreground_tag, aggregated_diagnostics.clone());
+                if aggregated_diagnostics.level != crate::AdmissionPressureLevel::Open {
+                    self.record_throttled_write_domain(&foreground_tag);
                 }
             }
 
@@ -1966,6 +1998,64 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    fn effective_admission_diagnostics(
+        decision: &crate::ThrottleDecision,
+        diagnostics: Option<crate::AdmissionDiagnostics>,
+        hard_l0_stall: bool,
+    ) -> crate::AdmissionDiagnostics {
+        let mut diagnostics = diagnostics.unwrap_or_default();
+        if hard_l0_stall {
+            diagnostics.level = crate::AdmissionPressureLevel::Stall;
+            diagnostics.max_write_bytes_per_second = None;
+            if !diagnostics
+                .triggered_by
+                .contains(&crate::AdmissionPressureSignal::L0Sstables)
+            {
+                diagnostics
+                    .triggered_by
+                    .push(crate::AdmissionPressureSignal::L0Sstables);
+            }
+        } else if decision.stall {
+            diagnostics.level = crate::AdmissionPressureLevel::Stall;
+            diagnostics.max_write_bytes_per_second = None;
+        } else if decision.throttle && diagnostics.level == crate::AdmissionPressureLevel::Open {
+            diagnostics.level = crate::AdmissionPressureLevel::RateLimit;
+            diagnostics.max_write_bytes_per_second = decision.max_write_bytes_per_second;
+        }
+        diagnostics.triggered_by.sort();
+        diagnostics.triggered_by.dedup();
+        diagnostics
+    }
+
+    fn stronger_admission_diagnostics(
+        current: crate::AdmissionDiagnostics,
+        candidate: crate::AdmissionDiagnostics,
+    ) -> crate::AdmissionDiagnostics {
+        let current_rank = Self::admission_diagnostics_rank(&current);
+        let candidate_rank = Self::admission_diagnostics_rank(&candidate);
+        if candidate_rank > current_rank {
+            return candidate;
+        }
+        if candidate_rank < current_rank {
+            return current;
+        }
+
+        let current_rate = current.max_write_bytes_per_second.unwrap_or(u64::MAX);
+        let candidate_rate = candidate.max_write_bytes_per_second.unwrap_or(u64::MAX);
+        if candidate_rate < current_rate {
+            return candidate;
+        }
+        current
+    }
+
+    fn admission_diagnostics_rank(diagnostics: &crate::AdmissionDiagnostics) -> u8 {
+        match diagnostics.level {
+            crate::AdmissionPressureLevel::Open => 0,
+            crate::AdmissionPressureLevel::RateLimit => 1,
+            crate::AdmissionPressureLevel::Stall => 2,
+        }
     }
 
     pub(super) fn memtable_budget_bytes(&self) -> Option<u64> {
@@ -2308,6 +2398,11 @@ impl Db {
             pending.start_sequence.get().saturating_sub(1),
             Ordering::SeqCst,
         );
+        self.inner.db_progress.publish(
+            self.current_sequence(),
+            self.current_durable_sequence(),
+            SequenceNumber::new(pending.start_sequence.get().saturating_sub(1)),
+        );
         for batch in affected_batches {
             batch.finish(Err(pending.error.clone()));
         }
@@ -2459,6 +2554,15 @@ impl Db {
             self.inner
                 .current_durable_sequence
                 .store(sequence.get(), Ordering::SeqCst);
+        }
+        if advance.visible_sequence.is_some() || advance.durable_sequence.is_some() {
+            let reserved_sequence =
+                SequenceNumber::new(self.inner.next_sequence.load(Ordering::SeqCst));
+            self.inner.db_progress.publish(
+                self.current_sequence(),
+                self.current_durable_sequence(),
+                reserved_sequence,
+            );
         }
 
         self.notify_table_sequences(&self.inner.visible_watchers, &advance.visible_tables);
@@ -4282,7 +4386,7 @@ impl Db {
             registry,
             tables
                 .into_iter()
-                .map(|table| (table.name().to_string(), registry.subscribe(table.name())))
+                .map(|table| table.name().to_string())
                 .collect(),
         )
     }
@@ -4343,88 +4447,27 @@ impl Db {
     }
 
     pub fn columnar_cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
-        self.inner.columnar_read_context.cache_usage_snapshot()
+        self.inner.columnar_read_context.usage_snapshot()
+    }
+
+    pub fn subscribe_columnar_cache_usage(&self) -> ColumnarCacheUsageSubscription {
+        self.inner.columnar_read_context.subscribe_usage()
+    }
+
+    pub fn subscribe_scheduler_observability(&self) -> SchedulerObservabilitySubscription {
+        SchedulerObservabilitySubscription::new(self.inner.scheduler_observability.subscribe())
+    }
+
+    pub fn subscribe_admission_observations(&self) -> AdmissionObservationReceiver {
+        AdmissionObservationReceiver::new(
+            self.inner
+                .scheduler_observability
+                .subscribe_admission_observations(),
+        )
     }
 
     pub fn scheduler_observability_snapshot(&self) -> SchedulerObservabilitySnapshot {
-        let deferred_work = mutex_lock(&self.inner.work_deferrals).clone();
-        let deferred_domains = mutex_lock(&self.inner.work_deferral_domains).clone();
-        let mut deferred_work_by_domain = BTreeMap::new();
-        let mut starved_domains = BTreeMap::new();
-        for (work_id, cycles) in &deferred_work {
-            let Some(domain) = deferred_domains.get(work_id) else {
-                continue;
-            };
-            *deferred_work_by_domain.entry(domain.clone()).or_default() += *cycles;
-            if *cycles >= MAX_SCHEDULER_DEFER_CYCLES {
-                *starved_domains.entry(domain.clone()).or_default() += 1;
-            }
-        }
-        SchedulerObservabilitySnapshot {
-            deferred_work,
-            deferred_work_by_domain,
-            starved_domains,
-            forced_executions: self
-                .inner
-                .scheduler_observability
-                .forced_executions
-                .load(Ordering::Relaxed),
-            forced_flushes: self
-                .inner
-                .scheduler_observability
-                .forced_flushes
-                .load(Ordering::Relaxed),
-            forced_l0_compactions: self
-                .inner
-                .scheduler_observability
-                .forced_l0_compactions
-                .load(Ordering::Relaxed),
-            budget_blocked_executions: self
-                .inner
-                .scheduler_observability
-                .budget_blocked_executions
-                .load(Ordering::Relaxed),
-            budget_blocked_executions_by_domain: self
-                .inner
-                .scheduler_observability
-                .budget_blocked_executions_by_domain
-                .lock()
-                .clone(),
-            background_delay_events: self
-                .inner
-                .scheduler_observability
-                .background_delay_events
-                .load(Ordering::Relaxed),
-            background_delay_millis: self
-                .inner
-                .scheduler_observability
-                .background_delay_millis
-                .load(Ordering::Relaxed),
-            background_delay_events_by_domain: self
-                .inner
-                .scheduler_observability
-                .background_delay_events_by_domain
-                .lock()
-                .clone(),
-            background_delay_millis_by_domain: self
-                .inner
-                .scheduler_observability
-                .background_delay_millis_by_domain
-                .lock()
-                .clone(),
-            throttled_writes_by_domain: self
-                .inner
-                .scheduler_observability
-                .throttled_writes_by_domain
-                .lock()
-                .clone(),
-            last_admission_diagnostics_by_domain: self
-                .inner
-                .scheduler_observability
-                .last_admission_diagnostics_by_domain
-                .lock()
-                .clone(),
-        }
+        self.inner.scheduler_observability.snapshot()
     }
 
     pub(super) fn record_admission_diagnostics(
@@ -4432,24 +4475,19 @@ impl Db {
         tag: &WorkRuntimeTag,
         diagnostics: crate::AdmissionDiagnostics,
     ) {
-        mutex_lock(
-            &self
-                .inner
-                .scheduler_observability
-                .last_admission_diagnostics_by_domain,
-        )
-        .insert(tag.domain.clone(), diagnostics);
+        let recorded = crate::RecordedAdmissionDiagnostics {
+            diagnostics,
+            recorded_at: self.inner.dependencies.clock.now(),
+        };
+        self.inner
+            .scheduler_observability
+            .record_admission_diagnostics(tag, recorded);
     }
 
     pub(super) fn record_throttled_write_domain(&self, tag: &WorkRuntimeTag) {
-        *mutex_lock(
-            &self
-                .inner
-                .scheduler_observability
-                .throttled_writes_by_domain,
-        )
-        .entry(tag.domain.clone())
-        .or_default() += 1;
+        self.inner
+            .scheduler_observability
+            .record_throttled_write_domain(tag);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -4460,6 +4498,7 @@ impl Db {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn clear_columnar_decoded_cache(&self) {
         self.inner.columnar_read_context.decoded_cache.clear();
+        self.inner.columnar_read_context.publish_usage_snapshot();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

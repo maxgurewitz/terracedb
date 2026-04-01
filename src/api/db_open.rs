@@ -66,6 +66,7 @@ impl Db {
                 Self::load_local_manifest(&config.storage, &dependencies, &columnar_read_context)
                     .await;
             columnar_read_context.decoded_cache.clear();
+            columnar_read_context.publish_usage_snapshot();
             columnar_read_context.decoded_cache.reset_stats();
             columnar_read_context.decoded_cache_enabled.store(
                 prior_decoded_cache_enabled,
@@ -151,8 +152,11 @@ impl Db {
                         initial_table_watermarks.clone(),
                     )),
                     durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
-                    work_deferrals: Mutex::new(BTreeMap::new()),
-                    work_deferral_domains: Mutex::new(BTreeMap::new()),
+                    db_progress: DbProgressPublisher::new(
+                        recovered_sequence,
+                        recovered_sequence,
+                        recovered_sequence,
+                    ),
                     pending_work_budget_state: Mutex::new(PendingWorkBudgetState::default()),
                     scheduler_observability: SchedulerObservabilityStats::default(),
                     compact_to_wide_stats: Mutex::new(BTreeMap::new()),
@@ -1329,7 +1333,7 @@ impl Db {
         let (raw_byte_total, raw_byte_order, raw_byte_lengths) = remote_cache
             .as_ref()
             .map(|cache| {
-                let entries = cache.entries_snapshot();
+                let entries = cache.progress_snapshot().entries;
                 let lengths = entries
                     .iter()
                     .map(|entry| {
@@ -1352,7 +1356,7 @@ impl Db {
                 (cache.total_cached_bytes(), order, lengths)
             })
             .unwrap_or_default();
-        let context = ColumnarReadContext {
+        let context = ColumnarReadContext::new(ColumnarReadContextInit {
             dependencies: dependencies.clone(),
             remote_cache,
             decoded_cache: DecodedColumnarCache::new(
@@ -1365,22 +1369,22 @@ impl Db {
                     .map(|(lane, budget)| (*lane, budget.decoded_column_entry_limit))
                     .collect(),
             ),
-            raw_byte_cache_enabled: AtomicBool::new(true),
-            raw_byte_cache_population_enabled: AtomicBool::new(true),
-            decoded_cache_enabled: AtomicBool::new(true),
+            raw_byte_cache_enabled: true,
+            raw_byte_cache_population_enabled: true,
+            decoded_cache_enabled: true,
             raw_byte_cache_budget_bytes: total_raw_byte_budget,
-            raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState {
+            raw_byte_cache_budget_state: RawByteCacheBudgetState {
                 total_bytes: raw_byte_total,
                 order: raw_byte_order,
                 lengths: raw_byte_lengths,
                 owners: BTreeMap::new(),
-            }),
+            },
             cache_domain_paths,
             cache_lane_budgets,
             skip_indexes_enabled: hybrid_read.skip_indexes_enabled,
             projection_sidecars_enabled: hybrid_read.projection_sidecars_enabled,
             aggressive_background_repair: hybrid_read.aggressive_background_repair,
-        };
+        });
         context.trim_raw_byte_cache_to_budget().await?;
         Ok(context)
     }
@@ -1391,7 +1395,7 @@ impl Db {
     ) -> ColumnarReadContext {
         let config = crate::HybridReadConfig::default();
         let cache_lane_budgets = Self::default_columnar_cache_lane_budgets(&config);
-        ColumnarReadContext {
+        ColumnarReadContext::new(ColumnarReadContextInit {
             dependencies: dependencies.clone(),
             remote_cache: None,
             decoded_cache: DecodedColumnarCache::new(
@@ -1404,11 +1408,11 @@ impl Db {
                     .map(|(lane, budget)| (*lane, budget.decoded_column_entry_limit))
                     .collect(),
             ),
-            raw_byte_cache_enabled: AtomicBool::new(false),
-            raw_byte_cache_population_enabled: AtomicBool::new(false),
-            decoded_cache_enabled: AtomicBool::new(true),
+            raw_byte_cache_enabled: false,
+            raw_byte_cache_population_enabled: false,
+            decoded_cache_enabled: true,
             raw_byte_cache_budget_bytes: 0,
-            raw_byte_cache_budget_state: Mutex::new(RawByteCacheBudgetState::default()),
+            raw_byte_cache_budget_state: RawByteCacheBudgetState::default(),
             cache_domain_paths: Self::columnar_cache_domain_paths(
                 &crate::DbExecutionProfile::default(),
             ),
@@ -1416,7 +1420,7 @@ impl Db {
             skip_indexes_enabled: false,
             projection_sidecars_enabled: false,
             aggressive_background_repair: false,
-        }
+        })
     }
 
     pub(super) async fn load_local_manifest(

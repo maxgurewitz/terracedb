@@ -1646,6 +1646,100 @@ where
         Ok(self.load_source_progress(source).await?.as_log_cursor())
     }
 
+    pub async fn wait_for_state(
+        &self,
+        instance_id: &str,
+        expected: Value,
+    ) -> Result<(), WorkflowError> {
+        self.wait_for_state_where(instance_id, |state| state == Some(&expected))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn wait_for_state_where<P>(
+        &self,
+        instance_id: &str,
+        predicate: P,
+    ) -> Result<Option<Value>, WorkflowError>
+    where
+        P: Fn(Option<&Value>) -> bool,
+    {
+        let mut durable_wakes = self
+            .inner
+            .db
+            .subscribe_durable(self.inner.tables.state_table());
+
+        loop {
+            let state = self.load_state(instance_id).await?;
+            if predicate(state.as_ref()) {
+                return Ok(state);
+            }
+
+            durable_wakes
+                .changed()
+                .await
+                .map_err(|_| WorkflowError::SubscriptionClosed {
+                    name: self.inner.name.clone(),
+                })?;
+        }
+    }
+
+    pub async fn wait_for_source_progress(
+        &self,
+        source: &Table,
+        expected: WorkflowSourceProgress,
+    ) -> Result<(), WorkflowError> {
+        let mut durable_wakes = self
+            .inner
+            .db
+            .subscribe_durable(self.inner.tables.source_progress_table());
+        if self.load_source_progress(source).await? == expected {
+            return Ok(());
+        }
+
+        loop {
+            durable_wakes
+                .changed()
+                .await
+                .map_err(|_| WorkflowError::SubscriptionClosed {
+                    name: self.inner.name.clone(),
+                })?;
+            if self.load_source_progress(source).await? == expected {
+                return Ok(());
+            }
+        }
+    }
+
+    pub async fn wait_for_telemetry<P>(
+        &self,
+        predicate: P,
+    ) -> Result<WorkflowTelemetrySnapshot, WorkflowError>
+    where
+        P: Fn(&WorkflowTelemetrySnapshot) -> bool,
+    {
+        let mut durable_wakes = self
+            .inner
+            .db
+            .subscribe_durable(self.inner.tables.source_progress_table());
+        let snapshot = self.telemetry_snapshot().await?;
+        if predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+
+        loop {
+            durable_wakes
+                .changed()
+                .await
+                .map_err(|_| WorkflowError::SubscriptionClosed {
+                    name: self.inner.name.clone(),
+                })?;
+            let snapshot = self.telemetry_snapshot().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
+    }
+
     pub async fn capture_checkpoint(
         &self,
         checkpoint_id: WorkflowCheckpointId,
@@ -1791,6 +1885,7 @@ where
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (finished_tx, finished_rx) = watch::channel(false);
         let runtime = self.inner.clone();
         let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
         let task = tokio::spawn(
@@ -1806,6 +1901,7 @@ where
                     });
 
                 *runtime.running.lock().expect("running lock poisoned") = false;
+                let _ = finished_tx.send(true);
                 result
             }
             .with_subscriber(dispatch),
@@ -1814,6 +1910,7 @@ where
         Ok(WorkflowHandle {
             name: self.inner.name.clone(),
             shutdown: shutdown_tx,
+            finished: finished_rx,
             task,
         })
     }
@@ -1863,6 +1960,7 @@ where
 pub struct WorkflowHandle {
     name: String,
     shutdown: watch::Sender<bool>,
+    finished: watch::Receiver<bool>,
     task: JoinHandle<Result<(), WorkflowError>>,
 }
 
@@ -1884,6 +1982,24 @@ impl WorkflowHandle {
     pub async fn shutdown(self) -> Result<(), WorkflowError> {
         self.shutdown.send_replace(true);
         self.task.await?
+    }
+
+    pub async fn wait_until_terminal(&mut self) -> Result<(), WorkflowError> {
+        if *self.finished.borrow() {
+            return Ok(());
+        }
+
+        loop {
+            self.finished
+                .changed()
+                .await
+                .map_err(|_| WorkflowError::SubscriptionClosed {
+                    name: self.name.clone(),
+                })?;
+            if *self.finished.borrow() {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -2139,6 +2255,49 @@ where
 
     pub async fn load_state(&self) -> Result<Option<RecurringWorkflowState>, WorkflowError> {
         decode_recurring_state(self.runtime.load_state(&self.instance_id).await?.as_ref())
+    }
+
+    pub async fn wait_for_state<P>(
+        &self,
+        predicate: P,
+    ) -> Result<RecurringWorkflowState, WorkflowError>
+    where
+        P: Fn(&RecurringWorkflowState) -> bool,
+    {
+        let mut durable_wakes = self
+            .runtime
+            .inner
+            .db
+            .subscribe_durable(self.runtime.inner.tables.state_table());
+        if let Some(state) = self.load_state().await?
+            && predicate(&state)
+        {
+            return Ok(state);
+        }
+
+        loop {
+            durable_wakes
+                .changed()
+                .await
+                .map_err(|_| WorkflowError::SubscriptionClosed {
+                    name: self.runtime.name().to_string(),
+                })?;
+            if let Some(state) = self.load_state().await?
+                && predicate(&state)
+            {
+                return Ok(state);
+            }
+        }
+    }
+
+    pub async fn wait_for_telemetry<P>(
+        &self,
+        predicate: P,
+    ) -> Result<WorkflowTelemetrySnapshot, WorkflowError>
+    where
+        P: Fn(&WorkflowTelemetrySnapshot) -> bool,
+    {
+        self.runtime.wait_for_telemetry(predicate).await
     }
 
     pub async fn next_fire_at(&self) -> Result<Option<Timestamp>, WorkflowError> {

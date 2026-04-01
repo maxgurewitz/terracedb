@@ -172,3 +172,11 @@ impl From<ChangeFeedError> for ReadError {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error("subscription closed")]
 pub struct SubscriptionClosed;
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum AdmissionObservationRecvError {
+    #[error("admission observation stream closed")]
+    Closed,
+    #[error("missed {0} admission observations")]
+    Lagged(u64),
+}

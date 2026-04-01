@@ -120,51 +120,69 @@ fn telemetry_server_host(
     prefix: &'static str,
     profile: TelemetryExampleProfile,
     shutdown: watch::Receiver<bool>,
-) -> SimulationHost {
-    SimulationHost::new(SERVER_HOST, move || {
-        let shutdown = shutdown.clone();
-        async move {
-            let db = Db::open(
-                telemetry_db_config(path, prefix, profile),
-                DbDependencies::new(
-                    Arc::new(SimulatedFileSystem::default()),
-                    Arc::new(NetworkObjectStore::new(
-                        OBJECT_STORE_HOST,
-                        OBJECT_STORE_PORT,
-                    )),
-                    Arc::new(TurmoilClock),
-                    Arc::new(terracedb::DeterministicRng::seeded(seed)),
-                ),
-            )
-            .await
-            .map_err(boxed_error)?;
-            let app = TelemetryApp::open(db, profile).await.map_err(boxed_error)?;
+) -> (SimulationHost, watch::Receiver<bool>) {
+    let (ready_tx, ready_rx) = watch::channel(false);
+    (
+        SimulationHost::new(SERVER_HOST, move || {
+            let shutdown = shutdown.clone();
+            let ready_tx = ready_tx.clone();
+            async move {
+                let db = Db::open(
+                    telemetry_db_config(path, prefix, profile),
+                    DbDependencies::new(
+                        Arc::new(SimulatedFileSystem::default()),
+                        Arc::new(NetworkObjectStore::new(
+                            OBJECT_STORE_HOST,
+                            OBJECT_STORE_PORT,
+                        )),
+                        Arc::new(TurmoilClock),
+                        Arc::new(terracedb::DeterministicRng::seeded(seed)),
+                    ),
+                )
+                .await
+                .map_err(boxed_error)?;
+                let app = TelemetryApp::open(db, profile).await.map_err(boxed_error)?;
 
-            let server = axum_router_server_with_shutdown(
-                SERVER_HOST,
-                TELEMETRY_SERVER_PORT,
-                app.router(),
-                shutdown,
-            );
-            let serve_result = server.run().await.map_err(boxed_error);
-            let shutdown_result = app.shutdown().await.map_err(boxed_error);
-            match (serve_result, shutdown_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(error), _) => Err(error),
-                (Ok(()), Err(error)) => Err(error),
+                let server = axum_router_server_with_shutdown(
+                    SERVER_HOST,
+                    TELEMETRY_SERVER_PORT,
+                    app.router(),
+                    shutdown,
+                );
+                let mut listening = server.ready();
+                let ready_tx = ready_tx.clone();
+                tokio::spawn(async move {
+                    if !*listening.borrow() {
+                        let _ = listening.changed().await;
+                    }
+                    let _ = ready_tx.send(true);
+                });
+
+                let serve_result = server.run().await.map_err(boxed_error);
+                let shutdown_result = app.shutdown().await.map_err(boxed_error);
+                match (serve_result, shutdown_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), _) => Err(error),
+                    (Ok(()), Err(error)) => Err(error),
+                }
             }
-        }
-    })
+        }),
+        ready_rx,
+    )
 }
 
-fn happy_path_client_host(done: watch::Sender<bool>) -> SimulationHost {
+fn happy_path_client_host(
+    done: watch::Sender<bool>,
+    ready: watch::Receiver<bool>,
+) -> SimulationHost {
     SimulationHost::new("client", move || {
         let done = done.clone();
+        let ready = ready.clone();
         async move {
             let client = SimulatedHttpClient::new(SERVER_HOST, TELEMETRY_SERVER_PORT);
             let readings = sample_readings();
             let oracle = oracle_from_readings(&readings);
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            wait_for_ready(ready).await?;
 
             let (status, ingested): (StatusCode, IngestReadingsResponse) = client
                 .request_json(
@@ -273,6 +291,16 @@ async fn wait_for_done(mut done: watch::Receiver<bool>) -> Result<(), std::io::E
     Ok(())
 }
 
+async fn wait_for_ready(mut ready: watch::Receiver<bool>) -> Result<(), std::io::Error> {
+    if !*ready.borrow() {
+        ready
+            .changed()
+            .await
+            .map_err(|_| std::io::Error::other("simulation server did not become ready"))?;
+    }
+    Ok(())
+}
+
 fn stub_dependencies(
     file_system: Arc<StubFileSystem>,
     object_store: Arc<StubObjectStore>,
@@ -321,18 +349,19 @@ async fn overwrite_file(
 fn telemetry_api_simulation_supports_ingest_state_scan_and_summary() -> turmoil::Result {
     let (done_tx, done_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (server, ready_rx) = telemetry_server_host(
+        0x5858,
+        "/telemetry-api-happy",
+        "telemetry-api-happy",
+        TelemetryExampleProfile::Base,
+        shutdown_rx,
+    );
 
     SeededSimulationRunner::new(0x5858)
         .with_simulation_duration(SIM_DURATION)
         .with_message_latency(MIN_MESSAGE_LATENCY, MAX_MESSAGE_LATENCY)
-        .with_host(telemetry_server_host(
-            0x5858,
-            "/telemetry-api-happy",
-            "telemetry-api-happy",
-            TelemetryExampleProfile::Base,
-            shutdown_rx,
-        ))
-        .with_host(happy_path_client_host(done_tx))
+        .with_host(server)
+        .with_host(happy_path_client_host(done_tx, ready_rx))
         .run_with(move |_context| async move {
             wait_for_done(done_rx).await.map_err(boxed_error)?;
             shutdown_tx.send_replace(true);

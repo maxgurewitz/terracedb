@@ -2,18 +2,20 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use parking_lot::Mutex;
+use terracedb::test_support::ClockProgressProbe;
 use terracedb::{
     ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement, CommitOptions,
-    CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbSettings, DomainBackgroundBudget,
-    DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork, DurabilityClass,
-    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainLifecycleEvent,
-    ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
-    ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding,
-    ExecutionLanePlacementConfig, ExecutionResourceKind, ExecutionResourceUsage, FileSystemFailure,
-    FileSystemOperation, InMemoryResourceManager, NoopScheduler, PendingWork, PendingWorkType,
-    PressureScope, ResourceManager, S3Location, ScanOptions, Scheduler, ShardReadyPlacementLayout,
-    StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat, TableStats,
-    ThrottleDecision, TieredDurabilityMode, Timestamp, Value,
+    CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbProgressSnapshot, DbSettings,
+    DomainBackgroundBudget, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork,
+    DurabilityClass, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget,
+    ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceKind,
+    ExecutionResourceUsage, FileSystemFailure, FileSystemOperation, InMemoryResourceManager,
+    NoopScheduler, PendingWork, PendingWorkType, PressureScope, ResourceManager, S3Location,
+    ScanOptions, Scheduler, ShardReadyPlacementLayout, StubClock, StubFileSystem, StubObjectStore,
+    StubRng, TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
+    Timestamp, Value,
 };
 use terracedb_simulation::{
     ColocatedDbWorkloadSpec, ContentionClass, DomainBudgetCharge, DomainBudgetOracle,
@@ -574,43 +576,6 @@ fn update_domain_spec(
         .clone();
     mutate(&mut spec);
     manager.update_domain(spec);
-}
-
-async fn wait_for_failpoint_hit_with_clock(
-    handle: &terracedb::FailpointHandle,
-    clock: &StubClock,
-    step: Duration,
-    max_steps: usize,
-) -> terracedb::FailpointHit {
-    let mut wait = Box::pin(handle.next_hit());
-    for _ in 0..max_steps {
-        tokio::select! {
-            hit = &mut wait => return hit,
-            _ = tokio::task::yield_now() => {
-                clock.advance(step);
-            }
-        }
-    }
-
-    panic!("failpoint was not hit within {max_steps} virtual-clock advances");
-}
-
-async fn advance_clock_until_finished<T>(
-    clock: &StubClock,
-    handle: &tokio::task::JoinHandle<T>,
-    step: Duration,
-    max_steps: usize,
-) -> u64 {
-    let start = terracedb::Clock::now(clock).get();
-    for _ in 0..max_steps {
-        if handle.is_finished() {
-            return terracedb::Clock::now(clock).get().saturating_sub(start);
-        }
-        clock.advance(step);
-        tokio::task::yield_now().await;
-    }
-
-    panic!("task was not finished within {max_steps} virtual-clock advances");
 }
 
 #[tokio::test]
@@ -2525,6 +2490,7 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         .execution_lane_binding(ExecutionLane::UserBackground)
         .domain
         .clone();
+    let mut updates = db.subscribe_resource_manager();
     assert_eq!(db.tag_user_background_work(()).tag.domain, background_path);
     assert_eq!(
         db.tag_work(
@@ -2559,21 +2525,31 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         },
         |decision| decision.admitted
     ));
-    let observed_during_scoped_usage = db.with_lane_usage(
+    let lease = db.acquire_lane_usage(
         ExecutionLane::UserForeground,
         ExecutionResourceUsage {
             cpu_workers: 1,
             ..ExecutionResourceUsage::default()
         },
-        |_| {
-            db.resource_manager_snapshot().domains[&foreground_path]
-                .usage
-                .cpu_workers_in_use
-        },
     );
-    assert_eq!(observed_during_scoped_usage, 1);
+    assert!(lease.admitted());
+    let observed_during_scoped_usage = updates
+        .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1)
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
-        db.resource_manager_snapshot().domains[&foreground_path]
+        observed_during_scoped_usage.domains[&foreground_path]
+            .usage
+            .cpu_workers_in_use,
+        1
+    );
+    drop(lease);
+    let released_usage = updates
+        .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0)
+        .await
+        .expect("resource manager snapshot update");
+    assert_eq!(
+        released_usage.domains[&foreground_path]
             .usage
             .cpu_workers_in_use,
         0
@@ -2590,7 +2566,7 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         .await
     );
     assert_eq!(
-        db.resource_manager_snapshot().domains[&foreground_path]
+        updates.current().domains[&foreground_path]
             .usage
             .cpu_workers_in_use,
         0
@@ -2605,17 +2581,21 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
             },
         );
         assert!(lease.admitted());
+        let snapshot = updates
+            .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1)
+            .await
+            .expect("resource manager snapshot update");
         assert_eq!(
-            db.resource_manager_snapshot().domains[&foreground_path]
-                .usage
-                .cpu_workers_in_use,
+            snapshot.domains[&foreground_path].usage.cpu_workers_in_use,
             1
         );
     }
+    let snapshot = updates
+        .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0)
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
-        db.resource_manager_snapshot().domains[&foreground_path]
-            .usage
-            .cpu_workers_in_use,
+        snapshot.domains[&foreground_path].usage.cpu_workers_in_use,
         0
     );
 
@@ -2627,14 +2607,26 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
                 queued_bytes: 64,
             },
         );
-        let snapshot = db.resource_manager_snapshot();
+        let snapshot = updates
+            .wait_for(|snapshot| {
+                snapshot.domains[&background_path].backlog.queued_work_items == 2
+                    && snapshot.domains[&background_path].backlog.queued_bytes == 64
+            })
+            .await
+            .expect("resource manager snapshot update");
         assert_eq!(
             snapshot.domains[&background_path].backlog.queued_work_items,
             2
         );
         assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 64);
     }
-    let snapshot = db.resource_manager_snapshot();
+    let snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 0
+                && snapshot.domains[&background_path].backlog.queued_bytes == 0
+        })
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         snapshot.domains[&background_path].backlog.queued_work_items,
         0
@@ -2646,7 +2638,7 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
             queued_work_items: 3,
             queued_bytes: 96,
         },
-        || db.resource_manager_snapshot().domains[&background_path].backlog,
+        || updates.current().domains[&background_path].backlog,
     );
     assert_eq!(queued.queued_work_items, 3);
     assert_eq!(queued.queued_bytes, 96);
@@ -2658,19 +2650,187 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
                 queued_bytes: 128,
             },
             || async {
-                db.resource_manager_snapshot().domains[&background_path]
-                    .backlog
-                    .queued_work_items
+                let snapshot = updates
+                    .wait_for(|snapshot| {
+                        snapshot.domains[&background_path].backlog.queued_work_items == 4
+                            && snapshot.domains[&background_path].backlog.queued_bytes == 128
+                    })
+                    .await
+                    .expect("resource manager snapshot update");
+                snapshot.domains[&background_path].backlog.queued_work_items
             },
         )
         .await;
     assert_eq!(queued_async, 4);
-    let snapshot = db.resource_manager_snapshot();
+    let snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 0
+                && snapshot.domains[&background_path].backlog.queued_bytes == 0
+        })
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         snapshot.domains[&background_path].backlog.queued_work_items,
         0
     );
     assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
+}
+
+#[tokio::test]
+async fn db_lane_backlog_subscription_observes_transition_edges() {
+    let deployment =
+        ColocatedDeployment::single_database(process_budget(), "primary").expect("single layout");
+    let db = open_deployed_db(
+        &deployment,
+        "primary",
+        "/execution-lane-helpers-subscription",
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+    )
+    .await;
+
+    let background_path = db
+        .execution_lane_binding(ExecutionLane::UserBackground)
+        .domain
+        .clone();
+    let mut updates = db.subscribe_resource_manager();
+
+    assert_eq!(
+        updates.current().domains[&background_path]
+            .backlog
+            .queued_work_items,
+        0
+    );
+    assert_eq!(
+        updates.current().domains[&background_path]
+            .backlog
+            .queued_bytes,
+        0
+    );
+
+    {
+        let _backlog = db.set_lane_backlog(
+            ExecutionLane::UserBackground,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 2,
+                queued_bytes: 64,
+            },
+        );
+        let snapshot = updates
+            .wait_for(|snapshot| {
+                snapshot.domains[&background_path].backlog.queued_work_items == 2
+                    && snapshot.domains[&background_path].backlog.queued_bytes == 64
+            })
+            .await
+            .expect("resource manager snapshot update");
+        assert_eq!(
+            snapshot.domains[&background_path].backlog.queued_work_items,
+            2
+        );
+        assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 64);
+        assert_eq!(
+            db.resource_manager_snapshot().domains[&background_path].backlog,
+            snapshot.domains[&background_path].backlog
+        );
+    }
+
+    let snapshot = updates.current();
+    assert_eq!(
+        snapshot.domains[&background_path].backlog.queued_work_items,
+        0
+    );
+    assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 0);
+
+    let queued = db
+        .with_lane_backlog_async(
+            ExecutionLane::UserBackground,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 4,
+                queued_bytes: 128,
+            },
+            || async {
+                let snapshot = updates.current();
+                assert_eq!(
+                    snapshot.domains[&background_path].backlog.queued_work_items,
+                    4
+                );
+                assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 128);
+                snapshot.domains[&background_path].backlog
+            },
+        )
+        .await;
+    assert_eq!(queued.queued_work_items, 4);
+    assert_eq!(queued.queued_bytes, 128);
+
+    let cleared = updates
+        .wait_for(|snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 0
+                && snapshot.domains[&background_path].backlog.queued_bytes == 0
+        })
+        .await
+        .expect("resource manager snapshot update");
+    assert_eq!(
+        cleared.domains[&background_path].backlog.queued_work_items,
+        0
+    );
+    assert_eq!(cleared.domains[&background_path].backlog.queued_bytes, 0);
+    assert_eq!(
+        db.resource_manager_snapshot().domains[&background_path].backlog,
+        cleared.domains[&background_path].backlog
+    );
+}
+
+#[tokio::test]
+async fn db_progress_subscription_observes_visible_then_durable_transitions() {
+    let db = Db::builder()
+        .settings(deferred_tiered_settings("/execution-progress-subscription"))
+        .components(stub_components(
+            Arc::new(InMemoryResourceManager::default()),
+        ))
+        .open()
+        .await
+        .expect("open db");
+
+    let table = db
+        .ensure_table(row_table_config("events"))
+        .await
+        .expect("create events table");
+    let mut progress = db.subscribe_progress();
+
+    assert_eq!(progress.current(), DbProgressSnapshot::default());
+
+    let visible = table
+        .write(b"k".to_vec(), Value::Bytes(b"v".to_vec()))
+        .await
+        .expect("write row");
+    let published_visible = progress
+        .wait_for(|snapshot| {
+            snapshot.current_sequence == visible
+                && snapshot.durable_sequence == terracedb::SequenceNumber::default()
+                && snapshot.reserved_sequence == visible
+        })
+        .await
+        .expect("db progress update");
+    assert_eq!(published_visible.current_sequence, visible);
+    assert_eq!(
+        published_visible.durable_sequence,
+        terracedb::SequenceNumber::default()
+    );
+    assert_eq!(published_visible.reserved_sequence, visible);
+
+    db.flush().await.expect("flush row");
+    let published_durable = progress
+        .wait_for(|snapshot| {
+            snapshot.current_sequence == visible
+                && snapshot.durable_sequence == visible
+                && snapshot.reserved_sequence == visible
+        })
+        .await
+        .expect("db progress update");
+    assert_eq!(published_durable.current_sequence, visible);
+    assert_eq!(published_durable.durable_sequence, visible);
+    assert_eq!(published_durable.reserved_sequence, visible);
+    assert_eq!(db.progress_snapshot(), published_durable);
 }
 
 #[tokio::test]
@@ -2884,40 +3044,47 @@ async fn placement_reports_include_attached_subsystems_and_match_runtime_topolog
 
 #[tokio::test]
 async fn whole_system_execution_domain_campaigns_remain_deterministic_across_seeds() {
-    let seeds = [0x6901_u64, 0x6902, 0x6903];
+    let first = run_whole_system_campaign(0x6901).await;
+    let first_replay = run_whole_system_campaign(0x6901).await;
+    let second = run_whole_system_campaign(0x6902).await;
 
-    for seed in seeds {
-        let first = run_whole_system_campaign(seed).await;
-        let second = run_whole_system_campaign(seed).await;
-        assert_eq!(first, second, "seed {seed:#x} should be reproducible");
+    assert_eq!(first, first_replay, "seed 0x6901 should be reproducible");
+    assert!(
+        first.database_order != second.database_order
+            || first.durable_rows_by_db != second.durable_rows_by_db
+            || first.oracle_cpu_millis_by_domain != second.oracle_cpu_millis_by_domain,
+        "different seeds should change the whole-system execution-domain campaign shape"
+    );
+
+    for (seed, outcome) in [(0x6901_u64, &first), (0x6902_u64, &second)] {
         assert!(
-            first.admissions["warehouse-shared-overflow-blocked"],
+            outcome.admissions["warehouse-shared-overflow-blocked"],
             "seed {seed:#x} should block extra shard-ready background work after tightening budgets"
         );
         assert!(
-            first.admissions["primary-control-plane"],
+            outcome.admissions["primary-control-plane"],
             "seed {seed:#x} should keep the protected control-plane domain progressing"
         );
         assert_eq!(
-            first.mutable_budget_by_domain["process/dbs/analytics/foreground"],
+            outcome.mutable_budget_by_domain["process/dbs/analytics/foreground"],
             Some(64)
         );
         assert_eq!(
-            first.background_slots_by_domain["process/shards/warehouse/background"],
+            outcome.background_slots_by_domain["process/shards/warehouse/background"],
             Some(1)
         );
         assert_eq!(
-            first.backlog_items_by_domain["process/shards/warehouse/background"],
+            outcome.backlog_items_by_domain["process/shards/warehouse/background"],
             2
         );
         assert_eq!(
-            first.backlog_bytes_by_domain["process/shards/warehouse/background"],
+            outcome.backlog_bytes_by_domain["process/shards/warehouse/background"],
             256
         );
-        assert_eq!(first.control_tables_by_db["primary"].len(), 1);
-        assert_eq!(first.control_tables_by_db["warehouse"].len(), 1);
+        assert_eq!(outcome.control_tables_by_db["primary"].len(), 1);
+        assert_eq!(outcome.control_tables_by_db["warehouse"].len(), 1);
         assert!(
-            first.oracle_cpu_millis_by_domain.contains_key("process"),
+            outcome.oracle_cpu_millis_by_domain.contains_key("process"),
             "seed {seed:#x} should aggregate the oracle at the process root"
         );
     }
@@ -3011,7 +3178,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         ),
     ] {
         let write = tokio::spawn(async move { table.write(key, Value::bytes(value)).await });
-        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_millis(25), 256).await;
+        ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 256)
+            .wait_for_task(&write)
+            .await;
         write
             .await
             .expect("bootstrap task should finish")
@@ -3039,9 +3208,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         }
     });
 
-    let hit =
-        wait_for_failpoint_hit_with_clock(&stall, clock.as_ref(), Duration::from_millis(25), 512)
-            .await;
+    let hit = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_failpoint_hit(&stall)
+        .await;
     assert_eq!(
         hit.name,
         terracedb::failpoints::names::DB_COMMIT_BEFORE_MEMTABLE_INSERT
@@ -3060,13 +3229,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         .expect("flush protected control-plane progress");
 
     stall.release();
-    advance_clock_until_finished(
-        clock.as_ref(),
-        &stalled_write,
-        Duration::from_millis(25),
-        512,
-    )
-    .await;
+    ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&stalled_write)
+        .await;
     stalled_write
         .await
         .expect("stalled write task should finish")
@@ -3093,9 +3258,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         }
     });
 
-    let fast_elapsed =
-        advance_clock_until_finished(clock.as_ref(), &fast_write, Duration::from_millis(25), 512)
-            .await;
+    let fast_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&fast_write)
+        .await;
     assert!(
         !slow_write.is_finished(),
         "analytics write should still be throttled when the primary write completes"
@@ -3104,9 +3269,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         .await
         .expect("primary tail task should finish")
         .expect("primary tail write should succeed");
-    let slow_elapsed =
-        advance_clock_until_finished(clock.as_ref(), &slow_write, Duration::from_millis(25), 512)
-            .await;
+    let slow_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&slow_write)
+        .await;
     slow_write
         .await
         .expect("analytics tail task should finish")

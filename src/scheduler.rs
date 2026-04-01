@@ -1,8 +1,14 @@
-use std::{collections::BTreeMap, fmt, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use serde_json::Value as JsonValue;
+use tokio::sync::{broadcast, watch};
 
 use crate::{
+    Timestamp,
     api::Table,
     current_state::CurrentStateRetentionStats,
     execution::{
@@ -165,6 +171,12 @@ pub enum DomainPriorityOverride {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordedAdmissionDiagnostics {
+    pub diagnostics: AdmissionDiagnostics,
+    pub recorded_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchedulerObservabilitySnapshot {
     pub deferred_work: BTreeMap<String, u32>,
     pub deferred_work_by_domain: BTreeMap<ExecutionDomainPath, u32>,
@@ -179,7 +191,126 @@ pub struct SchedulerObservabilitySnapshot {
     pub background_delay_events_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub background_delay_millis_by_domain: BTreeMap<ExecutionDomainPath, u64>,
     pub throttled_writes_by_domain: BTreeMap<ExecutionDomainPath, u64>,
-    pub last_admission_diagnostics_by_domain: BTreeMap<ExecutionDomainPath, AdmissionDiagnostics>,
+    pub current_admission_diagnostics_by_domain:
+        BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
+    pub last_non_open_admission_by_domain:
+        BTreeMap<ExecutionDomainPath, RecordedAdmissionDiagnostics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionObservation {
+    pub domain: ExecutionDomainPath,
+    pub current: RecordedAdmissionDiagnostics,
+    pub last_non_open: Option<RecordedAdmissionDiagnostics>,
+}
+
+#[derive(Debug)]
+pub struct AdmissionObservationReceiver {
+    inner: broadcast::Receiver<AdmissionObservation>,
+}
+
+impl AdmissionObservationReceiver {
+    pub(crate) fn new(inner: broadcast::Receiver<AdmissionObservation>) -> Self {
+        Self { inner }
+    }
+
+    pub async fn recv(
+        &mut self,
+    ) -> Result<AdmissionObservation, crate::AdmissionObservationRecvError> {
+        match self.inner.recv().await {
+            Ok(observation) => Ok(observation),
+            Err(broadcast::error::RecvError::Closed) => {
+                Err(crate::AdmissionObservationRecvError::Closed)
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(crate::AdmissionObservationRecvError::Lagged(skipped))
+            }
+        }
+    }
+
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<Option<AdmissionObservation>, crate::AdmissionObservationRecvError> {
+        match self.inner.try_recv() {
+            Ok(observation) => Ok(Some(observation)),
+            Err(broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(broadcast::error::TryRecvError::Closed) => {
+                Err(crate::AdmissionObservationRecvError::Closed)
+            }
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                Err(crate::AdmissionObservationRecvError::Lagged(skipped))
+            }
+        }
+    }
+
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<AdmissionObservation, crate::AdmissionObservationRecvError>
+    where
+        F: FnMut(&AdmissionObservation) -> bool,
+    {
+        loop {
+            let observation = self.recv().await?;
+            if predicate(&observation) {
+                return Ok(observation);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SchedulerObservabilitySubscription {
+    inner: watch::Receiver<Arc<SchedulerObservabilitySnapshot>>,
+}
+
+impl SchedulerObservabilitySubscription {
+    pub(crate) fn new(inner: watch::Receiver<Arc<SchedulerObservabilitySnapshot>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn current(&self) -> SchedulerObservabilitySnapshot {
+        self.inner.borrow().as_ref().clone()
+    }
+
+    pub async fn changed(
+        &mut self,
+    ) -> Result<SchedulerObservabilitySnapshot, crate::SubscriptionClosed> {
+        self.inner
+            .changed()
+            .await
+            .map_err(|_| crate::SubscriptionClosed)?;
+        Ok(self.current())
+    }
+
+    /// Waits until the current or next published snapshot satisfies `predicate`.
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<SchedulerObservabilitySnapshot, crate::SubscriptionClosed>
+    where
+        F: FnMut(&SchedulerObservabilitySnapshot) -> bool,
+    {
+        let snapshot = self.current();
+        if predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+
+        loop {
+            let snapshot = self.changed().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
+    }
+}
+
+impl Clone for SchedulerObservabilitySubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

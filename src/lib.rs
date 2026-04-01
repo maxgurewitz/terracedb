@@ -32,12 +32,13 @@ pub use adapters::{
 };
 pub use api::{
     BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarCacheUsageSnapshot,
-    ColumnarRecord, ColumnarScanExecution, ColumnarScanPartExecution, CommitOptions, Db, DbBuilder,
-    DbComponents, DbSettings, DomainColumnarCacheUsageSnapshot, FieldDefinition, FieldType,
-    FieldValue, FlushStatus, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet, ReadSetEntry,
-    RowScanExecution, ScanExecution, ScanMaterializationSource, ScanOptions, ScanPredicate,
-    SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver, WatermarkSubscriptionSet,
-    WatermarkUpdate, WriteBatch,
+    ColumnarCacheUsageSubscription, ColumnarRecord, ColumnarScanExecution,
+    ColumnarScanPartExecution, CommitOptions, Db, DbBuilder, DbComponents, DbProgressSnapshot,
+    DbProgressSubscription, DbSettings, DomainColumnarCacheUsageSnapshot, FieldDefinition,
+    FieldType, FieldValue, FlushStatus, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet,
+    ReadSetEntry, RowScanExecution, ScanExecution, ScanMaterializationSource, ScanOptions,
+    ScanPredicate, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
+    WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
 };
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,
@@ -79,8 +80,9 @@ pub use current_state::{
     CurrentStateThresholdCutoff, CurrentStateThresholdRetentionPolicy,
 };
 pub use error::{
-    ChangeFeedError, CommitError, CreateTableError, FlushError, OpenError, ReadError,
-    SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed, WriteError,
+    AdmissionObservationRecvError, ChangeFeedError, CommitError, CreateTableError, FlushError,
+    OpenError, ReadError, SnapshotTooOld, StorageError, StorageErrorKind, SubscriptionClosed,
+    WriteError,
 };
 pub use execution::{
     ColocatedDatabasePlacement, ColocatedDbWorkloadGenerator, ColocatedDbWorkloadSpec,
@@ -98,8 +100,8 @@ pub use execution::{
     ExecutionResourceUsage, ExecutionUsageLease, ExecutionUsageReleaseError,
     InMemoryDomainBudgetOracle, InMemoryResourceManager, PlacementAssignment, PlacementPolicy,
     PlacementRequest, PlacementTarget, PreferRequestedDomainPolicy, ResourceAdmissionDecision,
-    ResourceManager, ResourceManagerSnapshot, ShardReadyPlacementLayout, WorkPlacementRequest,
-    WorkRuntimeTag,
+    ResourceManager, ResourceManagerSnapshot, ResourceManagerSubscription,
+    ShardReadyPlacementLayout, WorkPlacementRequest, WorkRuntimeTag,
 };
 #[doc(hidden)]
 pub use failpoints::{
@@ -148,14 +150,18 @@ pub use pressure::{
     carry_write_delay_across_maintenance, derive_pressure_budget, multi_signal_write_admission,
 };
 pub use remote::{
-    CacheSpan, ObjectKeyLayout, RemoteCache, RemoteOperation, RemoteRecoveryHint,
-    RemoteStorageError, StorageSource, UnifiedStorage, UnifiedStorageError,
+    CacheSpan, ObjectKeyLayout, RemoteCache, RemoteCacheEntrySnapshot, RemoteCacheFetchKind,
+    RemoteCacheInFlightSnapshot, RemoteCacheProgressSnapshot, RemoteCacheProgressSubscription,
+    RemoteOperation, RemoteRecoveryHint, RemoteStorageError, StorageSource, UnifiedStorage,
+    UnifiedStorageError,
 };
 pub use scheduler::{
-    DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT,
-    DomainPriorityOverride, NoopScheduler, PendingWork, PendingWorkBudget,
-    PendingWorkBudgetBlockReason, PendingWorkType, RoundRobinScheduler, ScheduleAction,
-    ScheduleDecision, Scheduler, SchedulerObservabilitySnapshot, TableStats, ThrottleDecision,
+    AdmissionObservation, AdmissionObservationReceiver, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
+    DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, DomainPriorityOverride, NoopScheduler, PendingWork,
+    PendingWorkBudget, PendingWorkBudgetBlockReason, PendingWorkType, RecordedAdmissionDiagnostics,
+    RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
+    SchedulerObservabilitySnapshot, SchedulerObservabilitySubscription, TableStats,
+    ThrottleDecision,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{
@@ -164,7 +170,7 @@ pub use telemetry::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use test_support::{
-    bytes as test_bytes, row_table_config, test_dependencies, test_dependencies_with_clock,
-    tiered_test_config, tiered_test_config_with_durability,
+    ClockProgressProbe, bytes as test_bytes, row_table_config, test_dependencies,
+    test_dependencies_with_clock, tiered_test_config, tiered_test_config_with_durability,
 };
 pub use transaction::{Transaction, TransactionCommitError, TransactionCommitOptions};

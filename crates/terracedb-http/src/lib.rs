@@ -156,6 +156,7 @@ pub struct SimulatedHttpServer {
     host: Arc<str>,
     port: u16,
     trace: SimulatedHttpTrace,
+    ready: watch::Sender<bool>,
     run: Arc<dyn Fn() -> ServerFuture + Send + Sync>,
 }
 
@@ -222,6 +223,8 @@ impl SimulatedHttpServer {
         Error: StdError + Send + Sync + 'static,
     {
         let handler = Arc::new(handler);
+        let (ready, _) = watch::channel(false);
+        let ready_for_run = ready.clone();
         let boxed_handler: BoxedHandler = Arc::new(move |request| {
             let handler = handler.clone();
             Box::pin(async move {
@@ -244,8 +247,9 @@ impl SimulatedHttpServer {
                 let trace = trace.clone();
                 let boxed_handler = boxed_handler.clone();
                 let shutdown = shutdown.clone();
+                let ready = ready_for_run.clone();
                 Box::pin(async move {
-                    run_http_server(host, port, trace, shutdown, boxed_handler).await
+                    run_http_server(host, port, trace, shutdown, ready, boxed_handler).await
                 }) as ServerFuture
             }
         });
@@ -254,6 +258,7 @@ impl SimulatedHttpServer {
             host,
             port,
             trace,
+            ready,
             run,
         }
     }
@@ -268,6 +273,10 @@ impl SimulatedHttpServer {
 
     pub fn trace(&self) -> SimulatedHttpTrace {
         self.trace.clone()
+    }
+
+    pub fn ready(&self) -> watch::Receiver<bool> {
+        self.ready.subscribe()
     }
 
     pub async fn run(&self) -> io::Result<()> {
@@ -502,6 +511,7 @@ async fn run_http_server(
     port: u16,
     trace: SimulatedHttpTrace,
     mut shutdown: Option<watch::Receiver<bool>>,
+    ready: watch::Sender<bool>,
     handler: BoxedHandler,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -509,6 +519,7 @@ async fn run_http_server(
         host: host.to_string(),
         port,
     });
+    let _ = ready.send(true);
     let mut connections = JoinSet::new();
 
     loop {

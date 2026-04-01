@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -22,6 +21,7 @@ use super::{
 use crate::simulation::{
     CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
 };
+use crate::test_support::ClockProgressProbe;
 use crate::{
     ChangeFeedError, ChangeKind, Clock, CommitError, CommitId, CommitOptions, CompactionStrategy,
     DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
@@ -604,6 +604,121 @@ impl Scheduler for DomainMutableBudgetRateLimitScheduler {
     }
 }
 
+#[derive(Debug)]
+struct SizeSensitiveAdmissionScheduler {
+    rate_limit_bytes_threshold: u64,
+    max_write_bytes_per_second: u64,
+}
+
+impl Scheduler for SizeSensitiveAdmissionScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &crate::Table,
+        _stats: &TableStats,
+        signals: &crate::AdmissionSignals,
+        _tag: &crate::WorkRuntimeTag,
+        _domain_budget: Option<&crate::ExecutionDomainBudget>,
+    ) -> Option<crate::AdmissionDiagnostics> {
+        if signals.batch_write_bytes < self.rate_limit_bytes_threshold {
+            return Some(crate::AdmissionDiagnostics::default());
+        }
+
+        Some(crate::AdmissionDiagnostics {
+            level: crate::AdmissionPressureLevel::RateLimit,
+            triggered_by: vec![crate::AdmissionPressureSignal::MutableBudget],
+            max_write_bytes_per_second: Some(self.max_write_bytes_per_second),
+            metadata: BTreeMap::from([(
+                "scheduler".to_string(),
+                json!("size-sensitive-rate-limit"),
+            )]),
+            ..crate::AdmissionDiagnostics::default()
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct PerTableAdmissionScheduler {
+    diagnostics_by_table: BTreeMap<String, crate::AdmissionDiagnostics>,
+}
+
+impl Scheduler for PerTableAdmissionScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        table: &crate::Table,
+        _stats: &TableStats,
+        _signals: &crate::AdmissionSignals,
+        _tag: &crate::WorkRuntimeTag,
+        _domain_budget: Option<&crate::ExecutionDomainBudget>,
+    ) -> Option<crate::AdmissionDiagnostics> {
+        Some(
+            self.diagnostics_by_table
+                .get(table.name())
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct AlwaysStallAdmissionScheduler;
+
+impl Scheduler for AlwaysStallAdmissionScheduler {
+    fn on_work_available(&self, work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        work.iter()
+            .map(|work| ScheduleDecision {
+                work_id: work.id.clone(),
+                action: ScheduleAction::Defer,
+            })
+            .collect()
+    }
+
+    fn should_throttle(&self, _table: &crate::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_diagnostics(
+        &self,
+        _table: &crate::Table,
+        _stats: &TableStats,
+        _signals: &crate::AdmissionSignals,
+        _tag: &crate::WorkRuntimeTag,
+        _domain_budget: Option<&crate::ExecutionDomainBudget>,
+    ) -> Option<crate::AdmissionDiagnostics> {
+        Some(crate::AdmissionDiagnostics {
+            level: crate::AdmissionPressureLevel::Stall,
+            triggered_by: vec![crate::AdmissionPressureSignal::L0Sstables],
+            metadata: BTreeMap::from([("scheduler".to_string(), json!("always-stall"))]),
+            ..crate::AdmissionDiagnostics::default()
+        })
+    }
+}
+
 #[derive(Default)]
 struct TinyCompactionBudgetScheduler;
 
@@ -643,27 +758,6 @@ impl Scheduler for TinyCompactionBudgetScheduler {
             | PendingWorkType::Prefetch => PendingWorkBudget::default(),
         }
     }
-}
-
-async fn advance_clock_until_task_finishes<T>(
-    clock: &StubClock,
-    handle: &tokio::task::JoinHandle<T>,
-    step: Duration,
-    max_steps: usize,
-) -> u64 {
-    let start = clock.now().get();
-    for _ in 0..max_steps {
-        if handle.is_finished() {
-            break;
-        }
-        clock.advance(step);
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        handle.is_finished(),
-        "task should finish after advancing the simulated clock"
-    );
-    clock.now().get().saturating_sub(start)
 }
 
 #[derive(Debug)]
@@ -1904,7 +1998,6 @@ async fn pending_work_reports_flush_and_compaction_backlog() {
         .create_table(row_table_config("events"))
         .await
         .expect("create table");
-
     table
         .write(b"user:1".to_vec(), Value::bytes("v1"))
         .await
@@ -2217,6 +2310,8 @@ async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
     let config = row_table_config("events");
     let expected_metadata = config.metadata.clone();
     let table = db.create_table(config).await.expect("create table");
+    let domain = db.execution_profile().foreground.domain.clone();
+    let mut updates = db.subscribe_scheduler_observability();
 
     let write_table = table.clone();
     let write = tokio::spawn(async move {
@@ -2226,12 +2321,35 @@ async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
             .expect("rate-limited write")
     });
 
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    let throttled = updates
+        .wait_for(|snapshot| {
+            snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .is_some_and(|current| {
+                    current.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+                })
+                && snapshot
+                    .throttled_writes_by_domain
+                    .get(&domain)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+        })
+        .await
+        .expect("scheduler observability update");
     assert!(
         !write.is_finished(),
         "write should still be waiting on the clock"
+    );
+    assert_eq!(
+        throttled
+            .current_admission_diagnostics_by_domain
+            .get(&domain)
+            .expect("throttled current admission")
+            .diagnostics
+            .level,
+        crate::AdmissionPressureLevel::RateLimit
     );
 
     let seen = scheduler.seen();
@@ -2240,17 +2358,10 @@ async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
             .any(|(table_name, metadata)| table_name == "events" && metadata == &expected_metadata)
     );
 
-    for _ in 0..180 {
-        if write.is_finished() {
-            break;
-        }
-        clock.advance(Duration::from_secs(1));
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        write.is_finished(),
-        "write should finish once the simulated clock advances far enough"
-    );
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_secs(1), 180)
+        .wait_for_task(&write)
+        .await;
+    assert!(elapsed > 0);
     assert_eq!(
         write.await.expect("join write task"),
         SequenceNumber::new(1)
@@ -2298,6 +2409,7 @@ async fn forced_flush_guardrails_still_honor_domain_rate_limit_delay() {
         .create_table(row_table_config("events"))
         .await
         .expect("create table");
+    let mut updates = db.subscribe_scheduler_observability();
 
     let write_table = table.clone();
     let write = tokio::spawn(async move {
@@ -2307,25 +2419,47 @@ async fn forced_flush_guardrails_still_honor_domain_rate_limit_delay() {
             .expect("write should complete after the simulated delay")
     });
 
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    let throttled_snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&profile.foreground.domain)
+                .is_some_and(|current| {
+                    current.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+                })
+                && snapshot
+                    .throttled_writes_by_domain
+                    .get(&profile.foreground.domain)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+        })
+        .await
+        .expect("scheduler observability update");
     assert!(
         !write.is_finished(),
         "oversized write should still be waiting on the simulated clock"
     );
+    assert!(
+        throttled_snapshot.throttled_writes_by_domain[&profile.foreground.domain] > 0,
+        "rate-limited write should publish throttling before the delay elapses"
+    );
 
     clock.advance(Duration::from_millis(350));
-    tokio::task::yield_now().await;
+    let forced_snapshot = updates
+        .wait_for(|snapshot| snapshot.forced_flushes >= 1)
+        .await
+        .expect("forced flush update");
     assert!(
         !write.is_finished(),
         "hard flush guardrails should not bypass explicit domain throttling"
     );
+    assert!(forced_snapshot.forced_flushes >= 1);
 
-    let elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &write, Duration::from_millis(250), 32)
-            .await
-            + 350;
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 32)
+        .wait_for_task(&write)
+        .await
+        + 350;
     assert_eq!(
         write.await.expect("join write task"),
         SequenceNumber::new(1)
@@ -2334,9 +2468,10 @@ async fn forced_flush_guardrails_still_honor_domain_rate_limit_delay() {
         elapsed >= 5_000,
         "write should preserve the modeled delay even after a force-triggered flush: elapsed={elapsed}ms"
     );
-    assert!(db.scheduler_observability_snapshot().forced_flushes >= 1);
+    let final_snapshot = updates.current();
+    assert!(final_snapshot.forced_flushes >= 1);
     assert!(
-        db.scheduler_observability_snapshot()
+        final_snapshot
             .throttled_writes_by_domain
             .get(&profile.foreground.domain)
             .copied()
@@ -2384,6 +2519,7 @@ async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlo
         .create_table(row_table_config("events"))
         .await
         .expect("create table");
+    let mut updates = db.subscribe_scheduler_observability();
 
     table
         .write(b"user:1".to_vec(), Value::Bytes(vec![b'x'; 220]))
@@ -2413,36 +2549,58 @@ async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlo
             .expect("multi-signal throttled write")
     });
 
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    let snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot
+                .last_non_open_admission_by_domain
+                .get(&profile.foreground.domain)
+                .is_some_and(|recorded| {
+                    recorded.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+                        && recorded
+                            .diagnostics
+                            .triggered_by
+                            .contains(&crate::AdmissionPressureSignal::MutableBudget)
+                })
+                && snapshot
+                    .throttled_writes_by_domain
+                    .get(&profile.foreground.domain)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+        })
+        .await
+        .expect("scheduler observability update");
     assert!(
         !write.is_finished(),
         "write should be waiting on the simulated clock before L0 pressure accumulates",
     );
 
-    let elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &write, Duration::from_millis(250), 12)
-            .await;
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 12)
+        .wait_for_task(&write)
+        .await;
     assert!(elapsed > 0);
     assert_eq!(
         write.await.expect("join write task"),
         SequenceNumber::new(2)
     );
 
-    let snapshot = db.scheduler_observability_snapshot();
     let recorded = snapshot
-        .last_admission_diagnostics_by_domain
+        .last_non_open_admission_by_domain
         .get(&profile.foreground.domain)
         .expect("foreground diagnostics should be recorded");
-    assert_eq!(recorded.level, crate::AdmissionPressureLevel::RateLimit);
+    assert_eq!(
+        recorded.diagnostics.level,
+        crate::AdmissionPressureLevel::RateLimit
+    );
     assert!(
         recorded
+            .diagnostics
             .triggered_by
             .contains(&crate::AdmissionPressureSignal::MutableBudget)
     );
     assert!(
         !recorded
+            .diagnostics
             .triggered_by
             .contains(&crate::AdmissionPressureSignal::L0Sstables)
     );
@@ -2453,6 +2611,358 @@ async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlo
             .copied()
             .unwrap_or_default()
             >= 1
+    );
+}
+
+#[tokio::test]
+async fn scheduler_observability_current_admission_clears_after_recovery_write() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(10)));
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/scheduler-current-admission-clears",
+            Arc::new(SizeSensitiveAdmissionScheduler {
+                rate_limit_bytes_threshold: 64,
+                max_write_bytes_per_second: 128,
+            }),
+        ),
+        dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    let domain = db.execution_profile().foreground.domain.clone();
+    let throttled_start = clock.now();
+
+    let throttled_table = table.clone();
+    let throttled = tokio::spawn(async move {
+        throttled_table
+            .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
+            .await
+            .expect("throttled write")
+    });
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 16)
+        .wait_for_task(&throttled)
+        .await;
+    assert!(elapsed > 0);
+    assert_eq!(
+        throttled.await.expect("join throttled write"),
+        SequenceNumber::new(1)
+    );
+
+    let throttled_snapshot = db.scheduler_observability_snapshot();
+    let throttled_current = throttled_snapshot
+        .current_admission_diagnostics_by_domain
+        .get(&domain)
+        .expect("current throttled admission");
+    let throttled_last_non_open = throttled_snapshot
+        .last_non_open_admission_by_domain
+        .get(&domain)
+        .expect("last non-open throttled admission");
+    assert_eq!(
+        throttled_current.diagnostics.level,
+        crate::AdmissionPressureLevel::RateLimit
+    );
+    assert!(
+        throttled_current.recorded_at >= throttled_start,
+        "throttled write should record at or after the write start time",
+    );
+    assert_eq!(throttled_last_non_open, throttled_current);
+
+    clock.advance(Duration::from_millis(1));
+    table
+        .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
+        .await
+        .expect("open write should clear current admission");
+
+    let recovered_snapshot = db.scheduler_observability_snapshot();
+    let current = recovered_snapshot
+        .current_admission_diagnostics_by_domain
+        .get(&domain)
+        .expect("current admission after recovery");
+    let last_non_open = recovered_snapshot
+        .last_non_open_admission_by_domain
+        .get(&domain)
+        .expect("retained non-open admission after recovery");
+    assert_eq!(
+        current.diagnostics.level,
+        crate::AdmissionPressureLevel::Open
+    );
+    assert!(
+        current.recorded_at > last_non_open.recorded_at,
+        "recovery write should refresh current admission timestamp",
+    );
+    assert_eq!(
+        last_non_open.diagnostics.level,
+        crate::AdmissionPressureLevel::RateLimit
+    );
+    assert_eq!(last_non_open.recorded_at, throttled_current.recorded_at);
+}
+
+#[tokio::test]
+async fn scheduler_observability_subscription_matches_synchronous_snapshot_state() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/scheduler-observability-subscription-parity",
+            Arc::new(SizeSensitiveAdmissionScheduler {
+                rate_limit_bytes_threshold: 64,
+                max_write_bytes_per_second: 128,
+            }),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    let domain = db.execution_profile().foreground.domain.clone();
+    let mut updates = db.subscribe_scheduler_observability();
+
+    table
+        .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
+        .await
+        .expect("throttled write");
+    let throttled_snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .is_some_and(|current| {
+                    current.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+                })
+        })
+        .await
+        .expect("scheduler observability update");
+    assert_eq!(throttled_snapshot, db.scheduler_observability_snapshot());
+
+    table
+        .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
+        .await
+        .expect("recovered write");
+    let recovered_snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .is_some_and(|current| {
+                    current.diagnostics.level == crate::AdmissionPressureLevel::Open
+                })
+                && snapshot
+                    .last_non_open_admission_by_domain
+                    .get(&domain)
+                    .is_some_and(|last_non_open| {
+                        last_non_open.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+                    })
+        })
+        .await
+        .expect("scheduler observability update");
+    assert_eq!(recovered_snapshot, db.scheduler_observability_snapshot());
+}
+
+#[tokio::test]
+async fn admission_observation_stream_reports_recovery_transition_in_order() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(30)));
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/admission-observation-stream-recovery",
+            Arc::new(SizeSensitiveAdmissionScheduler {
+                rate_limit_bytes_threshold: 64,
+                max_write_bytes_per_second: 128,
+            }),
+        ),
+        dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    let domain = db.execution_profile().foreground.domain.clone();
+    let mut observations = db.subscribe_admission_observations();
+
+    let throttled_table = table.clone();
+    let throttled = tokio::spawn(async move {
+        throttled_table
+            .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
+            .await
+            .expect("throttled write")
+    });
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 16)
+        .wait_for_task(&throttled)
+        .await;
+    assert!(elapsed > 0);
+    assert_eq!(
+        throttled.await.expect("join throttled write"),
+        SequenceNumber::new(1)
+    );
+
+    let throttled = observations
+        .wait_for(|observation| {
+            observation.domain == domain
+                && observation.current.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+        })
+        .await
+        .expect("admission observation");
+    assert_eq!(throttled.last_non_open, Some(throttled.current.clone()));
+
+    clock.advance(Duration::from_millis(1));
+    table
+        .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
+        .await
+        .expect("recovered write");
+    let recovered = observations
+        .wait_for(|observation| {
+            observation.domain == domain
+                && observation.current.diagnostics.level == crate::AdmissionPressureLevel::Open
+        })
+        .await
+        .expect("admission observation");
+    assert_eq!(recovered.last_non_open, Some(throttled.current.clone()));
+    assert!(recovered.current.recorded_at > throttled.current.recorded_at);
+}
+
+#[tokio::test]
+async fn scheduler_observability_keeps_strongest_diagnostics_for_multi_table_write() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let scheduler = Arc::new(PerTableAdmissionScheduler {
+        diagnostics_by_table: BTreeMap::from([
+            (
+                "alpha".to_string(),
+                crate::AdmissionDiagnostics {
+                    level: crate::AdmissionPressureLevel::Stall,
+                    triggered_by: vec![crate::AdmissionPressureSignal::L0Sstables],
+                    metadata: BTreeMap::from([("source_table".to_string(), json!("alpha"))]),
+                    ..crate::AdmissionDiagnostics::default()
+                },
+            ),
+            (
+                "beta".to_string(),
+                crate::AdmissionDiagnostics {
+                    level: crate::AdmissionPressureLevel::RateLimit,
+                    triggered_by: vec![crate::AdmissionPressureSignal::MutableBudget],
+                    max_write_bytes_per_second: Some(128),
+                    metadata: BTreeMap::from([("source_table".to_string(), json!("beta"))]),
+                    ..crate::AdmissionDiagnostics::default()
+                },
+            ),
+        ]),
+    });
+    let db = Db::open(
+        tiered_config_with_scheduler("/scheduler-strongest-multi-table-admission", scheduler),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let alpha = db
+        .create_table(row_table_config("alpha"))
+        .await
+        .expect("create alpha");
+    let beta = db
+        .create_table(row_table_config("beta"))
+        .await
+        .expect("create beta");
+    let domain = db.execution_profile().foreground.domain.clone();
+
+    let mut tx = Transaction::begin(&db).await;
+    tx.write(&alpha, b"alpha".to_vec(), Value::bytes("a"));
+    tx.write(&beta, b"beta".to_vec(), Value::bytes("b"));
+    assert_eq!(
+        tx.commit_no_flush().await.expect("commit multi-table tx"),
+        SequenceNumber::new(1)
+    );
+
+    let snapshot = db.scheduler_observability_snapshot();
+    let current = snapshot
+        .current_admission_diagnostics_by_domain
+        .get(&domain)
+        .expect("current admission for multi-table write");
+    let last_non_open = snapshot
+        .last_non_open_admission_by_domain
+        .get(&domain)
+        .expect("last non-open admission for multi-table write");
+    assert_eq!(
+        current.diagnostics.level,
+        crate::AdmissionPressureLevel::Stall
+    );
+    assert_eq!(
+        last_non_open.diagnostics.level,
+        crate::AdmissionPressureLevel::Stall
+    );
+    assert_eq!(
+        current.diagnostics.metadata.get("source_table"),
+        Some(&json!("alpha"))
+    );
+    assert_eq!(
+        snapshot
+            .throttled_writes_by_domain
+            .get(&domain)
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn scheduler_observability_counts_stalled_writes_once_per_write() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config_with_scheduler(
+            "/scheduler-stalled-write-counts-once",
+            Arc::new(AlwaysStallAdmissionScheduler),
+        ),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let table = db
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create table");
+    let domain = db.execution_profile().foreground.domain.clone();
+
+    let before = db
+        .scheduler_observability_snapshot()
+        .throttled_writes_by_domain
+        .get(&domain)
+        .copied()
+        .unwrap_or_default();
+
+    assert_eq!(
+        table
+            .write(b"stalled".to_vec(), Value::bytes("v"))
+            .await
+            .expect("stalled write"),
+        SequenceNumber::new(1)
+    );
+
+    let snapshot = db.scheduler_observability_snapshot();
+    let after = snapshot
+        .throttled_writes_by_domain
+        .get(&domain)
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(after - before, 1);
+    assert_eq!(
+        snapshot
+            .current_admission_diagnostics_by_domain
+            .get(&domain)
+            .expect("current stalled admission")
+            .diagnostics
+            .level,
+        crate::AdmissionPressureLevel::Stall
     );
 }
 
@@ -2612,6 +3122,8 @@ async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
         .create_table(row_table_config("slow"))
         .await
         .expect("create slow");
+    let domain = db.execution_profile().foreground.domain.clone();
+    let mut updates = db.subscribe_scheduler_observability();
 
     let fast_only_db = db.clone();
     let fast_only_table = fast.clone();
@@ -2624,20 +3136,37 @@ async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
         );
         tx.commit_no_flush().await.expect("commit fast-only tx")
     });
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    let fast_only_snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&domain)
+                .is_some_and(|current| {
+                    current.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+                })
+                && snapshot
+                    .throttled_writes_by_domain
+                    .get(&domain)
+                    .copied()
+                    .unwrap_or_default()
+                    >= 1
+        })
+        .await
+        .expect("rate-limited fast-only commit");
     assert!(
         !fast_only.is_finished(),
         "fast-only commit should wait for the simulated clock"
     );
-    let fast_elapsed = advance_clock_until_task_finishes(
-        clock.as_ref(),
-        &fast_only,
-        Duration::from_millis(250),
-        40,
-    )
-    .await;
+    assert_eq!(
+        fast_only_snapshot
+            .throttled_writes_by_domain
+            .get(&domain)
+            .copied(),
+        Some(1)
+    );
+    let fast_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 40)
+        .wait_for_task(&fast_only)
+        .await;
     assert_eq!(
         fast_only.await.expect("join fast-only commit"),
         SequenceNumber::new(1)
@@ -2660,16 +3189,33 @@ async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
         );
         tx.commit_no_flush().await.expect("commit mixed tx")
     });
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    let mixed_snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot
+                .throttled_writes_by_domain
+                .get(&domain)
+                .copied()
+                .unwrap_or_default()
+                >= 2
+        })
+        .await
+        .expect("rate-limited mixed commit");
     assert!(
         !mixed.is_finished(),
         "mixed commit should wait for the simulated clock"
     );
-    let mixed_elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &mixed, Duration::from_millis(250), 80)
-            .await;
+    assert!(
+        mixed_snapshot
+            .current_admission_diagnostics_by_domain
+            .get(&domain)
+            .is_some_and(|current| {
+                current.diagnostics.level == crate::AdmissionPressureLevel::RateLimit
+            }),
+        "mixed commit should publish a live rate-limit diagnosis"
+    );
+    let mixed_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 80)
+        .wait_for_task(&mixed)
+        .await;
     assert_eq!(
         mixed.await.expect("join mixed commit"),
         SequenceNumber::new(2)
@@ -2909,9 +3455,9 @@ async fn domain_mutable_memory_budget_forces_flush_before_storage_ceiling() {
             .await
             .expect("write second value")
     });
-    let _elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &second, Duration::from_millis(250), 24)
-            .await;
+    let _elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 24)
+        .wait_for_task(&second)
+        .await;
     assert_eq!(
         second.await.expect("join second write"),
         SequenceNumber::new(2)
@@ -6829,7 +7375,7 @@ async fn columnar_cache_usage_snapshot_respects_configured_bounds() {
             .is_some()
     );
 
-    let usage = reopened.columnar_cache_usage_snapshot();
+    let usage = reopened.subscribe_columnar_cache_usage().current();
     assert_eq!(usage.raw_byte_budget_bytes, 256);
     assert!(usage.raw_byte_entries > 0);
     assert!(usage.raw_byte_bytes <= usage.raw_byte_budget_bytes);
@@ -6877,7 +7423,7 @@ async fn columnar_cache_usage_surfaces_domain_budget_partitions() {
         .with_execution_profile(profile.clone());
     let db = Db::open(config, dependencies).await.expect("open db");
 
-    let usage = db.columnar_cache_usage_snapshot();
+    let usage = db.subscribe_columnar_cache_usage().current();
     assert_eq!(usage.raw_byte_budget_bytes, 352);
     assert_eq!(
         usage.by_domain[&profile.foreground.domain].raw_byte_budget_bytes,
@@ -6971,7 +7517,7 @@ async fn columnar_background_compaction_uses_background_cache_partition() {
     db.clear_columnar_decoded_cache();
     assert!(db.run_next_compaction().await.expect("run compaction"));
 
-    let usage = db.columnar_cache_usage_snapshot();
+    let usage = db.subscribe_columnar_cache_usage().current();
     let foreground = usage.by_domain[&profile.foreground.domain];
     let background = usage.by_domain[&profile.background.domain];
     assert_eq!(foreground.decoded_metadata_entries, 0);
@@ -6980,6 +7526,73 @@ async fn columnar_background_compaction_uses_background_cache_partition() {
         background.decoded_metadata_entries <= background.decoded_metadata_entry_limit,
         "background maintenance reads should stay inside their own decoded-cache partition"
     );
+}
+
+#[tokio::test]
+async fn columnar_cache_usage_subscription_matches_snapshot_after_cache_population() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let inner_store = Arc::new(StubObjectStore::default());
+    let recording_store = Arc::new(RecordingObjectStore::new(inner_store));
+    let dependencies = DbDependencies::new(
+        file_system,
+        recording_store,
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(17)),
+    );
+    let mut config = s3_primary_config("columnar-cache-usage-subscription");
+    config.hybrid_read.raw_segment_cache_bytes = 256;
+    config.hybrid_read.decoded_metadata_cache_entries = 2;
+    config.hybrid_read.decoded_column_cache_entries = 2;
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open db");
+    let table_config = columnar_table_config("metrics");
+    let schema = table_config.schema.clone().expect("columnar schema");
+    let table = db
+        .create_table(table_config)
+        .await
+        .expect("create columnar table");
+
+    table
+        .write(
+            b"user:1".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("user_id", FieldValue::String("alice".to_string())),
+                    ("count", FieldValue::Int64(3)),
+                ],
+            )
+            .expect("encode columnar row"),
+        )
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush row");
+
+    let reopened = Db::open(config, dependencies).await.expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+
+    let mut updates = reopened.subscribe_columnar_cache_usage();
+    let initial = updates.current();
+    assert_eq!(initial, reopened.columnar_cache_usage_snapshot());
+
+    assert!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read row")
+            .is_some()
+    );
+
+    let published = updates
+        .wait_for(|snapshot| snapshot != &initial)
+        .await
+        .expect("columnar cache usage update");
+    assert_eq!(published, reopened.columnar_cache_usage_snapshot());
+    assert!(published.decoded_metadata_entries > 0 || published.raw_byte_entries > 0);
 }
 
 #[tokio::test]
@@ -10596,6 +11209,7 @@ async fn group_commit_batches_waiters_under_one_sync() {
         .create_table(row_table_config("events"))
         .await
         .expect("create table");
+    let mut progress = db.subscribe_progress();
 
     let before_syncs = file_system.operation_count(FileSystemOperation::Sync);
     let mut sync_blocker = db.block_next_commit_phase(CommitPhase::BeforeDurabilitySync);
@@ -10619,9 +11233,11 @@ async fn group_commit_batches_waiters_under_one_sync() {
             .expect("second write")
     });
 
-    while db.inner.next_sequence.load(Ordering::SeqCst) < 2 {
-        tokio::task::yield_now().await;
-    }
+    let reserved = progress
+        .wait_for(|snapshot| snapshot.reserved_sequence >= SequenceNumber::new(2))
+        .await
+        .expect("db progress update");
+    assert_eq!(reserved.reserved_sequence, SequenceNumber::new(2));
 
     sync_blocker.release();
 
@@ -10636,6 +11252,10 @@ async fn group_commit_batches_waiters_under_one_sync() {
     assert_eq!(
         file_system.operation_count(FileSystemOperation::Sync) - before_syncs,
         1
+    );
+    assert_eq!(
+        db.progress_snapshot().reserved_sequence,
+        SequenceNumber::new(2)
     );
 }
 
@@ -10909,6 +11529,7 @@ async fn group_commit_sync_failure_discards_later_provisional_batches_in_same_ta
         .create_table(row_table_config("events"))
         .await
         .expect("create table");
+    let mut progress = db.subscribe_progress();
 
     file_system.inject_failure(FileSystemFailure::timeout(
         FileSystemOperation::Sync,
@@ -10925,9 +11546,11 @@ async fn group_commit_sync_failure_discards_later_provisional_batches_in_same_ta
     let second =
         tokio::spawn(async move { second_events.write(b"user:2".to_vec(), bytes("v2")).await });
 
-    while db.inner.next_sequence.load(Ordering::SeqCst) < 2 {
-        tokio::task::yield_now().await;
-    }
+    let reserved = progress
+        .wait_for(|snapshot| snapshot.reserved_sequence >= SequenceNumber::new(2))
+        .await
+        .expect("db progress update");
+    assert_eq!(reserved.reserved_sequence, SequenceNumber::new(2));
 
     batch_one_blocker.release();
 
@@ -10946,6 +11569,10 @@ async fn group_commit_sync_failure_discards_later_provisional_batches_in_same_ta
 
     assert_eq!(db.current_sequence(), SequenceNumber::default());
     assert_eq!(db.current_durable_sequence(), SequenceNumber::default());
+    assert_eq!(
+        db.progress_snapshot().reserved_sequence,
+        SequenceNumber::default()
+    );
     assert_eq!(
         events.read(b"user:1".to_vec()).await.expect("read user:1"),
         None
@@ -11034,6 +11661,7 @@ async fn group_commit_sync_failure_cascades_across_multiple_sealed_batches() {
         .create_table(row_table_config("events"))
         .await
         .expect("create table");
+    let mut progress = db.subscribe_progress();
 
     file_system.inject_failure(FileSystemFailure::timeout(
         FileSystemOperation::Sync,
@@ -11056,9 +11684,11 @@ async fn group_commit_sync_failure_cascades_across_multiple_sealed_batches() {
     let third =
         tokio::spawn(async move { third_events.write(b"user:3".to_vec(), bytes("v3")).await });
 
-    while db.inner.next_sequence.load(Ordering::SeqCst) < 3 {
-        tokio::task::yield_now().await;
-    }
+    let reserved = progress
+        .wait_for(|snapshot| snapshot.reserved_sequence >= SequenceNumber::new(3))
+        .await
+        .expect("db progress update");
+    assert_eq!(reserved.reserved_sequence, SequenceNumber::new(3));
 
     batch_one_blocker.release();
     assert_group_commit_sync_failure(
@@ -11084,6 +11714,10 @@ async fn group_commit_sync_failure_cascades_across_multiple_sealed_batches() {
 
     assert_eq!(db.current_sequence(), SequenceNumber::default());
     assert_eq!(db.current_durable_sequence(), SequenceNumber::default());
+    assert_eq!(
+        db.progress_snapshot().reserved_sequence,
+        SequenceNumber::default()
+    );
     assert_eq!(
         events.read(b"user:1".to_vec()).await.expect("read user:1"),
         None
@@ -11175,6 +11809,7 @@ fn simulated_group_commit_sync_failure_discards_follow_on_batches_across_restart
         let config = tiered_config(root);
         let db = context.open_db(config.clone()).await?;
         let events = db.create_table(row_table_config("events")).await?;
+        let mut progress = db.subscribe_progress();
 
         context
             .file_system()
@@ -11193,9 +11828,11 @@ fn simulated_group_commit_sync_failure_discards_follow_on_batches_across_restart
         let second =
             tokio::spawn(async move { second_events.write(b"user:2".to_vec(), bytes("v2")).await });
 
-        while db.inner.next_sequence.load(Ordering::SeqCst) < 2 {
-            tokio::task::yield_now().await;
-        }
+        let reserved = progress
+            .wait_for(|snapshot| snapshot.reserved_sequence >= SequenceNumber::new(2))
+            .await
+            .expect("db progress update");
+        assert_eq!(reserved.reserved_sequence, SequenceNumber::new(2));
 
         batch_one_blocker.release();
 
@@ -11213,6 +11850,10 @@ fn simulated_group_commit_sync_failure_discards_follow_on_batches_across_restart
         );
         assert_eq!(db.current_sequence(), SequenceNumber::default());
         assert_eq!(db.current_durable_sequence(), SequenceNumber::default());
+        assert_eq!(
+            db.progress_snapshot().reserved_sequence,
+            SequenceNumber::default()
+        );
 
         let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
         let reopened_events = reopened.table("events");
@@ -12040,7 +12681,7 @@ async fn visible_and_durable_subscriptions_diverge_until_flush_in_deferred_mode(
     let mut durable = db.subscribe_durable(&table);
     let mut durable_set = db.subscribe_durable_set([&table]);
     assert_eq!(db.visible_subscriber_count(&table), 1);
-    assert_eq!(db.durable_subscriber_count(&table), 2);
+    assert_eq!(db.durable_subscriber_count(&table), 1);
 
     let committed = table
         .write(b"user:1".to_vec(), Value::bytes("v1"))
@@ -12094,7 +12735,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
         .expect("create orders table");
 
     let mut merged = db.subscribe_visible_set([&users, &orders]);
-    assert!(merged.drain_pending().is_empty());
+    assert!(merged.pending_updates().is_empty());
 
     let users_first = users
         .write(b"user:1".to_vec(), Value::bytes("v1"))
@@ -12105,7 +12746,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
         .await
         .expect("write orders row");
     assert_eq!(
-        merged.drain_pending(),
+        merged.pending_updates(),
         vec![
             WatermarkUpdate {
                 table: "orders".to_string(),
@@ -12117,7 +12758,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
             },
         ]
     );
-    assert!(merged.drain_pending().is_empty());
+    assert!(merged.pending_updates().is_empty());
 
     let orders_second = orders
         .write(b"order:2".to_vec(), Value::bytes("v2"))
@@ -12149,7 +12790,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
             },
         ]
     );
-    assert!(merged.drain_pending().is_empty());
+    assert!(merged.pending_updates().is_empty());
 }
 
 #[tokio::test]

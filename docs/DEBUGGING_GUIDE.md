@@ -64,6 +64,175 @@ In practice this usually produces a better fix, because the simulation test
 forces us to state what behavior is actually broken instead of only chasing a
 slow or noisy harness symptom.
 
+## Prefer Published Updates Over Sampling Shared State
+
+When a simulation needs to observe live runtime state, prefer the published
+subscription or event-stream APIs over point-in-time shared-state sampling.
+
+For scheduler/admission observability, the default pattern should now be:
+
+1. Subscribe first.
+2. Trigger the work you want to observe.
+3. Wait on the subscription or event stream until the predicate you care about
+   becomes true.
+4. Only fall back to a one-shot synchronous snapshot when you are inspecting
+   quiescent state after the interesting work is already complete.
+
+In practice that means:
+
+- use `Db::subscribe_scheduler_observability()` when the test wants an
+  eventually consistent view of the published observability snapshot;
+- use `Db::subscribe_admission_observations()` when the test cares about the
+  order of admission transitions such as `RateLimit -> Open` or "one event per
+  logical write"; and
+- use `Db::scheduler_observability_snapshot()` for post-condition assertions
+  once the system is idle, not as the primary in-flight observation mechanism.
+
+This keeps the simulation aligned with the product surface and avoids
+re-introducing hidden dependencies on mutex timing or reader-side state
+assembly.
+
+## Choose The Right Observation Surface
+
+When a simulation or async test needs to "see what the system is doing," choose
+the narrowest published surface that matches the question you are asking.
+
+### Use Latest-State Snapshots For "What Is True Right Now?"
+
+Use a published snapshot subscription when the test cares about the latest
+visible state, not the precise order of transitions:
+
+- `Db::subscribe_progress()`
+  Use this for database sequence frontiers.
+  `DbProgressSnapshot` now carries `current_sequence`, `durable_sequence`, and
+  `reserved_sequence`, so blocked group-commit tests can observe reserved
+  in-flight work without polling `db.inner.next_sequence`.
+- `Db::subscribe_scheduler_observability()`
+  Use this for domain-level throttling/forced-flush counters and current vs
+  last-non-open admission diagnostics.
+- `Db::subscribe_resource_manager()`
+  Use this for execution-domain usage, backlog, and budget assertions.
+- `Db::subscribe_columnar_cache_usage()`
+  Use this for cache partition occupancy and published cache-usage deltas.
+- `RemoteCache::subscribe_progress()`
+  Use this for warmed cache entries plus in-flight remote reads/prefetches.
+  The published snapshot now includes both stored entries and in-flight claims
+  with fetch kind and waiter count.
+
+The preferred test shape is:
+
+1. Subscribe before triggering the work.
+2. Trigger the work.
+3. `wait_for(...)` the published predicate.
+4. Assert on the returned snapshot.
+
+### Use Event Streams For Ordered Transitions
+
+If the test cares about "what happened first?" rather than "what is true now?",
+use an event stream instead of a latest-state snapshot.
+
+- `Db::subscribe_admission_observations()`
+  Use this for ordered write-admission transitions such as `RateLimit -> Open`,
+  "one observation per logical write," or "recovery cleared the current
+  diagnosis after the throttled write."
+- Watermark receivers (`subscribe`, `subscribe_durable`, and their `changed()`
+  APIs)
+  Use these when the semantic question is monotonic publication order for a
+  table rather than a whole-DB status summary.
+
+### Use Runtime Wait Surfaces For Workflow And Projection Progress
+
+When the runtime already owns the semantic concept you care about, prefer its
+wait surface over ad hoc table polling:
+
+- `WorkflowRuntime::wait_for_state(...)`
+  Use this when a workflow test cares about a particular instance state value.
+- `WorkflowRuntime::wait_for_source_progress(...)`
+  Use this when a workflow test cares about bootstrap or recovery progress
+  rather than the final state row.
+- `WorkflowRuntime::wait_for_telemetry(...)`
+  Use this when the assertion is phrased in terms of attach mode, lag, or other
+  published workflow telemetry.
+- `RecurringWorkflowRuntime::wait_for_state(...)`
+  Use this for recurring tick-count and next-fire assertions.
+- `ProjectionHandle::wait_for_watermark(...)` / `wait_for_sources(...)`
+  Use these for projection catch-up assertions.
+- `ProjectionHandle::wait_until_terminal()` and `WorkflowHandle::wait_until_terminal()`
+  Use these for fail-closed and failpoint cases instead of sleeping and then
+  calling `shutdown()`.
+
+If a library does not yet expose a native wait surface, wait on the backing DB
+publication channel that owns the truth:
+
+- use table watermark subscriptions for relay and projection outputs; and
+- use `TerracedbSimulationHarness::wait_for_change(...)` /
+  `wait_for_visible(...)` when a simulation already has a harness and the
+  product surface does not yet expose a narrower publisher.
+
+The rule is the same either way: react to a real publication edge, not to
+elapsed simulated time.
+
+### Use Bounded Progress Helpers For Liveness
+
+Some tests are not about state at all; they are about whether background work
+or delayed work eventually makes progress. In those cases, prefer a bounded
+progress helper over sleeps or incidental yields:
+
+- `ClockProgressProbe`
+  Use this when a test needs bounded virtual-time advancement to drive a task,
+  wait for a failpoint, or make a single explicit clock/progress step without
+  open-coding `yield_now()` loops.
+
+If a test has to call `tokio::task::yield_now()` in a loop to see whether
+something happened, treat that as a smell. Usually the right fix is to expose a
+published snapshot, an event stream, or a bounded progress helper instead.
+
+### Make Example Simulations Explicit About Readiness
+
+Example-app simulations should follow the same rules as library tests:
+
+1. Publish a ready signal once the server or runtime can actually answer work.
+2. Have the client host wait on that signal before issuing requests.
+3. Use app/runtime progress signals for projections, planners, or workflows.
+4. Reserve `sleep(...)` only for deliberate scenario time travel, such as
+   advancing a recurring schedule or modeling a slow response.
+
+### Keep Synchronous Snapshots For Quiescent Reads
+
+The synchronous snapshot methods are still useful, but mostly after the
+interesting work has already completed:
+
+- `Db::scheduler_observability_snapshot()`
+- `Db::progress_snapshot()`
+- `RemoteCache::progress_snapshot()`
+
+Use these for post-condition assertions or operator/debug surfaces when the
+system is idle. Avoid making them the primary observation mechanism for in-flight
+simulation behavior when a published subscription already exists.
+
+### Current Snapshot Classification
+
+The main snapshot/introspection helpers in Terracedb currently fall into these
+categories:
+
+- Runtime-safe published snapshots
+  `Db::progress_snapshot()`, `Db::resource_manager_snapshot()`,
+  `Db::columnar_cache_usage_snapshot()`, `Db::scheduler_observability_snapshot()`,
+  and `RemoteCache::progress_snapshot()`.
+  These are synchronous reads, but they clone already-published immutable state
+  rather than reconstructing live state under reader-side locking.
+- Ordered event streams
+  `Db::subscribe_admission_observations()` plus table watermark receivers.
+  Use these when ordering matters more than the latest state.
+- Bounded progress helpers
+  `ClockProgressProbe`.
+  This is for liveness and virtual-time advancement, not for state sampling.
+- Operator/debug-only reads
+  Anything that still reaches directly into quiescent state for one-off
+  inspection rather than participating in the published subscription surfaces.
+  Prefer not to introduce new async tests that depend on these when a published
+  surface already exists.
+
 ## Use Tracing As The First Debugger
 
 Turmoil already emits useful network/runtime events through `tracing`. Upstream

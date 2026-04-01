@@ -1,10 +1,13 @@
-use std::{collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration,
+};
 
 use crate::{
-    CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
+    Clock, CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
     StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat,
     TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, Value,
 };
+use tokio::task::JoinHandle;
 
 pub use crate::failpoints::{
     FailpointAction, FailpointHandle, FailpointHit, FailpointMode, FailpointOutcome,
@@ -66,6 +69,63 @@ pub fn test_dependencies_with_clock(
         clock,
         Arc::new(StubRng::seeded(7)),
     )
+}
+
+/// An explicit bounded progress probe for tests that need to advance a stub
+/// clock and let the executor make progress in between advances.
+#[derive(Clone, Copy, Debug)]
+pub struct ClockProgressProbe<'a> {
+    clock: &'a StubClock,
+    step: Duration,
+    max_steps: usize,
+}
+
+impl<'a> ClockProgressProbe<'a> {
+    pub fn new(clock: &'a StubClock, step: Duration, max_steps: usize) -> Self {
+        Self {
+            clock,
+            step,
+            max_steps,
+        }
+    }
+
+    pub async fn advance_once(&self) {
+        self.clock.advance(self.step);
+        tokio::task::yield_now().await;
+    }
+
+    pub async fn wait_for_failpoint_hit(
+        &self,
+        handle: &crate::FailpointHandle,
+    ) -> crate::FailpointHit {
+        let mut wait = Box::pin(handle.next_hit());
+        for _ in 0..self.max_steps {
+            tokio::select! {
+                hit = &mut wait => return hit,
+                _ = self.advance_once() => {}
+            }
+        }
+
+        panic!(
+            "failpoint was not hit within {} virtual-clock advances",
+            self.max_steps
+        );
+    }
+
+    pub async fn wait_for_task<T>(&self, handle: &JoinHandle<T>) -> u64 {
+        let start = self.clock.now().get();
+        for _ in 0..self.max_steps {
+            if handle.is_finished() {
+                return self.clock.now().get().saturating_sub(start);
+            }
+            self.advance_once().await;
+        }
+
+        panic!(
+            "task was not finished within {} virtual-clock advances",
+            self.max_steps
+        );
+    }
 }
 
 pub fn row_table_config(name: &str) -> TableConfig {
