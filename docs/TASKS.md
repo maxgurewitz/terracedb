@@ -1720,93 +1720,96 @@ Add a real remote-integration hardening layer that complements Terracedb's stubb
 
 ---
 
-### T33e. Shared cross-cutting fuzz/support crate for generated simulation and workspace invariants
+### T33e. Shared cross-cutting fuzz substrate crate for generated simulation and replay plumbing
 
 **Depends on:** T03a, T27, T31, T32, T32a, T32e, T33b, T33c
 
 **Description**
 
-Create a reusable workspace crate dedicated to broad-input correctness exploration across Terracedb libraries, not just the core DB. This crate should centralize scenario generators, invariant helpers, shadow oracles, shrink/repro plumbing, and per-library adapters so normal property tests, deterministic generated simulations, and dedicated fuzz harnesses all share one vocabulary. The intent is to make broad-input testing a first-class cross-cutting capability for the DB, projections, workflows, relays, VFS, retention, records, HTTP/sandbox-facing libraries, and any later workspace crate with meaningful state-machine or persistence semantics.
+Create the low-level reusable crate that broad-input testing will build on: seed campaigns, scenario replay helpers, artifact codecs, minimization/shrink plumbing, and generic invariant utilities that are useful across Terracedb libraries and third-party applications. This crate should stay deliberately lower-level and avoid baking in one opinionated application stack. The intent is for `terracedb-fuzz` to be the shared substrate that both crate-local generated suites and higher-level system/application harnesses can rely on.
 
 **Implementation steps**
 
-1. Add a new workspace crate (for example `crates/terracedb-fuzz-support`) with a stable-Rust API for:
-   - generated simulation scenario construction,
-   - per-library workload adapters,
-   - shared invariants,
-   - shrink/repro helpers, and
-   - corpus/minimized-case loading.
-2. Define reusable generator building blocks for:
-   - event streams,
-   - timer/backlog/work-queue activity,
-   - crash/restart schedules,
-   - object-store/filesystem faults,
-   - scheduler/admission perturbations, and
-   - bounded cross-library interaction patterns.
-3. Add per-library support modules that can be composed in generated scenarios, including at minimum:
-   - core DB,
-   - projections,
-   - workflows,
-   - relays,
-   - VFS,
-   - retention/current-state helpers, and
-   - any encoding/adapter-oriented libraries where state-machine invariants matter.
-4. Centralize shadow-oracle and invariant helpers for:
-   - durability/visibility prefixes,
-   - progress/frontier monotonicity,
-   - projection output/cursor correctness,
-   - workflow inbox/outbox/timer/idempotency behavior,
-   - relay/source progress ordering, and
-   - cross-library replay/recovery consistency.
-5. Document the supported workflow:
-   - broad-input property/simulation runs execute against generated scenarios,
-   - failures shrink or minimize into stable repros,
-   - minimized cases can be promoted into fixed regression tests in the owning crate.
+1. Add the public workspace crate `crates/terracedb-fuzz` with a stable-Rust API for:
+   - seed campaigns and replay helpers,
+   - scenario artifact save/load/encoding helpers,
+   - generic minimization/shrink helpers,
+   - generic invariant utilities, and
+   - scenario-runner traits that are neutral about the application stack sitting above them.
+2. Keep the crate low-level and broadly reusable:
+   - good contents include seed handling, replay capture, scenario codecs, minimization, and neutral simulation/repro plumbing,
+   - bad contents include opinionated HTTP app-stack builders, CDC-plus-web orchestration, or first-party-only omnistack wiring.
+3. Add low-level adapters where that abstraction holds naturally, including at minimum:
+   - core DB generated scenarios,
+   - VFS/current-state helpers,
+   - retention or record-level helpers where the invariants are still substrate-like, and
+   - other libraries whose state-machine semantics can be exercised without assuming a full application stack.
+4. Document the layering explicitly:
+   - crate-local generated/property tests can consume `terracedb-fuzz` directly,
+   - higher-level application/system harnesses should build on top of it rather than inside it, and
+   - open-ended `cargo-fuzz` executables should be thin drivers over the same reusable types.
+5. Document the supported failure workflow:
+   - generated runs execute against serializable scenarios,
+   - failures shrink or minimize into stable repro artifacts, and
+   - minimized cases can be promoted into fixed regression tests in the owning crate or application.
 
 **Verification**
 
-- Multiple workspace crates consume the shared support crate rather than each inventing ad hoc generators and oracle helpers.
+- Multiple workspace crates and at least one application/example consume the shared substrate rather than each inventing ad hoc replay/minimization helpers.
 - Generated scenarios can be replayed deterministically from a saved seed or minimized scenario artifact.
-- Cross-library invariants are expressed once and reused across DB, projection, workflow, relay, VFS, and related library suites.
-- Docs make the separation explicit: the support crate owns reusable fuzz/simulation machinery, while each consumer crate still owns its stable regression tests.
+- The crate remains reusable and public-facing instead of accreting first-party-only app-stack assumptions.
+- Docs make the separation explicit: `terracedb-fuzz` owns reusable low-level fuzz/simulation machinery, while higher-level system/app composition lives above it.
 
 ---
 
-### T33f. Workspace-wide generated simulation and fuzz suites for core DB, libraries, and cross-library composition
+### T33f. Public systemtest crate plus workspace-wide generated simulation and fuzz suites
 
 **Depends on:** T23a, T33, T33d, T33e
 
 **Description**
 
-Build the broad-input suites that consume the shared support crate: generated simulation/property runs for state-machine behavior and dedicated fuzz targets for parser/codec surfaces. This task should explicitly cover not only the core DB / projection / workflow stack, but also other workspace libraries whose semantics are easier to break than to enumerate manually. The goal is a layered fuzzing strategy:
+Build the public application/system harness layer on top of T33e and use it to power the broad-input suites. The key design goal is that the same systemtest harness can be driven either by a pre-selected deterministic seed under normal `cargo test` / `nextest` or by time-budgeted mutated scenario inputs under `cargo-fuzz`. This task should explicitly cover not only crate-local state-machine suites, but also cross-library composition and at least one example application using the same public API external users would use. The layered strategy should become:
 
 - generated deterministic simulation for ordering, recovery, retries, and restart behavior,
+- public app/system harnesses that can be shared by examples and external applications,
 - property-based broad input coverage for semantic invariants, and
-- dedicated fuzz targets for byte-level decoders and parser-heavy entrypoints.
+- dedicated fuzz targets for byte-level decoders and serialized higher-level scenarios.
 
 **Implementation steps**
 
-1. Add generated simulation/property suites that run broad bounded scenarios against at least:
+1. Add the public `crates/terracedb-systemtest` crate on top of `terracedb-fuzz`, with API support for:
+   - defining serializable application/system scenarios,
+   - running those scenarios from deterministic seeds,
+   - replaying serialized scenarios through the same runner,
+   - optionally consuming mutated scenario bytes through the same runner, and
+   - re-exporting the deterministic simulation/HTTP helpers that application-level tests commonly need.
+2. Use the same public `terracedb-systemtest` API in at least one example application so the design is exercised through real usage rather than only in first-party crate tests. The initial proving ground should include `examples/todo-api`, demonstrating that an application can keep a mostly flat local `tests/` directory while still getting seeded scenario runs and application-level deterministic simulation.
+3. Add generated simulation/property suites that run broad bounded scenarios against at least:
    - core DB recovery/state-machine behavior,
    - projections frontier/materialization behavior,
    - workflows inbox/outbox/timer/retry behavior,
    - relays/source-progress behavior, and
    - one or more supporting libraries such as VFS, retention, or records where generated scenarios can expose state-machine bugs.
-2. Add cross-library generated suites that compose the real production code paths rather than isolated stubs, for example:
+4. Add cross-library generated suites that compose the real production code paths rather than isolated stubs, for example:
    - DB writes flowing into projections,
    - DB/projection outputs driving workflows,
    - relay/source progress interacting with projection/workflow replay,
-   - restart/recovery cases spanning more than one library boundary.
-3. Add dedicated `cargo-fuzz`-style targets under a separate fuzz package for parser/codec-heavy surfaces such as:
+   - restart/recovery cases spanning more than one library boundary, and
+   - application-facing flows where writes or ingress events drive projections/workflows/HTTP-visible state.
+5. Add dedicated `cargo-fuzz`-style targets under a separate fuzz package for parser/codec-heavy surfaces such as:
    - commit-log frame decode,
    - segment/footer or manifest parsing,
    - remote-cache metadata and control-file parsing, and
    - any other durable or transport-facing decoders that benefit from byte-level mutation.
-4. Establish the failure-promotion workflow:
+6. Ensure the two execution modes share one vocabulary rather than two parallel harnesses:
+   - deterministic tests should run fixed seeds or saved scenarios through `terracedb-systemtest`,
+   - fuzz targets should mutate serialized scenarios or byte-level parser inputs and then call into the same reusable runner layer,
+   - application examples should not need bespoke internal-only glue to participate.
+7. Establish the failure-promotion workflow:
    - save failing seeds/scenarios or minimized byte corpora,
    - check in deterministic repros where appropriate,
    - keep the resulting fixed regression in the owning crate while the broad-input harness stays cross-cutting.
-5. Integrate the new suites operationally:
+8. Integrate the new suites operationally:
    - lightweight local smoke coverage,
    - pre-commit-friendly generated/property slices where cost is acceptable,
    - larger CI/nightly campaigns for broad seeded exploration and fuzz corpus growth.
@@ -1814,9 +1817,10 @@ Build the broad-input suites that consume the shared support crate: generated si
 **Verification**
 
 - Broad-input suites cover core DB, projections, workflows, and additional workspace libraries rather than stopping at the storage engine alone.
-- Cross-library generated runs find and replay failures that depend on restart/recovery, scheduling, or ordering across crate boundaries.
-- Parser/codec fuzz targets fail safely on malformed inputs and can reproduce minimized crashing inputs locally.
-- New failures can be promoted into stable deterministic regressions without duplicating generator or oracle logic across crates.
+- The public `terracedb-systemtest` crate is usable by at least one example application for both seeded deterministic runs and serialized-scenario replay.
+- Cross-library generated runs find and replay failures that depend on restart/recovery, scheduling, ordering, or app-surface interaction across crate boundaries.
+- Parser/codec fuzz targets and any higher-level scenario mutators fail safely on malformed inputs and can reproduce minimized crashing inputs locally.
+- New failures can be promoted into stable deterministic regressions without duplicating runner logic across crates or applications.
 
 ---
 
@@ -4840,11 +4844,16 @@ Finish the capstone work by hardening the new example app under failure/restart 
 
 **Description**
 
-Add the capstone broad-input suite that intentionally spans the full first-party Terracedb stack rather than only one vertical slice at a time. This harness should compose the real production code paths for the core DB, projections, workflows, relays/outbox flows, VFS, HTTP-facing application surfaces, telemetry capture, and sandbox/VFS-native authoring surfaces where practical, and then drive them from one shared generated-scenario vocabulary. CDC should be included, but explicitly as an optional ingress mode layered onto the same downstream stack rather than as the default path for every generated run: most users will not use Kafka/Debezium, but we still want a few high-value omnistack suites that prove the optional CDC path does not break the broader system.
+Add the capstone broad-input suite that intentionally spans the full first-party Terracedb stack rather than only one vertical slice at a time. This harness should compose the real production code paths for the core DB, projections, workflows, relays/outbox flows, VFS, HTTP-facing application surfaces, telemetry capture, and sandbox/VFS-native authoring surfaces where practical, and then drive them from one shared generated-scenario vocabulary. CDC should be included, but explicitly as an optional ingress mode layered onto the same downstream stack rather than as the default path for every generated run: most users will not use Kafka/Debezium, but we still want a few high-value omnistack suites that prove the optional CDC path does not break the broader system. This capstone should build on the public `terracedb-systemtest` harness model rather than inventing a one-off internal testing world.
 
 **Implementation steps**
 
-1. Add a top-level omnistack harness (for example under `tests/` plus shared `tests/support/`) that consumes the shared T33e fuzz/simulation support layer and defines one serializable scenario language covering:
+1. Extend the public `terracedb-systemtest` harness layer with an omnistack scenario mode for the full first-party stack, rather than creating a separate internal-only harness family that examples or external apps cannot learn from.
+2. Keep the local test organization lightweight and flat:
+   - deterministic omnistack suites can live in normal top-level `tests/` files with small adjacent helper modules where useful,
+   - if checked-in outputs are needed, prefer one local committed-output directory such as `tests/artifacts/` or `tests/snapshots/` per test root rather than a deep mandatory taxonomy, and
+   - reusable logic should live in crates, not in a growing maze of test helper directories.
+3. Add a top-level omnistack harness that consumes `terracedb-systemtest` plus the lower-level T33e substrate, and defines one serializable scenario language covering:
    - direct application writes,
    - projection/workflow/relay progress and drains,
    - timer/clock advancement,
@@ -4852,7 +4861,7 @@ Add the capstone broad-input suite that intentionally spans the full first-party
    - VFS or sandbox-visible file/activity operations,
    - HTTP requests against an application-facing surface, and
    - optional CDC delivery steps.
-2. Build a default non-CDC omnistack mode that spans, in one run:
+4. Build a default non-CDC omnistack mode that spans, in one run:
    - core DB state changes,
    - projections,
    - workflows,
@@ -4860,15 +4869,15 @@ Add the capstone broad-input suite that intentionally spans the full first-party
    - VFS-backed or sandbox-visible artifacts,
    - HTTP-visible read/write behavior, and
    - emitted telemetry/observability shapes where deterministic capture is supported.
-3. Extend the oracle/shadow model so one scenario can assert cross-layer invariants such as:
+5. Extend the oracle/shadow model so one scenario can assert cross-layer invariants such as:
    - projection outputs match the modeled retained state,
    - workflow state, timers, and outbox effects remain idempotent across restart,
    - relay-delivered effects match durable committed outbox entries,
    - VFS/sandbox-visible artifacts match the same logical actions seen by the DB-facing model, and
    - HTTP-visible responses and telemetry snapshots remain consistent with the underlying logical state.
-4. Add a small number of CDC-mode omnistack suites that reuse the same downstream harness but swap ingress to Kafka + Debezium, varying duplicate delivery, partition/batch boundaries, Debezium materialization mode, and restart timing.
-5. Add at least one direct-ingest versus CDC-ingest equivalence suite for scenarios where the logical semantics should match, comparing final projection/workflow/relay/application-visible outputs rather than low-level traces.
-6. Keep the checked-in local/pre-commit slice bounded and parallel-friendly, and reserve wider omnistack seed matrices for CI/nightly runs where larger minimized scenario artifacts and longer traces are acceptable.
+6. Add a small number of CDC-mode omnistack suites that reuse the same downstream harness but swap ingress to Kafka + Debezium, varying duplicate delivery, partition/batch boundaries, Debezium materialization mode, and restart timing.
+7. Add at least one direct-ingest versus CDC-ingest equivalence suite for scenarios where the logical semantics should match, comparing final projection/workflow/relay/application-visible outputs rather than low-level traces.
+8. Keep the checked-in local/pre-commit slice bounded and parallel-friendly, reserve wider omnistack seed matrices for CI/nightly runs where larger minimized scenario artifacts and longer traces are acceptable, and keep naming clear so deterministic suites use names like `generated` or `simulation` rather than overloading `fuzz` for both finite tests and open-ended mutation runners.
 
 **Verification**
 
@@ -4876,6 +4885,44 @@ Add the capstone broad-input suite that intentionally spans the full first-party
 - At least one generated suite spans core DB, projections, workflows, relays, VFS, HTTP-facing surfaces, and sandbox/VFS-native authoring behavior in one harness rather than as separate crate-local tests.
 - CDC-mode omnistack suites prove the optional Kafka/Debezium path preserves downstream logical invariants and remains diagnosable under duplicate delivery, restart, and replay/live-mode variation.
 - Direct-ingest and CDC-ingest equivalence suites prove that, where semantics are intended to match, optional CDC ingress changes only the ingest path and not the final user-visible logical state.
+
+---
+
+### T99b. Add time-budgeted mutational fuzz targets over serialized omnistack scenarios
+
+**Depends on:** T33e, T33f, T99a
+
+**Description**
+
+Once the deterministic omnistack scenario harness exists, add a second layer that feeds it from long-running mutation fuzzers rather than only bounded checked-in seed campaigns. The executable mutation targets should live under the standalone `fuzz/` package because they are corpus-driven, open-ended, and should not run in normal workspace `nextest`. However, the scenario schema, serialization format, replay entrypoints, artifact readers/writers, and invariant-checking harnesses they need must live in reusable normal crates, primarily the public `terracedb-systemtest` crate layered on top of the T33e substrate, so both deterministic test suites and fuzz executables consume the same contracts.
+
+**Implementation steps**
+
+1. Refactor the T99a omnistack scenario language and replay entrypoints so they are reusable through `terracedb-systemtest` rather than hidden inside one test tree, including:
+   - serializable scenario/operation types,
+   - deterministic replay APIs,
+   - stable artifact encoding/decoding,
+   - failure minimization hooks, and
+   - invariant/result summarization helpers suitable for both tests and fuzz targets.
+2. Add one or more `cargo-fuzz` targets under `fuzz/fuzz_targets/` that mutate serialized omnistack scenarios rather than arbitrary API bytes, for example:
+   - a default direct-ingest omnistack scenario target, and
+   - an optional CDC-ingest omnistack scenario target or mode flag.
+3. Seed those targets with corpora derived from:
+   - checked-in T99a scenario fixtures,
+   - minimized regressions found by deterministic generated suites, and
+   - hand-authored edge cases for restart, relay drain, timer, VFS, HTTP, and CDC schedule boundaries.
+4. Ensure every interesting failure found by the mutational targets can be materialized back into a stable scenario artifact that is replayable by the deterministic omnistack harness and suitable for check-in as a regression.
+5. Keep the fuzz target surface property-driven: mutated scenarios should be judged by the same omnistack logical invariants as T99a rather than by ad hoc target-specific assertions.
+6. Document the layering explicitly so contributors know:
+   - deterministic finite omnistack suites live in normal flat `tests/` roots,
+   - reusable scenario/harness code lives in `terracedb-systemtest` and `terracedb-fuzz`, and
+   - open-ended mutation executables and corpora live in `fuzz/`.
+
+**Verification**
+
+- `cargo fuzz` targets can mutate omnistack scenarios for extended time budgets without depending on ad hoc `tests/` internals.
+- Crashes or invariant failures discovered in `fuzz/` can be exported as stable scenario artifacts and replayed deterministically through the T99a test harness.
+- Seed corpora cover both non-CDC and CDC omnistack modes, while keeping the optional CDC path additive rather than mandatory for all fuzz campaigns.
 
 ---
 

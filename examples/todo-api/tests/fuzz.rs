@@ -8,10 +8,12 @@ use terracedb_example_todo_api::{
     CreateTodoRequest, PlannerSchedule, TodoApp, TodoAppOptions, TodoAppState, TodoRecord,
     UpdateTodoRequest, todo_db_builder,
 };
-use terracedb_fuzz::{
-    GeneratedScenarioHarness, ScenarioOperations, assert_seed_replays, assert_seed_variation,
-    decode_json_artifact, encode_json_artifact,
+use terracedb_systemtest::{
+    ScenarioOperations, SystemScenarioHarness, assert_seed_replays, assert_seed_variation,
+    decode_json_scenario, encode_json_scenario, replay_json_scenario, replay_json_scenario_bytes,
 };
+
+type BoxError = Box<dyn std::error::Error>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum TodoFuzzOperation {
@@ -49,10 +51,10 @@ struct TodoFuzzOutcome {
 
 struct TodoFuzzHarness;
 
-impl GeneratedScenarioHarness for TodoFuzzHarness {
+impl SystemScenarioHarness for TodoFuzzHarness {
     type Scenario = TodoFuzzScenario;
     type Outcome = TodoFuzzOutcome;
-    type Error = Box<dyn std::error::Error>;
+    type Error = BoxError;
 
     fn generate(&self, seed: u64) -> Self::Scenario {
         let rng = DeterministicRng::seeded(seed ^ 0x70d0);
@@ -108,9 +110,7 @@ impl ScenarioOperations for TodoFuzzScenario {
     }
 }
 
-fn run_todo_fuzz_scenario(
-    scenario: TodoFuzzScenario,
-) -> Result<TodoFuzzOutcome, Box<dyn std::error::Error>> {
+fn run_todo_fuzz_scenario(scenario: TodoFuzzScenario) -> Result<TodoFuzzOutcome, BoxError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -227,7 +227,7 @@ fn run_todo_fuzz_scenario(
 async fn assert_todo_invariants(
     state: &TodoAppState,
     model: &BTreeMap<String, TodoRecord>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), BoxError> {
     let mut expected_todos = model.values().cloned().collect::<Vec<_>>();
     sort_list_todos(&mut expected_todos);
     let actual_todos = state.list_todos().await?;
@@ -274,9 +274,9 @@ fn sort_list_todos(todos: &mut [TodoRecord]) {
 #[test]
 fn todo_api_generated_fuzz_replays_same_seed() -> turmoil::Result {
     let replay = assert_seed_replays(&TodoFuzzHarness, 0x70d1)?;
-    let encoded = encode_json_artifact(&replay.scenario).expect("encode todo fuzz scenario");
+    let encoded = encode_json_scenario(&replay.scenario).expect("encode todo fuzz scenario");
     let decoded: TodoFuzzScenario =
-        decode_json_artifact(&encoded).expect("decode todo fuzz scenario");
+        decode_json_scenario(&encoded).expect("decode todo fuzz scenario");
 
     assert_eq!(decoded, replay.scenario);
     assert_eq!(
@@ -291,5 +291,21 @@ fn todo_api_generated_fuzz_varies_across_seeds() -> turmoil::Result {
     let _ = assert_seed_variation(&TodoFuzzHarness, 0x70d1, 0x70d2, |left, right| {
         left.scenario != right.scenario || left.outcome != right.outcome
     })?;
+    Ok(())
+}
+
+#[test]
+fn todo_api_generated_fuzz_replays_serialized_scenarios_through_systemtest() -> turmoil::Result {
+    let replay = assert_seed_replays(&TodoFuzzHarness, 0x70d3)?;
+    let encoded = encode_json_scenario(&replay.scenario).expect("encode todo fuzz scenario");
+
+    let replayed = replay_json_scenario(&TodoFuzzHarness, &encoded)
+        .expect("replay serialized scenario through systemtest");
+    let replayed_from_bytes = replay_json_scenario_bytes(&TodoFuzzHarness, encoded.as_bytes())?
+        .expect("valid serialized scenario should decode from bytes");
+
+    assert_eq!(replayed.scenario, replay.scenario);
+    assert_eq!(replayed.outcome, replay.outcome);
+    assert_eq!(replayed_from_bytes.outcome, replay.outcome);
     Ok(())
 }

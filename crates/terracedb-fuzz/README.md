@@ -18,6 +18,6 @@ The intended workflow is:
 4. persist any failing scenario with [`save_json_artifact`], and
 5. promote the minimized repro into an owning crate regression test.
 
-`examples/todo-api/tests/fuzz.rs` demonstrates how an application that sits on top of Terracedb can use these utilities without reaching into Terracedb internals.
+Higher-level application and app-stack tests should generally prefer `terracedb-systemtest`, which builds on this crate.
 
-Byte-level `cargo-fuzz` entrypoints live separately under [`/fuzz`](/Users/maxwellgurewitz/.codex/worktrees/8690/terracedb/fuzz) as the standalone `terracedb-fuzz-targets` package so the reusable API crate can keep a clean public-facing name.
+Byte-level `cargo-fuzz` entrypoints live separately under `fuzz/` as the standalone `terracedb-fuzz-targets` package so the reusable API crate can keep a clean public-facing name.

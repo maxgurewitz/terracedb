@@ -6,9 +6,9 @@ use terracedb_example_todo_api::{
     CreateTodoRequest, MILLIS_PER_DAY, PlannerSchedule, TODO_SERVER_PORT, TodoApp, TodoAppOptions,
     TodoRecord, TodoStatus, UpdateTodoRequest, todo_db_builder,
 };
-use terracedb_http::{SimulatedHttpClient, axum_router_server_with_shutdown};
-use terracedb_simulation::{
-    NetworkObjectStore, SeededSimulationRunner, SimulationHost, TurmoilClock,
+use terracedb_systemtest::{
+    http::{SimulatedHttpClient, axum_router_server_with_shutdown},
+    simulation::{NetworkObjectStore, SeededSimulationRunner, SimulationHost, TurmoilClock},
 };
 use tokio::sync::watch;
 
