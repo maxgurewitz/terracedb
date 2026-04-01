@@ -68,6 +68,27 @@ impl DbProgressSubscription {
         self.inner.changed().await.map_err(|_| SubscriptionClosed)?;
         Ok(self.current())
     }
+
+    /// Waits until the current or next published progress snapshot satisfies `predicate`.
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<DbProgressSnapshot, SubscriptionClosed>
+    where
+        F: FnMut(&DbProgressSnapshot) -> bool,
+    {
+        let snapshot = self.current();
+        if predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+
+        loop {
+            let snapshot = self.changed().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
+    }
 }
 
 impl Clone for DbProgressSubscription {

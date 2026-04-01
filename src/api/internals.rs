@@ -238,6 +238,26 @@ impl ColumnarCacheUsageSubscription {
             .map_err(|_| crate::SubscriptionClosed)?;
         Ok(self.current())
     }
+
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<ColumnarCacheUsageSnapshot, crate::SubscriptionClosed>
+    where
+        F: FnMut(&ColumnarCacheUsageSnapshot) -> bool,
+    {
+        let snapshot = self.current();
+        if predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+
+        loop {
+            let snapshot = self.changed().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
+    }
 }
 
 impl Clone for ColumnarCacheUsageSubscription {

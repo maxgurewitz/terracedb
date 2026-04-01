@@ -242,6 +242,21 @@ impl AdmissionObservationReceiver {
             }
         }
     }
+
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<AdmissionObservation, crate::AdmissionObservationRecvError>
+    where
+        F: FnMut(&AdmissionObservation) -> bool,
+    {
+        loop {
+            let observation = self.recv().await?;
+            if predicate(&observation) {
+                return Ok(observation);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -266,6 +281,27 @@ impl SchedulerObservabilitySubscription {
             .await
             .map_err(|_| crate::SubscriptionClosed)?;
         Ok(self.current())
+    }
+
+    /// Waits until the current or next published snapshot satisfies `predicate`.
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<SchedulerObservabilitySnapshot, crate::SubscriptionClosed>
+    where
+        F: FnMut(&SchedulerObservabilitySnapshot) -> bool,
+    {
+        let snapshot = self.current();
+        if predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+
+        loop {
+            let snapshot = self.changed().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
     }
 }
 

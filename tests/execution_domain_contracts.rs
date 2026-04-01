@@ -2,14 +2,15 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use parking_lot::Mutex;
+use terracedb::test_support::{advance_clock_until_finished, wait_for_failpoint_hit_with_clock};
 use terracedb::{
     ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement, CommitOptions,
-    CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbProgressSnapshot,
-    DbProgressSubscription, DbSettings, DomainBackgroundBudget, DomainCpuBudget, DomainIoBudget,
-    DomainMemoryBudget, DomainTaggedWork, DurabilityClass, ExecutionDomainBacklogSnapshot,
-    ExecutionDomainBudget, ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook,
-    ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec,
-    ExecutionLane, ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceKind,
+    CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbProgressSnapshot, DbSettings,
+    DomainBackgroundBudget, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DomainTaggedWork,
+    DurabilityClass, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget,
+    ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceKind,
     ExecutionResourceUsage, FileSystemFailure, FileSystemOperation, InMemoryResourceManager,
     NoopScheduler, PendingWork, PendingWorkType, PressureScope, ResourceManager, S3Location,
     ScanOptions, Scheduler, ShardReadyPlacementLayout, StubClock, StubFileSystem, StubObjectStore,
@@ -210,41 +211,6 @@ fn process_budget() -> ExecutionDomainBudget {
             task_slots: Some(4),
             max_in_flight_bytes: Some(2048),
         },
-    }
-}
-
-async fn await_resource_manager_snapshot<F>(
-    subscription: &mut terracedb::ResourceManagerSubscription,
-    predicate: F,
-) -> terracedb::ResourceManagerSnapshot
-where
-    F: Fn(&terracedb::ResourceManagerSnapshot) -> bool,
-{
-    loop {
-        let snapshot = subscription.current();
-        if predicate(&snapshot) {
-            return snapshot;
-        }
-        subscription
-            .changed()
-            .await
-            .expect("resource manager snapshot update");
-    }
-}
-
-async fn await_db_progress_snapshot<F>(
-    subscription: &mut DbProgressSubscription,
-    predicate: F,
-) -> DbProgressSnapshot
-where
-    F: Fn(&DbProgressSnapshot) -> bool,
-{
-    loop {
-        let snapshot = subscription.current();
-        if predicate(&snapshot) {
-            return snapshot;
-        }
-        subscription.changed().await.expect("db progress update");
     }
 }
 
@@ -610,43 +576,6 @@ fn update_domain_spec(
         .clone();
     mutate(&mut spec);
     manager.update_domain(spec);
-}
-
-async fn wait_for_failpoint_hit_with_clock(
-    handle: &terracedb::FailpointHandle,
-    clock: &StubClock,
-    step: Duration,
-    max_steps: usize,
-) -> terracedb::FailpointHit {
-    let mut wait = Box::pin(handle.next_hit());
-    for _ in 0..max_steps {
-        tokio::select! {
-            hit = &mut wait => return hit,
-            _ = tokio::task::yield_now() => {
-                clock.advance(step);
-            }
-        }
-    }
-
-    panic!("failpoint was not hit within {max_steps} virtual-clock advances");
-}
-
-async fn advance_clock_until_finished<T>(
-    clock: &StubClock,
-    handle: &tokio::task::JoinHandle<T>,
-    step: Duration,
-    max_steps: usize,
-) -> u64 {
-    let start = terracedb::Clock::now(clock).get();
-    for _ in 0..max_steps {
-        if handle.is_finished() {
-            return terracedb::Clock::now(clock).get().saturating_sub(start);
-        }
-        clock.advance(step);
-        tokio::task::yield_now().await;
-    }
-
-    panic!("task was not finished within {max_steps} virtual-clock advances");
 }
 
 #[tokio::test]
@@ -2604,10 +2533,10 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         },
     );
     assert!(lease.admitted());
-    let observed_during_scoped_usage = await_resource_manager_snapshot(&mut updates, |snapshot| {
-        snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1
-    })
-    .await;
+    let observed_during_scoped_usage = updates
+        .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1)
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         observed_during_scoped_usage.domains[&foreground_path]
             .usage
@@ -2615,10 +2544,10 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         1
     );
     drop(lease);
-    let released_usage = await_resource_manager_snapshot(&mut updates, |snapshot| {
-        snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0
-    })
-    .await;
+    let released_usage = updates
+        .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0)
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         released_usage.domains[&foreground_path]
             .usage
@@ -2652,19 +2581,19 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
             },
         );
         assert!(lease.admitted());
-        let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
-            snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1
-        })
-        .await;
+        let snapshot = updates
+            .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1)
+            .await
+            .expect("resource manager snapshot update");
         assert_eq!(
             snapshot.domains[&foreground_path].usage.cpu_workers_in_use,
             1
         );
     }
-    let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
-        snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0
-    })
-    .await;
+    let snapshot = updates
+        .wait_for(|snapshot| snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0)
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         snapshot.domains[&foreground_path].usage.cpu_workers_in_use,
         0
@@ -2678,22 +2607,26 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
                 queued_bytes: 64,
             },
         );
-        let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
-            snapshot.domains[&background_path].backlog.queued_work_items == 2
-                && snapshot.domains[&background_path].backlog.queued_bytes == 64
-        })
-        .await;
+        let snapshot = updates
+            .wait_for(|snapshot| {
+                snapshot.domains[&background_path].backlog.queued_work_items == 2
+                    && snapshot.domains[&background_path].backlog.queued_bytes == 64
+            })
+            .await
+            .expect("resource manager snapshot update");
         assert_eq!(
             snapshot.domains[&background_path].backlog.queued_work_items,
             2
         );
         assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 64);
     }
-    let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
-        snapshot.domains[&background_path].backlog.queued_work_items == 0
-            && snapshot.domains[&background_path].backlog.queued_bytes == 0
-    })
-    .await;
+    let snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 0
+                && snapshot.domains[&background_path].backlog.queued_bytes == 0
+        })
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         snapshot.domains[&background_path].backlog.queued_work_items,
         0
@@ -2717,21 +2650,25 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
                 queued_bytes: 128,
             },
             || async {
-                let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
-                    snapshot.domains[&background_path].backlog.queued_work_items == 4
-                        && snapshot.domains[&background_path].backlog.queued_bytes == 128
-                })
-                .await;
+                let snapshot = updates
+                    .wait_for(|snapshot| {
+                        snapshot.domains[&background_path].backlog.queued_work_items == 4
+                            && snapshot.domains[&background_path].backlog.queued_bytes == 128
+                    })
+                    .await
+                    .expect("resource manager snapshot update");
                 snapshot.domains[&background_path].backlog.queued_work_items
             },
         )
         .await;
     assert_eq!(queued_async, 4);
-    let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
-        snapshot.domains[&background_path].backlog.queued_work_items == 0
-            && snapshot.domains[&background_path].backlog.queued_bytes == 0
-    })
-    .await;
+    let snapshot = updates
+        .wait_for(|snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 0
+                && snapshot.domains[&background_path].backlog.queued_bytes == 0
+        })
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         snapshot.domains[&background_path].backlog.queued_work_items,
         0
@@ -2779,11 +2716,13 @@ async fn db_lane_backlog_subscription_observes_transition_edges() {
                 queued_bytes: 64,
             },
         );
-        let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
-            snapshot.domains[&background_path].backlog.queued_work_items == 2
-                && snapshot.domains[&background_path].backlog.queued_bytes == 64
-        })
-        .await;
+        let snapshot = updates
+            .wait_for(|snapshot| {
+                snapshot.domains[&background_path].backlog.queued_work_items == 2
+                    && snapshot.domains[&background_path].backlog.queued_bytes == 64
+            })
+            .await
+            .expect("resource manager snapshot update");
         assert_eq!(
             snapshot.domains[&background_path].backlog.queued_work_items,
             2
@@ -2823,11 +2762,13 @@ async fn db_lane_backlog_subscription_observes_transition_edges() {
     assert_eq!(queued.queued_work_items, 4);
     assert_eq!(queued.queued_bytes, 128);
 
-    let cleared = await_resource_manager_snapshot(&mut updates, |snapshot| {
-        snapshot.domains[&background_path].backlog.queued_work_items == 0
-            && snapshot.domains[&background_path].backlog.queued_bytes == 0
-    })
-    .await;
+    let cleared = updates
+        .wait_for(|snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 0
+                && snapshot.domains[&background_path].backlog.queued_bytes == 0
+        })
+        .await
+        .expect("resource manager snapshot update");
     assert_eq!(
         cleared.domains[&background_path].backlog.queued_work_items,
         0
@@ -2862,11 +2803,13 @@ async fn db_progress_subscription_observes_visible_then_durable_transitions() {
         .write(b"k".to_vec(), Value::Bytes(b"v".to_vec()))
         .await
         .expect("write row");
-    let published_visible = await_db_progress_snapshot(&mut progress, |snapshot| {
-        snapshot.current_sequence == visible
-            && snapshot.durable_sequence == terracedb::SequenceNumber::default()
-    })
-    .await;
+    let published_visible = progress
+        .wait_for(|snapshot| {
+            snapshot.current_sequence == visible
+                && snapshot.durable_sequence == terracedb::SequenceNumber::default()
+        })
+        .await
+        .expect("db progress update");
     assert_eq!(published_visible.current_sequence, visible);
     assert_eq!(
         published_visible.durable_sequence,
@@ -2874,10 +2817,12 @@ async fn db_progress_subscription_observes_visible_then_durable_transitions() {
     );
 
     db.flush().await.expect("flush row");
-    let published_durable = await_db_progress_snapshot(&mut progress, |snapshot| {
-        snapshot.current_sequence == visible && snapshot.durable_sequence == visible
-    })
-    .await;
+    let published_durable = progress
+        .wait_for(|snapshot| {
+            snapshot.current_sequence == visible && snapshot.durable_sequence == visible
+        })
+        .await
+        .expect("db progress update");
     assert_eq!(published_durable.current_sequence, visible);
     assert_eq!(published_durable.durable_sequence, visible);
     assert_eq!(db.progress_snapshot(), published_durable);

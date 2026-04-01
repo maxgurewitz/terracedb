@@ -9,20 +9,19 @@ use futures::{StreamExt, TryStreamExt};
 use terracedb::{
     Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
     CommitOptions, CompactionStrategy, ContentionClass, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db,
-    DbComponents, DbConfig, DbProgressSnapshot, DbProgressSubscription, DbSettings,
-    DomainBackgroundBudget, DomainBudgetCharge, DomainBudgetOracle, DomainCpuBudget,
-    DomainIoBudget, DomainMemoryBudget, DurabilityClass, ExecutionDomainBacklogSnapshot,
-    ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement,
-    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, ExecutionLanePlacementConfig,
-    ExecutionResourceUsage, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
-    FileSystemFailure, FileSystemOperation, InMemoryDomainBudgetOracle, LogCursor, ManifestId,
-    ObjectKeyLayout, ObjectStore, ObjectStoreOperation, OpenError, PendingWork, PendingWorkType,
-    RemoteCache, RemoteRecoveryHint, ResourceManager, RoundRobinScheduler, S3Location,
-    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
-    SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
-    StorageSource, StubRng, TableConfig, TableFormat, TableStats, ThrottleDecision,
-    TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage, Value,
-    WorkPlacementRequest,
+    DbComponents, DbConfig, DbProgressSnapshot, DbSettings, DomainBackgroundBudget,
+    DomainBudgetCharge, DomainBudgetOracle, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget,
+    DurabilityClass, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceUsage, FieldDefinition,
+    FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure, FileSystemOperation,
+    InMemoryDomainBudgetOracle, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore,
+    ObjectStoreOperation, OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint,
+    ResourceManager, RoundRobinScheduler, S3Location, S3PrimaryStorageConfig, ScanOptions,
+    ScheduleAction, ScheduleDecision, Scheduler, SchemaDefinition, SegmentId, SequenceNumber,
+    SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubRng, TableConfig, TableFormat,
+    TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Transaction,
+    UnifiedStorage, Value, WorkPlacementRequest,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
@@ -539,73 +538,10 @@ where
     F: Fn(&terracedb::SchedulerObservabilitySnapshot) -> bool,
 {
     let mut updates = db.subscribe_scheduler_observability();
-    next_scheduler_observability_update(&mut updates, predicate).await
-}
-
-async fn next_scheduler_observability_update<F>(
-    updates: &mut terracedb::SchedulerObservabilitySubscription,
-    predicate: F,
-) -> terracedb::SchedulerObservabilitySnapshot
-where
-    F: Fn(&terracedb::SchedulerObservabilitySnapshot) -> bool,
-{
-    loop {
-        let snapshot = updates.current();
-        if predicate(&snapshot) {
-            return snapshot;
-        }
-        updates
-            .changed()
-            .await
-            .expect("scheduler observability update");
-    }
-}
-
-async fn next_resource_manager_snapshot<F>(
-    updates: &mut terracedb::ResourceManagerSubscription,
-    predicate: F,
-) -> terracedb::ResourceManagerSnapshot
-where
-    F: Fn(&terracedb::ResourceManagerSnapshot) -> bool,
-{
-    loop {
-        let snapshot = updates.current();
-        if predicate(&snapshot) {
-            return snapshot;
-        }
-        updates.changed().await.expect("resource manager update");
-    }
-}
-
-async fn next_db_progress_snapshot<F>(
-    updates: &mut DbProgressSubscription,
-    predicate: F,
-) -> DbProgressSnapshot
-where
-    F: Fn(&DbProgressSnapshot) -> bool,
-{
-    loop {
-        let snapshot = updates.current();
-        if predicate(&snapshot) {
-            return snapshot;
-        }
-        updates.changed().await.expect("db progress update");
-    }
-}
-
-async fn next_admission_observation<F>(
-    updates: &mut terracedb::AdmissionObservationReceiver,
-    predicate: F,
-) -> terracedb::AdmissionObservation
-where
-    F: Fn(&terracedb::AdmissionObservation) -> bool,
-{
-    loop {
-        let observation = updates.recv().await.expect("admission observation");
-        if predicate(&observation) {
-            return observation;
-        }
-    }
+    updates
+        .wait_for(predicate)
+        .await
+        .expect("scheduler observability update")
 }
 
 fn whole_system_simulation_process_budget() -> ExecutionDomainBudget {
@@ -3143,16 +3079,18 @@ fn simulation_resource_manager_subscription_tracks_backlog_transitions() -> turm
                         queued_bytes: 64,
                     },
                 );
-                let queued = next_resource_manager_snapshot(&mut updates, |snapshot| {
-                    snapshot
-                        .domains
-                        .get(&background_path)
-                        .is_some_and(|domain| {
-                            domain.backlog.queued_work_items == 2
-                                && domain.backlog.queued_bytes == 64
-                        })
-                })
-                .await;
+                let queued = updates
+                    .wait_for(|snapshot| {
+                        snapshot
+                            .domains
+                            .get(&background_path)
+                            .is_some_and(|domain| {
+                                domain.backlog.queued_work_items == 2
+                                    && domain.backlog.queued_bytes == 64
+                            })
+                    })
+                    .await
+                    .expect("resource manager update");
                 assert_eq!(
                     queued.domains[&background_path].backlog.queued_work_items,
                     2
@@ -3160,15 +3098,18 @@ fn simulation_resource_manager_subscription_tracks_backlog_transitions() -> turm
                 assert_eq!(queued.domains[&background_path].backlog.queued_bytes, 64);
             }
 
-            let cleared = next_resource_manager_snapshot(&mut updates, |snapshot| {
-                snapshot
-                    .domains
-                    .get(&background_path)
-                    .is_some_and(|domain| {
-                        domain.backlog.queued_work_items == 0 && domain.backlog.queued_bytes == 0
-                    })
-            })
-            .await;
+            let cleared = updates
+                .wait_for(|snapshot| {
+                    snapshot
+                        .domains
+                        .get(&background_path)
+                        .is_some_and(|domain| {
+                            domain.backlog.queued_work_items == 0
+                                && domain.backlog.queued_bytes == 0
+                        })
+                })
+                .await
+                .expect("resource manager update");
             assert_eq!(
                 cleared.domains[&background_path].backlog.queued_work_items,
                 0
@@ -3202,20 +3143,24 @@ fn simulation_resource_manager_subscription_tracks_usage_acquire_and_release() -
                 },
             );
             assert!(lease.admitted());
-            let acquired = next_resource_manager_snapshot(&mut updates, |snapshot| {
-                snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1
-            })
-            .await;
+            let acquired = updates
+                .wait_for(|snapshot| {
+                    snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1
+                })
+                .await
+                .expect("resource manager update");
             assert_eq!(
                 acquired.domains[&foreground_path].usage.cpu_workers_in_use,
                 1
             );
 
             drop(lease);
-            let released = next_resource_manager_snapshot(&mut updates, |snapshot| {
-                snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0
-            })
-            .await;
+            let released = updates
+                .wait_for(|snapshot| {
+                    snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0
+                })
+                .await
+                .expect("resource manager update");
             assert_eq!(
                 released.domains[&foreground_path].usage.cpu_workers_in_use,
                 0
@@ -3249,8 +3194,8 @@ fn scheduler_observability_update_stream_tracks_admission_recovery_sequence() ->
             table
                 .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
                 .await?;
-            let throttled_snapshot =
-                next_scheduler_observability_update(&mut updates, |snapshot| {
+            let throttled_snapshot = updates
+                .wait_for(|snapshot| {
                     snapshot
                         .current_admission_diagnostics_by_domain
                         .get(&domain)
@@ -3259,13 +3204,14 @@ fn scheduler_observability_update_stream_tracks_admission_recovery_sequence() ->
                                 == terracedb::AdmissionPressureLevel::RateLimit
                         })
                 })
-                .await;
+                .await
+                .expect("scheduler observability update");
 
             table
                 .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
                 .await?;
-            let recovered_snapshot =
-                next_scheduler_observability_update(&mut updates, |snapshot| {
+            let recovered_snapshot = updates
+                .wait_for(|snapshot| {
                     snapshot
                         .current_admission_diagnostics_by_domain
                         .get(&domain)
@@ -3280,7 +3226,8 @@ fn scheduler_observability_update_stream_tracks_admission_recovery_sequence() ->
                                     == terracedb::AdmissionPressureLevel::RateLimit
                             })
                 })
-                .await;
+                .await
+                .expect("scheduler observability update");
 
             assert_eq!(
                 throttled_snapshot
@@ -3338,12 +3285,14 @@ fn admission_observation_stream_reports_recovery_transition_in_order() -> turmoi
             table
                 .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
                 .await?;
-            let throttled = next_admission_observation(&mut observations, |observation| {
-                observation.domain == domain
-                    && observation.current.diagnostics.level
-                        == terracedb::AdmissionPressureLevel::RateLimit
-            })
-            .await;
+            let throttled = observations
+                .wait_for(|observation| {
+                    observation.domain == domain
+                        && observation.current.diagnostics.level
+                            == terracedb::AdmissionPressureLevel::RateLimit
+                })
+                .await
+                .expect("admission observation");
             assert_eq!(throttled.last_non_open, Some(throttled.current.clone()));
 
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -3351,12 +3300,14 @@ fn admission_observation_stream_reports_recovery_transition_in_order() -> turmoi
             table
                 .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
                 .await?;
-            let recovered = next_admission_observation(&mut observations, |observation| {
-                observation.domain == domain
-                    && observation.current.diagnostics.level
-                        == terracedb::AdmissionPressureLevel::Open
-            })
-            .await;
+            let recovered = observations
+                .wait_for(|observation| {
+                    observation.domain == domain
+                        && observation.current.diagnostics.level
+                            == terracedb::AdmissionPressureLevel::Open
+                })
+                .await
+                .expect("admission observation");
             assert_eq!(
                 recovered.last_non_open,
                 Some(throttled.current.clone()),
@@ -3395,29 +3346,33 @@ fn admission_observation_stream_tracks_admission_recovery_sequence() -> turmoil:
             table
                 .write(b"throttled".to_vec(), Value::Bytes(vec![b'x'; 128]))
                 .await?;
-            let throttled = next_admission_observation(&mut observations, |observation| {
-                observation.domain == domain
-                    && observation.current.diagnostics.level
-                        == terracedb::AdmissionPressureLevel::RateLimit
-            })
-            .await;
+            let throttled = observations
+                .wait_for(|observation| {
+                    observation.domain == domain
+                        && observation.current.diagnostics.level
+                            == terracedb::AdmissionPressureLevel::RateLimit
+                })
+                .await
+                .expect("admission observation");
 
             table
                 .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
                 .await?;
-            let recovered = next_admission_observation(&mut observations, |observation| {
-                observation.domain == domain
-                    && observation.current.diagnostics.level
-                        == terracedb::AdmissionPressureLevel::Open
-                    && observation
-                        .last_non_open
-                        .as_ref()
-                        .is_some_and(|last_non_open| {
-                            last_non_open.diagnostics.level
-                                == terracedb::AdmissionPressureLevel::RateLimit
-                        })
-            })
-            .await;
+            let recovered = observations
+                .wait_for(|observation| {
+                    observation.domain == domain
+                        && observation.current.diagnostics.level
+                            == terracedb::AdmissionPressureLevel::Open
+                        && observation
+                            .last_non_open
+                            .as_ref()
+                            .is_some_and(|last_non_open| {
+                                last_non_open.diagnostics.level
+                                    == terracedb::AdmissionPressureLevel::RateLimit
+                            })
+                })
+                .await
+                .expect("admission observation");
 
             assert_eq!(
                 throttled.current.diagnostics.level,
@@ -3664,10 +3619,10 @@ fn admission_observation_stream_emits_one_aggregated_event_per_multi_table_write
             tx.write(&beta, b"beta".to_vec(), Value::bytes("b"));
             assert_eq!(tx.commit_no_flush().await?, SequenceNumber::new(1));
 
-            let observation = next_admission_observation(&mut observations, |observation| {
-                observation.domain == domain
-            })
-            .await;
+            let observation = observations
+                .wait_for(|observation| observation.domain == domain)
+                .await
+                .expect("admission observation");
             assert_eq!(
                 observation.current.diagnostics.level,
                 terracedb::AdmissionPressureLevel::Stall
@@ -4167,11 +4122,13 @@ fn simulation_db_progress_subscription_tracks_visible_then_durable_frontiers() -
             assert_eq!(progress.current(), DbProgressSnapshot::default());
 
             let visible = table.write(b"k".to_vec(), Value::bytes("v1")).await?;
-            let published_visible = next_db_progress_snapshot(&mut progress, |snapshot| {
-                snapshot.current_sequence == visible
-                    && snapshot.durable_sequence == SequenceNumber::default()
-            })
-            .await;
+            let published_visible = progress
+                .wait_for(|snapshot| {
+                    snapshot.current_sequence == visible
+                        && snapshot.durable_sequence == SequenceNumber::default()
+                })
+                .await
+                .expect("db progress update");
             assert_eq!(published_visible.current_sequence, visible);
             assert_eq!(
                 published_visible.durable_sequence,

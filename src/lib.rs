@@ -168,7 +168,8 @@ pub use telemetry::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use test_support::{
-    bytes as test_bytes, row_table_config, test_dependencies, test_dependencies_with_clock,
-    tiered_test_config, tiered_test_config_with_durability,
+    advance_clock_until_finished, bytes as test_bytes, row_table_config, test_dependencies,
+    test_dependencies_with_clock, tiered_test_config, tiered_test_config_with_durability,
+    wait_for_failpoint_hit_with_clock,
 };
 pub use transaction::{Transaction, TransactionCommitError, TransactionCommitOptions};

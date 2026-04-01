@@ -1,10 +1,13 @@
-use std::{collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration,
+};
 
 use crate::{
-    CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
+    Clock, CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
     StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat,
     TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, Value,
 };
+use tokio::task::JoinHandle;
 
 pub use crate::failpoints::{
     FailpointAction, FailpointHandle, FailpointHit, FailpointMode, FailpointOutcome,
@@ -66,6 +69,45 @@ pub fn test_dependencies_with_clock(
         clock,
         Arc::new(StubRng::seeded(7)),
     )
+}
+
+/// Waits for a failpoint hit while advancing a stub clock in bounded steps.
+pub async fn wait_for_failpoint_hit_with_clock(
+    handle: &crate::FailpointHandle,
+    clock: &StubClock,
+    step: Duration,
+    max_steps: usize,
+) -> crate::FailpointHit {
+    let mut wait = Box::pin(handle.next_hit());
+    for _ in 0..max_steps {
+        tokio::select! {
+            hit = &mut wait => return hit,
+            _ = tokio::task::yield_now() => {
+                clock.advance(step);
+            }
+        }
+    }
+
+    panic!("failpoint was not hit within {max_steps} virtual-clock advances");
+}
+
+/// Advances a stub clock until a spawned task finishes or the bound is hit.
+pub async fn advance_clock_until_finished<T>(
+    clock: &StubClock,
+    handle: &JoinHandle<T>,
+    step: Duration,
+    max_steps: usize,
+) -> u64 {
+    let start = clock.now().get();
+    for _ in 0..max_steps {
+        if handle.is_finished() {
+            return clock.now().get().saturating_sub(start);
+        }
+        clock.advance(step);
+        tokio::task::yield_now().await;
+    }
+
+    panic!("task was not finished within {max_steps} virtual-clock advances");
 }
 
 pub fn row_table_config(name: &str) -> TableConfig {

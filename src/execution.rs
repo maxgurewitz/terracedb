@@ -2069,6 +2069,27 @@ impl ResourceManagerSubscription {
             .map_err(|_| crate::SubscriptionClosed)?;
         Ok(self.current())
     }
+
+    /// Waits until the current or next published snapshot satisfies `predicate`.
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<ResourceManagerSnapshot, crate::SubscriptionClosed>
+    where
+        F: FnMut(&ResourceManagerSnapshot) -> bool,
+    {
+        let snapshot = self.current();
+        if predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+
+        loop {
+            let snapshot = self.changed().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
+    }
 }
 
 impl Clone for ResourceManagerSubscription {
