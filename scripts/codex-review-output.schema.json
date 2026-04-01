@@ -2,6 +2,39 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CodexReviewResult",
   "type": "object",
+  "$defs": {
+    "reviewFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "body", "file", "start_line", "end_line"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1
+        },
+        "file": {
+          "type": ["string", "null"]
+        },
+        "start_line": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "end_line": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        }
+      }
+    }
+  },
   "additionalProperties": false,
   "required": [
     "status",
@@ -22,13 +55,13 @@
     "blocking_findings": {
       "type": "array",
       "items": {
-        "type": "string"
+        "$ref": "#/$defs/reviewFinding"
       }
     },
     "warnings": {
       "type": "array",
       "items": {
-        "type": "string"
+        "$ref": "#/$defs/reviewFinding"
       }
     },
     "full_review_markdown": {

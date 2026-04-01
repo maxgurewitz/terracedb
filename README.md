@@ -60,13 +60,32 @@ The Git hook at `.githooks/pre-commit` calls that script, which runs:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 
 By default, the Codex review step evaluates the staged diff against
-`docs/GUIDELINES.md`, writes a full Markdown review under `.tmp/codex-review/`,
-prints the absolute review path, and blocks the commit only when Codex returns
-blocking findings. Set `CODEX_REVIEW_ENABLED=0` to disable it, set
+`docs/GUIDELINES.md`, writes branch-local review history under
+`.tmp/codex-review/<branch>/`, prints the absolute decision-log, context-file,
+and review paths, and blocks the commit only when Codex returns blocking
+findings. Set `CODEX_REVIEW_ENABLED=0` to disable it, set
 `CODEX_REVIEW_STRICT=1` to also fail the commit on Codex tooling/setup errors,
 use `SKIP_CODEX_REVIEW=1` to bypass the review step for a single commit, and
 set `CODEX_REVIEW_REASONING_EFFORT` to override the default low reasoning mode.
 The hook also expects `jq` to be installed locally.
+
+Each branch keeps review memory in:
+
+- `.tmp/codex-review/<branch>/reviews/` for immutable review rounds
+- `.tmp/codex-review/<branch>/decisions.json` for structured user/agent
+  adjudications such as `dismissed`, `deferred`, and `accepted`
+- `.tmp/codex-review/<branch>/context.md` for optional freeform branch review
+  guidance
+
+To record a structured response to a finding so future review rounds can honor
+it, run:
+
+```bash
+scripts/codex-review-record-decision.sh \
+  --finding-id example-finding-id \
+  --resolution dismissed \
+  --reason "Intentional for this branch because ..."
+```
 
 Durable-format policy, fixture inventory, and the checked FlatBuffers schema reference live in `docs/DURABLE_FORMATS.md` and `schemas/durable_metadata.fbs`.
 
