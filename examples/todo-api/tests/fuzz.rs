@@ -131,6 +131,7 @@ fn run_todo_fuzz_scenario(scenario: TodoFuzzScenario) -> Result<TodoFuzzOutcome,
             clock.clone(),
             TodoAppOptions {
                 planner_schedule: PlannerSchedule::new(1_000_000, 1),
+                planner_initial_fire_at_ms: None,
             },
         )
         .await?;
