@@ -87,6 +87,11 @@ Required practice:
   there.
 - If a non-simulation bug can be captured faithfully in simulation, add the
   simulation regression and iterate there first.
+- As a rule, keep simulation coverage to one seed per test so the test runner
+  can parallelize seeds across independent tests. If multiple seeds matter,
+  split them into separate tests instead of serializing them inside one test
+  body unless the assertion itself fundamentally depends on cross-seed
+  comparison.
 - Use focused unit tests for local semantics and deterministic simulation tests
   for ordering, concurrency, recovery, and fault scenarios.
 - Keep tests explicit about what semantic boundary they are asserting:

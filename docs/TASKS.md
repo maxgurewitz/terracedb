@@ -1557,7 +1557,7 @@ Create a dedicated HTTP simulation harness crate for Terracedb-based application
 
 ## Phase 7 — Full-stack deterministic hardening
 
-**Parallelization:** This hardening phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist. T33b and T33c can start once their dependencies are ready; T33 should follow once the reusable failpoint/cut-point layer exists; T33a and T33d then operationalize the deterministic and real-remote suites.
+**Parallelization:** This hardening phase should begin only after the main engine, projection, workflow, and reusable simulation surfaces exist. T33b and T33c can start once their dependencies are ready; T33e should follow once the property-test conventions and shared failpoint/cut-point layer exist; T33 and T33f then consume those shared generators/oracles across the core DB, projections, workflows, and other libraries; T33a and T33d operationalize the deterministic and real-remote suites.
 
 ### T33. Full-stack randomized scenario generation and invariant suites
 
@@ -1717,6 +1717,106 @@ Add a real remote-integration hardening layer that complements Terracedb's stubb
 - Faulted scenarios prove Terracedb fails closed, retries where appropriate, and recovers to the correct durable prefix rather than panicking or inventing state.
 - Remote-manifest load/recovery, backup/offload ordering, cache rebuild, and remote columnar range-read behavior remain correct under injected network and HTTP faults.
 - CI/nightly jobs preserve enough logs and scenario metadata to reproduce a failing chaos run locally.
+
+---
+
+### T33e. Shared cross-cutting fuzz/support crate for generated simulation and workspace invariants
+
+**Depends on:** T03a, T27, T31, T32, T32a, T32e, T33b, T33c
+
+**Description**
+
+Create a reusable workspace crate dedicated to broad-input correctness exploration across Terracedb libraries, not just the core DB. This crate should centralize scenario generators, invariant helpers, shadow oracles, shrink/repro plumbing, and per-library adapters so normal property tests, deterministic generated simulations, and dedicated fuzz harnesses all share one vocabulary. The intent is to make broad-input testing a first-class cross-cutting capability for the DB, projections, workflows, relays, VFS, retention, records, HTTP/sandbox-facing libraries, and any later workspace crate with meaningful state-machine or persistence semantics.
+
+**Implementation steps**
+
+1. Add a new workspace crate (for example `crates/terracedb-fuzz-support`) with a stable-Rust API for:
+   - generated simulation scenario construction,
+   - per-library workload adapters,
+   - shared invariants,
+   - shrink/repro helpers, and
+   - corpus/minimized-case loading.
+2. Define reusable generator building blocks for:
+   - event streams,
+   - timer/backlog/work-queue activity,
+   - crash/restart schedules,
+   - object-store/filesystem faults,
+   - scheduler/admission perturbations, and
+   - bounded cross-library interaction patterns.
+3. Add per-library support modules that can be composed in generated scenarios, including at minimum:
+   - core DB,
+   - projections,
+   - workflows,
+   - relays,
+   - VFS,
+   - retention/current-state helpers, and
+   - any encoding/adapter-oriented libraries where state-machine invariants matter.
+4. Centralize shadow-oracle and invariant helpers for:
+   - durability/visibility prefixes,
+   - progress/frontier monotonicity,
+   - projection output/cursor correctness,
+   - workflow inbox/outbox/timer/idempotency behavior,
+   - relay/source progress ordering, and
+   - cross-library replay/recovery consistency.
+5. Document the supported workflow:
+   - broad-input property/simulation runs execute against generated scenarios,
+   - failures shrink or minimize into stable repros,
+   - minimized cases can be promoted into fixed regression tests in the owning crate.
+
+**Verification**
+
+- Multiple workspace crates consume the shared support crate rather than each inventing ad hoc generators and oracle helpers.
+- Generated scenarios can be replayed deterministically from a saved seed or minimized scenario artifact.
+- Cross-library invariants are expressed once and reused across DB, projection, workflow, relay, VFS, and related library suites.
+- Docs make the separation explicit: the support crate owns reusable fuzz/simulation machinery, while each consumer crate still owns its stable regression tests.
+
+---
+
+### T33f. Workspace-wide generated simulation and fuzz suites for core DB, libraries, and cross-library composition
+
+**Depends on:** T23a, T33, T33d, T33e
+
+**Description**
+
+Build the broad-input suites that consume the shared support crate: generated simulation/property runs for state-machine behavior and dedicated fuzz targets for parser/codec surfaces. This task should explicitly cover not only the core DB / projection / workflow stack, but also other workspace libraries whose semantics are easier to break than to enumerate manually. The goal is a layered fuzzing strategy:
+
+- generated deterministic simulation for ordering, recovery, retries, and restart behavior,
+- property-based broad input coverage for semantic invariants, and
+- dedicated fuzz targets for byte-level decoders and parser-heavy entrypoints.
+
+**Implementation steps**
+
+1. Add generated simulation/property suites that run broad bounded scenarios against at least:
+   - core DB recovery/state-machine behavior,
+   - projections frontier/materialization behavior,
+   - workflows inbox/outbox/timer/retry behavior,
+   - relays/source-progress behavior, and
+   - one or more supporting libraries such as VFS, retention, or records where generated scenarios can expose state-machine bugs.
+2. Add cross-library generated suites that compose the real production code paths rather than isolated stubs, for example:
+   - DB writes flowing into projections,
+   - DB/projection outputs driving workflows,
+   - relay/source progress interacting with projection/workflow replay,
+   - restart/recovery cases spanning more than one library boundary.
+3. Add dedicated `cargo-fuzz`-style targets under a separate fuzz package for parser/codec-heavy surfaces such as:
+   - commit-log frame decode,
+   - segment/footer or manifest parsing,
+   - remote-cache metadata and control-file parsing, and
+   - any other durable or transport-facing decoders that benefit from byte-level mutation.
+4. Establish the failure-promotion workflow:
+   - save failing seeds/scenarios or minimized byte corpora,
+   - check in deterministic repros where appropriate,
+   - keep the resulting fixed regression in the owning crate while the broad-input harness stays cross-cutting.
+5. Integrate the new suites operationally:
+   - lightweight local smoke coverage,
+   - pre-commit-friendly generated/property slices where cost is acceptable,
+   - larger CI/nightly campaigns for broad seeded exploration and fuzz corpus growth.
+
+**Verification**
+
+- Broad-input suites cover core DB, projections, workflows, and additional workspace libraries rather than stopping at the storage engine alone.
+- Cross-library generated runs find and replay failures that depend on restart/recovery, scheduling, or ordering across crate boundaries.
+- Parser/codec fuzz targets fail safely on malformed inputs and can reproduce minimized crashing inputs locally.
+- New failures can be promoted into stable deterministic regressions without duplicating generator or oracle logic across crates.
 
 ---
 
@@ -3802,15 +3902,15 @@ Extend the domains example so users can see pressure-aware flushing and write ad
 
 ### T76. Build the capstone whole-system simulation and chaos suite for pressure-aware flushing
 
-**Depends on:** T72, T73, T74, T75
+**Depends on:** T33e, T72, T73, T74, T75
 
 **Description**
 
-Add the capstone deterministic hardening pass for the pressure-aware flush/admission subsystem. This task owns the whole-system matrix across group commit, deferred durability, unified-log pressure, flush selection, multi-DB/domain contention, and restart/failure handling. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact.
+Add the capstone deterministic hardening pass for the pressure-aware flush/admission subsystem. This task owns the whole-system matrix across group commit, deferred durability, unified-log pressure, flush selection, multi-DB/domain contention, and restart/failure handling. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact. Implement it as a consumer of the shared cross-cutting fuzz/simulation support layer from T33e rather than as a pressure-only one-off harness: reuse the shared generator/replay/minimization plumbing where possible, and keep only pressure-specific generators/oracles local to this task.
 
 **Implementation steps**
 
-1. Compose the per-task pressure simulation/oracle helpers into a whole-system harness that can run:
+1. Compose the per-task pressure simulation/oracle helpers into the shared broad-input support layer so the pressure-aware whole-system harness can run:
    - bursty write spikes,
    - slow or failed flushes,
    - group-commit and deferred-durability modes,
@@ -3821,8 +3921,9 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
    - flush failures plus retry/reopen,
    - pressure spikes during control-plane and user-data contention, and
    - budget reconfiguration in the presence of in-flight flush work.
-3. Add a real-runtime chaos layer where appropriate, including injected flush stalls, delayed durability completion, and abrupt budget tightening events that complement the deterministic harness without weakening reproducibility requirements.
-4. Verify the full invariants matrix:
+3. Keep checked-in deterministic pressure regressions split as one seed per test wherever practical so local/pre-commit runners can exploit parallelism; reserve larger seed matrices for CI/nightly campaigns or generated broad-input runs.
+4. Add a real-runtime chaos layer where appropriate, including injected flush stalls, delayed durability completion, and abrupt budget tightening events that complement the deterministic harness without weakening reproducibility requirements.
+5. Verify the full invariants matrix:
    - no correctness change under different pressure thresholds,
    - pressure counters eventually converge after work completes,
    - domain-local soft policy differences change performance behavior only, while global hard guardrails still preserve liveness,
@@ -3832,6 +3933,7 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
 **Verification**
 
 - Large-seed deterministic simulation campaigns proving pressure-aware flushing and admission remain reproducible across restart, failure, and multi-tenant contention scenarios.
+- Local and pre-commit pressure simulation coverage stays parallel-friendly by avoiding serial multi-seed tests when independent seed cases can be split.
 - Cross-feature chaos tests proving flush stalls, retry paths, and budget tightening still preserve deterministic recovery and liveness.
 - End-to-end invariant tests proving the subsystem changes performance behavior only, not logical DB outcomes.
 
@@ -3849,20 +3951,21 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
 
 **Description**
 
-Refactor scheduler/admission observability away from reader-side locking and into published immutable state. This task owns the simulation-facing introspection layer for pressure/admission behavior: snapshots must be cheap to sample from a single-threaded simulated runtime, and ordered admission transitions must be assertable without polling shared mutable maps.
+Refactor scheduler/admission observability away from reader-side locking and into published immutable state. This task owns the simulation-facing introspection layer for pressure/admission behavior: snapshots must be cheap to sample from a single-threaded simulated runtime, ordered admission transitions must be assertable without polling shared mutable maps, and the resulting observation surfaces must be easy for the shared T33e/T33f broad-input harnesses to consume without bespoke pressure-only adapters.
 
 **Implementation steps**
 
 1. Replace lock-on-read scheduler observability assembly with published immutable snapshots that writers update whenever the underlying counters or per-domain diagnostics change.
 2. Add ordered admission observation streams so tests can assert transitions like `RateLimit -> Open` or "one aggregated event per write" directly, instead of inferring them from eventual shared-state samples.
 3. Make current-versus-historical admission state explicit, with the published snapshot carrying the live view and the last-non-open state preserved separately for debugging.
-4. Delete polling/try-lock style scheduler snapshot helpers that only existed to avoid deadlocking the simulated runtime, and move simulation tests onto the published snapshot / stream APIs.
+4. Delete polling/try-lock style scheduler snapshot helpers that only existed to avoid deadlocking the simulated runtime, and move simulation tests plus any generated/fuzzed pressure suites onto the published snapshot / stream APIs.
 5. Keep the synchronous operator-facing snapshot API as a thin clone of the published state so CLI/debugging callers still have a one-shot read surface.
 
 **Verification**
 
 - Simulation regressions proving in-flight rate-limited writes are observable through the published snapshot subscription without blocking the runtime.
 - Simulation regressions proving admission streams emit ordered write-level transitions and do not duplicate per-table diagnostics for one logical write.
+- Generated broad-input pressure suites can consume the same published snapshot/stream surfaces without extra lock-backed test hooks.
 - Unit tests proving the synchronous snapshot API returns the same data as the published stream state after representative observability updates.
 - Unit tests proving the historical last-non-open diagnostic survives recovery writes while the live state returns `Open`.
 
@@ -3874,12 +3977,12 @@ Refactor scheduler/admission observability away from reader-side locking and int
 
 **Description**
 
-Finish the simulation-safety pass across introspection surfaces that may still block the runtime thread or hide ordering behind shared mutable state. This task is broader than admission: it covers any synchronous snapshot or inspection helper that a deterministic simulation test would reasonably want to call while work is in flight.
+Finish the simulation-safety pass across introspection surfaces that may still block the runtime thread or hide ordering behind shared mutable state. This task is broader than admission: it covers any synchronous snapshot or inspection helper that a deterministic simulation test or generated broad-input suite would reasonably want to call while work is in flight.
 
 **Implementation steps**
 
 1. Inventory remaining snapshot/introspection APIs that take `parking_lot` or `std::sync` locks from async contexts or simulation helpers.
-2. Convert the high-value surfaces to published immutable snapshots, subscriptions, or explicit poll/step interfaces, depending on whether tests need sampled state, ordered events, or deterministic progress control.
+2. Convert the high-value surfaces to published immutable snapshots, subscriptions, or explicit poll/step interfaces, depending on whether tests need sampled state, ordered events, or deterministic progress control, and shape those replacements so they plug cleanly into the shared T33e support crate.
 3. Remove test-only retry loops that compensate for blocking inspection, and replace them with direct subscription- or progress-driven assertions.
 4. Extend the debugging guide with the preferred simulation-safe observation patterns so future work does not regress into blocking shared-state reads.
 5. Prioritize the concluding downstream-adoption slices in dependency order:
@@ -3910,12 +4013,12 @@ Finish the simulation-safety pass across introspection surfaces that may still b
 
 **Description**
 
-Expose explicit progress probes for scheduler-driven background work so simulations can assert "one step happened" or "the system is idle" without depending on arbitrary sleeps or repeated `yield_now()`. This task turns background maintenance from a mostly implicit runtime effect into a testable deterministic interface.
+Expose explicit progress probes for scheduler-driven background work so simulations can assert "one step happened" or "the system is idle" without depending on arbitrary sleeps or repeated `yield_now()`. This task turns background maintenance from a mostly implicit runtime effect into a testable deterministic interface that both hand-written simulation regressions and shared generated/fuzzed suites can drive directly.
 
 **Implementation steps**
 
 1. Identify the highest-value background loops whose progress is currently only inferable through side effects or eventual snapshots.
-2. Introduce poll/step helpers or bounded "wait until idle" probes where that can be done without weakening production invariants.
+2. Introduce poll/step helpers or bounded "wait until idle" probes where that can be done without weakening production invariants, and make those helpers reusable from the shared broad-input harness rather than pressure-only tests alone.
 3. Rewrite representative simulation tests to use the new probes instead of time-based heuristics.
 4. Keep the new probes clearly test/debug oriented so they do not become accidental correctness boundaries in production code.
 5. Treat `direct_backlog()` and similar lock-backed helper reads as candidates for this bucket when they are only needed to drive simulation progress or backlog assertions.
@@ -3925,6 +4028,7 @@ Expose explicit progress probes for scheduler-driven background work so simulati
 
 - Simulation tests showing background progress can be asserted without arbitrary sleep-based retries.
 - Regression coverage for at least one maintenance or scheduler scenario that previously required yield-heavy timing assumptions.
+- Generated pressure/fault suites can advance and observe scheduler-driven work through the same explicit probes without bespoke `yield_now()` loops.
 - Documentation updates that spell out when to use progress probes vs snapshots vs event streams.
 
 ---
