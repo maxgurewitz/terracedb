@@ -678,14 +678,12 @@ where
 
 fn referrer_to_workspace_path(referrer: &str) -> Result<String, SandboxError> {
     if referrer.starts_with(TERRACE_WORKSPACE_PREFIX) {
-        return Ok(SandboxModuleSpecifier::parse(referrer).and_then(
-            |specifier| match specifier {
-                SandboxModuleSpecifier::Workspace { path } => Ok(path),
-                _ => Err(SandboxError::InvalidModuleSpecifier {
-                    specifier: referrer.to_string(),
-                }),
-            },
-        )?);
+        return SandboxModuleSpecifier::parse(referrer).and_then(|specifier| match specifier {
+            SandboxModuleSpecifier::Workspace { path } => Ok(path),
+            _ => Err(SandboxError::InvalidModuleSpecifier {
+                specifier: referrer.to_string(),
+            }),
+        });
     }
     if referrer.starts_with("/workspace") {
         return Ok(normalize_path(referrer));

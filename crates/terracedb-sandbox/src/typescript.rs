@@ -882,13 +882,13 @@ fn strip_function_signature_annotations(line: &str) -> String {
     output.push_str(&stripped_params);
     output.push(')');
     let suffix = &line[close_paren + 1..];
-    if let Some(colon_index) = suffix.find(':') {
-        if let Some(body_index) = suffix[colon_index + 1..].find('{') {
-            output.push_str(&suffix[..colon_index]);
-            output.push(' ');
-            output.push_str(suffix[colon_index + 1 + body_index..].trim_start());
-            return output;
-        }
+    if let Some(colon_index) = suffix.find(':')
+        && let Some(body_index) = suffix[colon_index + 1..].find('{')
+    {
+        output.push_str(&suffix[..colon_index]);
+        output.push(' ');
+        output.push_str(suffix[colon_index + 1 + body_index..].trim_start());
+        return output;
     }
     output.push_str(suffix);
     output

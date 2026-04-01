@@ -135,14 +135,13 @@ async fn installed_supported_packages_import_from_guest_code_and_record_package_
     );
     assert!(manifest.materialized_compatibility_view);
     assert_eq!(manifest.packages.len(), 2);
-    assert_eq!(
+    assert!(
         session
             .filesystem()
             .read_file("/.terrace/npm/node_modules/lodash/package.json")
             .await
             .expect("read compatibility package.json")
-            .is_some(),
-        true
+            .is_some()
     );
 }
 

@@ -6,22 +6,29 @@ use std::{
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::Serialize;
 use terracedb::{
-    ChangeFeedError, Clock, Db, DeterministicRng, FileSystemFailure, FileSystemOperation,
-    LogCursor, ObjectStoreFailure, ObjectStoreOperation, OutboxEntry, Rng as TerraceRng,
-    ScanOptions, SequenceNumber, StorageError, StorageErrorKind, StubClock, StubFileSystem,
-    StubObjectStore, Table, TieredDurabilityMode, Timestamp, Transaction, Value,
+    ChangeFeedError, Clock, Db, DbDependencies, DeterministicRng, FileSystemFailure,
+    FileSystemOperation, LogCursor, ObjectStoreFailure, ObjectStoreOperation, OutboxEntry,
+    Rng as TerraceRng, ScanOptions, SequenceNumber, StorageError, StorageErrorKind, StubClock,
+    StubFileSystem, StubObjectStore, StubRng, Table, TieredDurabilityMode, Timestamp, Transaction,
+    Value,
     test_support::{
         FailpointMode, db_failpoint_registry, row_table_config, test_dependencies,
         test_dependencies_with_clock, tiered_test_config_with_durability,
     },
 };
 use terracedb_fuzz::{assert_seed_replays, assert_seed_variation};
+use terracedb_sandbox::{
+    ConflictPolicy, DefaultSandboxStore, PackageCompatibilityMode, SandboxConfig, SandboxServices,
+    SandboxStore,
+};
 use terracedb_simulation::{
     CutPoint, SeededSimulationRunner, SimulationStackBuilder, TerracedbSimulationHarness,
 };
+use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 use terracedb_workflows::{
-    DEFAULT_TIMER_POLL_INTERVAL, RecurringSchedule, RecurringTickOutput,
+    ContractWorkflowHandler, DEFAULT_TIMER_POLL_INTERVAL, RecurringSchedule, RecurringTickOutput,
     RecurringWorkflowDefinition, RecurringWorkflowHandle, RecurringWorkflowHandler,
     RecurringWorkflowRuntime, RecurringWorkflowState, WorkflowCheckpointArtifactKind,
     WorkflowCheckpointId, WorkflowCheckpointStore, WorkflowContext, WorkflowDefinition,
@@ -32,7 +39,8 @@ use terracedb_workflows::{
     WorkflowSourceAttachMode, WorkflowSourceBootstrapPolicy, WorkflowSourceConfig,
     WorkflowSourceProgress, WorkflowSourceProgressOrigin, WorkflowSourceRecoveryPolicy,
     WorkflowSourceResumePoint, WorkflowStateMutation, WorkflowTables, WorkflowTimerCommand,
-    failpoints::names as workflow_failpoint_names,
+    contracts, failpoints::names as workflow_failpoint_names,
+    sandbox_contracts::SandboxModuleWorkflowTaskV1Handler,
 };
 
 struct GeneratedSeedHarness<T> {
@@ -402,6 +410,284 @@ impl WorkflowHandler for BlockingResumeHandler {
         })
     }
 }
+
+#[derive(Clone, Debug, Default)]
+struct ContractParityLogic;
+
+impl ContractParityLogic {
+    fn route(&self, event: &contracts::WorkflowSourceEvent) -> String {
+        String::from_utf8_lossy(&event.key)
+            .split_once(':')
+            .expect("event key should contain an instance prefix")
+            .0
+            .to_string()
+    }
+
+    fn handle(
+        &self,
+        input: &contracts::WorkflowTransitionInput,
+    ) -> contracts::WorkflowTransitionOutput {
+        let sequence = input.history_len.saturating_add(1);
+        let id = format!("{}:{sequence}", input.instance_id);
+        let payload = match &input.trigger {
+            contracts::WorkflowTrigger::Event { event } => event.key.clone(),
+            contracts::WorkflowTrigger::Timer { payload, .. } => payload.clone(),
+            contracts::WorkflowTrigger::Callback { response, .. } => response.clone(),
+        };
+        contracts::WorkflowTransitionOutput {
+            state: contracts::WorkflowStateMutation::Put {
+                state: contracts::WorkflowPayload::bytes(format!(
+                    "contract:{}:{sequence}",
+                    input.workflow_name
+                )),
+            },
+            lifecycle: None,
+            visibility: None,
+            continue_as_new: None,
+            commands: vec![contracts::WorkflowCommand::Outbox {
+                entry: contracts::WorkflowOutboxCommand {
+                    outbox_id: id.clone().into_bytes(),
+                    idempotency_key: id,
+                    payload,
+                },
+            }],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeContractHandler {
+    logic: ContractParityLogic,
+}
+
+#[async_trait]
+impl contracts::WorkflowHandlerContract for NativeContractHandler {
+    async fn route_event(
+        &self,
+        event: &contracts::WorkflowSourceEvent,
+    ) -> Result<String, contracts::WorkflowTaskError> {
+        Ok(self.logic.route(event))
+    }
+
+    async fn handle_task(
+        &self,
+        input: contracts::WorkflowTransitionInput,
+        _ctx: contracts::WorkflowDeterministicContext,
+    ) -> Result<contracts::WorkflowTransitionOutput, contracts::WorkflowTaskError> {
+        Ok(self.logic.handle(&input))
+    }
+}
+
+fn contract_bundle(module: &str) -> contracts::WorkflowBundleMetadata {
+    contracts::WorkflowBundleMetadata {
+        bundle_id: contracts::WorkflowBundleId::new(format!("bundle:{module}")).expect("bundle id"),
+        workflow_name: "contract-billing".to_string(),
+        kind: contracts::WorkflowBundleKind::Sandbox {
+            abi: terracedb_workflows::sandbox_contracts::WORKFLOW_TASK_V1_ABI.to_string(),
+            module: module.to_string(),
+            entrypoint: "default".to_string(),
+        },
+        created_at_millis: 1,
+        labels: BTreeMap::from([(
+            terracedb_workflows::WORKFLOW_RUNTIME_SURFACE_LABEL.to_string(),
+            terracedb_workflows::WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1.to_string(),
+        )]),
+    }
+}
+
+fn native_contract_bundle() -> contracts::WorkflowBundleMetadata {
+    contracts::WorkflowBundleMetadata {
+        bundle_id: contracts::WorkflowBundleId::new("bundle:native-contract").expect("bundle id"),
+        workflow_name: "contract-billing".to_string(),
+        kind: contracts::WorkflowBundleKind::NativeRust {
+            registration: "tests/native-contract".to_string(),
+        },
+        created_at_millis: 1,
+        labels: BTreeMap::from([(
+            terracedb_workflows::WORKFLOW_RUNTIME_SURFACE_LABEL.to_string(),
+            terracedb_workflows::WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1.to_string(),
+        )]),
+    }
+}
+
+fn sandbox_store(now: u64, seed: u64) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
+    let dependencies = DbDependencies::new(
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+        Arc::new(StubClock::new(Timestamp::new(now))),
+        Arc::new(StubRng::seeded(seed)),
+    );
+    let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
+    let sandbox = DefaultSandboxStore::new(
+        Arc::new(vfs.clone()),
+        dependencies.clock,
+        SandboxServices::deterministic(),
+    );
+    (vfs, sandbox)
+}
+
+async fn seed_sandbox_workflow_module(store: &InMemoryVfsStore, volume_id: VolumeId, path: &str) {
+    let base = store
+        .open_volume(
+            VolumeConfig::new(volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open sandbox base volume");
+    base.fs()
+        .write_file(
+            path,
+            CONTRACT_PARITY_SANDBOX_MODULE.as_bytes().to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write sandbox workflow module");
+}
+
+async fn open_sandbox_contract_handler(
+    now: u64,
+    seed: u64,
+    base_volume_id: VolumeId,
+    session_volume_id: VolumeId,
+    module_path: &str,
+    bundle: contracts::WorkflowBundleMetadata,
+) -> ContractWorkflowHandler<
+    terracedb_workflows::sandbox_contracts::SandboxWorkflowHandlerAdapter<
+        SandboxModuleWorkflowTaskV1Handler,
+    >,
+> {
+    let (vfs, sandbox) = sandbox_store(now, seed);
+    seed_sandbox_workflow_module(&vfs, base_volume_id, module_path).await;
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open sandbox session");
+    ContractWorkflowHandler::new(
+        bundle.clone(),
+        terracedb_workflows::sandbox_contracts::SandboxWorkflowHandlerAdapter::new(
+            SandboxModuleWorkflowTaskV1Handler::new(session, bundle).expect("sandbox handler"),
+        ),
+    )
+    .expect("contract handler")
+}
+
+async fn drive_contract_runtime<H>(
+    path: &str,
+    clock: Arc<StubClock>,
+    handler: H,
+    workflow_name: &str,
+) -> Result<WorkflowTablesSnapshot, WorkflowError>
+where
+    H: terracedb_workflows::WorkflowRuntimeHandler + 'static,
+{
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("contract_source"))
+        .await
+        .expect("create source table");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(workflow_name, [source.clone()], handler),
+    )
+    .await?;
+    let handle = runtime.start().await?;
+
+    source
+        .write(b"acct-7:created".to_vec(), Value::bytes("created"))
+        .await
+        .expect("write source event");
+    runtime
+        .wait_for_state(
+            "acct-7",
+            Value::bytes(format!("contract:{workflow_name}:1")),
+        )
+        .await?;
+    let snapshot = snapshot_workflow_tables(runtime.tables())
+        .await
+        .expect("snapshot workflow tables");
+    handle.abort().await?;
+    Ok(snapshot)
+}
+
+const CONTRACT_PARITY_SANDBOX_MODULE: &str = r#"
+const bytes = (value) => Array.from(value).map((char) => char.charCodeAt(0));
+const keyToInstance = (key) => String.fromCharCode(...key).split(":")[0];
+
+function payloadFromTrigger(trigger) {
+  switch (trigger.kind) {
+    case "event":
+      return trigger.event.key;
+    case "timer":
+      return trigger.payload;
+    case "callback":
+      return trigger.response;
+    default:
+      throw { code: "invalid-contract", message: `unknown trigger kind ${trigger.kind}` };
+  }
+}
+
+export default {
+  routeEventV1(request) {
+    return {
+      abi: request.abi,
+      instance_id: keyToInstance(request.event.key),
+    };
+  },
+
+  async handleTaskV1(request) {
+    const sequence = request.input.history_len + 1;
+    const id = `${request.input.instance_id}:${sequence}`;
+    return {
+      abi: request.abi,
+      output: {
+        state: {
+          kind: "put",
+          state: {
+            encoding: "application/octet-stream",
+            bytes: bytes(`contract:${request.input.workflow_name}:${sequence}`),
+          },
+        },
+        lifecycle: null,
+        visibility: null,
+        continue_as_new: null,
+        commands: [
+          {
+            kind: "outbox",
+            entry: {
+              outbox_id: bytes(id),
+              idempotency_key: id,
+              payload: payloadFromTrigger(request.input.trigger),
+            },
+          },
+        ],
+      },
+    };
+  },
+};
+"#;
 
 #[tokio::test]
 async fn workflow_runtime_surfaces_typed_change_feed_storage_errors() {
@@ -3159,4 +3445,299 @@ async fn workflow_runtime_surfaces_change_feed_scan_failures_without_panicking()
             .expect("load source cursor after failed workflow runtime"),
         LogCursor::beginning()
     );
+}
+
+#[tokio::test]
+async fn contract_runtime_keeps_native_and_sandbox_handlers_in_parity() {
+    let native_snapshot = drive_contract_runtime(
+        "/workflow-contract-native",
+        Arc::new(StubClock::new(Timestamp::new(100))),
+        ContractWorkflowHandler::new(
+            native_contract_bundle(),
+            NativeContractHandler {
+                logic: ContractParityLogic,
+            },
+        )
+        .expect("native contract handler"),
+        "contract-billing",
+    )
+    .await
+    .expect("drive native contract runtime");
+
+    let sandbox_bundle = contract_bundle("/workspace/billing.js");
+    let sandbox_snapshot = drive_contract_runtime(
+        "/workflow-contract-sandbox",
+        Arc::new(StubClock::new(Timestamp::new(100))),
+        open_sandbox_contract_handler(
+            100,
+            501,
+            VolumeId::new(0x9400),
+            VolumeId::new(0x9401),
+            "/workspace/billing.js",
+            sandbox_bundle,
+        )
+        .await,
+        "contract-billing",
+    )
+    .await
+    .expect("drive sandbox contract runtime");
+
+    assert_eq!(native_snapshot, sandbox_snapshot);
+}
+
+#[tokio::test]
+async fn contract_runtime_requires_explicit_runtime_surface_compatibility() {
+    let mut bundle = native_contract_bundle();
+    bundle.labels.clear();
+    let error = ContractWorkflowHandler::new(
+        bundle,
+        NativeContractHandler {
+            logic: ContractParityLogic,
+        },
+    )
+    .expect_err("missing runtime-surface label should fail fast");
+    assert_eq!(error.code, "invalid-contract");
+    assert!(
+        error
+            .message
+            .contains(terracedb_workflows::WORKFLOW_RUNTIME_SURFACE_LABEL)
+    );
+}
+
+#[tokio::test]
+async fn contract_runtime_rejects_legacy_pending_inbox_rows_without_admitted_at() {
+    #[derive(Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyStoredWorkflowTrigger {
+        Callback {
+            callback_id: String,
+            response: Vec<u8>,
+        },
+    }
+
+    #[derive(Serialize)]
+    struct LegacyStoredAdmittedWorkflowTrigger {
+        workflow_instance: String,
+        trigger_seq: u64,
+        trigger: LegacyStoredWorkflowTrigger,
+        operation_context: Option<terracedb::OperationContext>,
+    }
+
+    fn encode_legacy_payload(value: &impl Serialize) -> Vec<u8> {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(
+            &serde_json::to_vec(value).expect("encode legacy workflow inbox payload"),
+        );
+        bytes
+    }
+
+    let clock = Arc::new(StubClock::new(Timestamp::new(300)));
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-contract-legacy-inbox",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let bootstrap_runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock.clone(),
+        WorkflowDefinition::new(
+            "contract-billing",
+            std::iter::empty::<Table>(),
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open bootstrap runtime");
+    bootstrap_runtime
+        .tables()
+        .inbox_table()
+        .write(
+            {
+                let mut key = b"acct-7".to_vec();
+                key.push(0);
+                key.extend_from_slice(&1_u64.to_be_bytes());
+                key
+            },
+            Value::bytes(encode_legacy_payload(
+                &LegacyStoredAdmittedWorkflowTrigger {
+                    workflow_instance: "acct-7".to_string(),
+                    trigger_seq: 1,
+                    trigger: LegacyStoredWorkflowTrigger::Callback {
+                        callback_id: "cb-legacy".to_string(),
+                        response: b"legacy".to_vec(),
+                    },
+                    operation_context: None,
+                },
+            )),
+        )
+        .await
+        .expect("write legacy inbox row");
+
+    let error = match WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "contract-billing",
+            std::iter::empty::<Table>(),
+            ContractWorkflowHandler::new(
+                native_contract_bundle(),
+                NativeContractHandler {
+                    logic: ContractParityLogic,
+                },
+            )
+            .expect("native contract handler"),
+        ),
+    )
+    .await
+    {
+        Ok(_) => panic!("legacy inbox rows should fail fast for contract runtime"),
+        Err(error) => error,
+    };
+
+    match error {
+        WorkflowError::Handler { source, .. } => {
+            assert!(source.to_string().contains("predates that format"));
+        }
+        other => panic!("expected handler validation error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sandbox_contract_runtime_reopen_preserves_replay_semantics() {
+    let clock = Arc::new(StubClock::new(Timestamp::new(200)));
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-contract-sandbox-restart",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let bundle = contract_bundle("/workspace/billing.js");
+
+    let runtime = tokio::time::timeout(
+        Duration::from_secs(5),
+        WorkflowRuntime::open(
+            db.clone(),
+            clock.clone(),
+            WorkflowDefinition::new(
+                "contract-billing",
+                std::iter::empty::<Table>(),
+                open_sandbox_contract_handler(
+                    200,
+                    601,
+                    VolumeId::new(0x9410),
+                    VolumeId::new(0x9411),
+                    "/workspace/billing.js",
+                    bundle.clone(),
+                )
+                .await,
+            ),
+        ),
+    )
+    .await
+    .expect("timed out opening initial workflow runtime")
+    .expect("open initial workflow runtime");
+    let handle = runtime
+        .start()
+        .await
+        .expect("start initial workflow runtime");
+
+    runtime
+        .admit_callback("acct-7", "cb-1", b"first".to_vec())
+        .await
+        .expect("admit first callback");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("contract:contract-billing:1")),
+    )
+    .await
+    .expect("timed out waiting for first state")
+    .expect("wait for first state");
+    tokio::time::timeout(Duration::from_secs(5), handle.abort())
+        .await
+        .expect("timed out aborting initial runtime")
+        .expect("abort initial runtime");
+
+    let reopened_runtime = tokio::time::timeout(
+        Duration::from_secs(5),
+        WorkflowRuntime::open(
+            db.clone(),
+            clock.clone(),
+            WorkflowDefinition::new(
+                "contract-billing",
+                std::iter::empty::<Table>(),
+                open_sandbox_contract_handler(
+                    200,
+                    602,
+                    VolumeId::new(0x9420),
+                    VolumeId::new(0x9421),
+                    "/workspace/billing.js",
+                    bundle,
+                )
+                .await,
+            ),
+        ),
+    )
+    .await
+    .expect("timed out reopening workflow runtime")
+    .expect("reopen workflow runtime");
+    let reopened_handle = reopened_runtime
+        .start()
+        .await
+        .expect("start reopened workflow runtime");
+
+    reopened_runtime
+        .admit_callback("acct-7", "cb-2", b"second".to_vec())
+        .await
+        .expect("admit second callback");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        reopened_runtime.wait_for_state("acct-7", Value::bytes("contract:contract-billing:2")),
+    )
+    .await
+    .expect("timed out waiting for second state")
+    .expect("wait for second state");
+
+    assert_eq!(
+        reopened_runtime
+            .load_state("acct-7")
+            .await
+            .expect("load reopened state"),
+        Some(Value::bytes("contract:contract-billing:2"))
+    );
+    assert!(
+        reopened_runtime
+            .tables()
+            .outbox_table()
+            .read(b"acct-7:1".to_vec())
+            .await
+            .expect("read first outbox entry")
+            .is_some()
+    );
+    assert!(
+        reopened_runtime
+            .tables()
+            .outbox_table()
+            .read(b"acct-7:2".to_vec())
+            .await
+            .expect("read second outbox entry")
+            .is_some()
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), reopened_handle.abort())
+        .await
+        .expect("timed out aborting reopened runtime")
+        .expect("abort reopened runtime");
 }
