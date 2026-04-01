@@ -2379,6 +2379,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "terracedb-fuzz",
  "terracedb-otel",
  "terracedb-projections",
  "terracedb-simulation",
@@ -2537,6 +2538,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
+ "terracedb-fuzz",
  "terracedb-http",
  "terracedb-projections",
  "terracedb-records",
@@ -2545,6 +2547,20 @@ dependencies = [
  "terracedb-workflows",
  "thiserror 2.0.18",
  "tokio",
+ "turmoil",
+]
+
+[[package]]
+name = "terracedb-fuzz"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-simulation",
+ "terracedb-vfs",
+ "thiserror 2.0.18",
  "turmoil",
 ]
 
@@ -2667,6 +2683,7 @@ dependencies = [
  "async-trait",
  "futures",
  "terracedb",
+ "terracedb-fuzz",
  "terracedb-otel",
  "terracedb-simulation",
  "thiserror 2.0.18",
@@ -2694,6 +2711,7 @@ dependencies = [
  "async-trait",
  "futures",
  "terracedb",
+ "terracedb-fuzz",
  "terracedb-simulation",
  "thiserror 2.0.18",
  "tokio",
@@ -2752,6 +2770,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
+ "terracedb-fuzz",
  "terracedb-simulation",
  "thiserror 2.0.18",
  "tokio",
@@ -2767,6 +2786,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
+ "terracedb-fuzz",
  "terracedb-otel",
  "terracedb-simulation",
  "thiserror 2.0.18",

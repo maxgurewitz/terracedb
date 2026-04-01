@@ -7,6 +7,7 @@ use terracedb::{
     Value,
     test_support::{row_table_config, tiered_test_config},
 };
+use terracedb_fuzz::{assert_seed_replays, assert_seed_variation};
 use terracedb_projections::{
     MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionHandle,
     ProjectionHandler, ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun,
@@ -21,6 +22,27 @@ const PROJECTION_SIMULATION_DURATION: std::time::Duration = std::time::Duration:
 const SIMULATION_MIN_MESSAGE_LATENCY: std::time::Duration = std::time::Duration::from_millis(1);
 const SIMULATION_MAX_MESSAGE_LATENCY: std::time::Duration = std::time::Duration::from_millis(1);
 const RECENT_TODO_LIMIT: usize = 10;
+
+struct ProjectionSeedHarness<T> {
+    run: fn(u64) -> turmoil::Result<T>,
+}
+
+impl<T> terracedb_fuzz::GeneratedScenarioHarness for ProjectionSeedHarness<T>
+where
+    T: Clone + std::fmt::Debug + PartialEq + Eq,
+{
+    type Scenario = u64;
+    type Outcome = T;
+    type Error = Box<dyn std::error::Error>;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        seed
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        Ok((self.run)(scenario)?)
+    }
+}
 
 struct MirrorProjection {
     output: Table,
@@ -482,37 +504,51 @@ fn run_multi_source_projection_simulation(
 
 #[test]
 fn projection_simulation_replays_same_seed() -> turmoil::Result {
-    let first = run_projection_simulation(0x1234_5678)?;
-    let second = run_projection_simulation(0x1234_5678)?;
-
-    assert_eq!(first, second);
+    let replay = assert_seed_replays(
+        &ProjectionSeedHarness {
+            run: run_projection_simulation,
+        },
+        0x1234_5678,
+    )?;
+    assert!(!replay.outcome.snapshots.is_empty());
     Ok(())
 }
 
 #[test]
 fn projection_simulation_changes_shape_for_different_seeds() -> turmoil::Result {
-    let left = run_projection_simulation(7)?;
-    let right = run_projection_simulation(8)?;
-
-    assert_ne!(left, right);
+    let _ = assert_seed_variation(
+        &ProjectionSeedHarness {
+            run: run_projection_simulation,
+        },
+        7,
+        8,
+        |left, right| left.outcome != right.outcome,
+    )?;
     Ok(())
 }
 
 #[test]
 fn multi_source_projection_simulation_replays_same_seed() -> turmoil::Result {
-    let first = run_multi_source_projection_simulation(0x0bad_5eed)?;
-    let second = run_multi_source_projection_simulation(0x0bad_5eed)?;
-
-    assert_eq!(first, second);
+    let replay = assert_seed_replays(
+        &ProjectionSeedHarness {
+            run: run_multi_source_projection_simulation,
+        },
+        0x0bad_5eed,
+    )?;
+    assert!(!replay.outcome.is_empty());
     Ok(())
 }
 
 #[test]
 fn multi_source_projection_simulation_changes_shape_for_different_seeds() -> turmoil::Result {
-    let left = run_multi_source_projection_simulation(17)?;
-    let right = run_multi_source_projection_simulation(23)?;
-
-    assert_ne!(left, right);
+    let _ = assert_seed_variation(
+        &ProjectionSeedHarness {
+            run: run_multi_source_projection_simulation,
+        },
+        17,
+        23,
+        |left, right| left.outcome != right.outcome,
+    )?;
     Ok(())
 }
 

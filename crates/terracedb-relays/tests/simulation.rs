@@ -3,10 +3,11 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, Db, DbConfig, OutboxEntry, S3Location, ScanOptions,
-    SsdConfig, StorageConfig, Table, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Transaction, Value,
+    Clock, CommitOptions, CompactionStrategy, Db, DbConfig, DeterministicRng, OutboxEntry, Rng,
+    S3Location, ScanOptions, SsdConfig, StorageConfig, Table, TableConfig, TableFormat,
+    TieredDurabilityMode, TieredStorageConfig, Transaction, Value,
 };
+use terracedb_fuzz::{GeneratedScenarioHarness, assert_seed_replays, assert_seed_variation};
 use terracedb_relays::{OutboxRelay, OutboxRelayHandler, RelayEntry};
 use terracedb_simulation::SeededSimulationRunner;
 use thiserror::Error;
@@ -141,6 +142,112 @@ async fn collect_rows(table: &Table) -> Result<Vec<String>, terracedb::ReadError
     Ok(values)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelayGeneratedScenario {
+    seed: u64,
+    batches: Vec<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelayGeneratedOutcome {
+    rows: Vec<String>,
+    observed_counts: Vec<Vec<usize>>,
+}
+
+struct RelayGeneratedHarness;
+
+impl GeneratedScenarioHarness for RelayGeneratedHarness {
+    type Scenario = RelayGeneratedScenario;
+    type Outcome = RelayGeneratedOutcome;
+    type Error = Box<dyn std::error::Error>;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        let rng = DeterministicRng::seeded(seed ^ 0x7713);
+        let batch_count = ((rng.next_u64() as usize) % 3) + 2;
+        let mut batches = Vec::with_capacity(batch_count);
+        for batch in 0..batch_count {
+            let entry_count = ((rng.next_u64() as usize) % 4) + 1;
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                let todo_idx = (rng.next_u64() as usize) % 6;
+                entries.push(format!("todo-{batch}-{todo_idx}"));
+            }
+            batches.push(entries);
+        }
+        RelayGeneratedScenario { seed, batches }
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        Ok(run_generated_relay_scenario(scenario)?)
+    }
+}
+
+fn run_generated_relay_scenario(
+    scenario: RelayGeneratedScenario,
+) -> turmoil::Result<RelayGeneratedOutcome> {
+    SeededSimulationRunner::new(scenario.seed)
+        .with_message_latency(MIN_MESSAGE_LATENCY, MAX_MESSAGE_LATENCY)
+        .run_with(move |context| {
+            let scenario = scenario.clone();
+            async move {
+                let db = context
+                    .open_db(simulation_config("/relays/generated-campaign"))
+                    .await?;
+                let outbox_table = db.create_table(row_table_config("outbox")).await?;
+                let todos = db.create_table(row_table_config("todos")).await?;
+                let outbox = terracedb::TransactionalOutbox::new(outbox_table.clone());
+                let clock: Arc<dyn Clock> = context.clock();
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let relay = OutboxRelay::new(
+                    db.clone(),
+                    clock,
+                    outbox_table.clone(),
+                    MirrorRelayHandler {
+                        todos: todos.clone(),
+                    },
+                )
+                .with_batch_limit(8)
+                .with_idle_poll_interval(Duration::from_millis(1));
+                let relay_task = tokio::spawn(async move { relay.run(shutdown_rx).await });
+
+                let mut expected = std::collections::BTreeSet::new();
+                let mut observed_counts = Vec::new();
+                for (batch_index, batch) in scenario.batches.iter().enumerate() {
+                    let mut write_batch = db.write_batch();
+                    for (entry_index, todo_id) in batch.iter().enumerate() {
+                        outbox.stage_entry(
+                            &mut write_batch,
+                            OutboxEntry {
+                                outbox_id: format!("generated:{batch_index}:{entry_index}")
+                                    .into_bytes(),
+                                idempotency_key: format!("generated:{batch_index}:{entry_index}"),
+                                payload: todo_id.clone().into_bytes(),
+                            },
+                        )?;
+                        expected.insert(todo_id.clone());
+                    }
+                    db.commit(write_batch, CommitOptions::default()).await?;
+                    observed_counts
+                        .push(observe_row_counts_until(&db, &todos, expected.len()).await?);
+                }
+
+                let rows = collect_rows(&todos).await?;
+                let expected_rows = expected.into_iter().collect::<Vec<_>>();
+                assert_eq!(rows, expected_rows);
+                assert_eq!(count_rows(&outbox_table).await?, 0);
+
+                shutdown_tx.send_replace(true);
+                relay_task
+                    .await
+                    .expect("generated relay task should join")?;
+                Ok(RelayGeneratedOutcome {
+                    rows,
+                    observed_counts,
+                })
+            }
+        })
+}
+
 #[test]
 fn relay_simulation_applies_placeholder_batch_atomically() -> turmoil::Result {
     SeededSimulationRunner::new(0x7711)
@@ -266,4 +373,26 @@ fn relay_simulation_processes_later_batches_after_idle() -> turmoil::Result {
             relay_task.await.expect("relay task should join")?;
             Ok(())
         })
+}
+
+#[test]
+fn relay_generated_campaign_replays_same_seed() -> turmoil::Result {
+    let replay = assert_seed_replays(&RelayGeneratedHarness, 0x7713)?;
+    assert!(!replay.outcome.rows.is_empty());
+    assert!(
+        replay
+            .outcome
+            .observed_counts
+            .iter()
+            .all(|counts| !counts.is_empty())
+    );
+    Ok(())
+}
+
+#[test]
+fn relay_generated_campaign_varies_across_seeds() -> turmoil::Result {
+    let _ = assert_seed_variation(&RelayGeneratedHarness, 0x7713, 0x7714, |left, right| {
+        left.scenario != right.scenario || left.outcome != right.outcome
+    })?;
+    Ok(())
 }

@@ -19,6 +19,7 @@ terracedb-relays = { path = "../../crates/terracedb-relays" }
 terracedb-workflows = { path = "../../crates/terracedb-workflows" }
 
 [dev-dependencies]
+terracedb-fuzz = { path = "../../crates/terracedb-fuzz" }
 terracedb-http = { path = "../../crates/terracedb-http", features = ["axum"] }
 terracedb-simulation = { path = "../../crates/terracedb-simulation" }
 tokio = { version = "1.50.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

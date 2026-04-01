@@ -13,6 +13,7 @@ tracing = "0.1.41"
 
 [dev-dependencies]
 terracedb = { path = "../..", features = ["test-support"] }
+terracedb-fuzz = { path = "../terracedb-fuzz" }
 terracedb-otel = { path = "../terracedb-otel" }
 terracedb-simulation = { path = "../terracedb-simulation" }
 tokio = { version = "1.48.0", features = ["macros", "rt", "sync", "time"] }

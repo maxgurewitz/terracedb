@@ -170,7 +170,7 @@ pub enum WorkloadOperation {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedScenario {
     pub seed: u64,
     pub workload: Vec<WorkloadOperation>,
@@ -301,7 +301,7 @@ pub enum DbWorkloadOperation {
     RunCompaction,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbGeneratedScenario {
     pub seed: u64,
     pub root_path: String,
