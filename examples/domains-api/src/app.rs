@@ -9,23 +9,28 @@ use axum::{
 };
 use futures::StreamExt;
 use terracedb::{
-    ColocatedDeployment, CreateTableError, Db, DbBuilder, ExecutionBacklogGuard, ExecutionLane,
-    ExecutionUsageLease, FlushError, ReadError, ResourceAdmissionDecision, ScanOptions,
-    StorageError,
+    AdmissionPressureLevel, ColocatedDeployment, CreateTableError, Db, DbBuilder,
+    ExecutionBacklogGuard, ExecutionLane, ExecutionUsageLease, FlushError, ReadError,
+    ResourceAdmissionDecision, ScanOptions, StorageError, TransactionCommitError,
+    multi_signal_write_admission,
 };
 use terracedb_records::{
-    JsonValueCodec, RecordReadError, RecordStream, RecordTable, RecordWriteError, Utf8StringCodec,
+    JsonValueCodec, RecordReadError, RecordStream, RecordTable, RecordTransaction,
+    RecordWriteError, Utf8StringCodec,
 };
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::model::{
     ANALYTICS_DATABASE_NAME, ActivePressureView, AdmissionProbeRequest, AdmissionProbeResponse,
     BackgroundMaintenanceRequest, BackgroundMaintenanceResponse, BackgroundPressureView,
     ControlPlaneTableRequest, ControlPlaneTableResponse, CreatePrimaryItemRequest,
-    DOMAINS_SERVER_PORT, DomainsExampleProfile, DomainsObservabilityResponse, ExampleDatabase,
+    DEFAULT_PRIMARY_BURST_TITLE_BYTES, DOMAINS_SERVER_PORT, DomainsExampleProfile,
+    DomainsObservabilityResponse, ExampleDatabase, HELPER_PRESSURE_PROBE_WRITE_BYTES,
     HELPER_REPORTS_TABLE_NAME, HelperLoadRequest, HelperLoadResponse, HelperPressureView,
-    HelperReportRecord, PRIMARY_DATABASE_NAME, PRIMARY_ITEMS_TABLE_NAME, PrimaryItemRecord,
-    domains_db_settings, row_table_config,
+    HelperReportRecord, PRIMARY_DATABASE_NAME, PRIMARY_ITEMS_TABLE_NAME,
+    PRIMARY_PRESSURE_PROBE_WRITE_BYTES, PrimaryBurstRequest, PrimaryBurstResponse,
+    PrimaryItemRecord, WorkloadObservabilityView, domains_db_settings, row_table_config,
 };
 
 type PrimaryItemsTable =
@@ -43,6 +48,8 @@ pub enum DomainsAppError {
     Read(#[from] ReadError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    TransactionCommit(#[from] TransactionCommitError),
     #[error(transparent)]
     RecordRead(#[from] RecordReadError),
     #[error(transparent)]
@@ -117,12 +124,12 @@ struct ActiveHelperPressure {
 }
 
 #[derive(Default)]
-struct ActivePressureState {
+struct HeldPressureState {
     primary_background: Option<ActivePrimaryPressure>,
     helper: Option<ActiveHelperPressure>,
 }
 
-impl ActivePressureState {
+impl HeldPressureState {
     fn view(&self) -> ActivePressureView {
         ActivePressureView {
             primary_background: self
@@ -142,7 +149,9 @@ pub struct DomainsAppState {
     analytics_db: Db,
     primary_items: PrimaryItemsTable,
     helper_reports: HelperReportsTable,
-    active_pressure: Arc<Mutex<ActivePressureState>>,
+    held_pressure: Arc<Mutex<HeldPressureState>>,
+    active_pressure: watch::Receiver<ActivePressureView>,
+    active_pressure_publisher: watch::Sender<ActivePressureView>,
 }
 
 impl std::fmt::Debug for DomainsAppState {
@@ -157,6 +166,57 @@ impl std::fmt::Debug for DomainsAppState {
 
 pub struct DomainsApp {
     state: DomainsAppState,
+}
+
+#[derive(Debug)]
+pub struct ActivePressureSubscription {
+    inner: watch::Receiver<ActivePressureView>,
+}
+
+impl ActivePressureSubscription {
+    fn new(inner: watch::Receiver<ActivePressureView>) -> Self {
+        Self { inner }
+    }
+
+    pub fn current(&self) -> ActivePressureView {
+        self.inner.borrow().clone()
+    }
+
+    pub async fn changed(&mut self) -> Result<ActivePressureView, terracedb::SubscriptionClosed> {
+        self.inner
+            .changed()
+            .await
+            .map_err(|_| terracedb::SubscriptionClosed)?;
+        Ok(self.current())
+    }
+
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<ActivePressureView, terracedb::SubscriptionClosed>
+    where
+        F: FnMut(&ActivePressureView) -> bool,
+    {
+        let current = self.current();
+        if predicate(&current) {
+            return Ok(current);
+        }
+
+        loop {
+            let current = self.changed().await?;
+            if predicate(&current) {
+                return Ok(current);
+            }
+        }
+    }
+}
+
+impl Clone for ActivePressureSubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl DomainsApp {
@@ -206,6 +266,9 @@ impl DomainsApp {
             JsonValueCodec::new(),
         );
 
+        let (active_pressure_publisher, active_pressure) =
+            watch::channel(ActivePressureView::default());
+
         Ok(Self {
             state: DomainsAppState {
                 profile,
@@ -214,7 +277,9 @@ impl DomainsApp {
                 analytics_db,
                 primary_items,
                 helper_reports,
-                active_pressure: Arc::new(Mutex::new(ActivePressureState::default())),
+                held_pressure: Arc::new(Mutex::new(HeldPressureState::default())),
+                active_pressure,
+                active_pressure_publisher,
             },
         })
     }
@@ -229,6 +294,7 @@ impl DomainsApp {
                 "/primary/items",
                 post(create_primary_item).get(list_primary_items),
             )
+            .route("/primary/burst", post(run_primary_burst))
             .route("/primary/maintenance", post(apply_primary_maintenance))
             .route(
                 "/primary/maintenance/release",
@@ -262,6 +328,10 @@ impl DomainsAppState {
         &self.analytics_db
     }
 
+    pub fn subscribe_active_pressure(&self) -> ActivePressureSubscription {
+        ActivePressureSubscription::new(self.active_pressure_publisher.subscribe())
+    }
+
     pub async fn create_primary_item(
         &self,
         request: CreatePrimaryItemRequest,
@@ -279,6 +349,51 @@ impl DomainsAppState {
             .await
             .map_err(DomainsAppError::from)?;
         Ok(record)
+    }
+
+    pub async fn run_primary_burst(
+        &self,
+        request: PrimaryBurstRequest,
+    ) -> Result<PrimaryBurstResponse, DomainsAppError> {
+        let batch_id = normalize_non_empty("batch_id", &request.batch_id)?;
+        if request.item_count == 0 {
+            return Err(DomainsAppError::Usage(
+                "item_count must be greater than zero".to_string(),
+            ));
+        }
+        let title_bytes = normalize_positive_u32(
+            "title_bytes",
+            request.title_bytes,
+            DEFAULT_PRIMARY_BURST_TITLE_BYTES,
+        )? as usize;
+
+        for ordinal in 0..request.item_count {
+            let item_id = format!("{batch_id}:{ordinal:04}");
+            if self.primary_items.read_str(&item_id).await?.is_some() {
+                return Err(DomainsAppError::Conflict(format!(
+                    "primary burst item '{item_id}' already exists"
+                )));
+            }
+        }
+
+        let mut tx = RecordTransaction::begin(&self.primary_db).await;
+        for ordinal in 0..request.item_count {
+            let item_id = format!("{batch_id}:{ordinal:04}");
+            let record = PrimaryItemRecord {
+                item_id: item_id.clone(),
+                title: build_primary_burst_title(&batch_id, ordinal, title_bytes),
+            };
+            tx.write(&self.primary_items, &item_id, &record)?;
+        }
+
+        let sequence = tx.commit_no_flush().await?;
+        Ok(PrimaryBurstResponse {
+            batch_id,
+            written_items: request.item_count,
+            primary_item_count: self.list_primary_items().await?.len(),
+            commit_sequence: sequence.get(),
+            primary_writer: self.primary_workload_observability().await,
+        })
     }
 
     pub async fn list_primary_items(&self) -> Result<Vec<PrimaryItemRecord>, DomainsAppError> {
@@ -301,18 +416,17 @@ impl DomainsAppState {
     ) -> Result<HelperLoadResponse, DomainsAppError> {
         let batch_id = normalize_non_empty("batch_id", &request.batch_id)?;
         let mut last_sequence = None;
-        for ordinal in 0..request.report_count {
-            let report = HelperReportRecord {
-                report_id: format!("{batch_id}:{ordinal:04}"),
-                batch_id: batch_id.clone(),
-                ordinal,
-            };
-            last_sequence = Some(
-                self.helper_reports
-                    .write_str(&report.report_id, &report)
-                    .await?
-                    .get(),
-            );
+        if request.report_count > 0 {
+            let mut tx = RecordTransaction::begin(&self.analytics_db).await;
+            for ordinal in 0..request.report_count {
+                let report = HelperReportRecord {
+                    report_id: format!("{batch_id}:{ordinal:04}"),
+                    batch_id: batch_id.clone(),
+                    ordinal,
+                };
+                tx.write(&self.helper_reports, &report.report_id, &report)?;
+            }
+            last_sequence = Some(tx.commit_no_flush().await?.get());
         }
         let flush_status = if request.flush_after_write {
             Some(self.analytics_db.flush_with_status().await?)
@@ -345,8 +459,7 @@ impl DomainsAppState {
     }
 
     pub fn release_helper_pressure(&self) -> Result<Option<HelperPressureView>, DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        Ok(state.helper.take().map(|pressure| pressure.view))
+        self.update_held_pressure(|state| state.helper.take().map(|pressure| pressure.view))
     }
 
     pub async fn apply_primary_maintenance(
@@ -370,18 +483,19 @@ impl DomainsAppState {
             flushed,
             flush_status,
             background_admission,
-            active_pressure: (!pressure.is_empty()).then_some(pressure),
+            active_pressure: self.active_pressure.borrow().primary_background.clone(),
         })
     }
 
     pub fn release_primary_maintenance(
         &self,
     ) -> Result<Option<BackgroundPressureView>, DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        Ok(state
-            .primary_background
-            .take()
-            .map(|pressure| pressure.view))
+        self.update_held_pressure(|state| {
+            state
+                .primary_background
+                .take()
+                .map(|pressure| pressure.view)
+        })
     }
 
     pub async fn ensure_control_plane_table(
@@ -418,19 +532,28 @@ impl DomainsAppState {
         })
     }
 
-    pub fn observability_report(&self) -> Result<DomainsObservabilityResponse, DomainsAppError> {
+    pub async fn observability_report(
+        &self,
+    ) -> Result<DomainsObservabilityResponse, DomainsAppError> {
+        let profile = self.profile;
+        let deployment = self.deployment.runtime_report();
+        let active_pressure = self.active_pressure.borrow().clone();
+        let primary_writer = self.primary_workload_observability().await;
+        let helper_writer = self.helper_workload_observability().await;
         Ok(DomainsObservabilityResponse {
-            profile: self.profile,
-            deployment: self.deployment.runtime_report(),
-            active_pressure: self.lock_pressure()?.view(),
+            profile,
+            deployment,
+            active_pressure,
+            primary_writer,
+            helper_writer,
         })
     }
 
     pub fn release_all_pressure(&self) -> Result<(), DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        let _ = state.primary_background.take();
-        let _ = state.helper.take();
-        Ok(())
+        self.update_held_pressure(|state| {
+            let _ = state.primary_background.take();
+            let _ = state.helper.take();
+        })
     }
 
     fn replace_helper_pressure(
@@ -443,9 +566,7 @@ impl DomainsAppState {
         ),
         DomainsAppError,
     > {
-        let mut state = self.lock_pressure()?;
-        let _ = state.helper.take();
-        drop(state);
+        let _ = self.update_held_pressure(|state| state.helper.take())?;
 
         if pressure.is_empty() {
             return Ok((None, None));
@@ -493,12 +614,14 @@ impl DomainsAppState {
         };
 
         if !admitted_pressure.is_empty() {
-            self.lock_pressure()?.helper = Some(ActiveHelperPressure {
-                view: admitted_pressure,
-                _foreground: foreground_lease.filter(|lease| lease.admitted()),
-                _background_usage: background_lease.filter(|lease| lease.admitted()),
-                _background_backlog: background_backlog,
-            });
+            self.update_held_pressure(|state| {
+                state.helper = Some(ActiveHelperPressure {
+                    view: admitted_pressure,
+                    _foreground: foreground_lease.filter(|lease| lease.admitted()),
+                    _background_usage: background_lease.filter(|lease| lease.admitted()),
+                    _background_backlog: background_backlog,
+                });
+            })?;
         }
 
         Ok((foreground_admission, background_admission))
@@ -508,9 +631,7 @@ impl DomainsAppState {
         &self,
         pressure: BackgroundPressureView,
     ) -> Result<Option<ResourceAdmissionDecision>, DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        let _ = state.primary_background.take();
-        drop(state);
+        let _ = self.update_held_pressure(|state| state.primary_background.take())?;
 
         if pressure.is_empty() {
             return Ok(None);
@@ -536,11 +657,13 @@ impl DomainsAppState {
             queued_work_items: pressure.queued_work_items,
             queued_bytes: pressure.queued_bytes,
         };
-        self.lock_pressure()?.primary_background = Some(ActivePrimaryPressure {
-            view: admitted_pressure,
-            _usage: usage_lease.admitted().then_some(usage_lease),
-            _backlog: backlog,
-        });
+        self.update_held_pressure(|state| {
+            state.primary_background = Some(ActivePrimaryPressure {
+                view: admitted_pressure,
+                _usage: usage_lease.admitted().then_some(usage_lease),
+                _backlog: backlog,
+            });
+        })?;
         Ok(Some(admission))
     }
 
@@ -551,10 +674,77 @@ impl DomainsAppState {
         }
     }
 
-    fn lock_pressure(&self) -> Result<MutexGuard<'_, ActivePressureState>, DomainsAppError> {
-        self.active_pressure
+    async fn primary_workload_observability(&self) -> WorkloadObservabilityView {
+        self.workload_observability(
+            &self.primary_db,
+            self.primary_items.table(),
+            PRIMARY_PRESSURE_PROBE_WRITE_BYTES,
+        )
+        .await
+    }
+
+    async fn helper_workload_observability(&self) -> WorkloadObservabilityView {
+        self.workload_observability(
+            &self.analytics_db,
+            self.helper_reports.table(),
+            HELPER_PRESSURE_PROBE_WRITE_BYTES,
+        )
+        .await
+    }
+
+    async fn workload_observability(
+        &self,
+        db: &Db,
+        table: &terracedb::Table,
+        sample_batch_write_bytes: u64,
+    ) -> WorkloadObservabilityView {
+        let signals = db
+            .write_admission_signals(table, sample_batch_write_bytes)
+            .await;
+        let next_write_admission = multi_signal_write_admission(&signals);
+        let scheduler = db.scheduler_observability_snapshot();
+        let foreground_domain = db.execution_profile().foreground.domain.clone();
+        let level = next_write_admission.level;
+
+        WorkloadObservabilityView {
+            table_name: table.name().to_string(),
+            foreground_domain: foreground_domain.clone(),
+            background_domain: db.execution_profile().background.domain.clone(),
+            sample_batch_write_bytes,
+            current_pressure: signals.pressure,
+            throttle_active: level != AdmissionPressureLevel::Open,
+            stall_active: level == AdmissionPressureLevel::Stall,
+            throttled_write_events: scheduler
+                .throttled_writes_by_domain
+                .get(&foreground_domain)
+                .copied()
+                .unwrap_or_default(),
+            last_non_open_write_admission: scheduler
+                .last_non_open_admission_by_domain
+                .get(&foreground_domain)
+                .cloned(),
+            next_write_admission,
+        }
+    }
+
+    fn lock_held_pressure(&self) -> Result<MutexGuard<'_, HeldPressureState>, DomainsAppError> {
+        self.held_pressure
             .lock()
             .map_err(|_| DomainsAppError::StatePoisoned)
+    }
+
+    fn update_held_pressure<R>(
+        &self,
+        update: impl FnOnce(&mut HeldPressureState) -> R,
+    ) -> Result<R, DomainsAppError> {
+        let (result, view) = {
+            let mut state = self.lock_held_pressure()?;
+            let result = update(&mut state);
+            let view = state.view();
+            (result, view)
+        };
+        self.active_pressure_publisher.send_replace(view);
+        Ok(result)
     }
 }
 
@@ -584,6 +774,14 @@ async fn create_primary_item(
 ) -> Result<(StatusCode, Json<PrimaryItemRecord>), DomainsApiError> {
     let item = state.create_primary_item(request).await?;
     Ok((StatusCode::CREATED, Json(item)))
+}
+
+async fn run_primary_burst(
+    State(state): State<DomainsAppState>,
+    Json(request): Json<PrimaryBurstRequest>,
+) -> Result<(StatusCode, Json<PrimaryBurstResponse>), DomainsApiError> {
+    let response = state.run_primary_burst(request).await?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn list_primary_items(
@@ -647,8 +845,33 @@ async fn probe_admission(
 async fn domains_report(
     State(state): State<DomainsAppState>,
 ) -> Result<Json<DomainsObservabilityResponse>, DomainsApiError> {
-    Ok(Json(state.observability_report()?))
+    Ok(Json(state.observability_report().await?))
 }
 
 #[allow(dead_code)]
 pub const DEFAULT_SERVER_PORT: u16 = DOMAINS_SERVER_PORT;
+
+fn build_primary_burst_title(batch_id: &str, ordinal: u32, title_bytes: usize) -> String {
+    let prefix = format!("Primary burst {batch_id} #{ordinal:04} ");
+    if prefix.len() >= title_bytes {
+        return prefix;
+    }
+
+    let mut title = prefix;
+    title.push_str(&"x".repeat(title_bytes.saturating_sub(title.len())));
+    title
+}
+
+fn normalize_positive_u32(
+    field: &str,
+    value: u32,
+    default_value: u32,
+) -> Result<u32, DomainsAppError> {
+    let resolved = if value == 0 { default_value } else { value };
+    if resolved == 0 {
+        return Err(DomainsAppError::Usage(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    Ok(resolved)
+}

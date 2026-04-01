@@ -2,10 +2,11 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use terracedb::{
-    ColocatedDatabasePlacement, ColocatedDeployment, ColocatedDeploymentError, CompactionStrategy,
-    DbConfig, DbSettings, ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionLane,
-    ExecutionResourceUsage, S3Location, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredLocalRetentionMode, TieredStorageConfig,
+    AdmissionDiagnostics, ColocatedDatabasePlacement, ColocatedDeployment,
+    ColocatedDeploymentError, CompactionStrategy, DbConfig, DbSettings,
+    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane,
+    ExecutionResourceUsage, PressureStats, S3Location, TableConfig, TableFormat,
+    TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig,
 };
 
 pub const PRIMARY_DATABASE_NAME: &str = "primary";
@@ -13,34 +14,37 @@ pub const ANALYTICS_DATABASE_NAME: &str = "analytics";
 pub const PRIMARY_ITEMS_TABLE_NAME: &str = "primary_items";
 pub const HELPER_REPORTS_TABLE_NAME: &str = "helper_reports";
 pub const DOMAINS_SERVER_PORT: u16 = 9603;
+pub const DEFAULT_PRIMARY_BURST_TITLE_BYTES: u32 = 1_024;
+pub const PRIMARY_PRESSURE_PROBE_WRITE_BYTES: u64 = 1_024;
+pub const HELPER_PRESSURE_PROBE_WRITE_BYTES: u64 = 1_024;
+const EXAMPLE_STORAGE_MAX_LOCAL_BYTES: u64 = 16 * 1_024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DomainsExampleProfile {
     #[default]
     Conservative,
-    Balanced,
+    PrimaryProtected,
 }
 
 impl DomainsExampleProfile {
     pub fn deployment(self) -> Result<ColocatedDeployment, ColocatedDeploymentError> {
-        match self {
-            Self::Conservative => ColocatedDeployment::primary_with_analytics(
-                domains_process_budget(),
-                PRIMARY_DATABASE_NAME,
-                ANALYTICS_DATABASE_NAME,
+        let (primary, analytics) = match self {
+            Self::Conservative => (
+                primary_database_placement(3, 2, 6 * 1_024, 4 * 1_024, 2, 2 * 1_024),
+                analytics_helper_placement(1, 1, 8 * 1_024, 6 * 1_024, 2, 3 * 1_024),
             ),
-            Self::Balanced => ColocatedDeployment::builder(domains_process_budget())
-                .with_database(
-                    ColocatedDatabasePlacement::shared(PRIMARY_DATABASE_NAME)
-                        .with_metadata("terracedb.execution.role", "primary"),
-                )?
-                .with_database(ColocatedDatabasePlacement::analytics_helper(
-                    ANALYTICS_DATABASE_NAME,
-                ))?
-                .build()
-                .pipe(Ok),
-        }
+            Self::PrimaryProtected => (
+                primary_database_placement(4, 1, 4 * 1_024, 2 * 1_024, 1, 1 * 1_024),
+                analytics_helper_placement(1, 1, 8 * 1_024, 4 * 1_024, 1, 2 * 1_024),
+            ),
+        };
+
+        ColocatedDeployment::builder(domains_process_budget())
+            .with_database(primary)?
+            .with_database(analytics)?
+            .build()
+            .pipe(Ok)
     }
 }
 
@@ -48,7 +52,7 @@ impl fmt::Display for DomainsExampleProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Conservative => f.write_str("conservative"),
-            Self::Balanced => f.write_str("balanced"),
+            Self::PrimaryProtected => f.write_str("primary_protected"),
         }
     }
 }
@@ -59,9 +63,9 @@ impl FromStr for DomainsExampleProfile {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "conservative" => Ok(Self::Conservative),
-            "balanced" => Ok(Self::Balanced),
+            "primary_protected" | "primary-protected" => Ok(Self::PrimaryProtected),
             other => Err(format!(
-                "unknown domains example profile '{other}'; expected 'conservative' or 'balanced'"
+                "unknown domains example profile '{other}'; expected 'conservative' or 'primary_protected'"
             )),
         }
     }
@@ -111,6 +115,13 @@ pub struct PrimaryItemRecord {
 pub struct CreatePrimaryItemRequest {
     pub item_id: String,
     pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryBurstRequest {
+    pub batch_id: String,
+    pub item_count: u32,
+    pub title_bytes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,7 +245,7 @@ impl HelperPressureView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivePressureView {
     pub primary_background: Option<BackgroundPressureView>,
     pub helper: Option<HelperPressureView>,
@@ -266,6 +277,29 @@ pub struct ControlPlaneTableResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadObservabilityView {
+    pub table_name: String,
+    pub foreground_domain: ExecutionDomainPath,
+    pub background_domain: ExecutionDomainPath,
+    pub sample_batch_write_bytes: u64,
+    pub current_pressure: PressureStats,
+    pub next_write_admission: AdmissionDiagnostics,
+    pub throttle_active: bool,
+    pub stall_active: bool,
+    pub throttled_write_events: u64,
+    pub last_non_open_write_admission: Option<terracedb::RecordedAdmissionDiagnostics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryBurstResponse {
+    pub batch_id: String,
+    pub written_items: u32,
+    pub primary_item_count: usize,
+    pub commit_sequence: u64,
+    pub primary_writer: WorkloadObservabilityView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionProbeResponse {
     pub database: ExampleDatabase,
     pub lane: ExampleLane,
@@ -277,6 +311,8 @@ pub struct DomainsObservabilityResponse {
     pub profile: DomainsExampleProfile,
     pub deployment: terracedb::ColocatedDeploymentReport,
     pub active_pressure: ActivePressureView,
+    pub primary_writer: WorkloadObservabilityView,
+    pub helper_writer: WorkloadObservabilityView,
 }
 
 pub fn domains_process_budget() -> ExecutionDomainBudget {
@@ -286,9 +322,9 @@ pub fn domains_process_budget() -> ExecutionDomainBudget {
             weight: None,
         },
         memory: terracedb::DomainMemoryBudget {
-            total_bytes: Some(8 * 1024),
-            cache_bytes: Some(6 * 1024),
-            mutable_bytes: Some(6 * 1024),
+            total_bytes: Some(16 * 1_024),
+            cache_bytes: Some(8 * 1_024),
+            mutable_bytes: Some(8 * 1_024),
         },
         io: terracedb::DomainIoBudget {
             local_concurrency: Some(8),
@@ -298,7 +334,7 @@ pub fn domains_process_budget() -> ExecutionDomainBudget {
         },
         background: terracedb::DomainBackgroundBudget {
             task_slots: Some(6),
-            max_in_flight_bytes: Some(8 * 1024),
+            max_in_flight_bytes: Some(4 * 1_024),
         },
     }
 }
@@ -312,7 +348,7 @@ pub fn domains_db_settings(path: &str, prefix: &str) -> DbSettings {
             bucket: "terracedb-domains-example".to_string(),
             prefix: prefix.to_string(),
         },
-        max_local_bytes: 1024 * 1024,
+        max_local_bytes: EXAMPLE_STORAGE_MAX_LOCAL_BYTES,
         durability: TieredDurabilityMode::GroupCommit,
         local_retention: TieredLocalRetentionMode::Offload,
     })
@@ -348,3 +384,87 @@ trait Pipe: Sized {
 }
 
 impl<T> Pipe for T {}
+
+fn primary_database_placement(
+    foreground_weight: u32,
+    background_weight: u32,
+    foreground_mutable_bytes: u64,
+    background_mutable_bytes: u64,
+    background_task_slots: u32,
+    background_in_flight_bytes: u64,
+) -> ColocatedDatabasePlacement {
+    let mut placement = ColocatedDatabasePlacement::shared(PRIMARY_DATABASE_NAME);
+    placement.foreground.placement = terracedb::ExecutionDomainPlacement::SharedWeighted {
+        weight: foreground_weight.max(1),
+    };
+    placement.background.placement = terracedb::ExecutionDomainPlacement::SharedWeighted {
+        weight: background_weight.max(1),
+    };
+    placement.foreground = placement
+        .foreground
+        .clone()
+        .with_budget(ExecutionDomainBudget {
+            memory: terracedb::DomainMemoryBudget {
+                mutable_bytes: Some(foreground_mutable_bytes),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    placement.background = placement
+        .background
+        .clone()
+        .with_budget(ExecutionDomainBudget {
+            memory: terracedb::DomainMemoryBudget {
+                mutable_bytes: Some(background_mutable_bytes),
+                ..Default::default()
+            },
+            background: terracedb::DomainBackgroundBudget {
+                task_slots: Some(background_task_slots.max(1)),
+                max_in_flight_bytes: Some(background_in_flight_bytes.max(1)),
+            },
+            ..Default::default()
+        });
+    placement.with_metadata("terracedb.execution.role", "primary")
+}
+
+fn analytics_helper_placement(
+    foreground_weight: u32,
+    background_weight: u32,
+    foreground_mutable_bytes: u64,
+    background_mutable_bytes: u64,
+    background_task_slots: u32,
+    background_in_flight_bytes: u64,
+) -> ColocatedDatabasePlacement {
+    let mut placement = ColocatedDatabasePlacement::analytics_helper(ANALYTICS_DATABASE_NAME);
+    placement.foreground.placement = terracedb::ExecutionDomainPlacement::SharedWeighted {
+        weight: foreground_weight.max(1),
+    };
+    placement.background.placement = terracedb::ExecutionDomainPlacement::SharedWeighted {
+        weight: background_weight.max(1),
+    };
+    placement.foreground = placement
+        .foreground
+        .clone()
+        .with_budget(ExecutionDomainBudget {
+            memory: terracedb::DomainMemoryBudget {
+                mutable_bytes: Some(foreground_mutable_bytes),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    placement.background = placement
+        .background
+        .clone()
+        .with_budget(ExecutionDomainBudget {
+            memory: terracedb::DomainMemoryBudget {
+                mutable_bytes: Some(background_mutable_bytes),
+                ..Default::default()
+            },
+            background: terracedb::DomainBackgroundBudget {
+                task_slots: Some(background_task_slots.max(1)),
+                max_in_flight_bytes: Some(background_in_flight_bytes.max(1)),
+            },
+            ..Default::default()
+        });
+    placement
+}

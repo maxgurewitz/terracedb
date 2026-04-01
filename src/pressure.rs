@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
 };
 
 /// Byte-oriented pressure counters kept distinct from correctness metadata.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureBytes {
     pub mutable_dirty_bytes: u64,
     pub immutable_queued_bytes: u64,
@@ -49,7 +50,7 @@ impl PressureBytes {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureBudget {
     pub mutable_soft_limit_bytes: Option<u64>,
     pub mutable_hard_limit_bytes: Option<u64>,
@@ -57,7 +58,7 @@ pub struct PressureBudget {
     pub unified_log_hard_limit_bytes: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AdmissionPolicyProfile {
     #[default]
     Conservative,
@@ -191,7 +192,7 @@ impl std::str::FromStr for AdmissionPolicyProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AdmissionPressureSignal {
     MutableBudget,
     UnifiedLogBudget,
@@ -202,7 +203,7 @@ pub enum AdmissionPressureSignal {
     CompactionDebt,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AdmissionPressureLevel {
     #[default]
     Open,
@@ -210,7 +211,7 @@ pub enum AdmissionPressureLevel {
     Stall,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionDiagnostics {
     pub level: AdmissionPressureLevel,
     pub policy: AdmissionPolicyProfile,
@@ -221,7 +222,7 @@ pub struct AdmissionDiagnostics {
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PressureScope {
     #[default]
     Process,
@@ -230,7 +231,7 @@ pub enum PressureScope {
 }
 
 /// Pressure view for one scope plus optional wider totals.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureStats {
     pub scope: PressureScope,
     pub local: PressureBytes,
