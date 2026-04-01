@@ -25,7 +25,8 @@ use terracedb_debezium::{
 };
 use terracedb_example_order_watch::{
     ATTENTION_ORDERS_TABLE_NAME, ATTENTION_TRANSITIONS_TABLE_NAME, BACKLOG_ALERT_ORDER_ID,
-    FILTERED_OUT_ORDER_ID, IGNORED_CUSTOMER_ID, LIVE_TRANSITION_ORDER_ID, OrderAttentionTransition,
+    FILTERED_OUT_ORDER_ID, IGNORED_CUSTOMER_ID, LIVE_TRANSITION_ORDER_ID,
+    OrderAttentionOrdersTable, OrderAttentionTransition, OrderAttentionTransitionsTable,
     OrderAttentionView, OrderWatchAlert, OrderWatchBoundary, OrderWatchOracleSnapshot,
     OrderWatchOrder, OrderWatchSourceProgress, OrderWatchWorkflowMode, SNAPSHOT_WEST_ORDER_ID,
 };
@@ -33,15 +34,17 @@ use terracedb_kafka::{
     DeterministicKafkaBroker, DeterministicKafkaBrokerTraceEvent, DeterministicKafkaFetchResponse,
     DeterministicKafkaPartitionScript, KafkaAdmissionBatch, KafkaBatchHandler,
     KafkaBootstrapPolicy, KafkaBroker, KafkaFetchedBatch, KafkaOffset, KafkaPartitionClaim,
-    KafkaPartitionSource, KafkaProgressStore, KafkaRecord, KafkaRuntimeEvent, KafkaSourceId,
-    KafkaTopicPartition, KeepAllKafkaRecords, NoopKafkaRuntimeObserver, NoopKafkaTelemetrySink,
-    TableKafkaProgressStore, drive_partition_once, drive_partition_once_with_retry,
+    KafkaPartitionSource, KafkaProgressStore, KafkaRecord, KafkaRuntimeError, KafkaRuntimeEvent,
+    KafkaSourceId, KafkaSourceProgress, KafkaTopicPartition, KeepAllKafkaRecords,
+    NoopKafkaRuntimeObserver, NoopKafkaTelemetrySink, TableKafkaProgressStore,
+    drive_partition_once, drive_partition_once_with_retry,
 };
 use terracedb_projections::{
     MultiSourceProjection, MultiSourceProjectionHandler, ProjectionContext, ProjectionError,
     ProjectionHandle, ProjectionHandlerError, ProjectionRuntime, ProjectionSequenceRun,
     ProjectionTransaction, RecomputeStrategy,
 };
+use terracedb_records::{JsonValueCodec, RecordTable, Utf8StringCodec};
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_workflows::{
     WorkflowCheckpointId, WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowHandler,
@@ -216,6 +219,71 @@ where
 
         self.inner
             .apply_batch(tx, batch)
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct RestartOnceBroker<B> {
+    inner: B,
+    topic_partition: KafkaTopicPartition,
+    requested_offset: KafkaOffset,
+    message: String,
+    triggered: Arc<AtomicBool>,
+}
+
+impl<B> RestartOnceBroker<B> {
+    fn new(
+        inner: B,
+        topic: &str,
+        partition: u32,
+        requested_offset: KafkaOffset,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            topic_partition: KafkaTopicPartition::new(topic, partition),
+            requested_offset,
+            message: message.into(),
+            triggered: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl<B> KafkaBroker for RestartOnceBroker<B>
+where
+    B: KafkaBroker,
+{
+    type Error = io::Error;
+
+    async fn resolve_offset(
+        &self,
+        claim: &KafkaPartitionClaim,
+        policy: KafkaBootstrapPolicy,
+    ) -> Result<KafkaOffset, Self::Error> {
+        self.inner
+            .resolve_offset(claim, policy)
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    async fn fetch_batch(
+        &self,
+        claim: &KafkaPartitionClaim,
+        requested_offset: KafkaOffset,
+        max_records: usize,
+    ) -> Result<KafkaFetchedBatch, Self::Error> {
+        if claim.source.topic_partition == self.topic_partition
+            && requested_offset == self.requested_offset
+            && !self.triggered.swap(true, Ordering::SeqCst)
+        {
+            return Err(io::Error::other(self.message.clone()));
+        }
+
+        self.inner
+            .fetch_batch(claim, requested_offset, max_records)
             .await
             .map_err(|error| io::Error::other(error.to_string()))
     }
@@ -767,6 +835,22 @@ async fn collect_attention_orders(
         out.insert(order_id, row);
     }
     Ok(out)
+}
+
+fn attention_orders_table_named(db: &Db, name: &str) -> OrderAttentionOrdersTable {
+    RecordTable::with_codecs(
+        db.table(name.to_string()),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+}
+
+fn attention_transitions_table_named(db: &Db, name: &str) -> OrderAttentionTransitionsTable {
+    RecordTable::with_codecs(
+        db.table(name.to_string()),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
 }
 
 async fn collect_attention_transitions(
@@ -2274,6 +2358,199 @@ fn order_watch_duplicate_delivery_campaign_is_reproducible_and_idempotent() -> t
 }
 
 #[tokio::test]
+async fn order_watch_broker_restart_reconnect_retries_without_partial_transition_or_alerts()
+-> Result<(), BoxError> {
+    let boundary = OrderWatchBoundary::new();
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/order-watch/broker-restart-reconnect",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await?;
+
+    let row_template = row_table_config("template");
+    let transitions_config = WorkflowSourceConfig::historical_replayable_source()
+        .prepare_source_table_config(row_table_config(ATTENTION_TRANSITIONS_TABLE_NAME));
+    ensure_layout_tables(&db, boundary.source_layouts(), &row_template, &row_template).await?;
+    db.ensure_table(row_table_config(ATTENTION_ORDERS_TABLE_NAME))
+        .await?;
+    db.ensure_table(transitions_config).await?;
+    let progress_table = db.ensure_table(row_table_config("kafka_progress")).await?;
+    let progress_store = TableKafkaProgressStore::new(progress_table);
+    let attention_orders = boundary.attention_orders_table(&db);
+    let attention_transitions = boundary.attention_transitions_table(&db);
+    let handler = boundary.ingress_handler(&db, DebeziumMaterializationMode::Hybrid)?;
+    let broker = RestartOnceBroker::new(
+        build_broker(0x98_17, &boundary),
+        boundary.orders_layout().topic(),
+        0,
+        KafkaOffset::new(1),
+        "simulated broker restart during backlog fetch",
+    );
+    let (orders_p0, _, _) = build_claims(&boundary, "order-watch-broker-reconnect");
+
+    let sources = boundary.orders_layout().projection_sources(&db);
+    let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
+    let mut attention_orders_handle = projection_runtime
+        .start_multi_source(
+            MultiSourceProjection::new(
+                "order-watch-attention-orders-broker-reconnect",
+                sources.clone(),
+                AttentionOrdersProjection {
+                    boundary: boundary.clone(),
+                    attention_orders: attention_orders.table().clone(),
+                },
+            )
+            .with_outputs([attention_orders.table().clone()])
+            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+        )
+        .await?;
+    let mut attention_transitions_handle = projection_runtime
+        .start_multi_source(
+            DebeziumDerivedTransitionProjection::new(
+                attention_transitions.table().clone(),
+                boundary.attention_row_predicate(),
+                encode_transition_value,
+            )
+            .into_multi_source(
+                "order-watch-attention-transitions-broker-reconnect",
+                sources.clone(),
+            ),
+        )
+        .await?;
+
+    let workflow_runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock,
+        WorkflowDefinition::new(
+            "order-watch-broker-reconnect",
+            [
+                WorkflowSource::new(attention_transitions.table().clone()).with_config(
+                    boundary.workflow_source_config(OrderWatchWorkflowMode::HistoricalReplay),
+                ),
+            ],
+            AlertWorkflowHandler {
+                transitions: attention_transitions.clone(),
+            },
+        ),
+    )
+    .await?;
+    let workflow_handle = workflow_runtime.start().await?;
+    wait_for_attach_mode(&workflow_runtime, WorkflowSourceAttachMode::Historical).await?;
+
+    let filtered_p0 = drive_until_offset(&db, &broker, &progress_store, &orders_p0, 1, &handler)
+        .await
+        .map_err(boxed_error_to_io)?
+        .expect("orders partition 0 should commit the filtered snapshot before reconnect");
+    let _ = filtered_p0;
+
+    let error = drive_partition_once(
+        &db,
+        &broker,
+        &progress_store,
+        &orders_p0,
+        terracedb_kafka::KafkaWorkerOptions {
+            batch_limit: 1,
+            ..terracedb_kafka::KafkaWorkerOptions::default()
+        },
+        &KeepAllKafkaRecords,
+        &handler,
+        &NoopKafkaRuntimeObserver,
+        &NoopKafkaTelemetrySink,
+    )
+    .await
+    .expect_err("simulated broker restart should bubble up as a broker error");
+    match error {
+        KafkaRuntimeError::Broker { message, .. } => {
+            assert!(
+                message.contains("simulated broker restart"),
+                "expected reconnect context in broker error, got {message}",
+            );
+        }
+        other => panic!("expected broker error during reconnect test, got {other:?}"),
+    }
+
+    assert_eq!(
+        progress_store.load(&orders_p0.source).await?,
+        Some(KafkaSourceProgress::new(KafkaOffset::new(1))),
+        "broker failure should not advance ingress progress past the failed backlog fetch",
+    );
+    assert!(
+        collect_attention_orders(&attention_orders)
+            .await
+            .map_err(boxed_error_to_io)?
+            .is_empty(),
+        "broker failure should not leak a partial attention read-model update",
+    );
+    assert!(
+        collect_attention_transitions(&attention_transitions)
+            .await
+            .map_err(boxed_error_to_io)?
+            .is_empty(),
+        "broker failure should not leak a partial transition row",
+    );
+    assert!(
+        collect_outbox_alerts(workflow_runtime.tables().outbox_table())
+            .await
+            .map_err(boxed_error_to_io)?
+            .is_empty(),
+        "broker failure should not leak a partial alert before reconnect succeeds",
+    );
+
+    let backlog_p0 = drive_until_offset(&db, &broker, &progress_store, &orders_p0, 2, &handler)
+        .await
+        .map_err(boxed_error_to_io)?
+        .expect("reconnected broker should commit the backlog transition");
+    wait_for_projection(&mut attention_orders_handle, [(&sources[0], backlog_p0)]).await?;
+    wait_for_projection(
+        &mut attention_transitions_handle,
+        [(&sources[0], backlog_p0)],
+    )
+    .await?;
+    wait_for_state(
+        &workflow_runtime,
+        BACKLOG_ALERT_ORDER_ID,
+        |state| decode_state_count_ref(state) == 1,
+        "state count == 1",
+    )
+    .await?;
+    assert_eq!(
+        collect_attention_orders(&attention_orders)
+            .await
+            .map_err(boxed_error_to_io)?
+            .len(),
+        1,
+        "the recovered backlog fetch should publish the attention read-model exactly once",
+    );
+    assert_eq!(
+        collect_attention_transitions(&attention_transitions)
+            .await
+            .map_err(boxed_error_to_io)?
+            .len(),
+        1,
+        "the recovered backlog fetch should append exactly one transition row",
+    );
+    assert_eq!(
+        collect_outbox_alerts(workflow_runtime.tables().outbox_table())
+            .await
+            .map_err(boxed_error_to_io)?
+            .len(),
+        1,
+        "the recovered backlog fetch should emit exactly one backlog alert",
+    );
+
+    attention_orders_handle.shutdown().await?;
+    attention_transitions_handle.shutdown().await?;
+    workflow_handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn order_watch_historical_and_live_only_workflows_share_one_transition_stream()
 -> Result<(), BoxError> {
     let boundary = OrderWatchBoundary::new();
@@ -2438,6 +2715,181 @@ async fn order_watch_historical_and_live_only_workflows_share_one_transition_str
     attention_transitions_handle.shutdown().await?;
     historical_handle.shutdown().await?;
     live_only_handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn order_watch_projection_rebuild_after_runtime_reopen_matches_primary_outputs()
+-> Result<(), BoxError> {
+    let boundary = OrderWatchBoundary::new();
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/order-watch/projection-rebuild",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock),
+    )
+    .await?;
+
+    let row_template = row_table_config("template");
+    let transitions_config = WorkflowSourceConfig::historical_replayable_source()
+        .prepare_source_table_config(row_table_config(ATTENTION_TRANSITIONS_TABLE_NAME));
+    ensure_layout_tables(&db, boundary.source_layouts(), &row_template, &row_template).await?;
+    db.ensure_table(row_table_config(ATTENTION_ORDERS_TABLE_NAME))
+        .await?;
+    db.ensure_table(transitions_config).await?;
+    let progress_table = db.ensure_table(row_table_config("kafka_progress")).await?;
+    let progress_store = TableKafkaProgressStore::new(progress_table);
+    let attention_orders = boundary.attention_orders_table(&db);
+    let attention_transitions = boundary.attention_transitions_table(&db);
+    let handler = boundary.ingress_handler(&db, DebeziumMaterializationMode::Hybrid)?;
+    let broker = build_broker(0x98_18, &boundary);
+    let (orders_p0, orders_p1, _) = build_claims(&boundary, "order-watch-projection-rebuild");
+
+    let sources = boundary.orders_layout().projection_sources(&db);
+    let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
+    let mut primary_attention_orders_handle = projection_runtime
+        .start_multi_source(
+            MultiSourceProjection::new(
+                "order-watch-attention-orders-projection-rebuild-primary",
+                sources.clone(),
+                AttentionOrdersProjection {
+                    boundary: boundary.clone(),
+                    attention_orders: attention_orders.table().clone(),
+                },
+            )
+            .with_outputs([attention_orders.table().clone()])
+            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+        )
+        .await?;
+    let mut primary_attention_transitions_handle = projection_runtime
+        .start_multi_source(
+            DebeziumDerivedTransitionProjection::new(
+                attention_transitions.table().clone(),
+                boundary.attention_row_predicate(),
+                encode_transition_value,
+            )
+            .into_multi_source(
+                "order-watch-attention-transitions-projection-rebuild-primary",
+                sources.clone(),
+            ),
+        )
+        .await?;
+
+    let final_p0 = drive_until_offset(&db, &broker, &progress_store, &orders_p0, 4, &handler)
+        .await
+        .map_err(boxed_error_to_io)?
+        .expect("orders partition 0 should commit the full retained history");
+    let final_p1 = drive_until_offset(&db, &broker, &progress_store, &orders_p1, 1, &handler)
+        .await
+        .map_err(boxed_error_to_io)?
+        .expect("orders partition 1 should commit the retained snapshot");
+
+    wait_for_projection(
+        &mut primary_attention_orders_handle,
+        [(&sources[0], final_p0), (&sources[1], final_p1)],
+    )
+    .await?;
+    wait_for_projection(
+        &mut primary_attention_transitions_handle,
+        [(&sources[0], final_p0), (&sources[1], final_p1)],
+    )
+    .await?;
+
+    let expected_attention_orders = collect_attention_orders(&attention_orders)
+        .await
+        .map_err(boxed_error_to_io)?;
+    let expected_attention_transitions = collect_attention_transitions(&attention_transitions)
+        .await
+        .map_err(boxed_error_to_io)?;
+    let expected_orders_frontier = primary_attention_orders_handle.current_frontier();
+    let expected_transitions_frontier = primary_attention_transitions_handle.current_frontier();
+
+    primary_attention_orders_handle.shutdown().await?;
+    primary_attention_transitions_handle.shutdown().await?;
+    drop(projection_runtime);
+
+    let rebuild_orders_name = "attention_orders_rebuild";
+    let rebuild_transitions_name = "attention_transitions_rebuild";
+    let rebuild_transitions_config = WorkflowSourceConfig::historical_replayable_source()
+        .prepare_source_table_config(row_table_config(rebuild_transitions_name));
+    db.ensure_table(row_table_config(rebuild_orders_name))
+        .await?;
+    db.ensure_table(rebuild_transitions_config).await?;
+    let rebuild_attention_orders = attention_orders_table_named(&db, rebuild_orders_name);
+    let rebuild_attention_transitions =
+        attention_transitions_table_named(&db, rebuild_transitions_name);
+
+    let reopened_projection_runtime = ProjectionRuntime::open(db.clone()).await?;
+    let mut rebuilt_attention_orders_handle = reopened_projection_runtime
+        .start_multi_source(
+            MultiSourceProjection::new(
+                "order-watch-attention-orders-projection-rebuild-reopened",
+                sources.clone(),
+                AttentionOrdersProjection {
+                    boundary: boundary.clone(),
+                    attention_orders: rebuild_attention_orders.table().clone(),
+                },
+            )
+            .with_outputs([rebuild_attention_orders.table().clone()])
+            .with_recompute_strategy(RecomputeStrategy::RebuildFromCurrentState),
+        )
+        .await?;
+    let mut rebuilt_attention_transitions_handle = reopened_projection_runtime
+        .start_multi_source(
+            DebeziumDerivedTransitionProjection::new(
+                rebuild_attention_transitions.table().clone(),
+                boundary.attention_row_predicate(),
+                encode_transition_value,
+            )
+            .into_multi_source(
+                "order-watch-attention-transitions-projection-rebuild-reopened",
+                sources.clone(),
+            ),
+        )
+        .await?;
+
+    wait_for_projection(
+        &mut rebuilt_attention_orders_handle,
+        [(&sources[0], final_p0), (&sources[1], final_p1)],
+    )
+    .await?;
+    wait_for_projection(
+        &mut rebuilt_attention_transitions_handle,
+        [(&sources[0], final_p0), (&sources[1], final_p1)],
+    )
+    .await?;
+
+    assert_eq!(
+        collect_attention_orders(&rebuild_attention_orders)
+            .await
+            .map_err(boxed_error_to_io)?,
+        expected_attention_orders,
+        "reopened projection runtime should rebuild the attention read-model from retained CDC history",
+    );
+    assert_eq!(
+        collect_attention_transitions(&rebuild_attention_transitions)
+            .await
+            .map_err(boxed_error_to_io)?,
+        expected_attention_transitions,
+        "reopened projection runtime should rebuild the transition stream from retained CDC history",
+    );
+    assert_eq!(
+        rebuilt_attention_orders_handle.current_frontier(),
+        expected_orders_frontier,
+        "rebuilt attention read-model should converge to the same source frontier",
+    );
+    assert_eq!(
+        rebuilt_attention_transitions_handle.current_frontier(),
+        expected_transitions_frontier,
+        "rebuilt transition stream should converge to the same source frontier",
+    );
+
+    rebuilt_attention_orders_handle.shutdown().await?;
+    rebuilt_attention_transitions_handle.shutdown().await?;
     Ok(())
 }
 
@@ -2860,6 +3312,159 @@ async fn order_watch_history_loss_fails_closed_without_fast_forwarding() -> Resu
             .await?,
         stale_progress,
         "fail-closed recovery must not silently fast-forward the workflow source progress",
+    );
+
+    attention_transitions_handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn order_watch_checkpoint_restore_recovers_saved_state_and_outbox() -> Result<(), BoxError> {
+    let boundary = OrderWatchBoundary::new();
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let checkpoint_store = Arc::new(WorkflowObjectStoreCheckpointStore::new(
+        object_store.clone(),
+        "order-watch-checkpoints",
+    ));
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/order-watch/checkpoint-restore",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await?;
+
+    let row_template = row_table_config("template");
+    let transitions_config = WorkflowSourceConfig::historical_replayable_source()
+        .prepare_source_table_config(row_table_config(ATTENTION_TRANSITIONS_TABLE_NAME));
+    ensure_layout_tables(&db, boundary.source_layouts(), &row_template, &row_template).await?;
+    db.ensure_table(transitions_config).await?;
+    let progress_table = db.ensure_table(row_table_config("kafka_progress")).await?;
+    let progress_store = TableKafkaProgressStore::new(progress_table);
+    let attention_transitions = boundary.attention_transitions_table(&db);
+    let handler = boundary.ingress_handler(&db, DebeziumMaterializationMode::Hybrid)?;
+    let broker = build_broker(0x98_19, &boundary);
+    let (orders_p0, _, _) = build_claims(&boundary, "order-watch-checkpoint-restore");
+
+    let sources = boundary.orders_layout().projection_sources(&db);
+    let projection_runtime = ProjectionRuntime::open(db.clone()).await?;
+    let mut attention_transitions_handle = projection_runtime
+        .start_multi_source(
+            DebeziumDerivedTransitionProjection::new(
+                attention_transitions.table().clone(),
+                boundary.attention_row_predicate(),
+                encode_transition_value,
+            )
+            .into_multi_source(
+                "order-watch-attention-transitions-checkpoint-restore",
+                sources.clone(),
+            ),
+        )
+        .await?;
+
+    let backlog_p0 = drive_until_offset(&db, &broker, &progress_store, &orders_p0, 2, &handler)
+        .await
+        .map_err(boxed_error_to_io)?
+        .expect("orders partition 0 should commit the backlog transition");
+    wait_for_projection(
+        &mut attention_transitions_handle,
+        [(&sources[0], backlog_p0)],
+    )
+    .await?;
+
+    let workflow_name = "order-watch-checkpoint-restore";
+    let definition = || {
+        WorkflowDefinition::new(
+            workflow_name,
+            [
+                WorkflowSource::new(attention_transitions.table().clone()).with_config(
+                    boundary.workflow_source_config(OrderWatchWorkflowMode::HistoricalReplay),
+                ),
+            ],
+            AlertWorkflowHandler {
+                transitions: attention_transitions.clone(),
+            },
+        )
+        .with_checkpoint_store(checkpoint_store.clone())
+    };
+
+    let workflow_runtime = WorkflowRuntime::open(db.clone(), clock.clone(), definition()).await?;
+    let workflow_handle = workflow_runtime.start().await?;
+    wait_for_state(
+        &workflow_runtime,
+        BACKLOG_ALERT_ORDER_ID,
+        |state| decode_state_count_ref(state) == 1,
+        "state count == 1",
+    )
+    .await?;
+    workflow_handle.shutdown().await?;
+
+    let saved_state = workflow_runtime.load_state(BACKLOG_ALERT_ORDER_ID).await?;
+    let saved_progress = workflow_runtime
+        .load_source_progress(attention_transitions.table())
+        .await?;
+    let saved_alerts = collect_outbox_alerts(workflow_runtime.tables().outbox_table())
+        .await
+        .map_err(boxed_error_to_io)?;
+    workflow_runtime
+        .capture_checkpoint(WorkflowCheckpointId::new(8))
+        .await?;
+
+    workflow_runtime
+        .tables()
+        .state_table()
+        .write(
+            BACKLOG_ALERT_ORDER_ID.as_bytes().to_vec(),
+            Value::bytes(b"mutated".to_vec()),
+        )
+        .await?;
+    workflow_runtime
+        .tables()
+        .outbox_table()
+        .delete(format!("alert:{BACKLOG_ALERT_ORDER_ID}:1").into_bytes())
+        .await?;
+
+    assert_ne!(
+        workflow_runtime.load_state(BACKLOG_ALERT_ORDER_ID).await?,
+        saved_state,
+        "the local workflow state should be mutated before restore",
+    );
+    assert_ne!(
+        collect_outbox_alerts(workflow_runtime.tables().outbox_table())
+            .await
+            .map_err(boxed_error_to_io)?,
+        saved_alerts,
+        "the local outbox should be mutated before restore",
+    );
+    drop(workflow_runtime);
+
+    let restored_runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock,
+        definition().with_restore_latest_checkpoint_on_open(),
+    )
+    .await?;
+    assert_eq!(
+        restored_runtime
+            .load_source_progress(attention_transitions.table())
+            .await?,
+        saved_progress,
+        "checkpoint restore should recover the saved workflow source progress",
+    );
+    assert_eq!(
+        restored_runtime.load_state(BACKLOG_ALERT_ORDER_ID).await?,
+        saved_state,
+        "checkpoint restore should recover the saved workflow state",
+    );
+    assert_eq!(
+        collect_outbox_alerts(restored_runtime.tables().outbox_table())
+            .await
+            .map_err(boxed_error_to_io)?,
+        saved_alerts,
+        "checkpoint restore should recover the saved workflow outbox entries",
     );
 
     attention_transitions_handle.shutdown().await?;
