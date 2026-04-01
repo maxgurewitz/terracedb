@@ -300,6 +300,39 @@ impl ShardingConfig {
             _ => false,
         }
     }
+
+    pub fn validate_shard_map_update(&self, published: &Self) -> Result<(), ShardingError> {
+        self.validate()?;
+        published.validate()?;
+
+        if self == published {
+            return Ok(());
+        }
+
+        if !self.compatible_reshard_identity(published) {
+            return Err(ShardingError::IncompatibleReshardIdentity {
+                source_virtual_partition_count: self.virtual_partition_count(),
+                target_virtual_partition_count: published.virtual_partition_count(),
+                source_hash_algorithm: self.hash_algorithm(),
+                target_hash_algorithm: published.hash_algorithm(),
+            });
+        }
+
+        let current_revision = self.current_revision();
+        let published_revision = published.current_revision();
+        if published_revision <= current_revision {
+            return Err(ShardingError::ShardMapRevisionNotIncreasing {
+                current_revision,
+                published_revision,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn preserves_physical_assignments(&self, other: &Self) -> Result<bool, ShardingError> {
+        Ok(self.shard_assignments()? == other.shard_assignments()?)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +368,26 @@ impl TableShardingState {
 
     pub fn current_revision(&self) -> ShardMapRevision {
         self.config.current_revision()
+    }
+
+    pub fn is_sharded(&self) -> bool {
+        self.config.is_sharded()
+    }
+
+    pub fn virtual_partition_count(&self) -> u32 {
+        self.config.virtual_partition_count()
+    }
+
+    pub fn shard_assignments(&self) -> Vec<ShardAssignment> {
+        self.config
+            .shard_assignments()
+            .expect("table sharding state should only exist for validated configs")
+    }
+
+    pub fn physical_shards(&self) -> BTreeSet<PhysicalShardId> {
+        self.config
+            .physical_shards()
+            .expect("table sharding state should only exist for validated configs")
     }
 
     pub fn partition_counts_per_shard(&self) -> BTreeMap<PhysicalShardId, usize> {
@@ -397,6 +450,29 @@ pub enum WriteBatchShardingError {
     InvalidTableConfig { table_name: String, message: String },
     #[error(transparent)]
     Locality(#[from] BatchShardLocalityError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum PublishShardMapError {
+    #[error("table does not exist: {table_name}")]
+    MissingTable { table_name: String },
+    #[error("cannot publish shard map for table {table_name}: {error}")]
+    InvalidShardMap {
+        table_name: String,
+        #[source]
+        error: ShardingError,
+    },
+    #[error(
+        "cannot publish shard map for table {table_name}: existing table data would require \
+         conservative reshard cutover before moving from revision {current_revision} to {published_revision}"
+    )]
+    DataMovementRequired {
+        table_name: String,
+        current_revision: ShardMapRevision,
+        published_revision: ShardMapRevision,
+    },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -651,6 +727,14 @@ pub enum ShardingError {
         target_virtual_partition_count: u32,
         source_hash_algorithm: Option<ShardHashAlgorithm>,
         target_hash_algorithm: Option<ShardHashAlgorithm>,
+    },
+    #[error(
+        "published shard-map revision must increase strictly; current revision is {current_revision}, \
+         published revision is {published_revision}"
+    )]
+    ShardMapRevisionNotIncreasing {
+        current_revision: ShardMapRevision,
+        published_revision: ShardMapRevision,
     },
     #[error("decode terracedb sharding metadata failed: {message}")]
     InvalidPersistedMetadata { message: String },

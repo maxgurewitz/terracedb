@@ -28,6 +28,20 @@ impl Table {
         Some(self.sharding_state()?.route_key(key))
     }
 
+    pub fn validate_shard_map(
+        &self,
+        sharding: &crate::ShardingConfig,
+    ) -> Result<crate::TableShardingState, crate::PublishShardMapError> {
+        self.db.validate_table_shard_map(self, sharding)
+    }
+
+    pub async fn publish_shard_map(
+        &self,
+        sharding: crate::ShardingConfig,
+    ) -> Result<crate::TableShardingState, crate::PublishShardMapError> {
+        self.db.publish_table_shard_map(self, sharding).await
+    }
+
     pub async fn read(&self, key: Key) -> Result<Option<Value>, ReadError> {
         self.read_at(key, self.db.current_sequence()).await
     }
