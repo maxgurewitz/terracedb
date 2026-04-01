@@ -4603,11 +4603,6 @@ interface VisibilityIndexSpec {
 }
 ```
 
-Persisted pre-T101a manifests may still decode legacy string placeholders for
-`rowScopeBinding` and `visibilityIndex`; recovery should surface those as explicit
-compatibility placeholders, with legacy row-scope placeholders remaining non-executable until
-the host migrates them, while new writes emit the structured contracts above.
-
 The important rule is that the host resolves `PolicyContext` and `RowScopePolicy`; guest code may invoke the bound capability, but it must not be able to choose a broader row scope from inside the sandbox.
 
 Recommended version-1 policy kinds:

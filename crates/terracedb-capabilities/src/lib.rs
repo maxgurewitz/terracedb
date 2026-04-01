@@ -85,7 +85,6 @@ impl RowQueryShape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowScopeFamily {
-    LegacyPlaceholder,
     KeyPrefix,
     TypedRowPredicate,
     VisibilityIndex,
@@ -141,9 +140,6 @@ impl VisibilityIndexSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RowScopePolicy {
-    LegacyPlaceholder {
-        legacy_binding: String,
-    },
     KeyPrefix {
         prefix_template: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -166,7 +162,6 @@ pub enum RowScopePolicy {
 impl RowScopePolicy {
     pub fn family(&self) -> RowScopeFamily {
         match self {
-            Self::LegacyPlaceholder { .. } => RowScopeFamily::LegacyPlaceholder,
             Self::KeyPrefix { .. } => RowScopeFamily::KeyPrefix,
             Self::TypedRowPredicate { .. } => RowScopeFamily::TypedRowPredicate,
             Self::VisibilityIndex { .. } => RowScopeFamily::VisibilityIndex,
@@ -176,7 +171,6 @@ impl RowScopePolicy {
 
     pub fn supported_query_shapes(&self) -> &'static [RowQueryShape] {
         match self {
-            Self::LegacyPlaceholder { .. } => &[],
             Self::KeyPrefix { .. } => &[
                 RowQueryShape::PointRead,
                 RowQueryShape::BoundedPrefixScan,
@@ -350,7 +344,6 @@ impl RowScopeBinding {
 
     fn visibility_index_name(&self) -> Option<String> {
         match &self.policy {
-            RowScopePolicy::LegacyPlaceholder { .. } => None,
             RowScopePolicy::VisibilityIndex { index_name } => Some(index_name.clone()),
             RowScopePolicy::KeyPrefix { .. }
             | RowScopePolicy::TypedRowPredicate { .. }
@@ -551,17 +544,9 @@ pub struct ResourcePolicy {
     pub deny: Vec<ResourceSelector>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tenant_scopes: Vec<String>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_row_scope_binding",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_scope_binding: Option<RowScopeBinding>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_visibility_index_spec",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility_index: Option<VisibilityIndexSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, JsonValue>,
@@ -581,7 +566,6 @@ impl ResourcePolicy {
         };
 
         let visibility_lookup = match &binding.policy {
-            RowScopePolicy::LegacyPlaceholder { .. } => None,
             RowScopePolicy::VisibilityIndex { index_name } => {
                 let spec = self
                     .visibility_index
@@ -2424,73 +2408,6 @@ fn capability_family_matches(left: Option<&str>, right: Option<&str>) -> bool {
         (Some(left), Some(right)) => left == right,
         _ => true,
     }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RowScopeBindingRepr {
-    Structured(RowScopeBinding),
-    Legacy(String),
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum VisibilityIndexSpecRepr {
-    Structured(VisibilityIndexSpec),
-    Legacy(String),
-}
-
-fn deserialize_optional_row_scope_binding<'de, D>(
-    deserializer: D,
-) -> Result<Option<RowScopeBinding>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let repr = Option::<RowScopeBindingRepr>::deserialize(deserializer)?;
-    Ok(repr.map(|repr| match repr {
-        RowScopeBindingRepr::Structured(binding) => binding,
-        RowScopeBindingRepr::Legacy(binding_id) => RowScopeBinding {
-            binding_id: binding_id.clone(),
-            // Legacy manifests only stored a label here. Preserve that representation as
-            // an explicit compatibility placeholder rather than reinterpreting it as a
-            // narrower version-1 contract during recovery.
-            policy: RowScopePolicy::LegacyPlaceholder {
-                legacy_binding: binding_id.clone(),
-            },
-            allowed_query_shapes: Vec::new(),
-            write_semantics: RowWriteSemantics::default(),
-            denial_contract: RowDenialContract::default(),
-            metadata: BTreeMap::from([(
-                "legacy_row_scope_binding".to_string(),
-                JsonValue::String(binding_id),
-            )]),
-        },
-    }))
-}
-
-fn deserialize_optional_visibility_index_spec<'de, D>(
-    deserializer: D,
-) -> Result<Option<VisibilityIndexSpec>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let repr = Option::<VisibilityIndexSpecRepr>::deserialize(deserializer)?;
-    Ok(repr.map(|repr| match repr {
-        VisibilityIndexSpecRepr::Structured(spec) => spec,
-        VisibilityIndexSpecRepr::Legacy(index_name) => VisibilityIndexSpec {
-            index_name: index_name.clone(),
-            index_table: index_name.clone(),
-            subject_key: VisibilityIndexSubjectKey::Subject,
-            row_id_field: "row_id".to_string(),
-            membership_source: None,
-            read_mirror_table: None,
-            authoritative_sources: Vec::new(),
-            metadata: BTreeMap::from([(
-                "legacy_visibility_index".to_string(),
-                JsonValue::String(index_name),
-            )]),
-        },
-    }))
 }
 
 fn tenant_scope_denies(subject: &PolicySubject, policy: &ResourcePolicy) -> bool {
