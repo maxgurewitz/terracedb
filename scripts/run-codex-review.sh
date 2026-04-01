@@ -10,7 +10,8 @@ cd "$repo_root"
 
 strict_review="${CODEX_REVIEW_STRICT:-0}"
 review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-180}"
-review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-low}"
+requested_review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-low}"
+review_reasoning_effort="${requested_review_reasoning_effort}"
 prior_round_limit="${CODEX_REVIEW_PRIOR_ROUNDS_MAX:-3}"
 max_context_file_bytes="${CODEX_REVIEW_MAX_CONTEXT_FILE_BYTES:-50000}"
 max_context_markdown_bytes="${CODEX_REVIEW_MAX_CONTEXT_MARKDOWN_BYTES:-20000}"
@@ -65,6 +66,31 @@ run_with_timeout() {
 
     return "$command_status"
 }
+
+normalize_review_reasoning_effort() {
+    case "$1" in
+        low|medium|high|xhigh)
+            printf '%s\n' "$1"
+            ;;
+        minimal|none)
+            printf 'low\n'
+            ;;
+        *)
+            printf 'low\n'
+            ;;
+    esac
+}
+
+review_reasoning_effort="$(normalize_review_reasoning_effort "$review_reasoning_effort")"
+
+if [[ "$review_reasoning_effort" != "$requested_review_reasoning_effort" ]]; then
+    echo "Normalizing CODEX_REVIEW_REASONING_EFFORT=${requested_review_reasoning_effort} to ${review_reasoning_effort} for web-search-backed Codex review." >&2
+fi
+
+if [[ "${CODEX_REVIEW_ENABLED:-1}" != "1" ]]; then
+    echo "Skipping Codex review because CODEX_REVIEW_ENABLED=${CODEX_REVIEW_ENABLED}."
+    exit 0
+fi
 
 if [[ "${SKIP_CODEX_REVIEW:-0}" == "1" ]]; then
     echo "Skipping Codex review because SKIP_CODEX_REVIEW=1."
