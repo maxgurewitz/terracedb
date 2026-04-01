@@ -29,8 +29,8 @@ The documented workflow modes are:
 - `live-only-attach`: attach from the current durable frontier and skip pre-existing transition backlog.
 
 The tests for this crate are the contract for the boundary: they prove the Kafka ingress offsets,
-Debezium materializations, projection frontier, workflow attach mode, and user-visible outputs can
-all be checked from one deterministic seeded run.
+Debezium materializations, projection frontier, broker reconnect behavior, workflow attach mode,
+checkpoint restore, and user-visible outputs can all be checked from one deterministic seeded run.
 
 ## Read Surface
 
@@ -54,6 +54,29 @@ Materialization expectations are part of the example contract:
   cannot reconstruct the historical enter/exit transition stream the example uses for backlog replay.
   That is why the example documents `Mirror` as a current-state-only surface, not a full substitute
   for replayable CDC history.
+
+Filtering expectations are part of the example contract too:
+
+- `OrderWatchBoundary::table_filter()` and `row_predicate()` intentionally sit at the Terracedb
+  boundary even though Debezium can also narrow the upstream feed. For very large upstream
+  databases, keep connector include-lists tight so Kafka is not carrying irrelevant schemas or
+  tables, then keep the Terracedb-side filters so retained history, mirrors, projections, and
+  workflows only pay storage and replay costs for the subset this example actually owns.
+- If the watched slice is still very large, prefer splitting it into multiple narrower Terracedb
+  boundaries instead of treating one huge CDC firehose as a single application surface. The example
+  uses one table and one row predicate on purpose: it shows the ownership boundary, not a claim
+  that every downstream use case should share one connector-sized dataset.
+
+The example also intentionally stops direct Kafka consumption at Debezium ingress:
+
+- Projections and workflows consume Terracedb tables, not Kafka topics, because the Terracedb
+  tables already encode the durable contract the rest of the example cares about: decoded Debezium
+  rows, table and row filtering, retained replayable history, projection frontiers, and typed read
+  surfaces.
+- Reading Kafka directly from every downstream component would duplicate bootstrap, decode, filter,
+  replay, and recovery logic in multiple places. Using Terracedb tables keeps rebuilds, restart
+  tests, and checkpoint restore centered on one durable boundary instead of reimplementing Kafka
+  consumer state in each projection or workflow.
 
 Both workflow modes now run through the real workflow runtime from the same append-only
 `attention_transitions` stream. The example intentionally uses the newer ergonomics added while
