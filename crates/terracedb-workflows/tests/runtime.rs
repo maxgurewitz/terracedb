@@ -884,7 +884,7 @@ fn generated_historical_campaign(seed: u64) -> Vec<WorkflowHistoricalCampaignCas
                         let recovery = recoveries[(rng.next_u64() as usize) % recoveries.len()];
                         let replay =
                             if matches!(recovery, WorkflowSourceRecoveryPolicy::ReplayFromHistory)
-                                && rng.next_u64() % 2 == 0
+                                && rng.next_u64().is_multiple_of(2)
                             {
                                 WorkflowReplayableSourceKind::AppendOnlyOrdered
                             } else {
@@ -892,20 +892,20 @@ fn generated_historical_campaign(seed: u64) -> Vec<WorkflowHistoricalCampaignCas
                             };
                         let checkpoint_support =
                             if matches!(recovery, WorkflowSourceRecoveryPolicy::RestoreCheckpoint)
-                                || rng.next_u64() % 3 == 0
+                                || rng.next_u64().is_multiple_of(3)
                             {
                                 WorkflowHistoricalArtifactSupport::Optional
                             } else {
                                 WorkflowHistoricalArtifactSupport::Unsupported
                             };
-                        let event = if rng.next_u64() % 2 == 0 {
+                        let event = if rng.next_u64().is_multiple_of(2) {
                             WorkflowHistoricalEvent::FirstAttach
                         } else {
                             WorkflowHistoricalEvent::SnapshotTooOld
                         };
                         let checkpoint_available =
                             matches!(recovery, WorkflowSourceRecoveryPolicy::RestoreCheckpoint)
-                                || rng.next_u64() % 2 == 0;
+                                || rng.next_u64().is_multiple_of(2);
                         (
                             bootstrap,
                             recovery,
@@ -931,9 +931,9 @@ fn generated_historical_campaign(seed: u64) -> Vec<WorkflowHistoricalCampaignCas
 
             WorkflowHistoricalCampaignCase {
                 scenario,
-                has_timers: index == 0 || rng.next_u64() % 2 == 0,
-                has_callbacks: index == 1 || rng.next_u64() % 2 == 0,
-                has_pending_outbox: index == 2 || rng.next_u64() % 2 == 0,
+                has_timers: index == 0 || rng.next_u64().is_multiple_of(2),
+                has_callbacks: index == 1 || rng.next_u64().is_multiple_of(2),
+                has_pending_outbox: index == 2 || rng.next_u64().is_multiple_of(2),
             }
         })
         .collect()
@@ -1436,17 +1436,15 @@ fn workflow_replays_startup_backlog_round_robin_and_outbox_order() -> turmoil::R
                 &LogCursor::new(sequence, 2),
             )?;
 
-            let max_active = stats.max_active.lock().expect("max-active lock poisoned");
-            harness.require_eq(
-                "alpha max concurrency",
-                &max_active.get("alpha").copied(),
-                &Some(1),
-            )?;
-            harness.require_eq(
-                "beta max concurrency",
-                &max_active.get("beta").copied(),
-                &Some(1),
-            )?;
+            let (alpha_max_active, beta_max_active) = {
+                let max_active = stats.max_active.lock().expect("max-active lock poisoned");
+                (
+                    max_active.get("alpha").copied(),
+                    max_active.get("beta").copied(),
+                )
+            };
+            harness.require_eq("alpha max concurrency", &alpha_max_active, &Some(1))?;
+            harness.require_eq("beta max concurrency", &beta_max_active, &Some(1))?;
 
             harness.require(
                 runtime

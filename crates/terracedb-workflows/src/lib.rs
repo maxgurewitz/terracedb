@@ -28,6 +28,7 @@ use terracedb::{
 };
 
 pub mod failpoints;
+pub mod transition_engine;
 
 pub use terracedb_workflows_core as contracts;
 pub use terracedb_workflows_sandbox as sandbox_contracts;
