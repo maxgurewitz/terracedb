@@ -735,6 +735,7 @@ impl<'a> ManifestSstable<'a> {
     pub(crate) const VT_MAX_SEQUENCE: VOffsetT = 26;
     pub(crate) const VT_HAS_SCHEMA_VERSION: VOffsetT = 28;
     pub(crate) const VT_SCHEMA_VERSION: VOffsetT = 30;
+    pub(crate) const VT_SHARD_OWNERSHIP_JSON: VOffsetT = 32;
 
     pub(crate) fn table_id(&self) -> u32 {
         unsafe { self._tab.get::<u32>(Self::VT_TABLE_ID, Some(0)).unwrap() }
@@ -829,6 +830,13 @@ impl<'a> ManifestSstable<'a> {
                 .unwrap()
         }
     }
+
+    pub(crate) fn shard_ownership_json(&self) -> Option<Vector<'a, u8>> {
+        unsafe {
+            self._tab
+                .get::<ForwardsUOffset<Vector<'a, u8>>>(Self::VT_SHARD_OWNERSHIP_JSON, None)
+        }
+    }
 }
 
 impl flatbuffers::Verifiable for ManifestSstable<'_> {
@@ -851,6 +859,11 @@ impl flatbuffers::Verifiable for ManifestSstable<'_> {
             .visit_field::<u64>("max_sequence", Self::VT_MAX_SEQUENCE, false)?
             .visit_field::<bool>("has_schema_version", Self::VT_HAS_SCHEMA_VERSION, false)?
             .visit_field::<u32>("schema_version", Self::VT_SCHEMA_VERSION, false)?
+            .visit_field::<ForwardsUOffset<Vector<'_, u8>>>(
+                "shard_ownership_json",
+                Self::VT_SHARD_OWNERSHIP_JSON,
+                false,
+            )?
             .finish();
         Ok(())
     }
@@ -871,6 +884,7 @@ pub(crate) struct ManifestSstableCreateArgs<'fbb> {
     pub(crate) max_sequence: u64,
     pub(crate) has_schema_version: bool,
     pub(crate) schema_version: u32,
+    pub(crate) shard_ownership_json: Option<WIPOffset<Vector<'fbb, u8>>>,
 }
 
 pub(crate) fn create_manifest_sstable<'fbb>(
@@ -900,6 +914,12 @@ pub(crate) fn create_manifest_sstable<'fbb>(
         false,
     );
     fbb.push_slot::<u32>(ManifestSstable::VT_SCHEMA_VERSION, args.schema_version, 0);
+    if let Some(shard_ownership_json) = args.shard_ownership_json {
+        fbb.push_slot_always::<WIPOffset<_>>(
+            ManifestSstable::VT_SHARD_OWNERSHIP_JSON,
+            shard_ownership_json,
+        );
+    }
     finish_table(fbb, start)
 }
 

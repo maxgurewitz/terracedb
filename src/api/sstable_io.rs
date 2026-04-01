@@ -1046,6 +1046,7 @@ impl Db {
             min_sequence: SequenceNumber::new(0),
             max_sequence: SequenceNumber::new(0),
             schema_version: Some(0),
+            shard_ownership: None,
         };
         let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
         let footer = columnar_read_context
@@ -1077,6 +1078,15 @@ impl Db {
         {
             return Err(StorageError::corruption(format!(
                 "manifest metadata does not match SSTable {location}",
+            )));
+        }
+        if let (Some(manifest_ownership), Some(footer_ownership)) = (
+            meta.shard_ownership.as_ref(),
+            footer.shard_ownership.as_ref(),
+        ) && manifest_ownership != footer_ownership
+        {
+            return Err(StorageError::corruption(format!(
+                "manifest shard ownership does not match SSTable {location}",
             )));
         }
 
@@ -1264,8 +1274,15 @@ impl Db {
             manifest_generation,
         )?;
 
+        let mut resident_meta = meta.clone();
+        resident_meta.shard_ownership = footer
+            .footer
+            .shard_ownership
+            .clone()
+            .or_else(|| meta.shard_ownership.clone());
+
         Ok(ResidentRowSstable {
-            meta: meta.clone(),
+            meta: resident_meta,
             rows: Vec::new(),
             user_key_bloom_filter: footer.footer.user_key_bloom_filter.clone(),
             columnar: Some(ResidentColumnarSstable { source }),
@@ -1319,6 +1336,15 @@ impl Db {
                 "manifest metadata does not match SSTable {location}",
             )));
         }
+        if let (Some(manifest_ownership), Some(body_ownership)) = (
+            meta.shard_ownership.as_ref(),
+            file.body.shard_ownership.as_ref(),
+        ) && manifest_ownership != body_ownership
+        {
+            return Err(StorageError::corruption(format!(
+                "manifest shard ownership does not match SSTable {location}",
+            )));
+        }
 
         let computed = Self::summarize_sstable_rows(
             meta.table_id,
@@ -1336,8 +1362,15 @@ impl Db {
             )));
         }
 
+        let mut resident_meta = meta.clone();
+        resident_meta.shard_ownership = file
+            .body
+            .shard_ownership
+            .clone()
+            .or_else(|| meta.shard_ownership.clone());
+
         Ok(ResidentRowSstable {
-            meta: meta.clone(),
+            meta: resident_meta,
             rows: file.body.rows,
             user_key_bloom_filter: file.body.user_key_bloom_filter,
             columnar: None,
@@ -1540,8 +1573,14 @@ impl Db {
             )));
         }
 
+        let mut resident_meta = meta.clone();
+        resident_meta.shard_ownership = footer
+            .shard_ownership
+            .clone()
+            .or_else(|| meta.shard_ownership.clone());
+
         Ok(ResidentRowSstable {
-            meta: meta.clone(),
+            meta: resident_meta,
             rows,
             user_key_bloom_filter: footer.user_key_bloom_filter,
             columnar: Some(ResidentColumnarSstable {
@@ -2584,6 +2623,7 @@ impl Db {
             min_sequence,
             max_sequence,
             schema_version: None,
+            shard_ownership: None,
         })
     }
 
@@ -2596,10 +2636,11 @@ impl Db {
         let mut outputs = Vec::new();
         let tables = self.tables_read().clone();
 
-        for (&table_id, table_memtable) in &immutable.memtable.tables {
+        for (table_key, table_memtable) in &immutable.memtable.tables {
             if table_memtable.is_empty() {
                 continue;
             }
+            let table_id = table_key.table_id;
 
             let stored = tables
                 .values()
@@ -2611,6 +2652,9 @@ impl Db {
                         table_id.get()
                     )))
                 })?;
+            let shard_ownership = table_memtable
+                .shard_ownership(table_id, &stored.config.sharding)
+                .map_err(FlushError::Storage)?;
 
             let rows = table_memtable
                 .entries
@@ -2626,7 +2670,12 @@ impl Db {
                 "SST-{:06}",
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
-            let path = Self::local_sstable_path(local_root, table_id, &local_id);
+            let path = Self::local_sstable_path_in_shard(
+                local_root,
+                table_id,
+                shard_ownership.physical_shard,
+                &local_id,
+            );
             let output = match stored.config.format {
                 TableFormat::Row => {
                     self.write_row_sstable(
@@ -2635,6 +2684,7 @@ impl Db {
                         0,
                         local_id,
                         rows,
+                        Some(shard_ownership.clone()),
                         stored.config.bloom_filter_bits_per_key,
                     )
                     .await
@@ -2646,6 +2696,7 @@ impl Db {
                         local_id,
                         &stored,
                         rows,
+                        Some(shard_ownership.clone()),
                         Some(applied_generation),
                         &[],
                     )
@@ -2668,10 +2719,11 @@ impl Db {
         let mut outputs = Vec::new();
         let tables = self.tables_read().clone();
 
-        for (&table_id, table_memtable) in &immutable.memtable.tables {
+        for (table_key, table_memtable) in &immutable.memtable.tables {
             if table_memtable.is_empty() {
                 continue;
             }
+            let table_id = table_key.table_id;
 
             let stored = tables
                 .values()
@@ -2683,6 +2735,9 @@ impl Db {
                         table_id.get()
                     )))
                 })?;
+            let shard_ownership = table_memtable
+                .shard_ownership(table_id, &stored.config.sharding)
+                .map_err(FlushError::Storage)?;
 
             let rows = table_memtable
                 .entries
@@ -2698,7 +2753,12 @@ impl Db {
                 "SST-{:06}",
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
-            let object_key = Self::remote_sstable_key(config, table_id, &local_id);
+            let object_key = Self::remote_sstable_key_in_shard(
+                config,
+                table_id,
+                shard_ownership.physical_shard,
+                &local_id,
+            );
             let output = match stored.config.format {
                 TableFormat::Row => {
                     self.write_row_sstable_remote(
@@ -2707,6 +2767,7 @@ impl Db {
                         0,
                         local_id,
                         rows,
+                        Some(shard_ownership.clone()),
                         stored.config.bloom_filter_bits_per_key,
                     )
                     .await
@@ -2718,6 +2779,7 @@ impl Db {
                         local_id,
                         &stored,
                         rows,
+                        Some(shard_ownership.clone()),
                         Some(applied_generation),
                         &[],
                     )
@@ -2736,9 +2798,11 @@ impl Db {
         level: u32,
         local_id: String,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         bloom_filter_bits_per_key: Option<u32>,
     ) -> Result<(ResidentRowSstable, Vec<u8>), StorageError> {
         let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
+        meta.shard_ownership = shard_ownership.clone();
         let user_key_bloom_filter = UserKeyBloomFilter::build(&rows, bloom_filter_bits_per_key);
         let rows_bytes = serde_json::to_vec(&rows).map_err(|error| {
             StorageError::corruption(format!("encode SSTable rows failed: {error}"))
@@ -2757,6 +2821,7 @@ impl Db {
             rows: rows.clone(),
             data_checksum,
             user_key_bloom_filter: user_key_bloom_filter.clone(),
+            shard_ownership,
         };
         let encoded_body = serde_json::to_vec(&body).map_err(|error| {
             StorageError::corruption(format!("encode SSTable body failed: {error}"))
@@ -3678,6 +3743,7 @@ impl Db {
         local_id: String,
         stored: &StoredTable,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         applied_generation: Option<ManifestId>,
         inputs: &[ResidentRowSstable],
     ) -> Result<ResidentRowSstable, StorageError> {
@@ -3689,13 +3755,22 @@ impl Db {
                     level,
                     local_id,
                     rows,
+                    shard_ownership,
                     stored.config.bloom_filter_bits_per_key,
                 )
                 .await
             }
             ColumnarOutputLayout::Wide => {
-                self.write_columnar_sstable(path, level, local_id, stored, rows, applied_generation)
-                    .await
+                self.write_columnar_sstable(
+                    path,
+                    level,
+                    local_id,
+                    stored,
+                    rows,
+                    shard_ownership,
+                    applied_generation,
+                )
+                .await
             }
         }
     }
@@ -3708,6 +3783,7 @@ impl Db {
         local_id: String,
         stored: &StoredTable,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         applied_generation: Option<ManifestId>,
         inputs: &[ResidentRowSstable],
     ) -> Result<ResidentRowSstable, StorageError> {
@@ -3719,6 +3795,7 @@ impl Db {
                     level,
                     local_id,
                     rows,
+                    shard_ownership,
                     stored.config.bloom_filter_bits_per_key,
                 )
                 .await
@@ -3730,6 +3807,7 @@ impl Db {
                     local_id,
                     stored,
                     rows,
+                    shard_ownership,
                     applied_generation,
                 )
                 .await
@@ -3744,6 +3822,7 @@ impl Db {
         local_id: String,
         schema: &SchemaDefinition,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         bloom_filter_bits_per_key: Option<u32>,
         applied_generation: Option<ManifestId>,
         optional_sidecars: Vec<PersistedOptionalSidecarDescriptor>,
@@ -3858,6 +3937,7 @@ impl Db {
             digests: Vec::new(),
             optional_sidecars,
             user_key_bloom_filter: user_key_bloom_filter.clone(),
+            shard_ownership: shard_ownership.clone(),
         };
         let mut footer = footer;
         footer.digests = vec![Self::compact_crc32_digest(
@@ -3886,6 +3966,7 @@ impl Db {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_row_sstable(
         &self,
         path: &str,
@@ -3893,10 +3974,17 @@ impl Db {
         level: u32,
         local_id: String,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         bloom_filter_bits_per_key: Option<u32>,
     ) -> Result<ResidentRowSstable, StorageError> {
-        let (mut resident, bytes) =
-            Self::encode_row_sstable(table_id, level, local_id, rows, bloom_filter_bits_per_key)?;
+        let (mut resident, bytes) = Self::encode_row_sstable(
+            table_id,
+            level,
+            local_id,
+            rows,
+            shard_ownership,
+            bloom_filter_bits_per_key,
+        )?;
 
         let handle = self
             .inner
@@ -3956,6 +4044,7 @@ impl Db {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_columnar_sstable(
         &self,
         path: &str,
@@ -3963,6 +4052,7 @@ impl Db {
         local_id: String,
         stored: &StoredTable,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         applied_generation: Option<ManifestId>,
     ) -> Result<ResidentRowSstable, StorageError> {
         let schema = stored.config.schema.as_ref().ok_or_else(|| {
@@ -3979,6 +4069,7 @@ impl Db {
             local_id,
             schema,
             rows,
+            shard_ownership,
             stored.config.bloom_filter_bits_per_key,
             applied_generation,
             sidecars
@@ -3996,6 +4087,7 @@ impl Db {
         Ok(resident)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_row_sstable_remote(
         &self,
         object_key: &str,
@@ -4003,10 +4095,17 @@ impl Db {
         level: u32,
         local_id: String,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         bloom_filter_bits_per_key: Option<u32>,
     ) -> Result<ResidentRowSstable, StorageError> {
-        let (mut resident, bytes) =
-            Self::encode_row_sstable(table_id, level, local_id, rows, bloom_filter_bits_per_key)?;
+        let (mut resident, bytes) = Self::encode_row_sstable(
+            table_id,
+            level,
+            local_id,
+            rows,
+            shard_ownership,
+            bloom_filter_bits_per_key,
+        )?;
         self.inner
             .dependencies
             .object_store
@@ -4016,6 +4115,7 @@ impl Db {
         Ok(resident)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_columnar_sstable_remote(
         &self,
         object_key: &str,
@@ -4023,6 +4123,7 @@ impl Db {
         local_id: String,
         stored: &StoredTable,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         applied_generation: Option<ManifestId>,
     ) -> Result<ResidentRowSstable, StorageError> {
         let schema = stored.config.schema.as_ref().ok_or_else(|| {
@@ -4039,6 +4140,7 @@ impl Db {
             local_id,
             schema,
             rows,
+            shard_ownership,
             stored.config.bloom_filter_bits_per_key,
             applied_generation,
             sidecars
@@ -4280,16 +4382,19 @@ impl Db {
         };
 
         let mut snapshots = Vec::new();
-        for descriptor in manager.enumerate_segments() {
+        for (shard, descriptor) in manager.enumerate_segments() {
             if descriptor.record_count == 0 {
                 continue;
             }
 
-            let bytes = manager.read_segment_bytes(descriptor.segment_id).await?;
+            let bytes = manager
+                .read_segment_bytes(shard, descriptor.segment_id)
+                .await?;
             let footer = segment_footer_from_bytes(descriptor.segment_id, &bytes)?;
             snapshots.push((
                 DurableRemoteCommitLogSegment {
-                    object_key: layout.backup_commit_log_segment(descriptor.segment_id),
+                    object_key: layout
+                        .backup_commit_log_segment_in_shard(shard, descriptor.segment_id),
                     footer,
                 },
                 bytes,
@@ -4339,7 +4444,11 @@ impl Db {
         for sstable in live {
             let mut meta = sstable.meta.clone();
             if !meta.file_path.is_empty() {
-                let backup_key = layout.backup_sstable(meta.table_id, 0, &meta.local_id);
+                let backup_key = layout.backup_sstable_in_shard(
+                    meta.table_id,
+                    meta.physical_shard(),
+                    &meta.local_id,
+                );
                 let bytes = read_path(&self.inner.dependencies, &meta.file_path).await?;
                 meta.file_path.clear();
                 meta.remote_key = Some(backup_key.clone());

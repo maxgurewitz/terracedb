@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
@@ -8,15 +12,15 @@ use serde_json::json;
 use super::{
     BACKUP_GC_METADATA_FORMAT_VERSION, BackupObjectBirthRecord, CATALOG_FORMAT_VERSION,
     COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, ColumnarCacheStatsSnapshot,
-    ColumnarReadAccessPattern, CommitPhase, CompactionJobKind, CompactionPhase, Db,
-    DurableRemoteCommitLogSegment, FlushPhase, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
-    LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
-    LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, MANIFEST_FORMAT_VERSION, ManifestId,
-    OffloadJobKind, OffloadPhase, PendingWorkSpec, PersistedManifestBody, PersistedManifestFile,
-    PersistedManifestSstable, PersistedRemoteManifestBody, PersistedRemoteManifestFile,
-    PersistedRowSstableFile, REMOTE_MANIFEST_FORMAT_VERSION, ResidentColumnarSstable,
-    SchemaDefinition, StorageSource, StoredTable, WatermarkUpdate, decode_mvcc_key,
-    encode_mvcc_key, read_path,
+    ColumnarReadAccessPattern, CommitLogBackend, CommitPhase, CommitRuntime, CompactionJobKind,
+    CompactionPhase, Db, DurableRemoteCommitLogSegment, FlushPhase, KeyMatcher,
+    LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR,
+    LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR,
+    MANIFEST_FORMAT_VERSION, ManifestId, MemoryCommitLog, OffloadJobKind, OffloadPhase,
+    PendingWorkSpec, PersistedManifestBody, PersistedManifestFile, PersistedManifestSstable,
+    PersistedRemoteManifestBody, PersistedRemoteManifestFile, PersistedRowSstableFile,
+    REMOTE_MANIFEST_FORMAT_VERSION, ResidentColumnarSstable, SchemaDefinition, StorageSource,
+    StoredTable, WatermarkUpdate, decode_mvcc_key, encode_mvcc_key, read_path,
 };
 use crate::simulation::{
     CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
@@ -1077,6 +1081,38 @@ fn row_table_config_with_history_retention(name: &str, retained_sequences: u64) 
     config
 }
 
+fn sharded_row_table_config(name: &str) -> TableConfig {
+    let mut config = row_table_config(name);
+    config.sharding = crate::ShardingConfig::hash(
+        4,
+        crate::ShardHashAlgorithm::Crc32,
+        crate::ShardMapRevision::new(7),
+        vec![
+            crate::PhysicalShardId::new(0),
+            crate::PhysicalShardId::new(0),
+            crate::PhysicalShardId::new(1),
+            crate::PhysicalShardId::new(1),
+        ],
+    )
+    .expect("valid sharding config");
+    config
+}
+
+fn find_key_for_shard(
+    config: &crate::ShardingConfig,
+    target: crate::PhysicalShardId,
+    prefix: &str,
+) -> Vec<u8> {
+    for index in 0..10_000_u32 {
+        let candidate = format!("{prefix}-{index}").into_bytes();
+        let route = config.route_key(&candidate).expect("route candidate");
+        if route.physical_shard == target {
+            return candidate;
+        }
+    }
+    panic!("failed to find key for shard {target}");
+}
+
 fn columnar_table_config(name: &str) -> TableConfig {
     TableConfig {
         name: name.to_string(),
@@ -1490,19 +1526,44 @@ fn merge_oracle_prefix_rows(
 }
 
 fn sstable_dir(root: &str, table_id: TableId) -> String {
+    sstable_dir_in_shard(root, table_id, crate::PhysicalShardId::UNSHARDED)
+}
+
+fn sstable_dir_in_shard(root: &str, table_id: TableId, shard: crate::PhysicalShardId) -> String {
+    let shard_dir = if shard == crate::PhysicalShardId::UNSHARDED {
+        LOCAL_SSTABLE_SHARD_DIR.to_string()
+    } else {
+        shard.to_string()
+    };
     Db::join_fs_path(
         root,
         &format!(
-            "{LOCAL_SSTABLE_RELATIVE_DIR}/table-{:06}/{LOCAL_SSTABLE_SHARD_DIR}",
+            "{LOCAL_SSTABLE_RELATIVE_DIR}/table-{:06}/{shard_dir}",
             table_id.get()
         ),
     )
 }
 
+fn commit_log_dir_in_shard(root: &str, shard: crate::PhysicalShardId) -> String {
+    if shard == crate::PhysicalShardId::UNSHARDED {
+        Db::join_fs_path(root, LOCAL_COMMIT_LOG_RELATIVE_DIR)
+    } else {
+        Db::join_fs_path(root, &format!("{LOCAL_COMMIT_LOG_RELATIVE_DIR}/{shard}"))
+    }
+}
+
 fn commit_log_segment_path(root: &str, segment_id: u64) -> String {
+    commit_log_segment_path_in_shard(root, crate::PhysicalShardId::UNSHARDED, segment_id)
+}
+
+fn commit_log_segment_path_in_shard(
+    root: &str,
+    shard: crate::PhysicalShardId,
+    segment_id: u64,
+) -> String {
     Db::join_fs_path(
-        root,
-        &format!("{LOCAL_COMMIT_LOG_RELATIVE_DIR}/SEG-{segment_id:06}"),
+        &commit_log_dir_in_shard(root, shard),
+        &format!("SEG-{segment_id:06}"),
     )
 }
 
@@ -1674,7 +1735,12 @@ fn durable_format_local_manifest_sstables() -> Vec<PersistedManifestSstable> {
             table_id: TableId::new(7),
             level: 0,
             local_id: "SST-000111".to_string(),
-            file_path: Db::local_sstable_path("/durable-fixtures", TableId::new(7), "SST-000111"),
+            file_path: Db::local_sstable_path_in_shard(
+                "/durable-fixtures",
+                TableId::new(7),
+                crate::PhysicalShardId::UNSHARDED,
+                "SST-000111",
+            ),
             remote_key: None,
             length: 512,
             checksum: 0x1a2b3c4d,
@@ -1684,12 +1750,18 @@ fn durable_format_local_manifest_sstables() -> Vec<PersistedManifestSstable> {
             min_sequence: SequenceNumber::new(11),
             max_sequence: SequenceNumber::new(19),
             schema_version: None,
+            shard_ownership: None,
         },
         PersistedManifestSstable {
             table_id: TableId::new(9),
             level: 1,
             local_id: "SST-000222".to_string(),
-            file_path: Db::local_sstable_path("/durable-fixtures", TableId::new(9), "SST-000222"),
+            file_path: Db::local_sstable_path_in_shard(
+                "/durable-fixtures",
+                TableId::new(9),
+                crate::PhysicalShardId::UNSHARDED,
+                "SST-000222",
+            ),
             remote_key: None,
             length: 1024,
             checksum: 0x55667788,
@@ -1699,6 +1771,7 @@ fn durable_format_local_manifest_sstables() -> Vec<PersistedManifestSstable> {
             min_sequence: SequenceNumber::new(20),
             max_sequence: SequenceNumber::new(42),
             schema_version: Some(3),
+            shard_ownership: None,
         },
     ]
 }
@@ -1708,8 +1781,11 @@ fn durable_format_remote_manifest_sstables() -> Vec<PersistedManifestSstable> {
     durable_format_local_manifest_sstables()
         .into_iter()
         .map(|mut sstable| {
-            sstable.remote_key =
-                Some(layout.backup_sstable(sstable.table_id, 0, &sstable.local_id));
+            sstable.remote_key = Some(layout.backup_sstable_in_shard(
+                sstable.table_id,
+                crate::PhysicalShardId::UNSHARDED,
+                &sstable.local_id,
+            ));
             sstable.file_path.clear();
             sstable
         })
@@ -1719,7 +1795,10 @@ fn durable_format_remote_manifest_sstables() -> Vec<PersistedManifestSstable> {
 fn durable_format_remote_segments() -> Vec<DurableRemoteCommitLogSegment> {
     let layout = tiered_layout();
     vec![DurableRemoteCommitLogSegment {
-        object_key: layout.backup_commit_log_segment(SegmentId::new(3)),
+        object_key: layout.backup_commit_log_segment_in_shard(
+            crate::PhysicalShardId::UNSHARDED,
+            SegmentId::new(3),
+        ),
         footer: SegmentFooter {
             segment_id: SegmentId::new(3),
             min_sequence: SequenceNumber::new(21),
@@ -1757,12 +1836,99 @@ fn durable_format_remote_segments() -> Vec<DurableRemoteCommitLogSegment> {
 
 fn durable_format_backup_gc_record() -> BackupObjectBirthRecord {
     let layout = tiered_layout();
-    let object_key = layout.backup_sstable(TableId::new(9), 0, "SST-000222");
+    let object_key = layout.backup_sstable_in_shard(
+        TableId::new(9),
+        crate::PhysicalShardId::UNSHARDED,
+        "SST-000222",
+    );
     BackupObjectBirthRecord {
         format_version: BACKUP_GC_METADATA_FORMAT_VERSION,
         object_key,
         first_uploaded_at_millis: 1_717_171_717,
     }
+}
+
+#[test]
+fn shard_local_recovery_orders_equal_sequences_by_full_commit_id() {
+    let sequence = SequenceNumber::new(7);
+    let mut records = vec![
+        crate::engine::commit_log::CommitRecord {
+            id: CommitId::with_shard_hint(sequence, crate::PhysicalShardId::new(2)),
+            entries: Vec::new(),
+        },
+        crate::engine::commit_log::CommitRecord {
+            id: CommitId::with_shard_hint(sequence, crate::PhysicalShardId::new(1)),
+            entries: Vec::new(),
+        },
+    ];
+
+    records.sort_by_key(|record| record.id);
+
+    assert_eq!(
+        records
+            .into_iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>(),
+        vec![
+            CommitId::with_shard_hint(sequence, crate::PhysicalShardId::new(1)),
+            CommitId::with_shard_hint(sequence, crate::PhysicalShardId::new(2)),
+        ]
+    );
+}
+
+#[test]
+fn shard_local_oldest_sequence_for_table_uses_the_earliest_lane_floor() {
+    let table_id = TableId::new(9);
+    let mut runtime = CommitRuntime {
+        backend: CommitLogBackend::Memory(MemoryCommitLog::new()),
+    };
+    let CommitLogBackend::Memory(log) = &mut runtime.backend else {
+        unreachable!("expected memory commit log");
+    };
+
+    log.lane_mut(crate::PhysicalShardId::new(1))
+        .durable_commit_log_segments = vec![DurableRemoteCommitLogSegment {
+        object_key: "backup/commitlog/0001/SEG-000001".to_string(),
+        footer: SegmentFooter {
+            segment_id: SegmentId::new(1),
+            min_sequence: SequenceNumber::new(2),
+            max_sequence: SequenceNumber::new(2),
+            record_count: 1,
+            entry_count: 1,
+            data_end_offset: 0,
+            tables: vec![TableSegmentMeta {
+                table_id,
+                min_sequence: SequenceNumber::new(2),
+                max_sequence: SequenceNumber::new(2),
+                entry_count: 1,
+            }],
+            block_index: Vec::new(),
+        },
+    }];
+    log.lane_mut(crate::PhysicalShardId::new(2))
+        .durable_commit_log_segments = vec![DurableRemoteCommitLogSegment {
+        object_key: "backup/commitlog/0002/SEG-000001".to_string(),
+        footer: SegmentFooter {
+            segment_id: SegmentId::new(1),
+            min_sequence: SequenceNumber::new(4),
+            max_sequence: SequenceNumber::new(4),
+            record_count: 1,
+            entry_count: 1,
+            data_end_offset: 0,
+            tables: vec![TableSegmentMeta {
+                table_id,
+                min_sequence: SequenceNumber::new(4),
+                max_sequence: SequenceNumber::new(4),
+                entry_count: 1,
+            }],
+            block_index: Vec::new(),
+        },
+    }];
+
+    assert_eq!(
+        runtime.oldest_sequence_for_table(table_id),
+        Some(SequenceNumber::new(2))
+    );
 }
 
 async fn seed_compaction_fixture(
@@ -5065,6 +5231,557 @@ async fn flush_persists_row_sstables_manifest_and_reopenable_reads() {
             (b"banana".to_vec(), Value::bytes("yellow")),
         ]
     );
+}
+
+#[tokio::test]
+async fn sharded_tiered_recovery_rebuilds_shard_local_commit_lanes() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+    let root = "/sharded-tiered-recovery";
+    let config = sharded_row_table_config("events");
+    let shard_zero_key =
+        find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(0), "user");
+    let shard_one_key =
+        find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(1), "user");
+    let shard_zero_route = config
+        .sharding
+        .route_key(&shard_zero_key)
+        .expect("route shard zero key");
+    let shard_one_route = config
+        .sharding
+        .route_key(&shard_one_key)
+        .expect("route shard one key");
+
+    let db = Db::open(tiered_config(root), dependencies.clone())
+        .await
+        .expect("open db");
+    let table = db.create_table(config).await.expect("create sharded table");
+    let first = table
+        .write(shard_zero_key.clone(), Value::bytes("left"))
+        .await
+        .expect("write shard zero");
+    let latest = table
+        .write(shard_one_key.clone(), Value::bytes("right"))
+        .await
+        .expect("write shard one");
+    assert_eq!(first, SequenceNumber::new(1));
+    assert_eq!(db.current_durable_sequence(), latest);
+
+    let commit_log_files = file_system
+        .list(&Db::join_fs_path(root, LOCAL_COMMIT_LOG_RELATIVE_DIR))
+        .await
+        .expect("list shard-local commit-log files");
+    assert!(commit_log_files.contains(&commit_log_segment_path_in_shard(
+        root,
+        shard_zero_route.physical_shard,
+        1,
+    )));
+    assert!(commit_log_files.contains(&commit_log_segment_path_in_shard(
+        root,
+        shard_one_route.physical_shard,
+        1,
+    )));
+
+    drop(db);
+
+    let reopened = Db::open(tiered_config(root), dependencies)
+        .await
+        .expect("reopen db");
+    let reopened_table = reopened.table("events");
+    assert_eq!(reopened.current_sequence(), latest);
+    assert_eq!(reopened.current_durable_sequence(), latest);
+    assert!(reopened.sstables_read().live.is_empty());
+    assert_eq!(
+        reopened_table
+            .read(shard_zero_key)
+            .await
+            .expect("recovered shard zero read"),
+        Some(Value::bytes("left"))
+    );
+    assert_eq!(
+        reopened_table
+            .read(shard_one_key)
+            .await
+            .expect("recovered shard one read"),
+        Some(Value::bytes("right"))
+    );
+
+    let recovered_shards = reopened
+        .memtables_read()
+        .mutable
+        .tables
+        .keys()
+        .filter(|key| key.table_id == reopened_table.id().expect("table id"))
+        .map(|key| key.physical_shard)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        recovered_shards,
+        BTreeSet::from([
+            shard_zero_route.physical_shard,
+            shard_one_route.physical_shard
+        ])
+    );
+}
+
+#[tokio::test]
+async fn sharded_recovery_preserves_durable_shard_map_revision_after_revision_only_publication() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+    let root = "/sharded-recovery-revision";
+    let config = sharded_row_table_config("events");
+    let key = find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(1), "user");
+    let route = config
+        .sharding
+        .route_key(&key)
+        .expect("route shard-local key");
+
+    let db = Db::open(tiered_config(root), dependencies.clone())
+        .await
+        .expect("open db");
+    let table = db.create_table(config).await.expect("create sharded table");
+    let table_id = table.id().expect("table id");
+
+    let written = table
+        .write(key.clone(), Value::bytes("before"))
+        .await
+        .expect("write shard-local value");
+    table
+        .publish_shard_map(
+            crate::ShardingConfig::hash(
+                4,
+                crate::ShardHashAlgorithm::Crc32,
+                crate::ShardMapRevision::new(8),
+                vec![
+                    crate::PhysicalShardId::new(0),
+                    crate::PhysicalShardId::new(0),
+                    crate::PhysicalShardId::new(1),
+                    crate::PhysicalShardId::new(1),
+                ],
+            )
+            .expect("valid revision-only config"),
+        )
+        .await
+        .expect("publish revision-only shard map");
+
+    drop(db);
+
+    let reopened = Db::open(tiered_config(root), dependencies)
+        .await
+        .expect("reopen db");
+    let reopened_table = reopened.table("events");
+    assert_eq!(
+        reopened_table
+            .sharding_state()
+            .expect("reopened sharding state")
+            .current_revision(),
+        crate::ShardMapRevision::new(8)
+    );
+    assert_eq!(
+        reopened_table
+            .read(key.clone())
+            .await
+            .expect("read after reopen"),
+        Some(Value::bytes("before"))
+    );
+
+    {
+        let memtables = reopened.memtables_read();
+        let recovered_memtable = memtables
+            .mutable
+            .tables
+            .get(&super::TableMemtableKey::new(
+                table_id,
+                route.physical_shard,
+            ))
+            .expect("recovered shard-local memtable");
+        let recovered_entry = recovered_memtable
+            .entries
+            .values()
+            .find(|entry| entry.user_key == key)
+            .expect("recovered memtable entry");
+        assert_eq!(recovered_entry.physical_shard, route.physical_shard);
+        assert_eq!(recovered_entry.virtual_partition, route.virtual_partition);
+        assert_eq!(
+            recovered_entry.shard_map_revision,
+            crate::ShardMapRevision::new(7)
+        );
+    }
+
+    reopened
+        .flush()
+        .await
+        .expect("flush reopened shard-local state");
+    let shard_local_meta = reopened
+        .sstables_read()
+        .live
+        .iter()
+        .find(|sstable| {
+            sstable.meta.table_id == table_id
+                && sstable.meta.physical_shard() == route.physical_shard
+        })
+        .map(|sstable| sstable.meta.clone())
+        .expect("flushed shard-local SSTable");
+    let ownership = shard_local_meta
+        .shard_ownership
+        .as_ref()
+        .expect("persisted shard ownership");
+    assert_eq!(ownership.physical_shard, route.physical_shard);
+    assert_eq!(
+        ownership.virtual_partitions,
+        crate::VirtualPartitionCoverage::single(route.virtual_partition)
+    );
+    assert_eq!(
+        ownership.shard_map_revision,
+        crate::ShardMapRevision::new(7)
+    );
+    assert_eq!(written, SequenceNumber::new(1));
+}
+
+#[tokio::test]
+async fn sharded_tiered_flush_persists_shard_local_sstable_metadata_and_reopens() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store);
+    let root = "/sharded-tiered-flush";
+    let config = sharded_row_table_config("events");
+    let shard_zero_key =
+        find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(0), "user");
+    let shard_one_key =
+        find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(1), "user");
+    let shard_zero_route = config
+        .sharding
+        .route_key(&shard_zero_key)
+        .expect("route shard zero key");
+    let shard_one_route = config
+        .sharding
+        .route_key(&shard_one_key)
+        .expect("route shard one key");
+
+    let db = Db::open(tiered_config(root), dependencies.clone())
+        .await
+        .expect("open db");
+    let table = db.create_table(config).await.expect("create sharded table");
+    let table_id = table.id().expect("table id");
+
+    table
+        .write(shard_zero_key.clone(), Value::bytes("left"))
+        .await
+        .expect("write shard zero");
+    let flushed = table
+        .write(shard_one_key.clone(), Value::bytes("right"))
+        .await
+        .expect("write shard one");
+    db.flush().await.expect("flush sharded table");
+
+    let live = db.sstables_read().live.clone();
+    assert_eq!(live.len(), 2);
+    let live_by_shard = live
+        .iter()
+        .map(|sstable| (sstable.meta.physical_shard(), sstable.meta.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (route, expected_key) in [
+        (shard_zero_route, shard_zero_key.as_slice()),
+        (shard_one_route, shard_one_key.as_slice()),
+    ] {
+        let meta = live_by_shard
+            .get(&route.physical_shard)
+            .expect("live shard-local SSTable");
+        assert!(meta.file_path.starts_with(&sstable_dir_in_shard(
+            root,
+            table_id,
+            route.physical_shard,
+        )));
+        let ownership = meta
+            .shard_ownership
+            .as_ref()
+            .expect("persisted shard ownership on live SSTable");
+        assert_eq!(ownership.physical_shard, route.physical_shard);
+        assert_eq!(
+            ownership.virtual_partitions,
+            crate::VirtualPartitionCoverage::single(route.virtual_partition)
+        );
+        assert_eq!(meta.min_key, expected_key);
+        assert_eq!(meta.max_key, expected_key);
+    }
+    assert_eq!(db.current_durable_sequence(), flushed);
+
+    assert_eq!(
+        file_system
+            .list(&sstable_dir_in_shard(
+                root,
+                table_id,
+                shard_zero_route.physical_shard
+            ))
+            .await
+            .expect("list shard zero SSTables")
+            .len(),
+        1
+    );
+    assert_eq!(
+        file_system
+            .list(&sstable_dir_in_shard(
+                root,
+                table_id,
+                shard_one_route.physical_shard
+            ))
+            .await
+            .expect("list shard one SSTables")
+            .len(),
+        1
+    );
+
+    let manifest = Db::read_manifest_at_path(
+        &dependencies,
+        &Db::local_manifest_path(root, ManifestId::new(1)),
+    )
+    .await
+    .expect("read sharded manifest");
+    assert_eq!(manifest.last_flushed_sequence, flushed);
+    assert_eq!(manifest.live_sstables.len(), 2);
+    let manifest_shards = manifest
+        .live_sstables
+        .iter()
+        .map(|sstable| sstable.meta.physical_shard())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        manifest_shards,
+        BTreeSet::from([
+            shard_zero_route.physical_shard,
+            shard_one_route.physical_shard
+        ])
+    );
+
+    let reopened = Db::open(tiered_config(root), dependencies)
+        .await
+        .expect("reopen sharded db");
+    let reopened_table = reopened.table("events");
+    assert_eq!(reopened.current_sequence(), flushed);
+    assert_eq!(reopened.current_durable_sequence(), flushed);
+    assert_eq!(
+        reopened_table
+            .read(shard_zero_key)
+            .await
+            .expect("reopened shard zero"),
+        Some(Value::bytes("left"))
+    );
+    assert_eq!(
+        reopened_table
+            .read(shard_one_key)
+            .await
+            .expect("reopened shard one"),
+        Some(Value::bytes("right"))
+    );
+    assert_eq!(
+        reopened.table_stats(&reopened_table).await.l0_sstable_count,
+        2
+    );
+}
+
+#[tokio::test]
+async fn sharded_compaction_preserves_durable_shard_map_revision_after_revision_only_publication() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+    let root = "/sharded-compaction-revision";
+    let config = sharded_row_table_config("events");
+    let first_key = find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(1), "user-a");
+    let second_key = find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(1), "user-b");
+    let first_route = config
+        .sharding
+        .route_key(&first_key)
+        .expect("route first shard-local key");
+    let second_route = config
+        .sharding
+        .route_key(&second_key)
+        .expect("route second shard-local key");
+
+    let db = Db::open(tiered_config(root), dependencies)
+        .await
+        .expect("open db");
+    let table = db.create_table(config).await.expect("create sharded table");
+    let table_id = table.id().expect("table id");
+
+    table
+        .write(first_key.clone(), Value::bytes("left"))
+        .await
+        .expect("write first shard-local value");
+    db.flush().await.expect("flush first shard-local SSTable");
+    table
+        .write(second_key.clone(), Value::bytes("right"))
+        .await
+        .expect("write second shard-local value");
+    db.flush().await.expect("flush second shard-local SSTable");
+
+    let initial_live = db.sstables_read().live.clone();
+    let initial_revisions = initial_live
+        .iter()
+        .filter(|sstable| {
+            sstable.meta.table_id == table_id
+                && sstable.meta.physical_shard() == first_route.physical_shard
+        })
+        .map(|sstable| {
+            sstable
+                .meta
+                .shard_ownership
+                .as_ref()
+                .expect("persisted shard ownership before compaction")
+                .shard_map_revision
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        initial_revisions,
+        BTreeSet::from([crate::ShardMapRevision::new(7)])
+    );
+    assert_eq!(db.table_stats(&table).await.l0_sstable_count, 2);
+
+    table
+        .publish_shard_map(
+            crate::ShardingConfig::hash(
+                4,
+                crate::ShardHashAlgorithm::Crc32,
+                crate::ShardMapRevision::new(8),
+                vec![
+                    crate::PhysicalShardId::new(0),
+                    crate::PhysicalShardId::new(0),
+                    crate::PhysicalShardId::new(1),
+                    crate::PhysicalShardId::new(1),
+                ],
+            )
+            .expect("valid revision-only config"),
+        )
+        .await
+        .expect("publish revision-only shard map");
+
+    assert!(db.run_next_compaction().await.expect("run compaction"));
+
+    let compacted_live = db.sstables_read().live.clone();
+    let shard_live = compacted_live
+        .iter()
+        .filter(|sstable| {
+            sstable.meta.table_id == table_id
+                && sstable.meta.physical_shard() == first_route.physical_shard
+        })
+        .map(|sstable| sstable.meta.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(shard_live.len(), 1);
+    let ownership = shard_live[0]
+        .shard_ownership
+        .as_ref()
+        .expect("persisted shard ownership after compaction");
+    assert_eq!(ownership.physical_shard, first_route.physical_shard);
+    assert_eq!(
+        ownership.shard_map_revision,
+        crate::ShardMapRevision::new(7)
+    );
+    assert_eq!(
+        ownership.virtual_partitions,
+        crate::VirtualPartitionCoverage::from_partitions([
+            first_route.virtual_partition,
+            second_route.virtual_partition,
+        ])
+        .expect("valid compacted virtual partition coverage")
+    );
+    assert_eq!(db.table_stats(&table).await.l0_sstable_count, 0);
+    assert_eq!(
+        table
+            .read(first_key)
+            .await
+            .expect("read first value after compaction"),
+        Some(Value::bytes("left"))
+    );
+    assert_eq!(
+        table
+            .read(second_key)
+            .await
+            .expect("read second value after compaction"),
+        Some(Value::bytes("right"))
+    );
+}
+
+#[tokio::test]
+async fn sharded_change_feed_scans_merge_commit_lanes_in_sequence_order() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store);
+    let root = "/sharded-change-feed-order";
+    let config = sharded_row_table_config("events");
+    let shard_zero_key =
+        find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(0), "user");
+    let shard_one_key =
+        find_key_for_shard(&config.sharding, crate::PhysicalShardId::new(1), "user");
+
+    let db = Db::open(tiered_config(root), dependencies.clone())
+        .await
+        .expect("open db");
+    let table = db.create_table(config).await.expect("create sharded table");
+
+    let first = table
+        .write(shard_one_key.clone(), Value::bytes("v1"))
+        .await
+        .expect("write first shard one");
+    let second = table
+        .write(shard_zero_key.clone(), Value::bytes("v2"))
+        .await
+        .expect("write shard zero");
+    let third = table
+        .write(shard_one_key.clone(), Value::bytes("v3"))
+        .await
+        .expect("write second shard one");
+
+    let visible = collect_changes(
+        db.scan_since(&table, LogCursor::beginning(), ScanOptions::default())
+            .await
+            .expect("visible sharded change feed"),
+    )
+    .await;
+    assert_eq!(
+        visible,
+        vec![
+            collected_change(
+                1,
+                0,
+                ChangeKind::Put,
+                &shard_one_key,
+                Some(Value::bytes("v1")),
+                "events",
+            ),
+            collected_change(
+                2,
+                0,
+                ChangeKind::Put,
+                &shard_zero_key,
+                Some(Value::bytes("v2")),
+                "events",
+            ),
+            collected_change(
+                3,
+                0,
+                ChangeKind::Put,
+                &shard_one_key,
+                Some(Value::bytes("v3")),
+                "events",
+            ),
+        ]
+    );
+
+    db.flush().await.expect("flush sharded change feed state");
+    assert_eq!(
+        db.table_stats(&table).await.change_feed_floor_sequence,
+        Some(second)
+    );
+    assert_change_feed_snapshot_too_old(
+        db.scan_durable_since(&table, LogCursor::beginning(), ScanOptions::default())
+            .await
+            .err()
+            .expect("shard-local GC should fail closed instead of leaving a hole"),
+        SequenceNumber::new(0),
+        second,
+    );
+    assert_eq!(first, SequenceNumber::new(1));
+    assert_eq!(second, SequenceNumber::new(2));
+    assert_eq!(third, SequenceNumber::new(3));
 }
 
 #[tokio::test]
@@ -9704,9 +10421,10 @@ async fn recovery_prefers_manifest_references_over_extra_local_files() {
 
     let active_live = db.sstables_read().live.clone();
     assert_eq!(active_live.len(), 2);
-    let stale_copy_path = Db::local_sstable_path(
+    let stale_copy_path = Db::local_sstable_path_in_shard(
         "/extra-local-files",
         table.id().expect("table id"),
+        crate::PhysicalShardId::UNSHARDED,
         "SST-999999",
     );
     let stale_bytes = read_path(&dependencies, &active_live[0].meta.file_path)
@@ -12993,11 +13711,17 @@ async fn s3_primary_flush_persists_state_and_durable_change_feed_across_reopen()
     });
     object_store.inject_failure(ObjectStoreFailure::timeout(
         ObjectStoreOperation::Get,
-        layout.backup_commit_log_segment(SegmentId::new(1)),
+        layout.backup_commit_log_segment_in_shard(
+            crate::PhysicalShardId::UNSHARDED,
+            SegmentId::new(1),
+        ),
     ));
     object_store.inject_failure(ObjectStoreFailure::timeout(
         ObjectStoreOperation::Get,
-        layout.backup_commit_log_segment(SegmentId::new(1)),
+        layout.backup_commit_log_segment_in_shard(
+            crate::PhysicalShardId::UNSHARDED,
+            SegmentId::new(1),
+        ),
     ));
 
     let mut visible = db
@@ -13064,6 +13788,145 @@ async fn s3_primary_flush_persists_state_and_durable_change_feed_across_reopen()
         visible_before_flush
     );
     assert_eq!(first, SequenceNumber::new(1));
+}
+
+#[tokio::test]
+async fn s3_primary_sharded_flush_persists_shard_local_remote_layout_and_reopens() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system, object_store.clone());
+    let config = s3_primary_config("s3-sharded-flush");
+    let table_config = sharded_row_table_config("events");
+    let shard_zero_key = find_key_for_shard(
+        &table_config.sharding,
+        crate::PhysicalShardId::new(0),
+        "user",
+    );
+    let shard_one_key = find_key_for_shard(
+        &table_config.sharding,
+        crate::PhysicalShardId::new(1),
+        "user",
+    );
+    let shard_zero_route = table_config
+        .sharding
+        .route_key(&shard_zero_key)
+        .expect("route shard zero key");
+    let shard_one_route = table_config
+        .sharding
+        .route_key(&shard_one_key)
+        .expect("route shard one key");
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open s3-primary db");
+    let events = db
+        .create_table(table_config)
+        .await
+        .expect("create sharded events table");
+    let table_id = events.id().expect("table id");
+
+    events
+        .write(shard_zero_key.clone(), bytes("left"))
+        .await
+        .expect("write shard zero");
+    let flushed = events
+        .write(shard_one_key.clone(), bytes("right"))
+        .await
+        .expect("write shard one");
+    db.flush().await.expect("flush sharded s3-primary state");
+    assert_eq!(db.current_durable_sequence(), flushed);
+
+    let live = db.sstables_read().live.clone();
+    assert_eq!(live.len(), 2);
+    let live_shards = live
+        .iter()
+        .map(|sstable| sstable.meta.physical_shard())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        live_shards,
+        BTreeSet::from([
+            shard_zero_route.physical_shard,
+            shard_one_route.physical_shard
+        ])
+    );
+
+    let layout = ObjectKeyLayout::new(&S3Location {
+        bucket: "terracedb-test".to_string(),
+        prefix: "s3-sharded-flush".to_string(),
+    });
+    let sstable_keys = object_store
+        .list(&layout.backup_sstable_prefix())
+        .await
+        .expect("list remote sharded SSTables");
+    let shard_zero_prefix = format!(
+        "{}/table-{:06}/{}/",
+        layout.backup_sstable_prefix().trim_end_matches('/'),
+        table_id.get(),
+        shard_zero_route.physical_shard
+    );
+    let shard_one_prefix = format!(
+        "{}/table-{:06}/{}/",
+        layout.backup_sstable_prefix().trim_end_matches('/'),
+        table_id.get(),
+        shard_one_route.physical_shard
+    );
+    assert!(
+        sstable_keys
+            .iter()
+            .any(|key| { key.starts_with(&shard_zero_prefix) })
+    );
+    assert!(
+        sstable_keys
+            .iter()
+            .any(|key| { key.starts_with(&shard_one_prefix) })
+    );
+
+    let commit_log_keys = object_store
+        .list(&layout.backup_commit_log_prefix())
+        .await
+        .expect("list remote shard-local commit-log segments");
+    assert!(
+        commit_log_keys.contains(&layout.backup_commit_log_segment_in_shard(
+            shard_zero_route.physical_shard,
+            SegmentId::new(1),
+        ))
+    );
+    assert!(
+        commit_log_keys.contains(
+            &layout.backup_commit_log_segment_in_shard(
+                shard_one_route.physical_shard,
+                SegmentId::new(1),
+            )
+        )
+    );
+
+    let reopened = Db::open(config, dependencies)
+        .await
+        .expect("reopen sharded s3-primary db");
+    let reopened_events = reopened.table("events");
+    assert_eq!(reopened.current_sequence(), flushed);
+    assert_eq!(reopened.current_durable_sequence(), flushed);
+    assert_eq!(
+        reopened_events
+            .read(shard_zero_key)
+            .await
+            .expect("reopened shard zero value"),
+        Some(bytes("left"))
+    );
+    assert_eq!(
+        reopened_events
+            .read(shard_one_key)
+            .await
+            .expect("reopened shard one value"),
+        Some(bytes("right"))
+    );
+    let reopened_shards = reopened
+        .sstables_read()
+        .live
+        .iter()
+        .map(|sstable| sstable.meta.physical_shard())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(reopened_shards, live_shards);
 }
 
 #[tokio::test]
@@ -13906,8 +14769,9 @@ async fn remote_durable_change_feed_limit_stops_before_fetching_later_segments()
     assert_eq!(first_page[0].sequence, first);
     assert_eq!(
         recording_store.get_calls(),
-        vec![Db::remote_commit_log_segment_key(
+        vec![Db::remote_commit_log_segment_key_in_shard(
             remote_config,
+            crate::PhysicalShardId::UNSHARDED,
             SegmentId::new(1),
         )]
     );
@@ -13951,7 +14815,11 @@ async fn remote_durable_change_feed_surfaces_mid_stream_get_errors_after_yieldin
         .expect("write second event");
     db.flush().await.expect("flush second segment");
 
-    let second_key = Db::remote_commit_log_segment_key(remote_config, SegmentId::new(2));
+    let second_key = Db::remote_commit_log_segment_key_in_shard(
+        remote_config,
+        crate::PhysicalShardId::UNSHARDED,
+        SegmentId::new(2),
+    );
     inner_store.inject_failure(ObjectStoreFailure::timeout(
         ObjectStoreOperation::Get,
         second_key.clone(),
@@ -14186,6 +15054,34 @@ async fn recovery_only_log_gc_drops_segments_once_a_flush_makes_them_unnecessary
 }
 
 #[test]
+fn manifest_flatbuffer_round_trip_preserves_shard_ownership() {
+    let mut sstables = durable_format_local_manifest_sstables();
+    sstables[0].shard_ownership = Some(crate::ShardSstableOwnership::new(
+        sstables[0].table_id,
+        crate::PhysicalShardId::new(1),
+        crate::ShardMapRevision::new(7),
+        crate::VirtualPartitionCoverage::from_partitions([
+            crate::VirtualPartitionId::new(2),
+            crate::VirtualPartitionId::new(3),
+        ])
+        .expect("valid virtual partition coverage"),
+    ));
+
+    let payload = Db::encode_manifest_payload_from_sstables(
+        ManifestId::new(12),
+        SequenceNumber::new(42),
+        &sstables,
+    )
+    .expect("encode manifest payload");
+    let decoded = Db::decode_manifest_file_flatbuffer(&payload).expect("decode manifest payload");
+
+    assert_eq!(
+        decoded.body.sstables[0].shard_ownership,
+        sstables[0].shard_ownership
+    );
+}
+
+#[test]
 fn durable_format_fixtures_match_golden_files() {
     let tables = durable_format_tables();
     let catalog = Db::encode_catalog(&tables).expect("encode catalog fixture");
@@ -14395,7 +15291,11 @@ async fn durable_format_decoders_fail_closed_on_corruption_and_unsupported_versi
     assert_eq!(corrupt_remote_error.kind(), StorageErrorKind::Corruption);
 
     let layout = tiered_layout();
-    let backup_object_key = layout.backup_sstable(TableId::new(9), 0, "SST-000222");
+    let backup_object_key = layout.backup_sstable_in_shard(
+        TableId::new(9),
+        crate::PhysicalShardId::UNSHARDED,
+        "SST-000222",
+    );
     let backup_metadata_key = layout.backup_gc_metadata(&backup_object_key);
 
     object_store

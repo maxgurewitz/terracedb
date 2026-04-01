@@ -1,5 +1,5 @@
 use super::*;
-use crate::Timestamp;
+use crate::{PhysicalShardId, ShardMapRevision, Timestamp, VirtualPartitionId};
 
 #[derive(Clone, Debug)]
 pub(super) struct MemtableEntry {
@@ -7,6 +7,9 @@ pub(super) struct MemtableEntry {
     pub(super) sequence: SequenceNumber,
     pub(super) kind: ChangeKind,
     pub(super) value: Option<Value>,
+    pub(super) physical_shard: PhysicalShardId,
+    pub(super) virtual_partition: VirtualPartitionId,
+    pub(super) shard_map_revision: ShardMapRevision,
     pub(super) size_bytes: u64,
 }
 
@@ -16,9 +19,16 @@ impl MemtableEntry {
         sequence: SequenceNumber,
         kind: ChangeKind,
         value: Option<Value>,
+        physical_shard: PhysicalShardId,
+        virtual_partition: VirtualPartitionId,
+        shard_map_revision: ShardMapRevision,
     ) -> Self {
         let size_bytes = (user_key.len()
-            + encode_mvcc_key(&user_key, CommitId::new(sequence)).len()
+            + encode_mvcc_key(
+                &user_key,
+                CommitId::with_shard_hint(sequence, physical_shard),
+            )
+            .len()
             + value.as_ref().map(value_size_bytes).unwrap_or_default())
             as u64;
 
@@ -27,7 +37,29 @@ impl MemtableEntry {
             sequence,
             kind,
             value,
+            physical_shard,
+            virtual_partition,
+            shard_map_revision,
             size_bytes,
+        }
+    }
+
+    pub(super) fn commit_id(&self) -> CommitId {
+        CommitId::with_shard_hint(self.sequence, self.physical_shard)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct TableMemtableKey {
+    pub(super) table_id: TableId,
+    pub(super) physical_shard: PhysicalShardId,
+}
+
+impl TableMemtableKey {
+    pub(super) const fn new(table_id: TableId, physical_shard: PhysicalShardId) -> Self {
+        Self {
+            table_id,
+            physical_shard,
         }
     }
 }
@@ -43,7 +75,7 @@ pub(super) struct TableMemtable {
 
 impl TableMemtable {
     pub(super) fn insert(&mut self, entry: MemtableEntry, now: Timestamp) {
-        let encoded_key = encode_mvcc_key(&entry.user_key, CommitId::new(entry.sequence));
+        let encoded_key = encode_mvcc_key(&entry.user_key, entry.commit_id());
         if let Some(replaced) = self.entries.insert(encoded_key, entry.clone()) {
             self.pending_flush_bytes = self.pending_flush_bytes.saturating_sub(replaced.size_bytes);
         }
@@ -63,7 +95,10 @@ impl TableMemtable {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn read_at(&self, key: &[u8], sequence: SequenceNumber) -> Option<MemtableEntry> {
-        let seek = encode_mvcc_key(key, CommitId::new(sequence));
+        let seek = encode_mvcc_key(
+            key,
+            CommitId::with_shard_hint(sequence, PhysicalShardId::new(u32::MAX)),
+        );
         let (_encoded_key, entry) = self.entries.range(seek..).next()?;
         (entry.user_key.as_slice() == key).then(|| entry.clone())
     }
@@ -82,7 +117,10 @@ impl TableMemtable {
         sequence: SequenceNumber,
         rows: &mut Vec<SstableRow>,
     ) {
-        let seek = encode_mvcc_key(key, CommitId::new(sequence));
+        let seek = encode_mvcc_key(
+            key,
+            CommitId::with_shard_hint(sequence, PhysicalShardId::new(u32::MAX)),
+        );
         for (_encoded_key, entry) in self.entries.range(seek..) {
             match entry.user_key.as_slice().cmp(key) {
                 std::cmp::Ordering::Less => continue,
@@ -112,11 +150,61 @@ impl TableMemtable {
     pub(super) fn restamp_oldest_unflushed_at(&mut self, now: Timestamp) {
         self.oldest_unflushed_at = (self.pending_flush_bytes > 0).then_some(now);
     }
+
+    pub(super) fn shard_ownership(
+        &self,
+        table_id: TableId,
+        sharding: &crate::ShardingConfig,
+    ) -> Result<crate::ShardSstableOwnership, StorageError> {
+        let first = self.entries.values().next().ok_or_else(|| {
+            StorageError::unsupported("cannot derive shard ownership for an empty memtable")
+        })?;
+        let mut physical_shard = first.physical_shard;
+        let mut shard_map_revision = first.shard_map_revision;
+        let coverage = crate::VirtualPartitionCoverage::from_partitions(
+            self.entries
+                .values()
+                .map(|entry| {
+                    if entry.physical_shard != physical_shard {
+                        physical_shard = PhysicalShardId::new(u32::MAX);
+                    }
+                    if entry.shard_map_revision != shard_map_revision {
+                        shard_map_revision = crate::ShardMapRevision::new(u64::MAX);
+                    }
+                    entry.virtual_partition
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| StorageError::corruption(error.to_string()))?;
+        if physical_shard == PhysicalShardId::new(u32::MAX) {
+            return Err(StorageError::corruption(format!(
+                "flush memtable for table {} mixes physical shards",
+                table_id.get()
+            )));
+        }
+        if shard_map_revision == crate::ShardMapRevision::new(u64::MAX) {
+            return Err(StorageError::corruption(format!(
+                "flush memtable for table {} mixes shard-map revisions",
+                table_id.get()
+            )));
+        }
+
+        Ok(crate::ShardSstableOwnership::new(
+            table_id,
+            physical_shard,
+            if sharding.is_sharded() {
+                shard_map_revision
+            } else {
+                sharding.current_revision()
+            },
+            coverage,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct Memtable {
-    pub(super) tables: BTreeMap<TableId, TableMemtable>,
+    pub(super) tables: BTreeMap<TableMemtableKey, TableMemtable>,
     pub(super) min_sequence: Option<SequenceNumber>,
     pub(super) max_sequence: SequenceNumber,
 }
@@ -134,21 +222,30 @@ impl Memtable {
                 .unwrap_or(sequence),
         );
         self.max_sequence = self.max_sequence.max(sequence);
-        self.tables.entry(operation.table_id).or_default().insert(
-            MemtableEntry::new(
-                operation.key.clone(),
-                sequence,
-                operation.kind,
-                operation.value.clone(),
-            ),
-            now,
-        );
+        self.tables
+            .entry(TableMemtableKey::new(
+                operation.table_id,
+                operation.physical_shard,
+            ))
+            .or_default()
+            .insert(
+                MemtableEntry::new(
+                    operation.key.clone(),
+                    sequence,
+                    operation.kind,
+                    operation.value.clone(),
+                    operation.physical_shard,
+                    operation.virtual_partition,
+                    operation.shard_map_revision,
+                ),
+                now,
+            );
     }
 
     pub(super) fn apply_recovered_entry(
         &mut self,
         sequence: SequenceNumber,
-        entry: &CommitEntry,
+        operation: &ResolvedBatchOperation,
         recovered_at: Timestamp,
     ) {
         self.min_sequence = Some(
@@ -157,10 +254,24 @@ impl Memtable {
                 .unwrap_or(sequence),
         );
         self.max_sequence = self.max_sequence.max(sequence);
-        self.tables.entry(entry.table_id).or_default().insert(
-            MemtableEntry::new(entry.key.clone(), sequence, entry.kind, entry.value.clone()),
-            recovered_at,
-        );
+        self.tables
+            .entry(TableMemtableKey::new(
+                operation.table_id,
+                operation.physical_shard,
+            ))
+            .or_default()
+            .insert(
+                MemtableEntry::new(
+                    operation.key.clone(),
+                    sequence,
+                    operation.kind,
+                    operation.value.clone(),
+                    operation.physical_shard,
+                    operation.virtual_partition,
+                    operation.shard_map_revision,
+                ),
+                recovered_at,
+            );
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -170,7 +281,11 @@ impl Memtable {
         key: &[u8],
         sequence: SequenceNumber,
     ) -> Option<MemtableEntry> {
-        self.tables.get(&table_id)?.read_at(key, sequence)
+        self.tables
+            .iter()
+            .filter(|(table, _)| table.table_id == table_id)
+            .filter_map(|(_, memtable)| memtable.read_at(key, sequence))
+            .max_by_key(|entry| entry.sequence)
     }
 
     pub(super) fn collect_matching_keys(
@@ -179,8 +294,10 @@ impl Memtable {
         matcher: &KeyMatcher<'_>,
         keys: &mut BTreeSet<Key>,
     ) {
-        if let Some(table) = self.tables.get(&table_id) {
-            table.collect_matching_keys(matcher, keys);
+        for (table, memtable) in &self.tables {
+            if table.table_id == table_id {
+                memtable.collect_matching_keys(matcher, keys);
+            }
         }
     }
 
@@ -191,14 +308,20 @@ impl Memtable {
         sequence: SequenceNumber,
         rows: &mut Vec<SstableRow>,
     ) {
-        if let Some(table) = self.tables.get(&table_id) {
-            table.collect_visible_rows(key, sequence, rows);
+        for (table, memtable) in &self.tables {
+            if table.table_id == table_id {
+                memtable.collect_visible_rows(key, sequence, rows);
+            }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn force_collapse(
         &mut self,
         table_id: TableId,
+        physical_shard: PhysicalShardId,
+        virtual_partition: VirtualPartitionId,
+        shard_map_revision: ShardMapRevision,
         key: Key,
         sequence: SequenceNumber,
         value: Value,
@@ -210,30 +333,53 @@ impl Memtable {
                 .unwrap_or(sequence),
         );
         self.max_sequence = self.max_sequence.max(sequence);
-        self.tables.entry(table_id).or_default().insert(
-            MemtableEntry::new(key, sequence, ChangeKind::Put, Some(value)),
-            now,
-        );
+        self.tables
+            .entry(TableMemtableKey::new(table_id, physical_shard))
+            .or_default()
+            .insert(
+                MemtableEntry::new(
+                    key,
+                    sequence,
+                    ChangeKind::Put,
+                    Some(value),
+                    physical_shard,
+                    virtual_partition,
+                    shard_map_revision,
+                ),
+                now,
+            );
     }
 
     pub(super) fn pending_flush_bytes(&self, table_id: TableId) -> u64 {
         self.tables
-            .get(&table_id)
-            .map(|table| table.pending_flush_bytes)
-            .unwrap_or_default()
+            .iter()
+            .filter(|(table, _)| table.table_id == table_id)
+            .map(|(_, table)| table.pending_flush_bytes)
+            .sum()
     }
 
     pub(super) fn pending_flush_bytes_by_table(&self) -> BTreeMap<TableId, u64> {
         self.tables
             .iter()
-            .filter_map(|(&table_id, table)| {
-                (table.pending_flush_bytes > 0).then_some((table_id, table.pending_flush_bytes))
+            .fold(BTreeMap::new(), |mut backlog, (table, memtable)| {
+                if memtable.pending_flush_bytes > 0 {
+                    backlog
+                        .entry(table.table_id)
+                        .and_modify(|current: &mut u64| {
+                            *current = current.saturating_add(memtable.pending_flush_bytes)
+                        })
+                        .or_insert(memtable.pending_flush_bytes);
+                }
+                backlog
             })
-            .collect()
     }
 
     pub(super) fn oldest_unflushed_at(&self, table_id: TableId) -> Option<Timestamp> {
-        self.tables.get(&table_id)?.oldest_unflushed_at
+        self.tables
+            .iter()
+            .filter(|(table, _)| table.table_id == table_id)
+            .filter_map(|(_, table)| table.oldest_unflushed_at)
+            .min()
     }
 
     pub(super) fn oldest_unflushed_at_all_tables(&self) -> Option<Timestamp> {
@@ -254,9 +400,27 @@ impl Memtable {
         &self,
         table_id: TableId,
     ) -> Option<(SequenceNumber, SequenceNumber)> {
-        self.tables
-            .get(&table_id)
-            .and_then(TableMemtable::sequence_range)
+        let mut min_sequence = None;
+        let mut max_sequence = None;
+        for (table, memtable) in &self.tables {
+            if table.table_id != table_id {
+                continue;
+            }
+            let Some((table_min, table_max)) = memtable.sequence_range() else {
+                continue;
+            };
+            min_sequence = Some(
+                min_sequence
+                    .map(|current: SequenceNumber| current.min(table_min))
+                    .unwrap_or(table_min),
+            );
+            max_sequence = Some(
+                max_sequence
+                    .map(|current: SequenceNumber| current.max(table_max))
+                    .unwrap_or(table_max),
+            );
+        }
+        min_sequence.zip(max_sequence)
     }
 
     pub(super) fn total_sequence_range(&self) -> Option<(SequenceNumber, SequenceNumber)> {
@@ -266,9 +430,8 @@ impl Memtable {
 
     pub(super) fn has_entries_for_table(&self, table_id: TableId) -> bool {
         self.tables
-            .get(&table_id)
-            .map(|table| !table.is_empty())
-            .unwrap_or(false)
+            .iter()
+            .any(|(table, memtable)| table.table_id == table_id && !memtable.is_empty())
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -285,11 +448,11 @@ impl Memtable {
         &self,
         watermarks: &mut BTreeMap<TableId, SequenceNumber>,
     ) {
-        for (&table_id, table) in &self.tables {
-            let Some(sequence) = table.entries.values().map(|entry| entry.sequence).max() else {
+        for (table, memtable) in &self.tables {
+            let Some(sequence) = memtable.entries.values().map(|entry| entry.sequence).max() else {
                 continue;
             };
-            update_table_watermark(watermarks, table_id, sequence);
+            update_table_watermark(watermarks, table.table_id, sequence);
         }
     }
 }
@@ -979,6 +1142,21 @@ impl SstableState {
         }
         watermarks
     }
+
+    pub(super) fn table_shard_watermarks(
+        &self,
+    ) -> BTreeMap<(TableId, crate::PhysicalShardId), SequenceNumber> {
+        let mut watermarks = BTreeMap::new();
+        for sstable in &self.live {
+            update_table_shard_watermark(
+                &mut watermarks,
+                sstable.meta.table_id,
+                sstable.meta.physical_shard(),
+                sstable.meta.max_sequence,
+            );
+        }
+        watermarks
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1016,12 +1194,75 @@ impl MemtableState {
     pub(super) fn apply_recovered_record(
         &mut self,
         record: &CommitRecord,
+        tables: &BTreeMap<String, StoredTable>,
         recovered_at: Timestamp,
-    ) {
+    ) -> Result<(), StorageError> {
         for entry in &record.entries {
-            self.mutable
-                .apply_recovered_entry(record.sequence(), entry, recovered_at);
+            let stored = Db::stored_table_by_id(tables, entry.table_id).ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "recovery references unknown table id {}",
+                    entry.table_id.get()
+                ))
+            })?;
+            let (physical_shard, virtual_partition, shard_map_revision) = match (
+                entry.physical_shard,
+                entry.virtual_partition,
+                entry.shard_map_revision,
+            ) {
+                (Some(physical_shard), Some(virtual_partition), Some(shard_map_revision)) => {
+                    (physical_shard, virtual_partition, shard_map_revision)
+                }
+                _ if stored.config.sharding.is_sharded() => {
+                    return Err(StorageError::corruption(format!(
+                        "recovery found sharded commit {} for table {} without durable shard metadata",
+                        record.sequence().get(),
+                        stored.config.name
+                    )));
+                }
+                _ => {
+                    let route = stored
+                        .config
+                        .sharding
+                        .route_key(&entry.key)
+                        .map_err(|error| {
+                            StorageError::corruption(format!(
+                                "recovery failed to route table {} key {:?}: {error}",
+                                stored.config.name, entry.key
+                            ))
+                        })?;
+                    (
+                        route.physical_shard,
+                        route.virtual_partition,
+                        route.shard_map_revision,
+                    )
+                }
+            };
+            if record.id.physical_shard_hint() != PhysicalShardId::UNSHARDED
+                && record.id.physical_shard_hint() != physical_shard
+            {
+                return Err(StorageError::corruption(format!(
+                    "recovery found shard-local commit {} in lane {} but entry belongs to shard {}",
+                    record.sequence().get(),
+                    record.id.physical_shard_hint(),
+                    physical_shard
+                )));
+            }
+            self.mutable.apply_recovered_entry(
+                record.sequence(),
+                &ResolvedBatchOperation {
+                    table_id: entry.table_id,
+                    table_name: stored.config.name.clone(),
+                    key: entry.key.clone(),
+                    kind: entry.kind,
+                    value: entry.value.clone(),
+                    physical_shard,
+                    virtual_partition,
+                    shard_map_revision,
+                },
+                recovered_at,
+            );
         }
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1087,16 +1328,28 @@ impl MemtableState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn force_collapse(
         &mut self,
         table_id: TableId,
+        physical_shard: PhysicalShardId,
+        virtual_partition: VirtualPartitionId,
+        shard_map_revision: ShardMapRevision,
         key: Key,
         sequence: SequenceNumber,
         value: Value,
         now: Timestamp,
     ) {
-        self.mutable
-            .force_collapse(table_id, key, sequence, value, now);
+        self.mutable.force_collapse(
+            table_id,
+            physical_shard,
+            virtual_partition,
+            shard_map_revision,
+            key,
+            sequence,
+            value,
+            now,
+        );
     }
 
     pub(super) fn rotate_mutable(&mut self) -> Option<SequenceNumber> {
@@ -1353,6 +1606,18 @@ pub(super) fn update_table_watermark(
         .or_insert(sequence);
 }
 
+pub(super) fn update_table_shard_watermark(
+    watermarks: &mut BTreeMap<(TableId, crate::PhysicalShardId), SequenceNumber>,
+    table_id: TableId,
+    physical_shard: crate::PhysicalShardId,
+    sequence: SequenceNumber,
+) {
+    watermarks
+        .entry((table_id, physical_shard))
+        .and_modify(|current| *current = (*current).max(sequence))
+        .or_insert(sequence);
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum KeyMatcher<'a> {
     Range { start: &'a [u8], end: &'a [u8] },
@@ -1596,13 +1861,25 @@ impl<'a> MergedRowRangeIterator<'a> {
     ) -> Self {
         let mut sources = Vec::new();
 
-        if let Some(table) = memtables.mutable.tables.get(&table_id) {
+        for table in memtables
+            .mutable
+            .tables
+            .iter()
+            .filter(|(table, _)| table.table_id == table_id)
+            .map(|(_, table)| table)
+        {
             sources.push(RowScanSourceCursor::Memtable(TableMemtableCursor::new(
                 table, matcher, direction,
             )));
         }
         for immutable in &memtables.immutables {
-            if let Some(table) = immutable.memtable.tables.get(&table_id) {
+            for table in immutable
+                .memtable
+                .tables
+                .iter()
+                .filter(|(table, _)| table.table_id == table_id)
+                .map(|(_, table)| table)
+            {
                 sources.push(RowScanSourceCursor::Memtable(TableMemtableCursor::new(
                     table, matcher, direction,
                 )));

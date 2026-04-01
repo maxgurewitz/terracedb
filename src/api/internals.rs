@@ -1,5 +1,5 @@
 use super::*;
-use crate::Timestamp;
+use crate::{FileSystem, Timestamp};
 use arc_swap::ArcSwap;
 
 pub(super) const CATALOG_FORMAT_VERSION: u32 = 1;
@@ -873,9 +873,26 @@ pub(super) struct PersistedManifestSstable {
     pub(super) max_sequence: SequenceNumber,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) shard_ownership: Option<crate::ShardSstableOwnership>,
 }
 
 impl PersistedManifestSstable {
+    pub(super) fn shard_ownership(&self) -> crate::ShardSstableOwnership {
+        self.shard_ownership.clone().unwrap_or_else(|| {
+            crate::ShardSstableOwnership::new(
+                self.table_id,
+                crate::PhysicalShardId::UNSHARDED,
+                crate::ShardMapRevision::default(),
+                crate::VirtualPartitionCoverage::single(crate::VirtualPartitionId::new(0)),
+            )
+        })
+    }
+
+    pub(super) fn physical_shard(&self) -> crate::PhysicalShardId {
+        self.shard_ownership().physical_shard
+    }
+
     pub(super) fn storage_source(&self) -> StorageSource {
         if !self.file_path.is_empty() {
             StorageSource::local_file(self.file_path.clone())
@@ -1533,13 +1550,19 @@ pub(super) struct ChangeFeedScanner {
     pub(super) table: Table,
     pub(super) remaining: Option<usize>,
     pub(super) _scan_guard: CommitLogScanGuard,
-    pub(super) sources: VecDeque<ChangeFeedSourcePlan>,
-    pub(super) current_source: Option<ActiveChangeFeedSource>,
+    pub(super) sources: BTreeMap<crate::PhysicalShardId, VecDeque<ChangeFeedSourcePlan>>,
+    pub(super) active_sources: Vec<LoadedChangeFeedSource>,
 }
 
 pub(super) enum ActiveChangeFeedSource {
     Segment(ChangeFeedSegmentSource),
     BufferedRecords(ChangeFeedBufferedRecordsSource),
+}
+
+pub(super) struct LoadedChangeFeedSource {
+    pub(super) shard: crate::PhysicalShardId,
+    pub(super) source: ActiveChangeFeedSource,
+    pub(super) next_entry: ChangeEntry,
 }
 
 pub(super) struct ChangeFeedSegmentSource {
@@ -1591,6 +1614,8 @@ pub(super) struct PersistedRowSstableBody {
     pub(super) data_checksum: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) shard_ownership: Option<crate::ShardSstableOwnership>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1681,6 +1706,8 @@ pub(super) struct PersistedColumnarSstableFooter {
     pub(super) optional_sidecars: Vec<PersistedOptionalSidecarDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) user_key_bloom_filter: Option<UserKeyBloomFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) shard_ownership: Option<crate::ShardSstableOwnership>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1936,6 +1963,9 @@ pub(super) struct ResolvedBatchOperation {
     pub(super) key: Key,
     pub(super) kind: ChangeKind,
     pub(super) value: Option<Value>,
+    pub(super) physical_shard: crate::PhysicalShardId,
+    pub(super) virtual_partition: crate::VirtualPartitionId,
+    pub(super) shard_map_revision: crate::ShardMapRevision,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2140,23 +2170,158 @@ pub(super) struct RecoveredCommitLogState {
 }
 
 pub(super) enum CommitLogBackend {
-    Local(Box<SegmentManager>),
+    Local(ShardLocalSegmentManagers),
     Memory(MemoryCommitLog),
 }
 
-pub(super) struct MemoryCommitLog {
+pub(super) struct ShardLocalSegmentManagers {
+    pub(super) fs: Arc<dyn FileSystem>,
+    pub(super) root_dir: String,
+    pub(super) options: SegmentOptions,
+    pub(super) lanes: BTreeMap<crate::PhysicalShardId, SegmentManager>,
+}
+
+#[derive(Clone)]
+pub(super) struct MemoryCommitLogLane {
     pub(super) records: Arc<Vec<CommitRecord>>,
     pub(super) durable_commit_log_segments: Vec<DurableRemoteCommitLogSegment>,
     pub(super) next_segment_id: u64,
 }
 
-impl MemoryCommitLog {
+impl MemoryCommitLogLane {
     pub(super) fn new() -> Self {
         Self {
             records: Arc::new(Vec::new()),
             durable_commit_log_segments: Vec::new(),
             next_segment_id: 1,
         }
+    }
+}
+
+pub(super) struct MemoryCommitLog {
+    pub(super) lanes: BTreeMap<crate::PhysicalShardId, MemoryCommitLogLane>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ChangeFeedShardRetentionState {
+    pub(super) oldest_sequence: SequenceNumber,
+    pub(super) oldest_segment_id: SegmentId,
+}
+
+impl MemoryCommitLog {
+    pub(super) fn new() -> Self {
+        Self {
+            lanes: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn lane_mut(&mut self, shard: crate::PhysicalShardId) -> &mut MemoryCommitLogLane {
+        self.lanes
+            .entry(shard)
+            .or_insert_with(MemoryCommitLogLane::new)
+    }
+}
+
+impl ShardLocalSegmentManagers {
+    pub(super) async fn open(
+        fs: Arc<dyn FileSystem>,
+        root_dir: String,
+        options: SegmentOptions,
+    ) -> Result<Self, StorageError> {
+        let mut shards = BTreeSet::new();
+        for path in fs.list(&root_dir).await? {
+            if Db::parse_segment_id(&path).is_some() {
+                let relative = path.strip_prefix(&(root_dir.clone() + "/"));
+                match relative.and_then(|value| value.split('/').next()) {
+                    Some(shard) if shard.starts_with("SEG-") => {
+                        shards.insert(crate::PhysicalShardId::UNSHARDED);
+                    }
+                    Some(shard) => {
+                        if let Ok(shard) = shard.parse::<u32>() {
+                            shards.insert(crate::PhysicalShardId::new(shard));
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        if shards.is_empty() {
+            shards.insert(crate::PhysicalShardId::UNSHARDED);
+        }
+
+        let mut lanes = BTreeMap::new();
+        for shard in shards {
+            let dir = Self::lane_dir_for_root(&root_dir, shard);
+            lanes.insert(
+                shard,
+                SegmentManager::open(fs.clone(), dir, options.clone()).await?,
+            );
+        }
+
+        Ok(Self {
+            fs,
+            root_dir,
+            options,
+            lanes,
+        })
+    }
+
+    fn lane_dir_for_root(root_dir: &str, shard: crate::PhysicalShardId) -> String {
+        if shard == crate::PhysicalShardId::UNSHARDED {
+            return root_dir.to_string();
+        }
+
+        format!("{root_dir}/{shard}")
+    }
+
+    pub(super) fn lane_dir(&self, shard: crate::PhysicalShardId) -> String {
+        Self::lane_dir_for_root(&self.root_dir, shard)
+    }
+
+    pub(super) async fn lane_mut(
+        &mut self,
+        shard: crate::PhysicalShardId,
+    ) -> Result<&mut SegmentManager, StorageError> {
+        if !self.lanes.contains_key(&shard) {
+            let dir = self.lane_dir(shard);
+            let manager = SegmentManager::open(self.fs.clone(), dir, self.options.clone()).await?;
+            self.lanes.insert(shard, manager);
+        }
+
+        self.lanes.get_mut(&shard).ok_or_else(|| {
+            StorageError::corruption(format!("commit-log shard lane {shard} did not open"))
+        })
+    }
+
+    pub(super) fn enumerate_segments(
+        &self,
+    ) -> Vec<(
+        crate::PhysicalShardId,
+        crate::engine::commit_log::SegmentDescriptor,
+    )> {
+        let mut descriptors = self
+            .lanes
+            .iter()
+            .flat_map(|(&shard, manager)| {
+                manager
+                    .enumerate_segments()
+                    .into_iter()
+                    .map(move |descriptor| (shard, descriptor))
+            })
+            .collect::<Vec<_>>();
+        descriptors.sort_by_key(|(shard, descriptor)| (shard.get(), descriptor.segment_id.get()));
+        descriptors
+    }
+
+    pub(super) async fn read_segment_bytes(
+        &self,
+        shard: crate::PhysicalShardId,
+        segment_id: SegmentId,
+    ) -> Result<Vec<u8>, StorageError> {
+        let manager = self.lanes.get(&shard).ok_or_else(|| {
+            StorageError::not_found(format!("unknown commit-log shard lane {shard}"))
+        })?;
+        manager.read_segment_bytes(segment_id).await
     }
 }
 
@@ -2168,7 +2333,7 @@ impl ChangeFeedScanner {
         upper_bound: SequenceNumber,
         remaining: Option<usize>,
         scan_guard: CommitLogScanGuard,
-        sources: VecDeque<ChangeFeedSourcePlan>,
+        sources: BTreeMap<crate::PhysicalShardId, VecDeque<ChangeFeedSourcePlan>>,
     ) -> Self {
         Self {
             cursor,
@@ -2178,7 +2343,7 @@ impl ChangeFeedScanner {
             remaining,
             _scan_guard: scan_guard,
             sources,
-            current_source: None,
+            active_sources: Vec::new(),
         }
     }
 
@@ -2187,37 +2352,91 @@ impl ChangeFeedScanner {
             return Ok(None);
         }
 
-        loop {
-            if let Some(source) = self.current_source.as_mut() {
-                match source.next_change(
-                    self.table_id,
-                    &self.table,
-                    self.cursor,
-                    self.upper_bound,
-                )? {
-                    Some(entry) => {
-                        if let Some(remaining) = &mut self.remaining {
-                            *remaining = remaining.saturating_sub(1);
-                        }
-                        return Ok(Some(entry));
-                    }
-                    None if source.reached_upper_bound() => {
-                        self.current_source = None;
-                        self.sources.clear();
-                        return Ok(None);
-                    }
-                    None => {
-                        self.current_source = None;
-                        continue;
-                    }
-                }
-            }
+        self.fill_active_sources().await?;
 
-            let Some(source) = self.sources.pop_front() else {
-                return Ok(None);
-            };
-            self.current_source = self.load_source(source).await?;
+        let Some((index, _)) = self
+            .active_sources
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, source)| source.next_entry.cursor)
+        else {
+            return Ok(None);
+        };
+
+        let mut source = self.active_sources.swap_remove(index);
+        let entry = source.next_entry;
+        if let Some(next_entry) =
+            source
+                .source
+                .next_change(self.table_id, &self.table, self.cursor, self.upper_bound)?
+        {
+            source.next_entry = next_entry;
+            self.active_sources.push(source);
         }
+
+        if let Some(remaining) = &mut self.remaining {
+            *remaining = remaining.saturating_sub(1);
+        }
+        Ok(Some(entry))
+    }
+
+    async fn fill_active_sources(&mut self) -> Result<(), StorageError> {
+        let active_shards = self
+            .active_sources
+            .iter()
+            .map(|source| source.shard)
+            .collect::<BTreeSet<_>>();
+        let shards_to_fill = self
+            .sources
+            .keys()
+            .filter(|shard| !active_shards.contains(shard))
+            .copied()
+            .collect::<Vec<_>>();
+
+        for shard in shards_to_fill {
+            self.load_next_source_for_shard(shard).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn load_next_source_for_shard(
+        &mut self,
+        shard: crate::PhysicalShardId,
+    ) -> Result<(), StorageError> {
+        while let Some(source) = self.pop_source_for_shard(shard) {
+            let Some(mut source) = self.load_source(source).await? else {
+                continue;
+            };
+            let Some(next_entry) =
+                source.next_change(self.table_id, &self.table, self.cursor, self.upper_bound)?
+            else {
+                continue;
+            };
+            self.active_sources.push(LoadedChangeFeedSource {
+                shard,
+                source,
+                next_entry,
+            });
+            break;
+        }
+
+        Ok(())
+    }
+
+    fn pop_source_for_shard(
+        &mut self,
+        shard: crate::PhysicalShardId,
+    ) -> Option<ChangeFeedSourcePlan> {
+        let (source, remove_shard) = {
+            let sources = self.sources.get_mut(&shard)?;
+            let source = sources.pop_front();
+            (source, sources.is_empty())
+        };
+        if remove_shard {
+            self.sources.remove(&shard);
+        }
+        source
     }
 
     pub(super) async fn load_source(
@@ -2298,13 +2517,6 @@ impl ActiveChangeFeedSource {
             Self::BufferedRecords(source) => {
                 source.next_change(table_id, table, cursor, upper_bound)
             }
-        }
-    }
-
-    pub(super) fn reached_upper_bound(&self) -> bool {
-        match self {
-            Self::Segment(source) => source.upper_bound_reached,
-            Self::BufferedRecords(source) => source.upper_bound_reached,
         }
     }
 }
@@ -2422,9 +2634,12 @@ pub(super) fn change_entries_for_record(
         .collect()
 }
 
-pub(super) fn pinned_segment_ids(sources: &VecDeque<ChangeFeedSourcePlan>) -> Vec<SegmentId> {
+pub(super) fn pinned_segment_ids(
+    sources: &BTreeMap<crate::PhysicalShardId, VecDeque<ChangeFeedSourcePlan>>,
+) -> Vec<SegmentId> {
     sources
         .iter()
+        .flat_map(|(_, sources)| sources.iter())
         .filter_map(|source| match source {
             ChangeFeedSourcePlan::LocalSegment(plan) => Some(plan.segment_id),
             ChangeFeedSourcePlan::RemoteSegment(_) | ChangeFeedSourcePlan::BufferedRecords(_) => {
@@ -2486,11 +2701,16 @@ pub(super) async fn read_change_feed_file(
 impl CommitRuntime {
     pub(super) async fn append(&mut self, record: CommitRecord) -> Result<(), StorageError> {
         match &mut self.backend {
-            CommitLogBackend::Local(manager) => {
-                manager.append(record).await?;
+            CommitLogBackend::Local(managers) => {
+                managers
+                    .lane_mut(record.id.physical_shard_hint())
+                    .await?
+                    .append(record)
+                    .await?;
             }
             CommitLogBackend::Memory(log) => {
-                Arc::make_mut(&mut log.records).push(record);
+                Arc::make_mut(&mut log.lane_mut(record.id.physical_shard_hint()).records)
+                    .push(record);
             }
         }
 
@@ -2502,9 +2722,28 @@ impl CommitRuntime {
         records: &[CommitRecord],
     ) -> Result<(), StorageError> {
         match &mut self.backend {
-            CommitLogBackend::Local(manager) => manager.append_batch_and_sync(records).await,
+            CommitLogBackend::Local(managers) => {
+                let mut by_shard = BTreeMap::<crate::PhysicalShardId, Vec<CommitRecord>>::new();
+                for record in records {
+                    by_shard
+                        .entry(record.id.physical_shard_hint())
+                        .or_default()
+                        .push(record.clone());
+                }
+                for (shard, records) in by_shard {
+                    managers
+                        .lane_mut(shard)
+                        .await?
+                        .append_batch_and_sync(&records)
+                        .await?;
+                }
+                Ok(())
+            }
             CommitLogBackend::Memory(log) => {
-                Arc::make_mut(&mut log.records).extend(records.iter().cloned());
+                for record in records {
+                    Arc::make_mut(&mut log.lane_mut(record.id.physical_shard_hint()).records)
+                        .push(record.clone());
+                }
                 Ok(())
             }
         }
@@ -2512,15 +2751,22 @@ impl CommitRuntime {
 
     pub(super) async fn sync(&mut self) -> Result<(), StorageError> {
         match &mut self.backend {
-            CommitLogBackend::Local(manager) => manager.sync_active().await,
+            CommitLogBackend::Local(managers) => {
+                for manager in managers.lanes.values_mut() {
+                    manager.sync_active().await?;
+                }
+                Ok(())
+            }
             CommitLogBackend::Memory(_) => Ok(()),
         }
     }
 
     pub(super) async fn maybe_seal_active(&mut self) -> Result<(), StorageError> {
         match &mut self.backend {
-            CommitLogBackend::Local(manager) => {
-                manager.seal_active().await?;
+            CommitLogBackend::Local(managers) => {
+                for manager in managers.lanes.values_mut() {
+                    manager.seal_active().await?;
+                }
                 Ok(())
             }
             CommitLogBackend::Memory(_) => Ok(()),
@@ -2533,10 +2779,12 @@ impl CommitRuntime {
         protected_segments: &BTreeSet<SegmentId>,
     ) -> Result<(), StorageError> {
         match &mut self.backend {
-            CommitLogBackend::Local(manager) => {
-                manager
-                    .prune_sealed_before(sequence_exclusive, protected_segments)
-                    .await?;
+            CommitLogBackend::Local(managers) => {
+                for manager in managers.lanes.values_mut() {
+                    manager
+                        .prune_sealed_before(sequence_exclusive, protected_segments)
+                        .await?;
+                }
                 Ok(())
             }
             CommitLogBackend::Memory(_) => Ok(()),
@@ -2546,10 +2794,18 @@ impl CommitRuntime {
     pub(super) async fn recover_after(
         &self,
         after_sequence: SequenceNumber,
+        tables: &BTreeMap<String, StoredTable>,
         recovered_at: Timestamp,
     ) -> Result<RecoveredCommitLogState, StorageError> {
         let records = match &self.backend {
-            CommitLogBackend::Local(manager) => manager.scan_from_sequence(after_sequence).await?,
+            CommitLogBackend::Local(managers) => {
+                let mut records = Vec::new();
+                for manager in managers.lanes.values() {
+                    records.extend(manager.scan_from_sequence(after_sequence).await?);
+                }
+                records.sort_by_key(|record| record.id);
+                records
+            }
             CommitLogBackend::Memory(_) => Vec::new(),
         };
 
@@ -2561,7 +2817,7 @@ impl CommitRuntime {
             recovered.max_sequence = recovered.max_sequence.max(record.sequence());
             recovered
                 .memtables
-                .apply_recovered_record(&record, recovered_at);
+                .apply_recovered_record(&record, tables, recovered_at)?;
         }
 
         Ok(recovered)
@@ -2571,36 +2827,51 @@ impl CommitRuntime {
         &self,
         table_id: TableId,
         sequence_inclusive: SequenceNumber,
-    ) -> VecDeque<ChangeFeedSourcePlan> {
+    ) -> BTreeMap<crate::PhysicalShardId, VecDeque<ChangeFeedSourcePlan>> {
         match &self.backend {
-            CommitLogBackend::Local(manager) => manager
-                .table_scan_plans_since(table_id, sequence_inclusive)
-                .into_iter()
-                .map(ChangeFeedSourcePlan::LocalSegment)
+            CommitLogBackend::Local(managers) => managers
+                .lanes
+                .iter()
+                .filter_map(|(&shard, manager)| {
+                    let sources = manager
+                        .table_scan_plans_since(table_id, sequence_inclusive)
+                        .into_iter()
+                        .map(ChangeFeedSourcePlan::LocalSegment)
+                        .collect::<VecDeque<_>>();
+                    (!sources.is_empty()).then_some((shard, sources))
+                })
                 .collect(),
             CommitLogBackend::Memory(log) => {
-                let mut sources = log
-                    .durable_commit_log_segments
-                    .iter()
-                    .filter(|segment| {
-                        segment
-                            .footer
-                            .tables
+                let mut sources = BTreeMap::new();
+                for (&shard, lane) in &log.lanes {
+                    let mut lane_sources = VecDeque::new();
+                    lane_sources.extend(
+                        lane.durable_commit_log_segments
                             .iter()
-                            .find(|table| table.table_id == table_id)
-                            .is_some_and(|table| table.max_sequence >= sequence_inclusive)
-                    })
-                    .cloned()
-                    .map(ChangeFeedSourcePlan::RemoteSegment)
-                    .collect::<VecDeque<_>>();
-                if log.records.iter().any(|record| {
-                    record.sequence() >= sequence_inclusive
-                        && record
-                            .entries
-                            .iter()
-                            .any(|entry| entry.table_id == table_id)
-                }) {
-                    sources.push_back(ChangeFeedSourcePlan::BufferedRecords(log.records.clone()));
+                            .filter(|segment| {
+                                segment
+                                    .footer
+                                    .tables
+                                    .iter()
+                                    .find(|table| table.table_id == table_id)
+                                    .is_some_and(|table| table.max_sequence >= sequence_inclusive)
+                            })
+                            .cloned()
+                            .map(ChangeFeedSourcePlan::RemoteSegment),
+                    );
+                    if lane.records.iter().any(|record| {
+                        record.sequence() >= sequence_inclusive
+                            && record
+                                .entries
+                                .iter()
+                                .any(|entry| entry.table_id == table_id)
+                    }) {
+                        lane_sources
+                            .push_back(ChangeFeedSourcePlan::BufferedRecords(lane.records.clone()));
+                    }
+                    if !lane_sources.is_empty() {
+                        sources.insert(shard, lane_sources);
+                    }
                 }
                 sources
             }
@@ -2609,95 +2880,160 @@ impl CommitRuntime {
 
     pub(super) fn oldest_sequence_for_table(&self, table_id: TableId) -> Option<SequenceNumber> {
         match &self.backend {
-            CommitLogBackend::Local(manager) => manager.oldest_sequence_for_table(table_id),
-            CommitLogBackend::Memory(log) => {
-                let durable_oldest = log
-                    .durable_commit_log_segments
-                    .iter()
-                    .flat_map(|segment| segment.footer.tables.iter())
-                    .filter(|table| table.table_id == table_id)
-                    .map(|table| table.min_sequence)
-                    .min();
-                let buffered_oldest = log
-                    .records
-                    .iter()
-                    .filter(|record| {
-                        record
-                            .entries
-                            .iter()
-                            .any(|entry| entry.table_id == table_id)
-                    })
-                    .map(CommitRecord::sequence)
-                    .min();
+            CommitLogBackend::Local(managers) => managers
+                .lanes
+                .values()
+                .filter_map(|manager| manager.oldest_sequence_for_table(table_id))
+                .min(),
+            CommitLogBackend::Memory(log) => log
+                .lanes
+                .values()
+                .filter_map(|lane| {
+                    let durable_oldest = lane
+                        .durable_commit_log_segments
+                        .iter()
+                        .flat_map(|segment| segment.footer.tables.iter())
+                        .filter(|table| table.table_id == table_id)
+                        .map(|table| table.min_sequence)
+                        .min();
+                    let buffered_oldest = lane
+                        .records
+                        .iter()
+                        .filter(|record| {
+                            record
+                                .entries
+                                .iter()
+                                .any(|entry| entry.table_id == table_id)
+                        })
+                        .map(CommitRecord::sequence)
+                        .min();
 
-                durable_oldest.into_iter().chain(buffered_oldest).min()
-            }
+                    durable_oldest.into_iter().chain(buffered_oldest).min()
+                })
+                .min(),
         }
     }
 
-    pub(super) fn oldest_segment_id(&self) -> Option<SegmentId> {
+    pub(super) fn shard_retention_states_for_table(
+        &self,
+        table_id: TableId,
+    ) -> BTreeMap<crate::PhysicalShardId, ChangeFeedShardRetentionState> {
         match &self.backend {
-            CommitLogBackend::Local(manager) => manager.oldest_segment_id(),
+            CommitLogBackend::Local(managers) => managers
+                .lanes
+                .iter()
+                .filter_map(|(&shard, manager)| {
+                    Some((
+                        shard,
+                        ChangeFeedShardRetentionState {
+                            oldest_sequence: manager.oldest_sequence_for_table(table_id)?,
+                            oldest_segment_id: manager.oldest_segment_id_for_table(table_id)?,
+                        },
+                    ))
+                })
+                .collect(),
             CommitLogBackend::Memory(log) => log
-                .durable_commit_log_segments
-                .first()
-                .map(|segment| segment.footer.segment_id)
-                .or_else(|| {
-                    (!log.records.is_empty()).then_some(SegmentId::new(log.next_segment_id))
-                }),
+                .lanes
+                .iter()
+                .filter_map(|(&shard, lane)| {
+                    let durable_state = lane
+                        .durable_commit_log_segments
+                        .iter()
+                        .filter_map(|segment| {
+                            segment
+                                .footer
+                                .tables
+                                .iter()
+                                .find(|table| table.table_id == table_id)
+                                .map(|table| ChangeFeedShardRetentionState {
+                                    oldest_sequence: table.min_sequence,
+                                    oldest_segment_id: segment.footer.segment_id,
+                                })
+                        })
+                        .min_by_key(|state| {
+                            (state.oldest_segment_id.get(), state.oldest_sequence.get())
+                        });
+                    let buffered_state = lane
+                        .records
+                        .iter()
+                        .filter(|record| {
+                            record
+                                .entries
+                                .iter()
+                                .any(|entry| entry.table_id == table_id)
+                        })
+                        .map(CommitRecord::sequence)
+                        .min()
+                        .map(|oldest_sequence| ChangeFeedShardRetentionState {
+                            oldest_sequence,
+                            oldest_segment_id: SegmentId::new(lane.next_segment_id),
+                        });
+
+                    durable_state
+                        .into_iter()
+                        .chain(buffered_state)
+                        .min_by_key(|state| {
+                            (state.oldest_segment_id.get(), state.oldest_sequence.get())
+                        })
+                        .map(|state| (shard, state))
+                })
+                .collect(),
         }
     }
 
     #[cfg(test)]
     pub(super) fn enumerate_segments(&self) -> Vec<crate::engine::commit_log::SegmentDescriptor> {
         match &self.backend {
-            CommitLogBackend::Local(manager) => manager.enumerate_segments(),
+            CommitLogBackend::Local(managers) => managers
+                .enumerate_segments()
+                .into_iter()
+                .map(|(_, descriptor)| descriptor)
+                .collect(),
             CommitLogBackend::Memory(log) => {
-                let mut descriptors = log
-                    .durable_commit_log_segments
-                    .iter()
-                    .map(|segment| {
+                let mut descriptors = Vec::new();
+                for lane in log.lanes.values() {
+                    descriptors.extend(lane.durable_commit_log_segments.iter().map(|segment| {
                         crate::engine::commit_log::SegmentDescriptor::from(&segment.footer)
-                    })
-                    .collect::<Vec<_>>();
-                if !log.records.is_empty() {
-                    let mut tables =
-                        BTreeMap::<TableId, (SequenceNumber, SequenceNumber, u32)>::new();
-                    for record in log.records.iter() {
-                        for entry in &record.entries {
-                            tables
-                                .entry(entry.table_id)
-                                .and_modify(|table| {
-                                    table.0 = table.0.min(record.sequence());
-                                    table.1 = table.1.max(record.sequence());
-                                    table.2 = table.2.saturating_add(1);
-                                })
-                                .or_insert((record.sequence(), record.sequence(), 1));
+                    }));
+                    if !lane.records.is_empty() {
+                        let mut tables =
+                            BTreeMap::<TableId, (SequenceNumber, SequenceNumber, u32)>::new();
+                        for record in lane.records.iter() {
+                            for entry in &record.entries {
+                                tables
+                                    .entry(entry.table_id)
+                                    .and_modify(|table| {
+                                        table.0 = table.0.min(record.sequence());
+                                        table.1 = table.1.max(record.sequence());
+                                        table.2 = table.2.saturating_add(1);
+                                    })
+                                    .or_insert((record.sequence(), record.sequence(), 1));
+                            }
                         }
+                        descriptors.push(crate::engine::commit_log::SegmentDescriptor {
+                            segment_id: SegmentId::new(lane.next_segment_id),
+                            sealed: false,
+                            min_sequence: lane.records.first().map(CommitRecord::sequence),
+                            max_sequence: lane.records.last().map(CommitRecord::sequence),
+                            record_count: lane.records.len() as u64,
+                            entry_count: lane
+                                .records
+                                .iter()
+                                .map(|record| record.entries.len() as u64)
+                                .sum(),
+                            tables: tables
+                                .into_iter()
+                                .map(|(table_id, (min_sequence, max_sequence, entry_count))| {
+                                    crate::engine::commit_log::TableSegmentMeta {
+                                        table_id,
+                                        min_sequence,
+                                        max_sequence,
+                                        entry_count,
+                                    }
+                                })
+                                .collect(),
+                        });
                     }
-                    descriptors.push(crate::engine::commit_log::SegmentDescriptor {
-                        segment_id: SegmentId::new(log.next_segment_id),
-                        sealed: false,
-                        min_sequence: log.records.first().map(CommitRecord::sequence),
-                        max_sequence: log.records.last().map(CommitRecord::sequence),
-                        record_count: log.records.len() as u64,
-                        entry_count: log
-                            .records
-                            .iter()
-                            .map(|record| record.entries.len() as u64)
-                            .sum(),
-                        tables: tables
-                            .into_iter()
-                            .map(|(table_id, (min_sequence, max_sequence, entry_count))| {
-                                crate::engine::commit_log::TableSegmentMeta {
-                                    table_id,
-                                    min_sequence,
-                                    max_sequence,
-                                    entry_count,
-                                }
-                            })
-                            .collect(),
-                    });
                 }
                 descriptors
             }
