@@ -4441,11 +4441,11 @@ interface CapabilityTemplate {
 }
 
 interface ResourcePolicy {
-  dbs?: string[]
-  tables?: string[]
-  keyPrefixes?: string[]
-  tenantScope?: "none" | "caller" | { fixed: string }
-  queryShapes?: Array<"point_read" | "prefix_scan" | "range_scan" | "index_query" | "write" | "schema">
+  allow?: Array<{ kind: ResourceKind, pattern: string }>
+  deny?: Array<{ kind: ResourceKind, pattern: string }>
+  tenantScopes?: string[]
+  rowScopeBinding?: RowScopeBinding
+  visibilityIndex?: VisibilityIndexSpec
 }
 
 interface BudgetPolicy {
@@ -4577,10 +4577,32 @@ interface PolicyContext {
 }
 
 type RowScopePolicy =
-  | { kind: "key_prefix", prefixTemplate: KeyTemplate }
-  | { kind: "typed_row_predicate", predicate: RowPredicateRef }
-  | { kind: "visibility_index", indexTable: string, subjectKey: "subject" | "tenant" | "group" }
-  | { kind: "procedure_only" }
+  | { kind: "key_prefix", prefixTemplate: string, contextFields?: string[] }
+  | { kind: "typed_row_predicate", predicateId: string, rowType?: string, referencedFields?: string[] }
+  | { kind: "visibility_index", indexName: string }
+  | { kind: "procedure_only", reason?: string }
+
+interface RowScopeBinding {
+  bindingId: string
+  policy: RowScopePolicy
+  allowedQueryShapes?: Array<"point_read" | "bounded_prefix_scan" | "write_mutation" | "multi_table_query" | "aggregate">
+  writeSemantics?: {
+    evaluatePreimage: boolean
+    evaluatePostimage: boolean
+    rejectScopeEscapingWrites: boolean
+    requireOccReadSet: boolean
+  }
+}
+
+interface VisibilityIndexSpec {
+  indexName: string
+  indexTable: string
+  subjectKey: "subject" | "tenant" | "group"
+  rowIdField: string
+  membershipSource?: string
+  readMirrorTable?: string
+  authoritativeSources?: string[]
+}
 ```
 
 The important rule is that the host resolves `PolicyContext` and `RowScopePolicy`; guest code may invoke the bound capability, but it must not be able to choose a broader row scope from inside the sandbox.

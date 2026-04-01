@@ -6,15 +6,17 @@ use terracedb_capabilities::{
     CapabilityPresetDescriptor, CapabilityProfileDescriptor, CapabilityTemplate,
     CapabilityUseMetrics, CapabilityUseRequest, DeterministicDraftAuthorizationSession,
     DeterministicPolicyEngine, DeterministicRateLimiter, DeterministicSubjectResolver,
-    DraftAuthorizationDecision, DraftAuthorizationFlowError, DraftAuthorizationHistoryKind,
-    DraftAuthorizationOutcomeKind, DraftAuthorizationRequestKind, ExecutionDomain,
-    ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy,
-    ForegroundSessionStatusProjector, ManifestBinding, PolicyOutcomeKind, PolicyResolutionRequest,
-    PolicySubject, PresetBinding, RateLimitOutcome, ResolvedSessionPolicy, ResourceKind,
-    ResourcePolicy, ResourceSelector, ResourceTarget, SessionLifecycleState, SessionMode,
-    SessionStatusSource, SessionStatusUpdate, ShellCommandDescriptor,
-    StaticExecutionPolicyResolver, SubjectResolutionRequest, SubjectSelector,
-    capability_module_specifier,
+    DeterministicVisibilityIndexStore, DraftAuthorizationDecision, DraftAuthorizationFlowError,
+    DraftAuthorizationHistoryKind, DraftAuthorizationOutcomeKind, DraftAuthorizationRequestKind,
+    ExecutionDomain, ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy,
+    FilteredScanResumeToken, ForegroundSessionStatusProjector, ManifestBinding, PolicyContext,
+    PolicyOutcomeKind, PolicyResolutionRequest, PolicySubject, PresetBinding, RateLimitOutcome,
+    ResolvedSessionPolicy, ResourceKind, ResourcePolicy, ResourceSelector, ResourceTarget,
+    RowDenialContract, RowQueryShape, RowScopeBinding, RowScopeFamily, RowScopePolicy,
+    RowVisibilityOutcomeKind, SessionLifecycleState, SessionMode, SessionStatusSource,
+    SessionStatusUpdate, ShellCommandDescriptor, StaticExecutionPolicyResolver,
+    SubjectResolutionRequest, SubjectSelector, VisibilityIndexSpec, VisibilityIndexSubjectKey,
+    VisibilityMembershipTransition, capability_module_specifier,
 };
 use terracedb_mcp::{
     DeterministicMcpAuthenticator, McpAuthContext, McpAuthenticationRequest, McpAuthenticator,
@@ -86,8 +88,8 @@ fn sample_template() -> CapabilityTemplate {
             }],
             deny: vec![],
             tenant_scopes: vec!["tenant-a".to_string()],
-            row_scope_binding: Some("tenant_id".to_string()),
-            visibility_index: Some("visible_by_subject".to_string()),
+            row_scope_binding: Some(sample_row_scope_binding()),
+            visibility_index: Some(sample_visibility_index()),
             metadata: BTreeMap::new(),
         },
         default_budget_policy: sample_budget(),
@@ -117,6 +119,32 @@ fn sample_subject() -> PolicySubject {
         tenant_id: Some("tenant-a".to_string()),
         groups: vec!["support".to_string()],
         attributes: BTreeMap::from([("role".to_string(), "operator".to_string())]),
+    }
+}
+
+fn sample_visibility_index() -> VisibilityIndexSpec {
+    VisibilityIndexSpec {
+        index_name: "visible_by_subject".to_string(),
+        index_table: "visible_by_subject".to_string(),
+        subject_key: VisibilityIndexSubjectKey::Subject,
+        row_id_field: "ticket_id".to_string(),
+        membership_source: Some("ticket_shares".to_string()),
+        read_mirror_table: None,
+        authoritative_sources: vec!["ticket_shares".to_string(), "tickets".to_string()],
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn sample_row_scope_binding() -> RowScopeBinding {
+    RowScopeBinding {
+        binding_id: "tickets.visible".to_string(),
+        policy: RowScopePolicy::VisibilityIndex {
+            index_name: "visible_by_subject".to_string(),
+        },
+        allowed_query_shapes: vec![RowQueryShape::PointRead, RowQueryShape::BoundedPrefixScan],
+        write_semantics: Default::default(),
+        denial_contract: RowDenialContract::default(),
+        metadata: BTreeMap::from([("scope".to_string(), serde_json::json!("shared"))]),
     }
 }
 
@@ -186,8 +214,8 @@ fn resource_policy_for_tables(tables: &[&str]) -> ResourcePolicy {
             .collect(),
         deny: vec![],
         tenant_scopes: vec!["tenant-a".to_string()],
-        row_scope_binding: Some("tenant_id".to_string()),
-        visibility_index: Some("visible_by_subject".to_string()),
+        row_scope_binding: Some(sample_row_scope_binding()),
+        visibility_index: Some(sample_visibility_index()),
         metadata: BTreeMap::new(),
     }
 }
@@ -300,6 +328,30 @@ fn frozen_contracts_compile_together() {
     let template = sample_template();
     let grant = sample_grant();
     let execution_policy = sample_execution_policy();
+    let policy_context = PolicyContext::from(sample_subject());
+    let resume_token = FilteredScanResumeToken {
+        version: 1,
+        binding_name: "tickets".to_string(),
+        query_shape: RowQueryShape::BoundedPrefixScan,
+        family: RowScopeFamily::VisibilityIndex,
+        last_primary_key: Some("ticket:t-1".to_string()),
+        last_visibility_key: Some("user:alice/ticket:t-1".to_string()),
+        scanned_rows: 3,
+        returned_rows: 2,
+        metadata: BTreeMap::new(),
+    };
+    let membership_transition = VisibilityMembershipTransition {
+        index_name: "visible_by_subject".to_string(),
+        lookup_key: "user:alice".to_string(),
+        row_id: "ticket:t-1".to_string(),
+        from_visible: false,
+        to_visible: true,
+        metadata: BTreeMap::new(),
+    };
+    let row_visibility = sample_row_scope_binding().not_visible_audit(
+        RowQueryShape::PointRead,
+        Some("row is outside the subject visibility index".to_string()),
+    );
     let manifest = CapabilityManifest {
         subject: Some(PolicySubject {
             subject_id: "user:alice".to_string(),
@@ -453,7 +505,72 @@ fn frozen_contracts_compile_together() {
         mcp_session,
         McpSseConnectionState::Active,
         store,
+        policy_context,
+        resume_token,
+        membership_transition,
+        row_visibility,
     );
+}
+
+#[test]
+fn row_scope_contracts_round_trip_through_serde() {
+    let key_prefix_policy = RowScopePolicy::KeyPrefix {
+        prefix_template: "tenant/{tenant_id}/tickets/".to_string(),
+        context_fields: vec!["tenant_id".to_string()],
+    };
+    let predicate_policy = RowScopePolicy::TypedRowPredicate {
+        predicate_id: "ticket_owner_or_tenant".to_string(),
+        row_type: Some("ticket".to_string()),
+        referenced_fields: vec!["tenant_id".to_string(), "owner_id".to_string()],
+    };
+    let visibility_index = sample_visibility_index();
+    let row_scope_binding = sample_row_scope_binding();
+    let denial = row_scope_binding.explicit_denial_audit(
+        RowQueryShape::Aggregate,
+        Some("aggregates leak existence for this binding".to_string()),
+    );
+    let resume_token = FilteredScanResumeToken {
+        version: 1,
+        binding_name: "tickets".to_string(),
+        query_shape: RowQueryShape::BoundedPrefixScan,
+        family: RowScopeFamily::VisibilityIndex,
+        last_primary_key: Some("ticket:t-9".to_string()),
+        last_visibility_key: Some("user:alice/ticket:t-9".to_string()),
+        scanned_rows: 11,
+        returned_rows: 4,
+        metadata: BTreeMap::from([("surface".to_string(), serde_json::json!("sandbox"))]),
+    };
+
+    let decoded_key_prefix: RowScopePolicy =
+        serde_json::from_slice(&serde_json::to_vec(&key_prefix_policy).expect("encode key prefix"))
+            .expect("decode key prefix");
+    let decoded_predicate: RowScopePolicy =
+        serde_json::from_slice(&serde_json::to_vec(&predicate_policy).expect("encode predicate"))
+            .expect("decode predicate");
+    let decoded_visibility_index: VisibilityIndexSpec = serde_json::from_slice(
+        &serde_json::to_vec(&visibility_index).expect("encode visibility index"),
+    )
+    .expect("decode visibility index");
+    let decoded_binding: RowScopeBinding =
+        serde_json::from_slice(&serde_json::to_vec(&row_scope_binding).expect("encode binding"))
+            .expect("decode binding");
+    let decoded_denial: terracedb_capabilities::RowVisibilityAuditRecord =
+        serde_json::from_slice(&serde_json::to_vec(&denial).expect("encode row denial"))
+            .expect("decode row denial");
+    let decoded_resume_token: FilteredScanResumeToken =
+        serde_json::from_slice(&serde_json::to_vec(&resume_token).expect("encode resume token"))
+            .expect("decode resume token");
+
+    assert_eq!(decoded_key_prefix, key_prefix_policy);
+    assert_eq!(decoded_predicate, predicate_policy);
+    assert_eq!(decoded_visibility_index, visibility_index);
+    assert_eq!(decoded_binding, row_scope_binding);
+    assert_eq!(decoded_denial, denial);
+    assert_eq!(
+        decoded_denial.outcome,
+        RowVisibilityOutcomeKind::ExplicitlyDenied
+    );
+    assert_eq!(decoded_resume_token, resume_token);
 }
 
 #[test]
@@ -545,6 +662,55 @@ fn deterministic_smoke_resolves_fake_subject_into_manifest_and_execution_policy(
             .iter()
             .all(|outcome| outcome.outcome.allowed),
         "smoke test should use deterministic allow-by-default rate limiting"
+    );
+}
+
+#[test]
+fn deterministic_row_scope_lookup_replays_the_same_visibility_answer() {
+    let resolved = resolve_sample_policy(DeterministicRateLimiter::default());
+    let binding = &resolved.manifest.bindings[0];
+    let context = PolicyContext::from(resolved.subject.clone());
+    let visibility = DeterministicVisibilityIndexStore::default()
+        .with_transition(VisibilityMembershipTransition {
+            index_name: "visible_by_subject".to_string(),
+            lookup_key: "user:alice".to_string(),
+            row_id: "ticket:t-1".to_string(),
+            from_visible: false,
+            to_visible: true,
+            metadata: BTreeMap::new(),
+        })
+        .with_visible_row("visible_by_subject", "user:alice", "ticket:t-2");
+
+    let first = binding
+        .resource_policy
+        .resolve_row_scope(context.clone(), &visibility)
+        .expect("resolve first row scope")
+        .expect("row scope binding should be attached");
+    let second = binding
+        .resource_policy
+        .resolve_row_scope(context, &visibility)
+        .expect("resolve second row scope")
+        .expect("row scope binding should be attached");
+
+    assert_eq!(first, second);
+    assert_eq!(first.binding_id, "tickets.visible");
+    assert_eq!(
+        first.allowed_query_shapes,
+        vec![RowQueryShape::PointRead, RowQueryShape::BoundedPrefixScan]
+    );
+    assert_eq!(
+        first
+            .visibility_lookup
+            .as_ref()
+            .map(|lookup| lookup.lookup_keys.clone()),
+        Some(vec!["user:alice".to_string()])
+    );
+    assert_eq!(
+        first
+            .visibility_lookup
+            .as_ref()
+            .map(|lookup| lookup.visible_row_ids.clone()),
+        Some(vec!["ticket:t-1".to_string(), "ticket:t-2".to_string()])
     );
 }
 
