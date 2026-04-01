@@ -324,23 +324,39 @@ where
         .expect("projection should settle")
 }
 
-async fn wait_for_state(
+async fn wait_for_state<P>(
     runtime: &WorkflowRuntime<AlertWorkflowHandler>,
     instance_id: &str,
-    expected: usize,
+    predicate: P,
     timeout: Duration,
-) -> Result<(), Box<dyn Error>> {
+    description: &str,
+) -> Result<(), io::Error>
+where
+    P: Fn(Option<&Value>) -> bool,
+{
     tokio::time::timeout(
         timeout,
-        runtime.wait_for_state(instance_id, Value::bytes(expected.to_string())),
+        runtime.wait_for_state_where(instance_id, predicate),
     )
     .await
     .map_err(|_| {
-        Box::new(io::Error::other(format!(
-            "workflow state for {instance_id} did not reach {expected} before timeout"
-        ))) as Box<dyn Error>
-    })??;
+        io::Error::other(format!(
+            "workflow state for {instance_id} did not satisfy {description} before timeout"
+        ))
+    })?
+    .map_err(io::Error::other)?;
     Ok(())
+}
+
+fn decode_state_count_ref(state: Option<&Value>) -> usize {
+    match state {
+        None => 0,
+        Some(Value::Bytes(bytes)) => std::str::from_utf8(bytes)
+            .expect("workflow state should be utf-8")
+            .parse()
+            .expect("workflow state should encode a count"),
+        Some(Value::Record(_)) => panic!("order-watch only stores byte workflow state"),
+    }
 }
 
 async fn wait_for_attach_mode(
@@ -588,15 +604,17 @@ async fn run_mode(
             wait_for_state(
                 &workflow_runtime,
                 BACKLOG_ALERT_ORDER_ID,
-                1,
+                |state| decode_state_count_ref(state) == 1,
                 options.timeout,
+                "state count == 1",
             )
             .await?;
             wait_for_state(
                 &workflow_runtime,
                 LIVE_TRANSITION_ORDER_ID,
-                2,
+                |state| decode_state_count_ref(state) == 2,
                 options.timeout,
+                "state count == 2",
             )
             .await?;
 
@@ -688,8 +706,9 @@ async fn run_mode(
             if let Err(error) = wait_for_state(
                 &workflow_runtime,
                 LIVE_TRANSITION_ORDER_ID,
-                2,
+                |state| decode_state_count_ref(state) == 2,
                 options.timeout,
+                "state count == 2",
             )
             .await
             {

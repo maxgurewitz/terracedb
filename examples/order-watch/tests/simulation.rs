@@ -464,17 +464,27 @@ where
         .expect("projection should settle")
 }
 
-async fn wait_for_state(
+async fn wait_for_state<P>(
     runtime: &WorkflowRuntime<AlertWorkflowHandler>,
     instance_id: &str,
-    expected: usize,
-) -> Result<(), WorkflowError> {
-    runtime
-        .wait_for_state_where(instance_id, |state| {
-            decode_state_count_ref(state) == expected
-        })
-        .await
-        .map(|_| ())
+    predicate: P,
+    description: &str,
+) -> Result<(), io::Error>
+where
+    P: Fn(Option<&Value>) -> bool,
+{
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state_where(instance_id, predicate),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::other(format!(
+            "workflow state for {instance_id} did not satisfy {description} before timeout"
+        ))
+    })?
+    .map_err(io::Error::other)?;
+    Ok(())
 }
 
 fn decode_state_count_ref(state: Option<&Value>) -> usize {
@@ -728,8 +738,20 @@ fn run_campaign_with_materialization(
                     let workflow_handle = workflow_runtime.start().await?;
                     wait_for_attach_mode(&workflow_runtime, WorkflowSourceAttachMode::Historical)
                         .await?;
-                    wait_for_state(&workflow_runtime, BACKLOG_ALERT_ORDER_ID, 1).await?;
-                    wait_for_state(&workflow_runtime, LIVE_TRANSITION_ORDER_ID, 2).await?;
+                    wait_for_state(
+                        &workflow_runtime,
+                        BACKLOG_ALERT_ORDER_ID,
+                        |state| decode_state_count_ref(state) == 1,
+                        "state count == 1",
+                    )
+                    .await?;
+                    wait_for_state(
+                        &workflow_runtime,
+                        LIVE_TRANSITION_ORDER_ID,
+                        |state| decode_state_count_ref(state) == 2,
+                        "state count == 2",
+                    )
+                    .await?;
 
                     let telemetry = workflow_runtime.telemetry_snapshot().await?;
                     let states = state_count_map(
@@ -807,7 +829,13 @@ fn run_campaign_with_materialization(
                     )
                     .await?;
 
-                    wait_for_state(&workflow_runtime, LIVE_TRANSITION_ORDER_ID, 2).await?;
+                    wait_for_state(
+                        &workflow_runtime,
+                        LIVE_TRANSITION_ORDER_ID,
+                        |state| decode_state_count_ref(state) == 2,
+                        "state count == 2",
+                    )
+                    .await?;
 
                     let telemetry = workflow_runtime.telemetry_snapshot().await?;
                     let states = state_count_map(
@@ -1061,7 +1089,12 @@ async fn run_restart_resume_campaign(
     wait_for_state(
         &workflow_runtime,
         BACKLOG_ALERT_ORDER_ID,
-        expected_backlog_count,
+        |state| decode_state_count_ref(state) == expected_backlog_count,
+        if expected_backlog_count == 0 {
+            "state absent or count == 0"
+        } else {
+            "state count == 1"
+        },
     )
     .await?;
 
@@ -1270,7 +1303,12 @@ async fn run_restart_resume_campaign(
     wait_for_state(
         &reopened_workflow_runtime,
         BACKLOG_ALERT_ORDER_ID,
-        expected_backlog_count,
+        |state| decode_state_count_ref(state) == expected_backlog_count,
+        if expected_backlog_count == 0 {
+            "state absent or count == 0"
+        } else {
+            "state count == 1"
+        },
     )
     .await?;
 
@@ -1294,7 +1332,13 @@ async fn run_restart_resume_campaign(
         ],
     )
     .await?;
-    wait_for_state(&reopened_workflow_runtime, LIVE_TRANSITION_ORDER_ID, 2).await?;
+    wait_for_state(
+        &reopened_workflow_runtime,
+        LIVE_TRANSITION_ORDER_ID,
+        |state| decode_state_count_ref(state) == 2,
+        "state count == 2",
+    )
+    .await?;
 
     let telemetry = reopened_workflow_runtime.telemetry_snapshot().await?;
     let snapshot = OrderWatchOracleSnapshot {

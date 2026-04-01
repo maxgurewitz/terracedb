@@ -1690,6 +1690,10 @@ async fn workflow_current_durable_bootstrap_processes_multiple_live_events_for_o
         )
         .await
         .expect("bootstrap source progress should publish the current-durable fence");
+    runtime
+        .wait_for_state_where("skipped-1", |state| state.is_none())
+        .await
+        .expect("live-only bootstrap should treat skipped backlog state as absent");
 
     source
         .write(b"live-1:entered".to_vec(), Value::bytes("entered"))
