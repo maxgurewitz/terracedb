@@ -470,9 +470,22 @@ async fn wait_for_state(
     expected: usize,
 ) -> Result<(), WorkflowError> {
     runtime
-        .wait_for_state(instance_id, Value::bytes(expected.to_string()))
+        .wait_for_state_where(instance_id, |state| {
+            decode_state_count_ref(state) == expected
+        })
         .await
         .map(|_| ())
+}
+
+fn decode_state_count_ref(state: Option<&Value>) -> usize {
+    match state {
+        None => 0,
+        Some(Value::Bytes(bytes)) => std::str::from_utf8(bytes)
+            .expect("workflow state should be utf-8")
+            .parse()
+            .expect("workflow state should encode a count"),
+        Some(Value::Record(_)) => panic!("order-watch only stores byte workflow state"),
+    }
 }
 
 async fn wait_for_attach_mode(

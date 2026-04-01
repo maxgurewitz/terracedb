@@ -1651,24 +1651,36 @@ where
         instance_id: &str,
         expected: Value,
     ) -> Result<(), WorkflowError> {
+        self.wait_for_state_where(instance_id, |state| state == Some(&expected))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn wait_for_state_where<P>(
+        &self,
+        instance_id: &str,
+        predicate: P,
+    ) -> Result<Option<Value>, WorkflowError>
+    where
+        P: Fn(Option<&Value>) -> bool,
+    {
         let mut durable_wakes = self
             .inner
             .db
             .subscribe_durable(self.inner.tables.state_table());
-        if self.load_state(instance_id).await? == Some(expected.clone()) {
-            return Ok(());
-        }
 
         loop {
+            let state = self.load_state(instance_id).await?;
+            if predicate(state.as_ref()) {
+                return Ok(state);
+            }
+
             durable_wakes
                 .changed()
                 .await
                 .map_err(|_| WorkflowError::SubscriptionClosed {
                     name: self.inner.name.clone(),
                 })?;
-            if self.load_state(instance_id).await? == Some(expected.clone()) {
-                return Ok(());
-            }
         }
     }
 
