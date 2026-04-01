@@ -1866,6 +1866,7 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use proptest::prelude::*;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
@@ -1876,13 +1877,44 @@ mod tests {
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_test_dir(name: &str) -> PathBuf {
-        let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "terracedb-remote-{name}-{}-{id}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        path
+        let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seed = format!("terracedb-remote:{name}:{}:{counter}", std::process::id());
+        std::env::temp_dir().join(format!("terracedb-remote-{}", uuid_from_seed(&seed)))
+    }
+
+    fn uuid_from_seed(seed: &str) -> Uuid {
+        let mut first = 0xcbf2_9ce4_8422_2325u64;
+        let mut second = 0x9e37_79b9_7f4a_7c15u64;
+        for byte in seed.bytes() {
+            first ^= byte as u64;
+            first = first.wrapping_mul(0x1000_0000_01b3);
+            second ^= first.rotate_left(13) ^ byte as u64;
+            second = second.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        }
+        let bytes = [
+            (first >> 24) as u8,
+            (first >> 16) as u8,
+            (first >> 8) as u8,
+            first as u8,
+            (first >> 56) as u8,
+            (first >> 48) as u8,
+            (first >> 40) as u8,
+            (first >> 32) as u8,
+            (second >> 56) as u8,
+            (second >> 48) as u8,
+            (second >> 40) as u8,
+            (second >> 32) as u8,
+            (second >> 24) as u8,
+            (second >> 16) as u8,
+            (second >> 8) as u8,
+            second as u8,
+        ];
+        Uuid::from_fields(
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u16::from_be_bytes([bytes[4], bytes[5]]),
+            u16::from_be_bytes([bytes[6], bytes[7]]),
+            &bytes[8..16].try_into().expect("uuid tail"),
+        )
     }
 
     fn cleanup(path: &Path) {

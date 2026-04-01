@@ -21,7 +21,7 @@ use super::{
 use crate::simulation::{
     CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
 };
-use crate::test_support::advance_clock_until_finished;
+use crate::test_support::ClockProgressProbe;
 use crate::{
     ChangeFeedError, ChangeKind, Clock, CommitError, CommitId, CommitOptions, CompactionStrategy,
     DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
@@ -2358,8 +2358,9 @@ async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
             .any(|(table_name, metadata)| table_name == "events" && metadata == &expected_metadata)
     );
 
-    let elapsed =
-        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_secs(1), 180).await;
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_secs(1), 180)
+        .wait_for_task(&write)
+        .await;
     assert!(elapsed > 0);
     assert_eq!(
         write.await.expect("join write task"),
@@ -2455,9 +2456,10 @@ async fn forced_flush_guardrails_still_honor_domain_rate_limit_delay() {
     );
     assert!(forced_snapshot.forced_flushes >= 1);
 
-    let elapsed =
-        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_millis(250), 32).await
-            + 350;
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 32)
+        .wait_for_task(&write)
+        .await
+        + 350;
     assert_eq!(
         write.await.expect("join write task"),
         SequenceNumber::new(1)
@@ -2573,8 +2575,9 @@ async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlo
         "write should be waiting on the simulated clock before L0 pressure accumulates",
     );
 
-    let elapsed =
-        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_millis(250), 12).await;
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 12)
+        .wait_for_task(&write)
+        .await;
     assert!(elapsed > 0);
     assert_eq!(
         write.await.expect("join write task"),
@@ -2642,9 +2645,9 @@ async fn scheduler_observability_current_admission_clears_after_recovery_write()
             .await
             .expect("throttled write")
     });
-    let elapsed =
-        advance_clock_until_finished(clock.as_ref(), &throttled, Duration::from_millis(250), 16)
-            .await;
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 16)
+        .wait_for_task(&throttled)
+        .await;
     assert!(elapsed > 0);
     assert_eq!(
         throttled.await.expect("join throttled write"),
@@ -2795,9 +2798,9 @@ async fn admission_observation_stream_reports_recovery_transition_in_order() {
             .await
             .expect("throttled write")
     });
-    let elapsed =
-        advance_clock_until_finished(clock.as_ref(), &throttled, Duration::from_millis(250), 16)
-            .await;
+    let elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 16)
+        .wait_for_task(&throttled)
+        .await;
     assert!(elapsed > 0);
     assert_eq!(
         throttled.await.expect("join throttled write"),
@@ -3161,9 +3164,9 @@ async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
             .copied(),
         Some(1)
     );
-    let fast_elapsed =
-        advance_clock_until_finished(clock.as_ref(), &fast_only, Duration::from_millis(250), 40)
-            .await;
+    let fast_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 40)
+        .wait_for_task(&fast_only)
+        .await;
     assert_eq!(
         fast_only.await.expect("join fast-only commit"),
         SequenceNumber::new(1)
@@ -3210,8 +3213,9 @@ async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
             }),
         "mixed commit should publish a live rate-limit diagnosis"
     );
-    let mixed_elapsed =
-        advance_clock_until_finished(clock.as_ref(), &mixed, Duration::from_millis(250), 80).await;
+    let mixed_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 80)
+        .wait_for_task(&mixed)
+        .await;
     assert_eq!(
         mixed.await.expect("join mixed commit"),
         SequenceNumber::new(2)
@@ -3451,8 +3455,9 @@ async fn domain_mutable_memory_budget_forces_flush_before_storage_ceiling() {
             .await
             .expect("write second value")
     });
-    let _elapsed =
-        advance_clock_until_finished(clock.as_ref(), &second, Duration::from_millis(250), 24).await;
+    let _elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(250), 24)
+        .wait_for_task(&second)
+        .await;
     assert_eq!(
         second.await.expect("join second write"),
         SequenceNumber::new(2)

@@ -71,43 +71,61 @@ pub fn test_dependencies_with_clock(
     )
 }
 
-/// Waits for a failpoint hit while advancing a stub clock in bounded steps.
-pub async fn wait_for_failpoint_hit_with_clock(
-    handle: &crate::FailpointHandle,
-    clock: &StubClock,
+/// An explicit bounded progress probe for tests that need to advance a stub
+/// clock and let the executor make progress in between advances.
+#[derive(Clone, Copy, Debug)]
+pub struct ClockProgressProbe<'a> {
+    clock: &'a StubClock,
     step: Duration,
     max_steps: usize,
-) -> crate::FailpointHit {
-    let mut wait = Box::pin(handle.next_hit());
-    for _ in 0..max_steps {
-        tokio::select! {
-            hit = &mut wait => return hit,
-            _ = tokio::task::yield_now() => {
-                clock.advance(step);
-            }
+}
+
+impl<'a> ClockProgressProbe<'a> {
+    pub fn new(clock: &'a StubClock, step: Duration, max_steps: usize) -> Self {
+        Self {
+            clock,
+            step,
+            max_steps,
         }
     }
 
-    panic!("failpoint was not hit within {max_steps} virtual-clock advances");
-}
-
-/// Advances a stub clock until a spawned task finishes or the bound is hit.
-pub async fn advance_clock_until_finished<T>(
-    clock: &StubClock,
-    handle: &JoinHandle<T>,
-    step: Duration,
-    max_steps: usize,
-) -> u64 {
-    let start = clock.now().get();
-    for _ in 0..max_steps {
-        if handle.is_finished() {
-            return clock.now().get().saturating_sub(start);
-        }
-        clock.advance(step);
+    pub async fn advance_once(&self) {
+        self.clock.advance(self.step);
         tokio::task::yield_now().await;
     }
 
-    panic!("task was not finished within {max_steps} virtual-clock advances");
+    pub async fn wait_for_failpoint_hit(
+        &self,
+        handle: &crate::FailpointHandle,
+    ) -> crate::FailpointHit {
+        let mut wait = Box::pin(handle.next_hit());
+        for _ in 0..self.max_steps {
+            tokio::select! {
+                hit = &mut wait => return hit,
+                _ = self.advance_once() => {}
+            }
+        }
+
+        panic!(
+            "failpoint was not hit within {} virtual-clock advances",
+            self.max_steps
+        );
+    }
+
+    pub async fn wait_for_task<T>(&self, handle: &JoinHandle<T>) -> u64 {
+        let start = self.clock.now().get();
+        for _ in 0..self.max_steps {
+            if handle.is_finished() {
+                return self.clock.now().get().saturating_sub(start);
+            }
+            self.advance_once().await;
+        }
+
+        panic!(
+            "task was not finished within {} virtual-clock advances",
+            self.max_steps
+        );
+    }
 }
 
 pub fn row_table_config(name: &str) -> TableConfig {

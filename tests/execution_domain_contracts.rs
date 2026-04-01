@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use parking_lot::Mutex;
-use terracedb::test_support::{advance_clock_until_finished, wait_for_failpoint_hit_with_clock};
+use terracedb::test_support::ClockProgressProbe;
 use terracedb::{
     ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement, CommitOptions,
     CompactionStrategy, Db, DbComponents, DbExecutionProfile, DbProgressSnapshot, DbSettings,
@@ -3178,7 +3178,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         ),
     ] {
         let write = tokio::spawn(async move { table.write(key, Value::bytes(value)).await });
-        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_millis(25), 256).await;
+        ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 256)
+            .wait_for_task(&write)
+            .await;
         write
             .await
             .expect("bootstrap task should finish")
@@ -3206,9 +3208,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         }
     });
 
-    let hit =
-        wait_for_failpoint_hit_with_clock(&stall, clock.as_ref(), Duration::from_millis(25), 512)
-            .await;
+    let hit = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_failpoint_hit(&stall)
+        .await;
     assert_eq!(
         hit.name,
         terracedb::failpoints::names::DB_COMMIT_BEFORE_MEMTABLE_INSERT
@@ -3227,13 +3229,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         .expect("flush protected control-plane progress");
 
     stall.release();
-    advance_clock_until_finished(
-        clock.as_ref(),
-        &stalled_write,
-        Duration::from_millis(25),
-        512,
-    )
-    .await;
+    ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&stalled_write)
+        .await;
     stalled_write
         .await
         .expect("stalled write task should finish")
@@ -3260,9 +3258,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         }
     });
 
-    let fast_elapsed =
-        advance_clock_until_finished(clock.as_ref(), &fast_write, Duration::from_millis(25), 512)
-            .await;
+    let fast_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&fast_write)
+        .await;
     assert!(
         !slow_write.is_finished(),
         "analytics write should still be throttled when the primary write completes"
@@ -3271,9 +3269,9 @@ async fn execution_domain_chaos_suite_preserves_protected_progress_under_stalls_
         .await
         .expect("primary tail task should finish")
         .expect("primary tail write should succeed");
-    let slow_elapsed =
-        advance_clock_until_finished(clock.as_ref(), &slow_write, Duration::from_millis(25), 512)
-            .await;
+    let slow_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&slow_write)
+        .await;
     slow_write
         .await
         .expect("analytics tail task should finish")

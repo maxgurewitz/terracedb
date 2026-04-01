@@ -146,12 +146,10 @@ Some tests are not about state at all; they are about whether background work
 or delayed work eventually makes progress. In those cases, prefer a bounded
 progress helper over sleeps or incidental yields:
 
-- `advance_clock_until_finished(...)`
-  Use this with `StubClock`-driven async work that is intentionally delayed by
-  simulated time.
-- `wait_for_failpoint_hit_with_clock(...)`
-  Use this when a failpoint is the synchronization boundary and the code under
-  test only progresses when virtual time advances.
+- `ClockProgressProbe`
+  Use this when a test needs bounded virtual-time advancement to drive a task,
+  wait for a failpoint, or make a single explicit clock/progress step without
+  open-coding `yield_now()` loops.
 
 If a test has to call `tokio::task::yield_now()` in a loop to see whether
 something happened, treat that as a smell. Usually the right fix is to expose a
@@ -185,8 +183,8 @@ categories:
   `Db::subscribe_admission_observations()` plus table watermark receivers.
   Use these when ordering matters more than the latest state.
 - Bounded progress helpers
-  `advance_clock_until_finished(...)` and `wait_for_failpoint_hit_with_clock(...)`.
-  These are for liveness and virtual-time advancement, not for state sampling.
+  `ClockProgressProbe`.
+  This is for liveness and virtual-time advancement, not for state sampling.
 - Operator/debug-only reads
   Anything that still reaches directly into quiescent state for one-off
   inspection rather than participating in the published subscription surfaces.
