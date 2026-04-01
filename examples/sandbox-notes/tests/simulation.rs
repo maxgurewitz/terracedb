@@ -5,8 +5,7 @@ use terracedb_example_sandbox_notes::{
     seed_example_project_into_base,
 };
 use terracedb_sandbox::{
-    CapabilityRegistry, ReadonlyViewClient, ReadonlyViewLocation, SandboxHarness,
-    StaticReadonlyViewRegistry,
+    ReadonlyViewClient, ReadonlyViewLocation, SandboxHarness, StaticReadonlyViewRegistry,
 };
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{InMemoryVfsStore, VolumeId};
@@ -25,13 +24,17 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
         .run_with(move |context| async move {
             let app = ExampleHostApp::sample();
             let vfs = InMemoryVfsStore::new(context.clock(), context.rng());
-            let harness = SandboxHarness::new(
-                Arc::new(vfs.clone()),
-                context.clock(),
-                app.deterministic_services(),
-            );
             let base_volume_id = VolumeId::new(0xa300 + seed as u128);
             let session_volume_id = VolumeId::new(0xa400 + seed as u128);
+            let policy_session_id = format!("simulation-{session_volume_id:?}");
+            let prepared = app
+                .prepare_notes_draft_session(policy_session_id.clone())
+                .expect("prepare preset session");
+            let services = app
+                .deterministic_services_for_prepared_session(policy_session_id, &prepared)
+                .expect("policy-aware services");
+            let harness =
+                SandboxHarness::new(Arc::new(vfs.clone()), context.clock(), services.clone());
 
             harness
                 .ensure_volume(base_volume_id)
@@ -40,11 +43,12 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
             seed_example_project_into_base(&vfs, base_volume_id)
                 .await
                 .expect("seed project into base");
+            let sandbox_manifest = services.capabilities.manifest();
 
             let session = harness
                 .open_session_with(base_volume_id, session_volume_id, |config| {
                     config
-                        .with_capabilities(app.notes_registry().manifest())
+                        .with_capabilities(sandbox_manifest)
                         .with_package_compat(terracedb_sandbox::PackageCompatibilityMode::NpmPureJs)
                 })
                 .await

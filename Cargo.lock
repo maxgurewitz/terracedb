@@ -2425,8 +2425,10 @@ dependencies = [
  "terracedb-mcp",
  "terracedb-migrate",
  "terracedb-procedures",
+ "terracedb-simulation",
  "thiserror 2.0.18",
  "tokio",
+ "turmoil",
 ]
 
 [[package]]
@@ -2505,6 +2507,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
+ "terracedb-capabilities",
  "terracedb-sandbox",
  "terracedb-simulation",
  "terracedb-vfs",

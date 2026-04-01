@@ -1433,6 +1433,7 @@ pub struct PolicyAuditMetadata {
     pub placement_tags: Vec<String>,
     pub preset_name: Option<String>,
     pub profile_name: Option<String>,
+    pub expanded_manifest: Option<CapabilityManifest>,
     pub rate_limit: Option<RateLimitOutcome>,
     pub budget_hook: Option<BudgetAccountingHook>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1877,6 +1878,7 @@ impl ResolvedSessionPolicy {
             placement_tags: assignment.placement_tags.clone(),
             preset_name: self.manifest.preset_name.clone(),
             profile_name: self.manifest.profile_name.clone(),
+            expanded_manifest: Some(self.manifest.clone()),
             rate_limit: rate_limit.clone(),
             budget_hook,
             metadata: request.metadata.clone(),
@@ -2189,6 +2191,39 @@ pub struct PolicyResolutionRequest {
     pub profile_name: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManifestBindingOverride {
+    pub binding_name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub drop_binding: bool,
+    pub resource_policy: Option<ResourcePolicy>,
+    pub budget_policy: Option<BudgetPolicy>,
+    pub expose_in_just_bash: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionPresetRequest {
+    pub subject: SubjectResolutionRequest,
+    pub preset_name: String,
+    pub profile_name: Option<String>,
+    pub session_mode_override: Option<SessionMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_overrides: Vec<ManifestBindingOverride>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PreparedSessionPreset {
+    pub preset: CapabilityPresetDescriptor,
+    pub profile: Option<CapabilityProfileDescriptor>,
+    pub resolved: ResolvedSessionPolicy,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub audit_metadata: BTreeMap<String, JsonValue>,
+}
+
 #[derive(Debug, Error)]
 pub enum PolicyError {
     #[error("subject could not be resolved for session {session_id}")]
@@ -2208,6 +2243,14 @@ pub enum PolicyError {
     ProfilePresetMismatch {
         profile_name: String,
         preset_name: String,
+    },
+    #[error("binding override references unknown binding {binding_name}")]
+    UnknownBindingOverride { binding_name: String },
+    #[error("{override_source} cannot widen binding {binding_name} field {field}")]
+    UnsafeBindingOverride {
+        override_source: String,
+        binding_name: String,
+        field: String,
     },
 }
 
@@ -2477,6 +2520,92 @@ impl DeterministicPolicyEngine {
         self
     }
 
+    pub fn list_presets(&self) -> Vec<CapabilityPresetDescriptor> {
+        self.presets.values().cloned().collect()
+    }
+
+    pub fn describe_preset(&self, preset_name: &str) -> Option<CapabilityPresetDescriptor> {
+        self.presets.get(preset_name).cloned()
+    }
+
+    pub fn list_profiles(&self, preset_name: Option<&str>) -> Vec<CapabilityProfileDescriptor> {
+        self.profiles
+            .values()
+            .filter(|profile| preset_name.is_none_or(|name| profile.preset_name == name))
+            .cloned()
+            .collect()
+    }
+
+    pub fn describe_profile(&self, profile_name: &str) -> Option<CapabilityProfileDescriptor> {
+        self.profiles.get(profile_name).cloned()
+    }
+
+    pub fn prepare_session_from_preset(
+        &self,
+        request: &SessionPresetRequest,
+    ) -> Result<PreparedSessionPreset, PolicyError> {
+        let preset = self
+            .presets
+            .get(&request.preset_name)
+            .cloned()
+            .ok_or_else(|| PolicyError::UnknownPreset {
+                preset_name: request.preset_name.clone(),
+            })?;
+        let profile = match request.profile_name.as_ref() {
+            Some(profile_name) => {
+                Some(self.profiles.get(profile_name).cloned().ok_or_else(|| {
+                    PolicyError::UnknownProfile {
+                        profile_name: profile_name.clone(),
+                    }
+                })?)
+            }
+            None => None,
+        };
+        if let Some(profile) = profile.as_ref()
+            && profile.preset_name != request.preset_name
+        {
+            return Err(PolicyError::ProfilePresetMismatch {
+                profile_name: profile.name.clone(),
+                preset_name: profile.preset_name.clone(),
+            });
+        }
+
+        let session_mode = request
+            .session_mode_override
+            .unwrap_or(preset.default_session_mode);
+        let mut resolved = self.resolve(&PolicyResolutionRequest {
+            subject: request.subject.clone(),
+            session_mode,
+            preset_name: Some(request.preset_name.clone()),
+            profile_name: request.profile_name.clone(),
+        })?;
+        apply_manifest_binding_overrides(
+            &mut resolved.manifest.bindings,
+            &request.binding_overrides,
+        )?;
+        resolved.rate_limits.retain(|evaluation| {
+            resolved
+                .manifest
+                .bindings
+                .iter()
+                .any(|binding| binding.binding_name == evaluation.binding_name)
+        });
+        let audit_metadata = prepared_session_audit_metadata(
+            &resolved.manifest,
+            resolved.session_mode,
+            &preset,
+            profile.as_ref(),
+            &request.metadata,
+        );
+
+        Ok(PreparedSessionPreset {
+            preset,
+            profile,
+            resolved,
+            audit_metadata,
+        })
+    }
+
     pub fn resolve(
         &self,
         request: &PolicyResolutionRequest,
@@ -2579,6 +2708,7 @@ impl DeterministicPolicyEngine {
                 bindings.push(self.binding_from_requested_binding(
                     grant,
                     add_binding,
+                    Some(profile.preset_name.as_str()),
                     Some(profile.name.as_str()),
                 )?);
             }
@@ -2609,7 +2739,7 @@ impl DeterministicPolicyEngine {
                         template_id: binding.template_id.clone(),
                     }
                 })?;
-                self.binding_from_requested_binding(grant, binding, Some(preset_name))
+                self.binding_from_requested_binding(grant, binding, Some(preset_name), None)
             })
             .collect()
     }
@@ -2629,17 +2759,31 @@ impl DeterministicPolicyEngine {
             .and_then(|value| value.binding_name.clone())
             .or_else(|| grant.binding_name.clone())
             .unwrap_or_else(|| template.default_binding.clone());
-        let expose_in_just_bash = requested
-            .and_then(|value| value.expose_in_just_bash)
-            .unwrap_or(template.expose_in_just_bash);
-        let resource_policy = requested
-            .and_then(|value| value.resource_policy.clone())
-            .or_else(|| grant.resource_policy.clone())
+        let base_resource_policy = grant
+            .resource_policy
+            .clone()
             .unwrap_or_else(|| template.default_resource_policy.clone());
-        let budget_policy = requested
-            .and_then(|value| value.budget_policy.clone())
-            .or_else(|| grant.budget_policy.clone())
+        let resource_policy = match requested.and_then(|value| value.resource_policy.as_ref()) {
+            Some(policy) => intersect_resource_policy(
+                &base_resource_policy,
+                policy,
+                "preset/profile selection",
+                &binding_name,
+            )?,
+            None => base_resource_policy,
+        };
+        let base_budget_policy = grant
+            .budget_policy
+            .clone()
             .unwrap_or_else(|| template.default_budget_policy.clone());
+        let budget_policy = match requested.and_then(|value| value.budget_policy.as_ref()) {
+            Some(policy) => intersect_budget_policy(&base_budget_policy, policy),
+            None => base_budget_policy,
+        };
+        let expose_in_just_bash = template.expose_in_just_bash
+            && requested
+                .and_then(|value| value.expose_in_just_bash)
+                .unwrap_or(template.expose_in_just_bash);
 
         Ok(ManifestBinding {
             binding_name: binding_name.clone(),
@@ -2660,9 +2804,16 @@ impl DeterministicPolicyEngine {
         &self,
         grant: &CapabilityGrant,
         requested: &PresetBinding,
+        preset_name: Option<&str>,
         profile_name: Option<&str>,
     ) -> Result<ManifestBinding, PolicyError> {
         let mut binding = self.binding_from_grant(grant, Some(requested))?;
+        if let Some(preset_name) = preset_name {
+            binding.metadata.insert(
+                "preset_name".to_string(),
+                JsonValue::String(preset_name.to_string()),
+            );
+        }
         if let Some(profile_name) = profile_name {
             binding.metadata.insert(
                 "profile_name".to_string(),
@@ -3173,6 +3324,254 @@ impl DeterministicDraftAuthorizationSession {
     fn session_id(&self) -> &str {
         &self.resolution_request.subject.session_id
     }
+}
+
+fn apply_manifest_binding_overrides(
+    bindings: &mut Vec<ManifestBinding>,
+    overrides: &[ManifestBindingOverride],
+) -> Result<(), PolicyError> {
+    for override_spec in overrides {
+        let Some(position) = bindings
+            .iter()
+            .position(|binding| binding.binding_name == override_spec.binding_name)
+        else {
+            return Err(PolicyError::UnknownBindingOverride {
+                binding_name: override_spec.binding_name.clone(),
+            });
+        };
+
+        if override_spec.drop_binding {
+            bindings.remove(position);
+            continue;
+        }
+
+        let binding = &mut bindings[position];
+        if let Some(resource_policy) = override_spec.resource_policy.as_ref() {
+            binding.resource_policy = intersect_resource_policy(
+                &binding.resource_policy,
+                resource_policy,
+                "session binding override",
+                &binding.binding_name,
+            )?;
+        }
+        if let Some(budget_policy) = override_spec.budget_policy.as_ref() {
+            binding.budget_policy = intersect_budget_policy(&binding.budget_policy, budget_policy);
+        }
+        if let Some(expose_in_just_bash) = override_spec.expose_in_just_bash {
+            if expose_in_just_bash {
+                if binding.shell_command.is_none() {
+                    return Err(PolicyError::UnsafeBindingOverride {
+                        override_source: "session binding override".to_string(),
+                        binding_name: binding.binding_name.clone(),
+                        field: "shell_command".to_string(),
+                    });
+                }
+            } else {
+                binding.shell_command = None;
+            }
+        }
+        binding.metadata.extend(override_spec.metadata.clone());
+    }
+    Ok(())
+}
+
+fn intersect_resource_policy(
+    base: &ResourcePolicy,
+    requested: &ResourcePolicy,
+    source: &str,
+    binding_name: &str,
+) -> Result<ResourcePolicy, PolicyError> {
+    let allow = match (base.allow.is_empty(), requested.allow.is_empty()) {
+        (_, true) => base.allow.clone(),
+        (true, false) => requested.allow.clone(),
+        (false, false) => requested
+            .allow
+            .iter()
+            .map(|selector| {
+                if base
+                    .allow
+                    .iter()
+                    .any(|base_selector| resource_selector_is_within(selector, base_selector))
+                {
+                    Ok(selector.clone())
+                } else {
+                    Err(PolicyError::UnsafeBindingOverride {
+                        override_source: source.to_string(),
+                        binding_name: binding_name.to_string(),
+                        field: format!(
+                            "resource_policy.allow[{:?}:{}]",
+                            selector.kind, selector.pattern
+                        ),
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    let mut deny = base.deny.clone();
+    for selector in &requested.deny {
+        if !deny.contains(selector) {
+            deny.push(selector.clone());
+        }
+    }
+
+    let tenant_scopes = intersect_string_scopes(&base.tenant_scopes, &requested.tenant_scopes);
+    let row_scope_binding = match (&base.row_scope_binding, &requested.row_scope_binding) {
+        (_, None) => base.row_scope_binding.clone(),
+        (None, Some(binding)) => Some(binding.clone()),
+        (Some(base_binding), Some(requested_binding)) if base_binding == requested_binding => {
+            Some(base_binding.clone())
+        }
+        _ => {
+            return Err(PolicyError::UnsafeBindingOverride {
+                override_source: source.to_string(),
+                binding_name: binding_name.to_string(),
+                field: "resource_policy.row_scope_binding".to_string(),
+            });
+        }
+    };
+    let visibility_index = match (&base.visibility_index, &requested.visibility_index) {
+        (_, None) => base.visibility_index.clone(),
+        (None, Some(index)) => Some(index.clone()),
+        (Some(base_index), Some(requested_index)) if base_index == requested_index => {
+            Some(base_index.clone())
+        }
+        _ => {
+            return Err(PolicyError::UnsafeBindingOverride {
+                override_source: source.to_string(),
+                binding_name: binding_name.to_string(),
+                field: "resource_policy.visibility_index".to_string(),
+            });
+        }
+    };
+
+    let mut metadata = base.metadata.clone();
+    metadata.extend(requested.metadata.clone());
+
+    Ok(ResourcePolicy {
+        allow,
+        deny,
+        tenant_scopes,
+        row_scope_binding,
+        visibility_index,
+        metadata,
+    })
+}
+
+fn intersect_budget_policy(base: &BudgetPolicy, requested: &BudgetPolicy) -> BudgetPolicy {
+    let mut labels = base.labels.clone();
+    labels.extend(requested.labels.clone());
+
+    BudgetPolicy {
+        max_calls: min_bound(base.max_calls, requested.max_calls),
+        max_scanned_rows: min_bound(base.max_scanned_rows, requested.max_scanned_rows),
+        max_returned_rows: min_bound(base.max_returned_rows, requested.max_returned_rows),
+        max_bytes: min_bound(base.max_bytes, requested.max_bytes),
+        max_millis: min_bound(base.max_millis, requested.max_millis),
+        rate_limit_bucket: match (
+            base.rate_limit_bucket.as_ref(),
+            requested.rate_limit_bucket.as_ref(),
+        ) {
+            (Some(base_bucket), Some(requested_bucket)) if base_bucket == requested_bucket => {
+                Some(base_bucket.clone())
+            }
+            (Some(base_bucket), Some(_)) => Some(base_bucket.clone()),
+            (Some(base_bucket), None) => Some(base_bucket.clone()),
+            (None, Some(requested_bucket)) => Some(requested_bucket.clone()),
+            (None, None) => None,
+        },
+        labels,
+    }
+}
+
+fn resource_selector_is_within(candidate: &ResourceSelector, allowed: &ResourceSelector) -> bool {
+    candidate.kind == allowed.kind
+        && wildcard_pattern_is_within(&candidate.pattern, &allowed.pattern)
+}
+
+fn wildcard_pattern_is_within(candidate: &str, allowed: &str) -> bool {
+    if candidate == allowed || allowed == "*" {
+        return true;
+    }
+
+    if !candidate.contains('*') {
+        return wildcard_pattern_matches(allowed, candidate);
+    }
+
+    if let Some(allowed_prefix) = allowed.strip_suffix('*')
+        && !allowed_prefix.contains('*')
+        && let Some(candidate_prefix) = candidate.strip_suffix('*')
+        && !candidate_prefix.contains('*')
+    {
+        return candidate_prefix.starts_with(allowed_prefix);
+    }
+
+    if let Some(allowed_suffix) = allowed.strip_prefix('*')
+        && !allowed_suffix.contains('*')
+        && let Some(candidate_suffix) = candidate.strip_prefix('*')
+        && !candidate_suffix.contains('*')
+    {
+        return candidate_suffix.ends_with(allowed_suffix);
+    }
+
+    false
+}
+
+fn intersect_string_scopes(base: &[String], requested: &[String]) -> Vec<String> {
+    match (base.is_empty(), requested.is_empty()) {
+        (true, true) => Vec::new(),
+        (true, false) => requested.to_vec(),
+        (false, true) => base.to_vec(),
+        (false, false) => base
+            .iter()
+            .filter(|value| requested.contains(*value))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn min_bound(base: Option<u64>, requested: Option<u64>) -> Option<u64> {
+    match (base, requested) {
+        (Some(base), Some(requested)) => Some(base.min(requested)),
+        (Some(base), None) => Some(base),
+        (None, Some(requested)) => Some(requested),
+        (None, None) => None,
+    }
+}
+
+fn prepared_session_audit_metadata(
+    manifest: &CapabilityManifest,
+    session_mode: SessionMode,
+    preset: &CapabilityPresetDescriptor,
+    profile: Option<&CapabilityProfileDescriptor>,
+    request_metadata: &BTreeMap<String, JsonValue>,
+) -> BTreeMap<String, JsonValue> {
+    let mut metadata = request_metadata.clone();
+    metadata.insert(
+        "preset_name".to_string(),
+        JsonValue::String(preset.name.clone()),
+    );
+    if let Some(profile) = profile {
+        metadata.insert(
+            "profile_name".to_string(),
+            JsonValue::String(profile.name.clone()),
+        );
+    }
+    metadata.insert("session_mode".to_string(), json_value(&session_mode));
+    metadata.insert("expanded_manifest".to_string(), json_value(manifest));
+    if let Some(policy) = preset.default_execution_policy.as_ref() {
+        metadata.insert(
+            "preset_execution_policy_hint".to_string(),
+            json_value(policy),
+        );
+    }
+    if let Some(policy) = profile.and_then(|profile| profile.execution_policy_override.as_ref()) {
+        metadata.insert(
+            "profile_execution_policy_hint".to_string(),
+            json_value(policy),
+        );
+    }
+    metadata
 }
 
 fn find_matching_grant<'a>(
