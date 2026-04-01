@@ -84,6 +84,194 @@ impl RowQueryShape {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DatabaseActionKind {
+    PointRead,
+    BoundedPrefixScan,
+    WriteMutation,
+    MultiTableQuery,
+    Aggregate,
+    SchemaMutation,
+    ProcedureInvocation,
+}
+
+impl DatabaseActionKind {
+    pub fn row_query_shape(self) -> Option<RowQueryShape> {
+        match self {
+            Self::PointRead => Some(RowQueryShape::PointRead),
+            Self::BoundedPrefixScan => Some(RowQueryShape::BoundedPrefixScan),
+            Self::WriteMutation => Some(RowQueryShape::WriteMutation),
+            Self::MultiTableQuery => Some(RowQueryShape::MultiTableQuery),
+            Self::Aggregate => Some(RowQueryShape::Aggregate),
+            Self::SchemaMutation | Self::ProcedureInvocation => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseCapabilityFamily {
+    DbTableV1,
+    DbQueryV1,
+    CatalogMigrateV1,
+    ProcedureInvokeV1,
+}
+
+impl DatabaseCapabilityFamily {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "db.table.v1" => Some(Self::DbTableV1),
+            "db.query.v1" => Some(Self::DbQueryV1),
+            "catalog.migrate.v1" => Some(Self::CatalogMigrateV1),
+            "procedure.invoke.v1" => Some(Self::ProcedureInvokeV1),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DbTableV1 => "db.table.v1",
+            Self::DbQueryV1 => "db.query.v1",
+            Self::CatalogMigrateV1 => "catalog.migrate.v1",
+            Self::ProcedureInvokeV1 => "procedure.invoke.v1",
+        }
+    }
+
+    pub fn allows_action(self, action: DatabaseActionKind) -> bool {
+        match self {
+            Self::DbTableV1 => matches!(
+                action,
+                DatabaseActionKind::PointRead
+                    | DatabaseActionKind::BoundedPrefixScan
+                    | DatabaseActionKind::WriteMutation
+            ),
+            Self::DbQueryV1 => matches!(
+                action,
+                DatabaseActionKind::PointRead
+                    | DatabaseActionKind::BoundedPrefixScan
+                    | DatabaseActionKind::WriteMutation
+            ),
+            Self::CatalogMigrateV1 => action == DatabaseActionKind::SchemaMutation,
+            Self::ProcedureInvokeV1 => action == DatabaseActionKind::ProcedureInvocation,
+        }
+    }
+
+    pub fn generated_methods(self) -> &'static [&'static str] {
+        match self {
+            Self::DbTableV1 => &["get", "scanPrefix", "put", "delete"],
+            Self::DbQueryV1 => &["get", "scanPrefix", "put", "delete"],
+            Self::CatalogMigrateV1 => &[
+                "ensureTable",
+                "installSchemaSuccessor",
+                "updateTableMetadata",
+                "checkPrecondition",
+            ],
+            Self::ProcedureInvokeV1 => &["invoke"],
+        }
+    }
+
+    pub fn generated_typescript_declarations(self, specifier: &str) -> String {
+        match self {
+            Self::DbTableV1 => format!(
+                r#"declare module "{specifier}" {{
+  export interface GetRequest {{
+    key: string;
+  }}
+  export interface ScanPrefixRequest {{
+    prefix?: string;
+    limit?: number;
+    resumeToken?: string | null;
+  }}
+  export interface PutRequest {{
+    key: string;
+    row: unknown;
+    occReadSet?: string[];
+  }}
+  export interface DeleteRequest {{
+    key: string;
+    occReadSet?: string[];
+  }}
+  export function get(request: GetRequest): {{ key: string; row: unknown | null }};
+  export function scanPrefix(request: ScanPrefixRequest): {{ rows: Array<{{ key: string; row: unknown }}>; scannedRows: number; returnedRows: number; resumeToken?: unknown }};
+  export function put(request: PutRequest): {{ key: string; row: unknown; written: boolean }};
+  export function delete(request: DeleteRequest): {{ key: string; deleted: boolean }};
+}}"#
+            ),
+            Self::DbQueryV1 => format!(
+                r#"declare module "{specifier}" {{
+  export interface GetRequest {{
+    table: string;
+    database?: string;
+    key: string;
+  }}
+  export interface ScanPrefixRequest {{
+    table: string;
+    database?: string;
+    prefix?: string;
+    limit?: number;
+    resumeToken?: string | null;
+  }}
+  export interface PutRequest {{
+    table: string;
+    database?: string;
+    key: string;
+    row: unknown;
+    occReadSet?: string[];
+  }}
+  export interface DeleteRequest {{
+    table: string;
+    database?: string;
+    key: string;
+    occReadSet?: string[];
+  }}
+  export function get(request: GetRequest): {{ key: string; row: unknown | null }};
+  export function scanPrefix(request: ScanPrefixRequest): {{ rows: Array<{{ key: string; row: unknown }}>; scannedRows: number; returnedRows: number; resumeToken?: unknown }};
+  export function put(request: PutRequest): {{ key: string; row: unknown; written: boolean }};
+  export function delete(request: DeleteRequest): {{ key: string; deleted: boolean }};
+}}"#
+            ),
+            Self::CatalogMigrateV1 => format!(
+                r#"declare module "{specifier}" {{
+  export interface EnsureTableRequest {{
+    table: string;
+    database?: string;
+    schema?: unknown;
+  }}
+  export interface InstallSchemaSuccessorRequest {{
+    table: string;
+    database?: string;
+    successor: unknown;
+  }}
+  export interface UpdateTableMetadataRequest {{
+    table: string;
+    database?: string;
+    metadata: Record<string, unknown>;
+  }}
+  export interface CheckPreconditionRequest {{
+    table?: string;
+    database?: string;
+    precondition: unknown;
+  }}
+  export function ensureTable(request: EnsureTableRequest): {{ applied: boolean; table: string }};
+  export function installSchemaSuccessor(request: InstallSchemaSuccessorRequest): {{ applied: boolean; table: string }};
+  export function updateTableMetadata(request: UpdateTableMetadataRequest): {{ applied: boolean; table: string }};
+  export function checkPrecondition(request: CheckPreconditionRequest): {{ ok: boolean }};
+}}"#
+            ),
+            Self::ProcedureInvokeV1 => format!(
+                r#"declare module "{specifier}" {{
+  export interface InvokeRequest {{
+    procedureId?: string;
+    arguments: unknown;
+  }}
+  export function invoke(request: InvokeRequest): {{ procedureId: string; result: unknown }};
+}}"#
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RowScopeFamily {
     KeyPrefix,
     TypedRowPredicate,
@@ -116,9 +304,13 @@ pub struct VisibilityIndexSpec {
 impl VisibilityIndexSpec {
     pub fn lookup_keys(&self, context: &PolicyContext) -> Vec<String> {
         match self.subject_key {
-            VisibilityIndexSubjectKey::Subject => (!context.subject_id.is_empty())
-                .then(|| vec![context.subject_id.clone()])
-                .unwrap_or_default(),
+            VisibilityIndexSubjectKey::Subject => {
+                if context.subject_id.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![context.subject_id.clone()]
+                }
+            }
             VisibilityIndexSubjectKey::Tenant => context
                 .tenant_id
                 .iter()
@@ -403,6 +595,335 @@ pub struct EffectiveRowScopeBinding {
     pub visibility_lookup: Option<VisibilityLookupResult>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Error)]
+pub enum TypedRowPredicateEvaluationError {
+    #[error("typed row predicate {predicate_id} is not registered")]
+    UnknownPredicate { predicate_id: String },
+    #[error("typed row predicate {predicate_id} could not be evaluated: {message}")]
+    Evaluation {
+        predicate_id: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum DatabasePolicyError {
+    #[error("binding {binding_name} uses unsupported capability family {capability_family}")]
+    UnsupportedCapabilityFamily {
+        binding_name: String,
+        capability_family: String,
+    },
+    #[error("database access preflight did not allow result authorization: {outcome:?}")]
+    PreflightDenied {
+        outcome: PolicyOutcomeKind,
+        message: Option<String>,
+    },
+    #[error("row-scope context is missing required field {field}")]
+    MissingContextField { field: String },
+    #[error(transparent)]
+    Predicate(#[from] TypedRowPredicateEvaluationError),
+    #[error(transparent)]
+    RowScope(#[from] RowScopeResolutionError),
+}
+
+pub trait TypedRowPredicateEvaluator {
+    fn evaluate(
+        &self,
+        predicate_id: &str,
+        row_type: Option<&str>,
+        row: &JsonValue,
+        context: &PolicyContext,
+    ) -> Result<bool, TypedRowPredicateEvaluationError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DeterministicTypedRowPredicate {
+    MatchContext {
+        row_field: String,
+        context_field: String,
+    },
+    MatchLiteral {
+        row_field: String,
+        value: JsonValue,
+    },
+    AnyOf {
+        predicates: Vec<DeterministicTypedRowPredicate>,
+    },
+    AllOf {
+        predicates: Vec<DeterministicTypedRowPredicate>,
+    },
+}
+
+impl DeterministicTypedRowPredicate {
+    fn evaluate(&self, row: &JsonValue, context: &PolicyContext) -> bool {
+        match self {
+            Self::MatchContext {
+                row_field,
+                context_field,
+            } => json_lookup(row, row_field)
+                .zip(policy_context_value(context, context_field))
+                .is_some_and(|(left, right)| left == &right),
+            Self::MatchLiteral { row_field, value } => {
+                json_lookup(row, row_field).is_some_and(|candidate| candidate == value)
+            }
+            Self::AnyOf { predicates } => predicates
+                .iter()
+                .any(|predicate| predicate.evaluate(row, context)),
+            Self::AllOf { predicates } => predicates
+                .iter()
+                .all(|predicate| predicate.evaluate(row, context)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicTypedRowPredicateEvaluator {
+    predicates: BTreeMap<String, DeterministicTypedRowPredicate>,
+}
+
+impl DeterministicTypedRowPredicateEvaluator {
+    pub fn with_predicate(
+        mut self,
+        predicate_id: impl Into<String>,
+        predicate: DeterministicTypedRowPredicate,
+    ) -> Self {
+        self.predicates.insert(predicate_id.into(), predicate);
+        self
+    }
+}
+
+impl TypedRowPredicateEvaluator for DeterministicTypedRowPredicateEvaluator {
+    fn evaluate(
+        &self,
+        predicate_id: &str,
+        _row_type: Option<&str>,
+        row: &JsonValue,
+        context: &PolicyContext,
+    ) -> Result<bool, TypedRowPredicateEvaluationError> {
+        self.predicates
+            .get(predicate_id)
+            .ok_or_else(|| TypedRowPredicateEvaluationError::UnknownPredicate {
+                predicate_id: predicate_id.to_string(),
+            })
+            .map(|predicate| predicate.evaluate(row, context))
+    }
+}
+
+impl EffectiveRowScopeBinding {
+    pub fn resolved_key_prefix(&self) -> Result<Option<String>, DatabasePolicyError> {
+        match &self.policy {
+            RowScopePolicy::KeyPrefix {
+                prefix_template, ..
+            } => Ok(Some(render_prefix_template(
+                prefix_template,
+                &self.context,
+            )?)),
+            RowScopePolicy::TypedRowPredicate { .. }
+            | RowScopePolicy::VisibilityIndex { .. }
+            | RowScopePolicy::ProcedureOnly { .. } => Ok(None),
+        }
+    }
+
+    pub fn rewrite_point_key(
+        &self,
+        requested_key: &str,
+    ) -> Result<Option<String>, DatabasePolicyError> {
+        let Some(prefix) = self.resolved_key_prefix()? else {
+            return Ok(None);
+        };
+        Ok(Some(rewrite_key_with_prefix(&prefix, requested_key)))
+    }
+
+    pub fn rewrite_scan_prefix(
+        &self,
+        requested_prefix: Option<&str>,
+    ) -> Result<Option<String>, DatabasePolicyError> {
+        let Some(prefix) = self.resolved_key_prefix()? else {
+            return Ok(None);
+        };
+        let requested_prefix = requested_prefix.unwrap_or_default();
+        if requested_prefix.is_empty() {
+            return Ok(Some(prefix));
+        }
+        Ok(Some(rewrite_key_with_prefix(&prefix, requested_prefix)))
+    }
+
+    pub fn evaluate_read<P>(
+        &self,
+        query_shape: RowQueryShape,
+        row_id: &str,
+        row: Option<&JsonValue>,
+        predicates: &P,
+    ) -> Result<Option<RowVisibilityAuditRecord>, DatabasePolicyError>
+    where
+        P: TypedRowPredicateEvaluator,
+    {
+        if !self.supports_query_shape(query_shape) {
+            return Ok(Some(self.explicit_denial_audit(
+                query_shape,
+                Some(format!(
+                    "query shape {query_shape:?} is not allowed for this binding"
+                )),
+            )));
+        }
+
+        let visible = match &self.policy {
+            RowScopePolicy::KeyPrefix { .. } => {
+                let Some(prefix) = self.resolved_key_prefix()? else {
+                    return Ok(None);
+                };
+                row_id.starts_with(&prefix)
+            }
+            RowScopePolicy::TypedRowPredicate {
+                predicate_id,
+                row_type,
+                ..
+            } => match row {
+                None => true,
+                Some(row) => {
+                    predicates.evaluate(predicate_id, row_type.as_deref(), row, &self.context)?
+                }
+            },
+            RowScopePolicy::VisibilityIndex { .. } => {
+                self.visibility_lookup.as_ref().is_some_and(|lookup| {
+                    lookup
+                        .visible_row_ids
+                        .iter()
+                        .any(|visible_row_id| visible_row_id == row_id)
+                })
+            }
+            RowScopePolicy::ProcedureOnly { reason } => {
+                return Ok(Some(
+                    self.explicit_denial_audit(query_shape, reason.clone()),
+                ));
+            }
+        };
+
+        if visible {
+            Ok(None)
+        } else {
+            Ok(Some(self.not_visible_audit(
+                query_shape,
+                Some("row is outside the resolved row scope".to_string()),
+            )))
+        }
+    }
+
+    pub fn evaluate_write<P>(
+        &self,
+        row_id: &str,
+        preimage: Option<&JsonValue>,
+        postimage: Option<&JsonValue>,
+        occ_read_set: &[String],
+        predicates: &P,
+    ) -> Result<Option<RowVisibilityAuditRecord>, DatabasePolicyError>
+    where
+        P: TypedRowPredicateEvaluator,
+    {
+        if !self.supports_query_shape(RowQueryShape::WriteMutation) {
+            return Ok(Some(self.explicit_denial_audit(
+                RowQueryShape::WriteMutation,
+                Some("write mutation is not allowed for this binding".to_string()),
+            )));
+        }
+
+        if self.write_semantics.require_occ_read_set
+            && preimage.is_some()
+            && !occ_read_set.iter().any(|candidate| candidate == row_id)
+        {
+            return Ok(Some(self.explicit_denial_audit(
+                RowQueryShape::WriteMutation,
+                Some(format!(
+                    "write is missing OCC read-set coverage for {row_id}"
+                )),
+            )));
+        }
+
+        let preimage_visible = if self.write_semantics.evaluate_preimage {
+            match self.evaluate_read(RowQueryShape::WriteMutation, row_id, preimage, predicates)? {
+                Some(audit) => {
+                    return Ok(Some(self.explicit_denial_audit(
+                        RowQueryShape::WriteMutation,
+                        audit.reason.or(Some(
+                            "preimage is outside the resolved row scope".to_string(),
+                        )),
+                    )));
+                }
+                None => preimage.is_some(),
+            }
+        } else {
+            preimage.is_some()
+        };
+
+        if self.write_semantics.evaluate_postimage
+            && let Some(audit) =
+                self.evaluate_read(RowQueryShape::WriteMutation, row_id, postimage, predicates)?
+        {
+            let reason = if self.write_semantics.reject_scope_escaping_writes && preimage_visible {
+                Some("write would escape the resolved row scope".to_string())
+            } else {
+                audit.reason
+            };
+            return Ok(Some(
+                self.explicit_denial_audit(RowQueryShape::WriteMutation, reason),
+            ));
+        }
+
+        Ok(None)
+    }
+
+    fn supports_query_shape(&self, shape: RowQueryShape) -> bool {
+        self.policy.supports_query_shape(shape)
+            && (self.allowed_query_shapes.is_empty() || self.allowed_query_shapes.contains(&shape))
+    }
+
+    fn not_visible_audit(
+        &self,
+        query_shape: RowQueryShape,
+        reason: Option<String>,
+    ) -> RowVisibilityAuditRecord {
+        RowVisibilityAuditRecord {
+            outcome: RowVisibilityOutcomeKind::NotVisible,
+            family: self.policy.family(),
+            query_shape,
+            surface_as_not_found: self.denial_contract.conceal_not_visible_as_not_found,
+            index_name: self.visibility_index_name(),
+            reason,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn explicit_denial_audit(
+        &self,
+        query_shape: RowQueryShape,
+        reason: Option<String>,
+    ) -> RowVisibilityAuditRecord {
+        RowVisibilityAuditRecord {
+            outcome: RowVisibilityOutcomeKind::ExplicitlyDenied,
+            family: self.policy.family(),
+            query_shape,
+            surface_as_not_found: false,
+            index_name: self.visibility_index_name(),
+            reason: self
+                .denial_contract
+                .explicit_denial_reveals_reason
+                .then_some(reason)
+                .flatten(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn visibility_index_name(&self) -> Option<String> {
+        match &self.policy {
+            RowScopePolicy::VisibilityIndex { index_name } => Some(index_name.clone()),
+            RowScopePolicy::KeyPrefix { .. }
+            | RowScopePolicy::TypedRowPredicate { .. }
+            | RowScopePolicy::ProcedureOnly { .. } => None,
+        }
+    }
 }
 
 pub trait VisibilityIndexReader {
@@ -775,6 +1296,7 @@ pub struct DraftAuthorizationDecision {
 pub enum PolicyOutcomeKind {
     Allowed,
     Denied,
+    NotVisible,
     MissingBinding,
     RateLimited,
     BudgetExhausted,
@@ -835,6 +1357,68 @@ pub struct CapabilityUseRequest {
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseTarget {
+    pub database: Option<String>,
+    pub table: Option<String>,
+    pub procedure_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseAccessRequest {
+    pub session_id: String,
+    pub operation: ExecutionOperation,
+    pub binding_name: String,
+    pub capability_family: Option<String>,
+    pub action: DatabaseActionKind,
+    pub target: DatabaseTarget,
+    pub key: Option<String>,
+    pub prefix: Option<String>,
+    pub row_id: Option<String>,
+    pub candidate_row: Option<JsonValue>,
+    pub preimage: Option<JsonValue>,
+    pub postimage: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub occ_read_set: Vec<String>,
+    #[serde(default)]
+    pub metrics: CapabilityUseMetrics,
+    pub requested_at: Timestamp,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseAccessDecision {
+    pub policy: PolicyDecisionRecord,
+    pub family: Option<DatabaseCapabilityFamily>,
+    pub action: DatabaseActionKind,
+    pub target: DatabaseTarget,
+    pub effective_row_scope: Option<EffectiveRowScopeBinding>,
+    pub effective_key: Option<String>,
+    pub effective_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseResultRow {
+    pub row_id: String,
+    pub row: JsonValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseAuthorizedRowSet {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<DatabaseResultRow>,
+    #[serde(default)]
+    pub scanned_rows: u64,
+    #[serde(default)]
+    pub returned_rows: u64,
+    #[serde(default)]
+    pub filtered_rows: u64,
+    pub resume_token: Option<FilteredScanResumeToken>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_audits: Vec<RowVisibilityAuditRecord>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PolicyAuditMetadata {
     pub session_id: String,
@@ -879,6 +1463,7 @@ impl PolicyDecisionRecord {
             }
             PolicyOutcomeKind::Denied => DraftAuthorizationRequestKind::RetryDeniedOperation,
             PolicyOutcomeKind::Allowed
+            | PolicyOutcomeKind::NotVisible
             | PolicyOutcomeKind::RateLimited
             | PolicyOutcomeKind::BudgetExhausted => return None,
         };
@@ -1358,6 +1943,242 @@ impl ResolvedSessionPolicy {
             audit,
         }
     }
+
+    pub fn evaluate_database_access<P, V>(
+        &self,
+        request: &DatabaseAccessRequest,
+        predicates: &P,
+        visibility_indexes: &V,
+    ) -> Result<DatabaseAccessDecision, DatabasePolicyError>
+    where
+        P: TypedRowPredicateEvaluator,
+        V: VisibilityIndexReader,
+    {
+        let mut decision = self.evaluate_use(&CapabilityUseRequest {
+            session_id: request.session_id.clone(),
+            operation: request.operation,
+            binding_name: request.binding_name.clone(),
+            capability_family: request.capability_family.clone(),
+            targets: database_resource_targets(&request.target),
+            metrics: request.metrics.clone(),
+            requested_at: request.requested_at,
+            metadata: request.metadata.clone(),
+        });
+        let binding = self
+            .manifest
+            .bindings
+            .iter()
+            .find(|binding| binding.binding_name == request.binding_name);
+        let family = binding
+            .and_then(|binding| DatabaseCapabilityFamily::parse(&binding.capability_family))
+            .or_else(|| {
+                request
+                    .capability_family
+                    .as_deref()
+                    .and_then(DatabaseCapabilityFamily::parse)
+            });
+
+        if decision.outcome.outcome != PolicyOutcomeKind::Allowed {
+            return Ok(DatabaseAccessDecision {
+                policy: decision,
+                family,
+                action: request.action,
+                target: request.target.clone(),
+                effective_row_scope: None,
+                effective_key: None,
+                effective_prefix: None,
+            });
+        }
+
+        let Some(binding) = binding else {
+            return Ok(DatabaseAccessDecision {
+                policy: decision,
+                family,
+                action: request.action,
+                target: request.target.clone(),
+                effective_row_scope: None,
+                effective_key: None,
+                effective_prefix: None,
+            });
+        };
+
+        let family =
+            DatabaseCapabilityFamily::parse(&binding.capability_family).ok_or_else(|| {
+                DatabasePolicyError::UnsupportedCapabilityFamily {
+                    binding_name: binding.binding_name.clone(),
+                    capability_family: binding.capability_family.clone(),
+                }
+            })?;
+
+        if !family.allows_action(request.action) {
+            decision.outcome.outcome = PolicyOutcomeKind::Denied;
+            decision.outcome.message = Some(format!(
+                "action {:?} is not allowed for capability family {}",
+                request.action,
+                family.as_str()
+            ));
+            return Ok(DatabaseAccessDecision {
+                policy: decision,
+                family: Some(family),
+                action: request.action,
+                target: request.target.clone(),
+                effective_row_scope: None,
+                effective_key: None,
+                effective_prefix: None,
+            });
+        }
+
+        let effective_row_scope = binding.resource_policy.resolve_row_scope(
+            PolicyContext::from(self.subject.clone()),
+            visibility_indexes,
+        )?;
+
+        let effective_key = match (effective_row_scope.as_ref(), request.key.as_deref()) {
+            (Some(row_scope), Some(key)) => row_scope
+                .rewrite_point_key(key)?
+                .or_else(|| Some(key.to_string())),
+            (None, Some(key)) => Some(key.to_string()),
+            (_, None) => None,
+        };
+        let effective_prefix = match (effective_row_scope.as_ref(), request.prefix.as_deref()) {
+            (Some(row_scope), prefix) => row_scope
+                .rewrite_scan_prefix(prefix)?
+                .or_else(|| prefix.map(str::to_string)),
+            (None, prefix) => prefix.map(str::to_string),
+        };
+
+        if let Some(query_shape) = request.action.row_query_shape()
+            && let Some(row_scope) = effective_row_scope.as_ref()
+        {
+            if !row_scope.supports_query_shape(query_shape) {
+                apply_row_scope_audit(
+                    &mut decision,
+                    row_scope.explicit_denial_audit(
+                        query_shape,
+                        Some(format!(
+                            "query shape {query_shape:?} is not allowed for this binding"
+                        )),
+                    ),
+                );
+            } else if request.action == DatabaseActionKind::WriteMutation {
+                if let Some(row_id) = request
+                    .row_id
+                    .as_deref()
+                    .or(effective_key.as_deref())
+                    .filter(|row_id| !row_id.is_empty())
+                    && let Some(audit) = row_scope.evaluate_write(
+                        row_id,
+                        request.preimage.as_ref(),
+                        request.postimage.as_ref(),
+                        &request.occ_read_set,
+                        predicates,
+                    )?
+                {
+                    apply_row_scope_audit(&mut decision, audit);
+                }
+            } else if let Some(row_id) = request
+                .row_id
+                .as_deref()
+                .or(effective_key.as_deref())
+                .filter(|row_id| !row_id.is_empty())
+                && let Some(audit) = row_scope.evaluate_read(
+                    query_shape,
+                    row_id,
+                    request.candidate_row.as_ref(),
+                    predicates,
+                )?
+            {
+                apply_row_scope_audit(&mut decision, audit);
+            }
+        }
+
+        Ok(DatabaseAccessDecision {
+            policy: decision,
+            family: Some(family),
+            action: request.action,
+            target: request.target.clone(),
+            effective_row_scope,
+            effective_key,
+            effective_prefix,
+        })
+    }
+}
+
+impl DatabaseAccessDecision {
+    pub fn authorize_result_rows<P>(
+        &self,
+        rows: impl IntoIterator<Item = DatabaseResultRow>,
+        predicates: &P,
+    ) -> Result<DatabaseAuthorizedRowSet, DatabasePolicyError>
+    where
+        P: TypedRowPredicateEvaluator,
+    {
+        if self.policy.outcome.outcome != PolicyOutcomeKind::Allowed {
+            return Err(DatabasePolicyError::PreflightDenied {
+                outcome: self.policy.outcome.outcome,
+                message: self.policy.outcome.message.clone(),
+            });
+        }
+
+        let Some(query_shape) = self.action.row_query_shape() else {
+            let rows = rows.into_iter().collect::<Vec<_>>();
+            return Ok(DatabaseAuthorizedRowSet {
+                scanned_rows: rows.len() as u64,
+                returned_rows: rows.len() as u64,
+                rows,
+                filtered_rows: 0,
+                resume_token: None,
+                row_audits: Vec::new(),
+            });
+        };
+
+        let mut visible_rows = Vec::new();
+        let mut row_audits = Vec::new();
+        let mut scanned_rows = 0u64;
+        let mut filtered_rows = 0u64;
+        let mut last_scanned_row_id = None;
+
+        for candidate in rows {
+            scanned_rows = scanned_rows.saturating_add(1);
+            last_scanned_row_id = Some(candidate.row_id.clone());
+            if let Some(row_scope) = self.effective_row_scope.as_ref()
+                && let Some(audit) = row_scope.evaluate_read(
+                    query_shape,
+                    &candidate.row_id,
+                    Some(&candidate.row),
+                    predicates,
+                )?
+            {
+                filtered_rows = filtered_rows.saturating_add(1);
+                row_audits.push(audit);
+                continue;
+            }
+            visible_rows.push(candidate);
+        }
+
+        let resume_token = self.effective_row_scope.as_ref().and_then(|row_scope| {
+            (query_shape == RowQueryShape::BoundedPrefixScan).then(|| FilteredScanResumeToken {
+                version: 1,
+                binding_name: self.policy.outcome.binding_name.clone(),
+                query_shape,
+                family: row_scope.policy.family(),
+                last_primary_key: last_scanned_row_id.clone(),
+                last_visibility_key: None,
+                scanned_rows,
+                returned_rows: visible_rows.len() as u64,
+                metadata: BTreeMap::new(),
+            })
+        });
+
+        Ok(DatabaseAuthorizedRowSet {
+            rows: visible_rows,
+            scanned_rows,
+            returned_rows: scanned_rows.saturating_sub(filtered_rows),
+            filtered_rows,
+            resume_token,
+            row_audits,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1556,15 +2377,15 @@ impl ExecutionPolicyResolver for StaticExecutionPolicyResolver {
         &self,
         request: &ExecutionPolicyRequest,
     ) -> Result<ExecutionPolicy, PolicyError> {
-        if let Some(profile_name) = request.profile_name.as_ref() {
-            if let Some(policy) = self.by_profile_name.get(profile_name) {
-                return Ok(policy.clone());
-            }
+        if let Some(profile_name) = request.profile_name.as_ref()
+            && let Some(policy) = self.by_profile_name.get(profile_name)
+        {
+            return Ok(policy.clone());
         }
-        if let Some(preset_name) = request.preset_name.as_ref() {
-            if let Some(policy) = self.by_preset_name.get(preset_name) {
-                return Ok(policy.clone());
-            }
+        if let Some(preset_name) = request.preset_name.as_ref()
+            && let Some(policy) = self.by_preset_name.get(preset_name)
+        {
+            return Ok(policy.clone());
         }
         Ok(self
             .by_session_mode
@@ -2150,6 +2971,7 @@ impl DeterministicDraftAuthorizationSession {
         Ok(Some(request))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn request_binding_authorization(
         &mut self,
         request_id: impl Into<String>,
@@ -2493,6 +3315,39 @@ fn budget_exhausted_message(
     None
 }
 
+fn database_resource_targets(target: &DatabaseTarget) -> Vec<ResourceTarget> {
+    let mut resources = Vec::new();
+    if let Some(database) = target.database.as_ref() {
+        resources.push(ResourceTarget {
+            kind: ResourceKind::Database,
+            identifier: database.clone(),
+        });
+    }
+    if let Some(table) = target.table.as_ref() {
+        resources.push(ResourceTarget {
+            kind: ResourceKind::Table,
+            identifier: table.clone(),
+        });
+    }
+    if let Some(procedure_id) = target.procedure_id.as_ref() {
+        resources.push(ResourceTarget {
+            kind: ResourceKind::Procedure,
+            identifier: procedure_id.clone(),
+        });
+    }
+    resources
+}
+
+fn apply_row_scope_audit(decision: &mut PolicyDecisionRecord, audit: RowVisibilityAuditRecord) {
+    decision.outcome.message = audit.reason.clone();
+    decision.outcome.outcome = match audit.outcome {
+        RowVisibilityOutcomeKind::Visible => PolicyOutcomeKind::Allowed,
+        RowVisibilityOutcomeKind::NotVisible => PolicyOutcomeKind::NotVisible,
+        RowVisibilityOutcomeKind::ExplicitlyDenied => PolicyOutcomeKind::Denied,
+    };
+    decision.outcome.row_visibility = Some(audit);
+}
+
 fn policy_outcome_metadata(
     request: &CapabilityUseRequest,
     assignment: &ExecutionDomainAssignment,
@@ -2531,6 +3386,76 @@ fn policy_outcome_metadata(
         );
     }
     metadata
+}
+
+fn render_prefix_template(
+    template: &str,
+    context: &PolicyContext,
+) -> Result<String, DatabasePolicyError> {
+    let mut rendered = String::new();
+    let mut remainder = template;
+    while let Some(start) = remainder.find('{') {
+        rendered.push_str(&remainder[..start]);
+        let after_start = &remainder[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            rendered.push_str(&remainder[start..]);
+            return Ok(rendered);
+        };
+        let field = &after_start[..end];
+        let value = policy_context_value_as_string(context, field).ok_or_else(|| {
+            DatabasePolicyError::MissingContextField {
+                field: field.to_string(),
+            }
+        })?;
+        rendered.push_str(&value);
+        remainder = &after_start[end + 1..];
+    }
+    rendered.push_str(remainder);
+    Ok(rendered)
+}
+
+fn rewrite_key_with_prefix(prefix: &str, key: &str) -> String {
+    if key.starts_with(prefix) {
+        key.to_string()
+    } else {
+        format!("{prefix}{key}")
+    }
+}
+
+fn policy_context_value_as_string(context: &PolicyContext, field: &str) -> Option<String> {
+    policy_context_value(context, field).map(json_value_to_string)
+}
+
+fn policy_context_value(context: &PolicyContext, field: &str) -> Option<JsonValue> {
+    match field {
+        "subject_id" => Some(JsonValue::String(context.subject_id.clone())),
+        "tenant_id" => context.tenant_id.clone().map(JsonValue::String),
+        "group_ids" => Some(json_value(&context.group_ids)),
+        _ => {
+            if let Some(attribute) = field.strip_prefix("attributes.") {
+                return context.attributes.get(attribute).cloned();
+            }
+            None
+        }
+    }
+}
+
+fn json_lookup<'a>(value: &'a JsonValue, field_path: &str) -> Option<&'a JsonValue> {
+    let mut current = value;
+    for segment in field_path.split('.') {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
+}
+
+fn json_value_to_string(value: JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(value) => value.to_string(),
+        JsonValue::Number(value) => value.to_string(),
+        JsonValue::String(value) => value,
+        JsonValue::Array(_) | JsonValue::Object(_) => value.to_string(),
+    }
 }
 
 fn wildcard_pattern_matches(pattern: &str, value: &str) -> bool {

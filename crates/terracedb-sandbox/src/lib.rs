@@ -21,7 +21,9 @@ pub use bash::{
 pub use capabilities::{
     CapabilityCallRequest, CapabilityCallResult, CapabilityManifest, CapabilityMethod0,
     CapabilityMethod1, CapabilityRegistry, DeterministicCapabilityMethodBehavior,
-    DeterministicCapabilityModule, DeterministicCapabilityRegistry, SandboxCapability,
+    DeterministicCapabilityModule, DeterministicCapabilityRegistry,
+    ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
+    ManifestBoundCapabilityRegistry, ManifestBoundCapabilityResult, SandboxCapability,
     SandboxCapabilityMethod, SandboxCapabilityModule, StaticCapabilityRegistry,
     TypedCapabilityModule, TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
