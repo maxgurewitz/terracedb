@@ -1346,6 +1346,507 @@ impl DeterministicPolicyEngine {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DraftAuthorizationAttempt {
+    pub request: DraftAuthorizationRequest,
+    pub trigger_request: Option<CapabilityUseRequest>,
+    pub trigger_decision: Option<PolicyDecisionRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DraftAuthorizationHistoryKind {
+    PolicyOutcome {
+        request: CapabilityUseRequest,
+        decision: PolicyDecisionRecord,
+        authorization_request_id: Option<String>,
+    },
+    AuthorizationRequested {
+        request: DraftAuthorizationRequest,
+    },
+    AuthorizationDecided {
+        request: DraftAuthorizationRequest,
+        decision: DraftAuthorizationDecision,
+    },
+    ManifestRefreshed {
+        request_id: String,
+        scope: AuthorizationScope,
+        manifest: CapabilityManifest,
+    },
+    RetryOutcome {
+        request_id: String,
+        request: CapabilityUseRequest,
+        decision: PolicyDecisionRecord,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DraftAuthorizationHistoryEntry {
+    pub sequence: u64,
+    pub session_id: String,
+    pub occurred_at: Timestamp,
+    pub kind: DraftAuthorizationHistoryKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppliedDraftAuthorizationDecision {
+    pub request: DraftAuthorizationRequest,
+    pub decision: DraftAuthorizationDecision,
+    pub refreshed_manifest: Option<CapabilityManifest>,
+    pub pending_authorization: Option<DraftAuthorizationRequest>,
+}
+
+#[derive(Debug, Error)]
+pub enum DraftAuthorizationFlowError {
+    #[error("interactive authorization is only available for trusted draft sessions")]
+    InteractiveAuthorizationDisabled,
+    #[error("draft authorization request {request_id} was not found")]
+    RequestNotFound { request_id: String },
+    #[error("session {session_id} already has a pending authorization request")]
+    PendingRequestExists { session_id: String },
+    #[error("approved authorization decision {request_id} is missing an approved scope")]
+    MissingApprovedScope { request_id: String },
+    #[error(
+        "approved authorization decision {request_id} did not produce a policy that satisfies the request"
+    )]
+    ApprovalUnsatisfied { request_id: String },
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ActiveDraftAuthorization {
+    attempt: DraftAuthorizationAttempt,
+    scope: AuthorizationScope,
+    policy: ResolvedSessionPolicy,
+    remaining_uses: Option<u64>,
+}
+
+impl ActiveDraftAuthorization {
+    fn matches(&self, request: &CapabilityUseRequest) -> bool {
+        if let Some(trigger_request) = self.attempt.trigger_request.as_ref() {
+            if self.scope == AuthorizationScope::OneCall {
+                trigger_request == request
+            } else {
+                use_request_signature_matches(trigger_request, request)
+            }
+        } else {
+            self.attempt.request.binding_name == request.binding_name
+                && request
+                    .capability_family
+                    .as_ref()
+                    .is_none_or(|family| family == &self.attempt.request.capability_family)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeterministicDraftAuthorizationSession {
+    engine: DeterministicPolicyEngine,
+    resolution_request: PolicyResolutionRequest,
+    trusted_draft: bool,
+    policy: ResolvedSessionPolicy,
+    pending_authorization: Option<DraftAuthorizationRequest>,
+    attempts: BTreeMap<String, DraftAuthorizationAttempt>,
+    active_authorizations: Vec<ActiveDraftAuthorization>,
+    history: Vec<DraftAuthorizationHistoryEntry>,
+    next_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct DeterministicDraftAuthorizationSessionState {
+    resolution_request: PolicyResolutionRequest,
+    trusted_draft: bool,
+    policy: ResolvedSessionPolicy,
+    pending_authorization: Option<DraftAuthorizationRequest>,
+    attempts: BTreeMap<String, DraftAuthorizationAttempt>,
+    active_authorizations: Vec<ActiveDraftAuthorization>,
+    history: Vec<DraftAuthorizationHistoryEntry>,
+    next_sequence: u64,
+}
+
+impl DeterministicDraftAuthorizationSessionState {
+    fn from_session(session: &DeterministicDraftAuthorizationSession) -> Self {
+        Self {
+            resolution_request: session.resolution_request.clone(),
+            trusted_draft: session.trusted_draft,
+            policy: session.policy.clone(),
+            pending_authorization: session.pending_authorization.clone(),
+            attempts: session.attempts.clone(),
+            active_authorizations: session.active_authorizations.clone(),
+            history: session.history.clone(),
+            next_sequence: session.next_sequence,
+        }
+    }
+}
+
+impl DeterministicDraftAuthorizationSession {
+    pub fn open(
+        engine: DeterministicPolicyEngine,
+        resolution_request: PolicyResolutionRequest,
+        trusted_draft: bool,
+    ) -> Result<Self, PolicyError> {
+        let policy = engine.resolve(&resolution_request)?;
+        Ok(Self {
+            engine,
+            resolution_request,
+            trusted_draft,
+            policy,
+            pending_authorization: None,
+            attempts: BTreeMap::new(),
+            active_authorizations: Vec::new(),
+            history: Vec::new(),
+            next_sequence: 1,
+        })
+    }
+
+    pub fn trusted_draft(&self) -> bool {
+        self.trusted_draft
+    }
+
+    pub fn resolved_policy(&self) -> &ResolvedSessionPolicy {
+        &self.policy
+    }
+
+    pub fn pending_authorization(&self) -> Option<&DraftAuthorizationRequest> {
+        self.pending_authorization.as_ref()
+    }
+
+    pub fn history(&self) -> &[DraftAuthorizationHistoryEntry] {
+        &self.history
+    }
+
+    pub fn snapshot_json(&self) -> Result<JsonValue, serde_json::Error> {
+        serde_json::to_value(DeterministicDraftAuthorizationSessionState::from_session(
+            self,
+        ))
+    }
+
+    pub fn restore_from_json(
+        engine: DeterministicPolicyEngine,
+        snapshot: JsonValue,
+    ) -> Result<Self, serde_json::Error> {
+        let state: DeterministicDraftAuthorizationSessionState = serde_json::from_value(snapshot)?;
+        Ok(Self {
+            engine,
+            resolution_request: state.resolution_request,
+            trusted_draft: state.trusted_draft,
+            policy: state.policy,
+            pending_authorization: state.pending_authorization,
+            attempts: state.attempts,
+            active_authorizations: state.active_authorizations,
+            history: state.history,
+            next_sequence: state.next_sequence,
+        })
+    }
+
+    pub fn evaluate_use(&mut self, request: CapabilityUseRequest) -> PolicyDecisionRecord {
+        let base_decision = self.policy.evaluate_use(&request);
+        let mut final_decision = base_decision.clone();
+        let mut authorization_request_id = None;
+
+        if base_decision.outcome.outcome != PolicyOutcomeKind::Allowed {
+            if let Some(index) = self.matching_active_authorization_index(&request) {
+                let candidate = self.active_authorizations[index]
+                    .policy
+                    .evaluate_use(&request);
+                if candidate.outcome.outcome == PolicyOutcomeKind::Allowed {
+                    final_decision = candidate;
+                    authorization_request_id = Some(
+                        self.active_authorizations[index]
+                            .attempt
+                            .request
+                            .request_id
+                            .clone(),
+                    );
+                    if let Some(remaining_uses) =
+                        self.active_authorizations[index].remaining_uses.as_mut()
+                    {
+                        *remaining_uses = remaining_uses.saturating_sub(1);
+                    }
+                }
+            }
+        } else if let Some(request_id) = self.matching_persistent_authorization_request_id(&request)
+        {
+            authorization_request_id = Some(request_id);
+        }
+
+        self.active_authorizations.retain(|authorization| {
+            authorization
+                .remaining_uses
+                .is_none_or(|remaining| remaining > 0)
+        });
+
+        let occurred_at = final_decision.outcome.observed_at;
+        if let Some(request_id) = authorization_request_id {
+            self.push_history(
+                occurred_at,
+                DraftAuthorizationHistoryKind::RetryOutcome {
+                    request_id,
+                    request,
+                    decision: final_decision.clone(),
+                },
+            );
+        } else {
+            self.push_history(
+                occurred_at,
+                DraftAuthorizationHistoryKind::PolicyOutcome {
+                    request,
+                    decision: final_decision.clone(),
+                    authorization_request_id: None,
+                },
+            );
+        }
+
+        final_decision
+    }
+
+    pub fn request_authorization_for_outcome(
+        &mut self,
+        use_request: CapabilityUseRequest,
+        decision: PolicyDecisionRecord,
+        request_id: impl Into<String>,
+        requested_scope: AuthorizationScope,
+        requested_at: Timestamp,
+        reason: Option<String>,
+    ) -> Result<Option<DraftAuthorizationRequest>, DraftAuthorizationFlowError> {
+        self.ensure_interactive_authorization_enabled()?;
+        self.ensure_no_pending_request()?;
+
+        if decision.outcome.outcome == PolicyOutcomeKind::Denied
+            && !self.binding_allows_interactive_widening(&decision.audit.binding_name)
+        {
+            return Ok(None);
+        }
+
+        let Some(request) =
+            decision.draft_authorization_request(request_id, requested_scope, requested_at, reason)
+        else {
+            return Ok(None);
+        };
+
+        self.attempts.insert(
+            request.request_id.clone(),
+            DraftAuthorizationAttempt {
+                request: request.clone(),
+                trigger_request: Some(use_request),
+                trigger_decision: Some(decision),
+            },
+        );
+        self.pending_authorization = Some(request.clone());
+        self.push_history(
+            request.requested_at,
+            DraftAuthorizationHistoryKind::AuthorizationRequested {
+                request: request.clone(),
+            },
+        );
+
+        Ok(Some(request))
+    }
+
+    pub fn request_binding_authorization(
+        &mut self,
+        request_id: impl Into<String>,
+        binding_name: impl Into<String>,
+        capability_family: impl Into<String>,
+        requested_scope: AuthorizationScope,
+        requested_at: Timestamp,
+        reason: Option<String>,
+        metadata: BTreeMap<String, JsonValue>,
+    ) -> Result<DraftAuthorizationRequest, DraftAuthorizationFlowError> {
+        self.ensure_interactive_authorization_enabled()?;
+        self.ensure_no_pending_request()?;
+
+        let request = DraftAuthorizationRequest {
+            request_id: request_id.into(),
+            session_id: self.session_id().to_string(),
+            binding_name: binding_name.into(),
+            capability_family: capability_family.into(),
+            kind: DraftAuthorizationRequestKind::InjectMissingBinding,
+            requested_scope,
+            reason,
+            requested_at,
+            metadata,
+        };
+
+        self.attempts.insert(
+            request.request_id.clone(),
+            DraftAuthorizationAttempt {
+                request: request.clone(),
+                trigger_request: None,
+                trigger_decision: None,
+            },
+        );
+        self.pending_authorization = Some(request.clone());
+        self.push_history(
+            request.requested_at,
+            DraftAuthorizationHistoryKind::AuthorizationRequested {
+                request: request.clone(),
+            },
+        );
+
+        Ok(request)
+    }
+
+    pub fn apply_decision(
+        &mut self,
+        decision: DraftAuthorizationDecision,
+        updated_engine: Option<DeterministicPolicyEngine>,
+        updated_resolution_request: Option<PolicyResolutionRequest>,
+    ) -> Result<AppliedDraftAuthorizationDecision, DraftAuthorizationFlowError> {
+        let attempt = self
+            .attempts
+            .get(&decision.request_id)
+            .cloned()
+            .ok_or_else(|| DraftAuthorizationFlowError::RequestNotFound {
+                request_id: decision.request_id.clone(),
+            })?;
+
+        self.push_history(
+            decision.decided_at,
+            DraftAuthorizationHistoryKind::AuthorizationDecided {
+                request: attempt.request.clone(),
+                decision: decision.clone(),
+            },
+        );
+
+        let mut refreshed_manifest = None;
+
+        match decision.outcome {
+            DraftAuthorizationOutcomeKind::Pending => {
+                self.pending_authorization = Some(attempt.request.clone());
+            }
+            DraftAuthorizationOutcomeKind::Rejected => {
+                if self
+                    .pending_authorization
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == decision.request_id)
+                {
+                    self.pending_authorization = None;
+                }
+                self.active_authorizations.retain(|authorization| {
+                    authorization.attempt.request.request_id != decision.request_id
+                });
+            }
+            DraftAuthorizationOutcomeKind::Approved => {
+                let scope = decision.approved_scope.ok_or_else(|| {
+                    DraftAuthorizationFlowError::MissingApprovedScope {
+                        request_id: decision.request_id.clone(),
+                    }
+                })?;
+                let engine = updated_engine.unwrap_or_else(|| self.engine.clone());
+                let resolution_request =
+                    updated_resolution_request.unwrap_or_else(|| self.resolution_request.clone());
+                let candidate_policy = engine.resolve(&resolution_request)?;
+
+                if !authorization_attempt_is_satisfied(&attempt, &candidate_policy) {
+                    return Err(DraftAuthorizationFlowError::ApprovalUnsatisfied {
+                        request_id: decision.request_id.clone(),
+                    });
+                }
+
+                if scope != AuthorizationScope::OneCall {
+                    self.engine = engine;
+                    self.resolution_request = resolution_request;
+                    self.policy = candidate_policy.clone();
+                    refreshed_manifest = Some(candidate_policy.manifest.clone());
+                    self.push_history(
+                        decision.decided_at,
+                        DraftAuthorizationHistoryKind::ManifestRefreshed {
+                            request_id: decision.request_id.clone(),
+                            scope,
+                            manifest: candidate_policy.manifest.clone(),
+                        },
+                    );
+                }
+
+                self.active_authorizations.retain(|authorization| {
+                    authorization.attempt.request.request_id != decision.request_id
+                });
+                self.active_authorizations.push(ActiveDraftAuthorization {
+                    attempt: attempt.clone(),
+                    scope,
+                    policy: candidate_policy,
+                    remaining_uses: (scope == AuthorizationScope::OneCall).then_some(1),
+                });
+                if self
+                    .pending_authorization
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == decision.request_id)
+                {
+                    self.pending_authorization = None;
+                }
+            }
+        }
+
+        Ok(AppliedDraftAuthorizationDecision {
+            request: attempt.request,
+            decision,
+            refreshed_manifest,
+            pending_authorization: self.pending_authorization.clone(),
+        })
+    }
+
+    fn ensure_interactive_authorization_enabled(&self) -> Result<(), DraftAuthorizationFlowError> {
+        if self.policy.session_mode == SessionMode::Draft && self.trusted_draft {
+            Ok(())
+        } else {
+            Err(DraftAuthorizationFlowError::InteractiveAuthorizationDisabled)
+        }
+    }
+
+    fn ensure_no_pending_request(&self) -> Result<(), DraftAuthorizationFlowError> {
+        if self.pending_authorization.is_some() {
+            Err(DraftAuthorizationFlowError::PendingRequestExists {
+                session_id: self.session_id().to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn binding_allows_interactive_widening(&self, binding_name: &str) -> bool {
+        self.policy
+            .manifest
+            .bindings
+            .iter()
+            .find(|binding| binding.binding_name == binding_name)
+            .is_none_or(|binding| binding.allow_interactive_widening)
+    }
+
+    fn matching_active_authorization_index(&self, request: &CapabilityUseRequest) -> Option<usize> {
+        self.active_authorizations
+            .iter()
+            .position(|authorization| authorization.matches(request))
+    }
+
+    fn matching_persistent_authorization_request_id(
+        &self,
+        request: &CapabilityUseRequest,
+    ) -> Option<String> {
+        self.active_authorizations
+            .iter()
+            .find(|authorization| {
+                authorization.scope != AuthorizationScope::OneCall && authorization.matches(request)
+            })
+            .map(|authorization| authorization.attempt.request.request_id.clone())
+    }
+
+    fn push_history(&mut self, occurred_at: Timestamp, kind: DraftAuthorizationHistoryKind) {
+        self.history.push(DraftAuthorizationHistoryEntry {
+            sequence: self.next_sequence,
+            session_id: self.session_id().to_string(),
+            occurred_at,
+            kind,
+        });
+        self.next_sequence += 1;
+    }
+
+    fn session_id(&self) -> &str {
+        &self.resolution_request.subject.session_id
+    }
+}
+
 fn find_matching_grant<'a>(
     grants: &[&'a CapabilityGrant],
     template_id: &str,
@@ -1362,6 +1863,41 @@ fn is_false(value: &bool) -> bool {
 
 fn default_call_count() -> u64 {
     1
+}
+
+fn authorization_attempt_is_satisfied(
+    attempt: &DraftAuthorizationAttempt,
+    policy: &ResolvedSessionPolicy,
+) -> bool {
+    if let Some(trigger_request) = attempt.trigger_request.as_ref() {
+        policy.evaluate_use(trigger_request).outcome.outcome == PolicyOutcomeKind::Allowed
+    } else {
+        policy.manifest.bindings.iter().any(|binding| {
+            binding.binding_name == attempt.request.binding_name
+                && binding.capability_family == attempt.request.capability_family
+        })
+    }
+}
+
+fn use_request_signature_matches(
+    left: &CapabilityUseRequest,
+    right: &CapabilityUseRequest,
+) -> bool {
+    left.session_id == right.session_id
+        && left.operation == right.operation
+        && left.binding_name == right.binding_name
+        && left.targets == right.targets
+        && capability_family_matches(
+            left.capability_family.as_deref(),
+            right.capability_family.as_deref(),
+        )
+}
+
+fn capability_family_matches(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 fn tenant_scope_denies(subject: &PolicySubject, policy: &ResourcePolicy) -> bool {
