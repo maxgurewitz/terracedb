@@ -3365,6 +3365,8 @@ It should not receive arbitrary database handles, shell access, live package ins
 
 For correctness, workflow execution must not depend on mutable guest-global state. The host may cache transpiled modules or sealed bundles, but each `routeToInstance` and `handle` call must behave as a pure function of admitted input, current state, and deterministic context.
 
+Near-term implementation note: if the older runtime is bridged to the shared handler contract before the fuller run/history engine lands, that bridge should stay explicitly gated to the subset of contract semantics the runtime can actually preserve. In practice that means a compatibility marker for the state/outbox/timer surface only, rather than silently accepting lifecycle, visibility, or continue-as-new outputs that the older runtime cannot yet durably represent.
+
 ---
 
 ## Event-Driven Workflows

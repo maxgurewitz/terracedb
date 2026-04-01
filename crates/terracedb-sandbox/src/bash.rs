@@ -258,9 +258,7 @@ impl DeterministicBashService {
         let target = if let Some(target) = tokens.get(1) {
             target.clone()
         } else {
-            match session.info().await.workspace_root {
-                workspace_root => workspace_root,
-            }
+            session.info().await.workspace_root
         };
         let resolved = match adapter.resolve_path(&target) {
             Ok(path) => path,

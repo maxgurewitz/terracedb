@@ -47,6 +47,9 @@ const WORKFLOW_CHECKPOINT_ARTIFACT_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_CHECKPOINT_MANIFEST_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_CHECKPOINT_LATEST_POINTER_FORMAT_VERSION: u8 = 1;
 const WORKFLOW_TABLE_PREFIX: &str = "_workflow_";
+const WORKFLOW_CONTRACT_VALUE_JSON_ENCODING: &str = "application/vnd.terracedb.value+json";
+pub const WORKFLOW_RUNTIME_SURFACE_LABEL: &str = "terracedb.workflow.runtime-surface";
+pub const WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1: &str = "state-outbox-timers/v1";
 const INBOX_KEY_SEPARATOR: u8 = 0;
 const TRIGGER_JOURNAL_ENTRY_PREFIX: u8 = 0;
 const TRIGGER_JOURNAL_HEAD_KEY: &[u8] = &[0xff];
@@ -1281,6 +1284,216 @@ pub trait WorkflowHandler: Send + Sync {
     ) -> Result<WorkflowOutput, WorkflowHandlerError>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowRuntimeTask {
+    pub workflow_name: String,
+    pub instance_id: String,
+    pub trigger_seq: u64,
+    pub admitted_at_millis: Option<u64>,
+}
+
+#[async_trait]
+pub trait WorkflowRuntimeHandler: Send + Sync {
+    async fn route_event(&self, entry: &ChangeEntry) -> Result<String, WorkflowHandlerError>;
+
+    async fn validate_runtime_tables(
+        &self,
+        _tables: &WorkflowTables,
+    ) -> Result<(), WorkflowHandlerError> {
+        Ok(())
+    }
+
+    async fn handle_runtime_task(
+        &self,
+        task: &WorkflowRuntimeTask,
+        state: Option<Value>,
+        trigger: &WorkflowTrigger,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError>;
+}
+
+#[async_trait]
+impl<T> WorkflowRuntimeHandler for T
+where
+    T: WorkflowHandler,
+{
+    async fn route_event(&self, entry: &ChangeEntry) -> Result<String, WorkflowHandlerError> {
+        WorkflowHandler::route_event(self, entry).await
+    }
+
+    async fn handle_runtime_task(
+        &self,
+        task: &WorkflowRuntimeTask,
+        state: Option<Value>,
+        trigger: &WorkflowTrigger,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        let ctx = WorkflowContext::new(
+            &task.workflow_name,
+            &task.instance_id,
+            trigger,
+            state.as_ref(),
+        )
+        .map_err(WorkflowHandlerError::new)?;
+        self.handle(&task.instance_id, state, trigger, &ctx).await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ContractWorkflowHandler<H> {
+    bundle: contracts::WorkflowBundleMetadata,
+    inner: H,
+}
+
+impl<H> ContractWorkflowHandler<H> {
+    pub fn new(
+        bundle: contracts::WorkflowBundleMetadata,
+        inner: H,
+    ) -> Result<Self, contracts::WorkflowTaskError> {
+        if bundle.workflow_name.trim().is_empty() {
+            return Err(contracts::WorkflowTaskError::invalid_contract(
+                "workflow bundle name cannot be empty",
+            ));
+        }
+        let Some(runtime_surface) = bundle.labels.get(WORKFLOW_RUNTIME_SURFACE_LABEL) else {
+            return Err(contracts::WorkflowTaskError::invalid_contract(format!(
+                "workflow bundle {} must declare {}={} before it can run on the current runtime adapter",
+                bundle.bundle_id,
+                WORKFLOW_RUNTIME_SURFACE_LABEL,
+                WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1
+            )));
+        };
+        if runtime_surface != WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1 {
+            return Err(contracts::WorkflowTaskError::invalid_contract(format!(
+                "workflow bundle {} declares unsupported runtime surface {}; expected {}",
+                bundle.bundle_id, runtime_surface, WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1
+            )));
+        }
+        if let contracts::WorkflowBundleKind::Sandbox { abi, .. } = &bundle.kind
+            && abi != sandbox_contracts::WORKFLOW_TASK_V1_ABI
+        {
+            return Err(contracts::WorkflowTaskError::new(
+                "abi-mismatch",
+                format!(
+                    "sandbox bundles must use {}, got {}",
+                    sandbox_contracts::WORKFLOW_TASK_V1_ABI,
+                    abi
+                ),
+            ));
+        }
+        Ok(Self { bundle, inner })
+    }
+
+    pub fn bundle(&self) -> &contracts::WorkflowBundleMetadata {
+        &self.bundle
+    }
+
+    pub fn into_inner(self) -> H {
+        self.inner
+    }
+}
+
+#[async_trait]
+impl<H> WorkflowRuntimeHandler for ContractWorkflowHandler<H>
+where
+    H: contracts::WorkflowHandlerContract,
+{
+    async fn route_event(&self, entry: &ChangeEntry) -> Result<String, WorkflowHandlerError> {
+        let event = change_entry_to_contract_event(entry).map_err(WorkflowHandlerError::new)?;
+        self.inner
+            .route_event(&event)
+            .await
+            .map_err(WorkflowHandlerError::new)
+    }
+
+    async fn handle_runtime_task(
+        &self,
+        task: &WorkflowRuntimeTask,
+        state: Option<Value>,
+        trigger: &WorkflowTrigger,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        let input = build_contract_transition_input(task, &self.bundle, state.as_ref(), trigger)
+            .map_err(WorkflowHandlerError::new)?;
+        let ctx = contracts::WorkflowDeterministicContext::new(
+            &input,
+            Arc::new(TracingWorkflowObservability {
+                span: tracing::Span::current(),
+            }),
+        )
+        .map_err(WorkflowHandlerError::new)?;
+        let output = self
+            .inner
+            .handle_task(input, ctx)
+            .await
+            .map_err(WorkflowHandlerError::new)?;
+        contract_output_to_runtime_output(output).map_err(WorkflowHandlerError::new)
+    }
+
+    async fn validate_runtime_tables(
+        &self,
+        tables: &WorkflowTables,
+    ) -> Result<(), WorkflowHandlerError> {
+        let mut pending = tables
+            .inbox_table()
+            .scan(Vec::new(), vec![0xff], ScanOptions::default())
+            .await
+            .map_err(WorkflowHandlerError::new)?;
+        while let Some((key, value)) = pending.next().await {
+            let bytes = match &value {
+                Value::Bytes(bytes) => bytes.as_slice(),
+                Value::Record(_) => {
+                    return Err(WorkflowHandlerError::new(std::io::Error::other(
+                        "workflow inbox trigger expected a byte value",
+                    )));
+                }
+            };
+            let stored: StoredAdmittedWorkflowTrigger =
+                decode_payload(bytes, "workflow inbox trigger")
+                    .map_err(WorkflowHandlerError::new)?;
+            if stored.admitted_at_millis.is_none() {
+                return Err(WorkflowHandlerError::new(std::io::Error::other(format!(
+                    "workflow bundle {} requires {} inbox rows; pending admission {:?} predates that format",
+                    self.bundle.bundle_id,
+                    WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1,
+                    String::from_utf8_lossy(&key)
+                ))));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct TracingWorkflowObservability {
+    span: tracing::Span,
+}
+
+impl contracts::WorkflowObservability for TracingWorkflowObservability {
+    fn record_attribute(&self, key: &str, value: contracts::WorkflowObservationValue) {
+        match value {
+            contracts::WorkflowObservationValue::Bool(value) => {
+                set_span_attribute(&self.span, key.to_string(), value);
+            }
+            contracts::WorkflowObservationValue::I64(value) => {
+                set_span_attribute(&self.span, key.to_string(), value);
+            }
+            contracts::WorkflowObservationValue::U64(value) => {
+                set_span_attribute(&self.span, key.to_string(), value);
+            }
+            contracts::WorkflowObservationValue::String(value) => {
+                set_span_attribute(&self.span, key.to_string(), value);
+            }
+        }
+    }
+
+    fn record_event(&self, event: contracts::WorkflowObservationEvent) {
+        tracing::debug!(
+            parent: &self.span,
+            workflow_observation_event = %event.name,
+            fields = ?event.fields,
+            "workflow handler observation"
+        );
+    }
+}
+
 #[async_trait]
 pub trait WorkflowScheduler: Send + Sync {
     fn mark_ready(&self, instance_id: String);
@@ -1569,7 +1782,7 @@ struct WorkflowRuntimeInner<H> {
 
 impl<H> WorkflowRuntime<H>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     pub async fn open(
         db: Db,
@@ -1590,6 +1803,14 @@ where
             let scheduler = definition
                 .scheduler
                 .unwrap_or_else(|| Arc::new(RoundRobinWorkflowScheduler::default()));
+            definition
+                .handler
+                .validate_runtime_tables(&tables)
+                .await
+                .map_err(|source| WorkflowError::Handler {
+                    name: definition.name.clone(),
+                    source,
+                })?;
 
             let runtime = Self {
                 inner: Arc::new(WorkflowRuntimeInner {
@@ -2522,7 +2743,7 @@ async fn resolve_workflow_source_progress<H>(
     snapshot_too_old: Option<&SnapshotTooOld>,
 ) -> Result<WorkflowSourceProgress, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let current_durable_sequence = runtime.db.subscribe_durable(source.table()).current();
     let checkpoint_progress = load_checkpoint_source_progress(runtime, source).await?;
@@ -2674,7 +2895,7 @@ async fn load_checkpoint_source_progress<H>(
     source: &WorkflowSource,
 ) -> Result<Option<WorkflowSourceProgress>, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     if !source.config().capabilities.supports_checkpoint_restore() {
         return Ok(None);
@@ -2698,7 +2919,7 @@ async fn persist_workflow_source_progress<H>(
     progress: WorkflowSourceProgress,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     loop {
         let mut tx = Transaction::begin(&runtime.db).await;
@@ -2720,7 +2941,7 @@ async fn retag_restored_source_progress<H>(
     runtime: &WorkflowRuntimeInner<H>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     for source in &runtime.sources {
         let Some(progress) =
@@ -2745,7 +2966,7 @@ async fn detect_snapshot_too_old_for_source_progress<H>(
     progress: WorkflowSourceProgress,
 ) -> Result<Option<SnapshotTooOld>, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     match runtime
         .db
@@ -2775,7 +2996,7 @@ async fn resolve_workflow_source_progress_on_start<H>(
     shutdown_rx: &watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let current_durable_sequence = runtime.db.subscribe_durable(source.table()).current();
     let checkpoint_progress = load_checkpoint_source_progress(runtime, source).await?;
@@ -2822,7 +3043,7 @@ async fn prepare_workflow_sources_on_start<H>(
     shutdown_rx: &watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     for source in &runtime.sources {
         let mut prepared = false;
@@ -2889,7 +3110,7 @@ async fn resume_local_durable_work<H>(
     shutdown_rx: &watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     loop {
         if *shutdown_rx.borrow() {
@@ -2914,7 +3135,7 @@ async fn has_durable_inbox_entries<H>(
     runtime: &WorkflowRuntimeInner<H>,
 ) -> Result<bool, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let durable_sequence = runtime.db.current_durable_sequence();
     let mut rows = runtime
@@ -2935,7 +3156,7 @@ where
 
 async fn has_due_durable_timers<H>(runtime: &WorkflowRuntimeInner<H>) -> Result<bool, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     Ok(!runtime
         .tables
@@ -2950,7 +3171,7 @@ async fn run_workflow_runtime<H>(
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let span = tracing::info_span!("terracedb.workflow.runtime");
     apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, None);
@@ -3005,7 +3226,7 @@ async fn run_source_admission_loop<H>(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let mut progress =
         match read_workflow_source_progress(runtime.tables.source_progress_table(), source.table())
@@ -3085,7 +3306,7 @@ async fn admit_source_page<H>(
     progress: &mut WorkflowSourceProgress,
 ) -> Result<bool, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let mut stream = runtime
         .db
@@ -3200,7 +3421,7 @@ async fn run_timer_loop<H>(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let mut timer_wakes = runtime.tables.timers.subscribe_durable(&runtime.db);
 
@@ -3235,7 +3456,7 @@ where
 
 async fn admit_due_timer_batch<H>(runtime: &WorkflowRuntimeInner<H>) -> Result<bool, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let due = runtime
         .tables
@@ -3332,7 +3553,7 @@ async fn run_inbox_executor<H>(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let mut inbox_wakes = runtime.db.subscribe_durable(runtime.tables.inbox_table());
     seed_ready_instances_from_durable_inbox(&runtime).await?;
@@ -3371,7 +3592,7 @@ async fn seed_ready_instances_from_durable_inbox<H>(
     runtime: &WorkflowRuntimeInner<H>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let durable_sequence = runtime.db.current_durable_sequence();
     let mut rows = runtime
@@ -3398,7 +3619,7 @@ async fn drain_ready_instances<H>(
     shutdown_rx: &watch::Receiver<bool>,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     loop {
         if *shutdown_rx.borrow() {
@@ -3452,7 +3673,7 @@ async fn process_one_ready_instance<H>(
     instance_id: &str,
 ) -> Result<bool, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let durable_sequence = runtime.db.current_durable_sequence();
     let mut pending = runtime
@@ -3483,6 +3704,7 @@ where
         instance_id,
         admitted.trigger,
         admitted.trigger_seq,
+        admitted.admitted_at_millis,
         admitted.operation_context,
         inbox_key,
     )
@@ -3495,11 +3717,12 @@ async fn process_workflow_trigger<H>(
     instance_id: &str,
     trigger: WorkflowTrigger,
     trigger_seq: u64,
+    admitted_at_millis: Option<u64>,
     operation_context: Option<OperationContext>,
     inbox_key: Key,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let span = tracing::info_span!("terracedb.workflow.step");
     apply_workflow_span_attributes(&span, &runtime.db, &runtime.name, Some(instance_id));
@@ -3539,11 +3762,15 @@ where
         let current_state = tx
             .read(runtime.tables.state_table(), instance_key(instance_id))
             .await?;
-        let ctx =
-            WorkflowContext::new(&runtime.name, instance_id, &trigger, current_state.as_ref())?;
+        let task = WorkflowRuntimeTask {
+            workflow_name: runtime.name.clone(),
+            instance_id: instance_id.to_string(),
+            trigger_seq,
+            admitted_at_millis,
+        };
         let output = runtime
             .handler
-            .handle(instance_id, current_state, &trigger, &ctx)
+            .handle_runtime_task(&task, current_state, &trigger)
             .await
             .map_err(|source| WorkflowError::Handler {
                 name: runtime.name.clone(),
@@ -3629,7 +3856,7 @@ async fn stage_trigger_admission<H>(
     operation_context: Option<OperationContext>,
 ) -> Result<u64, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     if instance_id.is_empty() {
         return Err(WorkflowError::EmptyInstanceId);
@@ -3642,6 +3869,7 @@ where
         )
         .await?;
     let trigger_sequence = decode_trigger_order(current.as_ref())? + 1;
+    let admitted_at_millis = runtime.clock.now().get();
 
     tx.write(
         runtime.tables.trigger_order_table(),
@@ -3657,6 +3885,7 @@ where
                 trigger_seq: trigger_sequence,
                 trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
                 operation_context: operation_context.clone(),
+                admitted_at_millis: Some(admitted_at_millis),
             },
             "workflow inbox trigger",
         )?),
@@ -3669,6 +3898,7 @@ where
             trigger_seq: trigger_sequence,
             trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
             operation_context,
+            admitted_at_millis: Some(admitted_at_millis),
         },
     )
     .await?;
@@ -3723,7 +3953,7 @@ async fn restore_checkpoint_on_open<H>(
     checkpoint_restore_on_open: WorkflowCheckpointRestoreOnOpen,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     if checkpoint_restore_on_open == WorkflowCheckpointRestoreOnOpen::Disabled {
         return Ok(());
@@ -3745,7 +3975,7 @@ async fn restore_checkpoint_selection<H>(
     selection: WorkflowCheckpointRestoreOnOpen,
 ) -> Result<Option<WorkflowCheckpointManifest>, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let manifest = match selection {
         WorkflowCheckpointRestoreOnOpen::Disabled => return Ok(None),
@@ -3772,7 +4002,7 @@ async fn capture_workflow_checkpoint<H>(
     checkpoint_id: WorkflowCheckpointId,
 ) -> Result<WorkflowCheckpointManifest, WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     let durable_sequence = runtime.db.current_durable_sequence();
     let captured_at = runtime.clock.now();
@@ -3887,7 +4117,7 @@ async fn restore_checkpoint_manifest<H>(
     manifest: WorkflowCheckpointManifest,
 ) -> Result<(), WorkflowError>
 where
-    H: WorkflowHandler + 'static,
+    H: WorkflowRuntimeHandler + 'static,
 {
     if manifest.workflow_name != runtime.name {
         return Err(StorageError::corruption(format!(
@@ -4512,7 +4742,190 @@ fn decode_admitted_trigger(
         trigger_seq: stored.trigger_seq,
         trigger: stored.trigger.into_runtime_trigger(db)?,
         operation_context: stored.operation_context,
+        admitted_at_millis: stored.admitted_at_millis,
     })
+}
+
+fn build_contract_transition_input(
+    task: &WorkflowRuntimeTask,
+    bundle: &contracts::WorkflowBundleMetadata,
+    state: Option<&Value>,
+    trigger: &WorkflowTrigger,
+) -> Result<contracts::WorkflowTransitionInput, contracts::WorkflowTaskError> {
+    if task.workflow_name != bundle.workflow_name {
+        return Err(contracts::WorkflowTaskError::invalid_contract(format!(
+            "workflow runtime name {} does not match bundle workflow {}",
+            task.workflow_name, bundle.workflow_name
+        )));
+    }
+
+    Ok(contracts::WorkflowTransitionInput {
+        run_id: contracts::WorkflowRunId::new(format!(
+            "run:{}:{}",
+            task.workflow_name, task.instance_id
+        ))?,
+        bundle_id: bundle.bundle_id.clone(),
+        task_id: contracts::WorkflowTaskId::new(format!(
+            "task:{}:{:020}",
+            task.instance_id, task.trigger_seq
+        ))?,
+        workflow_name: task.workflow_name.clone(),
+        instance_id: task.instance_id.clone(),
+        lifecycle: contracts::WorkflowLifecycleState::Running,
+        history_len: task.trigger_seq.saturating_sub(1),
+        attempt: 1,
+        admitted_at_millis: task.admitted_at_millis.ok_or_else(|| {
+            contracts::WorkflowTaskError::invalid_contract(
+                "pending workflow admission is missing admitted_at_millis; drain legacy inbox rows before enabling the contract runtime adapter",
+            )
+        })?,
+        state: state.map(runtime_value_to_contract_payload).transpose()?,
+        trigger: runtime_trigger_to_contract_trigger(trigger)?,
+    })
+}
+
+fn change_entry_to_contract_event(
+    entry: &ChangeEntry,
+) -> Result<contracts::WorkflowSourceEvent, contracts::WorkflowTaskError> {
+    Ok(contracts::WorkflowSourceEvent {
+        source_table: entry.table.name().to_string(),
+        key: entry.key.clone(),
+        value: entry
+            .value
+            .as_ref()
+            .map(runtime_value_to_contract_payload)
+            .transpose()?,
+        cursor: entry.cursor.encode(),
+        sequence: entry.sequence.get(),
+        kind: runtime_change_kind_to_contract_kind(entry.kind),
+        operation_context: entry.operation_context.clone(),
+    })
+}
+
+fn runtime_trigger_to_contract_trigger(
+    trigger: &WorkflowTrigger,
+) -> Result<contracts::WorkflowTrigger, contracts::WorkflowTaskError> {
+    match trigger {
+        WorkflowTrigger::Event(entry) => Ok(contracts::WorkflowTrigger::Event {
+            event: change_entry_to_contract_event(entry)?,
+        }),
+        WorkflowTrigger::Timer {
+            timer_id,
+            fire_at,
+            payload,
+        } => Ok(contracts::WorkflowTrigger::Timer {
+            timer_id: timer_id.clone(),
+            fire_at_millis: fire_at.get(),
+            payload: payload.clone(),
+        }),
+        WorkflowTrigger::Callback {
+            callback_id,
+            response,
+        } => Ok(contracts::WorkflowTrigger::Callback {
+            callback_id: callback_id.clone(),
+            response: response.clone(),
+        }),
+    }
+}
+
+fn contract_output_to_runtime_output(
+    output: contracts::WorkflowTransitionOutput,
+) -> Result<WorkflowOutput, contracts::WorkflowTaskError> {
+    if output.lifecycle.is_some() {
+        return Err(contracts::WorkflowTaskError::new(
+            "unsupported-contract",
+            "workflow lifecycle transitions are not yet supported by this runtime adapter",
+        ));
+    }
+    if output.visibility.is_some() {
+        return Err(contracts::WorkflowTaskError::new(
+            "unsupported-contract",
+            "workflow visibility updates are not yet supported by this runtime adapter",
+        ));
+    }
+    if output.continue_as_new.is_some() {
+        return Err(contracts::WorkflowTaskError::new(
+            "unsupported-contract",
+            "continue-as-new is not yet supported by this runtime adapter",
+        ));
+    }
+
+    let state = match output.state {
+        contracts::WorkflowStateMutation::Unchanged => WorkflowStateMutation::Unchanged,
+        contracts::WorkflowStateMutation::Put { state } => {
+            WorkflowStateMutation::Put(contract_payload_to_runtime_value(state)?)
+        }
+        contracts::WorkflowStateMutation::Delete => WorkflowStateMutation::Delete,
+    };
+
+    let mut outbox_entries = Vec::new();
+    let mut timers = Vec::new();
+    for command in output.commands {
+        match command {
+            contracts::WorkflowCommand::Outbox { entry } => {
+                outbox_entries.push(OutboxEntry {
+                    outbox_id: entry.outbox_id,
+                    idempotency_key: entry.idempotency_key,
+                    payload: entry.payload,
+                });
+            }
+            contracts::WorkflowCommand::Timer { command } => match command {
+                contracts::WorkflowTimerCommand::Schedule {
+                    timer_id,
+                    fire_at_millis,
+                    payload,
+                } => timers.push(WorkflowTimerCommand::Schedule {
+                    timer_id,
+                    fire_at: Timestamp::new(fire_at_millis),
+                    payload,
+                }),
+                contracts::WorkflowTimerCommand::Cancel { timer_id } => {
+                    timers.push(WorkflowTimerCommand::Cancel { timer_id })
+                }
+            },
+        }
+    }
+
+    Ok(WorkflowOutput {
+        state,
+        outbox_entries,
+        timers,
+    })
+}
+
+fn runtime_value_to_contract_payload(
+    value: &Value,
+) -> Result<contracts::WorkflowPayload, contracts::WorkflowTaskError> {
+    match value {
+        Value::Bytes(bytes) => Ok(contracts::WorkflowPayload::bytes(bytes.clone())),
+        Value::Record(_) => serde_json::to_vec(value)
+            .map(|bytes| {
+                contracts::WorkflowPayload::with_encoding(
+                    WORKFLOW_CONTRACT_VALUE_JSON_ENCODING,
+                    bytes,
+                )
+            })
+            .map_err(|error| contracts::WorkflowTaskError::serialization("workflow state", error)),
+    }
+}
+
+fn contract_payload_to_runtime_value(
+    payload: contracts::WorkflowPayload,
+) -> Result<Value, contracts::WorkflowTaskError> {
+    match payload.encoding.as_str() {
+        "application/octet-stream" => Ok(Value::bytes(payload.bytes)),
+        WORKFLOW_CONTRACT_VALUE_JSON_ENCODING => serde_json::from_slice(&payload.bytes)
+            .map_err(|error| contracts::WorkflowTaskError::serialization("workflow state", error)),
+        _ => Ok(Value::bytes(payload.bytes)),
+    }
+}
+
+fn runtime_change_kind_to_contract_kind(kind: ChangeKind) -> contracts::WorkflowChangeKind {
+    match kind {
+        ChangeKind::Put => contracts::WorkflowChangeKind::Put,
+        ChangeKind::Delete => contracts::WorkflowChangeKind::Delete,
+        ChangeKind::Merge => contracts::WorkflowChangeKind::Merge,
+    }
 }
 
 fn encode_trigger_context(trigger: &WorkflowTrigger) -> Result<Vec<u8>, WorkflowError> {
@@ -4626,6 +5039,7 @@ struct AdmittedWorkflowTrigger {
     trigger_seq: u64,
     trigger: WorkflowTrigger,
     operation_context: Option<OperationContext>,
+    admitted_at_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4634,6 +5048,8 @@ struct StoredAdmittedWorkflowTrigger {
     trigger_seq: u64,
     trigger: StoredWorkflowTrigger,
     operation_context: Option<OperationContext>,
+    #[serde(default)]
+    admitted_at_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
