@@ -61,13 +61,8 @@ proptest! {
             ("alpha".to_string(), SequenceNumber::default()),
             ("beta".to_string(), SequenceNumber::default()),
         ])));
-        let mut subscriptions = WatermarkSubscriptionSet::new(
-            &registry,
-            vec![
-                ("beta".to_string(), registry.subscribe("beta")),
-                ("alpha".to_string(), registry.subscribe("alpha")),
-            ],
-        );
+        let mut subscriptions =
+            WatermarkSubscriptionSet::new(&registry, vec!["beta".to_string(), "alpha".to_string()]);
 
         let mut expected = BTreeMap::from([
             ("alpha".to_string(), SequenceNumber::default()),
@@ -75,7 +70,7 @@ proptest! {
         ]);
         let mut emitted = expected.clone();
 
-        prop_assert!(subscriptions.drain_pending().is_empty());
+        prop_assert!(subscriptions.pending_updates().is_empty());
 
         for (table, raw_sequence) in updates {
             let sequence = SequenceNumber::new(raw_sequence);
@@ -88,7 +83,7 @@ proptest! {
                 *current = sequence;
             }
 
-            let drained = subscriptions.drain_pending();
+            let drained = subscriptions.pending_updates();
             let mut sorted = drained.clone();
             sorted.sort_by(|left, right| left.table.cmp(&right.table));
             prop_assert_eq!(drained.as_slice(), sorted.as_slice());

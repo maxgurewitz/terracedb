@@ -4386,7 +4386,7 @@ impl Db {
             registry,
             tables
                 .into_iter()
-                .map(|table| (table.name().to_string(), registry.subscribe(table.name())))
+                .map(|table| table.name().to_string())
                 .collect(),
         )
     }

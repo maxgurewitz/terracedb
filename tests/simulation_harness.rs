@@ -5299,3 +5299,65 @@ fn visible_subscription_simulation_catches_up_after_coalesced_wakes() -> turmoil
         Ok(())
     })
 }
+
+#[test]
+fn merged_visible_subscription_simulation_coalesces_latest_updates_per_table() -> turmoil::Result {
+    SeededSimulationRunner::new(0x1819).run_with(|context| async move {
+        let db = context
+            .open_db(simulation_db_config(
+                "/terracedb/sim/t18-merged-visible-subscription",
+                Arc::new(RandomSimulationScheduler::seeded(context.seed())),
+                1024 * 1024,
+            ))
+            .await?;
+        let users = db
+            .create_table(SimulationTableSpec::row("users").table_config())
+            .await?;
+        let orders = db
+            .create_table(SimulationTableSpec::row("orders").table_config())
+            .await?;
+
+        let mut merged = db.subscribe_visible_set([&users, &orders]);
+        assert!(merged.pending_updates().is_empty());
+
+        let users_first = users.write(b"user:1".to_vec(), Value::bytes("v1")).await?;
+        let orders_first = orders
+            .write(b"order:1".to_vec(), Value::bytes("v1"))
+            .await?;
+        assert_eq!(
+            merged.changed().await.expect("merged visible wake"),
+            vec![
+                terracedb::WatermarkUpdate {
+                    table: "orders".to_string(),
+                    sequence: orders_first,
+                },
+                terracedb::WatermarkUpdate {
+                    table: "users".to_string(),
+                    sequence: users_first,
+                },
+            ]
+        );
+
+        let orders_second = orders
+            .write(b"order:2".to_vec(), Value::bytes("v2"))
+            .await?;
+        let _users_second = users.write(b"user:2".to_vec(), Value::bytes("v2")).await?;
+        let users_third = users.write(b"user:3".to_vec(), Value::bytes("v3")).await?;
+        assert_eq!(
+            merged.changed().await.expect("merged coalesced wake"),
+            vec![
+                terracedb::WatermarkUpdate {
+                    table: "orders".to_string(),
+                    sequence: orders_second,
+                },
+                terracedb::WatermarkUpdate {
+                    table: "users".to_string(),
+                    sequence: users_third,
+                },
+            ]
+        );
+        assert!(merged.pending_updates().is_empty());
+
+        Ok(())
+    })
+}

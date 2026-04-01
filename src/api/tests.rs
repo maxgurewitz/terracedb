@@ -21,6 +21,7 @@ use super::{
 use crate::simulation::{
     CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
 };
+use crate::test_support::advance_clock_until_finished;
 use crate::{
     ChangeFeedError, ChangeKind, Clock, CommitError, CommitId, CommitOptions, CompactionStrategy,
     DbConfig, DbDependencies, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
@@ -757,27 +758,6 @@ impl Scheduler for TinyCompactionBudgetScheduler {
             | PendingWorkType::Prefetch => PendingWorkBudget::default(),
         }
     }
-}
-
-async fn advance_clock_until_task_finishes<T>(
-    clock: &StubClock,
-    handle: &tokio::task::JoinHandle<T>,
-    step: Duration,
-    max_steps: usize,
-) -> u64 {
-    let start = clock.now().get();
-    for _ in 0..max_steps {
-        if handle.is_finished() {
-            break;
-        }
-        clock.advance(step);
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        handle.is_finished(),
-        "task should finish after advancing the simulated clock"
-    );
-    clock.now().get().saturating_sub(start)
 }
 
 #[derive(Debug)]
@@ -2379,8 +2359,7 @@ async fn scheduler_receives_metadata_untouched_and_rate_limits_writes() {
     );
 
     let elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &write, Duration::from_secs(1), 180)
-            .await;
+        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_secs(1), 180).await;
     assert!(elapsed > 0);
     assert_eq!(
         write.await.expect("join write task"),
@@ -2477,8 +2456,7 @@ async fn forced_flush_guardrails_still_honor_domain_rate_limit_delay() {
     assert!(forced_snapshot.forced_flushes >= 1);
 
     let elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &write, Duration::from_millis(250), 32)
-            .await
+        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_millis(250), 32).await
             + 350;
     assert_eq!(
         write.await.expect("join write task"),
@@ -2596,8 +2574,7 @@ async fn default_scheduler_throttles_from_multi_signal_pressure_before_l0_backlo
     );
 
     let elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &write, Duration::from_millis(250), 12)
-            .await;
+        advance_clock_until_finished(clock.as_ref(), &write, Duration::from_millis(250), 12).await;
     assert!(elapsed > 0);
     assert_eq!(
         write.await.expect("join write task"),
@@ -2665,13 +2642,9 @@ async fn scheduler_observability_current_admission_clears_after_recovery_write()
             .await
             .expect("throttled write")
     });
-    let elapsed = advance_clock_until_task_finishes(
-        clock.as_ref(),
-        &throttled,
-        Duration::from_millis(250),
-        16,
-    )
-    .await;
+    let elapsed =
+        advance_clock_until_finished(clock.as_ref(), &throttled, Duration::from_millis(250), 16)
+            .await;
     assert!(elapsed > 0);
     assert_eq!(
         throttled.await.expect("join throttled write"),
@@ -2822,13 +2795,9 @@ async fn admission_observation_stream_reports_recovery_transition_in_order() {
             .await
             .expect("throttled write")
     });
-    let elapsed = advance_clock_until_task_finishes(
-        clock.as_ref(),
-        &throttled,
-        Duration::from_millis(250),
-        16,
-    )
-    .await;
+    let elapsed =
+        advance_clock_until_finished(clock.as_ref(), &throttled, Duration::from_millis(250), 16)
+            .await;
     assert!(elapsed > 0);
     assert_eq!(
         throttled.await.expect("join throttled write"),
@@ -3192,13 +3161,9 @@ async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
             .copied(),
         Some(1)
     );
-    let fast_elapsed = advance_clock_until_task_finishes(
-        clock.as_ref(),
-        &fast_only,
-        Duration::from_millis(250),
-        40,
-    )
-    .await;
+    let fast_elapsed =
+        advance_clock_until_finished(clock.as_ref(), &fast_only, Duration::from_millis(250), 40)
+            .await;
     assert_eq!(
         fast_only.await.expect("join fast-only commit"),
         SequenceNumber::new(1)
@@ -3246,8 +3211,7 @@ async fn multi_table_commit_waits_for_the_slowest_rate_limited_table() {
         "mixed commit should publish a live rate-limit diagnosis"
     );
     let mixed_elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &mixed, Duration::from_millis(250), 80)
-            .await;
+        advance_clock_until_finished(clock.as_ref(), &mixed, Duration::from_millis(250), 80).await;
     assert_eq!(
         mixed.await.expect("join mixed commit"),
         SequenceNumber::new(2)
@@ -3488,8 +3452,7 @@ async fn domain_mutable_memory_budget_forces_flush_before_storage_ceiling() {
             .expect("write second value")
     });
     let _elapsed =
-        advance_clock_until_task_finishes(clock.as_ref(), &second, Duration::from_millis(250), 24)
-            .await;
+        advance_clock_until_finished(clock.as_ref(), &second, Duration::from_millis(250), 24).await;
     assert_eq!(
         second.await.expect("join second write"),
         SequenceNumber::new(2)
@@ -12713,7 +12676,7 @@ async fn visible_and_durable_subscriptions_diverge_until_flush_in_deferred_mode(
     let mut durable = db.subscribe_durable(&table);
     let mut durable_set = db.subscribe_durable_set([&table]);
     assert_eq!(db.visible_subscriber_count(&table), 1);
-    assert_eq!(db.durable_subscriber_count(&table), 2);
+    assert_eq!(db.durable_subscriber_count(&table), 1);
 
     let committed = table
         .write(b"user:1".to_vec(), Value::bytes("v1"))
@@ -12767,7 +12730,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
         .expect("create orders table");
 
     let mut merged = db.subscribe_visible_set([&users, &orders]);
-    assert!(merged.drain_pending().is_empty());
+    assert!(merged.pending_updates().is_empty());
 
     let users_first = users
         .write(b"user:1".to_vec(), Value::bytes("v1"))
@@ -12778,7 +12741,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
         .await
         .expect("write orders row");
     assert_eq!(
-        merged.drain_pending(),
+        merged.pending_updates(),
         vec![
             WatermarkUpdate {
                 table: "orders".to_string(),
@@ -12790,7 +12753,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
             },
         ]
     );
-    assert!(merged.drain_pending().is_empty());
+    assert!(merged.pending_updates().is_empty());
 
     let orders_second = orders
         .write(b"order:2".to_vec(), Value::bytes("v2"))
@@ -12822,7 +12785,7 @@ async fn merged_subscription_sets_drain_pending_work_in_deterministic_table_orde
             },
         ]
     );
-    assert!(merged.drain_pending().is_empty());
+    assert!(merged.pending_updates().is_empty());
 }
 
 #[tokio::test]

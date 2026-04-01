@@ -36,7 +36,7 @@ simulation probes.
     domain/budget assertions.
   - [x] Columnar cache usage into published immutable state instead of lock-backed
     reconstruction.
-  - Watermark/progress reads where they are really transition notifications
+  - [x] Watermark/progress reads where they are really transition notifications
     rather than static summaries.
 - [ ] Replace retry loops and incidental `yield_now()` polling with direct
   observation helpers:
@@ -73,7 +73,7 @@ simulation probes.
 
 ## Highest-Value Follow-Ups
 
-- [ ] [src/api/watermark.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/watermark.rs):
-  decide whether any remaining watermark-facing test helpers want ordered event
-  semantics instead of latest-snapshot semantics now that `reserved_sequence`
-  is published.
+- [ ] [src/test_support.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/test_support.rs):
+  replace the remaining `yield_now()`-driven clock-stepping helpers with a more
+  explicit bounded progress-probe surface so liveness tests do not hide their
+  scheduling assumptions inside ad hoc executor yields.
