@@ -10,7 +10,7 @@ use crate::{
     JsForkPolicy, JsSubstrateError,
     compat::JsHostServices,
     entropy::JsEntropySource,
-    loader::{JsLoadedModule, JsModuleLoader},
+    loader::{JsLoadedModule, JsModuleLoader, JsResolvedModule},
     scheduler::{JsScheduledTask, JsScheduler, JsTaskQueue},
     time::JsClock,
     types::{
@@ -219,6 +219,7 @@ impl JsRuntime for DeterministicJsRuntime {
         let (entrypoint, root_source) = match request.kind {
             JsExecutionKind::Module { specifier } => {
                 let resolved = self.module_loader.resolve(&specifier, None).await?;
+                ensure_module_kind_allowed(&request.metadata, &self.handle.policy, &resolved)?;
                 let loaded = self.module_loader.load(&resolved).await?;
                 (resolved.canonical_specifier, loaded)
             }
@@ -327,15 +328,7 @@ impl DeterministicJsRuntime {
                     .module_loader
                     .resolve(&import, Some(&canonical))
                     .await?;
-                if matches!(resolved.kind, crate::JsModuleKind::HostCapability)
-                    && !policy.allow_host_modules
-                {
-                    return Err(JsSubstrateError::HostServiceDenied {
-                        service: resolved.canonical_specifier,
-                        operation: "import".to_string(),
-                        message: "host modules are disabled by policy".to_string(),
-                    });
-                }
+                ensure_module_kind_allowed(&BTreeMap::new(), policy, &resolved)?;
                 imports.push(self.module_loader.load(&resolved).await?);
             }
             imports.reverse();
@@ -458,4 +451,29 @@ fn extract_quoted_string(line: &str) -> Option<String> {
     let (_, tail) = line.split_once(quote)?;
     let (value, _) = tail.split_once(quote)?;
     Some(value.to_string())
+}
+
+pub(crate) fn ensure_module_kind_allowed(
+    _metadata: &BTreeMap<String, JsonValue>,
+    policy: &JsRuntimePolicy,
+    resolved: &JsResolvedModule,
+) -> Result<(), JsSubstrateError> {
+    if policy.allows_module_kind(resolved.kind) {
+        return Ok(());
+    }
+    Err(JsSubstrateError::ModulePolicyDenied {
+        specifier: resolved.canonical_specifier.clone(),
+        kind: resolved.kind,
+        message: match resolved.kind {
+            crate::JsModuleKind::Workspace => {
+                "workspace module loading is disabled by policy".to_string()
+            }
+            crate::JsModuleKind::HostCapability => {
+                "host capability modules are disabled by policy".to_string()
+            }
+            crate::JsModuleKind::Package => {
+                "package module loading is disabled by policy".to_string()
+            }
+        },
+    })
 }

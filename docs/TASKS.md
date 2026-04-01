@@ -2506,6 +2506,12 @@ Bring the Boa-based runtime core into the workspace and replace the first layer 
 - Deterministic simulation tests for runtime open/evaluate/import flows using the fake backend and fake VFS.
 - Tests proving ambient defaults such as stock cwd loading or process RNG are not reachable through the `terracedb-js` public surface.
 
+**Current backend split**
+
+- `DeterministicJsRuntimeHost` remains the default simulation/oracle backend when loaders or host seams may need real async progress.
+- `BoaJsRuntimeHost` is the real `boa_engine` execution backend and takes explicit Boa-owned scheduler, host-service, and module-loader seams.
+- `ImmediateBoaModuleLoader` is the bridging adapter from `JsModuleLoader` to the Boa loader boundary; it is only valid when the wrapped loader future completes without yielding.
+
 ---
 
 ### T40l. Implement simulation-native scheduling, time, entropy, and VFS-native module loading for `terracedb-js`

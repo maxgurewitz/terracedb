@@ -124,16 +124,25 @@ impl JsModuleLoader for VfsJsModuleLoader {
             }
             JsModuleKind::HostCapability => Ok(JsLoadedModule {
                 resolved: resolved.clone(),
-                source: format!(
-                    "// synthetic host capability module {}\nexport default null;",
-                    resolved.canonical_specifier
-                ),
+                source: host_capability_preview_source(&resolved.canonical_specifier),
                 trace: vec![JsTraceEvent {
                     phase: JsTracePhase::ModuleLoad,
                     label: resolved.canonical_specifier.clone(),
                     metadata: BTreeMap::from([("synthetic".to_string(), JsonValue::Bool(true))]),
                 }],
-                metadata: BTreeMap::from([("synthetic".to_string(), JsonValue::Bool(true))]),
+                metadata: BTreeMap::from([
+                    ("synthetic".to_string(), JsonValue::Bool(true)),
+                    (
+                        "host_service".to_string(),
+                        JsonValue::String("capability".to_string()),
+                    ),
+                    (
+                        "host_exports".to_string(),
+                        JsonValue::Array(vec![JsonValue::String(host_capability_operation_name(
+                            &resolved.canonical_specifier,
+                        ))]),
+                    ),
+                ]),
             }),
             JsModuleKind::Package => {
                 let source = self
@@ -199,4 +208,21 @@ fn normalize_path(path: &str) -> String {
     } else {
         format!("/{}", parts.join("/"))
     }
+}
+
+fn host_capability_preview_source(specifier: &str) -> String {
+    format!(
+        "// synthetic host capability module {}\nexport default null;",
+        specifier
+    )
+}
+
+fn host_capability_operation_name(specifier: &str) -> String {
+    specifier
+        .trim_start_matches("terrace:host/")
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("capability")
+        .to_string()
 }

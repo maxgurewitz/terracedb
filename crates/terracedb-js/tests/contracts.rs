@@ -10,11 +10,11 @@ use terracedb_git::{
     VfsGitRepositoryImage,
 };
 use terracedb_js::{
-    DeterministicJsEntropySource, DeterministicJsHostServices, DeterministicJsRuntimeHost,
-    DeterministicJsScheduler, DeterministicJsServiceOutcome, FixedJsClock, JsExecutionHooks,
-    JsExecutionRequest, JsForkPolicy, JsHostServices, JsModuleLoader, JsRuntimeHost,
-    JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, NeverCancel, NoopJsExecutionHooks,
-    VfsJsModuleLoader,
+    BoaJsRuntimeHost, DeterministicJsEntropySource, DeterministicJsHostServices,
+    DeterministicJsRuntimeHost, DeterministicJsScheduler, DeterministicJsServiceOutcome,
+    FixedJsClock, ImmediateBoaModuleLoader, JsExecutionHooks, JsExecutionRequest, JsForkPolicy,
+    JsHostServices, JsModuleLoader, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
+    JsRuntimeProvenance, JsSubstrateError, NeverCancel, NoopJsExecutionHooks, VfsJsModuleLoader,
 };
 use terracedb_vfs::{
     CreateOptions, InMemoryVfsStore, SnapshotOptions, VolumeConfig, VolumeId, VolumeStore,
@@ -52,6 +52,18 @@ async fn seeded_snapshot() -> Arc<dyn terracedb_vfs::VolumeSnapshot> {
     volume
         .fs()
         .write_file(
+            "/workspace/boa-helper.mjs",
+            b"export default {\"helper\":true,\"message\":\"from helper\"};".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write boa helper module");
+    volume
+        .fs()
+        .write_file(
             "/workspace/main.mjs",
             br#"
 import "terrace:/workspace/helper.mjs";
@@ -67,6 +79,32 @@ export default {"status":"ok"};
         )
         .await
         .expect("write main module");
+    volume
+        .fs()
+        .write_file(
+            "/workspace/boa-main.mjs",
+            br#"
+import helper from "./boa-helper.mjs";
+import { echo } from "terrace:host/echo";
+
+const response = await echo({ "message": helper.message });
+export default {
+  "status": "ok",
+  "helper": helper.helper,
+  "echoed": response.echoed,
+  "now": Date.now(),
+  "console_type": typeof console,
+  "process_type": typeof process
+};
+"#
+            .to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write boa main module");
     volume
         .fs()
         .write_file(
@@ -377,4 +415,195 @@ async fn deterministic_smoke_executes_fake_runtime_and_repo_over_vfs() {
         .await
         .expect("create pr");
     assert!(pr.url.starts_with("https://example.invalid/pull/"));
+}
+
+#[tokio::test]
+async fn boa_runtime_executes_modules_and_capability_imports_over_frozen_interfaces() {
+    let snapshot = seeded_snapshot().await;
+    let loader = Arc::new(ImmediateBoaModuleLoader::new(Arc::new(
+        VfsJsModuleLoader::new(snapshot),
+    )));
+    let host_services = DeterministicJsHostServices::new();
+    host_services
+        .register_outcome(
+            "capability",
+            "echo",
+            DeterministicJsServiceOutcome::Response {
+                result: json!({"echoed":"from boa"}),
+                metadata: BTreeMap::from([("kind".to_string(), json!("capability"))]),
+            },
+        )
+        .await;
+    let runtime = BoaJsRuntimeHost::new(loader, Arc::new(host_services))
+        .with_scheduler(Arc::new(DeterministicJsScheduler::default()))
+        .with_clock(Arc::new(FixedJsClock::new(9_001)))
+        .with_entropy(Arc::new(DeterministicJsEntropySource::new(0xface)))
+        .open_runtime(JsRuntimeOpenRequest {
+            runtime_id: "boa-runtime-1".to_string(),
+            policy: JsRuntimePolicy {
+                visible_host_services: vec!["capability::echo".to_string()],
+                ..Default::default()
+            },
+            provenance: JsRuntimeProvenance {
+                backend: "boa-js".to_string(),
+                host_model: "host-owned".to_string(),
+                module_root: "/workspace".to_string(),
+                volume_id: Some(VolumeId::new(0x9000)),
+                snapshot_sequence: Some(1),
+                durable_snapshot: false,
+                fork_policy: JsForkPolicy::simulation_native_baseline(),
+            },
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("open boa runtime");
+    let report = runtime
+        .execute(
+            JsExecutionRequest::module("terrace:/workspace/boa-main.mjs"),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("execute boa runtime");
+
+    assert_eq!(
+        report.result,
+        Some(json!({
+            "status": "ok",
+            "helper": true,
+            "echoed": "from boa",
+            "now": 9_001,
+            "console_type": "undefined",
+            "process_type": "undefined"
+        }))
+    );
+    assert_eq!(
+        report.module_graph,
+        vec![
+            "terrace:/workspace/boa-main.mjs".to_string(),
+            "terrace:/workspace/boa-helper.mjs".to_string(),
+            "terrace:host/echo".to_string()
+        ]
+    );
+    assert_eq!(report.host_calls.len(), 1);
+    assert_eq!(
+        report.host_calls[0].arguments,
+        json!({"message":"from helper"})
+    );
+    assert!(
+        report
+            .scheduled_tasks
+            .iter()
+            .any(|task| matches!(task.queue, terracedb_js::JsTaskQueue::PromiseJobs))
+    );
+}
+
+#[tokio::test]
+async fn boa_runtime_replaces_ambient_rng_and_denies_package_modules_by_default() {
+    let snapshot = seeded_snapshot().await;
+    let run_eval = |seed| {
+        let snapshot = snapshot.clone();
+        async move {
+            let loader = Arc::new(ImmediateBoaModuleLoader::new(Arc::new(
+                VfsJsModuleLoader::with_package_modules(
+                    snapshot,
+                    BTreeMap::from([(
+                        "npm:test".to_string(),
+                        "export default {\"package\":true};".to_string(),
+                    )]),
+                ),
+            )));
+            let runtime =
+                BoaJsRuntimeHost::new(loader, Arc::new(DeterministicJsHostServices::new()))
+                    .with_scheduler(Arc::new(DeterministicJsScheduler::default()))
+                    .with_clock(Arc::new(FixedJsClock::new(2_468)))
+                    .with_entropy(Arc::new(DeterministicJsEntropySource::new(seed)))
+                    .open_runtime(JsRuntimeOpenRequest {
+                        runtime_id: format!("boa-runtime-seed-{seed}"),
+                        policy: JsRuntimePolicy::default(),
+                        provenance: JsRuntimeProvenance {
+                            backend: "boa-js".to_string(),
+                            host_model: "host-owned".to_string(),
+                            module_root: "/workspace".to_string(),
+                            volume_id: Some(VolumeId::new(0x9000)),
+                            snapshot_sequence: Some(1),
+                            durable_snapshot: false,
+                            fork_policy: JsForkPolicy::simulation_native_baseline(),
+                        },
+                        metadata: BTreeMap::new(),
+                    })
+                    .await
+                    .expect("open boa runtime");
+            runtime
+                .execute(
+                    JsExecutionRequest::eval(
+                        r#"
+export default {
+  "now": Date.now(),
+  "randoms": [Math.random(), Math.random()],
+  "console_type": typeof console,
+  "process_type": typeof process
+};
+"#,
+                    ),
+                    Arc::new(NeverCancel),
+                )
+                .await
+                .expect("execute boa eval")
+        }
+    };
+
+    let first = run_eval(0x9abc).await;
+    let second = run_eval(0x9abc).await;
+    assert_eq!(first.result, second.result);
+    assert_eq!(
+        first.result,
+        Some(json!({
+            "now": 2_468,
+            "randoms": first.result.as_ref().expect("result")["randoms"].clone(),
+            "console_type": "undefined",
+            "process_type": "undefined"
+        }))
+    );
+
+    let loader = Arc::new(ImmediateBoaModuleLoader::new(Arc::new(
+        VfsJsModuleLoader::with_package_modules(
+            seeded_snapshot().await,
+            BTreeMap::from([(
+                "npm:test".to_string(),
+                "export default {\"package\":true};".to_string(),
+            )]),
+        ),
+    )));
+    let runtime = BoaJsRuntimeHost::new(loader, Arc::new(DeterministicJsHostServices::new()))
+        .with_scheduler(Arc::new(DeterministicJsScheduler::default()))
+        .with_clock(Arc::new(FixedJsClock::new(2_468)))
+        .with_entropy(Arc::new(DeterministicJsEntropySource::new(0x9abc)))
+        .open_runtime(JsRuntimeOpenRequest {
+            runtime_id: "boa-runtime-package-denied".to_string(),
+            policy: JsRuntimePolicy::default(),
+            provenance: JsRuntimeProvenance {
+                backend: "boa-js".to_string(),
+                host_model: "host-owned".to_string(),
+                module_root: "/workspace".to_string(),
+                volume_id: Some(VolumeId::new(0x9000)),
+                snapshot_sequence: Some(1),
+                durable_snapshot: false,
+                fork_policy: JsForkPolicy::simulation_native_baseline(),
+            },
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("open boa runtime");
+    let denied = runtime
+        .execute(
+            JsExecutionRequest::eval("import pkg from 'npm:test'; export default pkg;"),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect_err("package modules should be denied until enabled");
+    assert!(matches!(
+        denied,
+        JsSubstrateError::EvaluationFailed { ref message, .. }
+            if message.contains("package module loading is disabled by policy")
+    ));
 }
