@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
+use rstest::rstest;
 use terracedb::{
     CacheSpan, Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
     CommitOptions, CompactionStrategy, ContentionClass, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db,
@@ -4937,9 +4938,14 @@ fn simulation_db_progress_subscription_tracks_visible_then_durable_frontiers() -
         })
 }
 
-#[test]
-fn pressure_whole_system_simulation_fuzz_seed_0x7601_replays() -> turmoil::Result {
-    let replay = assert_seed_replays(&PressureWholeSystemFuzzHarness, 0x7601)?;
+#[rstest]
+#[case(0x7601_u64)]
+#[case(0x7602_u64)]
+#[case(0x7603_u64)]
+fn pressure_whole_system_simulation_fuzz_seed_replays_and_matches_expected_outcomes(
+    #[case] seed: u64,
+) -> turmoil::Result {
+    let replay = assert_seed_replays(&PressureWholeSystemFuzzHarness, seed)?;
     assert_pressure_whole_system_fuzz_outcome(&replay.scenario, &replay.outcome);
     Ok(())
 }
@@ -4957,25 +4963,6 @@ fn pressure_whole_system_simulation_fuzz_seed_variation_changes_shape() -> turmo
                     != right.outcome.analytics_budget_after_reopen
         },
     )?;
-    Ok(())
-}
-
-#[test]
-fn pressure_whole_system_simulation_fuzz_seed_campaign_is_reproducible() -> turmoil::Result {
-    let campaign = SeedCampaign::new([0x7601_u64, 0x7602, 0x7603]);
-    let first_pass = run_campaign(&PressureWholeSystemFuzzHarness, &campaign)?
-        .into_iter()
-        .map(|capture| {
-            assert_pressure_whole_system_fuzz_outcome(&capture.scenario, &capture.outcome);
-            (capture.seed, capture.outcome)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let second_pass = run_campaign(&PressureWholeSystemFuzzHarness, &campaign)?
-        .into_iter()
-        .map(|capture| (capture.seed, capture.outcome))
-        .collect::<BTreeMap<_, _>>();
-
-    assert_eq!(first_pass, second_pass);
     Ok(())
 }
 

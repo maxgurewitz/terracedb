@@ -6,6 +6,14 @@ use terracedb_vfs::VfsError;
 pub enum GitSubstrateError {
     #[error("git repository was not found at or above {path}")]
     RepositoryNotFound { path: String },
+    #[error(
+        "git repository image descriptor mismatch for {field}: expected {expected}, found {found}"
+    )]
+    RepositoryImageDescriptorMismatch {
+        field: &'static str,
+        expected: String,
+        found: String,
+    },
     #[error("git reference was not found: {reference}")]
     ReferenceNotFound { reference: String },
     #[error("git object was not found: {oid}")]

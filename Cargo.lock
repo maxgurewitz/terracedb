@@ -2570,9 +2570,13 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "terracedb",
+ "terracedb-fuzz",
+ "terracedb-simulation",
  "terracedb-vfs",
  "thiserror 2.0.18",
  "tokio",
+ "turmoil",
 ]
 
 [[package]]

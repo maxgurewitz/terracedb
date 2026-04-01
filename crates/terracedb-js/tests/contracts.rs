@@ -5,7 +5,7 @@ use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, Stub
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitDiscoverRequest,
     GitExportRequest, GitForkPolicy, GitHostBridge, GitImportRequest, GitOpenRequest,
-    GitPullRequestRequest, GitPushRequest, GitRepositoryImageDescriptor, GitRepositoryPolicy,
+    GitPullRequestRequest, GitPushRequest, GitRepositoryImage, GitRepositoryPolicy,
     GitRepositoryProvenance, GitRepositoryStore, NeverCancel as NeverCancelGit,
     VfsGitRepositoryImage,
 };
@@ -155,6 +155,7 @@ async fn public_substrate_contracts_are_instantiable() {
             .with_hooks(hooks),
     );
     let repo_image = Arc::new(VfsGitRepositoryImage::new(snapshot, "/repo"));
+    let repo_descriptor = GitRepositoryImage::descriptor(repo_image.as_ref());
     let repo_store: Arc<dyn GitRepositoryStore> =
         Arc::new(DeterministicGitRepositoryStore::default());
     let bridge: Arc<dyn GitHostBridge> = Arc::new(DeterministicGitHostBridge::default());
@@ -189,20 +190,15 @@ async fn public_substrate_contracts_are_instantiable() {
             repo_image,
             GitOpenRequest {
                 repository_id: "repo-1".to_string(),
-                repository_image: GitRepositoryImageDescriptor {
-                    root_path: "/repo".to_string(),
-                    volume_id: Some(VolumeId::new(0x9000)),
-                    snapshot_sequence: Some(1),
-                    durable_snapshot: false,
-                },
+                repository_image: repo_descriptor.clone(),
                 policy: GitRepositoryPolicy::default(),
                 provenance: GitRepositoryProvenance {
                     backend: "deterministic-git".to_string(),
-                    repo_root: "/repo".to_string(),
+                    repo_root: repo_descriptor.root_path.clone(),
                     imported_from_host: false,
-                    volume_id: Some(VolumeId::new(0x9000)),
-                    snapshot_sequence: Some(1),
-                    durable_snapshot: false,
+                    volume_id: repo_descriptor.volume_id,
+                    snapshot_sequence: repo_descriptor.snapshot_sequence,
+                    durable_snapshot: repo_descriptor.durable_snapshot,
                     fork_policy: GitForkPolicy::simulation_native_baseline(),
                 },
                 metadata: BTreeMap::new(),
@@ -295,29 +291,25 @@ async fn deterministic_smoke_executes_fake_runtime_and_repo_over_vfs() {
     assert_eq!(report.host_calls[0].result, Some(json!({"echoed":"hello"})));
 
     let repo_image = Arc::new(VfsGitRepositoryImage::new(snapshot, "/repo"));
+    let repo_descriptor = GitRepositoryImage::descriptor(repo_image.as_ref());
     let repo_store = DeterministicGitRepositoryStore::default();
     let repo = repo_store
         .open(
             repo_image,
             GitOpenRequest {
                 repository_id: "repo-2".to_string(),
-                repository_image: GitRepositoryImageDescriptor {
-                    root_path: "/repo".to_string(),
-                    volume_id: Some(VolumeId::new(0x9000)),
-                    snapshot_sequence: Some(1),
-                    durable_snapshot: false,
-                },
+                repository_image: repo_descriptor.clone(),
                 policy: GitRepositoryPolicy {
                     allow_host_bridge: true,
                     ..Default::default()
                 },
                 provenance: GitRepositoryProvenance {
                     backend: "deterministic-git".to_string(),
-                    repo_root: "/repo".to_string(),
+                    repo_root: repo_descriptor.root_path.clone(),
                     imported_from_host: false,
-                    volume_id: Some(VolumeId::new(0x9000)),
-                    snapshot_sequence: Some(1),
-                    durable_snapshot: false,
+                    volume_id: repo_descriptor.volume_id,
+                    snapshot_sequence: repo_descriptor.snapshot_sequence,
+                    durable_snapshot: repo_descriptor.durable_snapshot,
                     fork_policy: GitForkPolicy::simulation_native_baseline(),
                 },
                 metadata: BTreeMap::new(),
