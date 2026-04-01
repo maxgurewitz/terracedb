@@ -214,8 +214,8 @@ fn resource_policy_for_tables(tables: &[&str]) -> ResourcePolicy {
             .collect(),
         deny: vec![],
         tenant_scopes: vec!["tenant-a".to_string()],
-        row_scope_binding: Some("tenant_id".to_string()),
-        visibility_index: Some("visible_by_subject".to_string()),
+        row_scope_binding: Some(sample_row_scope_binding()),
+        visibility_index: Some(sample_visibility_index()),
         metadata: BTreeMap::new(),
     }
 }
