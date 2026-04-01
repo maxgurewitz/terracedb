@@ -215,6 +215,39 @@ pub struct ColumnarCacheUsageSnapshot {
     pub by_domain: BTreeMap<crate::ExecutionDomainPath, DomainColumnarCacheUsageSnapshot>,
 }
 
+#[derive(Debug)]
+pub struct ColumnarCacheUsageSubscription {
+    inner: watch::Receiver<Arc<ColumnarCacheUsageSnapshot>>,
+}
+
+impl ColumnarCacheUsageSubscription {
+    pub(super) fn new(inner: watch::Receiver<Arc<ColumnarCacheUsageSnapshot>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn current(&self) -> ColumnarCacheUsageSnapshot {
+        self.inner.borrow().as_ref().clone()
+    }
+
+    pub async fn changed(
+        &mut self,
+    ) -> Result<ColumnarCacheUsageSnapshot, crate::SubscriptionClosed> {
+        self.inner
+            .changed()
+            .await
+            .map_err(|_| crate::SubscriptionClosed)?;
+        Ok(self.current())
+    }
+}
+
+impl Clone for ColumnarCacheUsageSubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DomainColumnarCacheUsageSnapshot {
     pub raw_byte_entries: usize,
@@ -246,9 +279,27 @@ pub(super) struct ColumnarReadContext {
     pub(super) raw_byte_cache_budget_state: Mutex<RawByteCacheBudgetState>,
     pub(super) cache_domain_paths: BTreeMap<crate::ExecutionLane, crate::ExecutionDomainPath>,
     pub(super) cache_lane_budgets: BTreeMap<crate::ExecutionLane, ColumnarCacheLaneBudget>,
+    latest_usage_snapshot: ArcSwap<ColumnarCacheUsageSnapshot>,
+    published_usage_snapshot: watch::Sender<Arc<ColumnarCacheUsageSnapshot>>,
     pub(super) skip_indexes_enabled: bool,
     pub(super) projection_sidecars_enabled: bool,
     #[allow(dead_code)]
+    pub(super) aggressive_background_repair: bool,
+}
+
+pub(super) struct ColumnarReadContextInit {
+    pub(super) dependencies: DbDependencies,
+    pub(super) remote_cache: Option<Arc<RemoteCache>>,
+    pub(super) decoded_cache: DecodedColumnarCache,
+    pub(super) raw_byte_cache_enabled: bool,
+    pub(super) raw_byte_cache_population_enabled: bool,
+    pub(super) decoded_cache_enabled: bool,
+    pub(super) raw_byte_cache_budget_bytes: u64,
+    pub(super) raw_byte_cache_budget_state: RawByteCacheBudgetState,
+    pub(super) cache_domain_paths: BTreeMap<crate::ExecutionLane, crate::ExecutionDomainPath>,
+    pub(super) cache_lane_budgets: BTreeMap<crate::ExecutionLane, ColumnarCacheLaneBudget>,
+    pub(super) skip_indexes_enabled: bool,
+    pub(super) projection_sidecars_enabled: bool,
     pub(super) aggressive_background_repair: bool,
 }
 
@@ -269,6 +320,97 @@ pub(super) struct DecodedColumnarCache {
     pub(super) column_owners: RwLock<BTreeMap<ColumnarColumnCacheKey, crate::ExecutionLane>>,
     pub(super) metadata_order: Mutex<VecDeque<ColumnarSstableIdentity>>,
     pub(super) column_order: Mutex<VecDeque<ColumnarColumnCacheKey>>,
+}
+
+impl ColumnarReadContext {
+    pub(super) fn new(init: ColumnarReadContextInit) -> Self {
+        let raw_byte_cache_budget_state = Mutex::new(init.raw_byte_cache_budget_state);
+        let initial_usage_snapshot = Self::build_usage_snapshot(
+            init.raw_byte_cache_budget_bytes,
+            &raw_byte_cache_budget_state,
+            &init.decoded_cache,
+            &init.cache_domain_paths,
+            &init.cache_lane_budgets,
+        );
+        let (published_usage_snapshot, _receiver) =
+            watch::channel(Arc::new(initial_usage_snapshot.clone()));
+        Self {
+            dependencies: init.dependencies,
+            remote_cache: init.remote_cache,
+            decoded_cache: init.decoded_cache,
+            raw_byte_cache_enabled: AtomicBool::new(init.raw_byte_cache_enabled),
+            raw_byte_cache_population_enabled: AtomicBool::new(
+                init.raw_byte_cache_population_enabled,
+            ),
+            decoded_cache_enabled: AtomicBool::new(init.decoded_cache_enabled),
+            raw_byte_cache_budget_bytes: init.raw_byte_cache_budget_bytes,
+            raw_byte_cache_budget_state,
+            cache_domain_paths: init.cache_domain_paths,
+            cache_lane_budgets: init.cache_lane_budgets,
+            latest_usage_snapshot: ArcSwap::from_pointee(initial_usage_snapshot),
+            published_usage_snapshot,
+            skip_indexes_enabled: init.skip_indexes_enabled,
+            projection_sidecars_enabled: init.projection_sidecars_enabled,
+            aggressive_background_repair: init.aggressive_background_repair,
+        }
+    }
+
+    fn build_usage_snapshot(
+        raw_byte_budget_bytes: u64,
+        raw_byte_cache_budget_state: &Mutex<RawByteCacheBudgetState>,
+        decoded_cache: &DecodedColumnarCache,
+        cache_domain_paths: &BTreeMap<crate::ExecutionLane, crate::ExecutionDomainPath>,
+        cache_lane_budgets: &BTreeMap<crate::ExecutionLane, ColumnarCacheLaneBudget>,
+    ) -> ColumnarCacheUsageSnapshot {
+        let mut usage = decoded_cache.usage_snapshot(
+            raw_byte_budget_bytes,
+            cache_domain_paths,
+            cache_lane_budgets,
+        );
+        let state = raw_byte_cache_budget_state.lock();
+        usage.raw_byte_entries = state.lengths.len();
+        usage.raw_byte_bytes = state.total_bytes;
+        for (domain, domain_usage) in &mut usage.by_domain {
+            if let Some((lane, _)) = cache_domain_paths
+                .iter()
+                .find(|(_, mapped_domain)| *mapped_domain == domain)
+            {
+                domain_usage.raw_byte_entries = state
+                    .owners
+                    .values()
+                    .filter(|owner| **owner == *lane)
+                    .count();
+                domain_usage.raw_byte_bytes = state
+                    .owners
+                    .iter()
+                    .filter(|(_, owner)| **owner == *lane)
+                    .map(|(key, _)| state.lengths.get(key).copied().unwrap_or_default())
+                    .sum();
+            }
+        }
+        usage
+    }
+
+    pub(super) fn publish_usage_snapshot(&self) {
+        let snapshot = Self::build_usage_snapshot(
+            self.raw_byte_cache_budget_bytes,
+            &self.raw_byte_cache_budget_state,
+            &self.decoded_cache,
+            &self.cache_domain_paths,
+            &self.cache_lane_budgets,
+        );
+        let snapshot = Arc::new(snapshot);
+        self.latest_usage_snapshot.store(snapshot.clone());
+        self.published_usage_snapshot.send_replace(snapshot);
+    }
+
+    pub(super) fn usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
+        self.latest_usage_snapshot.load_full().as_ref().clone()
+    }
+
+    pub(super) fn subscribe_usage(&self) -> ColumnarCacheUsageSubscription {
+        ColumnarCacheUsageSubscription::new(self.published_usage_snapshot.subscribe())
+    }
 }
 
 #[derive(Default)]

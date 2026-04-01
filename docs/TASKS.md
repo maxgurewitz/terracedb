@@ -3533,6 +3533,12 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
 - Cross-feature chaos tests proving flush stalls, retry paths, and budget tightening still preserve deterministic recovery and liveness.
 - End-to-end invariant tests proving the subsystem changes performance behavior only, not logical DB outcomes.
 
+**Refactor slices**
+
+1. Slice the observability surfaces first so the whole-system harness can read published snapshots and ordered events without blocking the simulation runtime.
+2. Then migrate the remaining in-flight progress assertions to explicit subscriptions or progress probes.
+3. Only after those surfaces exist, add the capstone multi-tenant and failure campaigns that compose them.
+
 ---
 
 ### T76a. Publish simulation-safe scheduler observability snapshots and admission streams
@@ -3547,14 +3553,16 @@ Refactor scheduler/admission observability away from reader-side locking and int
 
 1. Replace lock-on-read scheduler observability assembly with published immutable snapshots that writers update whenever the underlying counters or per-domain diagnostics change.
 2. Add ordered admission observation streams so tests can assert transitions like `RateLimit -> Open` or "one aggregated event per write" directly, instead of inferring them from eventual shared-state samples.
-3. Delete polling/try-lock style scheduler snapshot helpers that only existed to avoid deadlocking the simulated runtime, and move simulation tests onto the published snapshot / stream APIs.
-4. Keep the synchronous operator-facing snapshot API as a thin clone of the published state so CLI/debugging callers still have a one-shot read surface.
+3. Make current-versus-historical admission state explicit, with the published snapshot carrying the live view and the last-non-open state preserved separately for debugging.
+4. Delete polling/try-lock style scheduler snapshot helpers that only existed to avoid deadlocking the simulated runtime, and move simulation tests onto the published snapshot / stream APIs.
+5. Keep the synchronous operator-facing snapshot API as a thin clone of the published state so CLI/debugging callers still have a one-shot read surface.
 
 **Verification**
 
 - Simulation regressions proving in-flight rate-limited writes are observable through the published snapshot subscription without blocking the runtime.
 - Simulation regressions proving admission streams emit ordered write-level transitions and do not duplicate per-table diagnostics for one logical write.
 - Unit tests proving the synchronous snapshot API returns the same data as the published stream state after representative observability updates.
+- Unit tests proving the historical last-non-open diagnostic survives recovery writes while the live state returns `Open`.
 
 ---
 
@@ -3572,12 +3580,19 @@ Finish the simulation-safety pass across introspection surfaces that may still b
 2. Convert the high-value surfaces to published immutable snapshots, subscriptions, or explicit poll/step interfaces, depending on whether tests need sampled state, ordered events, or deterministic progress control.
 3. Remove test-only retry loops that compensate for blocking inspection, and replace them with direct subscription- or progress-driven assertions.
 4. Extend the debugging guide with the preferred simulation-safe observation patterns so future work does not regress into blocking shared-state reads.
-5. Prioritize the next slices that are already identified by the current refactor:
-   - DB progress subscriptions that replace repeated `current_sequence()` / `current_durable_sequence()` sampling in async and simulation tests.
-   - Remaining resource-manager snapshot callsites that still poll synchronous state from async tests instead of using the published subscription path.
-   - Columnar cache usage observability, especially the public usage snapshot that still assembles live state from locks.
-   - Failpoint polling helpers that currently advance time by repeated `yield_now()` loops.
-   - Remote cache / prefetch progress events for range-cache and dedupe completion assertions.
+5. Prioritize the next slices that are already identified by the current refactor, in dependency order:
+   - DB progress subscriptions first, so async and simulation tests stop sampling `current_sequence()` / `current_durable_sequence()` directly when they need in-flight visibility.
+   - Remaining resource-manager snapshot callsites next, once the published subscription path is stable enough to replace in-flight polling.
+   - Columnar cache usage observability after that, because the public usage snapshot still assembles live state from locks and should become publish-on-change state.
+   - Failpoint polling helpers, once the event/probe surfaces exist to replace repeated `yield_now()` loops.
+   - Remote cache / prefetch progress events last, so range-cache and dedupe tests can wait on explicit completion instead of ad hoc sleeps.
+
+**Candidate refactor slices**
+
+1. Publish immutable progress snapshots for state that is read frequently but mutated by background work, such as DB progress and resource-manager pressure.
+2. Convert ordered transitions to event streams where the test needs the sequence of state changes, not just the latest state.
+3. Convert liveness and drain assertions to poll/step helpers where the test needs to prove the background system moved forward.
+4. Delete the old blocking reader-side helpers once each replacement slice has landed.
 
 **Verification**
 
@@ -3602,6 +3617,7 @@ Expose explicit progress probes for scheduler-driven background work so simulati
 3. Rewrite representative simulation tests to use the new probes instead of time-based heuristics.
 4. Keep the new probes clearly test/debug oriented so they do not become accidental correctness boundaries in production code.
 5. Treat `direct_backlog()` and similar lock-backed helper reads as candidates for this bucket when they are only needed to drive simulation progress or backlog assertions.
+6. Prefer a small explicit progress API over incidental `yield_now()` loops whenever the system can expose "made one step" or "fully idle" semantics safely.
 
 **Verification**
 

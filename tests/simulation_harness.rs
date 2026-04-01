@@ -3180,6 +3180,52 @@ fn simulation_resource_manager_subscription_tracks_backlog_transitions() -> turm
 }
 
 #[test]
+fn simulation_resource_manager_subscription_tracks_usage_acquire_and_release() -> turmoil::Result {
+    SeededSimulationRunner::new(0x8187)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16b-resource-manager-usage",
+                    Arc::new(RoundRobinScheduler::default()),
+                    1024 * 1024,
+                ))
+                .await?;
+            let foreground_path = db.execution_profile().foreground.domain.clone();
+            let mut updates = db.subscribe_resource_manager();
+
+            let lease = db.acquire_lane_usage(
+                ExecutionLane::UserForeground,
+                ExecutionResourceUsage {
+                    cpu_workers: 1,
+                    ..ExecutionResourceUsage::default()
+                },
+            );
+            assert!(lease.admitted());
+            let acquired = next_resource_manager_snapshot(&mut updates, |snapshot| {
+                snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1
+            })
+            .await;
+            assert_eq!(
+                acquired.domains[&foreground_path].usage.cpu_workers_in_use,
+                1
+            );
+
+            drop(lease);
+            let released = next_resource_manager_snapshot(&mut updates, |snapshot| {
+                snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0
+            })
+            .await;
+            assert_eq!(
+                released.domains[&foreground_path].usage.cpu_workers_in_use,
+                0
+            );
+
+            Ok(())
+        })
+}
+
+#[test]
 fn scheduler_observability_update_stream_tracks_admission_recovery_sequence() -> turmoil::Result {
     SeededSimulationRunner::new(0x8182)
         .with_simulation_duration(Duration::from_secs(10))

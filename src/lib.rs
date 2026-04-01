@@ -32,13 +32,13 @@ pub use adapters::{
 };
 pub use api::{
     BatchOperation, ChangeEntry, ChangeKind, ChangeStream, ColumnarCacheUsageSnapshot,
-    ColumnarRecord, ColumnarScanExecution, ColumnarScanPartExecution, CommitOptions, Db, DbBuilder,
-    DbComponents, DbProgressSnapshot, DbProgressSubscription, DbSettings,
-    DomainColumnarCacheUsageSnapshot, FieldDefinition, FieldType, FieldValue, FlushStatus, Key,
-    KeyPrefix, KvStream, NamedColumnarRecord, ReadSet, ReadSetEntry, RowScanExecution,
-    ScanExecution, ScanMaterializationSource, ScanOptions, ScanPredicate, SchemaDefinition,
-    Snapshot, Table, Value, WatermarkReceiver, WatermarkSubscriptionSet, WatermarkUpdate,
-    WriteBatch,
+    ColumnarCacheUsageSubscription, ColumnarRecord, ColumnarScanExecution,
+    ColumnarScanPartExecution, CommitOptions, Db, DbBuilder, DbComponents, DbProgressSnapshot,
+    DbProgressSubscription, DbSettings, DomainColumnarCacheUsageSnapshot, FieldDefinition,
+    FieldType, FieldValue, FlushStatus, Key, KeyPrefix, KvStream, NamedColumnarRecord, ReadSet,
+    ReadSetEntry, RowScanExecution, ScanExecution, ScanMaterializationSource, ScanOptions,
+    ScanPredicate, SchemaDefinition, Snapshot, Table, Value, WatermarkReceiver,
+    WatermarkSubscriptionSet, WatermarkUpdate, WriteBatch,
 };
 pub use composition::{
     DueTimer, DueTimerBatch, DurableCursorStore, DurableOutboxConsumer, DurableTimerSet,

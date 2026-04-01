@@ -3,7 +3,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -31,6 +34,9 @@ use terracedb_vfs::{
     ActivityKind, ActivityOptions, CreateOptions, InMemoryVfsStore, ReadOnlyVfsFileSystem,
     VolumeConfig, VolumeId, VolumeStore,
 };
+use uuid::Uuid;
+
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn sandbox_store(
     now: u64,
@@ -832,7 +838,18 @@ fn seeded_cross_cutting_campaign_replays_shadow_state_and_tool_ordering() -> tur
 }
 
 fn deterministic_temp_dir(label: &str, seed: u64) -> PathBuf {
-    std::env::temp_dir().join(format!("terracedb-sandbox-{label}-{seed:x}"))
+    let unique = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    loop {
+        let temp_id = Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!(
+            "terracedb-sandbox-{label}-{seed:x}-{unique}-{temp_id}"
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create temp dir {path:?}: {error}"),
+        }
+    }
 }
 
 fn cleanup(path: &Path) {
@@ -848,6 +865,17 @@ fn write_host_file(path: &Path, contents: &str) {
 
 fn read_host_file(path: &Path) -> String {
     fs::read_to_string(path).expect("read host file")
+}
+
+#[test]
+fn deterministic_temp_dir_allocates_unique_paths() {
+    let first = deterministic_temp_dir("cross-cutting", 0x5301);
+    let second = deterministic_temp_dir("cross-cutting", 0x5301);
+    assert_ne!(first, second);
+    assert!(first.starts_with(std::env::temp_dir()));
+    assert!(second.starts_with(std::env::temp_dir()));
+    assert!(first.is_dir());
+    assert!(second.is_dir());
 }
 
 fn sanitized_git_command() -> Command {

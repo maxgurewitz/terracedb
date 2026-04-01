@@ -13,37 +13,6 @@ enum ColumnarOutputLayout {
 }
 
 impl ColumnarReadContext {
-    pub(super) fn cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
-        let mut usage = self.decoded_cache.usage_snapshot(
-            self.raw_byte_cache_budget_bytes,
-            &self.cache_domain_paths,
-            &self.cache_lane_budgets,
-        );
-        let state = self.raw_byte_cache_budget_state.lock();
-        usage.raw_byte_entries = state.lengths.len();
-        usage.raw_byte_bytes = state.total_bytes;
-        for (domain, domain_usage) in &mut usage.by_domain {
-            if let Some((lane, _)) = self
-                .cache_domain_paths
-                .iter()
-                .find(|(_, mapped_domain)| *mapped_domain == domain)
-            {
-                domain_usage.raw_byte_entries = state
-                    .owners
-                    .values()
-                    .filter(|owner| **owner == *lane)
-                    .count();
-                domain_usage.raw_byte_bytes = state
-                    .owners
-                    .iter()
-                    .filter(|(_, owner)| **owner == *lane)
-                    .map(|(key, _)| state.lengths.get(key).copied().unwrap_or_default())
-                    .sum();
-            }
-        }
-        usage
-    }
-
     pub(super) async fn trim_raw_byte_cache_to_budget(&self) -> Result<(), StorageError> {
         let Some(cache) = &self.remote_cache else {
             return Ok(());
@@ -56,6 +25,7 @@ impl ColumnarReadContext {
         for evicted in evictions {
             cache.remove_span(&evicted.object_key, evicted.span).await?;
         }
+        self.publish_usage_snapshot();
         Ok(())
     }
 
@@ -270,6 +240,7 @@ impl ColumnarReadContext {
         for evicted in evictions {
             cache.remove_span(&evicted.object_key, evicted.span).await?;
         }
+        self.publish_usage_snapshot();
         Ok(())
     }
 
@@ -421,6 +392,7 @@ impl ColumnarReadContext {
         if policy.populate_decoded_cache {
             self.decoded_cache
                 .insert_footer(identity, cached.clone(), self.cache_lane(access));
+            self.publish_usage_snapshot();
         }
         Ok(cached)
     }
@@ -472,6 +444,7 @@ impl ColumnarReadContext {
         if policy.populate_decoded_cache {
             self.decoded_cache
                 .insert_key_index(identity, values.clone(), self.cache_lane(access));
+            self.publish_usage_snapshot();
         }
         Ok(values)
     }
@@ -526,6 +499,7 @@ impl ColumnarReadContext {
                 values.clone(),
                 self.cache_lane(access),
             );
+            self.publish_usage_snapshot();
         }
         Ok(values)
     }
@@ -580,6 +554,7 @@ impl ColumnarReadContext {
                 values.clone(),
                 self.cache_lane(access),
             );
+            self.publish_usage_snapshot();
         }
         Ok(values)
     }
@@ -634,6 +609,7 @@ impl ColumnarReadContext {
                 values.clone(),
                 self.cache_lane(access),
             );
+            self.publish_usage_snapshot();
         }
         Ok(values)
     }
@@ -675,6 +651,7 @@ impl ColumnarReadContext {
         if policy.populate_decoded_cache {
             self.decoded_cache
                 .insert_column_block(key, values.clone(), self.cache_lane(access));
+            self.publish_usage_snapshot();
         }
         Ok(values)
     }

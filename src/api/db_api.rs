@@ -4433,7 +4433,11 @@ impl Db {
     }
 
     pub fn columnar_cache_usage_snapshot(&self) -> ColumnarCacheUsageSnapshot {
-        self.inner.columnar_read_context.cache_usage_snapshot()
+        self.inner.columnar_read_context.usage_snapshot()
+    }
+
+    pub fn subscribe_columnar_cache_usage(&self) -> ColumnarCacheUsageSubscription {
+        self.inner.columnar_read_context.subscribe_usage()
     }
 
     pub fn subscribe_scheduler_observability(&self) -> SchedulerObservabilitySubscription {
@@ -4480,6 +4484,7 @@ impl Db {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn clear_columnar_decoded_cache(&self) {
         self.inner.columnar_read_context.decoded_cache.clear();
+        self.inner.columnar_read_context.publish_usage_snapshot();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

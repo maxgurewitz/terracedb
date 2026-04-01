@@ -9,15 +9,15 @@ use serde_json::json;
 use super::{
     BACKUP_GC_METADATA_FORMAT_VERSION, BackupObjectBirthRecord, CATALOG_FORMAT_VERSION,
     COLUMNAR_SSTABLE_FORMAT_VERSION, COLUMNAR_SSTABLE_MAGIC, ColumnarCacheStatsSnapshot,
-    ColumnarReadAccessPattern, CommitPhase, CompactionJobKind, CompactionPhase, Db,
-    DurableRemoteCommitLogSegment, FlushPhase, KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH,
-    LOCAL_CATALOG_TEMP_SUFFIX, LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX,
-    LOCAL_SSTABLE_RELATIVE_DIR, LOCAL_SSTABLE_SHARD_DIR, MANIFEST_FORMAT_VERSION, ManifestId,
-    OffloadJobKind, OffloadPhase, PendingWorkSpec, PersistedManifestBody, PersistedManifestFile,
-    PersistedManifestSstable, PersistedRemoteManifestBody, PersistedRemoteManifestFile,
-    PersistedRowSstableFile, REMOTE_MANIFEST_FORMAT_VERSION, ResidentColumnarSstable,
-    SchemaDefinition, StorageSource, StoredTable, WatermarkUpdate, decode_mvcc_key,
-    encode_mvcc_key, read_path,
+    ColumnarCacheUsageSnapshot, ColumnarCacheUsageSubscription, ColumnarReadAccessPattern,
+    CommitPhase, CompactionJobKind, CompactionPhase, Db, DurableRemoteCommitLogSegment, FlushPhase,
+    KeyMatcher, LOCAL_CATALOG_RELATIVE_PATH, LOCAL_CATALOG_TEMP_SUFFIX,
+    LOCAL_COMMIT_LOG_RELATIVE_DIR, LOCAL_MANIFEST_TEMP_SUFFIX, LOCAL_SSTABLE_RELATIVE_DIR,
+    LOCAL_SSTABLE_SHARD_DIR, MANIFEST_FORMAT_VERSION, ManifestId, OffloadJobKind, OffloadPhase,
+    PendingWorkSpec, PersistedManifestBody, PersistedManifestFile, PersistedManifestSstable,
+    PersistedRemoteManifestBody, PersistedRemoteManifestFile, PersistedRowSstableFile,
+    REMOTE_MANIFEST_FORMAT_VERSION, ResidentColumnarSstable, SchemaDefinition, StorageSource,
+    StoredTable, WatermarkUpdate, decode_mvcc_key, encode_mvcc_key, read_path,
 };
 use crate::simulation::{
     CutPoint, PointMutation, SeededSimulationRunner, ShadowOracle, TraceEvent,
@@ -261,6 +261,25 @@ impl RecordingObjectStore {
 
     fn range_calls(&self) -> Vec<(String, u64, u64)> {
         self.range_calls.lock().clone()
+    }
+}
+
+async fn await_columnar_cache_usage_snapshot<F>(
+    subscription: &mut ColumnarCacheUsageSubscription,
+    predicate: F,
+) -> ColumnarCacheUsageSnapshot
+where
+    F: Fn(&ColumnarCacheUsageSnapshot) -> bool,
+{
+    loop {
+        let snapshot = subscription.current();
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        subscription
+            .changed()
+            .await
+            .expect("columnar cache usage update");
     }
 }
 
@@ -7333,7 +7352,7 @@ async fn columnar_cache_usage_snapshot_respects_configured_bounds() {
             .is_some()
     );
 
-    let usage = reopened.columnar_cache_usage_snapshot();
+    let usage = reopened.subscribe_columnar_cache_usage().current();
     assert_eq!(usage.raw_byte_budget_bytes, 256);
     assert!(usage.raw_byte_entries > 0);
     assert!(usage.raw_byte_bytes <= usage.raw_byte_budget_bytes);
@@ -7381,7 +7400,7 @@ async fn columnar_cache_usage_surfaces_domain_budget_partitions() {
         .with_execution_profile(profile.clone());
     let db = Db::open(config, dependencies).await.expect("open db");
 
-    let usage = db.columnar_cache_usage_snapshot();
+    let usage = db.subscribe_columnar_cache_usage().current();
     assert_eq!(usage.raw_byte_budget_bytes, 352);
     assert_eq!(
         usage.by_domain[&profile.foreground.domain].raw_byte_budget_bytes,
@@ -7475,7 +7494,7 @@ async fn columnar_background_compaction_uses_background_cache_partition() {
     db.clear_columnar_decoded_cache();
     assert!(db.run_next_compaction().await.expect("run compaction"));
 
-    let usage = db.columnar_cache_usage_snapshot();
+    let usage = db.subscribe_columnar_cache_usage().current();
     let foreground = usage.by_domain[&profile.foreground.domain];
     let background = usage.by_domain[&profile.background.domain];
     assert_eq!(foreground.decoded_metadata_entries, 0);
@@ -7484,6 +7503,71 @@ async fn columnar_background_compaction_uses_background_cache_partition() {
         background.decoded_metadata_entries <= background.decoded_metadata_entry_limit,
         "background maintenance reads should stay inside their own decoded-cache partition"
     );
+}
+
+#[tokio::test]
+async fn columnar_cache_usage_subscription_matches_snapshot_after_cache_population() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let inner_store = Arc::new(StubObjectStore::default());
+    let recording_store = Arc::new(RecordingObjectStore::new(inner_store));
+    let dependencies = DbDependencies::new(
+        file_system,
+        recording_store,
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(17)),
+    );
+    let mut config = s3_primary_config("columnar-cache-usage-subscription");
+    config.hybrid_read.raw_segment_cache_bytes = 256;
+    config.hybrid_read.decoded_metadata_cache_entries = 2;
+    config.hybrid_read.decoded_column_cache_entries = 2;
+
+    let db = Db::open(config.clone(), dependencies.clone())
+        .await
+        .expect("open db");
+    let table_config = columnar_table_config("metrics");
+    let schema = table_config.schema.clone().expect("columnar schema");
+    let table = db
+        .create_table(table_config)
+        .await
+        .expect("create columnar table");
+
+    table
+        .write(
+            b"user:1".to_vec(),
+            Value::named_record(
+                &schema,
+                vec![
+                    ("user_id", FieldValue::String("alice".to_string())),
+                    ("count", FieldValue::Int64(3)),
+                ],
+            )
+            .expect("encode columnar row"),
+        )
+        .await
+        .expect("write row");
+    db.flush().await.expect("flush row");
+
+    let reopened = Db::open(config, dependencies).await.expect("reopen db");
+    let reopened_table = reopened.table("metrics");
+    reopened.clear_columnar_decoded_cache();
+    reopened.reset_columnar_cache_stats();
+
+    let mut updates = reopened.subscribe_columnar_cache_usage();
+    let initial = updates.current();
+    assert_eq!(initial, reopened.columnar_cache_usage_snapshot());
+
+    assert!(
+        reopened_table
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read row")
+            .is_some()
+    );
+
+    let published =
+        await_columnar_cache_usage_snapshot(&mut updates, |snapshot| snapshot != &initial).await;
+    assert_eq!(published, reopened.columnar_cache_usage_snapshot());
+    assert!(published.decoded_metadata_entries > 0 || published.raw_byte_entries > 0);
 }
 
 #[tokio::test]

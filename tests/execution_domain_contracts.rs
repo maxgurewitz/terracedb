@@ -2561,6 +2561,7 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         .execution_lane_binding(ExecutionLane::UserBackground)
         .domain
         .clone();
+    let mut updates = db.subscribe_resource_manager();
     assert_eq!(db.tag_user_background_work(()).tag.domain, background_path);
     assert_eq!(
         db.tag_work(
@@ -2595,21 +2596,31 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         },
         |decision| decision.admitted
     ));
-    let observed_during_scoped_usage = db.with_lane_usage(
+    let lease = db.acquire_lane_usage(
         ExecutionLane::UserForeground,
         ExecutionResourceUsage {
             cpu_workers: 1,
             ..ExecutionResourceUsage::default()
         },
-        |_| {
-            db.resource_manager_snapshot().domains[&foreground_path]
-                .usage
-                .cpu_workers_in_use
-        },
     );
-    assert_eq!(observed_during_scoped_usage, 1);
+    assert!(lease.admitted());
+    let observed_during_scoped_usage = await_resource_manager_snapshot(&mut updates, |snapshot| {
+        snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1
+    })
+    .await;
     assert_eq!(
-        db.resource_manager_snapshot().domains[&foreground_path]
+        observed_during_scoped_usage.domains[&foreground_path]
+            .usage
+            .cpu_workers_in_use,
+        1
+    );
+    drop(lease);
+    let released_usage = await_resource_manager_snapshot(&mut updates, |snapshot| {
+        snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0
+    })
+    .await;
+    assert_eq!(
+        released_usage.domains[&foreground_path]
             .usage
             .cpu_workers_in_use,
         0
@@ -2626,7 +2637,7 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
         .await
     );
     assert_eq!(
-        db.resource_manager_snapshot().domains[&foreground_path]
+        updates.current().domains[&foreground_path]
             .usage
             .cpu_workers_in_use,
         0
@@ -2641,17 +2652,21 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
             },
         );
         assert!(lease.admitted());
+        let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
+            snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 1
+        })
+        .await;
         assert_eq!(
-            db.resource_manager_snapshot().domains[&foreground_path]
-                .usage
-                .cpu_workers_in_use,
+            snapshot.domains[&foreground_path].usage.cpu_workers_in_use,
             1
         );
     }
+    let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
+        snapshot.domains[&foreground_path].usage.cpu_workers_in_use == 0
+    })
+    .await;
     assert_eq!(
-        db.resource_manager_snapshot().domains[&foreground_path]
-            .usage
-            .cpu_workers_in_use,
+        snapshot.domains[&foreground_path].usage.cpu_workers_in_use,
         0
     );
 
@@ -2663,14 +2678,22 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
                 queued_bytes: 64,
             },
         );
-        let snapshot = db.resource_manager_snapshot();
+        let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
+            snapshot.domains[&background_path].backlog.queued_work_items == 2
+                && snapshot.domains[&background_path].backlog.queued_bytes == 64
+        })
+        .await;
         assert_eq!(
             snapshot.domains[&background_path].backlog.queued_work_items,
             2
         );
         assert_eq!(snapshot.domains[&background_path].backlog.queued_bytes, 64);
     }
-    let snapshot = db.resource_manager_snapshot();
+    let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
+        snapshot.domains[&background_path].backlog.queued_work_items == 0
+            && snapshot.domains[&background_path].backlog.queued_bytes == 0
+    })
+    .await;
     assert_eq!(
         snapshot.domains[&background_path].backlog.queued_work_items,
         0
@@ -2682,7 +2705,7 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
             queued_work_items: 3,
             queued_bytes: 96,
         },
-        || db.resource_manager_snapshot().domains[&background_path].backlog,
+        || updates.current().domains[&background_path].backlog,
     );
     assert_eq!(queued.queued_work_items, 3);
     assert_eq!(queued.queued_bytes, 96);
@@ -2694,14 +2717,21 @@ async fn db_lane_helpers_offer_drop_safe_admission_and_backlog_paths() {
                 queued_bytes: 128,
             },
             || async {
-                db.resource_manager_snapshot().domains[&background_path]
-                    .backlog
-                    .queued_work_items
+                let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
+                    snapshot.domains[&background_path].backlog.queued_work_items == 4
+                        && snapshot.domains[&background_path].backlog.queued_bytes == 128
+                })
+                .await;
+                snapshot.domains[&background_path].backlog.queued_work_items
             },
         )
         .await;
     assert_eq!(queued_async, 4);
-    let snapshot = db.resource_manager_snapshot();
+    let snapshot = await_resource_manager_snapshot(&mut updates, |snapshot| {
+        snapshot.domains[&background_path].backlog.queued_work_items == 0
+            && snapshot.domains[&background_path].backlog.queued_bytes == 0
+    })
+    .await;
     assert_eq!(
         snapshot.domains[&background_path].backlog.queued_work_items,
         0

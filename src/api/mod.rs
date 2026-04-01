@@ -130,7 +130,9 @@ mod watermark;
 
 pub use self::builder::*;
 pub use self::db_api::FlushStatus;
-pub use self::internals::{ColumnarCacheUsageSnapshot, DomainColumnarCacheUsageSnapshot};
+pub use self::internals::{
+    ColumnarCacheUsageSnapshot, ColumnarCacheUsageSubscription, DomainColumnarCacheUsageSnapshot,
+};
 pub use self::operations::*;
 pub use self::schema::*;
 pub use self::snapshot::Snapshot;
