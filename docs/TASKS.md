@@ -64,6 +64,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 - **Phase 7** expands deterministic simulation to the full stack.
 - **Phase 8** adds an embedded virtual filesystem library on top of Terracedb.
 - **Phase 8a** adds an embedded sandbox runtime library, host-disk/git/PR interop, and local/remote read-only editor views on top of `terracedb-vfs`.
+- **Phase 8b** adds a forked `gitoxide`-derived `terracedb-git` library, VFS-native repository semantics, a narrow host bridge, simulation-first git hardening, and an updated sandbox-plus-git example.
 - **Phase 9** adds the `terracedb-bricks` blob / large-object library on top of Terracedb.
 - **Phase 10** adds an optional Arrow-ecosystem analytical export crate on top of Terracedb.
 - **Phase 11** hardens the hybrid OLTP/OLAP path with columnar-v2 layout contracts, selective-read execution, segmented remote caching, stronger publish/recovery semantics, and a small analytically shaped example app.
@@ -81,7 +82,7 @@ Those excluded areas are either marked as future extensions in the architecture 
 
 ## Parallel tracks
 
-Once Phase 0 is complete, the work naturally splits into twenty-three mostly independent tracks:
+Once Phase 0 is complete, the work naturally splits into twenty-four mostly independent tracks:
 
 - **Track A — local engine core:** T04 and T06 in parallel; T04a after T04; T05 after T04; T07 and T08 after T05 + T06; T09 after T07 + T08
 - **Track B — LSM hardening:** T10 → T11; then T12, T13, T14, and T16 can proceed; T15 follows T11 + T13
@@ -92,6 +93,7 @@ Once Phase 0 is complete, the work naturally splits into twenty-three mostly ind
 - **Track G — full-stack hardening:** T33b and T33c can begin once the relevant engine/runtime surfaces exist; T33 follows T33c; T33a and T33d follow T33
 - **Track H — embedded virtual filesystem library:** T34 first; T35 depends on T34; T36 depends on T35; T37 depends on T35 + T36 + T30/T31; T38 depends on T35 + T36 + T37 + T22/T23; T39 depends on T36 + T37 + T38; T40 depends on T33 + T37 + T38 + T39
 - **Track H2 — embedded sandbox runtime:** T40a first; T40b depends on T40a; T40c, T40d, and T40f can proceed once T40b and their library dependencies are ready; T40e depends on T40b + T40c; T40g depends on T40b + T40c + T40f; T40h depends on T33 + T40c + T40d + T40e + T40f + T40g; T40i depends on T40c + T40d + T40e + T40f + T40g + T40h
+- **Track H3 — VFS-native git library:** T40j first; T40k depends on T40j; T40l and T40m can proceed in parallel once T40k exists; T40n depends on T40f + T40l + T40m; T40o depends on T33 + T40l + T40m + T40n; T40p depends on T40i + T40n + T40o
 - **Track I — `terracedb-bricks` blob / large-object library:** T41 first; T42 and T43 proceed in parallel after T41; T44 depends on T43 + T30/T31; T45 depends on T42 + T43; T46 depends on T33 + T44 + T45
 - **Track J — analytical export crate:** T47 depends on T31 + T42; workflow-scheduled export adapters may be layered on once T32 exists but are not required for the base crate
 - **Track K — hybrid-read and columnar-v2 hardening:** T48 first; T49 follows T48; then T50, T51, T53, T55, and T56 can proceed in parallel; T52 depends on T50 + T51; T54 depends on T51 + T52 + T55; T57 depends on T50 + T51 + T52 + T53 + T55 + T56; T58 depends on T52 + T53 + T54 + T55 + T56 + T57
@@ -2302,6 +2304,214 @@ Add a small, teachable example project that demonstrates what the sandbox is for
 - Tests covering the foreground session-state surface the example presents for active tool runs and readonly-view state.
 - Local editor-view smoke tests against the example project and, where practical, a remote-view smoke path using the same protocol.
 - Deterministic simulation coverage for the example's capability and session semantics wherever the example uses simulated-capable paths.
+
+---
+
+## Phase 8b — VFS-native git library and sandbox git convergence
+
+**Phase rule:** T40j freezes the `terracedb-git` crate boundary, fork policy, host-bridge contracts, and deterministic seams first so the phase can parallelize aggressively without interface churn. `terracedb-git` is the architectural home of repository semantics; host git remains a bridge for import/export, push, and PR-provider boundaries rather than the place where correctness lives.
+
+**Simulation rule:** Every implementation task in this phase must extend the deterministic oracle/cut-point/simulation harness in the same change as the production-path change. When a behavior becomes VFS-native, its primary coverage must move from real-filesystem or threaded-I/O integration tests into simulation-backed tests immediately. Narrow real git / host-filesystem tests may remain only for `GitHostBridge` conformance and end-to-end bridge smoke behavior. T40o is additive cross-cutting hardening, not a substitute for task-local simulation in T40k-T40n and T40p.
+
+**Parallelization:** T40j first. T40k depends on T40j. T40l and T40m can proceed in parallel once T40k exists. T40n depends on T40f, T40l, and T40m. T40o depends on T33, T40l, T40m, and T40n. T40p depends on T40i, T40n, and T40o.
+
+### T40j. Freeze the `terracedb-git` crate boundary, fork policy, host-bridge contracts, and deterministic seams
+
+**Depends on:** T03a, T40a, T40f
+
+**Description**
+
+Define the VFS-native git subsystem before the invasive fork work branches. This task exists primarily to maximize parallelism: the forked `gitoxide` slice, the sandbox integration, and the host bridge should all target fixed contracts rather than discovering them mid-implementation.
+
+**Implementation steps**
+
+1. Add a new workspace member (for example `crates/terracedb-git`) and define its top-level module boundaries:
+   - repository store / open,
+   - object / ref / index storage,
+   - worktree / checkout / status / diff,
+   - runtime / cancellation / execution hooks,
+   - host import / export / push bridge,
+   - sandbox-facing adapters,
+   - shared error and provenance types.
+2. Freeze the core public contracts from the architecture:
+   - `GitRepositoryStore`,
+   - `GitRepository`,
+   - `GitHostBridge`,
+   - open / options / policy types,
+   - status / diff / checkout / ref-update request and report types,
+   - explicit execution / cancellation hook traits.
+3. Freeze the internal seams needed to parallelize the phase:
+   - VFS adapter and repository-image open / discover seam,
+   - object / ref / index seam,
+   - worktree materialization seam,
+   - host bridge seam,
+   - conformance-harness seam for stub-versus-real bridge behavior.
+4. Decide the fork ownership boundary explicitly:
+   - which `gix*` crates or slices are vendored,
+   - which upstream APIs remain private implementation detail,
+   - which host-path, tempfile, lockfile, threading, and process-global assumptions are forbidden across the `terracedb-git` boundary.
+5. Freeze the incremental simulation plan up front: once a behavior becomes VFS-native, new primary coverage must land in deterministic simulation, while existing real-filesystem or threaded-I/O tests are narrowed to bridge-only conformance or removed if redundant.
+6. Add stub/fake implementations so downstream tasks and the simulation harness can open a fake repository and run basic repo calls without host git or host disk.
+
+**Verification**
+
+- Compile-only tests that instantiate the new repository-store, repository, bridge, and execution-hook contracts together.
+- Unit tests that round-trip git provenance, request/report, and repository-open metadata encodings.
+- A deterministic smoke test that opens a fake repo over a fake VFS and fake host bridge without touching host I/O, host git, or real threads.
+
+---
+
+### T40k. Establish the forked git substrate, VFS adapter, and repository open/discovery path
+
+**Depends on:** T40j, T36, T38
+
+**Description**
+
+Bring the forked `gitoxide` slice into the workspace and replace the first layer of non-negotiable host assumptions so repositories can be opened over `terracedb-vfs` snapshots, overlays, and imported repository images. This task owns the substrate that later status/diff, checkout, and bridge work build on.
+
+**Implementation steps**
+
+1. Vendor the chosen `gitoxide` slice into the workspace according to T40j's boundary and re-export only through `terracedb-git`.
+2. Replace or wrap the non-negotiable host assumptions at the repository-open layer:
+   - ambient cwd discovery,
+   - host-path-only repository open,
+   - process-global interrupt / cleanup,
+   - uncontrolled tempfiles / lockfiles,
+   - correctness-relevant thread spawning.
+3. Implement the `terracedb-vfs` adapter and explicit repository-image / open flow for snapshots, overlays, and imported repo images.
+4. Implement a logically serialized or host-driven execution mode that deterministic simulation can own, while keeping any optional parallel hooks behind the frozen execution interface.
+5. Implement read-only repository open/discover, `HEAD` / ref enumeration, and object access over VFS-backed repos.
+6. Add deterministic simulation tests for open/discover/ref/object behavior as they land, and migrate matching host-filesystem or threaded-I/O coverage to the new simulation path whenever the semantics now live inside `terracedb-git`.
+
+**Verification**
+
+- Open/discover tests covering explicit-root repository lookup, `HEAD` resolution, and ref enumeration over VFS-backed repos.
+- Deterministic simulation tests for repository open/discover across snapshots, overlays, and imported repo images.
+- Narrow conformance tests proving the remaining real-host open/import path still agrees with the frozen bridge contract where it crosses the host boundary.
+
+---
+
+### T40l. Implement VFS-native index, status, diff, and provenance-planning semantics
+
+**Depends on:** T40j, T40k, T40b, T40f
+
+**Description**
+
+Implement the read-mostly repository semantics used by sandbox authoring and export planning: index refresh, status, diff, pathspec handling, dirty detection, and provenance-aware delta planning. This task is where repo-backed sandbox inspection stops depending on host git subprocesses for core semantics.
+
+**Implementation steps**
+
+1. Extend the git shadow model and deterministic harness first to represent index refresh, tracked/untracked/ignored state, dirty detection, pathspec filtering, and provenance planning before the production path changes.
+2. Implement VFS-native index load / refresh / write helpers using VFS inode/stat information instead of `std::fs` metadata.
+3. Implement status, diff, pathspec filtering, and dirty-state reporting over VFS snapshots and overlays.
+4. Move sandbox provenance validation, delta planning, and repo-backed inspection flows onto `terracedb-git` rather than host git subprocesses.
+5. Replace or demote existing tests that exercise these semantics only through real filesystem writes or threaded I/O; the new primary coverage should be deterministic simulation against the VFS-native code path, with only narrow bridge-conformance tests remaining on real git.
+
+**Verification**
+
+- Tests covering tracked, untracked, ignored, renamed, deleted, and pathspec-filtered status/diff behavior over VFS-backed repos.
+- Deterministic simulation tests for dirty detection, provenance validation, and delta planning across restart and replay.
+- Restart tests proving index refresh and provenance metadata remain stable across reopen of the same sandbox-backed repo image.
+
+---
+
+### T40m. Implement VFS-native checkout, ref updates, worktree mutation, and repo-backed sandbox sessions
+
+**Depends on:** T40j, T40k, T40b, T40c
+
+**Description**
+
+Implement the mutable repository path inside the virtual world: checkout, branch/ref movement, index/worktree updates, and snapshot-plus-overlay worktree flows for sandbox-backed repos. This task is where linked-worktree-style behavior stops depending on sibling host directories.
+
+**Implementation steps**
+
+1. Extend the git shadow model and deterministic harness first for checkout/materialization, branch movement, index/worktree consistency, copy-up, and conflict reporting over snapshots and overlays.
+2. Implement VFS-native checkout and tree materialization into volumes/overlays, plus branch/ref updates and index persistence.
+3. Implement snapshot-plus-overlay worktree flows so repo-backed sandbox sessions can branch, reset to base, and materialize alternate trees without host linked-worktree directories.
+4. Integrate sandbox session mutation flows that currently depend on host worktree preparation so they can operate directly on VFS-native repos where transport is not required.
+5. Add deterministic simulation tests for checkout, branch/ref changes, index/worktree consistency, and crash/restart as the code lands, replacing real-filesystem or threaded-I/O tests for semantics now owned by `terracedb-git`.
+
+**Verification**
+
+- Tests covering checkout into overlays, branch/ref updates, conflict reporting, and index/worktree consistency for repo-backed sessions.
+- Deterministic simulation tests for checkout/reset-style flows, branch movement, and restart/recovery after partial repo mutation.
+- Tests proving repo-backed sandbox sessions can switch or materialize trees without creating sibling host worktrees.
+
+---
+
+### T40n. Implement the host import/export bridge, push/PR adapters, and sandbox migration onto `terracedb-git`
+
+**Depends on:** T40f, T40l, T40m
+
+**Description**
+
+Narrow host git to the explicit boundary where it belongs. This task owns host-repo import into VFS-native repo images, export/materialization back to host checkouts or ephemeral worktrees, and the migration of sandbox git-aware flows so `terracedb-git` owns semantics while the bridge owns host materialization and transport.
+
+**Implementation steps**
+
+1. Implement host-repo import into a VFS-native repository image while preserving the provenance captured by the sandbox/session layer.
+2. Implement export/materialize flows from a VFS-native repo or branch plan to a real checkout or ephemeral worktree, plus push and PR-provider helpers through the narrow bridge.
+3. Refactor sandbox hoist/eject/branch/PR flows so `terracedb-git` owns status, diff, checkout, and planning semantics and the host bridge owns only host materialization, transport, and provider calls.
+4. Add deterministic stub-bridge tests and simulation coverage for import/export/push planning, diverged-base conflicts, and bridge error reporting as the migration lands; keep only the smallest set of real git integration tests needed to prove bridge conformance.
+5. Preserve explicit fail-closed reporting for diverged provenance, export conflicts, remote push failures, and provider-side PR errors.
+
+**Verification**
+
+- Round-trip tests for host import → sandbox/VFS-native repo mutate → host export on ordinary repositories.
+- Deterministic simulation tests for bridge planning, diverged-base handling, and push/PR error propagation using stub host-bridge implementations.
+- Narrow real git integration tests proving the host bridge can still materialize exports, create branches, and hand off to provider adapters correctly.
+
+---
+
+### T40o. Build cross-cutting deterministic simulation and conformance suites for the VFS-native git stack
+
+**Depends on:** T33, T40l, T40m, T40n
+
+**Description**
+
+Bring the VFS-native git subsystem up to the same bar as the rest of Terracedb by adding whole-system deterministic simulation, crash/fault campaigns, and bridge conformance tests across the full repo-backed sandbox flow. This task is explicitly the cross-cutting hardening pass for the phase.
+
+**Implementation steps**
+
+1. Compose the per-task git oracle helpers into a whole-system harness that can run repo-backed sandbox sessions through import, mutate, status/diff, branch updates, checkout, export, and recovery.
+2. Add long-running deterministic campaigns combining pathspecs, tracked/untracked churn, checkout/reset flows, overlay copy-up, diverged-base export conflicts, and restart/recovery.
+3. Add crash cut points around repo open, index write, checkout publication, bridge bookkeeping, and PR planning/publication boundaries.
+4. Add conformance tests comparing stub-bridge behavior with the real host bridge and, where practical, targeted behavioral comparisons between the VFS-native core and the remaining real git bridge semantics.
+5. Ensure failing seeds capture repository image/provenance, simulated fault schedule, and enough trace data to replay the failure exactly.
+
+**Verification**
+
+- Large-seed deterministic simulation campaigns proving repo-backed sandbox flows remain reproducible across restart, conflict, and export scenarios.
+- Same-seed replay tests proving identical traces and repository outcomes for VFS-native status/diff/checkout/export planning.
+- Stub-versus-real conformance tests for the host bridge and remaining non-simulated seams.
+
+---
+
+### T40p. Update the canonical sandbox example to demonstrate VFS-native git-backed authoring flows
+
+**Depends on:** T40i, T40n, T40o
+
+**Description**
+
+Update the canonical sandbox example so it demonstrates the repo-backed end state rather than only the earlier host-interop flows. This task should evolve `examples/sandbox-notes` where practical so the teaching artifact remains one coherent sandbox-plus-git example rather than splitting into near-duplicates.
+
+**Implementation steps**
+
+1. Extend `examples/sandbox-notes` as the canonical sandbox example unless the scope stops being teachable; prefer evolving that example over creating a near-duplicate.
+2. Add a repo-backed sandbox path that demonstrates:
+   - hoist/import of a repo into a sandbox session,
+   - editing files in the sandbox,
+   - inspecting git status/diff/branch information inside the sandbox,
+   - exporting/applying the delta or preparing a branch/PR through the host bridge.
+3. Keep at least one typed-capability flow and one shell-bridge flow from T40i so the example still teaches sandbox authoring rather than becoming only a git demo.
+4. Document clearly which git behaviors are VFS-native and simulation-backed versus which steps still cross the host bridge for materialization, push, or PR-provider calls.
+5. Add example-owned deterministic simulation tests for the repo-backed authoring flows as the example changes, and keep only a narrow real-bridge smoke test for the host-materialization path.
+
+**Verification**
+
+- End-to-end deterministic simulation tests for the example's repo-backed authoring workflow, including status/diff inspection and export/PR planning.
+- Example integration tests proving the documented sandbox-plus-git flow works through the public example surface without hidden setup.
+- Narrow real-bridge smoke tests for host materialization and PR-style export behavior, plus read-only editor-view smoke coverage where the example exercises that surface.
 
 ---
 
@@ -4785,7 +4995,7 @@ Bring the new stack up to the same correctness bar as the rest of Terracedb by a
 
 **Description**
 
-Add a small, teachable example repo/app that demonstrates the intended way to use the new stack in practice: reviewed migrations for catalog setup, trusted draft query sandboxes for internal users, row-scoped visibility rules, immutable published procedures for lower-trust callers, and an MCP surface that exposes the approved capabilities to an external agent. The example should include its own simulation tests, demonstrate the policy/authorization/session-UX affordances added in this phase, and serve as the reference integration pattern for these libraries. Build on the sandbox example from T40i where practical rather than creating a near-duplicate teaching app.
+Add a small, teachable example repo/app that demonstrates the intended way to use the new stack in practice: reviewed migrations for catalog setup, trusted draft query sandboxes for internal users, row-scoped visibility rules, immutable published procedures for lower-trust callers, and an MCP surface that exposes the approved capabilities to an external agent. The example should include its own simulation tests, demonstrate the policy/authorization/session-UX affordances added in this phase, and serve as the reference integration pattern for these libraries. Build on the sandbox example from T40p where practical rather than creating a near-duplicate teaching app.
 
 **Implementation steps**
 

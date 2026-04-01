@@ -4247,6 +4247,8 @@ The sandbox should support two explicit eject modes:
 
 For repos, `git head` should be the safest default import mode. `git working tree` is useful, but it should be explicit because it complicates later conflict handling and PR export.
 
+These host-facing hoist and eject flows are part of the intended architecture, but they are boundary adapters rather than the final location of git semantics. The planned git architecture is described later in this part under **VFS-Native Git Library**.
+
 ### Runtime Model
 
 The low-level execution surface should be a pure-Rust JavaScript engine, currently `boa_engine`, with custom module loading and host integration. Full Deno CLI behavior and the unrestricted Node host process model are not the design center for version 1.
@@ -4907,6 +4909,147 @@ This library should therefore define simulation seams explicitly and test them a
 - crash/restart points should exist around session creation, cache publish, install metadata updates, hoist/eject commits, and PR export bookkeeping.
 
 The architectural goal is not "simulate absolutely everything"; it is "simulate the maximum semantically important subset, and hide the rest behind deterministic contracts."
+
+## VFS-Native Git Library
+
+This section describes the planned git architecture for TerraceDB. Git is not merely a host integration detail; it is an intended embedded subsystem that runs inside the same filesystem, sandbox, and simulation model as the rest of the stack.
+
+The architecture target is **true TerraceDB-style VFS/sandbox/runtime compatibility for git itself**. Reaching that target likely requires an invasive fork of `gitoxide`, not a thin wrapper around the `git` CLI and not a small adaptation of unmodified `gix`.
+
+Implementation may still proceed in phases:
+
+- the first shipping milestone may rely more heavily on the simpler host-interop flows described earlier in this part,
+- the host bridge may initially carry more of the import/export burden while the VFS-native core is brought up, and
+- transport and provider integration remain outside the simulated core even after the VFS-native git subsystem exists.
+
+That staged rollout does not change the intended architecture. The target design is a TerraceDB-owned git subsystem with host interop pushed to explicit boundary adapters.
+
+### Why This Is a Separate Subsystem
+
+The reason to give this its own subsystem is structural rather than cosmetic:
+
+- existing git implementations are strongly shaped around real host paths, `std::fs` metadata, host tempfiles and lockfiles, and ordinary process/runtime assumptions,
+- TerraceDB wants repository semantics to run against a `terracedb-vfs` snapshot or overlay,
+- deterministic simulation wants semantically important git behavior to run without host filesystems, process-global signal handlers, or ambient machine state.
+
+That means the system is not "git plus a different path type." It is a library with a different ownership model for storage, cancellation, scheduling, and worktree materialization.
+
+### Proposed Layering
+
+Under this design, the stack is:
+
+- `terracedb-vfs`
+  The authoritative filesystem, KV, snapshot, overlay, and activity substrate.
+- `terracedb-git`
+  A new embedded git library, most plausibly derived from a forked `gitoxide`, that implements object, ref, index, checkout, diff, and status semantics against the VFS substrate.
+- `terracedb-sandbox`
+  The guest-runtime layer that uses `terracedb-git` for repo inspection, status, diffing, branch/export planning, and VFS-native worktree mutation.
+- `terracedb-git-host-bridge`
+  A narrow boundary for importing from real host repos, exporting changes back to a host checkout, and interacting with remotes or PR providers.
+
+A useful rule of thumb is:
+
+- `terracedb-git` owns **git semantics inside the virtual world**,
+- `terracedb-git-host-bridge` owns **boundary crossings between the virtual world and the host world**.
+
+### VFS-Native Repository Model
+
+The repository model must become VFS-native in a first-class way:
+
+- repository discovery and opening take explicit roots and policy context rather than relying on ambient cwd or process environment,
+- worktree reads and writes target `terracedb-vfs` volumes or snapshots directly,
+- index refresh and checkout metadata read VFS inode/stat information rather than `std::fs` metadata,
+- lockfiles, tempfiles, and atomic-replace flows are modeled in VFS-native terms rather than as ordinary host `.lock` files in host directories,
+- repository-local scratch state lives in sandbox/session storage instead of host temp directories.
+
+Worktree semantics shift as well:
+
+- "checkout" means materializing a tree into a VFS volume or overlay, not into a host directory,
+- linked-worktree style flows map more naturally to snapshot-plus-overlay clones than to sibling directories on the host filesystem,
+- diff, status, and index/worktree comparisons operate over VFS state directly,
+- sandbox git operations become first-class simulated operations rather than host-only integration tests.
+
+### Runtime and Determinism Requirements
+
+The fork must also adopt a runtime model that matches the rest of TerraceDB:
+
+- repository mutation should support a logically serialized or explicitly host-driven execution model,
+- process-global interrupt and cleanup state should be replaced with session-scoped cancellation and resource ownership,
+- parallel fan-out should either be host-controlled through explicit execution hooks or be cleanly disabled for deterministic simulation,
+- no correctness-critical behavior should depend on host signal handlers, global tempfile registries, or best-effort process-exit cleanup.
+
+This is where the cost becomes real. A viable fork likely needs to own or heavily rewrite the equivalent of:
+
+- `gix-fs`,
+- `gix-tempfile`,
+- `gix-lock`,
+- `gix-worktree`,
+- `gix-worktree-state`, and
+- higher-level orchestration in `gix`.
+
+Some porcelain workflows are incomplete even before adaptation, so the project must finish missing orchestration while also rehosting the IO and runtime boundary.
+
+### Host Boundary and Import/Export
+
+Even with a VFS-native git core, the application still needs an explicit boundary to the host world. The difference is that those flows are adapters around the core rather than the place where git semantics live.
+
+The host bridge is responsible for:
+
+- importing a real host repo into a VFS-native repository image,
+- materializing a VFS-native branch or patch into a real checkout for review,
+- pushing to a remote using real credentials and transport,
+- creating pull requests through provider APIs.
+
+This split keeps the core repository logic simulation-friendly while preserving practical interoperability with ordinary developer machines and hosted git providers.
+
+### Internal Interfaces
+
+Recommended internal interfaces would look more like:
+
+```typescript
+interface GitRepositoryStore {
+  open(repoRoot: string, opts?: GitOpenOptions): Promise<GitRepository>
+}
+
+interface GitRepository {
+  status(opts?: GitStatusOptions): Promise<GitStatusReport>
+  diff(req: GitDiffRequest): Promise<GitDiffReport>
+  checkout(req: GitCheckoutRequest): Promise<GitCheckoutReport>
+  writeIndex(): Promise<void>
+  updateRef(req: GitRefUpdate): Promise<void>
+}
+
+interface GitHostBridge {
+  importHostRepo(req: GitImportRequest): Promise<GitImportReport>
+  exportToHost(req: GitExportRequest): Promise<GitExportReport>
+  push(req: GitPushRequest): Promise<GitPushReport>
+}
+```
+
+These interfaces are intentionally split so the core repository semantics can remain VFS-native and simulation-friendly while the host bridge stays small, explicit, and replaceable.
+
+### Benefits, Costs, and Rollout
+
+This architecture has two major benefits:
+
+1. Git becomes part of the same correctness model as the rest of the stack.
+   Diff, status, checkout, branch staging, and export planning run against the same seeded simulation harness as VFS overlays, capability actions, and session recovery logic.
+2. Sandbox behavior becomes more self-contained.
+   A sandbox repo no longer needs a prepared host worktree just to evaluate git-aware workflows; the host bridge is needed only at explicit import/export or transport boundaries.
+
+It also has major costs:
+
+- this is a real fork, not a small integration layer,
+- the fork becomes a long-term owned subsystem rather than an incidental vendored dependency,
+- the blast radius is large enough that maintenance cost should be treated as product-level scope, not implementation detail.
+
+Because of that cost, this subsystem should be treated as an explicit product commitment rather than as a low-level implementation swap. The project is choosing to make git participate directly in the TerraceDB simulation and sandbox model instead of treating it only as a host import/export integration.
+
+The rollout implication is therefore:
+
+- host-git interop remains part of the design, but as a bridge layer and phased implementation path rather than the architectural endpoint,
+- a forked `gitoxide`-derived `terracedb-git` is the intended core git subsystem, and
+- implementation should proceed in stages so import/export, PR, and provider workflows can ship before the full VFS-native core is complete.
 
 ---
 
