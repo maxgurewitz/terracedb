@@ -1815,6 +1815,47 @@ impl Db {
             .collect()
     }
 
+    /// Returns a test/debug-oriented snapshot of scheduler-driven background work.
+    pub async fn scheduler_progress_snapshot(&self) -> crate::SchedulerProgressSnapshot {
+        crate::SchedulerProgressSnapshot {
+            pending_work: self.pending_work_with_runtime_tags().await,
+            observability: self.scheduler_observability_snapshot(),
+        }
+    }
+
+    /// Advances scheduler-driven background work by at most one explicit step.
+    pub async fn step_scheduler_background_work(
+        &self,
+    ) -> Result<crate::SchedulerProgressStepResult, StorageError> {
+        let progressed = self.run_next_scheduled_work().await?;
+        Ok(crate::SchedulerProgressStepResult {
+            progressed,
+            snapshot: self.scheduler_progress_snapshot().await,
+        })
+    }
+
+    /// Bounded helper for tests/debugging that steps background work until idle.
+    pub async fn wait_for_scheduler_idle(
+        &self,
+        max_steps: usize,
+    ) -> Result<crate::SchedulerIdleWaitResult, StorageError> {
+        let mut steps = 0;
+        loop {
+            let snapshot = self.scheduler_progress_snapshot().await;
+            if snapshot.is_idle() || steps >= max_steps {
+                return Ok(crate::SchedulerIdleWaitResult { steps, snapshot });
+            }
+
+            if !self.run_next_scheduled_work().await? {
+                return Ok(crate::SchedulerIdleWaitResult {
+                    steps,
+                    snapshot: self.scheduler_progress_snapshot().await,
+                });
+            }
+            steps += 1;
+        }
+    }
+
     pub fn tag_pending_work(&self, work: PendingWork) -> DomainTaggedWork<PendingWork> {
         let owner = if work.work_type == PendingWorkType::Backup {
             ExecutionDomainOwner::Subsystem {

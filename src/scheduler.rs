@@ -314,6 +314,45 @@ impl Clone for SchedulerObservabilitySubscription {
     }
 }
 
+/// Test/debug-oriented snapshot of scheduler-driven background work.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerProgressSnapshot {
+    pub pending_work: Vec<DomainTaggedWork<PendingWork>>,
+    pub observability: SchedulerObservabilitySnapshot,
+}
+
+impl SchedulerProgressSnapshot {
+    pub fn is_idle(&self) -> bool {
+        self.pending_work.is_empty()
+    }
+}
+
+/// Result of advancing scheduler-driven background work by at most one step.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerProgressStepResult {
+    pub progressed: bool,
+    pub snapshot: SchedulerProgressSnapshot,
+}
+
+impl SchedulerProgressStepResult {
+    pub fn is_idle(&self) -> bool {
+        self.snapshot.is_idle()
+    }
+}
+
+/// Result of bounded waiting for scheduler-driven background work to become idle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerIdleWaitResult {
+    pub steps: usize,
+    pub snapshot: SchedulerProgressSnapshot,
+}
+
+impl SchedulerIdleWaitResult {
+    pub fn is_idle(&self) -> bool {
+        self.snapshot.is_idle()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableStats {
     pub l0_sstable_count: u32,

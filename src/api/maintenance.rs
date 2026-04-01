@@ -1017,8 +1017,9 @@ impl Db {
         )
     }
 
-    #[cfg(test)]
-    pub(super) async fn run_next_scheduled_work(&self) -> Result<bool, StorageError> {
+    /// Test/debug-oriented bounded scheduler probe that executes at most one
+    /// pending background-work step.
+    pub async fn run_next_scheduled_work(&self) -> Result<bool, StorageError> {
         self.run_scheduler_pass(true).await
     }
 

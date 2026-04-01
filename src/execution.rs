@@ -1933,7 +1933,12 @@ impl ExecutionBacklogGuard {
         path: ExecutionDomainPath,
         backlog: ExecutionDomainBacklogSnapshot,
     ) -> Self {
-        let previous = manager.direct_backlog(&path);
+        let previous = manager
+            .snapshot()
+            .domains
+            .get(&path)
+            .map(|snapshot| snapshot.backlog)
+            .unwrap_or_default();
         manager.set_backlog(&path, backlog);
         Self {
             manager,
@@ -2035,8 +2040,6 @@ pub trait ResourceManager: Send + Sync {
         path: &ExecutionDomainPath,
         usage: ExecutionResourceUsage,
     ) -> ExecutionDomainSnapshot;
-    /// Returns the direct backlog currently recorded on a domain.
-    fn direct_backlog(&self, path: &ExecutionDomainPath) -> ExecutionDomainBacklogSnapshot;
     /// Replaces the direct backlog recorded on a domain.
     fn set_backlog(
         &self,
@@ -2864,14 +2867,6 @@ impl ResourceManager for InMemoryResourceManager {
     ) -> ExecutionDomainSnapshot {
         self.checked_release(path, usage)
             .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    fn direct_backlog(&self, path: &ExecutionDomainPath) -> ExecutionDomainBacklogSnapshot {
-        self.domains
-            .lock()
-            .get(path)
-            .map(|entry| entry.backlog)
-            .unwrap_or_default()
     }
 
     fn set_backlog(

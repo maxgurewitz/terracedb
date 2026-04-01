@@ -4078,6 +4078,62 @@ fn throttled_round_robin_simulation_services_three_backlogged_tables_without_sta
 }
 
 #[test]
+fn scheduler_wait_for_idle_drains_background_work_without_sleeping() -> turmoil::Result {
+    SeededSimulationRunner::new(0x3132)
+        .with_simulation_duration(Duration::from_secs(10))
+        .run_with(|context| async move {
+            let db = context
+                .open_db(simulation_db_config(
+                    "/terracedb/sim/t16c-scheduler-wait-idle",
+                    Arc::new(RoundRobinScheduler::default()),
+                    1024 * 1024,
+                ))
+                .await?;
+            let alpha = db
+                .create_table(SimulationTableSpec::row("alpha").table_config())
+                .await?;
+            let beta = db
+                .create_table(SimulationTableSpec::row("beta").table_config())
+                .await?;
+            let gamma = db
+                .create_table(SimulationTableSpec::row("gamma").table_config())
+                .await?;
+
+            for round in 0..2_u8 {
+                alpha
+                    .write(vec![b'a', round], Value::Bytes(vec![round]))
+                    .await?;
+                beta.write(vec![b'b', round], Value::Bytes(vec![round]))
+                    .await?;
+                gamma
+                    .write(vec![b'g', round], Value::Bytes(vec![round]))
+                    .await?;
+                db.flush().await?;
+            }
+
+            let before = db.scheduler_progress_snapshot().await;
+            assert_eq!(
+                before
+                    .pending_work
+                    .iter()
+                    .map(|work| work.work.table.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["alpha", "beta", "gamma"])
+            );
+            assert!(!before.is_idle());
+
+            let idle = db.wait_for_scheduler_idle(3).await?;
+            assert!(idle.is_idle());
+            assert_eq!(idle.steps, 3);
+            assert_eq!(db.table_stats(&alpha).await.compaction_debt, 0);
+            assert_eq!(db.table_stats(&beta).await.compaction_debt, 0);
+            assert_eq!(db.table_stats(&gamma).await.compaction_debt, 0);
+
+            Ok(())
+        })
+}
+
+#[test]
 fn hostile_scheduler_simulation_still_forces_flush_and_l0_progress() -> turmoil::Result {
     SeededSimulationRunner::new(0x1616)
         .with_simulation_duration(Duration::from_secs(5))

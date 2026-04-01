@@ -159,9 +159,9 @@ pub use scheduler::{
     AdmissionObservation, AdmissionObservationReceiver, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,
     DEFAULT_WRITE_THROTTLE_L0_SSTABLE_COUNT, DomainPriorityOverride, NoopScheduler, PendingWork,
     PendingWorkBudget, PendingWorkBudgetBlockReason, PendingWorkType, RecordedAdmissionDiagnostics,
-    RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler,
-    SchedulerObservabilitySnapshot, SchedulerObservabilitySubscription, TableStats,
-    ThrottleDecision,
+    RoundRobinScheduler, ScheduleAction, ScheduleDecision, Scheduler, SchedulerIdleWaitResult,
+    SchedulerObservabilitySnapshot, SchedulerObservabilitySubscription, SchedulerProgressSnapshot,
+    SchedulerProgressStepResult, TableStats, ThrottleDecision,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{
