@@ -4,8 +4,9 @@ use terracedb::Timestamp;
 use terracedb_capabilities::{
     AuthorizationScope, BudgetPolicy, CapabilityGrant, CapabilityManifest,
     CapabilityPresetDescriptor, CapabilityProfileDescriptor, CapabilityTemplate,
-    CapabilityUseMetrics, CapabilityUseRequest, DeterministicPolicyEngine,
-    DeterministicRateLimiter, DeterministicSubjectResolver, DraftAuthorizationDecision,
+    CapabilityUseMetrics, CapabilityUseRequest, DeterministicDraftAuthorizationSession,
+    DeterministicPolicyEngine, DeterministicRateLimiter, DeterministicSubjectResolver,
+    DraftAuthorizationDecision, DraftAuthorizationFlowError, DraftAuthorizationHistoryKind,
     DraftAuthorizationOutcomeKind, DraftAuthorizationRequestKind, ExecutionDomain,
     ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy,
     ForegroundSessionStatusProjector, ManifestBinding, PolicyOutcomeKind, PolicyResolutionRequest,
@@ -172,6 +173,126 @@ fn resolve_sample_policy(rate_limiter: DeterministicRateLimiter) -> ResolvedSess
     .with_rate_limiter(rate_limiter)
     .resolve(&sample_resolution_request(Some("foreground")))
     .expect("resolve sample policy")
+}
+
+fn resource_policy_for_tables(tables: &[&str]) -> ResourcePolicy {
+    ResourcePolicy {
+        allow: tables
+            .iter()
+            .map(|table| ResourceSelector {
+                kind: ResourceKind::Table,
+                pattern: (*table).to_string(),
+            })
+            .collect(),
+        deny: vec![],
+        tenant_scopes: vec!["tenant-a".to_string()],
+        row_scope_binding: Some("tenant_id".to_string()),
+        visibility_index: Some("visible_by_subject".to_string()),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn named_template(
+    template_id: &str,
+    default_binding: &str,
+    description: &str,
+    tables: &[&str],
+) -> CapabilityTemplate {
+    CapabilityTemplate {
+        template_id: template_id.to_string(),
+        capability_family: template_id.to_string(),
+        default_binding: default_binding.to_string(),
+        description: Some(description.to_string()),
+        default_resource_policy: resource_policy_for_tables(tables),
+        default_budget_policy: sample_budget(),
+        expose_in_just_bash: true,
+        metadata: BTreeMap::from([("surface".to_string(), serde_json::json!("sandbox"))]),
+    }
+}
+
+fn named_grant(grant_id: &str, template_id: &str, binding_name: &str) -> CapabilityGrant {
+    CapabilityGrant {
+        grant_id: grant_id.to_string(),
+        subject: SubjectSelector::Exact {
+            subject_id: "user:alice".to_string(),
+        },
+        template_id: template_id.to_string(),
+        binding_name: Some(binding_name.to_string()),
+        resource_policy: None,
+        budget_policy: None,
+        allow_interactive_widening: true,
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn interactive_policy_engine() -> DeterministicPolicyEngine {
+    let execution_policy = sample_execution_policy();
+    DeterministicPolicyEngine::new(
+        vec![
+            named_template(
+                "db.query.v1",
+                "tickets",
+                "Read tenant-scoped tickets",
+                &["tickets"],
+            ),
+            named_template(
+                "db.admin.v1",
+                "admin",
+                "Access admin tables",
+                &["admin_console"],
+            ),
+        ],
+        vec![
+            named_grant("grant-1", "db.query.v1", "tickets"),
+            named_grant("grant-2", "db.admin.v1", "admin"),
+        ],
+        sample_subject_resolver(),
+        StaticExecutionPolicyResolver::new(execution_policy.clone())
+            .with_policy(SessionMode::Draft, execution_policy.clone())
+            .with_policy(SessionMode::ReviewedProcedure, execution_policy),
+    )
+    .with_preset(CapabilityPresetDescriptor {
+        name: "draft-support".to_string(),
+        description: Some("Draft support preset".to_string()),
+        bindings: vec![PresetBinding {
+            template_id: "db.query.v1".to_string(),
+            binding_name: Some("tickets".to_string()),
+            resource_policy: None,
+            budget_policy: None,
+            expose_in_just_bash: Some(true),
+        }],
+        default_session_mode: SessionMode::Draft,
+        default_execution_policy: Some(sample_execution_policy()),
+        metadata: BTreeMap::new(),
+    })
+    .with_profile(CapabilityProfileDescriptor {
+        name: "admin-elevated".to_string(),
+        preset_name: "draft-support".to_string(),
+        add_bindings: vec![PresetBinding {
+            template_id: "db.admin.v1".to_string(),
+            binding_name: Some("admin".to_string()),
+            resource_policy: None,
+            budget_policy: None,
+            expose_in_just_bash: Some(true),
+        }],
+        drop_bindings: vec![],
+        execution_policy_override: None,
+        metadata: BTreeMap::new(),
+    })
+    .with_profile(CapabilityProfileDescriptor {
+        name: "private-tickets".to_string(),
+        preset_name: "draft-support".to_string(),
+        add_bindings: vec![PresetBinding {
+            template_id: "db.query.v1".to_string(),
+            binding_name: Some("tickets".to_string()),
+            resource_policy: Some(resource_policy_for_tables(&["tickets", "private_tickets"])),
+            budget_policy: None,
+            expose_in_just_bash: Some(true),
+        }],
+        drop_bindings: vec!["tickets".to_string()],
+        execution_policy_override: None,
+        metadata: BTreeMap::new(),
+    })
 }
 
 #[test]
@@ -766,4 +887,364 @@ fn foreground_session_status_projection_replays_the_same_history() {
         first.snapshot.metadata.get("view_visible"),
         Some(&serde_json::json!(true))
     );
+}
+
+#[test]
+fn trusted_draft_binding_requests_refresh_manifest_and_record_retry_history() {
+    let mut session = DeterministicDraftAuthorizationSession::open(
+        interactive_policy_engine(),
+        sample_resolution_request(None),
+        true,
+    )
+    .expect("open trusted draft session");
+    assert!(
+        session
+            .resolved_policy()
+            .manifest
+            .bindings
+            .iter()
+            .all(|binding| binding.binding_name != "admin")
+    );
+
+    let request = session
+        .request_binding_authorization(
+            "auth-admin",
+            "admin",
+            "db.admin.v1",
+            AuthorizationScope::Session,
+            Timestamp::new(300),
+            Some("need admin tools".to_string()),
+            BTreeMap::from([("surface".to_string(), serde_json::json!("host"))]),
+        )
+        .expect("request admin binding");
+    assert_eq!(
+        request.kind,
+        DraftAuthorizationRequestKind::InjectMissingBinding
+    );
+
+    let applied = session
+        .apply_decision(
+            DraftAuthorizationDecision {
+                request_id: request.request_id.clone(),
+                outcome: DraftAuthorizationOutcomeKind::Approved,
+                approved_scope: Some(AuthorizationScope::Session),
+                decided_at: Timestamp::new(301),
+                note: Some("approved for this draft session".to_string()),
+                metadata: BTreeMap::new(),
+            },
+            None,
+            Some(sample_resolution_request(Some("admin-elevated"))),
+        )
+        .expect("approve admin binding");
+    assert!(applied.pending_authorization.is_none());
+    assert!(
+        applied
+            .refreshed_manifest
+            .as_ref()
+            .expect("session approval should refresh the manifest")
+            .bindings
+            .iter()
+            .any(|binding| binding.binding_name == "admin")
+    );
+
+    let allowed = session.evaluate_use(CapabilityUseRequest {
+        session_id: "session-1".to_string(),
+        operation: ExecutionOperation::DraftSession,
+        binding_name: "admin".to_string(),
+        capability_family: Some("db.admin.v1".to_string()),
+        targets: vec![ResourceTarget {
+            kind: ResourceKind::Table,
+            identifier: "admin_console".to_string(),
+        }],
+        metrics: CapabilityUseMetrics::default(),
+        requested_at: Timestamp::new(302),
+        metadata: BTreeMap::new(),
+    });
+    assert_eq!(allowed.outcome.outcome, PolicyOutcomeKind::Allowed);
+
+    assert_eq!(session.history().len(), 4);
+    assert!(matches!(
+        session.history()[0].kind,
+        DraftAuthorizationHistoryKind::AuthorizationRequested { .. }
+    ));
+    assert!(matches!(
+        session.history()[1].kind,
+        DraftAuthorizationHistoryKind::AuthorizationDecided { .. }
+    ));
+    assert!(matches!(
+        session.history()[2].kind,
+        DraftAuthorizationHistoryKind::ManifestRefreshed { .. }
+    ));
+    assert!(matches!(
+        session.history()[3].kind,
+        DraftAuthorizationHistoryKind::RetryOutcome { .. }
+    ));
+}
+
+#[test]
+fn trusted_draft_retry_denial_can_be_approved_for_one_call_only() {
+    let mut session = DeterministicDraftAuthorizationSession::open(
+        interactive_policy_engine(),
+        sample_resolution_request(None),
+        true,
+    )
+    .expect("open trusted draft session");
+
+    let request = CapabilityUseRequest {
+        session_id: "session-1".to_string(),
+        operation: ExecutionOperation::DraftSession,
+        binding_name: "tickets".to_string(),
+        capability_family: None,
+        targets: vec![ResourceTarget {
+            kind: ResourceKind::Table,
+            identifier: "private_tickets".to_string(),
+        }],
+        metrics: CapabilityUseMetrics::default(),
+        requested_at: Timestamp::new(400),
+        metadata: BTreeMap::new(),
+    };
+
+    let denied = session.evaluate_use(request.clone());
+    assert_eq!(denied.outcome.outcome, PolicyOutcomeKind::Denied);
+
+    let auth_request = session
+        .request_authorization_for_outcome(
+            request.clone(),
+            denied.clone(),
+            "auth-private-tickets",
+            AuthorizationScope::OneCall,
+            Timestamp::new(401),
+            Some("retry this denied operation".to_string()),
+        )
+        .expect("request should be allowed for trusted draft")
+        .expect("denied operation should create an authorization request");
+    assert_eq!(
+        auth_request.kind,
+        DraftAuthorizationRequestKind::RetryDeniedOperation
+    );
+
+    let applied = session
+        .apply_decision(
+            DraftAuthorizationDecision {
+                request_id: auth_request.request_id.clone(),
+                outcome: DraftAuthorizationOutcomeKind::Approved,
+                approved_scope: Some(AuthorizationScope::OneCall),
+                decided_at: Timestamp::new(402),
+                note: Some("one retry approved".to_string()),
+                metadata: BTreeMap::new(),
+            },
+            None,
+            Some(sample_resolution_request(Some("private-tickets"))),
+        )
+        .expect("approve one retry");
+    assert!(applied.refreshed_manifest.is_none());
+
+    let mutated_retry = session.evaluate_use(CapabilityUseRequest {
+        requested_at: Timestamp::new(403),
+        metrics: CapabilityUseMetrics {
+            call_count: 2,
+            ..CapabilityUseMetrics::default()
+        },
+        ..request.clone()
+    });
+    assert_eq!(mutated_retry.outcome.outcome, PolicyOutcomeKind::Denied);
+
+    let first_retry = session.evaluate_use(request.clone());
+    assert_eq!(first_retry.outcome.outcome, PolicyOutcomeKind::Allowed);
+
+    let second_retry = session.evaluate_use(CapabilityUseRequest { ..request.clone() });
+    assert_eq!(second_retry.outcome.outcome, PolicyOutcomeKind::Denied);
+
+    assert_eq!(session.history().len(), 6);
+    assert!(matches!(
+        session.history()[0].kind,
+        DraftAuthorizationHistoryKind::PolicyOutcome { .. }
+    ));
+    assert!(matches!(
+        session.history()[1].kind,
+        DraftAuthorizationHistoryKind::AuthorizationRequested { .. }
+    ));
+    assert!(matches!(
+        session.history()[2].kind,
+        DraftAuthorizationHistoryKind::AuthorizationDecided { .. }
+    ));
+    assert!(matches!(
+        session.history()[3].kind,
+        DraftAuthorizationHistoryKind::PolicyOutcome { .. }
+    ));
+    assert!(matches!(
+        session.history()[4].kind,
+        DraftAuthorizationHistoryKind::RetryOutcome { .. }
+    ));
+    assert!(matches!(
+        session.history()[5].kind,
+        DraftAuthorizationHistoryKind::PolicyOutcome { .. }
+    ));
+}
+
+#[test]
+fn interactive_authorization_is_blocked_for_untrusted_and_non_draft_sessions() {
+    let untrusted_engine = interactive_policy_engine();
+    let mut untrusted = DeterministicDraftAuthorizationSession::open(
+        untrusted_engine,
+        sample_resolution_request(None),
+        false,
+    )
+    .expect("open untrusted draft session");
+    let request = CapabilityUseRequest {
+        session_id: "session-1".to_string(),
+        operation: ExecutionOperation::DraftSession,
+        binding_name: "admin".to_string(),
+        capability_family: Some("db.admin.v1".to_string()),
+        targets: vec![ResourceTarget {
+            kind: ResourceKind::Table,
+            identifier: "admin_console".to_string(),
+        }],
+        metrics: CapabilityUseMetrics::default(),
+        requested_at: Timestamp::new(500),
+        metadata: BTreeMap::new(),
+    };
+    let missing = untrusted.evaluate_use(request.clone());
+    assert_eq!(missing.outcome.outcome, PolicyOutcomeKind::MissingBinding);
+    let untrusted_error = untrusted
+        .request_authorization_for_outcome(
+            request,
+            missing,
+            "auth-untrusted",
+            AuthorizationScope::Session,
+            Timestamp::new(501),
+            None,
+        )
+        .expect_err("untrusted drafts should not enter interactive authorization");
+    assert!(matches!(
+        untrusted_error,
+        DraftAuthorizationFlowError::InteractiveAuthorizationDisabled
+    ));
+
+    let mut reviewed_request = sample_resolution_request(None);
+    reviewed_request.session_mode = SessionMode::ReviewedProcedure;
+    let mut reviewed = DeterministicDraftAuthorizationSession::open(
+        interactive_policy_engine(),
+        reviewed_request,
+        true,
+    )
+    .expect("open reviewed procedure session");
+    let reviewed_error = reviewed
+        .request_binding_authorization(
+            "auth-reviewed",
+            "admin",
+            "db.admin.v1",
+            AuthorizationScope::Session,
+            Timestamp::new(502),
+            Some("should stay blocked".to_string()),
+            BTreeMap::new(),
+        )
+        .expect_err("reviewed procedures should not enter interactive authorization");
+    assert!(matches!(
+        reviewed_error,
+        DraftAuthorizationFlowError::InteractiveAuthorizationDisabled
+    ));
+}
+
+#[test]
+fn draft_authorization_session_state_round_trips_across_restore() {
+    let mut pending = DeterministicDraftAuthorizationSession::open(
+        interactive_policy_engine(),
+        sample_resolution_request(None),
+        true,
+    )
+    .expect("open trusted draft session");
+    let pending_request = pending
+        .request_binding_authorization(
+            "auth-admin-pending",
+            "admin",
+            "db.admin.v1",
+            AuthorizationScope::Session,
+            Timestamp::new(600),
+            Some("need admin tools".to_string()),
+            BTreeMap::new(),
+        )
+        .expect("request binding");
+    let pending_snapshot = pending.snapshot_json().expect("snapshot pending state");
+    let restored_pending = DeterministicDraftAuthorizationSession::restore_from_json(
+        interactive_policy_engine(),
+        pending_snapshot,
+    )
+    .expect("restore pending state");
+    assert_eq!(
+        restored_pending.pending_authorization(),
+        Some(&pending_request)
+    );
+    assert_eq!(restored_pending.history(), pending.history());
+
+    let mut one_call = DeterministicDraftAuthorizationSession::open(
+        interactive_policy_engine(),
+        sample_resolution_request(None),
+        true,
+    )
+    .expect("open trusted draft session");
+    let denied_request = CapabilityUseRequest {
+        session_id: "session-1".to_string(),
+        operation: ExecutionOperation::DraftSession,
+        binding_name: "tickets".to_string(),
+        capability_family: None,
+        targets: vec![ResourceTarget {
+            kind: ResourceKind::Table,
+            identifier: "private_tickets".to_string(),
+        }],
+        metrics: CapabilityUseMetrics::default(),
+        requested_at: Timestamp::new(601),
+        metadata: BTreeMap::new(),
+    };
+    let denied = one_call.evaluate_use(denied_request.clone());
+    let retry_request = one_call
+        .request_authorization_for_outcome(
+            denied_request.clone(),
+            denied,
+            "auth-private-restore",
+            AuthorizationScope::OneCall,
+            Timestamp::new(602),
+            None,
+        )
+        .expect("request should succeed")
+        .expect("denied call should create request");
+    one_call
+        .apply_decision(
+            DraftAuthorizationDecision {
+                request_id: retry_request.request_id.clone(),
+                outcome: DraftAuthorizationOutcomeKind::Approved,
+                approved_scope: Some(AuthorizationScope::OneCall),
+                decided_at: Timestamp::new(603),
+                note: Some("retry once".to_string()),
+                metadata: BTreeMap::new(),
+            },
+            None,
+            Some(sample_resolution_request(Some("private-tickets"))),
+        )
+        .expect("approve retry");
+
+    let one_call_snapshot = one_call.snapshot_json().expect("snapshot one-call state");
+    let mut restored_one_call = DeterministicDraftAuthorizationSession::restore_from_json(
+        interactive_policy_engine(),
+        one_call_snapshot,
+    )
+    .expect("restore one-call state");
+    let allowed = restored_one_call.evaluate_use(denied_request.clone());
+    assert_eq!(allowed.outcome.outcome, PolicyOutcomeKind::Allowed);
+    assert_eq!(
+        restored_one_call
+            .evaluate_use(denied_request)
+            .outcome
+            .outcome,
+        PolicyOutcomeKind::Denied
+    );
+    let replay_snapshot = restored_one_call
+        .snapshot_json()
+        .expect("snapshot consumed one-call state");
+    let replayed = DeterministicDraftAuthorizationSession::restore_from_json(
+        interactive_policy_engine(),
+        replay_snapshot,
+    )
+    .expect("restore consumed state");
+    assert_eq!(replayed.history(), restored_one_call.history());
 }
