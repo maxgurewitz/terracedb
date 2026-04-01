@@ -4255,6 +4255,8 @@ The low-level execution surface should be a pure-Rust JavaScript engine, current
 
 Choosing a pure-Rust engine avoids the non-Rust V8 embedding stack and keeps the sandbox easier to build, test, and simulate inside the rest of the Rust codebase. Each sandbox instance should still behave like a logically serialized actor with message-passing from the surrounding app so module state, caches, and capability calls stay predictable.
 
+The detailed target architecture for this layer is described later in this part under **Simulation-Native JavaScript Runtime**.
+
 The runtime phases are:
 
 1. open or create the overlay session volume,
@@ -4893,6 +4895,7 @@ The first step in implementation should be to decide which parts can run inside 
 
 - session lifecycle,
 - overlay/VFS mutations and activity ordering,
+- guest runtime scheduling, module loading, and time/entropy behavior,
 - capability dispatch semantics,
 - TypeScript mirror updates,
 - package-manifest and cache-state transitions,
@@ -4900,7 +4903,7 @@ The first step in implementation should be to decide which parts can run inside 
 - PR-export planning,
 - read-only editor-view snapshot semantics.
 
-If a component such as the real JS runtime, real package fetching, real git provider integration, or real editor extension host cannot run inside the deterministic harness with acceptable fidelity, it should sit behind a stable interface with a deterministic stub/fake implementation. The simulation target then becomes the real session semantics plus the stubbed boundary behavior, while non-simulated production integrations still receive ordinary integration tests outside the turmoil harness.
+If a component such as real package fetching, remote registry integration, real git provider integration, or a real editor extension host cannot run inside the deterministic harness with acceptable fidelity, it should sit behind a stable interface with a deterministic stub/fake implementation. The simulation target then becomes the real session semantics plus the stubbed boundary behavior, while non-simulated production integrations still receive ordinary integration tests outside the turmoil harness.
 
 This library should therefore define simulation seams explicitly and test them aggressively:
 
@@ -4910,9 +4913,176 @@ This library should therefore define simulation seams explicitly and test them a
 
 The architectural goal is not "simulate absolutely everything"; it is "simulate the maximum semantically important subset, and hide the rest behind deterministic contracts."
 
+## Simulation-Native JavaScript Runtime
+
+This section describes the planned JavaScript runtime architecture for TerraceDB. A JavaScript engine is not merely a guest-language implementation choice; it is an intended embedded subsystem that runs inside the same filesystem, sandbox, and simulation model as the rest of the stack.
+
+The architecture target is a TerraceDB-owned runtime layer, tentatively `terracedb-js`, centered on `boa_engine` with maintained forks or replacements for runtime pieces that still assume ambient host behavior. The goal is not "embed Boa as-is" and not "run a stock Node or Deno host inside the sandbox." The goal is a JavaScript runtime whose sources of time, randomness, scheduling, module loading, IO, and compatibility behavior are owned by TerraceDB.
+
+Implementation may still proceed in stages:
+
+- the first shipping milestone may rely on a narrower compatibility surface and omit some host APIs entirely,
+- selected upstream Boa runtime helpers may be wrapped first and forked later as deterministic seams are tightened, and
+- some helper libraries may begin with deterministic stubs before production adapters exist.
+
+That staged rollout does not change the intended architecture. The target design is a TerraceDB-owned JavaScript runtime core with explicit host-service boundaries and simulation-native execution semantics.
+
+### Why This Is a Separate Subsystem
+
+The reason to give this its own subsystem is structural rather than cosmetic:
+
+- existing JavaScript runtime stacks usually bundle together parser/VM, module loading, timers, randomness, fetch, process/env, console, and compatibility shims,
+- `boa_engine` already exposes useful embedding seams, but stock builders and runtime helpers still assume ambient cwd, `std` time, OS entropy, ordinary stdout/stderr, and real network/process integrations,
+- TerraceDB wants sandbox execution to run against `terracedb-vfs`, execution domains, capability manifests, and deterministic simulation rather than ambient machine state.
+
+That means the system is not "Boa plus a custom filesystem shim." It is a library with a different ownership model for module resolution, host APIs, entropy, time, scheduling, and compatibility.
+
+### Proposed Layering
+
+Under this design, the stack is:
+
+- `terracedb-vfs`
+  The authoritative filesystem, KV, snapshot, overlay, and activity substrate.
+- `terracedb-js`
+  A new embedded JavaScript runtime layer, most plausibly derived from `boa_engine` plus selectively owned forks or replacements for `boa_runtime` and `boa_wintertc`, that implements guest execution, module loading, deterministic host services, and compatibility shims against the TerraceDB substrate.
+- `terracedb-sandbox`
+  The guest-runtime layer that uses `terracedb-js` for code evaluation, capability injection, package/type tooling, shell orchestration, and session lifecycle.
+- `terracedb-js-host-services`
+  A narrow boundary for optional host-backed services such as registry fetches, network requests, console sinks, and process/env projections when a deployment chooses to expose them.
+
+A useful rule of thumb is:
+
+- `terracedb-js` owns **guest-observable JavaScript semantics inside the virtual world**,
+- `terracedb-js-host-services` owns **explicit boundary crossings between the virtual world and the host world**.
+
+### Runtime Actor Model
+
+Each sandbox JavaScript instance should behave like a logically serialized actor:
+
+- one host-owned execution context plus its active realms,
+- no ambient `std::thread::spawn` or host scheduler ownership in the simulation path,
+- host-directed message passing between sandboxes, workers, or helper actors,
+- cross-context value transfer through structured-clone style serialization rather than shared mutable JavaScript objects.
+
+This aligns well with Boa's existing same-thread execution model, but the actor boundary must become an explicit architectural rule rather than an informal runtime convention.
+
+### Time, Entropy, and Scheduling
+
+The runtime must treat the main sources of non-determinism as first-class host services:
+
+- wall-clock and monotonic time flow through injected runtime services rather than ambient `SystemTime::now()` or `Instant::now()`,
+- `Date`, `Temporal.Now`, timer deadlines, and console timing all derive from those injected services,
+- randomness and entropy flow through an injected host-owned entropy source rather than OS randomness.
+
+That entropy rule applies to all guest-visible randomness:
+
+- `Math.random`,
+- `crypto.getRandomValues`,
+- `crypto.randomUUID`,
+- future UUID/token/nonce surfaces exposed by compatibility libraries, and
+- any runtime-generated identifiers whose values can leak into guest-observable behavior.
+
+The entropy service should support realm- or context-scoped substreams so different realms may observe distinct sequences while remaining deterministic under seeded replay.
+
+Scheduling must be owned in the same way:
+
+- promise jobs, microtasks, timers, module-loading continuations, and cancellation all run through a host-owned scheduler,
+- the runtime must be able to advance work to quiescence under deterministic simulation without wall-clock sleeps,
+- blocking APIs such as `await_blocking`, `Atomics.wait`, or hidden host sleeps must be absent from the simulated path, strictly gated, or reworked behind explicit host-controlled adapters.
+
+### Module Resolution and Filesystem Ownership
+
+Module resolution must be VFS-native in a first-class way:
+
+- the runtime never relies on ambient current working directory or Boa's stock filesystem-backed module loader,
+- module roots are explicit and point at `terracedb-vfs` snapshots or overlays,
+- resolution policy understands the sandbox specifier spaces described earlier in this part such as `terrace:/workspace`, `terrace:host`, and `npm:`,
+- loader preparation performs package resolution, TypeScript transpilation, source-map generation, and code-cache planning before evaluation,
+- source metadata and diagnostics should preserve stable virtual paths or URLs rather than accidental host paths.
+
+This keeps module semantics aligned with the sandbox volume model instead of leaking host filesystem layout into guest execution.
+
+### Compatibility and Host API Layers
+
+Stock `boa_runtime` and `boa_wintertc` are useful reference points, but they are not the architectural endpoint. TerraceDB should treat them as sources of reusable pieces, not as the final ownership boundary.
+
+The compatibility rule is:
+
+- web/node-style APIs such as `fetch`, `console`, `process`, timers, messaging, and future `crypto` surfaces are layered above explicit TerraceDB-owned host-service traits,
+- process/env views come from manifest and deployment policy rather than ambient process state,
+- console output routes to tool/activity/audit sinks rather than raw stdout/stderr,
+- network access, registry access, and any other side effects go through policy-controlled adapters instead of direct library defaults.
+
+If a compatibility API cannot be simulated faithfully enough in the first phase, it should sit behind a deterministic stub/fake in simulation rather than pulling the whole runtime out of the deterministic harness.
+
+### Internal Interfaces
+
+Recommended internal interfaces would look more like:
+
+```typescript
+interface JsRuntimeHost {
+  clock(): JsClock
+  entropy(): JsEntropySource
+  scheduler(): JsScheduler
+  moduleLoader(): JsModuleLoader
+  capabilities(): JsCapabilityResolver
+}
+
+interface JsEntropySource {
+  stream(scope: JsEntropyScope): JsEntropyStream
+}
+
+interface JsEntropyStream {
+  nextF64(): number
+  fill(bytes: Uint8Array): void
+  nextUuidV4(): string
+}
+
+interface JsRuntime {
+  evaluate(req: JsEvaluateRequest): Promise<JsEvaluateResult>
+  importModule(req: JsImportRequest): Promise<JsModuleHandle>
+  runUntilQuiescent(): Promise<void>
+}
+```
+
+These interfaces are intentionally split so the runtime core can remain simulation-native while deployment-specific host services stay small, explicit, and replaceable.
+
+### Benefits, Costs, and Rollout
+
+This architecture has two major benefits:
+
+1. JavaScript execution becomes part of the same correctness model as the rest of the stack.
+   Module resolution, timers, promise scheduling, entropy, capability dispatch, and guest-visible runtime behavior run against the same seeded simulation harness as VFS overlays, sandbox recovery, and git-aware flows.
+2. Sandbox behavior becomes more self-contained and policy-driven.
+   A sandbox no longer depends on ambient process cwd, env, time, randomness, or stdout just to evaluate code; those semantics are supplied explicitly by the host.
+
+It also has major costs:
+
+- this is a real owned subsystem, not just a thin `boa_engine` embedding,
+- the project will likely maintain targeted forks or replacements for parts of the upstream runtime layer,
+- web/node compatibility growth must be disciplined so convenience does not quietly reintroduce ambient host behavior.
+
+Because of that cost, this subsystem should be treated as an explicit product commitment rather than as a low-level implementation detail. The project is choosing to make JavaScript runtime semantics participate directly in the TerraceDB simulation and sandbox model instead of treating the guest engine as an opaque library hidden behind host-only integration tests.
+
+### Relationship to VFS-Native Git
+
+`terracedb-js` and `terracedb-git` are separate libraries, but they are intended to sit on one shared simulation-native sandbox substrate rather than evolve as unrelated integrations.
+
+That shared substrate should include:
+
+- `terracedb-vfs` as the only authoritative filesystem and snapshot/overlay model,
+- one host-owned scheduler and cancellation model for guest execution and repository work,
+- one deterministic source of time and entropy,
+- one capability and host-service boundary for explicit crossings to registries, remotes, consoles, or provider APIs,
+- one replay/debug story in which a failing seed captures guest actions, repository state, boundary calls, and recovery points together.
+
+Guest-facing git-aware flows should therefore be ordinary sandbox capability calls from JavaScript into `terracedb-git`, not ad hoc subprocess invocations or a second guest-side reimplementation of repository semantics. The important architectural property is that guest execution, VFS mutation, repository inspection, branch/export planning, and host-bridge calls all participate in one seeded replay model.
+
 ## VFS-Native Git Library
 
 This section describes the planned git architecture for TerraceDB. Git is not merely a host integration detail; it is an intended embedded subsystem that runs inside the same filesystem, sandbox, and simulation model as the rest of the stack.
+
+This subsystem is designed alongside the **Simulation-Native JavaScript Runtime** above. Together, `terracedb-js` and `terracedb-git` form the simulation-native sandbox substrate that guest code, repo-backed authoring flows, and host-bridge adapters build on.
 
 The architecture target is **true TerraceDB-style VFS/sandbox/runtime compatibility for git itself**. Reaching that target likely requires an invasive fork of `gitoxide`, not a thin wrapper around the `git` CLI and not a small adaptation of unmodified `gix`.
 
