@@ -4,18 +4,21 @@ use terracedb::Timestamp;
 use terracedb_capabilities::{
     AuthorizationScope, BudgetPolicy, CapabilityGrant, CapabilityManifest,
     CapabilityPresetDescriptor, CapabilityProfileDescriptor, CapabilityTemplate,
-    CapabilityUseMetrics, CapabilityUseRequest, DeterministicDraftAuthorizationSession,
-    DeterministicPolicyEngine, DeterministicRateLimiter, DeterministicSubjectResolver,
-    DeterministicVisibilityIndexStore, DraftAuthorizationDecision, DraftAuthorizationFlowError,
-    DraftAuthorizationHistoryKind, DraftAuthorizationOutcomeKind, DraftAuthorizationRequestKind,
-    ExecutionDomain, ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy,
-    FilteredScanResumeToken, ForegroundSessionStatusProjector, ManifestBinding, PolicyContext,
-    PolicyOutcomeKind, PolicyResolutionRequest, PolicySubject, PresetBinding, RateLimitOutcome,
-    ResolvedSessionPolicy, ResourceKind, ResourcePolicy, ResourceSelector, ResourceTarget,
-    RowDenialContract, RowQueryShape, RowScopeBinding, RowScopeFamily, RowScopePolicy,
-    RowVisibilityOutcomeKind, SessionLifecycleState, SessionMode, SessionStatusSource,
-    SessionStatusUpdate, ShellCommandDescriptor, StaticExecutionPolicyResolver,
-    SubjectResolutionRequest, SubjectSelector, VisibilityIndexSpec, VisibilityIndexSubjectKey,
+    CapabilityUseMetrics, CapabilityUseRequest, DatabaseAccessRequest, DatabaseActionKind,
+    DatabaseCapabilityFamily, DatabaseResultRow, DatabaseTarget,
+    DeterministicDraftAuthorizationSession, DeterministicPolicyEngine, DeterministicRateLimiter,
+    DeterministicSubjectResolver, DeterministicTypedRowPredicate,
+    DeterministicTypedRowPredicateEvaluator, DeterministicVisibilityIndexStore,
+    DraftAuthorizationDecision, DraftAuthorizationFlowError, DraftAuthorizationHistoryKind,
+    DraftAuthorizationOutcomeKind, DraftAuthorizationRequestKind, ExecutionDomain,
+    ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy, FilteredScanResumeToken,
+    ForegroundSessionStatusProjector, ManifestBinding, PolicyContext, PolicyOutcomeKind,
+    PolicyResolutionRequest, PolicySubject, PresetBinding, RateLimitOutcome, ResolvedSessionPolicy,
+    ResourceKind, ResourcePolicy, ResourceSelector, ResourceTarget, RowDenialContract,
+    RowQueryShape, RowScopeBinding, RowScopeFamily, RowScopePolicy, RowVisibilityOutcomeKind,
+    SessionLifecycleState, SessionMode, SessionStatusSource, SessionStatusUpdate,
+    ShellCommandDescriptor, StaticExecutionPolicyResolver, SubjectResolutionRequest,
+    SubjectSelector, VisibilityIndexSpec, VisibilityIndexSubjectKey,
     VisibilityMembershipTransition, capability_module_specifier,
 };
 use terracedb_mcp::{
@@ -218,6 +221,56 @@ fn resource_policy_for_tables(tables: &[&str]) -> ResourcePolicy {
         visibility_index: Some(sample_visibility_index()),
         metadata: BTreeMap::new(),
     }
+}
+
+fn resolve_database_policy(
+    capability_family: &str,
+    binding_name: &str,
+    resource_policy: ResourcePolicy,
+) -> ResolvedSessionPolicy {
+    let execution_policy = sample_execution_policy();
+    let template = CapabilityTemplate {
+        template_id: capability_family.to_string(),
+        capability_family: capability_family.to_string(),
+        default_binding: binding_name.to_string(),
+        description: Some(format!("database binding {binding_name}")),
+        default_resource_policy: resource_policy,
+        default_budget_policy: sample_budget(),
+        expose_in_just_bash: true,
+        metadata: BTreeMap::new(),
+    };
+    let grant = CapabilityGrant {
+        grant_id: format!("grant-{binding_name}"),
+        subject: SubjectSelector::Exact {
+            subject_id: "user:alice".to_string(),
+        },
+        template_id: capability_family.to_string(),
+        binding_name: Some(binding_name.to_string()),
+        resource_policy: None,
+        budget_policy: None,
+        allow_interactive_widening: true,
+        metadata: BTreeMap::new(),
+    };
+    DeterministicPolicyEngine::new(
+        vec![template],
+        vec![grant],
+        sample_subject_resolver(),
+        StaticExecutionPolicyResolver::new(execution_policy.clone())
+            .with_policy(SessionMode::Draft, execution_policy),
+    )
+    .resolve(&PolicyResolutionRequest {
+        subject: SubjectResolutionRequest {
+            session_id: "session-1".to_string(),
+            auth_subject_hint: Some("alice".to_string()),
+            tenant_hint: Some("tenant-a".to_string()),
+            groups: vec![],
+            attributes: BTreeMap::new(),
+        },
+        session_mode: SessionMode::Draft,
+        preset_name: None,
+        profile_name: None,
+    })
+    .expect("resolve database policy")
 }
 
 fn named_template(
@@ -1413,4 +1466,411 @@ fn draft_authorization_session_state_round_trips_across_restore() {
     )
     .expect("restore consumed state");
     assert_eq!(replayed.history(), restored_one_call.history());
+}
+
+#[test]
+fn database_capability_families_expose_expected_generated_surfaces() {
+    assert_eq!(
+        DatabaseCapabilityFamily::DbTableV1.generated_methods(),
+        &["get", "scanPrefix", "put", "delete"]
+    );
+    assert_eq!(
+        DatabaseCapabilityFamily::CatalogMigrateV1.generated_methods(),
+        &[
+            "ensureTable",
+            "installSchemaSuccessor",
+            "updateTableMetadata",
+            "checkPrecondition",
+        ]
+    );
+    assert!(
+        DatabaseCapabilityFamily::ProcedureInvokeV1
+            .generated_typescript_declarations("terrace:host/proc")
+            .contains("procedureId")
+    );
+}
+
+#[test]
+fn database_access_rewrites_key_prefix_for_allowed_reads() {
+    let resolved = resolve_database_policy(
+        "db.table.v1",
+        "tickets",
+        ResourcePolicy {
+            allow: vec![ResourceSelector {
+                kind: ResourceKind::Table,
+                pattern: "tickets".to_string(),
+            }],
+            deny: vec![],
+            tenant_scopes: vec!["tenant-a".to_string()],
+            row_scope_binding: Some(RowScopeBinding {
+                binding_id: "tickets.prefix".to_string(),
+                policy: RowScopePolicy::KeyPrefix {
+                    prefix_template: "tenant/{tenant_id}/".to_string(),
+                    context_fields: vec!["tenant_id".to_string()],
+                },
+                allowed_query_shapes: vec![
+                    RowQueryShape::PointRead,
+                    RowQueryShape::BoundedPrefixScan,
+                    RowQueryShape::WriteMutation,
+                ],
+                write_semantics: Default::default(),
+                denial_contract: Default::default(),
+                metadata: BTreeMap::new(),
+            }),
+            visibility_index: None,
+            metadata: BTreeMap::new(),
+        },
+    );
+
+    let decision = resolved
+        .evaluate_database_access(
+            &DatabaseAccessRequest {
+                session_id: "session-1".to_string(),
+                operation: ExecutionOperation::DraftSession,
+                binding_name: "tickets".to_string(),
+                capability_family: None,
+                action: DatabaseActionKind::PointRead,
+                target: DatabaseTarget {
+                    database: None,
+                    table: Some("tickets".to_string()),
+                    procedure_id: None,
+                },
+                key: Some("ticket:t-1".to_string()),
+                prefix: None,
+                row_id: None,
+                candidate_row: None,
+                preimage: None,
+                postimage: None,
+                occ_read_set: vec![],
+                metrics: CapabilityUseMetrics::default(),
+                requested_at: Timestamp::new(700),
+                metadata: BTreeMap::new(),
+            },
+            &DeterministicTypedRowPredicateEvaluator::default(),
+            &DeterministicVisibilityIndexStore::default(),
+        )
+        .expect("evaluate database access");
+
+    assert_eq!(decision.policy.outcome.outcome, PolicyOutcomeKind::Allowed);
+    assert_eq!(
+        decision.effective_key.as_deref(),
+        Some("tenant/tenant-a/ticket:t-1")
+    );
+}
+
+#[test]
+fn database_access_marks_typed_predicate_misses_as_not_visible_and_rejects_aggregate() {
+    let resolved = resolve_database_policy(
+        "db.query.v1",
+        "tickets",
+        ResourcePolicy {
+            allow: vec![ResourceSelector {
+                kind: ResourceKind::Table,
+                pattern: "tickets".to_string(),
+            }],
+            deny: vec![],
+            tenant_scopes: vec!["tenant-a".to_string()],
+            row_scope_binding: Some(RowScopeBinding {
+                binding_id: "tickets.owner".to_string(),
+                policy: RowScopePolicy::TypedRowPredicate {
+                    predicate_id: "ticket_owner_or_tenant".to_string(),
+                    row_type: Some("ticket".to_string()),
+                    referenced_fields: vec!["owner_id".to_string(), "tenant_id".to_string()],
+                },
+                allowed_query_shapes: vec![
+                    RowQueryShape::PointRead,
+                    RowQueryShape::BoundedPrefixScan,
+                    RowQueryShape::WriteMutation,
+                ],
+                write_semantics: Default::default(),
+                denial_contract: Default::default(),
+                metadata: BTreeMap::new(),
+            }),
+            visibility_index: None,
+            metadata: BTreeMap::new(),
+        },
+    );
+    let predicates = DeterministicTypedRowPredicateEvaluator::default().with_predicate(
+        "ticket_owner_or_tenant",
+        DeterministicTypedRowPredicate::AnyOf {
+            predicates: vec![
+                DeterministicTypedRowPredicate::MatchContext {
+                    row_field: "owner_id".to_string(),
+                    context_field: "subject_id".to_string(),
+                },
+                DeterministicTypedRowPredicate::MatchContext {
+                    row_field: "tenant_id".to_string(),
+                    context_field: "tenant_id".to_string(),
+                },
+            ],
+        },
+    );
+
+    let not_visible = resolved
+        .evaluate_database_access(
+            &DatabaseAccessRequest {
+                session_id: "session-1".to_string(),
+                operation: ExecutionOperation::DraftSession,
+                binding_name: "tickets".to_string(),
+                capability_family: None,
+                action: DatabaseActionKind::PointRead,
+                target: DatabaseTarget {
+                    database: None,
+                    table: Some("tickets".to_string()),
+                    procedure_id: None,
+                },
+                key: Some("ticket:t-2".to_string()),
+                prefix: None,
+                row_id: Some("ticket:t-2".to_string()),
+                candidate_row: Some(serde_json::json!({
+                    "owner_id": "user:bob",
+                    "tenant_id": "tenant-b"
+                })),
+                preimage: None,
+                postimage: None,
+                occ_read_set: vec![],
+                metrics: CapabilityUseMetrics::default(),
+                requested_at: Timestamp::new(710),
+                metadata: BTreeMap::new(),
+            },
+            &predicates,
+            &DeterministicVisibilityIndexStore::default(),
+        )
+        .expect("evaluate not-visible read");
+    assert_eq!(
+        not_visible.policy.outcome.outcome,
+        PolicyOutcomeKind::NotVisible
+    );
+    assert_eq!(
+        not_visible
+            .policy
+            .outcome
+            .row_visibility
+            .as_ref()
+            .map(|audit| audit.outcome),
+        Some(RowVisibilityOutcomeKind::NotVisible)
+    );
+
+    let aggregate = resolved
+        .evaluate_database_access(
+            &DatabaseAccessRequest {
+                session_id: "session-1".to_string(),
+                operation: ExecutionOperation::DraftSession,
+                binding_name: "tickets".to_string(),
+                capability_family: None,
+                action: DatabaseActionKind::Aggregate,
+                target: DatabaseTarget {
+                    database: None,
+                    table: Some("tickets".to_string()),
+                    procedure_id: None,
+                },
+                key: None,
+                prefix: None,
+                row_id: None,
+                candidate_row: None,
+                preimage: None,
+                postimage: None,
+                occ_read_set: vec![],
+                metrics: CapabilityUseMetrics::default(),
+                requested_at: Timestamp::new(711),
+                metadata: BTreeMap::new(),
+            },
+            &predicates,
+            &DeterministicVisibilityIndexStore::default(),
+        )
+        .expect("evaluate aggregate denial");
+    assert_eq!(aggregate.policy.outcome.outcome, PolicyOutcomeKind::Denied);
+    assert!(aggregate.policy.outcome.row_visibility.is_none());
+}
+
+#[test]
+fn database_access_authorizes_scan_results_row_by_row() {
+    let resolved = resolve_database_policy(
+        "db.query.v1",
+        "tickets",
+        ResourcePolicy {
+            allow: vec![ResourceSelector {
+                kind: ResourceKind::Table,
+                pattern: "tickets".to_string(),
+            }],
+            deny: vec![],
+            tenant_scopes: vec!["tenant-a".to_string()],
+            row_scope_binding: Some(RowScopeBinding {
+                binding_id: "tickets.owner".to_string(),
+                policy: RowScopePolicy::TypedRowPredicate {
+                    predicate_id: "ticket_owner".to_string(),
+                    row_type: Some("ticket".to_string()),
+                    referenced_fields: vec!["owner_id".to_string()],
+                },
+                allowed_query_shapes: vec![RowQueryShape::BoundedPrefixScan],
+                write_semantics: Default::default(),
+                denial_contract: Default::default(),
+                metadata: BTreeMap::new(),
+            }),
+            visibility_index: None,
+            metadata: BTreeMap::new(),
+        },
+    );
+    let predicates = DeterministicTypedRowPredicateEvaluator::default().with_predicate(
+        "ticket_owner",
+        DeterministicTypedRowPredicate::MatchContext {
+            row_field: "owner_id".to_string(),
+            context_field: "subject_id".to_string(),
+        },
+    );
+
+    let decision = resolved
+        .evaluate_database_access(
+            &DatabaseAccessRequest {
+                session_id: "session-1".to_string(),
+                operation: ExecutionOperation::DraftSession,
+                binding_name: "tickets".to_string(),
+                capability_family: None,
+                action: DatabaseActionKind::BoundedPrefixScan,
+                target: DatabaseTarget {
+                    database: None,
+                    table: Some("tickets".to_string()),
+                    procedure_id: None,
+                },
+                key: None,
+                prefix: Some("ticket:".to_string()),
+                row_id: None,
+                candidate_row: None,
+                preimage: None,
+                postimage: None,
+                occ_read_set: vec![],
+                metrics: CapabilityUseMetrics::default(),
+                requested_at: Timestamp::new(712),
+                metadata: BTreeMap::new(),
+            },
+            &predicates,
+            &DeterministicVisibilityIndexStore::default(),
+        )
+        .expect("evaluate scan preflight");
+
+    let authorized = decision
+        .authorize_result_rows(
+            vec![
+                DatabaseResultRow {
+                    row_id: "ticket:t-1".to_string(),
+                    row: serde_json::json!({ "owner_id": "user:alice" }),
+                },
+                DatabaseResultRow {
+                    row_id: "ticket:t-2".to_string(),
+                    row: serde_json::json!({ "owner_id": "user:bob" }),
+                },
+            ],
+            &predicates,
+        )
+        .expect("authorize result rows");
+
+    assert_eq!(authorized.scanned_rows, 2);
+    assert_eq!(authorized.returned_rows, 1);
+    assert_eq!(authorized.filtered_rows, 1);
+    assert_eq!(authorized.rows.len(), 1);
+    assert_eq!(authorized.rows[0].row_id, "ticket:t-1");
+    assert_eq!(authorized.row_audits.len(), 1);
+    assert_eq!(
+        authorized.row_audits[0].outcome,
+        RowVisibilityOutcomeKind::NotVisible
+    );
+    assert_eq!(
+        authorized
+            .resume_token
+            .as_ref()
+            .map(|token| token.binding_name.as_str()),
+        Some("tickets")
+    );
+    assert_eq!(
+        authorized
+            .resume_token
+            .as_ref()
+            .and_then(|token| token.last_primary_key.as_deref()),
+        Some("ticket:t-2")
+    );
+}
+
+#[test]
+fn database_access_rejects_scope_escaping_writes() {
+    let resolved = resolve_database_policy(
+        "db.table.v1",
+        "tickets",
+        ResourcePolicy {
+            allow: vec![ResourceSelector {
+                kind: ResourceKind::Table,
+                pattern: "tickets".to_string(),
+            }],
+            deny: vec![],
+            tenant_scopes: vec!["tenant-a".to_string()],
+            row_scope_binding: Some(RowScopeBinding {
+                binding_id: "tickets.owner".to_string(),
+                policy: RowScopePolicy::TypedRowPredicate {
+                    predicate_id: "ticket_owner".to_string(),
+                    row_type: Some("ticket".to_string()),
+                    referenced_fields: vec!["owner_id".to_string()],
+                },
+                allowed_query_shapes: vec![RowQueryShape::WriteMutation],
+                write_semantics: Default::default(),
+                denial_contract: Default::default(),
+                metadata: BTreeMap::new(),
+            }),
+            visibility_index: None,
+            metadata: BTreeMap::new(),
+        },
+    );
+    let predicates = DeterministicTypedRowPredicateEvaluator::default().with_predicate(
+        "ticket_owner",
+        DeterministicTypedRowPredicate::MatchContext {
+            row_field: "owner_id".to_string(),
+            context_field: "subject_id".to_string(),
+        },
+    );
+
+    let denied = resolved
+        .evaluate_database_access(
+            &DatabaseAccessRequest {
+                session_id: "session-1".to_string(),
+                operation: ExecutionOperation::DraftSession,
+                binding_name: "tickets".to_string(),
+                capability_family: None,
+                action: DatabaseActionKind::WriteMutation,
+                target: DatabaseTarget {
+                    database: None,
+                    table: Some("tickets".to_string()),
+                    procedure_id: None,
+                },
+                key: Some("ticket:t-3".to_string()),
+                prefix: None,
+                row_id: Some("ticket:t-3".to_string()),
+                candidate_row: None,
+                preimage: Some(serde_json::json!({ "owner_id": "user:alice" })),
+                postimage: Some(serde_json::json!({ "owner_id": "user:bob" })),
+                occ_read_set: vec!["ticket:t-3".to_string()],
+                metrics: CapabilityUseMetrics::default(),
+                requested_at: Timestamp::new(720),
+                metadata: BTreeMap::new(),
+            },
+            &predicates,
+            &DeterministicVisibilityIndexStore::default(),
+        )
+        .expect("evaluate write denial");
+
+    assert_eq!(denied.policy.outcome.outcome, PolicyOutcomeKind::Denied);
+    assert_eq!(
+        denied
+            .policy
+            .outcome
+            .row_visibility
+            .as_ref()
+            .map(|audit| audit.outcome),
+        Some(RowVisibilityOutcomeKind::ExplicitlyDenied)
+    );
+    assert!(
+        denied
+            .policy
+            .outcome
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("escape"))
+    );
 }

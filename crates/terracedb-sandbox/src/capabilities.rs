@@ -3,6 +3,9 @@ use std::{collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use terracedb_capabilities::{
+    CapabilityManifest as PolicyCapabilityManifest, DatabaseCapabilityFamily, ManifestBinding,
+};
 use terracedb_vfs::JsonValue;
 
 use crate::{HOST_CAPABILITY_PREFIX, SandboxError, SandboxSession};
@@ -494,6 +497,217 @@ impl CapabilityRegistry for StaticCapabilityRegistry {
     fn resolve(&self, specifier: &str) -> Option<SandboxCapability> {
         self.manifest.get(specifier).cloned()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManifestBoundCapabilityInvocation {
+    pub binding_name: String,
+    pub capability_family: String,
+    pub method: String,
+    pub args: Vec<JsonValue>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ManifestBoundCapabilityResult {
+    pub value: JsonValue,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[async_trait]
+pub trait ManifestBoundCapabilityDispatcher: Send + Sync {
+    async fn invoke_binding(
+        &self,
+        session: &SandboxSession,
+        binding: &ManifestBinding,
+        request: ManifestBoundCapabilityInvocation,
+    ) -> Result<ManifestBoundCapabilityResult, SandboxError>;
+}
+
+#[derive(Clone)]
+pub struct ManifestBoundCapabilityRegistry {
+    policy_manifest: PolicyCapabilityManifest,
+    bindings: BTreeMap<String, ManifestBinding>,
+    modules: BTreeMap<String, SandboxCapabilityModule>,
+    dispatcher: Arc<dyn ManifestBoundCapabilityDispatcher>,
+}
+
+impl ManifestBoundCapabilityRegistry {
+    pub fn new(
+        policy_manifest: PolicyCapabilityManifest,
+        dispatcher: Arc<dyn ManifestBoundCapabilityDispatcher>,
+    ) -> Result<Self, SandboxError> {
+        let mut bindings = BTreeMap::new();
+        let mut modules = BTreeMap::new();
+
+        for binding in &policy_manifest.bindings {
+            let family =
+                DatabaseCapabilityFamily::parse(&binding.capability_family).ok_or_else(|| {
+                    SandboxError::Service {
+                        service: "capabilities",
+                        message: format!(
+                            "unsupported generated capability family {} for binding {}",
+                            binding.capability_family, binding.binding_name
+                        ),
+                    }
+                })?;
+            let capability = generated_capability_for_binding(binding, &policy_manifest, family)?;
+            let module = SandboxCapabilityModule {
+                capability,
+                methods: family
+                    .generated_methods()
+                    .iter()
+                    .map(|method| SandboxCapabilityMethod::new(*method))
+                    .collect(),
+                metadata: generated_binding_metadata(binding, &policy_manifest),
+            };
+            bindings.insert(binding.module_specifier.clone(), binding.clone());
+            modules.insert(binding.module_specifier.clone(), module);
+        }
+
+        Ok(Self {
+            policy_manifest,
+            bindings,
+            modules,
+            dispatcher,
+        })
+    }
+
+    pub fn policy_manifest(&self) -> &PolicyCapabilityManifest {
+        &self.policy_manifest
+    }
+}
+
+#[async_trait]
+impl CapabilityRegistry for ManifestBoundCapabilityRegistry {
+    fn manifest(&self) -> CapabilityManifest {
+        CapabilityManifest {
+            capabilities: self
+                .modules
+                .values()
+                .map(|module| module.capability.clone())
+                .collect(),
+        }
+    }
+
+    fn resolve(&self, specifier: &str) -> Option<SandboxCapability> {
+        self.modules
+            .get(specifier)
+            .map(|module| module.capability.clone())
+    }
+
+    fn module(&self, specifier: &str) -> Option<SandboxCapabilityModule> {
+        self.modules.get(specifier).cloned()
+    }
+
+    async fn invoke(
+        &self,
+        session: &SandboxSession,
+        request: CapabilityCallRequest,
+    ) -> Result<CapabilityCallResult, SandboxError> {
+        let binding = self.bindings.get(&request.specifier).ok_or_else(|| {
+            SandboxError::CapabilityUnavailable {
+                specifier: request.specifier.clone(),
+            }
+        })?;
+        let module = self.modules.get(&request.specifier).ok_or_else(|| {
+            SandboxError::CapabilityUnavailable {
+                specifier: request.specifier.clone(),
+            }
+        })?;
+        if !module
+            .methods
+            .iter()
+            .any(|method| method.name == request.method)
+        {
+            return Err(SandboxError::CapabilityMethodNotFound {
+                specifier: request.specifier,
+                method: request.method,
+            });
+        }
+
+        let binding_result = self
+            .dispatcher
+            .invoke_binding(
+                session,
+                binding,
+                ManifestBoundCapabilityInvocation {
+                    binding_name: binding.binding_name.clone(),
+                    capability_family: binding.capability_family.clone(),
+                    method: request.method.clone(),
+                    args: request.args,
+                },
+            )
+            .await?;
+        let mut metadata = module.capability.metadata.clone();
+        metadata.extend(binding_result.metadata);
+
+        Ok(CapabilityCallResult {
+            specifier: request.specifier,
+            method: request.method,
+            value: binding_result.value,
+            metadata,
+        })
+    }
+}
+
+fn generated_capability_for_binding(
+    binding: &ManifestBinding,
+    manifest: &PolicyCapabilityManifest,
+    family: DatabaseCapabilityFamily,
+) -> Result<SandboxCapability, SandboxError> {
+    let capability = SandboxCapability {
+        name: binding.binding_name.clone(),
+        specifier: binding.module_specifier.clone(),
+        description: Some(format!(
+            "Generated host binding for {} ({})",
+            binding.binding_name, binding.capability_family
+        )),
+        typescript_declarations: Some(
+            family.generated_typescript_declarations(&binding.module_specifier),
+        ),
+        metadata: generated_binding_metadata(binding, manifest),
+    };
+    capability.validate()?;
+    Ok(capability)
+}
+
+fn generated_binding_metadata(
+    binding: &ManifestBinding,
+    manifest: &PolicyCapabilityManifest,
+) -> BTreeMap<String, JsonValue> {
+    let mut metadata = binding.metadata.clone();
+    metadata.insert(
+        "binding_name".to_string(),
+        JsonValue::String(binding.binding_name.clone()),
+    );
+    metadata.insert(
+        "capability_family".to_string(),
+        JsonValue::String(binding.capability_family.clone()),
+    );
+    metadata.insert(
+        "source_template_id".to_string(),
+        JsonValue::String(binding.source_template_id.clone()),
+    );
+    if let Some(source_grant_id) = binding.source_grant_id.as_ref() {
+        metadata.insert(
+            "source_grant_id".to_string(),
+            JsonValue::String(source_grant_id.clone()),
+        );
+    }
+    if let Some(preset_name) = manifest.preset_name.as_ref() {
+        metadata.insert(
+            "preset_name".to_string(),
+            JsonValue::String(preset_name.clone()),
+        );
+    }
+    if let Some(profile_name) = manifest.profile_name.as_ref() {
+        metadata.insert(
+            "profile_name".to_string(),
+            JsonValue::String(profile_name.clone()),
+        );
+    }
+    metadata
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -2744,6 +2744,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terracedb",
+ "terracedb-capabilities",
  "terracedb-simulation",
  "terracedb-vfs",
  "thiserror 2.0.18",
