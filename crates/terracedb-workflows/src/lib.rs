@@ -29,6 +29,9 @@ use terracedb::{
 
 pub mod failpoints;
 
+pub use terracedb_workflows_core as contracts;
+pub use terracedb_workflows_sandbox as sandbox_contracts;
+
 pub const DEFAULT_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const DEFAULT_SOURCE_BATCH_LIMIT: usize = 128;
 pub const DEFAULT_TIMER_BATCH_LIMIT: usize = 128;

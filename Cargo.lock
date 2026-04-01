@@ -2801,10 +2801,34 @@ dependencies = [
  "terracedb-fuzz",
  "terracedb-otel",
  "terracedb-simulation",
+ "terracedb-workflows-core",
+ "terracedb-workflows-sandbox",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "turmoil",
+]
+
+[[package]]
+name = "terracedb-workflows-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "terracedb-workflows-sandbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "terracedb-workflows-core",
+ "tokio",
 ]
 
 [[package]]

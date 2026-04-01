@@ -1,0 +1,12 @@
+[package]
+name = "terracedb-workflows-sandbox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+terracedb-workflows-core = { path = "../terracedb-workflows-core" }
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["macros", "rt"] }

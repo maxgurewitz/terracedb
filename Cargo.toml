@@ -28,6 +28,8 @@ members = [
     "crates/turmoil-determinism",
     "crates/terracedb-projections",
     "crates/terracedb-workflows",
+    "crates/terracedb-workflows-core",
+    "crates/terracedb-workflows-sandbox",
     "crates/terracedb-otel",
 ]
 resolver = "2"

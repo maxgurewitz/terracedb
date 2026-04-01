@@ -5441,6 +5441,10 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
 
 Freeze the stronger workflow model up front: explicit runs pinned to immutable bundles, append-only run history, current mutable state, lifecycle metadata, and separate operator-facing visibility contracts. This task should also freeze the dual handler boundary: native Rust handlers remain first-class, while sandbox handlers plug in through a narrower versioned task ABI.
 
+**Implementation note**
+
+This task may reserve the refined crate boundaries before every runtime file move lands. Once T108 exists, `terracedb-workflows-core` should be treated as the source of truth for the frozen public workflow contracts and `terracedb-workflows-sandbox` as the source of truth for the sandbox task ABI, even if the executable runtime still lives temporarily inside `terracedb-workflows`.
+
 **Implementation steps**
 
 1. Reserve or add the refined workflow crate boundaries, for example:
@@ -5485,6 +5489,10 @@ Freeze the stronger workflow model up front: explicit runs pinned to immutable b
 
 Implement the refined durable data model for workflows: explicit run records, append-only history, mutable state summaries, and durable lifecycle state. This task owns the storage model and deterministic reducer boundaries, not the higher-level operator surfaces.
 
+**Implementation note**
+
+T109 should store and reduce the T108 contract types rather than introducing parallel run/history/state/lifecycle record structs in the runtime layer. If runtime code has not yet moved into a dedicated `terracedb-workflows-runtime` crate, that crate split can still land incrementally during T109/T110/T112 without blocking the semantics in this task.
+
 **Implementation steps**
 
 1. Implement durable storage for:
@@ -5512,6 +5520,10 @@ Implement the refined durable data model for workflows: explicit run records, ap
 **Description**
 
 Implement the Rust-owned transition engine that all workflow inputs must pass through. This task owns the durable-apply-before-side-effects rule, explicit waiter sets, retry state, timer ownership, and the transition from admitted input into history/state/effect proposals.
+
+**Implementation note**
+
+T110 owns the private executor and effects model that sits behind the frozen T108 handler boundary. It should reuse `WorkflowTransitionInput` and `WorkflowTransitionOutput` at the public edge, while keeping richer reducer/effect internals private to the runtime implementation so later tasks do not accidentally widen the guest-visible contract.
 
 **Implementation steps**
 
@@ -5541,6 +5553,10 @@ Implement the Rust-owned transition engine that all workflow inputs must pass th
 **Description**
 
 Implement the shared execution boundary so native Rust workflows and sandbox-authored workflows both run on the same durable engine. Rust-native workflows must remain first-class; sandbox execution is an adapter path, not the primary workflow model.
+
+**Implementation note**
+
+T108 may already provide the first pass of the shared handler traits, deterministic context helpers, and `workflow-task/v1` request/response types. T111 still owns the runtime-loadable execution path, bundle/module loading integration, restart semantics, capability narrowing, and parity wiring into the real workflow engine; it should extend the frozen ABI rather than redefining it.
 
 **Implementation steps**
 
@@ -5683,6 +5699,10 @@ Add a small, teachable example repo/app that demonstrates the intended workflow-
 **Description**
 
 Freeze the operator- and deployment-facing contracts on top of the redesigned workflow core: immutable bundle and deployment metadata, native Rust registration identity, list/describe/history visibility APIs, query/update message lanes, compatibility manifests, and continue-as-new / restart-as-new upgrade semantics.
+
+**Implementation note**
+
+T115 should build on the bundle/run/visibility contracts frozen in T108 instead of creating a second incompatible bundle-metadata or visibility-record family. The work here is to extend those core contracts with deployment-manager, query/update, and upgrade metadata and APIs.
 
 **Implementation steps**
 
