@@ -3904,13 +3904,13 @@ Extend the domains example so users can see pressure-aware flushing and write ad
 
 ---
 
-### T76. Build the capstone whole-system simulation and chaos suite for pressure-aware flushing
+### T76. Build the capstone whole-system simulation, fuzz, and chaos coverage for pressure-aware flushing
 
 **Depends on:** T33e, T72, T73, T74, T75
 
 **Description**
 
-Add the capstone deterministic hardening pass for the pressure-aware flush/admission subsystem. This task owns the whole-system matrix across group commit, deferred durability, unified-log pressure, flush selection, multi-DB/domain contention, and restart/failure handling. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact. Implement it as a consumer of the shared cross-cutting fuzz/simulation support layer from T33e rather than as a pressure-only one-off harness: reuse the shared generator/replay/minimization plumbing where possible, and keep only pressure-specific generators/oracles local to this task.
+Add the capstone deterministic hardening pass for the pressure-aware flush/admission subsystem. This task owns the whole-system matrix across group commit, deferred durability, unified-log pressure, flush selection, multi-DB/domain contention, and restart/failure handling. It does not replace task-local simulation; it verifies that the composed system still behaves correctly when all of those features interact. The main matrix should be expressed as seeded deterministic simulation / generated-fuzz coverage built on the shared cross-cutting fuzz substrate from T33e rather than as a pressure-only one-off harness: reuse the shared generator/replay/minimization plumbing where possible, and keep only pressure-specific generators/oracles local to this task. Keep a smaller focused runtime chaos layer for fault-injection-specific behavior such as flush stalls and timing-sensitive recovery, but do not let that layer become the primary correctness story.
 
 **Implementation steps**
 
@@ -3920,13 +3920,13 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
    - group-commit and deferred-durability modes,
    - multiple colocated DB/domain workloads, and
    - restart/recovery under sustained pressure.
-2. Add long-running deterministic campaigns that combine:
+2. Add long-running deterministic generated / fuzz campaigns that combine:
    - unified-log pressure plus L0/compaction debt,
    - flush failures plus retry/reopen,
    - pressure spikes during control-plane and user-data contention, and
    - budget reconfiguration in the presence of in-flight flush work.
 3. Keep checked-in deterministic pressure regressions split as one seed per test wherever practical so local/pre-commit runners can exploit parallelism; reserve larger seed matrices for CI/nightly campaigns or generated broad-input runs.
-4. Add a real-runtime chaos layer where appropriate, including injected flush stalls, delayed durability completion, and abrupt budget tightening events that complement the deterministic harness without weakening reproducibility requirements.
+4. Add a focused real-runtime chaos layer where appropriate, including injected flush stalls, delayed durability completion, and abrupt budget tightening events that complement the deterministic fuzz/simulation harness without weakening reproducibility requirements.
 5. Verify the full invariants matrix:
    - no correctness change under different pressure thresholds,
    - pressure counters eventually converge after work completes,
@@ -3936,7 +3936,7 @@ Add the capstone deterministic hardening pass for the pressure-aware flush/admis
 
 **Verification**
 
-- Large-seed deterministic simulation campaigns proving pressure-aware flushing and admission remain reproducible across restart, failure, and multi-tenant contention scenarios.
+- Large-seed deterministic simulation / generated-fuzz campaigns proving pressure-aware flushing and admission remain reproducible across restart, failure, and multi-tenant contention scenarios.
 - Local and pre-commit pressure simulation coverage stays parallel-friendly by avoiding serial multi-seed tests when independent seed cases can be split.
 - Cross-feature chaos tests proving flush stalls, retry paths, and budget tightening still preserve deterministic recovery and liveness.
 - End-to-end invariant tests proving the subsystem changes performance behavior only, not logical DB outcomes.
@@ -6100,7 +6100,7 @@ At this point the system should additionally support:
 - pressure-aware flush selection that optimizes for actual relief value rather than only immutable presence or coarse L0 heuristics,
 - adaptive throttling/stalling that considers unified-log pressure, memory pressure, flush backlog, and L0/compaction pressure together,
 - optional domain-aware pressure budgeting so one colocated workload cannot pin all mutable-memory or unified-log headroom,
-- whole-system deterministic simulation and chaos coverage for pressure spikes, failed flushes, and recovery, and
+- whole-system deterministic simulation, seeded fuzz, and focused chaos coverage for pressure spikes, failed flushes, and recovery, and
 - an example app that demonstrates pressure-aware flushing and admission without changing logical answers.
 
 ### Milestone O — Opt-in physical sharding and virtual-partition resharding

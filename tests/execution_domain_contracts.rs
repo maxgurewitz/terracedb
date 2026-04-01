@@ -389,6 +389,52 @@ impl Scheduler for RateLimitedMutableBudgetScheduler {
     }
 }
 
+#[derive(Debug)]
+struct PressureRuntimeChaosScheduler {
+    minimum_rate: u64,
+}
+
+impl Scheduler for PressureRuntimeChaosScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<terracedb::ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_decision_in_domain(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+        signals: &terracedb::AdmissionSignals,
+        tag: &terracedb::WorkRuntimeTag,
+        domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        if tag.durability_class == DurabilityClass::ControlPlane {
+            return ThrottleDecision::default();
+        }
+
+        let Some(limit) = domain_budget.and_then(|budget| budget.memory.mutable_bytes) else {
+            return ThrottleDecision::default();
+        };
+        let projected_bytes = signals
+            .pressure
+            .local
+            .mutable_dirty_bytes
+            .saturating_add(signals.batch_write_bytes);
+        if projected_bytes < limit {
+            return ThrottleDecision::default();
+        }
+
+        ThrottleDecision {
+            throttle: true,
+            max_write_bytes_per_second: Some(limit.max(self.minimum_rate)),
+            stall: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CampaignRng {
     state: u64,
@@ -427,6 +473,52 @@ struct WholeSystemCampaignOutcome {
 
 type DurableRow = (Vec<u8>, Vec<u8>);
 type DurableRows = Vec<DurableRow>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressureRuntimeDurabilityMode {
+    Deferred,
+    GroupCommit,
+}
+
+impl PressureRuntimeDurabilityMode {
+    fn actual(self) -> TieredDurabilityMode {
+        match self {
+            Self::Deferred => TieredDurabilityMode::Deferred,
+            Self::GroupCommit => TieredDurabilityMode::GroupCommit,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Deferred => "deferred",
+            Self::GroupCommit => "group",
+        }
+    }
+
+    fn tail_survives_crash(self) -> bool {
+        matches!(self, Self::GroupCommit)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PressureRuntimeChaosScenario {
+    seed: u64,
+    durability: PressureRuntimeDurabilityMode,
+    analytics_mutable_budget: u64,
+    stalled_payload_bytes: u16,
+    tail_payload_bytes: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PressureRuntimeChaosOutcome {
+    control_table_present: bool,
+    stalled_row_present: bool,
+    primary_tail_present: bool,
+    analytics_tail_present: bool,
+    analytics_budget_after_reopen: Option<u64>,
+    analytics_throttled_writes: u64,
+    slow_write_lagged_primary: bool,
+}
 
 #[derive(Clone)]
 struct TestRuntimeHandle {
@@ -3151,6 +3243,320 @@ async fn execution_domain_whole_system_nightly_seed_matrix() {
         orders.windows(2).any(|window| window[0] != window[1]),
         "nightly seed matrix should exercise more than one seeded execution order"
     );
+}
+
+fn generate_pressure_runtime_chaos_scenario(seed: u64) -> PressureRuntimeChaosScenario {
+    PressureRuntimeChaosScenario {
+        seed,
+        durability: if seed & 1 == 0 {
+            PressureRuntimeDurabilityMode::Deferred
+        } else {
+            PressureRuntimeDurabilityMode::GroupCommit
+        },
+        analytics_mutable_budget: if (seed >> 1) & 1 == 0 { 32 } else { 48 },
+        stalled_payload_bytes: 96 + (((seed >> 2) & 1) as u16 * 16),
+        tail_payload_bytes: 96 + (((seed >> 3) & 0b11) as u16 * 16),
+    }
+}
+
+async fn run_pressure_runtime_chaos_scenario(
+    scenario: PressureRuntimeChaosScenario,
+) -> PressureRuntimeChaosOutcome {
+    let scheduler: Arc<dyn Scheduler> =
+        Arc::new(PressureRuntimeChaosScheduler { minimum_rate: 16 });
+    let clock = Arc::new(StubClock::default());
+    let durability = scenario.durability.actual();
+    let (deployment, _maintenance_path) = whole_system_deployment();
+    let manager = deployment.resource_manager();
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let runtime = TestRuntimeHandle::new(
+        file_system.clone(),
+        object_store.clone(),
+        clock.clone(),
+        scheduler.clone(),
+        durability,
+    );
+    let label = scenario.durability.label();
+    let primary_root = format!(
+        "/execution-pressure-chaos-primary-{label}-{:x}",
+        scenario.seed
+    );
+    let analytics_root = format!(
+        "/execution-pressure-chaos-analytics-{label}-{:x}",
+        scenario.seed
+    );
+    let warehouse_root = format!(
+        "/execution-pressure-chaos-warehouse-{label}-{:x}",
+        scenario.seed
+    );
+
+    let primary =
+        open_deployed_db_with_runtime(&deployment, "primary", &primary_root, &runtime).await;
+    let analytics =
+        open_deployed_db_with_runtime(&deployment, "analytics", &analytics_root, &runtime).await;
+    let warehouse =
+        open_deployed_db_with_runtime(&deployment, "warehouse", &warehouse_root, &runtime).await;
+
+    let primary_events = primary
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create primary events table");
+    let analytics_events = analytics
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create analytics events table");
+    let warehouse_events = warehouse
+        .create_table(row_table_config("events"))
+        .await
+        .expect("create warehouse events table");
+
+    for (table, key, value) in [
+        (
+            primary_events.clone(),
+            b"bootstrap".to_vec(),
+            format!("primary-bootstrap-{:04x}", scenario.seed).into_bytes(),
+        ),
+        (
+            analytics_events.clone(),
+            b"bootstrap".to_vec(),
+            format!("analytics-bootstrap-{:04x}", scenario.seed).into_bytes(),
+        ),
+        (
+            warehouse_events.clone(),
+            b"bootstrap".to_vec(),
+            format!("warehouse-bootstrap-{:04x}", scenario.seed).into_bytes(),
+        ),
+    ] {
+        table
+            .write(key, Value::bytes(value))
+            .await
+            .expect("write bootstrap row");
+    }
+    primary.flush().await.expect("flush primary bootstrap");
+    analytics.flush().await.expect("flush analytics bootstrap");
+    warehouse.flush().await.expect("flush warehouse bootstrap");
+
+    let analytics_foreground = analytics
+        .execution_placement_report()
+        .foreground
+        .binding
+        .domain;
+    let stalled_value = vec![b's'; scenario.stalled_payload_bytes as usize];
+    analytics_events
+        .write(b"stalled".to_vec(), Value::Bytes(stalled_value.clone()))
+        .await
+        .expect("write analytics row before stalled flush");
+
+    let flush_pause = analytics.__failpoint_registry().arm_pause(
+        terracedb::failpoints::names::DB_FLUSH_INPUTS_MARKED_FLUSHING,
+        terracedb::FailpointMode::Once,
+    );
+    let stalled_flush = tokio::spawn({
+        let db = analytics.clone();
+        async move { db.flush().await }
+    });
+    ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_failpoint_hit(&flush_pause)
+        .await;
+
+    update_domain_spec(&manager, &analytics_foreground, |spec| {
+        spec.budget.memory.mutable_bytes = Some(scenario.analytics_mutable_budget);
+    });
+    file_system.inject_failure(FileSystemFailure::timeout(
+        FileSystemOperation::SyncDir,
+        format!("{analytics_root}/manifest"),
+    ));
+
+    let control_table = format!("audit_pressure_{:04x}", scenario.seed);
+    primary
+        .create_table(row_table_config(&control_table))
+        .await
+        .expect("control-plane progress should succeed while analytics flush is stalled");
+    primary
+        .flush()
+        .await
+        .expect("flush protected control-plane progress");
+
+    flush_pause.release();
+    ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&stalled_flush)
+        .await;
+    stalled_flush
+        .await
+        .expect("stalled flush task should finish")
+        .expect_err("first stalled analytics flush should fail");
+    analytics
+        .flush()
+        .await
+        .expect("retry stalled analytics flush");
+
+    let primary_tail_value = vec![b'p'; scenario.tail_payload_bytes as usize];
+    let analytics_tail_value = vec![b'a'; scenario.tail_payload_bytes as usize];
+    let fast_write = tokio::spawn({
+        let table = primary_events.clone();
+        let value = primary_tail_value.clone();
+        async move {
+            table
+                .write(b"primary-tail".to_vec(), Value::Bytes(value))
+                .await
+        }
+    });
+    let slow_write = tokio::spawn({
+        let table = analytics_events.clone();
+        let value = analytics_tail_value.clone();
+        async move {
+            table
+                .write(b"analytics-tail".to_vec(), Value::Bytes(value))
+                .await
+        }
+    });
+
+    let fast_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&fast_write)
+        .await;
+    let slow_write_lagged_primary = !slow_write.is_finished();
+    fast_write
+        .await
+        .expect("primary tail task should finish")
+        .expect("primary tail write should succeed");
+    let slow_elapsed = ClockProgressProbe::new(clock.as_ref(), Duration::from_millis(25), 512)
+        .wait_for_task(&slow_write)
+        .await;
+    slow_write
+        .await
+        .expect("analytics tail task should finish")
+        .expect("analytics tail write should succeed");
+
+    let analytics_throttled_writes = analytics
+        .scheduler_observability_snapshot()
+        .throttled_writes_by_domain
+        .get(&analytics_foreground)
+        .copied()
+        .unwrap_or_default();
+    assert!(
+        slow_elapsed > fast_elapsed,
+        "tightened analytics budget should add virtual delay: fast={fast_elapsed}ms slow={slow_elapsed}ms"
+    );
+
+    file_system.crash();
+    drop(primary_events);
+    drop(analytics_events);
+    drop(warehouse_events);
+    drop(primary);
+    drop(analytics);
+    drop(warehouse);
+
+    let reopened_runtime = TestRuntimeHandle::new(
+        file_system.clone(),
+        object_store.clone(),
+        Arc::new(StubClock::default()),
+        Arc::new(PressureRuntimeChaosScheduler { minimum_rate: 16 }),
+        durability,
+    );
+    let reopened_primary =
+        open_deployed_db_with_runtime(&deployment, "primary", &primary_root, &reopened_runtime)
+            .await;
+    let reopened_analytics =
+        open_deployed_db_with_runtime(&deployment, "analytics", &analytics_root, &reopened_runtime)
+            .await;
+    let reopened_warehouse =
+        open_deployed_db_with_runtime(&deployment, "warehouse", &warehouse_root, &reopened_runtime)
+            .await;
+
+    let reopened_primary_events = reopened_primary.table("events");
+    let reopened_analytics_events = reopened_analytics.table("events");
+    let _ = reopened_warehouse.table("events");
+    PressureRuntimeChaosOutcome {
+        control_table_present: reopened_primary.try_table(control_table).is_some(),
+        stalled_row_present: reopened_analytics_events
+            .read(b"stalled".to_vec())
+            .await
+            .expect("read retried stalled analytics row")
+            == Some(Value::Bytes(stalled_value)),
+        primary_tail_present: reopened_primary_events
+            .read(b"primary-tail".to_vec())
+            .await
+            .expect("read primary tail after reopen")
+            == Some(Value::Bytes(primary_tail_value)),
+        analytics_tail_present: reopened_analytics_events
+            .read(b"analytics-tail".to_vec())
+            .await
+            .expect("read analytics tail after reopen")
+            == Some(Value::Bytes(analytics_tail_value)),
+        analytics_budget_after_reopen: manager.snapshot().domains[&analytics_foreground]
+            .spec
+            .budget
+            .memory
+            .mutable_bytes,
+        analytics_throttled_writes,
+        slow_write_lagged_primary,
+    }
+}
+
+fn assert_pressure_runtime_chaos_outcome(
+    scenario: &PressureRuntimeChaosScenario,
+    outcome: &PressureRuntimeChaosOutcome,
+) {
+    assert!(
+        outcome.control_table_present,
+        "seed {:#x} should preserve protected control-plane progress during the stalled flush",
+        scenario.seed
+    );
+    assert!(
+        outcome.stalled_row_present,
+        "seed {:#x} should recover the retried analytics row after the injected flush failure",
+        scenario.seed
+    );
+    assert_eq!(
+        outcome.primary_tail_present,
+        scenario.durability.tail_survives_crash(),
+        "seed {:#x} should keep primary tail durability aligned with {:?}",
+        scenario.seed,
+        scenario.durability
+    );
+    assert_eq!(
+        outcome.analytics_tail_present,
+        scenario.durability.tail_survives_crash(),
+        "seed {:#x} should keep analytics tail durability aligned with {:?}",
+        scenario.seed,
+        scenario.durability
+    );
+    assert_eq!(
+        outcome.analytics_budget_after_reopen,
+        Some(scenario.analytics_mutable_budget),
+        "seed {:#x} should preserve the tightened analytics mutable budget",
+        scenario.seed
+    );
+    assert!(
+        outcome.analytics_throttled_writes > 0,
+        "seed {:#x} should record analytics throttling under the tightened budget",
+        scenario.seed
+    );
+    assert!(
+        outcome.slow_write_lagged_primary,
+        "seed {:#x} should keep the throttled analytics tail slower than the primary tail",
+        scenario.seed
+    );
+}
+
+#[tokio::test]
+async fn pressure_runtime_chaos_suite_preserves_recovery_and_protected_progress() {
+    for seed in [0x7601_u64, 0x7602] {
+        let scenario = generate_pressure_runtime_chaos_scenario(seed);
+        let outcome = run_pressure_runtime_chaos_scenario(scenario.clone()).await;
+        assert_pressure_runtime_chaos_outcome(&scenario, &outcome);
+    }
+}
+
+#[tokio::test]
+#[ignore = "slow pressure runtime chaos seed matrix"]
+async fn pressure_runtime_chaos_seed_matrix() {
+    for seed in [0x7603_u64, 0x7604, 0x7605, 0x7606] {
+        let scenario = generate_pressure_runtime_chaos_scenario(seed);
+        let outcome = run_pressure_runtime_chaos_scenario(scenario.clone()).await;
+        assert_pressure_runtime_chaos_outcome(&scenario, &outcome);
+    }
 }
 
 #[tokio::test]

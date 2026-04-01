@@ -26,7 +26,8 @@ use terracedb::{
     WorkPlacementRequest,
 };
 use terracedb_fuzz::{
-    DbScenarioHarness, SeedCampaign, assert_seed_replays, assert_seed_variation, run_campaign,
+    DbScenarioHarness, GeneratedScenarioHarness, SeedCampaign, assert_seed_replays,
+    assert_seed_variation, run_campaign,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
@@ -468,6 +469,59 @@ struct WholeSystemSimulationCampaignOutcome {
     admissions: BTreeMap<String, bool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PressureFuzzDurabilityMode {
+    Deferred,
+    GroupCommit,
+}
+
+impl PressureFuzzDurabilityMode {
+    fn actual(self) -> TieredDurabilityMode {
+        match self {
+            Self::Deferred => TieredDurabilityMode::Deferred,
+            Self::GroupCommit => TieredDurabilityMode::GroupCommit,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Deferred => "deferred",
+            Self::GroupCommit => "group",
+        }
+    }
+
+    fn tail_survives_crash(self) -> bool {
+        matches!(self, Self::GroupCommit)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PressureWholeSystemFuzzScenario {
+    seed: u64,
+    durability: PressureFuzzDurabilityMode,
+    analytics_mutable_budget: u64,
+    stalled_payload_bytes: u16,
+    tail_payload_bytes: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PressureWholeSystemFuzzOutcome {
+    durable_rows_by_db: DurableRowsByDb,
+    progress_transitions_by_db: BTreeMap<String, Vec<PublishedDbProgressFrontier>>,
+    visible_sequence_by_db: BTreeMap<String, u64>,
+    durable_sequence_by_db: BTreeMap<String, u64>,
+    throttled_writes_by_domain: BTreeMap<String, u64>,
+    control_table_present: bool,
+    stalled_row_present: bool,
+    primary_tail_present: bool,
+    analytics_tail_present: bool,
+    observed_analytics_throttle: bool,
+    observed_deferred_gap_before_crash: bool,
+    analytics_budget_after_reopen: Option<u64>,
+}
+
+struct PressureWholeSystemFuzzHarness;
+
 #[derive(Clone, Debug)]
 struct WholeSystemCampaignRng {
     state: u64,
@@ -575,6 +629,52 @@ impl Scheduler for MutableBudgetThrottleSimulationScheduler {
         }
 
         ThrottleDecision::default()
+    }
+}
+
+#[derive(Debug)]
+struct PressureFuzzSimulationScheduler {
+    minimum_rate: u64,
+}
+
+impl Scheduler for PressureFuzzSimulationScheduler {
+    fn on_work_available(&self, _work: &[PendingWork]) -> Vec<ScheduleDecision> {
+        Vec::new()
+    }
+
+    fn should_throttle(&self, _table: &terracedb::Table, _stats: &TableStats) -> ThrottleDecision {
+        ThrottleDecision::default()
+    }
+
+    fn admission_decision_in_domain(
+        &self,
+        _table: &terracedb::Table,
+        _stats: &TableStats,
+        signals: &terracedb::AdmissionSignals,
+        tag: &terracedb::WorkRuntimeTag,
+        domain_budget: Option<&ExecutionDomainBudget>,
+    ) -> ThrottleDecision {
+        if tag.durability_class == DurabilityClass::ControlPlane {
+            return ThrottleDecision::default();
+        }
+
+        let Some(limit) = domain_budget.and_then(|budget| budget.memory.mutable_bytes) else {
+            return ThrottleDecision::default();
+        };
+        let projected_bytes = signals
+            .pressure
+            .local
+            .mutable_dirty_bytes
+            .saturating_add(signals.batch_write_bytes);
+        if projected_bytes < limit {
+            return ThrottleDecision::default();
+        }
+
+        ThrottleDecision {
+            throttle: true,
+            max_write_bytes_per_second: Some(limit.max(self.minimum_rate)),
+            stall: false,
+        }
     }
 }
 
@@ -1562,6 +1662,443 @@ fn run_simulated_whole_system_execution_domain_seed(
         .run_with(move |context| async move {
             run_simulated_whole_system_execution_domain_campaign(&context, seed).await
         })
+}
+
+fn generate_pressure_whole_system_fuzz_scenario(seed: u64) -> PressureWholeSystemFuzzScenario {
+    PressureWholeSystemFuzzScenario {
+        seed,
+        durability: if seed & 1 == 0 {
+            PressureFuzzDurabilityMode::Deferred
+        } else {
+            PressureFuzzDurabilityMode::GroupCommit
+        },
+        analytics_mutable_budget: if (seed >> 1) & 1 == 0 { 32 } else { 48 },
+        stalled_payload_bytes: 96 + (((seed >> 2) & 1) as u16 * 16),
+        tail_payload_bytes: 96 + (((seed >> 3) & 0b11) as u16 * 16),
+    }
+}
+
+impl GeneratedScenarioHarness for PressureWholeSystemFuzzHarness {
+    type Scenario = PressureWholeSystemFuzzScenario;
+    type Outcome = PressureWholeSystemFuzzOutcome;
+    type Error = Box<dyn std::error::Error>;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        generate_pressure_whole_system_fuzz_scenario(seed)
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        run_pressure_whole_system_fuzz_scenario(scenario)
+    }
+}
+
+fn run_pressure_whole_system_fuzz_scenario(
+    scenario: PressureWholeSystemFuzzScenario,
+) -> turmoil::Result<PressureWholeSystemFuzzOutcome> {
+    SeededSimulationRunner::new(scenario.seed)
+        .with_simulation_duration(Duration::from_secs(20))
+        .run_with(move |context| async move {
+            let scheduler: Arc<dyn Scheduler> =
+                Arc::new(PressureFuzzSimulationScheduler { minimum_rate: 16 });
+            let durability = scenario.durability.actual();
+            let (deployment, _maintenance_path) = whole_system_simulation_deployment();
+            let manager = deployment.resource_manager();
+            let label = scenario.durability.label();
+            let primary_root = format!(
+                "/terracedb/sim/pressure-fuzz-primary-{label}-{:x}",
+                scenario.seed
+            );
+            let analytics_root = format!(
+                "/terracedb/sim/pressure-fuzz-analytics-{label}-{:x}",
+                scenario.seed
+            );
+            let warehouse_root = format!(
+                "/terracedb/sim/pressure-fuzz-warehouse-{label}-{:x}",
+                scenario.seed
+            );
+
+            let primary = open_simulated_deployed_db(
+                &deployment,
+                "primary",
+                &primary_root,
+                &context,
+                scheduler.clone(),
+                durability,
+            )
+            .await?;
+            let analytics = open_simulated_deployed_db(
+                &deployment,
+                "analytics",
+                &analytics_root,
+                &context,
+                scheduler.clone(),
+                durability,
+            )
+            .await?;
+            let warehouse = open_simulated_deployed_db(
+                &deployment,
+                "warehouse",
+                &warehouse_root,
+                &context,
+                scheduler.clone(),
+                durability,
+            )
+            .await?;
+
+            let primary_events = primary
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let analytics_events = analytics
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+            let warehouse_events = warehouse
+                .create_table(SimulationTableSpec::row("events").table_config())
+                .await?;
+
+            let mut primary_progress = primary.subscribe_progress();
+            let mut analytics_progress = analytics.subscribe_progress();
+            let mut warehouse_progress = warehouse.subscribe_progress();
+            let mut progress_transitions_by_db = BTreeMap::new();
+
+            for (name, db, table, value) in [
+                (
+                    "primary",
+                    &primary,
+                    &primary_events,
+                    format!("primary-bootstrap-{:04x}", scenario.seed).into_bytes(),
+                ),
+                (
+                    "analytics",
+                    &analytics,
+                    &analytics_events,
+                    format!("analytics-bootstrap-{:04x}", scenario.seed).into_bytes(),
+                ),
+                (
+                    "warehouse",
+                    &warehouse,
+                    &warehouse_events,
+                    format!("warehouse-bootstrap-{:04x}", scenario.seed).into_bytes(),
+                ),
+            ] {
+                let sequence = table
+                    .write(b"bootstrap".to_vec(), Value::bytes(value))
+                    .await?;
+                let progress = match name {
+                    "primary" => &mut primary_progress,
+                    "analytics" => &mut analytics_progress,
+                    "warehouse" => &mut warehouse_progress,
+                    _ => unreachable!("bootstrap only targets declared databases"),
+                };
+                let visible = wait_for_visible_progress(progress, sequence).await;
+                record_campaign_progress(&mut progress_transitions_by_db, name, &visible);
+                db.flush().await?;
+                let durable_snapshot = wait_for_durable_progress(progress, sequence).await;
+                record_campaign_progress(&mut progress_transitions_by_db, name, &durable_snapshot);
+            }
+
+            let analytics_foreground = analytics
+                .execution_placement_report()
+                .foreground
+                .binding
+                .domain;
+            let stalled_key = format!("stalled-{:04x}", scenario.seed).into_bytes();
+            let stalled_value = vec![b's'; scenario.stalled_payload_bytes as usize];
+            let stalled_sequence = analytics_events
+                .write(stalled_key.clone(), Value::Bytes(stalled_value.clone()))
+                .await?;
+            let stalled_visible =
+                wait_for_visible_progress(&mut analytics_progress, stalled_sequence).await;
+            record_campaign_progress(
+                &mut progress_transitions_by_db,
+                "analytics",
+                &stalled_visible,
+            );
+
+            let flush_pause = analytics.__failpoint_registry().arm_pause(
+                terracedb::failpoints::names::DB_FLUSH_INPUTS_MARKED_FLUSHING,
+                terracedb::FailpointMode::Once,
+            );
+            let flush_db = analytics.clone();
+            let stalled_flush = tokio::spawn(async move { flush_db.flush().await });
+            flush_pause.wait_until_hit().await;
+
+            update_simulation_domain_spec(&manager, &analytics_foreground, |spec| {
+                spec.budget.memory.mutable_bytes = Some(scenario.analytics_mutable_budget);
+            });
+            context
+                .file_system()
+                .inject_failure(FileSystemFailure::timeout(
+                    FileSystemOperation::SyncDir,
+                    format!("{analytics_root}/manifest"),
+                ));
+
+            let control_table = format!("audit_pressure_{:04x}", scenario.seed);
+            primary
+                .create_table(SimulationTableSpec::row(&control_table).table_config())
+                .await?;
+            primary.flush().await?;
+            let primary_control_progress =
+                wait_for_durable_progress(&mut primary_progress, primary.current_sequence()).await;
+            record_campaign_progress(
+                &mut progress_transitions_by_db,
+                "primary",
+                &primary_control_progress,
+            );
+
+            flush_pause.release();
+            stalled_flush
+                .await
+                .expect("join stalled analytics flush")
+                .expect_err("first stalled analytics flush should fail");
+            analytics.flush().await?;
+            let analytics_durable =
+                wait_for_durable_progress(&mut analytics_progress, stalled_sequence).await;
+            record_campaign_progress(
+                &mut progress_transitions_by_db,
+                "analytics",
+                &analytics_durable,
+            );
+
+            let primary_tail_value = vec![b'p'; scenario.tail_payload_bytes as usize];
+            let analytics_tail_value = vec![b'a'; scenario.tail_payload_bytes as usize];
+            let primary_tail = tokio::spawn({
+                let table = primary_events.clone();
+                let value = primary_tail_value.clone();
+                async move {
+                    table
+                        .write(b"primary-tail".to_vec(), Value::Bytes(value))
+                        .await
+                }
+            });
+            let analytics_tail = tokio::spawn({
+                let table = analytics_events.clone();
+                let value = analytics_tail_value.clone();
+                async move {
+                    table
+                        .write(b"analytics-tail".to_vec(), Value::Bytes(value))
+                        .await
+                }
+            });
+
+            let primary_tail_sequence = primary_tail.await.expect("join primary tail")?;
+            let primary_tail_visible =
+                wait_for_visible_progress(&mut primary_progress, primary_tail_sequence).await;
+            record_campaign_progress(
+                &mut progress_transitions_by_db,
+                "primary",
+                &primary_tail_visible,
+            );
+            let analytics_tail_sequence = analytics_tail.await.expect("join analytics tail")?;
+            let analytics_tail_visible =
+                wait_for_visible_progress(&mut analytics_progress, analytics_tail_sequence).await;
+            record_campaign_progress(
+                &mut progress_transitions_by_db,
+                "analytics",
+                &analytics_tail_visible,
+            );
+            let observed_deferred_gap_before_crash = [primary_tail_visible, analytics_tail_visible]
+                .into_iter()
+                .any(|snapshot| snapshot.current_sequence > snapshot.durable_sequence);
+
+            let mut throttled_writes_by_domain = BTreeMap::new();
+            for db in [&primary, &analytics, &warehouse] {
+                for (path, count) in db
+                    .scheduler_observability_snapshot()
+                    .throttled_writes_by_domain
+                {
+                    *throttled_writes_by_domain
+                        .entry(path.as_string())
+                        .or_insert(0) += count;
+                }
+            }
+            let observed_analytics_throttle = throttled_writes_by_domain
+                .get(&analytics_foreground.as_string())
+                .copied()
+                .unwrap_or_default()
+                > 0;
+
+            context.crash_filesystem(CutPoint::AfterStep);
+            drop(primary_events);
+            drop(analytics_events);
+            drop(warehouse_events);
+            drop(primary);
+            drop(analytics);
+            drop(warehouse);
+
+            let reopened_scheduler: Arc<dyn Scheduler> =
+                Arc::new(PressureFuzzSimulationScheduler { minimum_rate: 16 });
+            let reopened_primary = open_simulated_deployed_db(
+                &deployment,
+                "primary",
+                &primary_root,
+                &context,
+                reopened_scheduler.clone(),
+                durability,
+            )
+            .await?;
+            let reopened_analytics = open_simulated_deployed_db(
+                &deployment,
+                "analytics",
+                &analytics_root,
+                &context,
+                reopened_scheduler.clone(),
+                durability,
+            )
+            .await?;
+            let reopened_warehouse = open_simulated_deployed_db(
+                &deployment,
+                "warehouse",
+                &warehouse_root,
+                &context,
+                reopened_scheduler,
+                durability,
+            )
+            .await?;
+
+            let reopened_primary_events = reopened_primary.table("events");
+            let reopened_analytics_events = reopened_analytics.table("events");
+            let durable_rows_by_db = BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    read_existing_event_rows(&reopened_primary).await,
+                ),
+                (
+                    "analytics".to_string(),
+                    read_existing_event_rows(&reopened_analytics).await,
+                ),
+                (
+                    "warehouse".to_string(),
+                    read_existing_event_rows(&reopened_warehouse).await,
+                ),
+            ]);
+            Ok(PressureWholeSystemFuzzOutcome {
+                durable_rows_by_db,
+                progress_transitions_by_db,
+                visible_sequence_by_db: BTreeMap::from([
+                    (
+                        "primary".to_string(),
+                        reopened_primary.current_sequence().get(),
+                    ),
+                    (
+                        "analytics".to_string(),
+                        reopened_analytics.current_sequence().get(),
+                    ),
+                    (
+                        "warehouse".to_string(),
+                        reopened_warehouse.current_sequence().get(),
+                    ),
+                ]),
+                durable_sequence_by_db: BTreeMap::from([
+                    (
+                        "primary".to_string(),
+                        reopened_primary.current_durable_sequence().get(),
+                    ),
+                    (
+                        "analytics".to_string(),
+                        reopened_analytics.current_durable_sequence().get(),
+                    ),
+                    (
+                        "warehouse".to_string(),
+                        reopened_warehouse.current_durable_sequence().get(),
+                    ),
+                ]),
+                throttled_writes_by_domain,
+                control_table_present: reopened_primary.try_table(control_table.clone()).is_some(),
+                stalled_row_present: reopened_analytics_events.read(stalled_key).await?
+                    == Some(Value::Bytes(stalled_value)),
+                primary_tail_present: reopened_primary_events
+                    .read(b"primary-tail".to_vec())
+                    .await?
+                    == Some(Value::Bytes(primary_tail_value)),
+                analytics_tail_present: reopened_analytics_events
+                    .read(b"analytics-tail".to_vec())
+                    .await?
+                    == Some(Value::Bytes(analytics_tail_value)),
+                observed_analytics_throttle,
+                observed_deferred_gap_before_crash,
+                analytics_budget_after_reopen: manager.snapshot().domains[&analytics_foreground]
+                    .spec
+                    .budget
+                    .memory
+                    .mutable_bytes,
+            })
+        })
+}
+
+fn assert_pressure_whole_system_fuzz_outcome(
+    scenario: &PressureWholeSystemFuzzScenario,
+    outcome: &PressureWholeSystemFuzzOutcome,
+) {
+    assert!(
+        outcome.control_table_present,
+        "seed {:#x} should preserve protected control-plane progress across the stalled flush",
+        scenario.seed
+    );
+    assert!(
+        outcome.stalled_row_present,
+        "seed {:#x} should recover the retried stalled analytics row",
+        scenario.seed
+    );
+    assert!(
+        outcome.observed_analytics_throttle,
+        "seed {:#x} should publish analytics throttling after the mutable budget tightens",
+        scenario.seed
+    );
+    assert_eq!(
+        outcome.analytics_budget_after_reopen,
+        Some(scenario.analytics_mutable_budget),
+        "seed {:#x} should preserve the tightened analytics mutable budget",
+        scenario.seed
+    );
+    assert_eq!(
+        outcome.primary_tail_present,
+        scenario.durability.tail_survives_crash(),
+        "seed {:#x} should keep primary tail visibility aligned with {:?} durability",
+        scenario.seed,
+        scenario.durability
+    );
+    assert_eq!(
+        outcome.analytics_tail_present,
+        scenario.durability.tail_survives_crash(),
+        "seed {:#x} should keep analytics tail visibility aligned with {:?} durability",
+        scenario.seed,
+        scenario.durability
+    );
+    assert_eq!(
+        outcome.visible_sequence_by_db["primary"], outcome.durable_sequence_by_db["primary"],
+        "seed {:#x} should reopen primary at a durable frontier",
+        scenario.seed
+    );
+    assert_eq!(
+        outcome.visible_sequence_by_db["analytics"], outcome.durable_sequence_by_db["analytics"],
+        "seed {:#x} should reopen analytics at a durable frontier",
+        scenario.seed
+    );
+    assert_eq!(
+        outcome.visible_sequence_by_db["warehouse"], outcome.durable_sequence_by_db["warehouse"],
+        "seed {:#x} should reopen warehouse at a durable frontier",
+        scenario.seed
+    );
+    if scenario.durability == PressureFuzzDurabilityMode::Deferred {
+        assert!(
+            outcome.observed_deferred_gap_before_crash,
+            "seed {:#x} should publish an in-flight visible>durable gap before the deferred crash",
+            scenario.seed
+        );
+    } else {
+        assert!(
+            !outcome.observed_deferred_gap_before_crash,
+            "seed {:#x} should not publish a deferred-only durable gap under group commit",
+            scenario.seed
+        );
+    }
+    for db_name in ["primary", "analytics", "warehouse"] {
+        assert!(
+            !outcome.progress_transitions_by_db[db_name].is_empty(),
+            "seed {:#x} should publish progress transitions for {db_name}",
+            scenario.seed
+        );
+    }
 }
 
 async fn collect_change_feed(stream: terracedb::ChangeStream) -> Vec<DbOracleChange> {
@@ -4341,6 +4878,48 @@ fn simulation_db_progress_subscription_tracks_visible_then_durable_frontiers() -
 
             Ok(())
         })
+}
+
+#[test]
+fn pressure_whole_system_simulation_fuzz_seed_0x7601_replays() -> turmoil::Result {
+    let replay = assert_seed_replays(&PressureWholeSystemFuzzHarness, 0x7601)?;
+    assert_pressure_whole_system_fuzz_outcome(&replay.scenario, &replay.outcome);
+    Ok(())
+}
+
+#[test]
+fn pressure_whole_system_simulation_fuzz_seed_variation_changes_shape() -> turmoil::Result {
+    let _ = assert_seed_variation(
+        &PressureWholeSystemFuzzHarness,
+        0x7601,
+        0x7602,
+        |left, right| {
+            left.scenario != right.scenario
+                || left.outcome.primary_tail_present != right.outcome.primary_tail_present
+                || left.outcome.analytics_budget_after_reopen
+                    != right.outcome.analytics_budget_after_reopen
+        },
+    )?;
+    Ok(())
+}
+
+#[test]
+fn pressure_whole_system_simulation_fuzz_seed_campaign_is_reproducible() -> turmoil::Result {
+    let campaign = SeedCampaign::new([0x7601_u64, 0x7602, 0x7603]);
+    let first_pass = run_campaign(&PressureWholeSystemFuzzHarness, &campaign)?
+        .into_iter()
+        .map(|capture| {
+            assert_pressure_whole_system_fuzz_outcome(&capture.scenario, &capture.outcome);
+            (capture.seed, capture.outcome)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let second_pass = run_campaign(&PressureWholeSystemFuzzHarness, &campaign)?
+        .into_iter()
+        .map(|capture| (capture.seed, capture.outcome))
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(first_pass, second_pass);
+    Ok(())
 }
 
 #[test]
