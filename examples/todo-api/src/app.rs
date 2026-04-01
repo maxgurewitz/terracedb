@@ -61,6 +61,7 @@ type RecentTodosTable = RecordTable<u64, TodoRecord, BigEndianU64Codec, JsonValu
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TodoAppOptions {
     pub planner_schedule: PlannerSchedule,
+    pub planner_initial_fire_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -228,6 +229,7 @@ impl TodoApp {
         };
 
         let planner_schedule = options.planner_schedule;
+        let planner_initial_fire_at_ms = options.planner_initial_fire_at_ms;
         let workflow_runtime = RecurringWorkflowRuntime::open(
             db.clone(),
             clock.clone(),
@@ -236,9 +238,9 @@ impl TodoApp {
                 PLANNER_INSTANCE_ID,
                 RecurringSchedule::custom(
                     move |now| {
-                        Some(Timestamp::new(
-                            planner_schedule.next_week_start_ms(now.get()),
-                        ))
+                        Some(Timestamp::new(planner_initial_fire_at_ms.unwrap_or_else(
+                            || planner_schedule.next_week_start_ms(now.get()),
+                        )))
                     },
                     move |_state, fire_at| {
                         Some(Timestamp::new(

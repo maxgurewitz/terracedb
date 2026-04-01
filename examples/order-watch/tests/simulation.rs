@@ -51,6 +51,7 @@ use terracedb_workflows::{
     WorkflowHandlerError, WorkflowObjectStoreCheckpointStore, WorkflowOutput, WorkflowRuntime,
     WorkflowSource, WorkflowSourceAttachMode, WorkflowSourceConfig, WorkflowSourceProgress,
     WorkflowSourceRecoveryPolicy, WorkflowStateMutation, WorkflowTrigger,
+    contracts::{WorkflowPayload, WorkflowStateRecord},
     failpoints as workflow_failpoints,
 };
 
@@ -427,6 +428,15 @@ fn decode_state_count(state: Option<Value>) -> usize {
             .expect("workflow state should encode a count"),
         Some(Value::Record(_)) => panic!("order-watch only stores byte workflow state"),
     }
+}
+
+fn encode_versioned_workflow_contract<T: serde::Serialize>(value: &T) -> Value {
+    let mut bytes = vec![1];
+    bytes.extend(
+        serde_json::to_vec(value)
+            .expect("workflow contract value should serialize deterministically"),
+    );
+    Value::bytes(bytes)
 }
 
 fn debezium_key(id: &str) -> Vec<u8> {
@@ -3403,6 +3413,10 @@ async fn order_watch_checkpoint_restore_recovers_saved_state_and_outbox() -> Res
     workflow_handle.shutdown().await?;
 
     let saved_state = workflow_runtime.load_state(BACKLOG_ALERT_ORDER_ID).await?;
+    let saved_state_record = workflow_runtime
+        .load_state_record(BACKLOG_ALERT_ORDER_ID)
+        .await?
+        .expect("saved workflow state record should exist");
     let saved_progress = workflow_runtime
         .load_source_progress(attention_transitions.table())
         .await?;
@@ -3418,7 +3432,10 @@ async fn order_watch_checkpoint_restore_recovers_saved_state_and_outbox() -> Res
         .state_table()
         .write(
             BACKLOG_ALERT_ORDER_ID.as_bytes().to_vec(),
-            Value::bytes(b"mutated".to_vec()),
+            encode_versioned_workflow_contract(&WorkflowStateRecord {
+                state: Some(WorkflowPayload::bytes("mutated")),
+                ..saved_state_record
+            }),
         )
         .await?;
     workflow_runtime

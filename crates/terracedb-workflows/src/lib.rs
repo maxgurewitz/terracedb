@@ -29,7 +29,13 @@ use terracedb::{
 
 pub mod failpoints;
 pub mod transition_engine;
+mod run_model;
 
+pub use run_model::{
+    InMemoryWorkflowRunStore, WorkflowHistoryRecord, WorkflowReductionPlan, WorkflowRunBuilder,
+    WorkflowRunRecord, WorkflowTransitionReducer, default_native_bundle_id, default_run_id,
+    default_task_id,
+};
 pub use terracedb_workflows_core as contracts;
 pub use terracedb_workflows_sandbox as sandbox_contracts;
 
@@ -56,6 +62,8 @@ const TRIGGER_JOURNAL_ENTRY_PREFIX: u8 = 0;
 const TRIGGER_JOURNAL_HEAD_KEY: &[u8] = &[0xff];
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
+const WORKFLOW_PAYLOAD_ENCODING_BYTES: &str = "application/octet-stream";
+const WORKFLOW_PAYLOAD_ENCODING_JSON: &str = "application/vnd.terracedb.value+json";
 
 fn workflow_trigger_kind(trigger: &WorkflowTrigger) -> &'static str {
     match trigger {
@@ -821,7 +829,11 @@ impl std::fmt::Display for WorkflowCheckpointId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkflowCheckpointArtifactKind {
+    Runs,
     State,
+    History,
+    Lifecycle,
+    Visibility,
     Inbox,
     TriggerOrder,
     SourceProgress,
@@ -834,7 +846,11 @@ pub enum WorkflowCheckpointArtifactKind {
 impl WorkflowCheckpointArtifactKind {
     pub fn filename_stem(self) -> &'static str {
         match self {
+            Self::Runs => "runs",
             Self::State => "state",
+            Self::History => "history",
+            Self::Lifecycle => "lifecycle",
+            Self::Visibility => "visibility",
             Self::Inbox => "inbox",
             Self::TriggerOrder => "trigger-order",
             Self::SourceProgress => "source-progress",
@@ -1538,7 +1554,11 @@ impl WorkflowScheduler for RoundRobinWorkflowScheduler {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowTableNames {
+    pub runs: String,
     pub state: String,
+    pub history: String,
+    pub lifecycle: String,
+    pub visibility: String,
     pub inbox: String,
     pub trigger_order: String,
     pub source_cursors: String,
@@ -1552,7 +1572,11 @@ impl WorkflowTableNames {
     pub fn for_workflow(name: &str) -> Self {
         let prefix = format!("{WORKFLOW_TABLE_PREFIX}{name}");
         Self {
+            runs: format!("{prefix}_runs"),
             state: format!("{prefix}_state"),
+            history: format!("{prefix}_history"),
+            lifecycle: format!("{prefix}_lifecycle"),
+            visibility: format!("{prefix}_visibility"),
             inbox: format!("{prefix}_inbox"),
             trigger_order: format!("{prefix}_trigger_order"),
             source_cursors: format!("{prefix}_source_cursors"),
@@ -1566,7 +1590,11 @@ impl WorkflowTableNames {
 
 #[derive(Clone, Debug)]
 pub struct WorkflowTables {
+    runs: Table,
     state: Table,
+    history: Table,
+    lifecycle: Table,
+    visibility: Table,
     inbox: Table,
     trigger_order: Table,
     source_cursors: Table,
@@ -1576,8 +1604,24 @@ pub struct WorkflowTables {
 }
 
 impl WorkflowTables {
+    pub fn run_table(&self) -> &Table {
+        &self.runs
+    }
+
     pub fn state_table(&self) -> &Table {
         &self.state
+    }
+
+    pub fn history_table(&self) -> &Table {
+        &self.history
+    }
+
+    pub fn lifecycle_table(&self) -> &Table {
+        &self.lifecycle
+    }
+
+    pub fn visibility_table(&self) -> &Table {
+        &self.visibility
     }
 
     pub fn inbox_table(&self) -> &Table {
@@ -1770,6 +1814,7 @@ struct WorkflowRuntimeInner<H> {
     sources: Vec<WorkflowSource>,
     handler: Arc<H>,
     scheduler: Arc<dyn WorkflowScheduler>,
+    reducer: WorkflowTransitionReducer,
     tables: WorkflowTables,
     checkpoint_store: Option<Arc<dyn WorkflowCheckpointStore>>,
     timer_poll_interval: Duration,
@@ -1821,6 +1866,7 @@ where
                     sources: definition.sources,
                     handler: Arc::new(definition.handler),
                     scheduler,
+                    reducer: WorkflowTransitionReducer::default(),
                     checkpoint_store: definition.checkpoint_store,
                     tables,
                     timer_poll_interval: definition.timer_poll_interval,
@@ -1851,13 +1897,76 @@ where
         self.inner.checkpoint_store.as_ref()
     }
 
+    pub async fn load_state_record(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<contracts::WorkflowStateRecord>, WorkflowError> {
+        decode_workflow_state_record_opt(
+            self.inner
+                .tables
+                .state_table()
+                .read(instance_key(instance_id))
+                .await?
+                .as_ref(),
+        )
+    }
+
     pub async fn load_state(&self, instance_id: &str) -> Result<Option<Value>, WorkflowError> {
         Ok(self
-            .inner
-            .tables
-            .state_table()
-            .read(instance_id.as_bytes().to_vec())
-            .await?)
+            .load_state_record(instance_id)
+            .await?
+            .map(|state| workflow_state_record_state_to_runtime_value(&state))
+            .transpose()?
+            .flatten())
+    }
+
+    pub async fn load_run_record(
+        &self,
+        run_id: &contracts::WorkflowRunId,
+    ) -> Result<Option<WorkflowRunRecord>, WorkflowError> {
+        decode_workflow_run_record_opt(
+            self.inner
+                .tables
+                .run_table()
+                .read(workflow_run_key(run_id))
+                .await?
+                .as_ref(),
+        )
+    }
+
+    pub async fn load_lifecycle_record(
+        &self,
+        run_id: &contracts::WorkflowRunId,
+    ) -> Result<Option<contracts::WorkflowLifecycleRecord>, WorkflowError> {
+        decode_workflow_lifecycle_record_opt(
+            self.inner
+                .tables
+                .lifecycle_table()
+                .read(workflow_run_key(run_id))
+                .await?
+                .as_ref(),
+        )
+    }
+
+    pub async fn load_visibility_record(
+        &self,
+        run_id: &contracts::WorkflowRunId,
+    ) -> Result<Option<contracts::WorkflowVisibilityRecord>, WorkflowError> {
+        decode_workflow_visibility_record_opt(
+            self.inner
+                .tables
+                .visibility_table()
+                .read(workflow_run_key(run_id))
+                .await?
+                .as_ref(),
+        )
+    }
+
+    pub async fn load_run_history(
+        &self,
+        run_id: &contracts::WorkflowRunId,
+    ) -> Result<Vec<WorkflowHistoryRecord>, WorkflowError> {
+        load_workflow_run_history(self.inner.tables.history_table(), run_id).await
     }
 
     pub async fn load_source_progress(
@@ -3760,16 +3869,37 @@ where
 
     async move {
         let mut tx = Transaction::begin(&runtime.db).await;
-        let current_state = tx
+        let persisted_state = tx
             .read(runtime.tables.state_table(), instance_key(instance_id))
             .await?;
+        let current_state_record = decode_workflow_state_record_opt(persisted_state.as_ref())?;
+        if let Some(state_record) = current_state_record.as_ref() {
+            validate_active_run_metadata(
+                &mut tx,
+                &runtime.name,
+                instance_id,
+                &runtime.tables,
+                state_record,
+            )
+            .await?;
+        } else {
+            validate_missing_state_row(&tx, &runtime.name, instance_id, &runtime.tables).await?;
+        }
+        let processing_state_record = current_state_record
+            .as_ref()
+            .filter(|record| !workflow_lifecycle_is_terminal(record.lifecycle));
+        let current_state = processing_state_record
+            .as_ref()
+            .map(|state| workflow_state_record_state_to_runtime_value(state))
+            .transpose()?
+            .flatten();
         let task = WorkflowRuntimeTask {
             workflow_name: runtime.name.clone(),
             instance_id: instance_id.to_string(),
             trigger_seq,
             admitted_at_millis,
         };
-        let output = runtime
+        let runtime_output = runtime
             .handler
             .handle_runtime_task(&task, current_state, &trigger)
             .await
@@ -3777,60 +3907,36 @@ where
                 name: runtime.name.clone(),
                 source,
             })?;
+        let transition_input = build_transition_input(
+            &runtime.name,
+            instance_id,
+            trigger_seq,
+            admitted_at_millis,
+            processing_state_record,
+            &trigger,
+        )?;
+        let transition_output = workflow_output_to_transition_output(runtime_output)?;
+        let committed_at_millis = runtime.clock.now().get();
+        let reduction = runtime
+            .reducer
+            .reduce(
+                processing_state_record,
+                &transition_input,
+                &transition_output,
+                committed_at_millis,
+            )
+            .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?;
 
         tx.delete(runtime.tables.inbox_table(), inbox_key);
-
-        match output.state {
-            WorkflowStateMutation::Unchanged => {}
-            WorkflowStateMutation::Put(value) => {
-                tx.write(
-                    runtime.tables.state_table(),
-                    instance_key(instance_id),
-                    value,
-                );
-            }
-            WorkflowStateMutation::Delete => {
-                tx.delete(runtime.tables.state_table(), instance_key(instance_id));
-            }
-        }
-
-        for entry in output.outbox_entries {
-            runtime
-                .tables
-                .outbox
-                .stage_entry_in_transaction(&mut tx, entry)?;
-        }
-
-        for timer in output.timers {
-            match timer {
-                WorkflowTimerCommand::Schedule {
-                    timer_id,
-                    fire_at,
-                    payload,
-                } => runtime.tables.timers.stage_schedule_in_transaction(
-                    &mut tx,
-                    ScheduledTimer {
-                        timer_id,
-                        fire_at,
-                        payload: encode_payload(
-                            &StoredWorkflowTimer {
-                                workflow_instance: instance_id.to_string(),
-                                payload,
-                                operation_context: operation_context.clone(),
-                            },
-                            "workflow timer payload",
-                        )?,
-                    },
-                )?,
-                WorkflowTimerCommand::Cancel { timer_id } => {
-                    runtime
-                        .tables
-                        .timers
-                        .cancel_in_transaction(&mut tx, timer_id)
-                        .await?;
-                }
-            }
-        }
+        stage_reduction_plan_in_transaction(runtime, &mut tx, instance_id, reduction)?;
+        stage_workflow_commands_in_transaction(
+            runtime,
+            &mut tx,
+            instance_id,
+            &transition_output,
+            operation_context.clone(),
+        )
+        .await?;
 
         let _ = runtime
             .db
@@ -4009,8 +4115,16 @@ where
     let captured_at = runtime.clock.now();
     let layout = WorkflowCheckpointLayout::new(&runtime.name, checkpoint_id);
 
+    let run_rows =
+        scan_table_rows_at_sequence(runtime.tables.run_table(), durable_sequence).await?;
     let state_rows =
         scan_table_rows_at_sequence(runtime.tables.state_table(), durable_sequence).await?;
+    let history_rows =
+        scan_table_rows_at_sequence(runtime.tables.history_table(), durable_sequence).await?;
+    let lifecycle_rows =
+        scan_table_rows_at_sequence(runtime.tables.lifecycle_table(), durable_sequence).await?;
+    let visibility_rows =
+        scan_table_rows_at_sequence(runtime.tables.visibility_table(), durable_sequence).await?;
     let inbox_rows =
         scan_table_rows_at_sequence(runtime.tables.inbox_table(), durable_sequence).await?;
     let trigger_order_rows =
@@ -4035,10 +4149,38 @@ where
 
     let mut artifacts = vec![
         WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::Runs,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Runs,
+                &run_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
             kind: WorkflowCheckpointArtifactKind::State,
             bytes: encode_checkpoint_table_artifact(
                 WorkflowCheckpointArtifactKind::State,
                 &state_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::History,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::History,
+                &history_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::Lifecycle,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Lifecycle,
+                &lifecycle_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::Visibility,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Visibility,
+                &visibility_rows,
             )?,
         },
         WorkflowCheckpointArtifactPayload {
@@ -4128,11 +4270,39 @@ where
         .into());
     }
 
+    let run_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::Runs,
+    )
+    .await?;
     let state_rows = load_required_checkpoint_rows(
         checkpoint_store.as_ref(),
         &runtime.name,
         manifest.checkpoint_id,
         WorkflowCheckpointArtifactKind::State,
+    )
+    .await?;
+    let history_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::History,
+    )
+    .await?;
+    let lifecycle_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::Lifecycle,
+    )
+    .await?;
+    let visibility_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::Visibility,
     )
     .await?;
     let inbox_rows = load_required_checkpoint_rows(
@@ -4209,8 +4379,16 @@ where
     }
 
     let durable_sequence = runtime.db.current_durable_sequence();
+    let existing_run_keys =
+        scan_table_keys_at_sequence(runtime.tables.run_table(), durable_sequence).await?;
     let existing_state_keys =
         scan_table_keys_at_sequence(runtime.tables.state_table(), durable_sequence).await?;
+    let existing_history_keys =
+        scan_table_keys_at_sequence(runtime.tables.history_table(), durable_sequence).await?;
+    let existing_lifecycle_keys =
+        scan_table_keys_at_sequence(runtime.tables.lifecycle_table(), durable_sequence).await?;
+    let existing_visibility_keys =
+        scan_table_keys_at_sequence(runtime.tables.visibility_table(), durable_sequence).await?;
     let existing_inbox_keys =
         scan_table_keys_at_sequence(runtime.tables.inbox_table(), durable_sequence).await?;
     let existing_trigger_order_keys =
@@ -4232,9 +4410,33 @@ where
     let mut tx = Transaction::begin(&runtime.db).await;
     replace_table_rows_in_transaction(
         &mut tx,
+        runtime.tables.run_table(),
+        &existing_run_keys,
+        &run_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
         runtime.tables.state_table(),
         &existing_state_keys,
         &state_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.history_table(),
+        &existing_history_keys,
+        &history_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.lifecycle_table(),
+        &existing_lifecycle_keys,
+        &lifecycle_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.visibility_table(),
+        &existing_visibility_keys,
+        &visibility_rows,
     );
     replace_table_rows_in_transaction(
         &mut tx,
@@ -4396,7 +4598,11 @@ async fn ensure_workflow_tables(
     db: &Db,
     table_names: &WorkflowTableNames,
 ) -> Result<WorkflowTables, WorkflowError> {
+    let runs = ensure_table(db, &table_names.runs).await?;
     let state = ensure_table(db, &table_names.state).await?;
+    let history = ensure_table(db, &table_names.history).await?;
+    let lifecycle = ensure_table(db, &table_names.lifecycle).await?;
+    let visibility = ensure_table(db, &table_names.visibility).await?;
     let inbox = ensure_table(db, &table_names.inbox).await?;
     let trigger_order = ensure_table(db, &table_names.trigger_order).await?;
     let source_cursors = ensure_table(db, &table_names.source_cursors).await?;
@@ -4406,7 +4612,11 @@ async fn ensure_workflow_tables(
     let trigger_journal = ensure_table(db, &table_names.trigger_journal).await?;
 
     Ok(WorkflowTables {
+        runs,
         state,
+        history,
+        lifecycle,
+        visibility,
         inbox,
         trigger_order,
         source_cursors,
@@ -4449,6 +4659,859 @@ fn instance_key(instance_id: &str) -> Key {
 
 fn source_cursor_key(source: &Table) -> Key {
     source.name().as_bytes().to_vec()
+}
+
+fn workflow_run_key(run_id: &contracts::WorkflowRunId) -> Key {
+    run_id.as_str().as_bytes().to_vec()
+}
+
+fn decode_workflow_run_id_key(
+    key: &[u8],
+    context: &str,
+) -> Result<contracts::WorkflowRunId, WorkflowError> {
+    let run_id = std::str::from_utf8(key)
+        .map_err(|_| StorageError::corruption(format!("{context} encoding is invalid")))?;
+    contracts::WorkflowRunId::new(run_id.to_string())
+        .map_err(|error| StorageError::corruption(format!("{context} decoding failed: {error}")))
+        .map_err(Into::into)
+}
+
+fn workflow_history_key(run_id: &contracts::WorkflowRunId, sequence: u64) -> Key {
+    let mut key = Vec::with_capacity(run_id.as_str().len() + 1 + 8);
+    key.extend_from_slice(run_id.as_str().as_bytes());
+    key.push(INBOX_KEY_SEPARATOR);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+fn workflow_history_start_key(run_id: &contracts::WorkflowRunId) -> Key {
+    let mut key = Vec::with_capacity(run_id.as_str().len() + 1);
+    key.extend_from_slice(run_id.as_str().as_bytes());
+    key.push(INBOX_KEY_SEPARATOR);
+    key
+}
+
+fn workflow_history_end_key(run_id: &contracts::WorkflowRunId) -> Key {
+    let mut key = Vec::with_capacity(run_id.as_str().len() + 1);
+    key.extend_from_slice(run_id.as_str().as_bytes());
+    key.push(0xff);
+    key
+}
+
+fn decode_workflow_history_key_sequence(
+    run_id: &contracts::WorkflowRunId,
+    key: &[u8],
+) -> Result<u64, WorkflowError> {
+    let prefix = workflow_history_start_key(run_id);
+    if key.len() != prefix.len() + 8 || !key.starts_with(&prefix) {
+        return Err(StorageError::corruption("workflow history key encoding is invalid").into());
+    }
+    let mut sequence = [0_u8; 8];
+    sequence.copy_from_slice(&key[prefix.len()..]);
+    Ok(u64::from_be_bytes(sequence))
+}
+
+fn decode_workflow_history_key_run_id(
+    key: &[u8],
+) -> Result<contracts::WorkflowRunId, WorkflowError> {
+    if key.len() < 9 || key[key.len() - 9] != INBOX_KEY_SEPARATOR {
+        return Err(StorageError::corruption("workflow history key encoding is invalid").into());
+    }
+    decode_workflow_run_id_key(&key[..key.len() - 9], "workflow history key")
+}
+
+fn default_run_id_instance_id<'a>(workflow_name: &str, run_id: &'a str) -> Option<&'a str> {
+    let prefix = format!("run:{workflow_name}:");
+    let remainder = run_id.strip_prefix(&prefix)?;
+    let (instance_id, trigger_seq) = remainder.rsplit_once(':')?;
+    if trigger_seq.parse::<u64>().is_ok() {
+        Some(instance_id)
+    } else {
+        None
+    }
+}
+
+async fn load_workflow_run_history(
+    history_table: &Table,
+    run_id: &contracts::WorkflowRunId,
+) -> Result<Vec<WorkflowHistoryRecord>, WorkflowError> {
+    let mut rows = history_table
+        .scan(
+            workflow_history_start_key(run_id),
+            workflow_history_end_key(run_id),
+            ScanOptions::default(),
+        )
+        .await?;
+    let mut history = Vec::new();
+    while let Some((key, value)) = rows.next().await {
+        history.push(WorkflowHistoryRecord {
+            run_id: run_id.clone(),
+            sequence: decode_workflow_history_key_sequence(run_id, &key)?,
+            event: decode_workflow_history_event_value(&value)?,
+        });
+    }
+    Ok(history)
+}
+
+async fn validate_active_run_metadata(
+    tx: &mut Transaction,
+    workflow_name: &str,
+    instance_id: &str,
+    tables: &WorkflowTables,
+    state: &contracts::WorkflowStateRecord,
+) -> Result<(), WorkflowError> {
+    validate_active_state_record(workflow_name, instance_id, state)?;
+
+    let run_record = decode_workflow_run_record_opt(
+        tx.read(tables.run_table(), workflow_run_key(&state.run_id))
+            .await?
+            .as_ref(),
+    )?
+    .ok_or_else(|| active_run_metadata_corruption(&state.run_id, "workflow run record missing"))?;
+    validate_active_run_record(state, &run_record)?;
+
+    let lifecycle_record = decode_workflow_lifecycle_record_opt(
+        tx.read(tables.lifecycle_table(), workflow_run_key(&state.run_id))
+            .await?
+            .as_ref(),
+    )?
+    .ok_or_else(|| {
+        active_run_metadata_corruption(&state.run_id, "workflow lifecycle record missing")
+    })?;
+    validate_active_lifecycle_record(state, &lifecycle_record)?;
+
+    let visibility_record = decode_workflow_visibility_record_opt(
+        tx.read(tables.visibility_table(), workflow_run_key(&state.run_id))
+            .await?
+            .as_ref(),
+    )?
+    .ok_or_else(|| {
+        active_run_metadata_corruption(&state.run_id, "workflow visibility record missing")
+    })?;
+    validate_active_visibility_record(state, &visibility_record)?;
+    validate_active_run_history(tx, tables.history_table(), state, &visibility_record).await?;
+    Ok(())
+}
+
+async fn validate_missing_state_row(
+    tx: &Transaction,
+    workflow_name: &str,
+    instance_id: &str,
+    tables: &WorkflowTables,
+) -> Result<(), WorkflowError> {
+    let snapshot_sequence = tx.snapshot_sequence();
+    let mut run_ids = BTreeSet::new();
+    let mut visibility_run_ids = BTreeSet::new();
+
+    let mut run_rows = tables
+        .run_table()
+        .scan_at(
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            snapshot_sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((_, value)) = run_rows.next().await {
+        let Some(run_record) = decode_workflow_run_record_opt(Some(&value))? else {
+            continue;
+        };
+        run_ids.insert(run_record.run_id.clone());
+        if run_record.workflow_name == workflow_name && run_record.instance_id == instance_id {
+            return Err(missing_state_row_corruption(
+                instance_id,
+                format!(
+                    "workflow state record is missing while run {} still exists",
+                    run_record.run_id.as_str()
+                ),
+            ));
+        }
+    }
+
+    let mut visibility_rows = tables
+        .visibility_table()
+        .scan_at(
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            snapshot_sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((_, value)) = visibility_rows.next().await {
+        let Some(visibility_record) = decode_workflow_visibility_record_opt(Some(&value))? else {
+            continue;
+        };
+        visibility_run_ids.insert(visibility_record.run_id.clone());
+        if visibility_record.workflow_name == workflow_name
+            && visibility_record.instance_id == instance_id
+        {
+            return Err(missing_state_row_corruption(
+                instance_id,
+                format!(
+                    "workflow state record is missing while visibility for run {} still exists",
+                    visibility_record.run_id.as_str()
+                ),
+            ));
+        }
+    }
+
+    let mut lifecycle_rows = tables
+        .lifecycle_table()
+        .scan_at(
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            snapshot_sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((key, _)) = lifecycle_rows.next().await {
+        let run_id = decode_workflow_run_id_key(&key, "workflow lifecycle key")?;
+        if default_run_id_instance_id(workflow_name, run_id.as_str()) == Some(instance_id) {
+            return Err(missing_state_row_corruption(
+                instance_id,
+                format!(
+                    "workflow state record is missing while lifecycle for run {} still exists",
+                    run_id.as_str()
+                ),
+            ));
+        }
+        if !run_ids.contains(&run_id) || !visibility_run_ids.contains(&run_id) {
+            return Err(missing_state_row_corruption(
+                instance_id,
+                format!(
+                    "workflow state record is missing while orphan lifecycle for run {} still exists",
+                    run_id.as_str()
+                ),
+            ));
+        }
+    }
+
+    let mut history_rows = tables
+        .history_table()
+        .scan_at(
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            snapshot_sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((key, value)) = history_rows.next().await {
+        let run_id = decode_workflow_history_key_run_id(&key)?;
+        if default_run_id_instance_id(workflow_name, run_id.as_str()) == Some(instance_id) {
+            return Err(missing_state_row_corruption(
+                instance_id,
+                format!(
+                    "workflow state record is missing while history for run {} still exists",
+                    run_id.as_str()
+                ),
+            ));
+        }
+        let event = decode_workflow_history_event_value(&value)?;
+        if let contracts::WorkflowHistoryEvent::RunCreated {
+            run_id,
+            instance_id: history_instance_id,
+            ..
+        } = event
+            && history_instance_id == instance_id
+        {
+            return Err(missing_state_row_corruption(
+                instance_id,
+                format!(
+                    "workflow state record is missing while history for run {} still exists",
+                    run_id.as_str()
+                ),
+            ));
+        }
+        if !run_ids.contains(&run_id) || !visibility_run_ids.contains(&run_id) {
+            return Err(missing_state_row_corruption(
+                instance_id,
+                format!(
+                    "workflow state record is missing while orphan history for run {} still exists",
+                    run_id.as_str()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_active_state_record(
+    workflow_name: &str,
+    instance_id: &str,
+    state: &contracts::WorkflowStateRecord,
+) -> Result<(), WorkflowError> {
+    if state.workflow_name != workflow_name {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow state record workflow name does not match runtime",
+        ));
+    }
+    if state.instance_id != instance_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow state record instance id does not match active inbox entry",
+        ));
+    }
+    if state.history_len == 0 {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow state record history length must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_run_record(
+    state: &contracts::WorkflowStateRecord,
+    run_record: &WorkflowRunRecord,
+) -> Result<(), WorkflowError> {
+    if run_record.run_id != state.run_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow run record id does not match active state",
+        ));
+    }
+    if run_record.bundle_id != state.bundle_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow run record bundle id does not match active state",
+        ));
+    }
+    if run_record.workflow_name != state.workflow_name {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow run record workflow name does not match active state",
+        ));
+    }
+    if run_record.instance_id != state.instance_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow run record instance id does not match active state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_lifecycle_record(
+    state: &contracts::WorkflowStateRecord,
+    lifecycle_record: &contracts::WorkflowLifecycleRecord,
+) -> Result<(), WorkflowError> {
+    if lifecycle_record.run_id != state.run_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow lifecycle record id does not match active state",
+        ));
+    }
+    if lifecycle_record.lifecycle != state.lifecycle {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow lifecycle record lifecycle does not match active state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_visibility_record(
+    state: &contracts::WorkflowStateRecord,
+    visibility_record: &contracts::WorkflowVisibilityRecord,
+) -> Result<(), WorkflowError> {
+    if visibility_record.run_id != state.run_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record id does not match active state",
+        ));
+    }
+    if visibility_record.bundle_id != state.bundle_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record bundle id does not match active state",
+        ));
+    }
+    if visibility_record.workflow_name != state.workflow_name {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record workflow name does not match active state",
+        ));
+    }
+    if visibility_record.instance_id != state.instance_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record instance id does not match active state",
+        ));
+    }
+    if visibility_record.lifecycle != state.lifecycle {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record lifecycle does not match active state",
+        ));
+    }
+    if visibility_record.last_task_id != state.current_task_id {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record task id does not match active state",
+        ));
+    }
+    if visibility_record.history_len != state.history_len {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record history length does not match active state",
+        ));
+    }
+    if visibility_record.updated_at_millis != state.updated_at_millis {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow visibility record timestamp does not match active state",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_active_run_history(
+    tx: &Transaction,
+    history_table: &Table,
+    state: &contracts::WorkflowStateRecord,
+    visibility_record: &contracts::WorkflowVisibilityRecord,
+) -> Result<(), WorkflowError> {
+    let mut last_event = None;
+    let mut seen = 0_u64;
+    let mut rows = history_table
+        .scan_at(
+            workflow_history_start_key(&state.run_id),
+            workflow_history_end_key(&state.run_id),
+            tx.snapshot_sequence(),
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((key, value)) = rows.next().await {
+        let sequence = decode_workflow_history_key_sequence(&state.run_id, &key)?;
+        let expected = seen.saturating_add(1);
+        if sequence != expected {
+            return Err(active_run_metadata_corruption(
+                &state.run_id,
+                format!("workflow history sequence {sequence} is not contiguous"),
+            ));
+        }
+        if sequence > state.history_len {
+            return Err(active_run_metadata_corruption(
+                &state.run_id,
+                format!(
+                    "workflow history contains event {sequence} beyond the active state history length {}",
+                    state.history_len
+                ),
+            ));
+        }
+        seen = sequence;
+        last_event = Some(decode_workflow_history_event_value(&value)?);
+    }
+
+    if seen < state.history_len {
+        return Err(active_run_metadata_corruption(
+            &state.run_id,
+            format!("workflow history event {} missing", seen.saturating_add(1)),
+        ));
+    }
+
+    match last_event {
+        Some(contracts::WorkflowHistoryEvent::VisibilityUpdated { record })
+            if record == *visibility_record =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow history does not end with the active visibility record",
+        )),
+        None => Err(active_run_metadata_corruption(
+            &state.run_id,
+            "workflow history is empty for active state",
+        )),
+    }
+}
+
+fn active_run_metadata_corruption(
+    run_id: &contracts::WorkflowRunId,
+    detail: impl Into<String>,
+) -> WorkflowError {
+    WorkflowError::Storage(StorageError::corruption(format!(
+        "{} for active run {}",
+        detail.into(),
+        run_id.as_str(),
+    )))
+}
+
+fn missing_state_row_corruption(instance_id: &str, detail: impl Into<String>) -> WorkflowError {
+    WorkflowError::Storage(StorageError::corruption(format!(
+        "{} for workflow instance {}",
+        detail.into(),
+        instance_id,
+    )))
+}
+
+fn build_transition_input(
+    workflow_name: &str,
+    instance_id: &str,
+    trigger_seq: u64,
+    admitted_at_millis: Option<u64>,
+    current_state: Option<&contracts::WorkflowStateRecord>,
+    trigger: &WorkflowTrigger,
+) -> Result<contracts::WorkflowTransitionInput, WorkflowError> {
+    let run_id = current_state
+        .map(|state| state.run_id.clone())
+        .unwrap_or_else(|| workflow_run_id_for_admission(workflow_name, instance_id, trigger_seq));
+    let bundle_id = current_state
+        .map(|state| state.bundle_id.clone())
+        .unwrap_or_else(|| default_native_bundle_id(workflow_name));
+    Ok(contracts::WorkflowTransitionInput {
+        run_id,
+        bundle_id,
+        task_id: default_task_id(instance_id, trigger_seq),
+        workflow_name: workflow_name.to_string(),
+        instance_id: instance_id.to_string(),
+        lifecycle: current_state
+            .map(|state| state.lifecycle)
+            .unwrap_or(contracts::WorkflowLifecycleState::Scheduled),
+        history_len: current_state.map(|state| state.history_len).unwrap_or(0),
+        attempt: 1,
+        admitted_at_millis: admitted_at_millis.ok_or_else(|| {
+            WorkflowError::Storage(StorageError::corruption(
+                "pending workflow admission is missing admitted_at_millis; drain legacy inbox rows before enabling explicit workflow run persistence",
+            ))
+        })?,
+        state: current_state.and_then(|state| state.state.clone()),
+        trigger: runtime_trigger_to_transition_trigger(trigger)?,
+    })
+}
+
+fn workflow_output_to_transition_output(
+    output: WorkflowOutput,
+) -> Result<contracts::WorkflowTransitionOutput, WorkflowError> {
+    Ok(contracts::WorkflowTransitionOutput {
+        state: match output.state {
+            WorkflowStateMutation::Unchanged => contracts::WorkflowStateMutation::Unchanged,
+            WorkflowStateMutation::Put(value) => contracts::WorkflowStateMutation::Put {
+                state: runtime_value_to_workflow_payload(&value)?,
+            },
+            WorkflowStateMutation::Delete => contracts::WorkflowStateMutation::Delete,
+        },
+        lifecycle: None,
+        visibility: None,
+        continue_as_new: None,
+        commands: output
+            .outbox_entries
+            .into_iter()
+            .map(|entry| contracts::WorkflowCommand::Outbox {
+                entry: contracts::WorkflowOutboxCommand {
+                    outbox_id: entry.outbox_id,
+                    idempotency_key: entry.idempotency_key,
+                    payload: entry.payload,
+                },
+            })
+            .chain(
+                output
+                    .timers
+                    .into_iter()
+                    .map(|timer| contracts::WorkflowCommand::Timer {
+                        command: match timer {
+                            WorkflowTimerCommand::Schedule {
+                                timer_id,
+                                fire_at,
+                                payload,
+                            } => contracts::WorkflowTimerCommand::Schedule {
+                                timer_id,
+                                fire_at_millis: fire_at.get(),
+                                payload,
+                            },
+                            WorkflowTimerCommand::Cancel { timer_id } => {
+                                contracts::WorkflowTimerCommand::Cancel { timer_id }
+                            }
+                        },
+                    }),
+            )
+            .collect(),
+    })
+}
+
+fn workflow_run_id_for_admission(
+    workflow_name: &str,
+    instance_id: &str,
+    trigger_seq: u64,
+) -> contracts::WorkflowRunId {
+    contracts::WorkflowRunId::new(format!("run:{workflow_name}:{instance_id}:{trigger_seq}"))
+        .expect("admission-derived run ids should always be valid")
+}
+
+fn workflow_lifecycle_is_terminal(lifecycle: contracts::WorkflowLifecycleState) -> bool {
+    matches!(
+        lifecycle,
+        contracts::WorkflowLifecycleState::Completed | contracts::WorkflowLifecycleState::Failed
+    )
+}
+
+fn runtime_trigger_to_transition_trigger(
+    trigger: &WorkflowTrigger,
+) -> Result<contracts::WorkflowTrigger, WorkflowError> {
+    match trigger {
+        WorkflowTrigger::Event(entry) => Ok(contracts::WorkflowTrigger::Event {
+            event: contracts::WorkflowSourceEvent {
+                source_table: entry.table.name().to_string(),
+                key: entry.key.clone(),
+                value: entry
+                    .value
+                    .as_ref()
+                    .map(runtime_value_to_workflow_payload)
+                    .transpose()?,
+                cursor: entry.cursor.encode(),
+                sequence: entry.sequence.get(),
+                kind: match entry.kind {
+                    ChangeKind::Put => contracts::WorkflowChangeKind::Put,
+                    ChangeKind::Delete => contracts::WorkflowChangeKind::Delete,
+                    ChangeKind::Merge => contracts::WorkflowChangeKind::Merge,
+                },
+                operation_context: entry.operation_context.clone(),
+            },
+        }),
+        WorkflowTrigger::Timer {
+            timer_id,
+            fire_at,
+            payload,
+        } => Ok(contracts::WorkflowTrigger::Timer {
+            timer_id: timer_id.clone(),
+            fire_at_millis: fire_at.get(),
+            payload: payload.clone(),
+        }),
+        WorkflowTrigger::Callback {
+            callback_id,
+            response,
+        } => Ok(contracts::WorkflowTrigger::Callback {
+            callback_id: callback_id.clone(),
+            response: response.clone(),
+        }),
+    }
+}
+
+fn runtime_value_to_workflow_payload(
+    value: &Value,
+) -> Result<contracts::WorkflowPayload, WorkflowError> {
+    match value {
+        Value::Bytes(bytes) => Ok(contracts::WorkflowPayload::bytes(bytes.clone())),
+        Value::Record(_) => {
+            let bytes = serde_json::to_vec(value).map_err(|error| {
+                StorageError::corruption(format!("workflow state serialization failed: {error}"))
+            })?;
+            Ok(contracts::WorkflowPayload::with_encoding(
+                WORKFLOW_PAYLOAD_ENCODING_JSON,
+                bytes,
+            ))
+        }
+    }
+}
+
+fn workflow_payload_to_runtime_value(
+    payload: &contracts::WorkflowPayload,
+) -> Result<Value, WorkflowError> {
+    match payload.encoding.as_str() {
+        WORKFLOW_PAYLOAD_ENCODING_JSON => {
+            serde_json::from_slice::<Value>(&payload.bytes).map_err(|error| {
+                StorageError::corruption(format!("workflow state decoding failed: {error}")).into()
+            })
+        }
+        WORKFLOW_PAYLOAD_ENCODING_BYTES => Ok(Value::bytes(payload.bytes.clone())),
+        other => Err(StorageError::corruption(format!(
+            "workflow state encoding {other} is unsupported"
+        ))
+        .into()),
+    }
+}
+
+fn workflow_state_record_state_to_runtime_value(
+    state: &contracts::WorkflowStateRecord,
+) -> Result<Option<Value>, WorkflowError> {
+    state
+        .state
+        .as_ref()
+        .map(workflow_payload_to_runtime_value)
+        .transpose()
+}
+
+fn encode_workflow_run_record(record: &WorkflowRunRecord) -> Result<Vec<u8>, WorkflowError> {
+    encode_payload(record, "workflow run record")
+}
+
+fn decode_workflow_run_record_opt(
+    value: Option<&Value>,
+) -> Result<Option<WorkflowRunRecord>, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = expect_bytes_value(value, "workflow run record")?;
+    Ok(Some(decode_payload(bytes, "workflow run record")?))
+}
+
+fn encode_workflow_state_record(
+    record: &contracts::WorkflowStateRecord,
+) -> Result<Vec<u8>, WorkflowError> {
+    encode_payload(record, "workflow state record")
+}
+
+fn decode_workflow_state_record_opt(
+    value: Option<&Value>,
+) -> Result<Option<contracts::WorkflowStateRecord>, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = expect_bytes_value(value, "workflow state record")?;
+    Ok(Some(decode_payload(bytes, "workflow state record")?))
+}
+
+fn encode_workflow_lifecycle_record(
+    record: &contracts::WorkflowLifecycleRecord,
+) -> Result<Vec<u8>, WorkflowError> {
+    encode_payload(record, "workflow lifecycle record")
+}
+
+fn decode_workflow_lifecycle_record_opt(
+    value: Option<&Value>,
+) -> Result<Option<contracts::WorkflowLifecycleRecord>, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = expect_bytes_value(value, "workflow lifecycle record")?;
+    Ok(Some(decode_payload(bytes, "workflow lifecycle record")?))
+}
+
+fn encode_workflow_visibility_record(
+    record: &contracts::WorkflowVisibilityRecord,
+) -> Result<Vec<u8>, WorkflowError> {
+    encode_payload(record, "workflow visibility record")
+}
+
+fn decode_workflow_visibility_record_opt(
+    value: Option<&Value>,
+) -> Result<Option<contracts::WorkflowVisibilityRecord>, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = expect_bytes_value(value, "workflow visibility record")?;
+    Ok(Some(decode_payload(bytes, "workflow visibility record")?))
+}
+
+fn encode_workflow_history_event(
+    event: &contracts::WorkflowHistoryEvent,
+) -> Result<Vec<u8>, WorkflowError> {
+    encode_payload(event, "workflow history event")
+}
+
+fn decode_workflow_history_event_value(
+    value: &Value,
+) -> Result<contracts::WorkflowHistoryEvent, WorkflowError> {
+    let bytes = expect_bytes_value(value, "workflow history event")?;
+    decode_payload(bytes, "workflow history event")
+}
+
+fn stage_reduction_plan_in_transaction<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    tx: &mut Transaction,
+    instance_id: &str,
+    reduction: WorkflowReductionPlan,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowRuntimeHandler + 'static,
+{
+    for run_record in reduction.run_records {
+        tx.write(
+            runtime.tables.run_table(),
+            workflow_run_key(&run_record.run_id),
+            Value::bytes(encode_workflow_run_record(&run_record)?),
+        );
+    }
+
+    tx.write(
+        runtime.tables.state_table(),
+        instance_key(instance_id),
+        Value::bytes(encode_workflow_state_record(&reduction.active_state)?),
+    );
+
+    for lifecycle_record in reduction.lifecycle_records {
+        tx.write(
+            runtime.tables.lifecycle_table(),
+            workflow_run_key(&lifecycle_record.run_id),
+            Value::bytes(encode_workflow_lifecycle_record(&lifecycle_record)?),
+        );
+    }
+
+    for visibility_record in reduction.visibility_records {
+        tx.write(
+            runtime.tables.visibility_table(),
+            workflow_run_key(&visibility_record.run_id),
+            Value::bytes(encode_workflow_visibility_record(&visibility_record)?),
+        );
+    }
+
+    for history_record in reduction.history {
+        tx.write(
+            runtime.tables.history_table(),
+            workflow_history_key(&history_record.run_id, history_record.sequence),
+            Value::bytes(encode_workflow_history_event(&history_record.event)?),
+        );
+    }
+
+    Ok(())
+}
+
+async fn stage_workflow_commands_in_transaction<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    tx: &mut Transaction,
+    instance_id: &str,
+    output: &contracts::WorkflowTransitionOutput,
+    operation_context: Option<OperationContext>,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowRuntimeHandler + 'static,
+{
+    for command in &output.commands {
+        match command {
+            contracts::WorkflowCommand::Outbox { entry } => {
+                runtime.tables.outbox.stage_entry_in_transaction(
+                    tx,
+                    OutboxEntry {
+                        outbox_id: entry.outbox_id.clone(),
+                        idempotency_key: entry.idempotency_key.clone(),
+                        payload: entry.payload.clone(),
+                    },
+                )?
+            }
+            contracts::WorkflowCommand::Timer { command } => match command {
+                contracts::WorkflowTimerCommand::Schedule {
+                    timer_id,
+                    fire_at_millis,
+                    payload,
+                } => runtime.tables.timers.stage_schedule_in_transaction(
+                    tx,
+                    ScheduledTimer {
+                        timer_id: timer_id.clone(),
+                        fire_at: Timestamp::new(*fire_at_millis),
+                        payload: encode_payload(
+                            &StoredWorkflowTimer {
+                                workflow_instance: instance_id.to_string(),
+                                payload: payload.clone(),
+                                operation_context: operation_context.clone(),
+                            },
+                            "workflow timer payload",
+                        )?,
+                    },
+                )?,
+                contracts::WorkflowTimerCommand::Cancel { timer_id } => {
+                    runtime
+                        .tables
+                        .timers
+                        .cancel_in_transaction(tx, timer_id.clone())
+                        .await?;
+                }
+            },
+        }
+    }
+    Ok(())
 }
 
 async fn load_workflow_source_progress(
@@ -5191,5 +6254,157 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send + 'static>) -> 
         message.clone()
     } else {
         "non-string panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod durable_format_tests {
+    use std::collections::BTreeMap;
+
+    use terracedb::{Value, test_support::assert_durable_format_fixture};
+
+    use super::*;
+
+    #[test]
+    fn durable_format_fixtures_match_golden_files() {
+        let run = WorkflowRunRecord {
+            run_id: contracts::WorkflowRunId::new("run:orders:order-1:1").expect("run id"),
+            bundle_id: contracts::WorkflowBundleId::new("native:orders").expect("bundle id"),
+            workflow_name: "orders".to_string(),
+            instance_id: "order-1".to_string(),
+            created_at_millis: 7,
+            continued_from_run_id: None,
+        };
+        let task_id = contracts::WorkflowTaskId::new("task:order-1:1").expect("task id");
+        let state = contracts::WorkflowStateRecord {
+            run_id: run.run_id.clone(),
+            bundle_id: run.bundle_id.clone(),
+            workflow_name: run.workflow_name.clone(),
+            instance_id: run.instance_id.clone(),
+            lifecycle: contracts::WorkflowLifecycleState::Running,
+            current_task_id: Some(task_id.clone()),
+            history_len: 3,
+            state: Some(contracts::WorkflowPayload::bytes("current-state")),
+            updated_at_millis: 11,
+        };
+        let lifecycle = contracts::WorkflowLifecycleRecord {
+            run_id: run.run_id.clone(),
+            lifecycle: contracts::WorkflowLifecycleState::Running,
+            updated_at_millis: 11,
+            reason: Some("task-applied".to_string()),
+            task_id: Some(task_id.clone()),
+            attempt: 1,
+        };
+        let visibility = contracts::WorkflowVisibilityRecord {
+            run_id: run.run_id.clone(),
+            bundle_id: run.bundle_id.clone(),
+            workflow_name: run.workflow_name.clone(),
+            instance_id: run.instance_id.clone(),
+            lifecycle: contracts::WorkflowLifecycleState::Running,
+            last_task_id: Some(task_id.clone()),
+            history_len: 3,
+            summary: BTreeMap::from([("lifecycle".to_string(), "running".to_string())]),
+            updated_at_millis: 11,
+        };
+        let history_event = contracts::WorkflowHistoryEvent::TaskApplied {
+            task_id: task_id.clone(),
+            output: contracts::WorkflowTransitionOutput {
+                state: contracts::WorkflowStateMutation::Put {
+                    state: contracts::WorkflowPayload::bytes("current-state"),
+                },
+                lifecycle: Some(contracts::WorkflowLifecycleState::Running),
+                visibility: Some(contracts::WorkflowVisibilityUpdate {
+                    summary: BTreeMap::from([("lifecycle".to_string(), "running".to_string())]),
+                    note: Some("visible".to_string()),
+                }),
+                continue_as_new: None,
+                commands: vec![contracts::WorkflowCommand::Outbox {
+                    entry: contracts::WorkflowOutboxCommand {
+                        outbox_id: b"order-1:notify".to_vec(),
+                        idempotency_key: "order-1:notify".to_string(),
+                        payload: b"notify".to_vec(),
+                    },
+                }],
+            },
+            committed_at_millis: 11,
+        };
+
+        let run_bytes = encode_workflow_run_record(&run).expect("encode run record fixture");
+        assert_durable_format_fixture("workflow-run-record-v1.bin", &run_bytes);
+
+        let state_bytes =
+            encode_workflow_state_record(&state).expect("encode state record fixture");
+        assert_durable_format_fixture("workflow-state-record-v1.bin", &state_bytes);
+
+        let history_bytes =
+            encode_workflow_history_event(&history_event).expect("encode history event fixture");
+        assert_durable_format_fixture("workflow-history-event-v1.bin", &history_bytes);
+
+        let lifecycle_bytes =
+            encode_workflow_lifecycle_record(&lifecycle).expect("encode lifecycle fixture");
+        assert_durable_format_fixture("workflow-lifecycle-record-v1.bin", &lifecycle_bytes);
+
+        let visibility_bytes =
+            encode_workflow_visibility_record(&visibility).expect("encode visibility fixture");
+        assert_durable_format_fixture("workflow-visibility-record-v1.bin", &visibility_bytes);
+
+        let run_rows = vec![WorkflowCheckpointTableRow {
+            key: workflow_run_key(&run.run_id),
+            value: Value::bytes(run_bytes),
+        }];
+        assert_durable_format_fixture(
+            "workflow-runs-artifact-v1.bin",
+            &encode_checkpoint_table_artifact(WorkflowCheckpointArtifactKind::Runs, &run_rows)
+                .expect("encode runs artifact fixture"),
+        );
+
+        let state_rows = vec![WorkflowCheckpointTableRow {
+            key: instance_key(&state.instance_id),
+            value: Value::bytes(state_bytes),
+        }];
+        assert_durable_format_fixture(
+            "workflow-state-artifact-v1.bin",
+            &encode_checkpoint_table_artifact(WorkflowCheckpointArtifactKind::State, &state_rows)
+                .expect("encode state artifact fixture"),
+        );
+
+        let history_rows = vec![WorkflowCheckpointTableRow {
+            key: workflow_history_key(&run.run_id, 3),
+            value: Value::bytes(history_bytes),
+        }];
+        assert_durable_format_fixture(
+            "workflow-history-artifact-v1.bin",
+            &encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::History,
+                &history_rows,
+            )
+            .expect("encode history artifact fixture"),
+        );
+
+        let lifecycle_rows = vec![WorkflowCheckpointTableRow {
+            key: workflow_run_key(&run.run_id),
+            value: Value::bytes(lifecycle_bytes),
+        }];
+        assert_durable_format_fixture(
+            "workflow-lifecycle-artifact-v1.bin",
+            &encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Lifecycle,
+                &lifecycle_rows,
+            )
+            .expect("encode lifecycle artifact fixture"),
+        );
+
+        let visibility_rows = vec![WorkflowCheckpointTableRow {
+            key: workflow_run_key(&run.run_id),
+            value: Value::bytes(visibility_bytes),
+        }];
+        assert_durable_format_fixture(
+            "workflow-visibility-artifact-v1.bin",
+            &encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Visibility,
+                &visibility_rows,
+            )
+            .expect("encode visibility artifact fixture"),
+        );
     }
 }

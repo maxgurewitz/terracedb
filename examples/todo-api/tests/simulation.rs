@@ -1,7 +1,9 @@
 use std::{error::Error as StdError, sync::Arc, time::Duration};
 
 use axum::http::{Method, StatusCode};
-use terracedb::{DeterministicRng, SimulatedFileSystem};
+use terracedb::{
+    DeterministicRng, SimulatedFileSystem, StubClock, StubFileSystem, StubObjectStore, Timestamp,
+};
 use terracedb_example_todo_api::{
     CreateTodoRequest, MILLIS_PER_DAY, PlannerSchedule, TODO_SERVER_PORT, TodoApp, TodoAppOptions,
     TodoRecord, TodoStatus, UpdateTodoRequest, todo_db_builder,
@@ -28,11 +30,24 @@ fn boxed_error(error: impl StdError + Send + Sync + 'static) -> BoxError {
     Box::new(error)
 }
 
+async fn wait_for_planner_state(app: &TodoApp) -> Result<u64, BoxError> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(state) = app.planner_state().await.map_err(boxed_error)? {
+                return Ok(state.next_fire_at_ms);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .map_err(boxed_error)?
+}
+
 fn todo_server_host(
     seed: u64,
     path: &'static str,
     prefix: &'static str,
-    planner_schedule: PlannerSchedule,
+    options: TodoAppOptions,
     shutdown: watch::Receiver<bool>,
 ) -> (SimulationHost, watch::Receiver<bool>, watch::Receiver<bool>) {
     let (ready_tx, ready_rx) = watch::channel(false);
@@ -55,10 +70,9 @@ fn todo_server_host(
                     .open()
                     .await
                     .map_err(boxed_error)?;
-                let app =
-                    TodoApp::open_with_options(db, clock, TodoAppOptions { planner_schedule })
-                        .await
-                        .map_err(boxed_error)?;
+                let app = TodoApp::open_with_options(db, clock, options)
+                    .await
+                    .map_err(boxed_error)?;
                 let mut planner_ready = app.planner_ready();
                 let server = axum_router_server_with_shutdown(
                     SERVER_HOST,
@@ -183,13 +197,17 @@ fn weekly_planner_client_host(
             assert_eq!(status, StatusCode::OK);
             assert_eq!(todos.len(), 7);
             assert!(todos.iter().all(|todo| todo.placeholder));
+            let first_scheduled_for_day = todos
+                .first()
+                .and_then(|todo| todo.scheduled_for_day)
+                .expect("planner should set the first placeholder day");
             assert_eq!(
-                todos.first().and_then(|todo| todo.scheduled_for_day),
-                Some(TEST_WEEK_MILLIS)
+                first_scheduled_for_day, TEST_WEEK_MILLIS,
+                "planner should start at the injected first week boundary",
             );
             assert_eq!(
                 todos.last().and_then(|todo| todo.scheduled_for_day),
-                Some(TEST_WEEK_MILLIS + 6 * TEST_DAY_MILLIS)
+                Some(first_scheduled_for_day + 6 * TEST_DAY_MILLIS)
             );
 
             tokio::time::sleep(Duration::from_millis(TEST_DAY_MILLIS)).await;
@@ -232,7 +250,10 @@ fn todo_api_simulation_supports_create_read_update_list_and_recent_projection() 
         0x5151,
         "/todo-api-happy",
         "todo-api-happy",
-        PlannerSchedule::new(HAPPY_PATH_DAY_MILLIS, 7),
+        TodoAppOptions {
+            planner_schedule: PlannerSchedule::new(HAPPY_PATH_DAY_MILLIS, 7),
+            planner_initial_fire_at_ms: None,
+        },
         shutdown_rx,
     );
 
@@ -256,7 +277,10 @@ fn todo_api_weekly_planner_time_travel_creates_placeholders() -> turmoil::Result
         0x6161,
         "/todo-api-weekly",
         "todo-api-weekly",
-        PlannerSchedule::new(TEST_DAY_MILLIS, 7),
+        TodoAppOptions {
+            planner_schedule: PlannerSchedule::new(TEST_DAY_MILLIS, 7),
+            planner_initial_fire_at_ms: Some(TEST_WEEK_MILLIS),
+        },
         shutdown_rx,
     );
 
@@ -274,4 +298,66 @@ fn todo_api_weekly_planner_time_travel_creates_placeholders() -> turmoil::Result
             shutdown_tx.send_replace(true);
             Ok(())
         })
+}
+
+#[tokio::test]
+async fn todo_api_planner_initial_fire_override_persists_across_reopen() -> Result<(), BoxError> {
+    let clock = Arc::new(StubClock::new(Timestamp::new(0)));
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let schedule = PlannerSchedule::new(TEST_DAY_MILLIS, 7);
+
+    let first_db = todo_db_builder(
+        "/todo-api-planner-override-recovery",
+        "todo-api-planner-override-recovery",
+    )
+    .file_system(file_system.clone())
+    .object_store(object_store.clone())
+    .clock(clock.clone())
+    .rng(Arc::new(DeterministicRng::seeded(0x7171)))
+    .open()
+    .await
+    .map_err(boxed_error)?;
+    let app = TodoApp::open_with_options(
+        first_db,
+        clock.clone(),
+        TodoAppOptions {
+            planner_schedule: schedule,
+            planner_initial_fire_at_ms: Some(TEST_WEEK_MILLIS),
+        },
+    )
+    .await
+    .map_err(boxed_error)?;
+    let initial_next_fire_at = wait_for_planner_state(&app).await?;
+    assert_eq!(initial_next_fire_at, TEST_WEEK_MILLIS);
+    app.shutdown().await.map_err(boxed_error)?;
+
+    let reopened_db = todo_db_builder(
+        "/todo-api-planner-override-recovery",
+        "todo-api-planner-override-recovery",
+    )
+    .file_system(file_system)
+    .object_store(object_store)
+    .clock(clock.clone())
+    .rng(Arc::new(DeterministicRng::seeded(0x7171)))
+    .open()
+    .await
+    .map_err(boxed_error)?;
+    let reopened = TodoApp::open_with_options(
+        reopened_db,
+        clock,
+        TodoAppOptions {
+            planner_schedule: schedule,
+            planner_initial_fire_at_ms: Some(TEST_WEEK_MILLIS * 3),
+        },
+    )
+    .await
+    .map_err(boxed_error)?;
+    let resumed_next_fire_at = wait_for_planner_state(&reopened).await?;
+    assert_eq!(
+        resumed_next_fire_at, TEST_WEEK_MILLIS,
+        "reopen should preserve the persisted planner schedule instead of recomputing it",
+    );
+    reopened.shutdown().await.map_err(boxed_error)?;
+    Ok(())
 }
