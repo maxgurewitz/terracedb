@@ -926,6 +926,11 @@ impl Db {
                 self.inner
                     .next_sequence
                     .store(sequence.get(), Ordering::SeqCst);
+                self.inner.db_progress.publish(
+                    self.current_sequence(),
+                    self.current_durable_sequence(),
+                    sequence,
+                );
                 participant
             };
 
@@ -2393,6 +2398,11 @@ impl Db {
             pending.start_sequence.get().saturating_sub(1),
             Ordering::SeqCst,
         );
+        self.inner.db_progress.publish(
+            self.current_sequence(),
+            self.current_durable_sequence(),
+            SequenceNumber::new(pending.start_sequence.get().saturating_sub(1)),
+        );
         for batch in affected_batches {
             batch.finish(Err(pending.error.clone()));
         }
@@ -2546,9 +2556,13 @@ impl Db {
                 .store(sequence.get(), Ordering::SeqCst);
         }
         if advance.visible_sequence.is_some() || advance.durable_sequence.is_some() {
-            self.inner
-                .db_progress
-                .publish(self.current_sequence(), self.current_durable_sequence());
+            let reserved_sequence =
+                SequenceNumber::new(self.inner.next_sequence.load(Ordering::SeqCst));
+            self.inner.db_progress.publish(
+                self.current_sequence(),
+                self.current_durable_sequence(),
+                reserved_sequence,
+            );
         }
 
         self.notify_table_sequences(&self.inner.visible_watchers, &advance.visible_tables);

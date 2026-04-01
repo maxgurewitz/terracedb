@@ -17,9 +17,9 @@ simulation probes.
   published subscription state after representative updates.
 - [x] Make the current vs historical admission shape explicit so tests can
   distinguish live pressure from the last non-open reason.
-- [ ] Sweep remaining scheduler observability tests onto subscription/event
+- [x] Sweep remaining scheduler observability tests onto subscription/event
   helpers where they still rely on incidental yields.
-- [ ] Delete any old reader-side helpers that reconstruct scheduler state from
+- [x] Delete any old reader-side helpers that reconstruct scheduler state from
   locks once the published snapshot path is fully in place.
 
 ## T76b: Remaining Blocking Inspection Surfaces
@@ -31,10 +31,10 @@ simulation probes.
   - ordered event stream, or
   - bounded progress probe.
 - [ ] Convert the highest-value runtime-safe surfaces first, in this order:
-  - DB progress snapshots/subscriptions for in-flight sequence visibility.
-  - Resource-manager snapshots into subscription-backed reads for active
+  - [x] DB progress snapshots/subscriptions for in-flight sequence visibility.
+  - [x] Resource-manager snapshots into subscription-backed reads for active
     domain/budget assertions.
-  - Columnar cache usage into published immutable state instead of lock-backed
+  - [x] Columnar cache usage into published immutable state instead of lock-backed
     reconstruction.
   - Watermark/progress reads where they are really transition notifications
     rather than static summaries.
@@ -48,9 +48,10 @@ simulation probes.
 - [ ] Extend the debugging guide with the preferred simulation-safe
   observation patterns and examples of when to choose snapshots versus
   subscriptions versus progress probes.
-- [ ] Add remote cache / prefetch progress events so range-cache and dedupe
-  tests can wait on explicit completion instead of ad hoc sleeps.
-- [ ] Replace failpoint helpers that depend on repeated `yield_now()` polling
+- [x] Add remote cache / prefetch progress events so range-cache and dedupe
+  tests can wait on explicit in-flight claims and completion instead of ad hoc
+  sleeps.
+- [x] Replace failpoint helpers that depend on repeated `yield_now()` polling
   with event-driven or bounded progress helpers.
 
 ## T76c: Deterministic Progress Probes
@@ -72,19 +73,13 @@ simulation probes.
 
 ## Highest-Value Follow-Ups
 
-- [ ] [src/api/db_api.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/db_api.rs):
-  finish migrating async tests away from direct DB progress sampling and onto
-  the progress subscription and publish-on-change snapshot path.
 - [ ] [tests/execution_domain_contracts.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/tests/execution_domain_contracts.rs):
   replace remaining resource-manager polling patterns with subscription-based
   waits where assertions are about in-flight state.
-- [ ] [src/api/internals.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/internals.rs)
-  and [src/api/sstable_io.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/sstable_io.rs):
-  finish publishing columnar cache usage state and delete the reader-side
-  reconstruction path.
 - [ ] [src/api/watermark.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/src/api/watermark.rs):
-  review watermark/progress inspection for the same published-state vs
-  blocking split where it still matters for simulation tests.
+  decide whether any remaining watermark-facing test helpers want ordered event
+  semantics instead of latest-snapshot semantics now that `reserved_sequence`
+  is published.
 - [ ] [tests/simulation_harness.rs](/Users/maxwellgurewitz/.codex/worktrees/7dfb/terracedb/tests/simulation_harness.rs):
   extend whole-system scenarios so they assert observability transitions
   through subscriptions/events, not only end-of-test snapshots.

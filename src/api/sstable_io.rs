@@ -190,7 +190,7 @@ impl ColumnarReadContext {
             return Ok(());
         };
 
-        let entries = cache.entries_snapshot();
+        let entries = cache.progress_snapshot().entries;
         let lengths = entries
             .iter()
             .map(|entry| {

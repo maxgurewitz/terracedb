@@ -152,7 +152,11 @@ impl Db {
                         initial_table_watermarks.clone(),
                     )),
                     durable_watchers: Arc::new(WatermarkRegistry::new(initial_table_watermarks)),
-                    db_progress: DbProgressPublisher::new(recovered_sequence, recovered_sequence),
+                    db_progress: DbProgressPublisher::new(
+                        recovered_sequence,
+                        recovered_sequence,
+                        recovered_sequence,
+                    ),
                     pending_work_budget_state: Mutex::new(PendingWorkBudgetState::default()),
                     scheduler_observability: SchedulerObservabilityStats::default(),
                     compact_to_wide_stats: Mutex::new(BTreeMap::new()),
@@ -1329,7 +1333,7 @@ impl Db {
         let (raw_byte_total, raw_byte_order, raw_byte_lengths) = remote_cache
             .as_ref()
             .map(|cache| {
-                let entries = cache.entries_snapshot();
+                let entries = cache.progress_snapshot().entries;
                 let lengths = entries
                     .iter()
                     .map(|entry| {

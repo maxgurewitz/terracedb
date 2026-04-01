@@ -48,6 +48,7 @@ impl Clone for WatermarkReceiver {
 pub struct DbProgressSnapshot {
     pub current_sequence: SequenceNumber,
     pub durable_sequence: SequenceNumber,
+    pub reserved_sequence: SequenceNumber,
 }
 
 #[derive(Debug)]
@@ -114,10 +115,15 @@ pub(super) struct DbProgressPublisher {
 }
 
 impl DbProgressPublisher {
-    pub(super) fn new(current_sequence: SequenceNumber, durable_sequence: SequenceNumber) -> Self {
+    pub(super) fn new(
+        current_sequence: SequenceNumber,
+        durable_sequence: SequenceNumber,
+        reserved_sequence: SequenceNumber,
+    ) -> Self {
         let initial_snapshot = Arc::new(DbProgressSnapshot {
             current_sequence,
             durable_sequence,
+            reserved_sequence,
         });
         let (published_snapshot, _receiver) = watch::channel(initial_snapshot.clone());
         Self {
@@ -138,10 +144,12 @@ impl DbProgressPublisher {
         &self,
         current_sequence: SequenceNumber,
         durable_sequence: SequenceNumber,
+        reserved_sequence: SequenceNumber,
     ) {
         let snapshot = Arc::new(DbProgressSnapshot {
             current_sequence,
             durable_sequence,
+            reserved_sequence,
         });
         self.latest_snapshot.store(snapshot.clone());
         self.published_snapshot.send_replace(snapshot);

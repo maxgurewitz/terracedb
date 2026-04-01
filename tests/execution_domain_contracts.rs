@@ -2807,6 +2807,7 @@ async fn db_progress_subscription_observes_visible_then_durable_transitions() {
         .wait_for(|snapshot| {
             snapshot.current_sequence == visible
                 && snapshot.durable_sequence == terracedb::SequenceNumber::default()
+                && snapshot.reserved_sequence == visible
         })
         .await
         .expect("db progress update");
@@ -2815,16 +2816,20 @@ async fn db_progress_subscription_observes_visible_then_durable_transitions() {
         published_visible.durable_sequence,
         terracedb::SequenceNumber::default()
     );
+    assert_eq!(published_visible.reserved_sequence, visible);
 
     db.flush().await.expect("flush row");
     let published_durable = progress
         .wait_for(|snapshot| {
-            snapshot.current_sequence == visible && snapshot.durable_sequence == visible
+            snapshot.current_sequence == visible
+                && snapshot.durable_sequence == visible
+                && snapshot.reserved_sequence == visible
         })
         .await
         .expect("db progress update");
     assert_eq!(published_durable.current_sequence, visible);
     assert_eq!(published_durable.durable_sequence, visible);
+    assert_eq!(published_durable.reserved_sequence, visible);
     assert_eq!(db.progress_snapshot(), published_durable);
 }
 

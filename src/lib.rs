@@ -150,8 +150,10 @@ pub use pressure::{
     carry_write_delay_across_maintenance, derive_pressure_budget, multi_signal_write_admission,
 };
 pub use remote::{
-    CacheSpan, ObjectKeyLayout, RemoteCache, RemoteOperation, RemoteRecoveryHint,
-    RemoteStorageError, StorageSource, UnifiedStorage, UnifiedStorageError,
+    CacheSpan, ObjectKeyLayout, RemoteCache, RemoteCacheEntrySnapshot, RemoteCacheFetchKind,
+    RemoteCacheInFlightSnapshot, RemoteCacheProgressSnapshot, RemoteCacheProgressSubscription,
+    RemoteOperation, RemoteRecoveryHint, RemoteStorageError, StorageSource, UnifiedStorage,
+    UnifiedStorageError,
 };
 pub use scheduler::{
     AdmissionObservation, AdmissionObservationReceiver, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT,

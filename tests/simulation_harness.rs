@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use terracedb::{
-    Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
+    CacheSpan, Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
     CommitOptions, CompactionStrategy, ContentionClass, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db,
     DbComponents, DbConfig, DbProgressSnapshot, DbSettings, DomainBackgroundBudget,
     DomainBudgetCharge, DomainBudgetOracle, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget,
@@ -16,12 +17,13 @@ use terracedb::{
     ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceUsage, FieldDefinition,
     FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure, FileSystemOperation,
     InMemoryDomainBudgetOracle, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore,
-    ObjectStoreOperation, OpenError, PendingWork, PendingWorkType, RemoteCache, RemoteRecoveryHint,
-    ResourceManager, RoundRobinScheduler, S3Location, S3PrimaryStorageConfig, ScanOptions,
-    ScheduleAction, ScheduleDecision, Scheduler, SchemaDefinition, SegmentId, SequenceNumber,
-    SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubRng, TableConfig, TableFormat,
-    TableStats, ThrottleDecision, TieredDurabilityMode, TieredStorageConfig, Transaction,
-    UnifiedStorage, Value, WorkPlacementRequest,
+    ObjectStoreOperation, OpenError, PendingWork, PendingWorkType, RemoteCache,
+    RemoteCacheFetchKind, RemoteRecoveryHint, ResourceManager, RoundRobinScheduler, S3Location,
+    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+    SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
+    StorageSource, StubRng, TableConfig, TableFormat, TableStats, ThrottleDecision,
+    TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage, Value,
+    WorkPlacementRequest,
 };
 use terracedb_simulation::{
     CutPoint, DbGeneratedScenario, DbMutation, DbOracleChange, DbShadowOracle,
@@ -30,6 +32,7 @@ use terracedb_simulation::{
     SimulationContext, SimulationMergeOperatorId, SimulationScenarioConfig, SimulationTableSpec,
     StubDbProcess, TraceEvent,
 };
+use tokio::sync::Notify;
 
 fn ttl_value(expires_at_millis: u64, payload: &str) -> Value {
     let mut encoded = expires_at_millis.to_be_bytes().to_vec();
@@ -46,6 +49,94 @@ fn assert_change_feed_storage_kind(
     expected_kind: StorageErrorKind,
 ) {
     assert_eq!(error.kind(), expected_kind);
+}
+
+#[derive(Clone)]
+struct BlockingRangeObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    range_calls: Arc<Mutex<Vec<(String, u64, u64)>>>,
+    range_call_notify: Arc<Notify>,
+    block_ranges: Arc<AtomicBool>,
+    release_ranges: Arc<Notify>,
+}
+
+impl BlockingRangeObjectStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            range_calls: Arc::new(Mutex::new(Vec::new())),
+            range_call_notify: Arc::new(Notify::new()),
+            block_ranges: Arc::new(AtomicBool::new(true)),
+            release_ranges: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn wait_for_range_calls(&self, expected: usize) {
+        loop {
+            if self
+                .range_calls
+                .lock()
+                .expect("range call log should not be poisoned")
+                .len()
+                >= expected
+            {
+                return;
+            }
+            self.range_call_notify.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.block_ranges.store(false, Ordering::Relaxed);
+        self.release_ranges.notify_waiters();
+    }
+
+    fn range_calls(&self) -> Vec<(String, u64, u64)> {
+        self.range_calls
+            .lock()
+            .expect("range call log should not be poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for BlockingRangeObjectStore {
+    async fn put(&self, key: &str, data: &[u8]) -> Result<(), terracedb::StorageError> {
+        self.inner.put(key, data).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, terracedb::StorageError> {
+        self.inner.get(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, terracedb::StorageError> {
+        self.range_calls
+            .lock()
+            .expect("range call log should not be poisoned")
+            .push((key.to_string(), start, end));
+        self.range_call_notify.notify_waiters();
+        if self.block_ranges.load(Ordering::Relaxed) {
+            self.release_ranges.notified().await;
+        }
+        self.inner.get_range(key, start, end).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), terracedb::StorageError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, terracedb::StorageError> {
+        self.inner.list(prefix).await
+    }
+
+    async fn copy(&self, from: &str, to: &str) -> Result<(), terracedb::StorageError> {
+        self.inner.copy(from, to).await
+    }
 }
 
 #[derive(Default)]
@@ -3003,14 +3094,6 @@ fn simulation_scheduler_observability_subscription_observes_rate_limited_write_w
                     .await
             });
 
-            for _ in 0..4 {
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                !write.is_finished(),
-                "rate-limited write should still be pending when the async snapshot reads"
-            );
-
             let snapshot = scheduler_observability_snapshot_eventually(&db, |snapshot| {
                 snapshot
                     .current_admission_diagnostics_by_domain
@@ -3026,6 +3109,10 @@ fn simulation_scheduler_observability_subscription_observes_rate_limited_write_w
                         == 1
             })
             .await;
+            assert!(
+                !write.is_finished(),
+                "rate-limited write should still be pending when the async snapshot reads"
+            );
             let current = snapshot
                 .current_admission_diagnostics_by_domain
                 .get(&domain)
@@ -3295,7 +3382,7 @@ fn admission_observation_stream_reports_recovery_transition_in_order() -> turmoi
                 .expect("admission observation");
             assert_eq!(throttled.last_non_open, Some(throttled.current.clone()));
 
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            context.clock().sleep(Duration::from_millis(1)).await;
 
             table
                 .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
@@ -3457,7 +3544,7 @@ fn current_admission_simulation_clears_after_recovery_and_preserves_last_non_ope
             );
             assert_eq!(throttled_last_non_open, throttled_current);
 
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            context.clock().sleep(Duration::from_millis(1)).await;
             table
                 .write(b"recovered".to_vec(), Value::Bytes(vec![b'y'; 8]))
                 .await?;
@@ -4126,6 +4213,7 @@ fn simulation_db_progress_subscription_tracks_visible_then_durable_frontiers() -
                 .wait_for(|snapshot| {
                     snapshot.current_sequence == visible
                         && snapshot.durable_sequence == SequenceNumber::default()
+                        && snapshot.reserved_sequence == visible
                 })
                 .await
                 .expect("db progress update");
@@ -4134,11 +4222,13 @@ fn simulation_db_progress_subscription_tracks_visible_then_durable_frontiers() -
                 published_visible.durable_sequence,
                 SequenceNumber::default()
             );
+            assert_eq!(published_visible.reserved_sequence, visible);
 
             db.flush().await?;
             let published_durable = progress.current();
             assert_eq!(published_durable.current_sequence, visible);
             assert_eq!(published_durable.durable_sequence, visible);
+            assert_eq!(published_durable.reserved_sequence, visible);
             assert_eq!(db.progress_snapshot(), published_durable);
 
             Ok(())
@@ -4684,6 +4774,142 @@ fn remote_cache_survives_simulated_restart_and_masks_warmed_network_faults() -> 
             .await?;
         let reopened_full = reopened_storage.read_all(&source).await?;
         assert_eq!(reopened_full, payload);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn remote_cache_background_prefetch_progress_is_observable_in_simulation() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2021).run_with(|context| async move {
+        let key = "backup/sst/table-000001/0000/SST-000777.sst";
+        let payload = (0..512)
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect::<Vec<_>>();
+        let cache_root = "/terracedb/sim/remote-cache-progress";
+
+        context.object_store().put(key, &payload).await?;
+
+        let cache = Arc::new(RemoteCache::open(context.file_system(), cache_root).await?);
+        let mut progress = cache.subscribe_progress();
+        let storage =
+            UnifiedStorage::new(context.file_system(), context.object_store(), Some(cache));
+        let source = StorageSource::remote_object(key);
+
+        let first = storage.read_range(&source, 0..64).await?;
+        assert_eq!(first, payload[0..64].to_vec());
+
+        let snapshot = progress
+            .wait_for(|snapshot| {
+                snapshot.in_flight.iter().any(|entry| {
+                    entry.object_key == key
+                        && entry.span
+                            == CacheSpan::Range {
+                                start: 128,
+                                end: 256,
+                            }
+                        && entry.fetch_kind == RemoteCacheFetchKind::Prefetch
+                })
+            })
+            .await?;
+        assert!(
+            snapshot.in_flight.iter().any(|entry| {
+                entry.object_key == key
+                    && entry.span
+                        == CacheSpan::Range {
+                            start: 128,
+                            end: 256,
+                        }
+                    && entry.fetch_kind == RemoteCacheFetchKind::Prefetch
+            }),
+            "background prefetch should be published as an explicit in-flight update"
+        );
+        let warmed = progress
+            .wait_for(|snapshot| {
+                snapshot.entries.iter().any(|entry| {
+                    entry.object_key == key
+                        && entry.span
+                            == CacheSpan::Range {
+                                start: 128,
+                                end: 256,
+                            }
+                })
+            })
+            .await?;
+        assert!(warmed.entries.iter().any(|entry| {
+            entry.object_key == key
+                && entry.span
+                    == CacheSpan::Range {
+                        start: 128,
+                        end: 256,
+                    }
+        }));
+
+        let prefetched = storage.read_range(&source, 128..192).await?;
+        assert_eq!(prefetched, payload[128..192].to_vec());
+
+        Ok(())
+    })
+}
+
+#[test]
+fn remote_cache_duplicate_download_progress_reports_waiters_in_simulation() -> turmoil::Result {
+    SeededSimulationRunner::new(0x2022).run_with(|context| async move {
+        let key = "backup/sst/table-000001/0000/SST-000778.sst";
+        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+        let cache_root = "/terracedb/sim/remote-cache-waiters";
+        let object_store = Arc::new(BlockingRangeObjectStore::new(context.object_store()));
+
+        object_store.put(key, &payload).await?;
+
+        let cache = Arc::new(RemoteCache::open(context.file_system(), cache_root).await?);
+        let mut progress = cache.subscribe_progress();
+        let storage = Arc::new(UnifiedStorage::new(
+            context.file_system(),
+            object_store.clone(),
+            Some(cache),
+        ));
+        let source = StorageSource::remote_object(key);
+
+        let first_storage = storage.clone();
+        let first_source = source.clone();
+        let first =
+            tokio::spawn(async move { first_storage.read_range(&first_source, 2..6).await });
+        object_store.wait_for_range_calls(1).await;
+        let demand_span = CacheSpan::Range { start: 0, end: 128 };
+
+        let second_storage = storage.clone();
+        let second_source = source.clone();
+        let second =
+            tokio::spawn(async move { second_storage.read_range(&second_source, 2..6).await });
+
+        let snapshot = progress
+            .wait_for(|snapshot| {
+                snapshot.in_flight.iter().any(|entry| {
+                    entry.object_key == key
+                        && entry.span == demand_span
+                        && entry.fetch_kind == RemoteCacheFetchKind::Demand
+                        && entry.waiter_count >= 1
+                })
+            })
+            .await?;
+        assert!(snapshot.in_flight.iter().any(|entry| {
+            entry.object_key == key
+                && entry.span == demand_span
+                && entry.fetch_kind == RemoteCacheFetchKind::Demand
+                && entry.waiter_count >= 1
+        }));
+        assert_eq!(object_store.range_calls(), vec![(key.to_string(), 0, 128)]);
+
+        object_store.release();
+        assert_eq!(
+            first.await.expect("join first").expect("first read"),
+            payload[2..6].to_vec()
+        );
+        assert_eq!(
+            second.await.expect("join second").expect("second read"),
+            payload[2..6].to_vec()
+        );
 
         Ok(())
     })
