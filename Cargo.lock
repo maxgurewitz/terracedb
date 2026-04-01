@@ -2415,6 +2415,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-capabilities"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-mcp",
+ "terracedb-migrate",
+ "terracedb-procedures",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "terracedb-debezium"
 version = "0.1.0"
 dependencies = [
@@ -2591,6 +2605,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-capabilities",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "terracedb-migrate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-capabilities",
+]
+
+[[package]]
 name = "terracedb-otel"
 version = "0.1.0"
 dependencies = [
@@ -2610,6 +2647,17 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "terracedb-procedures"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-capabilities",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
