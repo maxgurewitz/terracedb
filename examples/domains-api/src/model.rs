@@ -245,7 +245,7 @@ impl HelperPressureView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivePressureView {
     pub primary_background: Option<BackgroundPressureView>,
     pub helper: Option<HelperPressureView>,
@@ -287,7 +287,7 @@ pub struct WorkloadObservabilityView {
     pub throttle_active: bool,
     pub stall_active: bool,
     pub throttled_write_events: u64,
-    pub last_recorded_write_admission: Option<AdmissionDiagnostics>,
+    pub last_non_open_write_admission: Option<terracedb::RecordedAdmissionDiagnostics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

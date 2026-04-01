@@ -1,5 +1,5 @@
 use tempfile::tempdir;
-use terracedb::{DbComponents, ExecutionDomainPlacement, FailpointMode};
+use terracedb::{AdmissionPressureLevel, DbComponents, ExecutionDomainPlacement, FailpointMode};
 use terracedb_example_domains_api::{
     ANALYTICS_DATABASE_NAME, BackgroundMaintenanceRequest, ControlPlaneTableRequest,
     CreatePrimaryItemRequest, DomainsApp, DomainsExampleProfile, ExampleDatabase,
@@ -355,6 +355,223 @@ async fn placement_profiles_change_admission_behavior_without_changing_logical_a
 }
 
 #[tokio::test]
+async fn published_scheduler_and_resource_updates_match_documented_pressure_transitions() {
+    let fixture = open_fixture(DomainsExampleProfile::PrimaryProtected)
+        .await
+        .expect("open protected fixture");
+    let state = fixture.app.state();
+    let primary_foreground = state
+        .primary_db()
+        .execution_profile()
+        .foreground
+        .domain
+        .clone();
+    let primary_background = state
+        .primary_db()
+        .execution_profile()
+        .background
+        .domain
+        .clone();
+    let helper_foreground = state
+        .analytics_db()
+        .execution_profile()
+        .foreground
+        .domain
+        .clone();
+    let helper_background = state
+        .analytics_db()
+        .execution_profile()
+        .background
+        .domain
+        .clone();
+    let mut active_pressure_updates = state.subscribe_active_pressure();
+    let mut scheduler_updates = state.primary_db().subscribe_scheduler_observability();
+    let mut admission_updates = state.primary_db().subscribe_admission_observations();
+    let mut resource_updates = state.primary_db().subscribe_resource_manager();
+
+    state
+        .run_primary_burst(PrimaryBurstRequest {
+            batch_id: "published-burst".to_string(),
+            item_count: 4,
+            title_bytes: 1_024,
+        })
+        .await
+        .expect("run primary burst");
+
+    let throttled = scheduler_updates
+        .wait_for(|snapshot| {
+            snapshot
+                .current_admission_diagnostics_by_domain
+                .get(&primary_foreground)
+                .is_some_and(|current| current.diagnostics.level != AdmissionPressureLevel::Open)
+                && snapshot
+                    .throttled_writes_by_domain
+                    .get(&primary_foreground)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+        })
+        .await
+        .expect("scheduler update");
+    assert!(
+        throttled.current_admission_diagnostics_by_domain[&primary_foreground]
+            .diagnostics
+            .level
+            != AdmissionPressureLevel::Open
+    );
+
+    let observation = admission_updates
+        .wait_for(|observation| {
+            observation.domain == primary_foreground
+                && observation.current.diagnostics.level != AdmissionPressureLevel::Open
+        })
+        .await
+        .expect("admission observation");
+    assert_eq!(observation.last_non_open, Some(observation.current.clone()));
+
+    let maintenance = state
+        .apply_primary_maintenance(BackgroundMaintenanceRequest {
+            flush_now: false,
+            hold_background_tasks: 1,
+            background_in_flight_bytes: 512,
+            queued_work_items: 2,
+            queued_bytes: 1_024,
+        })
+        .await
+        .expect("apply primary maintenance");
+    let maintenance_admitted = maintenance
+        .background_admission
+        .as_ref()
+        .is_some_and(|decision| decision.admitted);
+    let primary_background_snapshot = resource_updates
+        .wait_for(|snapshot| {
+            let domain = &snapshot.domains[&primary_background];
+            domain.backlog.queued_work_items >= 2
+                && domain.backlog.queued_bytes >= 1_024
+                && (!maintenance_admitted
+                    || (domain.usage.background_tasks >= 1
+                        && domain.usage.background_in_flight_bytes >= 512))
+        })
+        .await
+        .expect("primary background publication");
+    assert_eq!(
+        primary_background_snapshot.domains[&primary_background]
+            .backlog
+            .queued_bytes,
+        1_024
+    );
+    if maintenance_admitted {
+        assert_eq!(
+            primary_background_snapshot.domains[&primary_background]
+                .usage
+                .background_tasks,
+            1
+        );
+    }
+
+    let helper = state
+        .run_helper_load(HelperLoadRequest {
+            batch_id: "published-helper".to_string(),
+            report_count: 3,
+            hold_foreground_cpu_workers: 2,
+            hold_background_tasks: 1,
+            background_in_flight_bytes: 512,
+            queued_work_items: 3,
+            queued_bytes: 1_024,
+            flush_after_write: false,
+        })
+        .await
+        .expect("run helper load");
+    let helper_foreground_admitted = helper
+        .foreground_admission
+        .as_ref()
+        .is_some_and(|decision| decision.admitted);
+    let helper_background_admitted = helper
+        .background_admission
+        .as_ref()
+        .is_some_and(|decision| decision.admitted);
+    let helper_snapshot = resource_updates
+        .wait_for(|snapshot| {
+            let foreground = &snapshot.domains[&helper_foreground];
+            let background = &snapshot.domains[&helper_background];
+            background.backlog.queued_work_items >= 3
+                && background.backlog.queued_bytes >= 1_024
+                && (!helper_foreground_admitted || foreground.usage.cpu_workers_in_use >= 2)
+                && (!helper_background_admitted
+                    || (background.usage.background_tasks >= 1
+                        && background.usage.background_in_flight_bytes >= 512))
+        })
+        .await
+        .expect("helper resource publication");
+    assert_eq!(
+        helper_snapshot.domains[&helper_background]
+            .backlog
+            .queued_work_items,
+        3
+    );
+    if helper_foreground_admitted {
+        assert_eq!(
+            helper_snapshot.domains[&helper_foreground]
+                .usage
+                .cpu_workers_in_use,
+            2
+        );
+    }
+    if helper_background_admitted {
+        assert_eq!(
+            helper_snapshot.domains[&helper_background]
+                .usage
+                .background_tasks,
+            1
+        );
+    }
+
+    let report = state
+        .observability_report()
+        .await
+        .expect("observe documented transitions");
+    assert!(report.primary_writer.throttle_active);
+    assert!(
+        report
+            .primary_writer
+            .last_non_open_write_admission
+            .is_some()
+    );
+    assert!(report.active_pressure.primary_background.is_some());
+    assert!(report.active_pressure.helper.is_some());
+
+    state.primary_db().flush().await.expect("flush primary");
+    assert!(
+        state
+            .release_primary_maintenance()
+            .expect("release primary maintenance")
+            .is_some()
+    );
+    assert!(
+        state
+            .release_helper_pressure()
+            .expect("release helper pressure")
+            .is_some()
+    );
+
+    let recovered_pressure = active_pressure_updates
+        .wait_for(|view| view.primary_background.is_none() && view.helper.is_none())
+        .await
+        .expect("released active pressure");
+    assert!(recovered_pressure.primary_background.is_none());
+    assert!(recovered_pressure.helper.is_none());
+
+    let recovered = state
+        .observability_report()
+        .await
+        .expect("observe recovered report");
+    assert!(recovered.active_pressure.primary_background.is_none());
+    assert!(recovered.active_pressure.helper.is_none());
+    assert!(!recovered.primary_writer.throttle_active);
+    assert!(!recovered.primary_writer.stall_active);
+}
+
+#[tokio::test]
 async fn pressure_report_tracks_dirty_queued_flushing_and_recovery() {
     let fixture = open_fixture(DomainsExampleProfile::PrimaryProtected)
         .await
@@ -420,6 +637,12 @@ async fn pressure_report_tracks_dirty_queued_flushing_and_recovery() {
             > 0
     );
     assert!(after_burst.primary_writer.throttle_active);
+    assert!(
+        after_burst
+            .primary_writer
+            .last_non_open_write_admission
+            .is_some()
+    );
     assert!(
         after_burst
             .helper_writer
@@ -514,6 +737,9 @@ async fn pressure_report_tracks_dirty_queued_flushing_and_recovery() {
         .expect("join flush task")
         .expect("flush after failpoint release");
     state
+        .release_primary_maintenance()
+        .expect("release primary maintenance");
+    state
         .release_helper_pressure()
         .expect("release helper pressure");
 
@@ -555,4 +781,6 @@ async fn pressure_report_tracks_dirty_queued_flushing_and_recovery() {
     );
     assert!(!recovered.primary_writer.throttle_active);
     assert!(!recovered.primary_writer.stall_active);
+    assert!(recovered.active_pressure.primary_background.is_none());
+    assert!(recovered.active_pressure.helper.is_none());
 }

@@ -73,8 +73,9 @@ Each section includes:
   Whether the current pressure state would rate-limit or stall the next write
 - `throttled_write_events`
   How many throttled writes the scheduler has already recorded
-- `last_recorded_write_admission`
-  The most recent scheduler-side diagnostics for that foreground domain
+- `last_non_open_write_admission`
+  The most recent non-open scheduler-side diagnostics for that foreground domain,
+  including when it was recorded
 
 The top-level `deployment` report still shows the configured domain/resource budget layout through each lane's `snapshot.spec.budget`, `snapshot.spec.placement`, and domain metadata.
 

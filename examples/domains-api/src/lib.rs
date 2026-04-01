@@ -2,11 +2,11 @@ mod app;
 mod model;
 
 pub use app::{
-    DEFAULT_SERVER_PORT, DomainsApiError, DomainsApp, DomainsAppError, DomainsAppState,
-    domains_db_builder,
+    ActivePressureSubscription, DEFAULT_SERVER_PORT, DomainsApiError, DomainsApp, DomainsAppError,
+    DomainsAppState, domains_db_builder,
 };
 pub use model::{
-    ANALYTICS_DATABASE_NAME, AdmissionProbeRequest, AdmissionProbeResponse,
+    ANALYTICS_DATABASE_NAME, ActivePressureView, AdmissionProbeRequest, AdmissionProbeResponse,
     BackgroundMaintenanceRequest, BackgroundMaintenanceResponse, BackgroundPressureView,
     ControlPlaneTableRequest, ControlPlaneTableResponse, CreatePrimaryItemRequest,
     DEFAULT_PRIMARY_BURST_TITLE_BYTES, DOMAINS_SERVER_PORT, DomainsExampleProfile,

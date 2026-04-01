@@ -19,6 +19,7 @@ use terracedb_records::{
     RecordWriteError, Utf8StringCodec,
 };
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::model::{
     ANALYTICS_DATABASE_NAME, ActivePressureView, AdmissionProbeRequest, AdmissionProbeResponse,
@@ -123,12 +124,12 @@ struct ActiveHelperPressure {
 }
 
 #[derive(Default)]
-struct ActivePressureState {
+struct HeldPressureState {
     primary_background: Option<ActivePrimaryPressure>,
     helper: Option<ActiveHelperPressure>,
 }
 
-impl ActivePressureState {
+impl HeldPressureState {
     fn view(&self) -> ActivePressureView {
         ActivePressureView {
             primary_background: self
@@ -148,7 +149,9 @@ pub struct DomainsAppState {
     analytics_db: Db,
     primary_items: PrimaryItemsTable,
     helper_reports: HelperReportsTable,
-    active_pressure: Arc<Mutex<ActivePressureState>>,
+    held_pressure: Arc<Mutex<HeldPressureState>>,
+    active_pressure: watch::Receiver<ActivePressureView>,
+    active_pressure_publisher: watch::Sender<ActivePressureView>,
 }
 
 impl std::fmt::Debug for DomainsAppState {
@@ -163,6 +166,57 @@ impl std::fmt::Debug for DomainsAppState {
 
 pub struct DomainsApp {
     state: DomainsAppState,
+}
+
+#[derive(Debug)]
+pub struct ActivePressureSubscription {
+    inner: watch::Receiver<ActivePressureView>,
+}
+
+impl ActivePressureSubscription {
+    fn new(inner: watch::Receiver<ActivePressureView>) -> Self {
+        Self { inner }
+    }
+
+    pub fn current(&self) -> ActivePressureView {
+        self.inner.borrow().clone()
+    }
+
+    pub async fn changed(&mut self) -> Result<ActivePressureView, terracedb::SubscriptionClosed> {
+        self.inner
+            .changed()
+            .await
+            .map_err(|_| terracedb::SubscriptionClosed)?;
+        Ok(self.current())
+    }
+
+    pub async fn wait_for<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<ActivePressureView, terracedb::SubscriptionClosed>
+    where
+        F: FnMut(&ActivePressureView) -> bool,
+    {
+        let current = self.current();
+        if predicate(&current) {
+            return Ok(current);
+        }
+
+        loop {
+            let current = self.changed().await?;
+            if predicate(&current) {
+                return Ok(current);
+            }
+        }
+    }
+}
+
+impl Clone for ActivePressureSubscription {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl DomainsApp {
@@ -212,6 +266,9 @@ impl DomainsApp {
             JsonValueCodec::new(),
         );
 
+        let (active_pressure_publisher, active_pressure) =
+            watch::channel(ActivePressureView::default());
+
         Ok(Self {
             state: DomainsAppState {
                 profile,
@@ -220,7 +277,9 @@ impl DomainsApp {
                 analytics_db,
                 primary_items,
                 helper_reports,
-                active_pressure: Arc::new(Mutex::new(ActivePressureState::default())),
+                held_pressure: Arc::new(Mutex::new(HeldPressureState::default())),
+                active_pressure,
+                active_pressure_publisher,
             },
         })
     }
@@ -267,6 +326,10 @@ impl DomainsAppState {
 
     pub fn analytics_db(&self) -> &Db {
         &self.analytics_db
+    }
+
+    pub fn subscribe_active_pressure(&self) -> ActivePressureSubscription {
+        ActivePressureSubscription::new(self.active_pressure_publisher.subscribe())
     }
 
     pub async fn create_primary_item(
@@ -396,8 +459,7 @@ impl DomainsAppState {
     }
 
     pub fn release_helper_pressure(&self) -> Result<Option<HelperPressureView>, DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        Ok(state.helper.take().map(|pressure| pressure.view))
+        self.update_held_pressure(|state| state.helper.take().map(|pressure| pressure.view))
     }
 
     pub async fn apply_primary_maintenance(
@@ -421,18 +483,19 @@ impl DomainsAppState {
             flushed,
             flush_status,
             background_admission,
-            active_pressure: (!pressure.is_empty()).then_some(pressure),
+            active_pressure: self.active_pressure.borrow().primary_background.clone(),
         })
     }
 
     pub fn release_primary_maintenance(
         &self,
     ) -> Result<Option<BackgroundPressureView>, DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        Ok(state
-            .primary_background
-            .take()
-            .map(|pressure| pressure.view))
+        self.update_held_pressure(|state| {
+            state
+                .primary_background
+                .take()
+                .map(|pressure| pressure.view)
+        })
     }
 
     pub async fn ensure_control_plane_table(
@@ -474,7 +537,7 @@ impl DomainsAppState {
     ) -> Result<DomainsObservabilityResponse, DomainsAppError> {
         let profile = self.profile;
         let deployment = self.deployment.runtime_report();
-        let active_pressure = self.lock_pressure()?.view();
+        let active_pressure = self.active_pressure.borrow().clone();
         let primary_writer = self.primary_workload_observability().await;
         let helper_writer = self.helper_workload_observability().await;
         Ok(DomainsObservabilityResponse {
@@ -487,10 +550,10 @@ impl DomainsAppState {
     }
 
     pub fn release_all_pressure(&self) -> Result<(), DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        let _ = state.primary_background.take();
-        let _ = state.helper.take();
-        Ok(())
+        self.update_held_pressure(|state| {
+            let _ = state.primary_background.take();
+            let _ = state.helper.take();
+        })
     }
 
     fn replace_helper_pressure(
@@ -503,9 +566,7 @@ impl DomainsAppState {
         ),
         DomainsAppError,
     > {
-        let mut state = self.lock_pressure()?;
-        let _ = state.helper.take();
-        drop(state);
+        let _ = self.update_held_pressure(|state| state.helper.take())?;
 
         if pressure.is_empty() {
             return Ok((None, None));
@@ -553,12 +614,14 @@ impl DomainsAppState {
         };
 
         if !admitted_pressure.is_empty() {
-            self.lock_pressure()?.helper = Some(ActiveHelperPressure {
-                view: admitted_pressure,
-                _foreground: foreground_lease.filter(|lease| lease.admitted()),
-                _background_usage: background_lease.filter(|lease| lease.admitted()),
-                _background_backlog: background_backlog,
-            });
+            self.update_held_pressure(|state| {
+                state.helper = Some(ActiveHelperPressure {
+                    view: admitted_pressure,
+                    _foreground: foreground_lease.filter(|lease| lease.admitted()),
+                    _background_usage: background_lease.filter(|lease| lease.admitted()),
+                    _background_backlog: background_backlog,
+                });
+            })?;
         }
 
         Ok((foreground_admission, background_admission))
@@ -568,9 +631,7 @@ impl DomainsAppState {
         &self,
         pressure: BackgroundPressureView,
     ) -> Result<Option<ResourceAdmissionDecision>, DomainsAppError> {
-        let mut state = self.lock_pressure()?;
-        let _ = state.primary_background.take();
-        drop(state);
+        let _ = self.update_held_pressure(|state| state.primary_background.take())?;
 
         if pressure.is_empty() {
             return Ok(None);
@@ -596,11 +657,13 @@ impl DomainsAppState {
             queued_work_items: pressure.queued_work_items,
             queued_bytes: pressure.queued_bytes,
         };
-        self.lock_pressure()?.primary_background = Some(ActivePrimaryPressure {
-            view: admitted_pressure,
-            _usage: usage_lease.admitted().then_some(usage_lease),
-            _backlog: backlog,
-        });
+        self.update_held_pressure(|state| {
+            state.primary_background = Some(ActivePrimaryPressure {
+                view: admitted_pressure,
+                _usage: usage_lease.admitted().then_some(usage_lease),
+                _backlog: backlog,
+            });
+        })?;
         Ok(Some(admission))
     }
 
@@ -656,18 +719,32 @@ impl DomainsAppState {
                 .get(&foreground_domain)
                 .copied()
                 .unwrap_or_default(),
-            last_recorded_write_admission: scheduler
-                .last_admission_diagnostics_by_domain
+            last_non_open_write_admission: scheduler
+                .last_non_open_admission_by_domain
                 .get(&foreground_domain)
                 .cloned(),
             next_write_admission,
         }
     }
 
-    fn lock_pressure(&self) -> Result<MutexGuard<'_, ActivePressureState>, DomainsAppError> {
-        self.active_pressure
+    fn lock_held_pressure(&self) -> Result<MutexGuard<'_, HeldPressureState>, DomainsAppError> {
+        self.held_pressure
             .lock()
             .map_err(|_| DomainsAppError::StatePoisoned)
+    }
+
+    fn update_held_pressure<R>(
+        &self,
+        update: impl FnOnce(&mut HeldPressureState) -> R,
+    ) -> Result<R, DomainsAppError> {
+        let (result, view) = {
+            let mut state = self.lock_held_pressure()?;
+            let result = update(&mut state);
+            let view = state.view();
+            (result, view)
+        };
+        self.active_pressure_publisher.send_replace(view);
+        Ok(result)
     }
 }
 

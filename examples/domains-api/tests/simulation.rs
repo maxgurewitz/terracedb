@@ -63,6 +63,19 @@ fn run_seeded_example(
                 .await
                 .expect("open app");
             let state = app.state();
+            let primary_background = state
+                .primary_db()
+                .execution_profile()
+                .background
+                .domain
+                .clone();
+            let helper_background = state
+                .analytics_db()
+                .execution_profile()
+                .background
+                .domain
+                .clone();
+            let mut resource_updates = state.primary_db().subscribe_resource_manager();
 
             state
                 .run_primary_burst(PrimaryBurstRequest {
@@ -95,6 +108,15 @@ fn run_seeded_example(
                 })
                 .await
                 .expect("run helper load");
+            let _ = resource_updates
+                .wait_for(|snapshot| {
+                    let primary_background = &snapshot.domains[&primary_background];
+                    let helper_background = &snapshot.domains[&helper_background];
+                    primary_background.backlog.queued_bytes >= 1_024
+                        && helper_background.backlog.queued_bytes >= 2_048
+                })
+                .await
+                .expect("resource publication");
             state
                 .ensure_control_plane_table(ControlPlaneTableRequest {
                     database: ExampleDatabase::Primary,

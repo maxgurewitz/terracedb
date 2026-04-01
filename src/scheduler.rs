@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::{broadcast, watch};
 
@@ -170,7 +171,7 @@ pub enum DomainPriorityOverride {
     ControlPlaneReserved,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedAdmissionDiagnostics {
     pub diagnostics: AdmissionDiagnostics,
     pub recorded_at: Timestamp,
