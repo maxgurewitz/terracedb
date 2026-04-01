@@ -72,6 +72,12 @@ pub struct ResourceSelector {
     pub pattern: String,
 }
 
+impl ResourceSelector {
+    pub fn matches_target(&self, target: &ResourceTarget) -> bool {
+        self.kind == target.kind && wildcard_pattern_matches(&self.pattern, &target.identifier)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourcePolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -153,6 +159,8 @@ pub struct ManifestBinding {
     pub budget_policy: BudgetPolicy,
     pub source_template_id: String,
     pub source_grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_interactive_widening: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, JsonValue>,
 }
@@ -279,6 +287,118 @@ pub struct PolicyOutcomeRecord {
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceTarget {
+    pub kind: ResourceKind,
+    pub identifier: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityUseMetrics {
+    #[serde(default = "default_call_count")]
+    pub call_count: u64,
+    pub scanned_rows: Option<u64>,
+    pub returned_rows: Option<u64>,
+    pub bytes: Option<u64>,
+    pub millis: Option<u64>,
+}
+
+impl Default for CapabilityUseMetrics {
+    fn default() -> Self {
+        Self {
+            call_count: default_call_count(),
+            scanned_rows: None,
+            returned_rows: None,
+            bytes: None,
+            millis: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityUseRequest {
+    pub session_id: String,
+    pub operation: ExecutionOperation,
+    pub binding_name: String,
+    pub capability_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ResourceTarget>,
+    #[serde(default)]
+    pub metrics: CapabilityUseMetrics,
+    pub requested_at: Timestamp,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyAuditMetadata {
+    pub session_id: String,
+    pub session_mode: SessionMode,
+    pub subject: PolicySubject,
+    pub binding_name: String,
+    pub capability_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_resources: Vec<ResourceTarget>,
+    pub execution_domain: ExecutionDomain,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement_tags: Vec<String>,
+    pub preset_name: Option<String>,
+    pub profile_name: Option<String>,
+    pub rate_limit: Option<RateLimitOutcome>,
+    pub budget_hook: Option<BudgetAccountingHook>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDecisionRecord {
+    pub outcome: PolicyOutcomeRecord,
+    pub audit: PolicyAuditMetadata,
+}
+
+impl PolicyDecisionRecord {
+    pub fn draft_authorization_request(
+        &self,
+        request_id: impl Into<String>,
+        requested_scope: AuthorizationScope,
+        requested_at: Timestamp,
+        reason: Option<String>,
+    ) -> Option<DraftAuthorizationRequest> {
+        if self.audit.session_mode != SessionMode::Draft {
+            return None;
+        }
+
+        let kind = match self.outcome.outcome {
+            PolicyOutcomeKind::MissingBinding => {
+                DraftAuthorizationRequestKind::InjectMissingBinding
+            }
+            PolicyOutcomeKind::Denied => DraftAuthorizationRequestKind::RetryDeniedOperation,
+            PolicyOutcomeKind::Allowed
+            | PolicyOutcomeKind::RateLimited
+            | PolicyOutcomeKind::BudgetExhausted => return None,
+        };
+
+        let capability_family = self.audit.capability_family.clone()?;
+        let mut metadata = self.audit.metadata.clone();
+        metadata.insert(
+            "policy_outcome".to_string(),
+            json_value(&self.outcome.outcome),
+        );
+
+        Some(DraftAuthorizationRequest {
+            request_id: request_id.into(),
+            session_id: self.audit.session_id.clone(),
+            binding_name: self.audit.binding_name.clone(),
+            capability_family,
+            kind,
+            requested_scope,
+            reason: reason.or_else(|| self.outcome.message.clone()),
+            requested_at,
+            metadata,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionLifecycleState {
@@ -322,6 +442,188 @@ pub struct ForegroundSessionStatusRecord {
     pub sources: Vec<SessionStatusSource>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SessionStatusUpdate {
+    ToolRun {
+        running: bool,
+        updated_at: Timestamp,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, JsonValue>,
+    },
+    ActivityEntry {
+        lifecycle: Option<SessionLifecycleState>,
+        pending_authorization: Option<DraftAuthorizationRequest>,
+        updated_at: Timestamp,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, JsonValue>,
+    },
+    ViewState {
+        visible: bool,
+        updated_at: Timestamp,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, JsonValue>,
+    },
+    PolicyOutcome {
+        outcome: PolicyOutcomeRecord,
+        updated_at: Timestamp,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, JsonValue>,
+    },
+    Closed {
+        updated_at: Timestamp,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, JsonValue>,
+    },
+}
+
+impl SessionStatusUpdate {
+    fn source(&self) -> SessionStatusSource {
+        match self {
+            Self::ToolRun { .. } => SessionStatusSource::ToolRun,
+            Self::ActivityEntry { .. } | Self::Closed { .. } => SessionStatusSource::ActivityEntry,
+            Self::ViewState { .. } => SessionStatusSource::ViewState,
+            Self::PolicyOutcome { .. } => SessionStatusSource::PolicyOutcome,
+        }
+    }
+
+    fn updated_at(&self) -> Timestamp {
+        match self {
+            Self::ToolRun { updated_at, .. }
+            | Self::ActivityEntry { updated_at, .. }
+            | Self::ViewState { updated_at, .. }
+            | Self::PolicyOutcome { updated_at, .. }
+            | Self::Closed { updated_at, .. } => *updated_at,
+        }
+    }
+
+    fn metadata(&self) -> &BTreeMap<String, JsonValue> {
+        match self {
+            Self::ToolRun { metadata, .. }
+            | Self::ActivityEntry { metadata, .. }
+            | Self::ViewState { metadata, .. }
+            | Self::PolicyOutcome { metadata, .. }
+            | Self::Closed { metadata, .. } => metadata,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ForegroundSessionStatusProjector {
+    pub session_id: String,
+    pub session_mode: SessionMode,
+    pub subject: Option<PolicySubject>,
+    pub manifest: CapabilityManifest,
+    pub execution_policy: ExecutionPolicy,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+impl ForegroundSessionStatusProjector {
+    pub fn new(
+        session_id: impl Into<String>,
+        session_mode: SessionMode,
+        subject: Option<PolicySubject>,
+        manifest: CapabilityManifest,
+        execution_policy: ExecutionPolicy,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            session_mode,
+            subject,
+            manifest,
+            execution_policy,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: JsonValue) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    pub fn project(
+        &self,
+        revision: u64,
+        updates: &[SessionStatusUpdate],
+    ) -> ForegroundSessionStatusRecord {
+        let mut lifecycle = SessionLifecycleState::Opening;
+        let mut pending_authorization = None;
+        let mut last_policy_outcome = None;
+        let mut updated_at = Timestamp::new(0);
+        let mut metadata = self.metadata.clone();
+        let mut sources = Vec::new();
+
+        for update in updates {
+            let source = update.source();
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+            metadata.extend(update.metadata().clone());
+            updated_at = update.updated_at();
+
+            match update {
+                SessionStatusUpdate::ToolRun { running, .. } => {
+                    if *running {
+                        lifecycle = SessionLifecycleState::Busy;
+                    } else if pending_authorization.is_some() {
+                        lifecycle = SessionLifecycleState::WaitingForAuthorization;
+                    } else if lifecycle != SessionLifecycleState::Closed {
+                        lifecycle = SessionLifecycleState::Ready;
+                    }
+                }
+                SessionStatusUpdate::ActivityEntry {
+                    lifecycle: next_lifecycle,
+                    pending_authorization: next_pending_authorization,
+                    ..
+                } => {
+                    pending_authorization = next_pending_authorization.clone();
+                    lifecycle = if let Some(next_lifecycle) = next_lifecycle {
+                        *next_lifecycle
+                    } else if pending_authorization.is_some() {
+                        SessionLifecycleState::WaitingForAuthorization
+                    } else if lifecycle == SessionLifecycleState::Closed {
+                        SessionLifecycleState::Closed
+                    } else {
+                        SessionLifecycleState::Ready
+                    };
+                }
+                SessionStatusUpdate::ViewState { visible, .. } => {
+                    metadata.insert("view_visible".to_string(), JsonValue::Bool(*visible));
+                    if *visible && lifecycle == SessionLifecycleState::Opening {
+                        lifecycle = SessionLifecycleState::Ready;
+                    }
+                }
+                SessionStatusUpdate::PolicyOutcome { outcome, .. } => {
+                    last_policy_outcome = Some(outcome.clone());
+                }
+                SessionStatusUpdate::Closed { .. } => {
+                    lifecycle = SessionLifecycleState::Closed;
+                    pending_authorization = None;
+                }
+            }
+        }
+
+        ForegroundSessionStatusRecord {
+            session_id: self.session_id.clone(),
+            revision,
+            snapshot: ForegroundSessionStatusSnapshot {
+                session_id: self.session_id.clone(),
+                lifecycle,
+                session_mode: self.session_mode,
+                subject: self.subject.clone(),
+                manifest: self.manifest.clone(),
+                execution_policy: self.execution_policy.clone(),
+                pending_authorization,
+                last_policy_outcome,
+                updated_at,
+                metadata,
+            },
+            sources,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionOperation {
@@ -333,6 +635,19 @@ pub enum ExecutionOperation {
     MigrationApply,
     ProcedureInvocation,
     McpRequest,
+}
+
+impl ExecutionOperation {
+    pub const ALL: [Self; 8] = [
+        Self::DraftSession,
+        Self::PackageInstall,
+        Self::TypeCheck,
+        Self::BashHelper,
+        Self::MigrationPublication,
+        Self::MigrationApply,
+        Self::ProcedureInvocation,
+        Self::McpRequest,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +677,14 @@ pub struct ExecutionPolicy {
     pub operations: BTreeMap<ExecutionOperation, ExecutionDomainAssignment>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, JsonValue>,
+}
+
+impl ExecutionPolicy {
+    pub fn assignment_for(&self, operation: ExecutionOperation) -> &ExecutionDomainAssignment {
+        self.operations
+            .get(&operation)
+            .unwrap_or(&self.default_assignment)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,12 +738,120 @@ pub struct RateLimitEvaluation {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedSessionPolicy {
     pub subject: PolicySubject,
+    pub session_mode: SessionMode,
     pub manifest: CapabilityManifest,
     pub execution_policy: ExecutionPolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rate_limits: Vec<RateLimitEvaluation>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub budget_hooks: BTreeMap<ExecutionOperation, BudgetAccountingHook>,
+}
+
+impl ResolvedSessionPolicy {
+    pub fn evaluate_use(&self, request: &CapabilityUseRequest) -> PolicyDecisionRecord {
+        let assignment = self
+            .execution_policy
+            .assignment_for(request.operation)
+            .clone();
+        let binding = self
+            .manifest
+            .bindings
+            .iter()
+            .find(|binding| binding.binding_name == request.binding_name);
+        let rate_limit = self
+            .rate_limits
+            .iter()
+            .find(|evaluation| evaluation.binding_name == request.binding_name)
+            .map(|evaluation| evaluation.outcome.clone());
+        let budget_hook = self
+            .budget_hooks
+            .get(&request.operation)
+            .cloned()
+            .or_else(|| {
+                self.budget_hooks
+                    .get(&ExecutionOperation::DraftSession)
+                    .cloned()
+            });
+
+        let capability_family = binding
+            .map(|binding| binding.capability_family.clone())
+            .or_else(|| request.capability_family.clone());
+        let audit = PolicyAuditMetadata {
+            session_id: request.session_id.clone(),
+            session_mode: self.session_mode,
+            subject: self.subject.clone(),
+            binding_name: request.binding_name.clone(),
+            capability_family,
+            target_resources: request.targets.clone(),
+            execution_domain: assignment.domain,
+            placement_tags: assignment.placement_tags.clone(),
+            preset_name: self.manifest.preset_name.clone(),
+            profile_name: self.manifest.profile_name.clone(),
+            rate_limit: rate_limit.clone(),
+            budget_hook,
+            metadata: request.metadata.clone(),
+        };
+
+        let (outcome, message) = match binding {
+            None => (
+                PolicyOutcomeKind::MissingBinding,
+                Some(format!(
+                    "binding {} is not present in the resolved manifest",
+                    request.binding_name
+                )),
+            ),
+            Some(binding) => {
+                if tenant_scope_denies(&self.subject, &binding.resource_policy) {
+                    (
+                        PolicyOutcomeKind::Denied,
+                        Some(format!(
+                            "subject {} is outside the binding tenant scopes",
+                            self.subject.subject_id
+                        )),
+                    )
+                } else if let Some(target) = denied_target(binding, &request.targets) {
+                    (
+                        PolicyOutcomeKind::Denied,
+                        Some(format!(
+                            "target {:?}:{} is outside the binding resource policy",
+                            target.kind, target.identifier
+                        )),
+                    )
+                } else if let Some(rate_limit) =
+                    rate_limit.as_ref().filter(|rate_limit| !rate_limit.allowed)
+                {
+                    let message = rate_limit
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "rate limited by host policy".to_string());
+                    (PolicyOutcomeKind::RateLimited, Some(message))
+                } else if let Some(message) =
+                    budget_exhausted_message(&binding.budget_policy, &request.metrics)
+                {
+                    (PolicyOutcomeKind::BudgetExhausted, Some(message))
+                } else {
+                    (PolicyOutcomeKind::Allowed, None)
+                }
+            }
+        };
+
+        PolicyDecisionRecord {
+            outcome: PolicyOutcomeRecord {
+                binding_name: request.binding_name.clone(),
+                outcome,
+                message,
+                observed_at: request.requested_at,
+                metadata: policy_outcome_metadata(
+                    request,
+                    &assignment,
+                    audit.capability_family.as_deref(),
+                    self.manifest.preset_name.as_deref(),
+                    self.manifest.profile_name.as_deref(),
+                ),
+            },
+            audit,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +1007,8 @@ impl BudgetAccountant for NoopBudgetAccountant {
 pub struct StaticExecutionPolicyResolver {
     default_policy: ExecutionPolicy,
     by_session_mode: BTreeMap<SessionMode, ExecutionPolicy>,
+    by_preset_name: BTreeMap<String, ExecutionPolicy>,
+    by_profile_name: BTreeMap<String, ExecutionPolicy>,
 }
 
 impl StaticExecutionPolicyResolver {
@@ -583,11 +1016,31 @@ impl StaticExecutionPolicyResolver {
         Self {
             default_policy,
             by_session_mode: BTreeMap::new(),
+            by_preset_name: BTreeMap::new(),
+            by_profile_name: BTreeMap::new(),
         }
     }
 
     pub fn with_policy(mut self, mode: SessionMode, policy: ExecutionPolicy) -> Self {
         self.by_session_mode.insert(mode, policy);
+        self
+    }
+
+    pub fn with_preset_policy(
+        mut self,
+        preset_name: impl Into<String>,
+        policy: ExecutionPolicy,
+    ) -> Self {
+        self.by_preset_name.insert(preset_name.into(), policy);
+        self
+    }
+
+    pub fn with_profile_policy(
+        mut self,
+        profile_name: impl Into<String>,
+        policy: ExecutionPolicy,
+    ) -> Self {
+        self.by_profile_name.insert(profile_name.into(), policy);
         self
     }
 }
@@ -597,6 +1050,16 @@ impl ExecutionPolicyResolver for StaticExecutionPolicyResolver {
         &self,
         request: &ExecutionPolicyRequest,
     ) -> Result<ExecutionPolicy, PolicyError> {
+        if let Some(profile_name) = request.profile_name.as_ref() {
+            if let Some(policy) = self.by_profile_name.get(profile_name) {
+                return Ok(policy.clone());
+            }
+        }
+        if let Some(preset_name) = request.preset_name.as_ref() {
+            if let Some(policy) = self.by_preset_name.get(preset_name) {
+                return Ok(policy.clone());
+            }
+        }
         Ok(self
             .by_session_mode
             .get(&request.session_mode)
@@ -718,22 +1181,17 @@ impl DeterministicPolicyEngine {
             .collect();
 
         let mut budget_hooks = BTreeMap::new();
-        budget_hooks.insert(
-            ExecutionOperation::DraftSession,
-            self.budget_accountant.hook_for(
-                ExecutionOperation::DraftSession,
-                &execution_policy.default_assignment,
-            ),
-        );
-        for (operation, assignment) in &execution_policy.operations {
+        for operation in ExecutionOperation::ALL {
             budget_hooks.insert(
-                *operation,
-                self.budget_accountant.hook_for(*operation, assignment),
+                operation,
+                self.budget_accountant
+                    .hook_for(operation, execution_policy.assignment_for(operation)),
             );
         }
 
         Ok(ResolvedSessionPolicy {
             subject,
+            session_mode: request.session_mode,
             manifest,
             execution_policy,
             rate_limits,
@@ -866,6 +1324,7 @@ impl DeterministicPolicyEngine {
             budget_policy,
             source_template_id: template.template_id.clone(),
             source_grant_id: Some(grant.grant_id.clone()),
+            allow_interactive_widening: grant.allow_interactive_widening,
             metadata: template.metadata.clone(),
         })
     }
@@ -895,4 +1354,178 @@ fn find_matching_grant<'a>(
         .iter()
         .copied()
         .find(|grant| grant.template_id == template_id)
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn default_call_count() -> u64 {
+    1
+}
+
+fn tenant_scope_denies(subject: &PolicySubject, policy: &ResourcePolicy) -> bool {
+    !policy.tenant_scopes.is_empty()
+        && subject
+            .tenant_id
+            .as_deref()
+            .is_none_or(|tenant_id| !policy.tenant_scopes.iter().any(|scope| scope == tenant_id))
+}
+
+fn denied_target<'a>(
+    binding: &'a ManifestBinding,
+    targets: &'a [ResourceTarget],
+) -> Option<&'a ResourceTarget> {
+    targets.iter().find(|target| {
+        binding
+            .resource_policy
+            .deny
+            .iter()
+            .any(|selector| selector.matches_target(target))
+            || (!binding.resource_policy.allow.is_empty()
+                && !binding
+                    .resource_policy
+                    .allow
+                    .iter()
+                    .any(|selector| selector.matches_target(target)))
+    })
+}
+
+fn budget_exhausted_message(
+    policy: &BudgetPolicy,
+    metrics: &CapabilityUseMetrics,
+) -> Option<String> {
+    if let Some(max_calls) = policy
+        .max_calls
+        .filter(|max_calls| metrics.call_count > *max_calls)
+    {
+        return Some(format!(
+            "requested {} calls exceeds max_calls {}",
+            metrics.call_count, max_calls
+        ));
+    }
+    if let Some((requested, max)) = metrics
+        .scanned_rows
+        .zip(policy.max_scanned_rows)
+        .filter(|(requested, max)| requested > max)
+    {
+        return Some(format!(
+            "requested scanned_rows {} exceeds max_scanned_rows {}",
+            requested, max
+        ));
+    }
+    if let Some((requested, max)) = metrics
+        .returned_rows
+        .zip(policy.max_returned_rows)
+        .filter(|(requested, max)| requested > max)
+    {
+        return Some(format!(
+            "requested returned_rows {} exceeds max_returned_rows {}",
+            requested, max
+        ));
+    }
+    if let Some((requested, max)) = metrics
+        .bytes
+        .zip(policy.max_bytes)
+        .filter(|(requested, max)| requested > max)
+    {
+        return Some(format!(
+            "requested bytes {} exceeds max_bytes {}",
+            requested, max
+        ));
+    }
+    if let Some((requested, max)) = metrics
+        .millis
+        .zip(policy.max_millis)
+        .filter(|(requested, max)| requested > max)
+    {
+        return Some(format!(
+            "requested millis {} exceeds max_millis {}",
+            requested, max
+        ));
+    }
+    None
+}
+
+fn policy_outcome_metadata(
+    request: &CapabilityUseRequest,
+    assignment: &ExecutionDomainAssignment,
+    capability_family: Option<&str>,
+    preset_name: Option<&str>,
+    profile_name: Option<&str>,
+) -> BTreeMap<String, JsonValue> {
+    let mut metadata = BTreeMap::from([
+        (
+            "session_id".to_string(),
+            JsonValue::String(request.session_id.clone()),
+        ),
+        ("operation".to_string(), json_value(&request.operation)),
+        (
+            "execution_domain".to_string(),
+            json_value(&assignment.domain),
+        ),
+        ("target_resources".to_string(), json_value(&request.targets)),
+    ]);
+    if let Some(capability_family) = capability_family {
+        metadata.insert(
+            "capability_family".to_string(),
+            JsonValue::String(capability_family.to_string()),
+        );
+    }
+    if let Some(preset_name) = preset_name {
+        metadata.insert(
+            "preset_name".to_string(),
+            JsonValue::String(preset_name.to_string()),
+        );
+    }
+    if let Some(profile_name) = profile_name {
+        metadata.insert(
+            "profile_name".to_string(),
+            JsonValue::String(profile_name.to_string()),
+        );
+    }
+    metadata
+}
+
+fn wildcard_pattern_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    if parts.len() == 1 {
+        return pattern == value;
+    }
+
+    let mut remainder = value;
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+
+        if index == 0 && !pattern.starts_with('*') {
+            let Some(next) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = next;
+            continue;
+        }
+
+        if index == parts.len() - 1 && !pattern.ends_with('*') {
+            return remainder.ends_with(part);
+        }
+
+        let Some(position) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[position + part.len()..];
+    }
+
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+fn json_value<T>(value: &T) -> JsonValue
+where
+    T: Serialize,
+{
+    serde_json::to_value(value).unwrap_or(JsonValue::Null)
 }
