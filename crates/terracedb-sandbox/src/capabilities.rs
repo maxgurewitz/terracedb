@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use terracedb_capabilities::{
     CapabilityManifest as PolicyCapabilityManifest, DatabaseCapabilityFamily, ManifestBinding,
+    ShellCommandDescriptor,
 };
 use terracedb_vfs::JsonValue;
 
@@ -70,7 +71,18 @@ impl SandboxCapability {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxCapabilityMethod {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub min_args: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub max_args: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_example: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_description: Option<String>,
 }
 
 impl SandboxCapabilityMethod {
@@ -78,7 +90,42 @@ impl SandboxCapabilityMethod {
         Self {
             name: name.into(),
             description: None,
+            min_args: 0,
+            max_args: 0,
+            input_description: None,
+            input_example: None,
+            output_description: None,
         }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn with_argument_arity(mut self, min_args: u8, max_args: u8) -> Self {
+        self.min_args = min_args;
+        self.max_args = max_args.max(min_args);
+        self
+    }
+
+    pub fn with_input_description(mut self, description: impl Into<String>) -> Self {
+        self.input_description = Some(description.into());
+        self
+    }
+
+    pub fn with_input_example(mut self, example: impl Into<String>) -> Self {
+        self.input_example = Some(example.into());
+        self
+    }
+
+    pub fn with_output_description(mut self, description: impl Into<String>) -> Self {
+        self.output_description = Some(description.into());
+        self
+    }
+
+    pub fn requires_args(&self) -> bool {
+        self.min_args > 0
     }
 }
 
@@ -86,6 +133,24 @@ impl SandboxCapabilityMethod {
 pub struct SandboxCapabilityModule {
     pub capability: SandboxCapability,
     pub methods: Vec<SandboxCapabilityMethod>,
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SandboxShellCommandTarget {
+    Capability { specifier: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SandboxShellCommand {
+    pub descriptor: ShellCommandDescriptor,
+    pub target: SandboxShellCommandTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<SandboxCapabilityMethod>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
@@ -228,6 +293,10 @@ pub trait CapabilityRegistry: Send + Sync {
         None
     }
 
+    fn shell_commands(&self) -> Vec<SandboxShellCommand> {
+        Vec::new()
+    }
+
     async fn invoke(
         &self,
         _session: &SandboxSession,
@@ -246,7 +315,7 @@ type ErasedCapabilityHandler<State> =
 
 #[derive(Clone)]
 struct RegisteredCapabilityMethod<State> {
-    description: Option<String>,
+    surface: SandboxCapabilityMethod,
     handler: Arc<ErasedCapabilityHandler<State>>,
 }
 
@@ -296,11 +365,19 @@ where
         self.ensure_method_specifier(method.specifier())?;
         let handler = Arc::new(handler);
         let name = method.name().to_string();
+        let description = description.map(Into::into);
         let method_name = name.clone();
         self.methods.insert(
             name,
             RegisteredCapabilityMethod {
-                description: description.map(Into::into),
+                surface: description.as_ref().map_or_else(
+                    || SandboxCapabilityMethod::new(method_name.clone()).with_argument_arity(0, 0),
+                    |description| {
+                        SandboxCapabilityMethod::new(method_name.clone())
+                            .with_description(description.clone())
+                            .with_argument_arity(0, 0)
+                    },
+                ),
                 handler: Arc::new(move |state, session, args| {
                     let handler = handler.clone();
                     let method_name = method_name.clone();
@@ -336,11 +413,19 @@ where
         self.ensure_method_specifier(method.specifier())?;
         let handler = Arc::new(handler);
         let name = method.name().to_string();
+        let description = description.map(Into::into);
         let method_name = name.clone();
         self.methods.insert(
             name,
             RegisteredCapabilityMethod {
-                description: description.map(Into::into),
+                surface: description.as_ref().map_or_else(
+                    || SandboxCapabilityMethod::new(method_name.clone()).with_argument_arity(1, 1),
+                    |description| {
+                        SandboxCapabilityMethod::new(method_name.clone())
+                            .with_description(description.clone())
+                            .with_argument_arity(1, 1)
+                    },
+                ),
                 handler: Arc::new(move |state, session, args| {
                     let handler = handler.clone();
                     let method_name = method_name.clone();
@@ -440,11 +525,8 @@ where
                 capability: module.capability.clone(),
                 methods: module
                     .methods
-                    .iter()
-                    .map(|(name, method)| SandboxCapabilityMethod {
-                        name: name.clone(),
-                        description: method.description.clone(),
-                    })
+                    .values()
+                    .map(|method| method.surface.clone())
                     .collect(),
                 metadata: module.metadata.clone(),
             })
@@ -529,6 +611,7 @@ pub struct ManifestBoundCapabilityRegistry {
     policy_manifest: PolicyCapabilityManifest,
     bindings: BTreeMap<String, ManifestBinding>,
     modules: BTreeMap<String, SandboxCapabilityModule>,
+    shell_commands: Vec<SandboxShellCommand>,
     dispatcher: Arc<dyn ManifestBoundCapabilityDispatcher>,
 }
 
@@ -539,6 +622,7 @@ impl ManifestBoundCapabilityRegistry {
     ) -> Result<Self, SandboxError> {
         let mut bindings = BTreeMap::new();
         let mut modules = BTreeMap::new();
+        let mut shell_commands = Vec::new();
 
         for binding in &policy_manifest.bindings {
             let family =
@@ -552,15 +636,27 @@ impl ManifestBoundCapabilityRegistry {
                     }
                 })?;
             let capability = generated_capability_for_binding(binding, &policy_manifest, family)?;
+            let metadata = generated_binding_metadata(binding, &policy_manifest);
+            let methods = generated_capability_methods(family);
             let module = SandboxCapabilityModule {
                 capability,
-                methods: family
-                    .generated_methods()
-                    .iter()
-                    .map(|method| SandboxCapabilityMethod::new(*method))
-                    .collect(),
-                metadata: generated_binding_metadata(binding, &policy_manifest),
+                methods: methods.clone(),
+                metadata: metadata.clone(),
             };
+            if let Some(descriptor) = binding.shell_command.clone() {
+                shell_commands.push(SandboxShellCommand {
+                    description: descriptor
+                        .description
+                        .clone()
+                        .or_else(|| module.capability.description.clone()),
+                    descriptor,
+                    target: SandboxShellCommandTarget::Capability {
+                        specifier: binding.module_specifier.clone(),
+                    },
+                    methods: methods.clone(),
+                    metadata: metadata.clone(),
+                });
+            }
             bindings.insert(binding.module_specifier.clone(), binding.clone());
             modules.insert(binding.module_specifier.clone(), module);
         }
@@ -569,6 +665,7 @@ impl ManifestBoundCapabilityRegistry {
             policy_manifest,
             bindings,
             modules,
+            shell_commands,
             dispatcher,
         })
     }
@@ -598,6 +695,10 @@ impl CapabilityRegistry for ManifestBoundCapabilityRegistry {
 
     fn module(&self, specifier: &str) -> Option<SandboxCapabilityModule> {
         self.modules.get(specifier).cloned()
+    }
+
+    fn shell_commands(&self) -> Vec<SandboxShellCommand> {
+        self.shell_commands.clone()
     }
 
     async fn invoke(
@@ -847,4 +948,117 @@ impl CapabilityRegistry for DeterministicCapabilityRegistry {
             metadata: module.metadata.clone(),
         })
     }
+}
+
+fn generated_capability_methods(family: DatabaseCapabilityFamily) -> Vec<SandboxCapabilityMethod> {
+    match family {
+        DatabaseCapabilityFamily::DbTableV1 => vec![
+            SandboxCapabilityMethod::new("get")
+                .with_description("Read a single row from the bound table.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with the row key to read.")
+                .with_input_example(r#"{"key":"ticket:t-1"}"#)
+                .with_output_description("Returns the key that was read and the row value or null."),
+            SandboxCapabilityMethod::new("scanPrefix")
+                .with_description("Scan visible rows from the bound table by key prefix.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with optional prefix, limit, and resumeToken fields.")
+                .with_input_example(r#"{"prefix":"ticket:","limit":50,"resumeToken":null}"#)
+                .with_output_description(
+                    "Returns rows plus scannedRows, returnedRows, and an optional resumeToken.",
+                ),
+            SandboxCapabilityMethod::new("put")
+                .with_description("Write or replace a row in the bound table.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with key, row, and optional occReadSet.")
+                .with_input_example(
+                    r#"{"key":"ticket:t-1","row":{"status":"open"},"occReadSet":["ticket:t-1"]}"#,
+                )
+                .with_output_description("Returns the written key, row, and whether a write occurred."),
+            SandboxCapabilityMethod::new("delete")
+                .with_description("Delete a row from the bound table.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with key and optional occReadSet.")
+                .with_input_example(r#"{"key":"ticket:t-1","occReadSet":["ticket:t-1"]}"#)
+                .with_output_description("Returns the deleted key and whether a row was removed."),
+        ],
+        DatabaseCapabilityFamily::DbQueryV1 => vec![
+            SandboxCapabilityMethod::new("get")
+                .with_description("Read a single row from an approved table binding.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with table, optional database, and key.")
+                .with_input_example(r#"{"table":"tickets","key":"ticket:t-1"}"#)
+                .with_output_description("Returns the key that was read and the row value or null."),
+            SandboxCapabilityMethod::new("scanPrefix")
+                .with_description("Scan approved rows from an approved table binding by key prefix.")
+                .with_argument_arity(1, 1)
+                .with_input_description(
+                    "Pass a JSON object with table, optional database, prefix, limit, and resumeToken.",
+                )
+                .with_input_example(
+                    r#"{"table":"tickets","prefix":"ticket:","limit":50,"resumeToken":null}"#,
+                )
+                .with_output_description(
+                    "Returns rows plus scannedRows, returnedRows, and an optional resumeToken.",
+                ),
+            SandboxCapabilityMethod::new("put")
+                .with_description("Write or replace a row in an approved table binding.")
+                .with_argument_arity(1, 1)
+                .with_input_description(
+                    "Pass a JSON object with table, optional database, key, row, and optional occReadSet.",
+                )
+                .with_input_example(
+                    r#"{"table":"tickets","key":"ticket:t-1","row":{"status":"open"},"occReadSet":["ticket:t-1"]}"#,
+                )
+                .with_output_description("Returns the written key, row, and whether a write occurred."),
+            SandboxCapabilityMethod::new("delete")
+                .with_description("Delete a row from an approved table binding.")
+                .with_argument_arity(1, 1)
+                .with_input_description(
+                    "Pass a JSON object with table, optional database, key, and optional occReadSet.",
+                )
+                .with_input_example(
+                    r#"{"table":"tickets","key":"ticket:t-1","occReadSet":["ticket:t-1"]}"#,
+                )
+                .with_output_description("Returns the deleted key and whether a row was removed."),
+        ],
+        DatabaseCapabilityFamily::CatalogMigrateV1 => vec![
+            SandboxCapabilityMethod::new("ensureTable")
+                .with_description("Ensure that a table exists with the requested schema.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with table, optional database, and optional schema.")
+                .with_input_example(r#"{"table":"tickets","schema":{"version":1}}"#)
+                .with_output_description("Returns whether the change was applied and the table name."),
+            SandboxCapabilityMethod::new("installSchemaSuccessor")
+                .with_description("Install a reviewed schema successor for a table.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with table, optional database, and successor.")
+                .with_input_example(r#"{"table":"tickets","successor":{"version":2}}"#)
+                .with_output_description("Returns whether the change was applied and the table name."),
+            SandboxCapabilityMethod::new("updateTableMetadata")
+                .with_description("Update metadata for a table.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with table, optional database, and metadata.")
+                .with_input_example(r#"{"table":"tickets","metadata":{"owner":"support"}}"#)
+                .with_output_description("Returns whether the change was applied and the table name."),
+            SandboxCapabilityMethod::new("checkPrecondition")
+                .with_description("Evaluate a migration precondition against the catalog.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with optional table, optional database, and precondition.")
+                .with_input_example(r#"{"table":"tickets","precondition":{"kind":"exists"}}"#)
+                .with_output_description("Returns whether the requested precondition holds."),
+        ],
+        DatabaseCapabilityFamily::ProcedureInvokeV1 => vec![
+            SandboxCapabilityMethod::new("invoke")
+                .with_description("Invoke a reviewed procedure through the bound host surface.")
+                .with_argument_arity(1, 1)
+                .with_input_description("Pass a JSON object with an optional procedureId override and arguments.")
+                .with_input_example(r#"{"procedureId":"sync-ticket","arguments":{"ticketId":"t-1"}}"#)
+                .with_output_description("Returns the resolved procedureId and the procedure result."),
+        ],
+    }
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }

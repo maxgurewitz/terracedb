@@ -25,8 +25,9 @@ pub use capabilities::{
     DeterministicCapabilityModule, DeterministicCapabilityRegistry,
     ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
     ManifestBoundCapabilityRegistry, ManifestBoundCapabilityResult, SandboxCapability,
-    SandboxCapabilityMethod, SandboxCapabilityModule, StaticCapabilityRegistry,
-    TypedCapabilityModule, TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
+    SandboxCapabilityMethod, SandboxCapabilityModule, SandboxShellCommand,
+    SandboxShellCommandTarget, StaticCapabilityRegistry, TypedCapabilityModule,
+    TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
 pub use disk::{
     ConflictEntry, ConflictReport, EjectMode, EjectReport, EjectRequest, HoistMode, HoistReport,

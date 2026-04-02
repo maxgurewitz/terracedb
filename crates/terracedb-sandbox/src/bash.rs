@@ -2,13 +2,15 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
 use terracedb_vfs::{
     CompletedToolRunOutcome, CreateOptions, DirEntry, FileKind, MkdirOptions, Stats,
 };
 
 use crate::{
-    DeterministicTypeScriptService, PackageInstallRequest, SandboxError, SandboxFilesystemShim,
-    SandboxSession, TypeCheckRequest, TypeScriptService, session::record_completed_tool_run,
+    CapabilityCallRequest, DeterministicTypeScriptService, PackageInstallRequest, SandboxError,
+    SandboxFilesystemShim, SandboxSession, SandboxShellCommand, SandboxShellCommandTarget,
+    TypeCheckRequest, TypeScriptService, session::record_completed_tool_run,
 };
 
 pub const TERRACE_BASH_SESSION_STATE_PATH: &str = "/.terrace/tools/bash/session.json";
@@ -240,11 +242,14 @@ impl DeterministicBashService {
             "export" => export_command(state, &tokens),
             "npm" => self.npm_command(session, &tokens).await,
             "tsc" => self.tsc_command(session, state, &tokens).await,
-            command => shell_failure(
-                127,
-                String::new(),
-                format!("unsupported sandbox command: {command}\n"),
-            ),
+            command => match shell_bridge_command(session, &adapter, &tokens).await? {
+                Some(outcome) => outcome,
+                None => shell_failure(
+                    127,
+                    String::new(),
+                    format!("unsupported sandbox command: {command}\n"),
+                ),
+            },
         })
     }
 
@@ -368,6 +373,118 @@ impl DeterministicBashService {
     }
 }
 
+async fn shell_bridge_command(
+    session: &SandboxSession,
+    adapter: &JustBashFilesystemAdapter,
+    tokens: &[String],
+) -> Result<Option<CommandOutcome>, SandboxError> {
+    let mut commands = available_shell_commands(session)
+        .await
+        .into_iter()
+        .filter(|command| command.descriptor.command_name == tokens[0])
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        return Ok(None);
+    }
+    commands.sort_by(|left, right| {
+        render_shell_command_prefix(left).cmp(&render_shell_command_prefix(right))
+    });
+
+    if tokens.len() == 1 || is_help_flag(tokens[1].as_str()) {
+        return Ok(Some(shell_bridge_root_help(&commands)));
+    }
+
+    let command = match commands
+        .iter()
+        .filter(|command| shell_command_matches(tokens, command))
+        .max_by_key(|command| command.descriptor.argv.len())
+    {
+        Some(command) => command,
+        None => {
+            let available = commands
+                .iter()
+                .map(render_shell_command_prefix)
+                .collect::<Vec<_>>();
+            return Ok(Some(shell_bridge_error(
+                &tokens[0],
+                None,
+                None,
+                ShellBridgeErrorDetails {
+                    kind: "binding_not_available",
+                    message: format!("{} is not available in this session", tokens[1]),
+                    metadata: BTreeMap::from([(
+                        "available_bindings".to_string(),
+                        json!(available),
+                    )]),
+                    exit_code: 69,
+                    compact: false,
+                },
+            )));
+        }
+    };
+
+    let method_index = 1 + command.descriptor.argv.len();
+    if tokens.len() <= method_index || is_help_flag(tokens[method_index].as_str()) {
+        return Ok(Some(shell_bridge_binding_help(command)));
+    }
+
+    let method_name = &tokens[method_index];
+    let Some(method) = command
+        .methods
+        .iter()
+        .find(|method| method.name == *method_name)
+    else {
+        return Ok(Some(shell_bridge_error(
+            &tokens[0],
+            Some(command),
+            Some(method_name),
+            ShellBridgeErrorDetails {
+                kind: "method_not_available",
+                message: format!(
+                    "method {method_name} is not available for {}",
+                    render_shell_command_prefix(command)
+                ),
+                metadata: BTreeMap::new(),
+                exit_code: 69,
+                compact: false,
+            },
+        )));
+    };
+
+    let args = &tokens[method_index + 1..];
+    if args.len() == 1 && is_help_flag(args[0].as_str()) {
+        return Ok(Some(shell_bridge_method_help(command, method)));
+    }
+
+    let invocation = match parse_shell_bridge_invocation(command, method, adapter, args).await {
+        Ok(invocation) => invocation,
+        Err(outcome) => return Ok(Some(outcome)),
+    };
+    let request = CapabilityCallRequest {
+        specifier: capability_specifier_for_command(command).ok_or_else(|| {
+            SandboxError::Service {
+                service: "bash",
+                message: "shell command target is not yet supported".to_string(),
+            }
+        })?,
+        method: method.name.clone(),
+        args: invocation.input.into_iter().collect(),
+    };
+
+    Ok(Some(match session.invoke_capability(request).await {
+        Ok(result) => shell_bridge_success(
+            command,
+            &method.name,
+            result.value,
+            result.metadata,
+            invocation.compact,
+        ),
+        Err(error) => {
+            shell_bridge_error_from_invocation(command, &method.name, error, invocation.compact)
+        }
+    }))
+}
+
 impl Default for DeterministicBashService {
     fn default() -> Self {
         Self::new("deterministic-bash")
@@ -416,6 +533,531 @@ impl BashService for DeterministicBashService {
             }
         }
     }
+}
+
+struct ShellBridgeInvocation {
+    compact: bool,
+    input: Option<JsonValue>,
+}
+
+struct ShellBridgeErrorDetails<'a> {
+    kind: &'a str,
+    message: String,
+    metadata: BTreeMap<String, JsonValue>,
+    exit_code: i32,
+    compact: bool,
+}
+
+async fn available_shell_commands(session: &SandboxSession) -> Vec<SandboxShellCommand> {
+    let allowed = session.info().await.provenance.capabilities;
+    session
+        .capability_registry()
+        .shell_commands()
+        .into_iter()
+        .filter(|command| {
+            capability_specifier_for_command(command)
+                .is_some_and(|specifier| allowed.contains(&specifier))
+        })
+        .collect()
+}
+
+async fn parse_shell_bridge_invocation(
+    command: &SandboxShellCommand,
+    method: &crate::SandboxCapabilityMethod,
+    adapter: &JustBashFilesystemAdapter,
+    tokens: &[String],
+) -> Result<ShellBridgeInvocation, CommandOutcome> {
+    let mut compact = false;
+    let mut input = None;
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "--compact" => {
+                compact = true;
+                index += 1;
+            }
+            "--input" => {
+                let Some(raw) = tokens.get(index + 1) else {
+                    return Err(shell_bridge_error(
+                        &command.descriptor.command_name,
+                        Some(command),
+                        Some(&method.name),
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "--input requires a JSON argument".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
+                            compact,
+                        },
+                    ));
+                };
+                if input
+                    .replace(parse_shell_json_input(raw, compact, command, &method.name)?)
+                    .is_some()
+                {
+                    return Err(shell_bridge_error(
+                        &command.descriptor.command_name,
+                        Some(command),
+                        Some(&method.name),
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "provide only one JSON input value".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
+                            compact,
+                        },
+                    ));
+                }
+                index += 2;
+            }
+            "--input-file" => {
+                let Some(path) = tokens.get(index + 1) else {
+                    return Err(shell_bridge_error(
+                        &command.descriptor.command_name,
+                        Some(command),
+                        Some(&method.name),
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "--input-file requires a path".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
+                            compact,
+                        },
+                    ));
+                };
+                if input
+                    .replace(
+                        read_shell_json_input_file(adapter, path, compact, command, &method.name)
+                            .await?,
+                    )
+                    .is_some()
+                {
+                    return Err(shell_bridge_error(
+                        &command.descriptor.command_name,
+                        Some(command),
+                        Some(&method.name),
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "provide only one JSON input value".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
+                            compact,
+                        },
+                    ));
+                }
+                index += 2;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(shell_bridge_error(
+                    &command.descriptor.command_name,
+                    Some(command),
+                    Some(&method.name),
+                    ShellBridgeErrorDetails {
+                        kind: "usage_error",
+                        message: format!("unknown option: {flag}"),
+                        metadata: BTreeMap::new(),
+                        exit_code: 64,
+                        compact,
+                    },
+                ));
+            }
+            raw => {
+                if input
+                    .replace(parse_shell_json_input(raw, compact, command, &method.name)?)
+                    .is_some()
+                {
+                    return Err(shell_bridge_error(
+                        &command.descriptor.command_name,
+                        Some(command),
+                        Some(&method.name),
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "provide only one JSON input value".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
+                            compact,
+                        },
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+
+    if method.min_args > 1 || method.max_args > 1 {
+        return Err(shell_bridge_error(
+            &command.descriptor.command_name,
+            Some(command),
+            Some(&method.name),
+            ShellBridgeErrorDetails {
+                kind: "unsupported_signature",
+                message: format!(
+                    "{} currently supports only methods with zero or one JSON argument",
+                    render_shell_command_prefix(command)
+                ),
+                metadata: BTreeMap::from([
+                    ("min_args".to_string(), json!(method.min_args)),
+                    ("max_args".to_string(), json!(method.max_args)),
+                ]),
+                exit_code: 64,
+                compact,
+            },
+        ));
+    }
+    if method.min_args == 0 && method.max_args == 0 && input.is_some() {
+        return Err(shell_bridge_error(
+            &command.descriptor.command_name,
+            Some(command),
+            Some(&method.name),
+            ShellBridgeErrorDetails {
+                kind: "usage_error",
+                message: format!("{} does not accept a JSON input value", method.name),
+                metadata: BTreeMap::new(),
+                exit_code: 64,
+                compact,
+            },
+        ));
+    }
+    if method.requires_args() && input.is_none() {
+        return Err(shell_bridge_error(
+            &command.descriptor.command_name,
+            Some(command),
+            Some(&method.name),
+            ShellBridgeErrorDetails {
+                kind: "usage_error",
+                message: format!("{} requires one JSON input value", method.name),
+                metadata: BTreeMap::new(),
+                exit_code: 64,
+                compact,
+            },
+        ));
+    }
+
+    Ok(ShellBridgeInvocation { compact, input })
+}
+
+fn parse_shell_json_input(
+    raw: &str,
+    compact: bool,
+    command: &SandboxShellCommand,
+    method_name: &str,
+) -> Result<JsonValue, CommandOutcome> {
+    serde_json::from_str(raw).map_err(|error| {
+        shell_bridge_error(
+            &command.descriptor.command_name,
+            Some(command),
+            Some(method_name),
+            ShellBridgeErrorDetails {
+                kind: "invalid_json_input",
+                message: format!("invalid JSON input: {error}"),
+                metadata: BTreeMap::new(),
+                exit_code: 65,
+                compact,
+            },
+        )
+    })
+}
+
+async fn read_shell_json_input_file(
+    adapter: &JustBashFilesystemAdapter,
+    path: &str,
+    compact: bool,
+    command: &SandboxShellCommand,
+    method_name: &str,
+) -> Result<JsonValue, CommandOutcome> {
+    let Some(contents) = adapter.read_text(path).await.map_err(|error| {
+        shell_bridge_error(
+            &command.descriptor.command_name,
+            Some(command),
+            Some(method_name),
+            ShellBridgeErrorDetails {
+                kind: "input_file_error",
+                message: error.to_string(),
+                metadata: BTreeMap::from([("path".to_string(), json!(path))]),
+                exit_code: 66,
+                compact,
+            },
+        )
+    })?
+    else {
+        return Err(shell_bridge_error(
+            &command.descriptor.command_name,
+            Some(command),
+            Some(method_name),
+            ShellBridgeErrorDetails {
+                kind: "input_file_missing",
+                message: format!("JSON input file not found: {path}"),
+                metadata: BTreeMap::from([("path".to_string(), json!(path))]),
+                exit_code: 66,
+                compact,
+            },
+        ));
+    };
+    parse_shell_json_input(&contents, compact, command, method_name)
+}
+
+fn shell_bridge_root_help(commands: &[SandboxShellCommand]) -> CommandOutcome {
+    let command_name = &commands[0].descriptor.command_name;
+    let mut lines = vec![
+        format!("{command_name} exposes manifest-granted host bindings as JSON commands."),
+        String::new(),
+        "Usage:".to_string(),
+        format!(
+            "  {command_name} <binding> <method> [--input <json> | --input-file <path>] [--compact]"
+        ),
+        format!("  {command_name} <binding> --help"),
+        String::new(),
+        "Available bindings:".to_string(),
+    ];
+    for command in commands {
+        lines.push(format!(
+            "  {:<24} {}",
+            render_shell_command_prefix(command),
+            command
+                .description
+                .as_deref()
+                .unwrap_or("No description available.")
+        ));
+    }
+    CommandOutcome {
+        exit_code: 0,
+        stdout: format!("{}\n", lines.join("\n")),
+        stderr: String::new(),
+    }
+}
+
+fn shell_bridge_binding_help(command: &SandboxShellCommand) -> CommandOutcome {
+    let prefix = render_shell_command_prefix(command);
+    let mut lines = vec![
+        format!("{prefix} invokes {}", render_shell_command_target(command)),
+        command
+            .description
+            .clone()
+            .unwrap_or_else(|| "No description available.".to_string()),
+        String::new(),
+        "Usage:".to_string(),
+        format!("  {prefix} <method> [--input <json> | --input-file <path>] [--compact]"),
+        format!("  {prefix} <method> --help"),
+        String::new(),
+        "Methods:".to_string(),
+    ];
+    for method in &command.methods {
+        lines.push(format!(
+            "  {:<20} {}",
+            method.name,
+            method
+                .description
+                .as_deref()
+                .unwrap_or("No description available.")
+        ));
+        if let Some(input_description) = method.input_description.as_deref() {
+            lines.push(format!("    input: {input_description}"));
+        }
+        if let Some(input_example) = method.input_example.as_deref() {
+            lines.push(format!("    example: {input_example}"));
+        }
+    }
+    CommandOutcome {
+        exit_code: 0,
+        stdout: format!("{}\n", lines.join("\n")),
+        stderr: String::new(),
+    }
+}
+
+fn shell_bridge_method_help(
+    command: &SandboxShellCommand,
+    method: &crate::SandboxCapabilityMethod,
+) -> CommandOutcome {
+    let prefix = render_shell_command_prefix(command);
+    let mut lines = vec![
+        format!("Usage for {prefix} {}:", method.name),
+        format!("  {prefix} {} --input <json> [--compact]", method.name),
+        format!("  {prefix} {} --input-file <path> [--compact]", method.name),
+        format!("  {prefix} {} '<json>' [--compact]", method.name),
+        String::new(),
+    ];
+    if let Some(description) = method.description.as_deref() {
+        lines.push(format!("Description: {description}"));
+    }
+    if method.min_args == 0 && method.max_args == 0 {
+        lines.push("Input: no JSON input is accepted.".to_string());
+    } else if let Some(input_description) = method.input_description.as_deref() {
+        lines.push(format!("Input: {input_description}"));
+    }
+    if let Some(input_example) = method.input_example.as_deref() {
+        lines.push(format!("Example: {input_example}"));
+    }
+    if let Some(output_description) = method.output_description.as_deref() {
+        lines.push(format!("Output: {output_description}"));
+    }
+    CommandOutcome {
+        exit_code: 0,
+        stdout: format!("{}\n", lines.join("\n")),
+        stderr: String::new(),
+    }
+}
+
+fn shell_bridge_success(
+    command: &SandboxShellCommand,
+    method_name: &str,
+    value: JsonValue,
+    result_metadata: BTreeMap<String, JsonValue>,
+    compact: bool,
+) -> CommandOutcome {
+    let mut metadata = command.metadata.clone();
+    metadata.extend(result_metadata);
+    let payload = json!({
+        "ok": true,
+        "command": format!("{} {}", render_shell_command_prefix(command), method_name),
+        "binding": shell_binding_name(command),
+        "specifier": capability_specifier_for_command(command),
+        "method": method_name,
+        "value": value,
+        "metadata": metadata,
+    });
+    CommandOutcome {
+        exit_code: 0,
+        stdout: format!("{}\n", render_json(&payload, compact)),
+        stderr: String::new(),
+    }
+}
+
+fn shell_bridge_error_from_invocation(
+    command: &SandboxShellCommand,
+    method_name: &str,
+    error: SandboxError,
+    compact: bool,
+) -> CommandOutcome {
+    let mut metadata = command.metadata.clone();
+    let (kind, message, exit_code) = match &error {
+        SandboxError::CapabilityDenied { .. } => ("capability_denied", error.to_string(), 69),
+        SandboxError::CapabilityUnavailable { .. } => {
+            ("capability_unavailable", error.to_string(), 69)
+        }
+        SandboxError::CapabilityMethodNotFound { .. } => {
+            ("method_not_available", error.to_string(), 69)
+        }
+        SandboxError::Service { service, message } if *service == "capabilities" => {
+            if let Some(policy_outcome) = parse_policy_outcome(message) {
+                metadata.insert("policy_outcome".to_string(), json!(policy_outcome));
+                ("host_enforcement_denied", message.clone(), 70)
+            } else {
+                ("host_invoke_error", message.clone(), 70)
+            }
+        }
+        SandboxError::Service { service, message } => {
+            metadata.insert("service".to_string(), json!(service));
+            ("service_error", message.clone(), 70)
+        }
+        _ => ("shell_bridge_error", error.to_string(), 70),
+    };
+
+    shell_bridge_error(
+        &command.descriptor.command_name,
+        Some(command),
+        Some(method_name),
+        ShellBridgeErrorDetails {
+            kind,
+            message,
+            metadata,
+            exit_code,
+            compact,
+        },
+    )
+}
+
+fn shell_bridge_error(
+    command_name: &str,
+    command: Option<&SandboxShellCommand>,
+    method_name: Option<&str>,
+    details: ShellBridgeErrorDetails<'_>,
+) -> CommandOutcome {
+    let payload = json!({
+        "ok": false,
+        "command": command
+            .map(|command| {
+                method_name.map_or_else(
+                    || render_shell_command_prefix(command),
+                    |method_name| format!("{} {}", render_shell_command_prefix(command), method_name),
+                )
+            })
+            .unwrap_or_else(|| command_name.to_string()),
+        "binding": command.map(shell_binding_name),
+        "specifier": command.and_then(capability_specifier_for_command),
+        "method": method_name,
+        "error": {
+            "kind": details.kind,
+            "message": details.message,
+        },
+        "metadata": details.metadata,
+    });
+    CommandOutcome {
+        exit_code: details.exit_code,
+        stdout: String::new(),
+        stderr: format!("{}\n", render_json(&payload, details.compact)),
+    }
+}
+
+fn shell_command_matches(tokens: &[String], command: &SandboxShellCommand) -> bool {
+    let prefix_len = command.descriptor.argv.len();
+    tokens.len() > prefix_len
+        && tokens[0] == command.descriptor.command_name
+        && tokens[1..=prefix_len]
+            .iter()
+            .zip(command.descriptor.argv.iter())
+            .all(|(token, expected)| token == expected)
+}
+
+fn capability_specifier_for_command(command: &SandboxShellCommand) -> Option<String> {
+    match &command.target {
+        SandboxShellCommandTarget::Capability { specifier } => Some(specifier.clone()),
+    }
+}
+
+fn render_shell_command_prefix(command: &SandboxShellCommand) -> String {
+    if command.descriptor.argv.is_empty() {
+        command.descriptor.command_name.clone()
+    } else {
+        format!(
+            "{} {}",
+            command.descriptor.command_name,
+            command.descriptor.argv.join(" ")
+        )
+    }
+}
+
+fn render_shell_command_target(command: &SandboxShellCommand) -> String {
+    match &command.target {
+        SandboxShellCommandTarget::Capability { specifier } => specifier.clone(),
+    }
+}
+
+fn shell_binding_name(command: &SandboxShellCommand) -> String {
+    command
+        .metadata
+        .get("binding_name")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .or_else(|| command.descriptor.argv.last().cloned())
+        .unwrap_or_else(|| command.descriptor.command_name.clone())
+}
+
+fn parse_policy_outcome(message: &str) -> Option<String> {
+    let outcome = message.strip_prefix("policy ")?;
+    Some(outcome.split(':').next()?.trim().to_ascii_lowercase())
+}
+
+fn render_json(value: &JsonValue, compact: bool) -> String {
+    if compact {
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+fn is_help_flag(value: &str) -> bool {
+    matches!(value, "--help" | "-h" | "help")
 }
 
 async fn load_bash_state(

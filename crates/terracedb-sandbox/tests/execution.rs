@@ -13,7 +13,8 @@ use terracedb_capabilities::{
     DeterministicTypedRowPredicateEvaluator, DeterministicVisibilityIndexStore, ExecutionDomain,
     ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy, ManifestBinding,
     PolicyOutcomeKind, PolicySubject, ResolvedSessionPolicy, ResourceKind, ResourcePolicy,
-    ResourceSelector, RowScopeBinding, RowScopePolicy, SessionMode, capability_module_specifier,
+    ResourceSelector, RowScopeBinding, RowScopePolicy, SessionMode, ShellCommandDescriptor,
+    capability_module_specifier,
 };
 use terracedb_sandbox::{
     BashRequest, CapabilityRegistry, ConflictPolicy, DefaultSandboxStore, DeterministicBashService,
@@ -679,7 +680,7 @@ fn db_table_policy_manifest(resource_policy: ResourcePolicy) -> PolicyCapability
             binding_name: "tickets".to_string(),
             capability_family: "db.table.v1".to_string(),
             module_specifier: capability_module_specifier("tickets"),
-            shell_command: None,
+            shell_command: Some(ShellCommandDescriptor::for_binding("tickets")),
             resource_policy,
             budget_policy: Default::default(),
             source_template_id: "db.table.v1".to_string(),
@@ -926,6 +927,374 @@ async fn manifest_bound_registry_omits_ungranted_bindings_and_surfaces_granted_d
         absent,
         SandboxError::CapabilityDenied { ref specifier } if specifier == "terrace:host/admin"
     ));
+}
+
+#[tokio::test]
+async fn manifest_bound_shell_bridge_matches_typed_import_metadata_and_audit_names() {
+    let policy_manifest = db_table_policy_manifest(ResourcePolicy {
+        allow: vec![ResourceSelector {
+            kind: ResourceKind::Table,
+            pattern: "tickets".to_string(),
+        }],
+        deny: vec![],
+        tenant_scopes: vec!["tenant-a".to_string()],
+        row_scope_binding: Some(RowScopeBinding {
+            binding_id: "tickets.owner".to_string(),
+            policy: RowScopePolicy::TypedRowPredicate {
+                predicate_id: "ticket_owner".to_string(),
+                row_type: Some("ticket".to_string()),
+                referenced_fields: vec!["owner_id".to_string()],
+            },
+            allowed_query_shapes: vec![terracedb_capabilities::RowQueryShape::PointRead],
+            write_semantics: Default::default(),
+            denial_contract: Default::default(),
+            metadata: BTreeMap::new(),
+        }),
+        visibility_index: None,
+        metadata: BTreeMap::new(),
+    });
+    let dispatcher =
+        DeterministicPolicyDbDispatcher::new(resolved_policy_for_manifest(policy_manifest.clone()))
+            .with_predicates(
+                DeterministicTypedRowPredicateEvaluator::default().with_predicate(
+                    "ticket_owner",
+                    DeterministicTypedRowPredicate::MatchContext {
+                        row_field: "owner_id".to_string(),
+                        context_field: "subject_id".to_string(),
+                    },
+                ),
+            );
+    dispatcher
+        .seed_row("tickets", "ticket:t-1", json!({ "owner_id": "user:alice" }))
+        .await;
+    let registry =
+        ManifestBoundCapabilityRegistry::new(policy_manifest, Arc::new(dispatcher.clone()))
+            .expect("build manifest-bound registry");
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store(131, 541, services);
+    let base_volume_id = VolumeId::new(0x9034);
+    let session_volume_id = VolumeId::new(0x9035);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        r#"
+        import { get } from "terrace:host/tickets";
+        export default get({ key: "ticket:t-1" });
+        "#,
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: registry.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open shell-bridge session");
+
+    let typed = session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("execute typed import");
+    let shell = session
+        .run_bash(BashRequest {
+            command: r#"terrace-call tickets get '{"key":"ticket:t-1"}'"#.to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("execute shell bridge");
+    let shell_json: serde_json::Value =
+        serde_json::from_str(shell.stdout.trim()).expect("decode shell bridge JSON");
+
+    assert_eq!(shell.exit_code, 0);
+    assert_eq!(shell_json["ok"], json!(true));
+    assert_eq!(shell_json["binding"], json!("tickets"));
+    assert_eq!(shell_json["specifier"], json!("terrace:host/tickets"));
+    assert_eq!(shell_json["method"], json!("get"));
+    assert_eq!(shell_json["value"], typed.result.expect("typed result"));
+    assert_eq!(
+        shell_json["metadata"],
+        serde_json::to_value(&typed.capability_calls[0].metadata).expect("encode typed metadata")
+    );
+
+    let tool_names = session
+        .volume()
+        .tools()
+        .recent(None)
+        .await
+        .expect("recent tool runs")
+        .into_iter()
+        .map(|run| run.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_names
+            .iter()
+            .filter(|name| name.as_str() == "host_api.tickets.get")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn manifest_bound_shell_bridge_exposes_help_and_json_io() {
+    let policy_manifest = db_table_policy_manifest(ResourcePolicy {
+        allow: vec![ResourceSelector {
+            kind: ResourceKind::Table,
+            pattern: "tickets".to_string(),
+        }],
+        deny: vec![],
+        tenant_scopes: vec!["tenant-a".to_string()],
+        row_scope_binding: Some(RowScopeBinding {
+            binding_id: "tickets.owner".to_string(),
+            policy: RowScopePolicy::TypedRowPredicate {
+                predicate_id: "ticket_owner".to_string(),
+                row_type: Some("ticket".to_string()),
+                referenced_fields: vec!["owner_id".to_string()],
+            },
+            allowed_query_shapes: vec![terracedb_capabilities::RowQueryShape::PointRead],
+            write_semantics: Default::default(),
+            denial_contract: Default::default(),
+            metadata: BTreeMap::new(),
+        }),
+        visibility_index: None,
+        metadata: BTreeMap::new(),
+    });
+    let dispatcher =
+        DeterministicPolicyDbDispatcher::new(resolved_policy_for_manifest(policy_manifest.clone()))
+            .with_predicates(
+                DeterministicTypedRowPredicateEvaluator::default().with_predicate(
+                    "ticket_owner",
+                    DeterministicTypedRowPredicate::MatchContext {
+                        row_field: "owner_id".to_string(),
+                        context_field: "subject_id".to_string(),
+                    },
+                ),
+            );
+    dispatcher
+        .seed_row("tickets", "ticket:t-1", json!({ "owner_id": "user:alice" }))
+        .await;
+    let registry =
+        ManifestBoundCapabilityRegistry::new(policy_manifest, Arc::new(dispatcher.clone()))
+            .expect("build manifest-bound registry");
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store(132, 542, services);
+    let base_volume_id = VolumeId::new(0x9036);
+    let session_volume_id = VolumeId::new(0x9037);
+
+    seed_base(&vfs, base_volume_id, "export default null;", &[]).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: registry.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open shell help session");
+    session
+        .filesystem()
+        .write_file(
+            "/workspace/request.json",
+            br#"{"key":"ticket:t-1"}"#.to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed JSON input file");
+
+    let help = session
+        .run_bash(BashRequest {
+            command: "terrace-call --help".to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("root help");
+    assert_eq!(help.exit_code, 0);
+    assert!(help.stdout.contains("Available bindings"));
+    assert!(help.stdout.contains("terrace-call tickets"));
+
+    let method_help = session
+        .run_bash(BashRequest {
+            command: "terrace-call tickets get --help".to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("method help");
+    assert_eq!(method_help.exit_code, 0);
+    assert!(
+        method_help
+            .stdout
+            .contains("Pass a JSON object with the row key to read.")
+    );
+    assert!(method_help.stdout.contains(r#"{"key":"ticket:t-1"}"#));
+
+    let shell = session
+        .run_bash(BashRequest {
+            command: "terrace-call tickets get --input-file request.json --compact".to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("input file invocation");
+    assert_eq!(shell.exit_code, 0);
+    assert!(!shell.stdout.trim().contains('\n'));
+    let shell_json: serde_json::Value =
+        serde_json::from_str(shell.stdout.trim()).expect("decode compact JSON");
+    assert_eq!(shell_json["value"]["key"], json!("ticket:t-1"));
+
+    let invalid = session
+        .run_bash(BashRequest {
+            command: r#"terrace-call tickets get '{bad-json}'"#.to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("invalid JSON should still return a bash report");
+    let invalid_json: serde_json::Value =
+        serde_json::from_str(invalid.stderr.trim()).expect("decode invalid JSON error");
+    assert_eq!(invalid.exit_code, 65);
+    assert_eq!(invalid_json["error"]["kind"], json!("invalid_json_input"));
+}
+
+#[tokio::test]
+async fn manifest_bound_shell_bridge_omits_ungranted_bindings_and_reports_host_denials_as_json() {
+    let policy_manifest = db_table_policy_manifest(ResourcePolicy {
+        allow: vec![ResourceSelector {
+            kind: ResourceKind::Table,
+            pattern: "tickets".to_string(),
+        }],
+        deny: vec![],
+        tenant_scopes: vec!["tenant-a".to_string()],
+        row_scope_binding: Some(RowScopeBinding {
+            binding_id: "tickets.owner".to_string(),
+            policy: RowScopePolicy::TypedRowPredicate {
+                predicate_id: "ticket_owner".to_string(),
+                row_type: Some("ticket".to_string()),
+                referenced_fields: vec!["owner_id".to_string()],
+            },
+            allowed_query_shapes: vec![terracedb_capabilities::RowQueryShape::WriteMutation],
+            write_semantics: Default::default(),
+            denial_contract: Default::default(),
+            metadata: BTreeMap::new(),
+        }),
+        visibility_index: None,
+        metadata: BTreeMap::new(),
+    });
+    let dispatcher =
+        DeterministicPolicyDbDispatcher::new(resolved_policy_for_manifest(policy_manifest.clone()))
+            .with_predicates(
+                DeterministicTypedRowPredicateEvaluator::default().with_predicate(
+                    "ticket_owner",
+                    DeterministicTypedRowPredicate::MatchContext {
+                        row_field: "owner_id".to_string(),
+                        context_field: "subject_id".to_string(),
+                    },
+                ),
+            );
+    dispatcher
+        .seed_row("tickets", "ticket:t-1", json!({ "owner_id": "user:alice" }))
+        .await;
+    let registry =
+        ManifestBoundCapabilityRegistry::new(policy_manifest, Arc::new(dispatcher.clone()))
+            .expect("build manifest-bound registry");
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store(133, 543, services);
+    let base_volume_id = VolumeId::new(0x9038);
+    let session_volume_id = VolumeId::new(0x9039);
+
+    seed_base(&vfs, base_volume_id, "export default null;", &[]).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: registry.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open denial session");
+
+    let help = session
+        .run_bash(BashRequest {
+            command: "terrace-call --help".to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("shell bridge help");
+    assert!(help.stdout.contains("terrace-call tickets"));
+    assert!(!help.stdout.contains("admin"));
+
+    let absent = session
+        .run_bash(BashRequest {
+            command: r#"terrace-call admin get '{"key":"ticket:t-1"}'"#.to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("absent binding should still return a bash report");
+    let absent_json: serde_json::Value =
+        serde_json::from_str(absent.stderr.trim()).expect("decode absent binding error");
+    assert_eq!(absent.exit_code, 69);
+    assert_eq!(absent_json["error"]["kind"], json!("binding_not_available"));
+    assert_eq!(
+        absent_json["metadata"]["available_bindings"],
+        json!(["terrace-call tickets"])
+    );
+
+    let denied = session
+        .run_bash(BashRequest {
+            command: r#"terrace-call tickets put '{"key":"ticket:t-1","row":{"owner_id":"user:bob"},"occReadSet":["ticket:t-1"]}'"#.to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("host denial should still return a bash report");
+    let denied_json: serde_json::Value =
+        serde_json::from_str(denied.stderr.trim()).expect("decode host denial JSON");
+    assert_eq!(denied.exit_code, 70);
+    assert_eq!(
+        denied_json["error"]["kind"],
+        json!("host_enforcement_denied")
+    );
+    assert_eq!(denied_json["metadata"]["binding_name"], json!("tickets"));
+    assert_eq!(
+        denied_json["metadata"]["capability_family"],
+        json!("db.table.v1")
+    );
+    assert_eq!(denied_json["metadata"]["policy_outcome"], json!("denied"));
 }
 
 #[tokio::test]

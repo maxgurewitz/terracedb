@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+use async_trait::async_trait;
 use serde_json::json;
 use terracedb::{
     DbDependencies, DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainPath,
@@ -7,17 +8,21 @@ use terracedb::{
     StubFileSystem, StubObjectStore, StubRng, Timestamp,
 };
 use terracedb_capabilities::{
-    ExecutionDomain, ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy,
+    CapabilityManifest as PolicyCapabilityManifest, ExecutionDomain, ExecutionDomainAssignment,
+    ExecutionOperation, ExecutionPolicy, ManifestBinding, ResourceKind, ResourcePolicy,
+    ResourceSelector, ShellCommandDescriptor, capability_module_specifier,
 };
 use terracedb_sandbox::{
-    BashRequest, BashService, DefaultSandboxStore, DeterministicBashService,
+    BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
     DeterministicPackageInstaller, DeterministicRuntimeBackend, DeterministicTypeScriptService,
-    GitProvenance, PackageCompatibilityMode, PackageInstallRequest, ReopenSessionOptions,
-    SandboxConfig, SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter,
-    SandboxServices, SandboxStore, TERRACE_BASH_SESSION_STATE_PATH,
-    TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_RUNTIME_MODULE_CACHE_PATH,
-    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH,
-    TERRACE_TYPESCRIPT_STATE_PATH, TypeCheckRequest, TypeScriptService, TypeScriptTranspileRequest,
+    GitProvenance, ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
+    ManifestBoundCapabilityRegistry, ManifestBoundCapabilityResult, PackageCompatibilityMode,
+    PackageInstallRequest, ReopenSessionOptions, SandboxConfig, SandboxExecutionDomainRoute,
+    SandboxExecutionPlacement, SandboxExecutionRouter, SandboxServices, SandboxStore,
+    TERRACE_BASH_SESSION_STATE_PATH, TERRACE_NPM_INSTALL_MANIFEST_PATH,
+    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
+    TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH, TypeCheckRequest,
+    TypeScriptService, TypeScriptTranspileRequest,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore,
@@ -127,6 +132,77 @@ async fn seed_package_runtime_module(store: &InMemoryVfsStore, volume_id: Volume
         )
         .await
         .expect("seed package runtime module");
+}
+
+#[derive(Clone, Default)]
+struct RecoveryShellBridgeDispatcher;
+
+#[async_trait]
+impl ManifestBoundCapabilityDispatcher for RecoveryShellBridgeDispatcher {
+    async fn invoke_binding(
+        &self,
+        _session: &terracedb_sandbox::SandboxSession,
+        binding: &ManifestBinding,
+        request: ManifestBoundCapabilityInvocation,
+    ) -> Result<ManifestBoundCapabilityResult, terracedb_sandbox::SandboxError> {
+        match (binding.capability_family.as_str(), request.method.as_str()) {
+            ("db.table.v1", "get") => {
+                let key = request
+                    .args
+                    .first()
+                    .and_then(|value| value.get("key"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing");
+                Ok(ManifestBoundCapabilityResult {
+                    value: json!({
+                        "key": key,
+                        "row": {
+                            "owner_id": "user:alice",
+                        },
+                    }),
+                    metadata: BTreeMap::from([("recovered".to_string(), json!(true))]),
+                })
+            }
+            _ => Err(terracedb_sandbox::SandboxError::Service {
+                service: "capabilities",
+                message: format!(
+                    "recovery shell dispatcher does not implement {}::{}",
+                    binding.capability_family, request.method
+                ),
+            }),
+        }
+    }
+}
+
+fn recovery_shell_policy_manifest() -> PolicyCapabilityManifest {
+    PolicyCapabilityManifest {
+        subject: None,
+        preset_name: Some("recovery".to_string()),
+        profile_name: None,
+        bindings: vec![ManifestBinding {
+            binding_name: "tickets".to_string(),
+            capability_family: "db.table.v1".to_string(),
+            module_specifier: capability_module_specifier("tickets"),
+            shell_command: Some(ShellCommandDescriptor::for_binding("tickets")),
+            resource_policy: ResourcePolicy {
+                allow: vec![ResourceSelector {
+                    kind: ResourceKind::Table,
+                    pattern: "tickets".to_string(),
+                }],
+                deny: vec![],
+                tenant_scopes: vec![],
+                row_scope_binding: None,
+                visibility_index: None,
+                metadata: BTreeMap::new(),
+            },
+            budget_policy: Default::default(),
+            source_template_id: "db.table.v1".to_string(),
+            source_grant_id: Some("grant-recovery".to_string()),
+            allow_interactive_widening: false,
+            metadata: BTreeMap::new(),
+        }],
+        metadata: BTreeMap::new(),
+    }
 }
 
 #[tokio::test]
@@ -380,6 +456,63 @@ async fn reopen_preserves_typescript_and_bash_service_metadata() {
         .expect("resume bash");
     assert_eq!(resumed.stdout, "Terrace\n/workspace/notes\n");
     assert_eq!(resumed.cwd, "/workspace/notes");
+}
+
+#[tokio::test]
+async fn reopen_rebuilds_manifest_bound_shell_bridge_from_session_manifest() {
+    let registry = ManifestBoundCapabilityRegistry::new(
+        recovery_shell_policy_manifest(),
+        Arc::new(RecoveryShellBridgeDispatcher),
+    )
+    .expect("build recovery shell registry");
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store_with_services(85, 2051, services);
+    let base_volume_id = VolumeId::new(0x8202);
+    let session_volume_id = VolumeId::new(0x8203);
+    seed_base(&vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(
+            SandboxConfig::new(base_volume_id, session_volume_id)
+                .with_chunk_size(4096)
+                .with_capabilities(registry.manifest()),
+        )
+        .await
+        .expect("open shell bridge session");
+    session.flush().await.expect("flush shell bridge session");
+
+    let reopened = sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen shell bridge session");
+
+    let help = reopened
+        .run_bash(BashRequest {
+            command: "terrace-call --help".to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("shell bridge help after reopen");
+    assert_eq!(help.exit_code, 0);
+    assert!(help.stdout.contains("terrace-call tickets"));
+
+    let shell = reopened
+        .run_bash(BashRequest {
+            command: r#"terrace-call tickets get '{"key":"ticket:t-1"}'"#.to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("shell bridge call after reopen");
+    let shell_json: serde_json::Value =
+        serde_json::from_str(shell.stdout.trim()).expect("decode reopened shell JSON");
+    assert_eq!(shell.exit_code, 0);
+    assert_eq!(shell_json["ok"], json!(true));
+    assert_eq!(shell_json["metadata"]["recovered"], json!(true));
 }
 
 #[tokio::test]
