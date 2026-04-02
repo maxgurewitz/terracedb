@@ -48,10 +48,10 @@ pub use composition::{
 };
 pub use config::{
     ColumnarTableConfigBuilder, CompactionDecision, CompactionDecisionContext, CompactionFilter,
-    CompactionFilterRef, CompactionStrategy, DbConfig, MergeOperator, MergeOperatorRef, S3Location,
-    S3PrimaryStorageConfig, SsdConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
-    TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, TtlCompactionFilter,
-    TtlExpiryExtractor,
+    CompactionFilterRef, CompactionStrategy, DbConfig, MergeOperator, MergeOperatorRef,
+    RowTableConfigBuilder, S3Location, S3PrimaryStorageConfig, SsdConfig, StorageConfig,
+    TableConfig, TableFormat, TableMetadata, TieredDurabilityMode, TieredLocalRetentionMode,
+    TieredStorageConfig, TtlCompactionFilter, TtlExpiryExtractor,
 };
 pub use current_state::{
     CurrentStateCompactionRowRemovalMode, CurrentStateComputedOrderingKey,
@@ -92,17 +92,17 @@ pub use execution::{
     ContentionClass, DbExecutionPlacementReport, DbExecutionProfile, DomainBackgroundBudget,
     DomainBudgetCharge, DomainBudgetOracle, DomainBudgetSnapshot, DomainCpuBudget, DomainIoBudget,
     DomainMemoryBudget, DomainTaggedWork, DurabilityClass, ExecutionBacklogGuard,
-    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainContentionSnapshot,
-    ExecutionDomainInvariant, ExecutionDomainInvariantSet, ExecutionDomainLifecycleEvent,
-    ExecutionDomainLifecycleHook, ExecutionDomainOwner, ExecutionDomainPath,
-    ExecutionDomainPlacement, ExecutionDomainSnapshot, ExecutionDomainSpec, ExecutionDomainState,
-    ExecutionDomainUsageSnapshot, ExecutionLane, ExecutionLaneBinding,
-    ExecutionLanePlacementConfig, ExecutionPlacementDecision, ExecutionResourceKind,
-    ExecutionResourceUsage, ExecutionUsageLease, ExecutionUsageReleaseError,
+    ExecutionBacklogPublication, ExecutionBacklogPublisher, ExecutionDomainBacklogSnapshot,
+    ExecutionDomainBudget, ExecutionDomainContentionSnapshot, ExecutionDomainInvariant,
+    ExecutionDomainInvariantSet, ExecutionDomainLifecycleEvent, ExecutionDomainLifecycleHook,
+    ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSnapshot,
+    ExecutionDomainSpec, ExecutionDomainState, ExecutionDomainUsageSnapshot, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionPlacementDecision,
+    ExecutionResourceKind, ExecutionResourceUsage, ExecutionUsageLease, ExecutionUsageReleaseError,
     InMemoryDomainBudgetOracle, InMemoryResourceManager, PlacementAssignment, PlacementPolicy,
     PlacementRequest, PlacementTarget, PreferRequestedDomainPolicy, ResourceAdmissionDecision,
     ResourceManager, ResourceManagerSnapshot, ResourceManagerSubscription,
-    ShardReadyPlacementLayout, WorkPlacementRequest, WorkRuntimeTag,
+    ShardExecutionDomainProfile, ShardReadyPlacementLayout, WorkPlacementRequest, WorkRuntimeTag,
 };
 #[doc(hidden)]
 pub use failpoints::{

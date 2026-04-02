@@ -219,6 +219,173 @@ impl fmt::Debug for TableConfig {
     }
 }
 
+impl TableConfig {
+    pub fn row(name: impl Into<String>) -> RowTableConfigBuilder {
+        RowTableConfigBuilder::new(name)
+    }
+
+    pub fn persisted_definition_matches(&self, other: &Self) -> bool {
+        self.persisted_definition_mismatches(other).is_empty()
+    }
+
+    pub fn persisted_definition_mismatches(&self, other: &Self) -> Vec<&'static str> {
+        let mut mismatches = Vec::new();
+        if self.name != other.name {
+            mismatches.push("name");
+        }
+        if self.format != other.format {
+            mismatches.push("format");
+        }
+        if self.max_merge_operand_chain_length != other.max_merge_operand_chain_length {
+            mismatches.push("max_merge_operand_chain_length");
+        }
+        if self.bloom_filter_bits_per_key != other.bloom_filter_bits_per_key {
+            mismatches.push("bloom_filter_bits_per_key");
+        }
+        if self.history_retention_sequences != other.history_retention_sequences {
+            mismatches.push("history_retention_sequences");
+        }
+        if self.compaction_strategy != other.compaction_strategy {
+            mismatches.push("compaction_strategy");
+        }
+        if self.schema != other.schema {
+            mismatches.push("schema");
+        }
+        if self.sharding != other.sharding {
+            mismatches.push("sharding");
+        }
+        if self.metadata != other.metadata {
+            mismatches.push("metadata");
+        }
+        mismatches
+    }
+}
+
+#[derive(Clone)]
+pub struct RowTableConfigBuilder {
+    name: String,
+    merge_operator: Option<MergeOperatorRef>,
+    max_merge_operand_chain_length: Option<u32>,
+    compaction_filter: Option<CompactionFilterRef>,
+    bloom_filter_bits_per_key: Option<u32>,
+    history_retention_sequences: Option<u64>,
+    compaction_strategy: CompactionStrategy,
+    sharding: ShardingConfig,
+    metadata: TableMetadata,
+}
+
+impl fmt::Debug for RowTableConfigBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RowTableConfigBuilder")
+            .field("name", &self.name)
+            .field(
+                "merge_operator",
+                &self.merge_operator.as_ref().map(|_| "<dyn MergeOperator>"),
+            )
+            .field(
+                "max_merge_operand_chain_length",
+                &self.max_merge_operand_chain_length,
+            )
+            .field(
+                "compaction_filter",
+                &self
+                    .compaction_filter
+                    .as_ref()
+                    .map(|_| "<dyn CompactionFilter>"),
+            )
+            .field("bloom_filter_bits_per_key", &self.bloom_filter_bits_per_key)
+            .field(
+                "history_retention_sequences",
+                &self.history_retention_sequences,
+            )
+            .field("compaction_strategy", &self.compaction_strategy)
+            .field("sharding", &self.sharding)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+impl RowTableConfigBuilder {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            merge_operator: None,
+            max_merge_operand_chain_length: None,
+            compaction_filter: None,
+            bloom_filter_bits_per_key: Some(10),
+            history_retention_sequences: None,
+            compaction_strategy: CompactionStrategy::Leveled,
+            sharding: ShardingConfig::default(),
+            metadata: TableMetadata::default(),
+        }
+    }
+
+    pub fn merge_operator(mut self, merge_operator: Option<MergeOperatorRef>) -> Self {
+        self.merge_operator = merge_operator;
+        self
+    }
+
+    pub fn max_merge_operand_chain_length(mut self, value: Option<u32>) -> Self {
+        self.max_merge_operand_chain_length = value;
+        self
+    }
+
+    pub fn compaction_filter(mut self, compaction_filter: Option<CompactionFilterRef>) -> Self {
+        self.compaction_filter = compaction_filter;
+        self
+    }
+
+    pub fn bloom_filter_bits_per_key(mut self, value: Option<u32>) -> Self {
+        self.bloom_filter_bits_per_key = value;
+        self
+    }
+
+    pub fn history_retention_sequences(mut self, value: Option<u64>) -> Self {
+        self.history_retention_sequences = value;
+        self
+    }
+
+    pub fn compaction_strategy(mut self, strategy: CompactionStrategy) -> Self {
+        self.compaction_strategy = strategy;
+        self
+    }
+
+    pub fn sharding(mut self, sharding: ShardingConfig) -> Self {
+        self.sharding = sharding;
+        self
+    }
+
+    pub fn metadata(mut self, metadata: TableMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn build(self) -> TableConfig {
+        TableConfig {
+            name: self.name,
+            format: TableFormat::Row,
+            merge_operator: self.merge_operator,
+            max_merge_operand_chain_length: self.max_merge_operand_chain_length,
+            compaction_filter: self.compaction_filter,
+            bloom_filter_bits_per_key: self.bloom_filter_bits_per_key,
+            history_retention_sequences: self.history_retention_sequences,
+            compaction_strategy: self.compaction_strategy,
+            schema: None,
+            sharding: self.sharding,
+            metadata: self.metadata,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ColumnarTableConfigBuilder {
     name: String,

@@ -17,8 +17,7 @@ use terracedb::{
     HybridCompactToWidePromotionConfig, HybridProfile, HybridProjectionSidecarConfig,
     HybridReadConfig, HybridSkipIndexConfig, HybridSkipIndexFamily, HybridTableFeatures, OpenError,
     ReadError, S3Location, ScanOptions, ScanPredicate, SchemaDefinition, StorageError, Table,
-    TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Transaction,
-    TransactionCommitError,
+    TableConfig, TieredDurabilityMode, TieredStorageConfig, Transaction, TransactionCommitError,
 };
 use terracedb_records::{
     ColumnarProjection, ColumnarRecordCodec, ColumnarTable, JsonValueCodec, KeyCodec,
@@ -549,33 +548,19 @@ pub async fn ensure_telemetry_tables(
             Utf8StringCodec,
             JsonValueCodec::new(),
         ),
-        sensor_readings: ColumnarTable::with_codecs(
-            db.ensure_table(sensor_readings_table_config(
-                SENSOR_READINGS_TABLE_NAME,
-                profile,
-            ))
-            .await?,
+        sensor_readings: ColumnarTable::get_or_create_by_name(
+            db,
+            sensor_readings_table_config(SENSOR_READINGS_TABLE_NAME, profile),
             sensor_schema,
             SensorReadingKeyCodec,
             SensorReadingRecordCodec,
-        ),
+        )
+        .await?,
     })
 }
 
 fn row_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: Default::default(),
-    }
+    TableConfig::row(name).build()
 }
 
 fn sensor_readings_table_config(name: &str, profile: TelemetryExampleProfile) -> TableConfig {

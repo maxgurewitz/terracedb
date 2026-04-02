@@ -1057,22 +1057,13 @@ fn row_table_config_with_strategy(
     name: &str,
     compaction_strategy: CompactionStrategy,
 ) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy,
-        schema: None,
-        sharding: Default::default(),
-        metadata: BTreeMap::from([
+    TableConfig::row(name)
+        .compaction_strategy(compaction_strategy)
+        .metadata(BTreeMap::from([
             ("priority".to_string(), json!("high")),
             ("tenant".to_string(), json!("alpha")),
-        ]),
-    }
+        ]))
+        .build()
 }
 
 fn row_table_config_with_history_retention(name: &str, retained_sequences: u64) -> TableConfig {
@@ -1343,6 +1334,66 @@ fn columnar_table_config_builder_applies_hybrid_metadata_only_for_accelerated_pr
     assert!(read_profile.skip_indexes_enabled);
     assert!(read_profile.projection_sidecars_enabled);
     assert!(read_profile.compact_to_wide_promotion_enabled);
+}
+
+#[test]
+fn row_table_config_builder_applies_defaults_and_metadata() {
+    let config = crate::TableConfig::row("events")
+        .with_metadata("owner", serde_json::json!("tests"))
+        .build();
+
+    assert_eq!(config.name, "events");
+    assert_eq!(config.format, TableFormat::Row);
+    assert_eq!(config.bloom_filter_bits_per_key, Some(10));
+    assert_eq!(config.compaction_strategy, CompactionStrategy::Leveled);
+    assert_eq!(
+        config.metadata.get("owner"),
+        Some(&serde_json::json!("tests"))
+    );
+}
+
+#[tokio::test]
+async fn ensure_table_requires_matching_persisted_definition() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_config("/ensure-table-definition-match"),
+        dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+
+    let created = db
+        .ensure_table(row_table_config("events"))
+        .await
+        .expect("ensure initial table");
+    let same = db
+        .ensure_table(row_table_config("events"))
+        .await
+        .expect("ensure matching table");
+    assert_eq!(created.id(), same.id());
+
+    let mut mismatched = row_table_config("events");
+    mismatched.compaction_strategy = CompactionStrategy::Tiered;
+    let error = db
+        .ensure_table(mismatched.clone())
+        .await
+        .expect_err("mismatched config should fail");
+    let crate::CreateTableError::DefinitionMismatch {
+        table_name,
+        details,
+    } = error
+    else {
+        panic!("expected definition mismatch");
+    };
+    assert_eq!(table_name, "events");
+    assert!(details.contains("compaction_strategy"));
+
+    let fallback = db
+        .get_or_create_table_by_name(mismatched)
+        .await
+        .expect("name-only escape hatch");
+    assert_eq!(fallback.id(), created.id());
 }
 
 fn assert_catalog_entry(table: &StoredTable, expected: &TableConfig) {

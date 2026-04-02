@@ -9,9 +9,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    ChangeEntry, CompactionStrategy, Db, DbBuilder, DbSettings, S3Location, ScanOptions,
-    SequenceNumber, SystemClock, Table, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Value, decode_outbox_entry,
+    ChangeEntry, Db, DbBuilder, DbSettings, S3Location, ScanOptions, SequenceNumber, SystemClock,
+    Table, TableConfig, TieredDurabilityMode, TieredStorageConfig, Value, decode_outbox_entry,
 };
 use terracedb_debezium::{
     DebeziumChangeEntry, DebeziumDerivedTransition, DebeziumDerivedTransitionProjection,
@@ -222,19 +221,7 @@ fn decode_state_count(state: Option<Value>) -> usize {
 }
 
 fn row_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: Default::default(),
-    }
+    TableConfig::row(name).build()
 }
 
 fn order_watch_db_settings(path: &str, prefix: &str) -> DbSettings {

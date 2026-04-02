@@ -20,12 +20,9 @@ use terracedb::{
     ChangeEntry, ChangeFeedError, ChangeKind, Clock, CommitError, CreateTableError, Db,
     DurableTimerSet, Key, LogCursor, ObjectStore, OperationContext, OutboxEntry, ReadError,
     ScanOptions, ScheduledTimer, SnapshotTooOld, StorageError, StorageErrorKind, Table,
-    TableConfig, TableFormat, Timestamp, Transaction, TransactionCommitError, TransactionalOutbox,
-    Value,
+    TableConfig, Timestamp, Transaction, TransactionCommitError, TransactionalOutbox, Value,
 };
-use terracedb::{
-    CompactionStrategy, SequenceNumber, SpanRelation, set_span_attribute, telemetry_attrs,
-};
+use terracedb::{SequenceNumber, SpanRelation, set_span_attribute, telemetry_attrs};
 
 pub mod failpoints;
 mod run_model;
@@ -4707,19 +4704,9 @@ fn lookup_table(db: &Db, name: &str) -> Result<Table, StorageError> {
 }
 
 fn workflow_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(8),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: BTreeMap::new(),
-    }
+    TableConfig::row(name)
+        .bloom_filter_bits_per_key(Some(8))
+        .build()
 }
 
 fn instance_key(instance_id: &str) -> Key {

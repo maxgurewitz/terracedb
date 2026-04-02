@@ -1,20 +1,30 @@
-use std::{collections::BTreeMap, io, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use terracedb::{
-    ColumnarRecord, ColumnarTableConfigBuilder, CompactionStrategy, Db, DbConfig, FieldDefinition,
+    ColumnarRecord, ColumnarTableConfigBuilder, CreateTableError, Db, DbConfig, FieldDefinition,
     FieldId, FieldType, FieldValue, HybridProfile, HybridProjectionSidecarConfig, HybridReadConfig,
-    HybridTableFeatures, S3Location, ScanOptions, ScanPredicate, SchemaDefinition, SsdConfig,
-    StorageConfig, StubFileSystem, StubObjectStore, TableConfig, TableFormat, TieredDurabilityMode,
-    TieredStorageConfig, Value,
+    HybridTableFeatures, PhysicalShardId, S3Location, ScanOptions, ScanPredicate, SchemaDefinition,
+    ShardHashAlgorithm, ShardMapRevision, ShardingConfig, SsdConfig, StorageConfig, StubFileSystem,
+    StubObjectStore, TableConfig, TieredDurabilityMode, TieredStorageConfig, Value,
+    VirtualPartitionId,
     test_support::{row_table_config, test_dependencies},
 };
 use terracedb_records::{
     BigEndianU64Codec, CodecPhase, CodecTarget, ColumnarProjection, ColumnarRecordCodec,
-    ColumnarTable, JsonValueCodec, KeyCodec, ProjectionStream, RecordCodecError, RecordReadError,
-    RecordStream, RecordTable, RecordTransaction, RecordWriteError, Utf8StringCodec, ValueCodec,
+    ColumnarTable, JsonValueCodec, KeyCodec, ProjectionStream, RecordCodecError, RecordKeyspace,
+    RecordKeyspaceError, RecordReadError, RecordStream, RecordTable, RecordTransaction,
+    RecordTransactionFuture, RecordWriteError, Utf8StringCodec, ValueCodec,
 };
+use tokio::sync::Notify;
 
 type JsonStringTable = RecordTable<String, TestRecord, Utf8StringCodec, JsonValueCodec<TestRecord>>;
 type SensorReadingsTable = ColumnarTable<
@@ -220,14 +230,15 @@ async fn open_json_table(
     object_store: Arc<StubObjectStore>,
 ) -> (Db, JsonStringTable) {
     let db = open_db(path, file_system, object_store).await;
-    let raw = match db.create_table(row_table_config("records")).await {
-        Ok(table) => table,
-        Err(_) => db.table("records"),
-    };
-    (
-        db,
-        RecordTable::with_codecs(raw, Utf8StringCodec, JsonValueCodec::new()),
+    let table: JsonStringTable = RecordTable::ensure(
+        &db,
+        row_table_config("records"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
     )
+    .await
+    .expect("ensure records table");
+    (db, table)
 }
 
 async fn collect_stream<K>(mut stream: RecordStream<K, TestRecord>) -> Vec<TestRecord> {
@@ -244,6 +255,27 @@ async fn collect_projection_stream<V>(mut stream: ProjectionStream<V>) -> Vec<V>
         rows.push(value);
     }
     rows
+}
+
+fn test_sharding_config() -> ShardingConfig {
+    ShardingConfig::hash(
+        4,
+        ShardHashAlgorithm::Crc32,
+        ShardMapRevision::new(7),
+        vec![
+            PhysicalShardId::new(0),
+            PhysicalShardId::new(0),
+            PhysicalShardId::new(1),
+            PhysicalShardId::new(1),
+        ],
+    )
+    .expect("test sharding config")
+}
+
+fn sharded_row_table_config(name: &str) -> TableConfig {
+    TableConfig::row(name)
+        .sharding(test_sharding_config())
+        .build()
 }
 
 fn sensor_reading_schema() -> SchemaDefinition {
@@ -350,19 +382,7 @@ async fn transaction_scans_include_local_writes_and_preserve_codec_order() {
     let object_store = Arc::new(StubObjectStore::default());
     let db = open_db("/records/scan-order", file_system, object_store).await;
     let raw = db
-        .create_table(TableConfig {
-            name: "numeric".to_string(),
-            format: TableFormat::Row,
-            merge_operator: None,
-            max_merge_operand_chain_length: None,
-            compaction_filter: None,
-            bloom_filter_bits_per_key: Some(10),
-            history_retention_sequences: None,
-            compaction_strategy: CompactionStrategy::Leveled,
-            schema: None,
-            sharding: Default::default(),
-            metadata: Default::default(),
-        })
+        .create_table(TableConfig::row("numeric").build())
         .await
         .expect("create numeric table");
     let table = RecordTable::with_codecs(raw, BigEndianU64Codec, Utf8StringCodec);
@@ -522,6 +542,259 @@ async fn direct_table_scan_decodes_all_rows() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].title, "alpha");
     assert_eq!(rows[1].title, "beta");
+}
+
+#[tokio::test]
+async fn typed_ensure_detects_definition_mismatch() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = open_db("/records/ensure", file_system, object_store).await;
+
+    let created: JsonStringTable = RecordTable::ensure(
+        &db,
+        row_table_config("records"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+    .await
+    .expect("create typed table");
+    let ensured: JsonStringTable = RecordTable::ensure(
+        &db,
+        row_table_config("records"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+    .await
+    .expect("ensure matching typed table");
+    assert_eq!(created.table().id(), ensured.table().id());
+
+    let mismatch = TableConfig::row("records")
+        .history_retention_sequences(Some(5))
+        .build();
+    let error = JsonStringTable::ensure(&db, mismatch, Utf8StringCodec, JsonValueCodec::new())
+        .await
+        .expect_err("mismatched config should fail");
+    let CreateTableError::DefinitionMismatch {
+        table_name,
+        details,
+    } = error
+    else {
+        panic!("expected definition mismatch");
+    };
+    assert_eq!(table_name, "records");
+    assert!(details.contains("history_retention_sequences"));
+}
+
+#[tokio::test]
+async fn typed_get_or_create_by_name_accepts_evolved_persisted_sharding() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = open_db("/records/get-or-create", file_system, object_store).await;
+
+    let table: JsonStringTable = RecordTable::ensure(
+        &db,
+        sharded_row_table_config("rooms"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+    .await
+    .expect("create sharded table");
+    let target = table
+        .sharding_state()
+        .expect("source sharding")
+        .config
+        .move_partition(VirtualPartitionId::new(0), PhysicalShardId::new(2))
+        .expect("move partition");
+    table
+        .reshard_to(target.clone())
+        .await
+        .expect("reshard table");
+
+    let reopened = JsonStringTable::get_or_create_by_name(
+        &db,
+        sharded_row_table_config("rooms"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+    .await
+    .expect("reopen by name with evolved sharding");
+    assert_eq!(
+        reopened.sharding_state().expect("reopened sharding").config,
+        target
+    );
+}
+
+#[tokio::test]
+async fn record_keyspace_detects_misaligned_routes_and_reshards_members_together() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = open_db("/records/keyspace", file_system, object_store).await;
+
+    let primary: JsonStringTable = RecordTable::ensure(
+        &db,
+        sharded_row_table_config("primary"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+    .await
+    .expect("create primary table");
+    let follower: JsonStringTable = RecordTable::ensure(
+        &db,
+        sharded_row_table_config("follower"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+    .await
+    .expect("create follower table");
+
+    let keyspace = RecordKeyspace::new(
+        primary.table().clone(),
+        [follower.table().clone()],
+        Utf8StringCodec,
+    )
+    .expect("aligned keyspace");
+    let initial = keyspace.sharding_state().expect("aligned sharding state");
+    let target = initial
+        .config
+        .move_partition(VirtualPartitionId::new(0), PhysicalShardId::new(2))
+        .expect("move partition");
+    keyspace
+        .reshard_to(target.clone())
+        .await
+        .expect("reshard both tables");
+
+    assert_eq!(
+        primary.sharding_state().expect("primary sharding").config,
+        target
+    );
+    assert_eq!(
+        follower.sharding_state().expect("follower sharding").config,
+        target
+    );
+
+    let misaligned: JsonStringTable = RecordTable::ensure(
+        &db,
+        sharded_row_table_config("misaligned"),
+        Utf8StringCodec,
+        JsonValueCodec::new(),
+    )
+    .await
+    .expect("create misaligned table");
+    let misaligned_keyspace = RecordKeyspace::new(
+        primary.table().clone(),
+        [misaligned.table().clone()],
+        Utf8StringCodec,
+    )
+    .expect("compatible keyspace identity");
+
+    let divergent_key = (0..10_000_u64)
+        .map(|index| format!("room:{index}"))
+        .find(|key| {
+            primary
+                .route_key(key)
+                .expect("route primary key")
+                .virtual_partition
+                == VirtualPartitionId::new(0)
+        })
+        .expect("key routed through moved partition");
+
+    let error = misaligned_keyspace
+        .route_key(&divergent_key)
+        .expect_err("misaligned keyspace should reject divergent routing");
+    let RecordKeyspaceError::MisalignedRouting {
+        primary_table,
+        table_name,
+    } = error
+    else {
+        panic!("expected misaligned routing");
+    };
+    assert_eq!(primary_table, "primary");
+    assert_eq!(table_name, "misaligned");
+}
+
+#[tokio::test]
+async fn conflict_retry_loop_retries_until_conflict_is_resolved() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let (db, table) = open_json_table("/records/run-with-retry", file_system, object_store).await;
+
+    table
+        .write_str(
+            "counter",
+            &TestRecord {
+                title: "seed".to_string(),
+                visits: 0,
+            },
+        )
+        .await
+        .expect("seed counter");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let first_attempt_started = Arc::new(Notify::new());
+    let allow_first_attempt_commit = Arc::new(Notify::new());
+    let worker_table = table.clone();
+    let worker_attempts = attempts.clone();
+    let worker_started = first_attempt_started.clone();
+    let worker_allow = allow_first_attempt_commit.clone();
+
+    let worker = tokio::spawn(async move {
+        RecordTransaction::run_conflict_retry_loop(
+            &db,
+            RecordTransaction::replay_safe(move |tx: &mut RecordTransaction| {
+                let table = worker_table.clone();
+                let attempts = worker_attempts.clone();
+                let started = worker_started.clone();
+                let allow = worker_allow.clone();
+                let future: RecordTransactionFuture<'_, _, _> = Box::pin(async move {
+                    let current = tx
+                        .read_str(&table, "counter")
+                        .await
+                        .map_err(io::Error::other)?
+                        .expect("seeded counter");
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt == 1 {
+                        started.notify_one();
+                        allow.notified().await;
+                    }
+
+                    let next = TestRecord {
+                        title: format!("attempt-{attempt}"),
+                        visits: current.visits + 1,
+                    };
+                    tx.write_str(&table, "counter", &next)
+                        .map_err(io::Error::other)?;
+                    Ok::<_, io::Error>(next)
+                });
+                future
+            }),
+        )
+        .await
+    });
+
+    first_attempt_started.notified().await;
+    table
+        .write_str(
+            "counter",
+            &TestRecord {
+                title: "external".to_string(),
+                visits: 10,
+            },
+        )
+        .await
+        .expect("create conflict");
+    allow_first_attempt_commit.notify_one();
+
+    let (result, _sequence) = worker
+        .await
+        .expect("join worker")
+        .expect("transaction should retry and commit");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(result.visits, 11);
+    assert_eq!(result.title, "attempt-2");
+    assert_eq!(
+        table.read_str("counter").await.expect("read final counter"),
+        Some(result)
+    );
 }
 
 #[tokio::test]

@@ -17,17 +17,18 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
 use terracedb::{
-    Clock, ColocatedDeployment, CommitError, CompactionStrategy, CreateTableError, Db, DbSettings,
-    DomainBackgroundBudget, DomainCpuBudget, ExecutionBacklogGuard, ExecutionDomainBacklogSnapshot,
-    ExecutionDomainBudget, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec,
-    ExecutionLane, KeyShardRoute, PhysicalShardId, ReshardPlanError, ShardHashAlgorithm,
-    ShardMapRevision, ShardReadyPlacementLayout, ShardingConfig, StorageError, Table, TableConfig,
-    TableFormat, TieredDurabilityMode, TieredStorageConfig, TransactionCommitError,
-    VirtualPartitionId,
+    Clock, ColocatedDeployment, CommitError, CreateTableError, Db, DbSettings,
+    DomainBackgroundBudget, DomainCpuBudget, ExecutionBacklogPublisher,
+    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane,
+    KeyShardRoute, PhysicalShardId, PublishShardMapError, ReshardPlanError,
+    ShardExecutionDomainProfile, ShardHashAlgorithm, ShardMapRevision, ShardingConfig,
+    ShardingError, StorageError, Table, TableConfig, TieredDurabilityMode, TieredStorageConfig,
+    TransactionCommitError, VirtualPartitionId,
 };
 use terracedb_records::{
-    JsonValueCodec, KeyCodec, RecordCodecError, RecordReadError, RecordStream, RecordTable,
-    RecordTransaction, RecordWriteError,
+    JsonValueCodec, KeyCodec, RecordCodecError, RecordKeyspace, RecordKeyspaceError,
+    RecordKeyspaceReshardError, RecordReadError, RecordStream, RecordTable, RecordTransaction,
+    RecordTransactionFuture, RecordTransactionRunError, RecordWriteError,
 };
 
 use crate::model::{
@@ -52,6 +53,7 @@ type RoomMessagesTable = RecordTable<
     RoomShardKeyCodec,
     JsonValueCodec<RoomMessagesRecord>,
 >;
+type RoomKeyspace = RecordKeyspace<RoomShardKey, RoomShardKeyCodec>;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RoomShardKey {
@@ -89,30 +91,6 @@ impl KeyCodec<RoomShardKey> for RoomShardKeyCodec {
 struct RoomMessagesRecord {
     room_id: String,
     messages: Vec<ChatMessageRecord>,
-}
-
-#[derive(Clone, Debug)]
-struct RoomRoutePair {
-    key: RoomShardKey,
-    room_state: KeyShardRoute,
-    room_messages: KeyShardRoute,
-}
-
-impl RoomRoutePair {
-    fn require_aligned(&self, room_id: &str) -> Result<KeyShardRoute, ChatRoomsAppError> {
-        (self.room_state == self.room_messages)
-            .then_some(self.room_state)
-            .ok_or_else(|| {
-                ChatRoomsAppError::Conflict(format!(
-                    "room '{room_id}' is temporarily unavailable while shard maps converge"
-                ))
-            })
-    }
-}
-
-#[derive(Default)]
-struct RoomPressurePublication {
-    guards: Vec<ExecutionBacklogGuard>,
 }
 
 #[derive(Default)]
@@ -200,6 +178,7 @@ impl IntoResponse for ChatRoomsApiError {
 pub struct ChatRoomsTables {
     room_state: RoomStateTable,
     room_messages: RoomMessagesTable,
+    room_keyspace: RoomKeyspace,
 }
 
 impl ChatRoomsTables {
@@ -218,9 +197,8 @@ pub struct ChatRoomsAppState {
     clock: Arc<dyn Clock>,
     profile: ChatRoomsExampleProfile,
     tables: ChatRoomsTables,
-    layout: ShardReadyPlacementLayout,
     room_write_locks: Arc<RoomWriteLocks>,
-    pressure: Arc<AsyncMutex<RoomPressurePublication>>,
+    backlog: ExecutionBacklogPublisher,
 }
 
 impl std::fmt::Debug for ChatRoomsAppState {
@@ -259,18 +237,18 @@ impl ChatRoomsApp {
         }
 
         let tables = ensure_chat_rooms_tables(&db).await?;
+        let backlog = db.backlog_publisher();
         let state = ChatRoomsAppState {
             db,
             clock,
             profile,
             tables,
-            layout: ShardReadyPlacementLayout::new(CHAT_ROOMS_DATABASE_NAME),
             room_write_locks: Arc::new(RoomWriteLocks::default()),
-            pressure: Arc::new(AsyncMutex::new(RoomPressurePublication::default())),
+            backlog,
         };
 
         if profile.uses_shard_local_execution() {
-            state.register_shard_execution_domains();
+            state.register_shard_execution_domains()?;
         }
         state.publish_backlog().await?;
 
@@ -325,35 +303,50 @@ impl ChatRoomsAppState {
         let title = normalize_non_empty("title", &request.title)?;
         let write_lock = self.room_write_lock(&room_id);
         let _write_guard = write_lock.lock().await;
-        let routes = self.room_routes(&room_id)?;
-        let _ = routes.require_aligned(&room_id)?;
+        let key = RoomShardKey::new(room_id.clone());
+        let _ = self.require_room_route(&key, &room_id)?;
 
-        let mut tx = RecordTransaction::begin(&self.db).await;
-        if tx
-            .read(&self.tables.room_state, &routes.key)
-            .await?
-            .is_some()
-        {
-            return Err(ChatRoomsAppError::Conflict(format!(
-                "room '{room_id}' already exists"
-            )));
-        }
+        let tables = self.tables.clone();
+        let clock = self.clock.clone();
+        let room_id_for_tx = room_id.clone();
+        let title_for_tx = title.clone();
+        let key_for_tx = key.clone();
+        let (state, _sequence) = RecordTransaction::run_conflict_retry_loop(
+            &self.db,
+            RecordTransaction::replay_safe(move |tx: &mut RecordTransaction| {
+                let tables = tables.clone();
+                let clock = clock.clone();
+                let room_id = room_id_for_tx.clone();
+                let title = title_for_tx.clone();
+                let key = key_for_tx.clone();
+                let future: RecordTransactionFuture<'_, _, _> = Box::pin(async move {
+                    if tx.read(&tables.room_state, &key).await?.is_some() {
+                        return Err(ChatRoomsAppError::Conflict(format!(
+                            "room '{room_id}' already exists"
+                        )));
+                    }
 
-        let now_ms = self.clock.now().get();
-        let state = RoomStateRecord {
-            room_id: room_id.clone(),
-            title,
-            created_at_ms: now_ms,
-            message_count: 0,
-            last_message_at_ms: None,
-        };
-        let log = RoomMessagesRecord {
-            room_id,
-            messages: Vec::new(),
-        };
-        tx.write(&self.tables.room_state, &routes.key, &state)?;
-        tx.write(&self.tables.room_messages, &routes.key, &log)?;
-        tx.commit().await?;
+                    let now_ms = clock.now().get();
+                    let state = RoomStateRecord {
+                        room_id: room_id.clone(),
+                        title,
+                        created_at_ms: now_ms,
+                        message_count: 0,
+                        last_message_at_ms: None,
+                    };
+                    let log = RoomMessagesRecord {
+                        room_id,
+                        messages: Vec::new(),
+                    };
+                    tx.write(&tables.room_state, &key, &state)?;
+                    tx.write(&tables.room_messages, &key, &log)?;
+                    Ok(state)
+                });
+                future
+            }),
+        )
+        .await
+        .map_err(map_record_transaction_error)?;
         self.publish_backlog().await?;
         Ok(state)
     }
@@ -368,41 +361,56 @@ impl ChatRoomsAppState {
         let body = normalize_non_empty("body", &request.body)?;
         let write_lock = self.room_write_lock(&room_id);
         let _write_guard = write_lock.lock().await;
-        let routes = self.room_routes(&room_id)?;
-        let _ = routes.require_aligned(&room_id)?;
+        let key = RoomShardKey::new(room_id.clone());
+        let _ = self.require_room_route(&key, &room_id)?;
 
-        let mut tx = RecordTransaction::begin(&self.db).await;
-        let mut room = tx
-            .read(&self.tables.room_state, &routes.key)
-            .await?
-            .ok_or_else(|| {
-                ChatRoomsAppError::NotFound(format!("room '{room_id}' does not exist"))
-            })?;
-        let mut log = tx
-            .read(&self.tables.room_messages, &routes.key)
-            .await?
-            .ok_or_else(|| {
-                ChatRoomsAppError::InvalidConfig(format!(
-                    "room '{room_id}' is missing its message log row"
-                ))
-            })?;
+        let tables = self.tables.clone();
+        let clock = self.clock.clone();
+        let room_id_for_tx = room_id.clone();
+        let author_for_tx = author.clone();
+        let body_for_tx = body.clone();
+        let key_for_tx = key.clone();
+        let (message, _sequence) = RecordTransaction::run_conflict_retry_loop(
+            &self.db,
+            RecordTransaction::replay_safe(move |tx: &mut RecordTransaction| {
+                let tables = tables.clone();
+                let clock = clock.clone();
+                let room_id = room_id_for_tx.clone();
+                let author = author_for_tx.clone();
+                let body = body_for_tx.clone();
+                let key = key_for_tx.clone();
+                let future: RecordTransactionFuture<'_, _, _> = Box::pin(async move {
+                    let mut room = tx.read(&tables.room_state, &key).await?.ok_or_else(|| {
+                        ChatRoomsAppError::NotFound(format!("room '{room_id}' does not exist"))
+                    })?;
+                    let mut log = tx.read(&tables.room_messages, &key).await?.ok_or_else(|| {
+                        ChatRoomsAppError::InvalidConfig(format!(
+                            "room '{room_id}' is missing its message log row"
+                        ))
+                    })?;
 
-        let posted_at_ms = self.clock.now().get();
-        let next_ordinal = room.message_count.saturating_add(1);
-        let message = ChatMessageRecord {
-            room_id: room_id.clone(),
-            message_id: format!("{room_id}:{next_ordinal:08}"),
-            author,
-            body,
-            posted_at_ms,
-        };
-        room.message_count = next_ordinal;
-        room.last_message_at_ms = Some(posted_at_ms);
-        log.messages.push(message.clone());
+                    let posted_at_ms = clock.now().get();
+                    let next_ordinal = room.message_count.saturating_add(1);
+                    let message = ChatMessageRecord {
+                        room_id: room_id.clone(),
+                        message_id: format!("{room_id}:{next_ordinal:08}"),
+                        author,
+                        body,
+                        posted_at_ms,
+                    };
+                    room.message_count = next_ordinal;
+                    room.last_message_at_ms = Some(posted_at_ms);
+                    log.messages.push(message.clone());
 
-        tx.write(&self.tables.room_state, &routes.key, &room)?;
-        tx.write(&self.tables.room_messages, &routes.key, &log)?;
-        tx.commit().await?;
+                    tx.write(&tables.room_state, &key, &room)?;
+                    tx.write(&tables.room_messages, &key, &log)?;
+                    Ok(message)
+                });
+                future
+            }),
+        )
+        .await
+        .map_err(map_record_transaction_error)?;
         self.publish_backlog().await?;
         Ok(message)
     }
@@ -414,18 +422,18 @@ impl ChatRoomsAppState {
     ) -> Result<RoomMessagesResponse, ChatRoomsAppError> {
         let room_id = normalize_room_id(room_id)?;
         let limit = normalize_recent_limit(limit)?;
-        let routes = self.room_routes(&room_id)?;
-        let _ = routes.require_aligned(&room_id)?;
+        let key = RoomShardKey::new(room_id.clone());
+        let _ = self.require_room_route(&key, &room_id)?;
 
         let mut tx = RecordTransaction::begin(&self.db).await;
         let room = tx
-            .read(&self.tables.room_state, &routes.key)
+            .read(&self.tables.room_state, &key)
             .await?
             .ok_or_else(|| {
                 ChatRoomsAppError::NotFound(format!("room '{room_id}' does not exist"))
             })?;
         let log = tx
-            .read(&self.tables.room_messages, &routes.key)
+            .read(&self.tables.room_messages, &key)
             .await?
             .ok_or_else(|| {
                 ChatRoomsAppError::InvalidConfig(format!(
@@ -456,22 +464,18 @@ impl ChatRoomsAppState {
         target_physical_shard: u32,
     ) -> Result<ShardingConfig, ChatRoomsAppError> {
         let room_id = normalize_room_id(room_id)?;
-        let routes = self.room_routes(&room_id)?;
-        let route = routes.require_aligned(&room_id)?;
-        build_target_sharding(
-            &self
-                .tables
-                .room_state_raw()
-                .sharding_state()
-                .ok_or_else(|| {
-                    ChatRoomsAppError::InvalidConfig(
-                        "room_state table is missing sharding state".to_string(),
-                    )
-                })?
-                .config,
-            route.virtual_partition,
-            PhysicalShardId::new(target_physical_shard),
-        )
+        let key = RoomShardKey::new(room_id.clone());
+        let (_key, route) = self.require_room_route(&key, &room_id)?;
+        self.tables
+            .room_keyspace
+            .sharding_state()
+            .map_err(map_keyspace_error)?
+            .config
+            .move_partition(
+                route.virtual_partition,
+                PhysicalShardId::new(target_physical_shard),
+            )
+            .map_err(|error| map_sharding_error(&room_id, error))
     }
 
     pub async fn reshard_room(
@@ -482,9 +486,9 @@ impl ChatRoomsAppState {
         let room_id = normalize_room_id(room_id)?;
         let write_lock = self.room_write_lock(&room_id);
         let _write_guard = write_lock.lock().await;
-        let routes = self.room_routes(&room_id)?;
-        let route = routes.require_aligned(&room_id)?;
-        if self.tables.room_state.read(&routes.key).await?.is_none() {
+        let key = RoomShardKey::new(room_id.clone());
+        let (_key, route) = self.require_room_route(&key, &room_id)?;
+        if self.tables.room_state.read(&key).await?.is_none() {
             return Err(ChatRoomsAppError::NotFound(format!(
                 "room '{room_id}' does not exist"
             )));
@@ -499,39 +503,32 @@ impl ChatRoomsAppState {
         }
 
         if self.profile.uses_shard_local_execution() && target != PhysicalShardId::UNSHARDED {
-            self.register_one_shard_execution_domain(target);
+            self.register_one_shard_execution_domain(target)?;
         }
 
-        let target_sharding = build_target_sharding(
-            &self
-                .tables
-                .room_state_raw()
-                .sharding_state()
-                .ok_or_else(|| {
-                    ChatRoomsAppError::InvalidConfig(
-                        "room_state table is missing sharding state".to_string(),
-                    )
-                })?
-                .config,
-            route.virtual_partition,
-            target,
-        )?;
-
-        let room_state = self
+        let target_sharding = self.target_sharding_for_room(&room_id, target.get())?;
+        let resharded = self
             .tables
-            .room_state_raw()
-            .reshard_to(target_sharding.clone())
-            .await?;
-        let room_messages = self
-            .tables
-            .room_messages_raw()
+            .room_keyspace
             .reshard_to(target_sharding)
-            .await?;
+            .await
+            .map_err(map_keyspace_reshard_error)?;
         self.publish_backlog().await?;
 
-        let room_state_view = reshard_view(&room_state.table_name.clone(), Some(room_state));
-        let room_messages_view =
-            reshard_view(&room_messages.table_name.clone(), Some(room_messages));
+        let room_state_view = reshard_view(
+            ROOM_STATE_TABLE_NAME,
+            resharded
+                .iter()
+                .find(|state| state.table_name == ROOM_STATE_TABLE_NAME)
+                .cloned(),
+        );
+        let room_messages_view = reshard_view(
+            ROOM_MESSAGES_TABLE_NAME,
+            resharded
+                .iter()
+                .find(|state| state.table_name == ROOM_MESSAGES_TABLE_NAME)
+                .cloned(),
+        );
 
         Ok(ReshardRoomResponse {
             room_id,
@@ -548,19 +545,17 @@ impl ChatRoomsAppState {
         room_id: &str,
     ) -> Result<RoomShardInspection, ChatRoomsAppError> {
         let room_id = normalize_room_id(room_id)?;
-        let room = self
-            .tables
-            .room_state
-            .read(&RoomShardKey::new(room_id.clone()))
-            .await?
-            .ok_or_else(|| {
-                ChatRoomsAppError::NotFound(format!("room '{room_id}' does not exist"))
-            })?;
-        let routes = self.room_routes(&room_id)?;
-        let route = routes.room_state;
+        let key = RoomShardKey::new(room_id.clone());
+        let room = self.tables.room_state.read(&key).await?.ok_or_else(|| {
+            ChatRoomsAppError::NotFound(format!("room '{room_id}' does not exist"))
+        })?;
+        let (_key, route) = self.require_room_route(&key, &room_id)?;
         let snapshot = self.db.resource_manager_snapshot();
-        let preferred = route.physical_shard.execution_placement(&self.layout);
-        let active_background_domain = self.active_background_domain(route.physical_shard);
+        let preferred = self
+            .db
+            .shard_execution_placement(route.physical_shard)
+            .map_err(ChatRoomsAppError::from)?;
+        let active_background_domain = self.active_background_domain(route.physical_shard)?;
 
         Ok(RoomShardInspection {
             room_id,
@@ -582,12 +577,12 @@ impl ChatRoomsAppState {
             ),
             room_state_resharding: self
                 .tables
-                .room_state_raw()
+                .room_state
                 .resharding_state()
                 .map(|state| reshard_view(ROOM_STATE_TABLE_NAME, Some(state))),
             room_messages_resharding: self
                 .tables
-                .room_messages_raw()
+                .room_messages
                 .resharding_state()
                 .map(|state| reshard_view(ROOM_MESSAGES_TABLE_NAME, Some(state))),
         })
@@ -600,13 +595,9 @@ impl ChatRoomsAppState {
         let snapshot = self.db.resource_manager_snapshot();
         let shard_assignments = self
             .tables
-            .room_state_raw()
+            .room_state
             .sharding_state()
-            .ok_or_else(|| {
-                ChatRoomsAppError::InvalidConfig(
-                    "room_state table is missing sharding state".to_string(),
-                )
-            })?
+            .map_err(ChatRoomsAppError::from)?
             .shard_assignments()
             .into_iter()
             .map(|assignment| VirtualPartitionAssignment {
@@ -643,20 +634,19 @@ impl ChatRoomsAppState {
 
         let shard_ids = self
             .tables
-            .room_state_raw()
+            .room_state
             .sharding_state()
-            .ok_or_else(|| {
-                ChatRoomsAppError::InvalidConfig(
-                    "room_state table is missing sharding state".to_string(),
-                )
-            })?
+            .map_err(ChatRoomsAppError::from)?
             .physical_shards()
             .into_iter()
             .collect::<BTreeSet<_>>();
         let mut shards = Vec::new();
         for shard in shard_ids {
-            let preferred = shard.execution_placement(&self.layout);
-            let active_background_domain = self.active_background_domain(shard);
+            let preferred = self
+                .db
+                .shard_execution_placement(shard)
+                .map_err(ChatRoomsAppError::from)?;
+            let active_background_domain = self.active_background_domain(shard)?;
             let room_ids = rooms_by_shard
                 .get(&shard.get())
                 .cloned()
@@ -706,14 +696,11 @@ impl ChatRoomsAppState {
     }
 
     async fn clear_backlog_publication(&self) {
-        let mut publication = self.pressure.lock().await;
-        publication.guards.clear();
+        self.backlog.clear();
     }
 
     async fn publish_backlog(&self) -> Result<(), ChatRoomsAppError> {
-        // Serialize backlog rebuilds so a later request cannot be overwritten by
-        // an earlier scan that finishes out of order.
-        let mut publication = self.pressure.lock().await;
+        let publication = self.backlog.begin_replace();
         let mut domain_backlog =
             BTreeMap::<String, (ExecutionDomainPath, ExecutionDomainBacklogSnapshot)>::new();
         let mut stream = self
@@ -727,8 +714,12 @@ impl ChatRoomsAppState {
             if backlog.is_empty() {
                 continue;
             }
-            let route = self.route_room_messages_key(&key)?;
-            let path = self.active_background_domain(route.physical_shard);
+            let route = self
+                .tables
+                .room_keyspace
+                .route_key(&key)
+                .map_err(map_keyspace_error)?;
+            let path = self.active_background_domain(route.physical_shard)?;
             let entry = domain_backlog
                 .entry(path.as_string())
                 .or_insert_with(|| (path.clone(), ExecutionDomainBacklogSnapshot::default()));
@@ -739,151 +730,62 @@ impl ChatRoomsAppState {
             entry.1.queued_bytes = entry.1.queued_bytes.saturating_add(backlog.queued_bytes);
         }
 
-        publication.guards.clear();
-        let manager = self.db.resource_manager();
-        publication.guards = domain_backlog
-            .into_iter()
-            .map(|(_key, (path, backlog))| {
-                ExecutionBacklogGuard::set(manager.clone(), path, backlog)
-            })
-            .collect();
+        let _ = self.backlog.replace_all_at(
+            publication,
+            domain_backlog
+                .into_iter()
+                .map(|(_key, (path, backlog))| (path, backlog)),
+        );
         Ok(())
     }
 
-    fn register_shard_execution_domains(&self) {
-        for shard in example_physical_shards() {
-            self.register_one_shard_execution_domain(shard);
-        }
+    fn register_shard_execution_domains(&self) -> Result<(), ChatRoomsAppError> {
+        self.db
+            .register_shard_execution_domains(
+                example_physical_shards(),
+                &chat_rooms_shard_execution_profile(),
+            )
+            .map_err(ChatRoomsAppError::from)
     }
 
-    fn register_one_shard_execution_domain(&self, shard: PhysicalShardId) {
-        if shard == PhysicalShardId::UNSHARDED {
-            return;
-        }
-
-        let placement = shard.execution_placement(&self.layout);
-        let manager = self.db.resource_manager();
-
-        for (path, lane, budget, placement_mode) in [
-            (
-                placement.foreground.clone(),
-                ExecutionLane::UserForeground,
-                ExecutionDomainBudget {
-                    cpu: DomainCpuBudget {
-                        worker_slots: Some(2),
-                        weight: None,
-                    },
-                    ..ExecutionDomainBudget::default()
-                },
-                ExecutionDomainPlacement::SharedWeighted { weight: 1 },
-            ),
-            (
-                placement.background.clone(),
-                ExecutionLane::UserBackground,
-                ExecutionDomainBudget {
-                    background: DomainBackgroundBudget {
-                        task_slots: Some(2),
-                        max_in_flight_bytes: Some(64 * 1024),
-                    },
-                    ..ExecutionDomainBudget::default()
-                },
-                ExecutionDomainPlacement::SharedWeighted { weight: 1 },
-            ),
-            (
-                placement.control_plane.clone(),
-                ExecutionLane::ControlPlane,
-                ExecutionDomainBudget {
-                    cpu: DomainCpuBudget {
-                        worker_slots: Some(1),
-                        weight: None,
-                    },
-                    background: DomainBackgroundBudget {
-                        task_slots: Some(1),
-                        max_in_flight_bytes: Some(16 * 1024),
-                    },
-                    ..ExecutionDomainBudget::default()
-                },
-                ExecutionDomainPlacement::Dedicated,
-            ),
-        ] {
-            let mut metadata = BTreeMap::new();
-            metadata.insert(
-                "terracedb.example".to_string(),
-                "chat-rooms-api".to_string(),
-            );
-            metadata.insert(
-                "terracedb.execution.layout".to_string(),
-                "shard-local-demo".to_string(),
-            );
-            metadata.insert(
-                "terracedb.execution.physical_shard".to_string(),
-                shard.to_string(),
-            );
-            metadata.insert(
-                "terracedb.execution.lane".to_string(),
-                match lane {
-                    ExecutionLane::UserForeground => "foreground",
-                    ExecutionLane::UserBackground => "background",
-                    ExecutionLane::ControlPlane => "control",
-                }
-                .to_string(),
-            );
-            manager.register_domain(ExecutionDomainSpec {
-                path,
-                owner: placement.owner.clone(),
-                budget,
-                placement: placement_mode,
-                metadata,
-            });
-        }
+    fn register_one_shard_execution_domain(
+        &self,
+        shard: PhysicalShardId,
+    ) -> Result<(), ChatRoomsAppError> {
+        self.db
+            .register_shard_execution_domains([shard], &chat_rooms_shard_execution_profile())
+            .map_err(ChatRoomsAppError::from)
     }
 
-    fn room_routes(&self, room_id: &str) -> Result<RoomRoutePair, ChatRoomsAppError> {
-        let key = RoomShardKey::new(room_id.to_string());
-        Ok(RoomRoutePair {
-            room_state: self.route_room_state_key(&key)?,
-            room_messages: self.route_room_messages_key(&key)?,
-            key,
-        })
-    }
-
-    fn route_room_state_key(&self, key: &RoomShardKey) -> Result<KeyShardRoute, ChatRoomsAppError> {
-        let encoded = self.tables.room_state.encode_key(key)?;
-        self.tables
-            .room_state_raw()
-            .route_key(&encoded)
-            .ok_or_else(|| {
-                ChatRoomsAppError::InvalidConfig(
-                    "room_state table is missing sharding metadata".to_string(),
-                )
-            })
-    }
-
-    fn route_room_messages_key(
+    fn require_room_route(
         &self,
         key: &RoomShardKey,
-    ) -> Result<KeyShardRoute, ChatRoomsAppError> {
-        let encoded = self.tables.room_messages.encode_key(key)?;
-        self.tables
-            .room_messages_raw()
-            .route_key(&encoded)
-            .ok_or_else(|| {
-                ChatRoomsAppError::InvalidConfig(
-                    "room_messages table is missing sharding metadata".to_string(),
-                )
-            })
+        room_id: &str,
+    ) -> Result<(RoomShardKey, KeyShardRoute), ChatRoomsAppError> {
+        let route = self
+            .tables
+            .room_keyspace
+            .route_key(key)
+            .map_err(|error| map_room_keyspace_error(room_id, error))?;
+        Ok((key.clone(), route))
     }
 
-    fn active_background_domain(&self, shard: PhysicalShardId) -> ExecutionDomainPath {
+    fn active_background_domain(
+        &self,
+        shard: PhysicalShardId,
+    ) -> Result<ExecutionDomainPath, ChatRoomsAppError> {
         if self.profile.uses_shard_local_execution() && shard != PhysicalShardId::UNSHARDED {
-            return self
-                .layout
-                .future_shard_lane_path(shard.to_string(), ExecutionLane::UserBackground);
+            return Ok(self
+                .db
+                .shard_execution_placement(shard)
+                .map_err(ChatRoomsAppError::from)?
+                .background);
         }
-        self.db
+        Ok(self
+            .db
             .execution_lane_binding(ExecutionLane::UserBackground)
             .domain
-            .clone()
+            .clone())
     }
 }
 
@@ -903,22 +805,37 @@ pub fn chat_rooms_db_settings(path: &str, prefix: &str) -> DbSettings {
 }
 
 pub async fn ensure_chat_rooms_tables(db: &Db) -> Result<ChatRoomsTables, ChatRoomsAppError> {
+    let room_state = RoomStateTable::get_or_create_by_name(
+        db,
+        sharded_room_table_config(ROOM_STATE_TABLE_NAME),
+        RoomShardKeyCodec,
+        JsonValueCodec::new(),
+    )
+    .await?;
+    let room_messages = RoomMessagesTable::get_or_create_by_name(
+        db,
+        sharded_room_table_config(ROOM_MESSAGES_TABLE_NAME),
+        RoomShardKeyCodec,
+        JsonValueCodec::new(),
+    )
+    .await?;
+    let room_keyspace = RoomKeyspace::new(
+        room_state.table().clone(),
+        [room_messages.table().clone()],
+        RoomShardKeyCodec,
+    )
+    .map_err(map_keyspace_error)?;
     Ok(ChatRoomsTables {
-        room_state: room_state_table(
-            db.ensure_table(sharded_room_table_config(ROOM_STATE_TABLE_NAME))
-                .await?,
-        ),
-        room_messages: room_messages_table(
-            db.ensure_table(sharded_room_table_config(ROOM_MESSAGES_TABLE_NAME))
-                .await?,
-        ),
+        room_keyspace,
+        room_state,
+        room_messages,
     })
 }
 
 pub fn sharded_room_table_config(name: &str) -> TableConfig {
-    let mut config = row_table_config(name);
-    config.sharding = room_sharding_config();
-    config
+    terracedb::TableConfig::row(name)
+        .sharding(room_sharding_config())
+        .build()
 }
 
 pub fn room_sharding_config() -> ShardingConfig {
@@ -974,30 +891,6 @@ pub fn find_room_id_for_partition(
     panic!("failed to find room for virtual partition {target}");
 }
 
-fn row_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: ShardingConfig::default(),
-        metadata: Default::default(),
-    }
-}
-
-fn room_state_table(table: Table) -> RoomStateTable {
-    RecordTable::with_codecs(table, RoomShardKeyCodec, JsonValueCodec::new())
-}
-
-fn room_messages_table(table: Table) -> RoomMessagesTable {
-    RecordTable::with_codecs(table, RoomShardKeyCodec, JsonValueCodec::new())
-}
-
 fn backlog_from_log(log: &RoomMessagesRecord) -> ExecutionDomainBacklogSnapshot {
     let queued_work_items = log
         .messages
@@ -1035,7 +928,7 @@ fn reshard_view(
         table_name: state.table_name,
         source_revision: state.source_revision.get(),
         target_revision: state.target_revision.get(),
-        phase: format!("{:?}", state.phase).to_ascii_lowercase(),
+        phase: state.phase.as_str().to_string(),
         paused_partitions: state
             .paused_partitions
             .into_iter()
@@ -1046,39 +939,93 @@ fn reshard_view(
     }
 }
 
-fn build_target_sharding(
-    current: &ShardingConfig,
-    partition: VirtualPartitionId,
-    target_physical_shard: PhysicalShardId,
-) -> Result<ShardingConfig, ChatRoomsAppError> {
-    let ShardingConfig::Hash(current) = current else {
-        return Err(ChatRoomsAppError::InvalidConfig(
-            "chat rooms example expects sharded tables".to_string(),
-        ));
-    };
-
-    let mut assignments = current.physical_shards_by_virtual_partition.clone();
-    let slot = partition.get() as usize;
-    let Some(current_shard) = assignments.get(slot).copied() else {
-        return Err(ChatRoomsAppError::InvalidConfig(format!(
-            "virtual partition {} is outside the room shard map",
-            partition
-        )));
-    };
-    if current_shard == target_physical_shard {
-        return Err(ChatRoomsAppError::Usage(format!(
-            "virtual partition {} is already assigned to physical shard {}",
-            partition, target_physical_shard
-        )));
-    }
-    assignments[slot] = target_physical_shard;
-    ShardingConfig::hash(
-        current.virtual_partition_count,
-        current.hash_algorithm,
-        ShardMapRevision::new(current.shard_map_revision.get().saturating_add(1)),
-        assignments,
+fn chat_rooms_shard_execution_profile() -> ShardExecutionDomainProfile {
+    ShardExecutionDomainProfile::new(
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(2),
+                weight: None,
+            },
+            ..ExecutionDomainBudget::default()
+        },
+        ExecutionDomainBudget {
+            background: DomainBackgroundBudget {
+                task_slots: Some(2),
+                max_in_flight_bytes: Some(64 * 1024),
+            },
+            ..ExecutionDomainBudget::default()
+        },
+        ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(1),
+                weight: None,
+            },
+            background: DomainBackgroundBudget {
+                task_slots: Some(1),
+                max_in_flight_bytes: Some(16 * 1024),
+            },
+            ..ExecutionDomainBudget::default()
+        },
     )
-    .map_err(|error| ChatRoomsAppError::InvalidConfig(error.to_string()))
+    .with_metadata("terracedb.example", "chat-rooms-api")
+}
+
+fn map_record_transaction_error(
+    error: RecordTransactionRunError<ChatRoomsAppError>,
+) -> ChatRoomsAppError {
+    match error {
+        RecordTransactionRunError::Callback(error) => error,
+        RecordTransactionRunError::Commit(error) => error.into(),
+    }
+}
+
+fn map_keyspace_error(error: RecordKeyspaceError) -> ChatRoomsAppError {
+    match error {
+        RecordKeyspaceError::Storage(error) => error.into(),
+        RecordKeyspaceError::Codec(error) => error.into(),
+        RecordKeyspaceError::IncompatibleMember { .. } => {
+            ChatRoomsAppError::InvalidConfig(error.to_string())
+        }
+        RecordKeyspaceError::MisalignedRouting { .. } => {
+            ChatRoomsAppError::Conflict(error.to_string())
+        }
+    }
+}
+
+fn map_room_keyspace_error(room_id: &str, error: RecordKeyspaceError) -> ChatRoomsAppError {
+    match error {
+        RecordKeyspaceError::MisalignedRouting { .. } => ChatRoomsAppError::Conflict(format!(
+            "room '{room_id}' is temporarily unavailable while shard maps converge"
+        )),
+        other => map_keyspace_error(other),
+    }
+}
+
+fn map_keyspace_reshard_error(error: RecordKeyspaceReshardError) -> ChatRoomsAppError {
+    match error {
+        RecordKeyspaceReshardError::Keyspace(error) => map_keyspace_error(error),
+        RecordKeyspaceReshardError::Publish(error) => map_publish_shard_error(error),
+        RecordKeyspaceReshardError::Plan(error) => error.into(),
+        RecordKeyspaceReshardError::PartialFailure { .. } => {
+            ChatRoomsAppError::Conflict(error.to_string())
+        }
+    }
+}
+
+fn map_publish_shard_error(error: PublishShardMapError) -> ChatRoomsAppError {
+    match error {
+        PublishShardMapError::Storage(error) => error.into(),
+        other => ChatRoomsAppError::Usage(other.to_string()),
+    }
+}
+
+fn map_sharding_error(_room_id: &str, error: ShardingError) -> ChatRoomsAppError {
+    match error {
+        ShardingError::PartitionAlreadyAssigned { physical_shard, .. } => ChatRoomsAppError::Usage(
+            format!("room is already on physical shard {physical_shard}"),
+        ),
+        other => ChatRoomsAppError::InvalidConfig(other.to_string()),
+    }
 }
 
 fn normalize_room_id(value: &str) -> Result<String, ChatRoomsAppError> {

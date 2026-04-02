@@ -15,10 +15,10 @@ use tokio::{sync::watch, task::JoinHandle};
 use tracing::{Instrument, instrument::WithSubscriber};
 
 use terracedb::{
-    ChangeEntry, ChangeFeedError, ChangeKind, CommitError, CommitOptions, CompactionStrategy,
-    CreateTableError, Db, KvStream, LogCursor, OperationContext, ReadError, ScanOptions,
-    SequenceNumber, Snapshot, SnapshotTooOld, SpanRelation, StorageError, SubscriptionClosed,
-    Table, TableConfig, TableFormat, Value, WriteBatch, set_span_attribute, telemetry_attrs,
+    ChangeEntry, ChangeFeedError, ChangeKind, CommitError, CommitOptions, CreateTableError, Db,
+    KvStream, LogCursor, OperationContext, ReadError, ScanOptions, SequenceNumber, Snapshot,
+    SnapshotTooOld, SpanRelation, StorageError, SubscriptionClosed, Table, TableConfig, Value,
+    WriteBatch, set_span_attribute, telemetry_attrs,
 };
 use terracedb_capabilities::{PolicyContext, VisibilityIndexSpec, VisibilityMembershipTransition};
 
@@ -2881,19 +2881,9 @@ async fn scan_whole_sequence_run(
 }
 
 fn projection_cursor_table_config() -> TableConfig {
-    TableConfig {
-        name: PROJECTION_CURSOR_TABLE_NAME.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(8),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: BTreeMap::new(),
-    }
+    TableConfig::row(PROJECTION_CURSOR_TABLE_NAME)
+        .bloom_filter_bits_per_key(Some(8))
+        .build()
 }
 
 fn projection_source_cursor_key(name: &str, source_name: &str) -> Vec<u8> {

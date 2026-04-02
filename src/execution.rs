@@ -985,6 +985,108 @@ impl ShardReadyPlacementLayout {
     }
 }
 
+/// Budget and metadata template used when activating shard-local execution lanes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardExecutionDomainProfile {
+    pub foreground_budget: ExecutionDomainBudget,
+    pub background_budget: ExecutionDomainBudget,
+    pub control_plane_budget: ExecutionDomainBudget,
+    pub foreground_placement: ExecutionDomainPlacement,
+    pub background_placement: ExecutionDomainPlacement,
+    pub control_plane_placement: ExecutionDomainPlacement,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl ShardExecutionDomainProfile {
+    pub fn new(
+        foreground_budget: ExecutionDomainBudget,
+        background_budget: ExecutionDomainBudget,
+        control_plane_budget: ExecutionDomainBudget,
+    ) -> Self {
+        Self {
+            foreground_budget,
+            background_budget,
+            control_plane_budget,
+            foreground_placement: ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+            background_placement: ExecutionDomainPlacement::SharedWeighted { weight: 1 },
+            control_plane_placement: ExecutionDomainPlacement::Dedicated,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn specs_for_shard(
+        &self,
+        layout: &ShardReadyPlacementLayout,
+        shard: PhysicalShardId,
+    ) -> [ExecutionDomainSpec; 3] {
+        let placement = shard.execution_placement(layout);
+        [
+            self.spec_for_lane(
+                placement.clone(),
+                ExecutionLane::UserForeground,
+                self.foreground_budget,
+                self.foreground_placement,
+            ),
+            self.spec_for_lane(
+                placement.clone(),
+                ExecutionLane::UserBackground,
+                self.background_budget,
+                self.background_placement,
+            ),
+            self.spec_for_lane(
+                placement,
+                ExecutionLane::ControlPlane,
+                self.control_plane_budget,
+                self.control_plane_placement,
+            ),
+        ]
+    }
+
+    fn spec_for_lane(
+        &self,
+        placement: crate::ShardExecutionPlacement,
+        lane: ExecutionLane,
+        budget: ExecutionDomainBudget,
+        placement_mode: ExecutionDomainPlacement,
+    ) -> ExecutionDomainSpec {
+        let mut metadata = self.metadata.clone();
+        metadata.insert(
+            "terracedb.execution.layout".to_string(),
+            "shard-local".to_string(),
+        );
+        metadata.insert(
+            "terracedb.execution.physical_shard".to_string(),
+            placement.physical_shard.to_string(),
+        );
+        metadata.insert(
+            "terracedb.execution.lane".to_string(),
+            match lane {
+                ExecutionLane::UserForeground => "foreground",
+                ExecutionLane::UserBackground => "background",
+                ExecutionLane::ControlPlane => "control",
+            }
+            .to_string(),
+        );
+        let path = match lane {
+            ExecutionLane::UserForeground => placement.foreground,
+            ExecutionLane::UserBackground => placement.background,
+            ExecutionLane::ControlPlane => placement.control_plane,
+        };
+        ExecutionDomainSpec {
+            path,
+            owner: placement.owner,
+            budget,
+            placement: placement_mode,
+            metadata,
+        }
+    }
+}
+
 impl ColocatedDatabasePlacement {
     /// Builds a placement recipe from explicit lane configs.
     pub fn new(
@@ -1041,6 +1143,9 @@ impl ColocatedDatabasePlacement {
     }
 
     /// Returns a profile whose naming scheme leaves room for future shard paths.
+    ///
+    /// Use [`crate::Db::register_shard_execution_domains`] to activate shard-local
+    /// execution lanes against this layout.
     pub fn shard_ready(name: impl Into<String>) -> Self {
         let layout = ShardReadyPlacementLayout::new(name.into());
         let mut placement = Self::new(
@@ -1380,6 +1485,9 @@ impl ColocatedDeployment {
     }
 
     /// Convenience helper for the shard-ready single-database layout.
+    ///
+    /// This reserves canonical database and future-shard paths but does not
+    /// automatically provision shard-local domains.
     pub fn shard_ready(
         process_budget: ExecutionDomainBudget,
         name: impl Into<String>,
@@ -1935,7 +2043,8 @@ impl fmt::Debug for ExecutionUsageLease {
 /// RAII guard for temporarily overriding direct backlog on a domain.
 ///
 /// Prefer [`crate::Db::set_lane_backlog`] or [`crate::Db::with_lane_backlog`]
-/// in application code.
+/// in application code. For long-lived publications that are rebuilt over
+/// time, prefer [`ExecutionBacklogPublisher`].
 #[must_use = "backlog is restored when the guard is dropped"]
 pub struct ExecutionBacklogGuard {
     manager: Arc<dyn ResourceManager>,
@@ -2008,6 +2117,91 @@ impl fmt::Debug for ExecutionBacklogGuard {
             .field("previous", &self.previous)
             .field("current", &self.current)
             .field("restored", &self.restored)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExecutionBacklogPublication(u64);
+
+#[derive(Debug, Default)]
+struct ExecutionBacklogPublisherState {
+    next_publication: u64,
+    published: u64,
+    active: BTreeMap<ExecutionDomainPath, ExecutionDomainBacklogSnapshot>,
+}
+
+/// Durable publisher for direct backlog observations.
+///
+/// Unlike [`ExecutionBacklogGuard`], this type is intended for longer-lived
+/// publications that are rebuilt over time. Call [`Self::begin_replace`] before
+/// starting a rebuild, then finish with [`Self::replace_all_at`] so older scans
+/// cannot overwrite newer observations.
+#[derive(Clone)]
+pub struct ExecutionBacklogPublisher {
+    manager: Arc<dyn ResourceManager>,
+    state: Arc<Mutex<ExecutionBacklogPublisherState>>,
+}
+
+impl ExecutionBacklogPublisher {
+    pub fn new(manager: Arc<dyn ResourceManager>) -> Self {
+        Self {
+            manager,
+            state: Arc::new(Mutex::new(ExecutionBacklogPublisherState::default())),
+        }
+    }
+
+    /// Reserves a monotonic publication slot for one rebuild attempt.
+    pub fn begin_replace(&self) -> ExecutionBacklogPublication {
+        let mut state = self.state.lock();
+        state.next_publication = state.next_publication.saturating_add(1);
+        ExecutionBacklogPublication(state.next_publication)
+    }
+
+    /// Replaces all active direct backlog using a previously reserved publication slot.
+    ///
+    /// Returns `true` when the publication was applied. Older reserved publications
+    /// are ignored and return `false`.
+    pub fn replace_all_at<I>(&self, publication: ExecutionBacklogPublication, entries: I) -> bool
+    where
+        I: IntoIterator<Item = (ExecutionDomainPath, ExecutionDomainBacklogSnapshot)>,
+    {
+        let next = entries
+            .into_iter()
+            .filter(|(_path, backlog)| backlog.is_non_zero())
+            .collect::<BTreeMap<_, _>>();
+        let mut state = self.state.lock();
+        if publication.0 < state.published {
+            return false;
+        }
+
+        for path in state.active.keys().cloned().collect::<Vec<_>>() {
+            if !next.contains_key(&path) {
+                self.manager
+                    .set_backlog(&path, ExecutionDomainBacklogSnapshot::default());
+            }
+        }
+        for (path, backlog) in &next {
+            self.manager.set_backlog(path, *backlog);
+        }
+
+        state.published = publication.0;
+        state.active = next;
+        true
+    }
+
+    pub fn clear(&self) {
+        let publication = self.begin_replace();
+        let _ = self.replace_all_at(publication, std::iter::empty());
+    }
+}
+
+impl fmt::Debug for ExecutionBacklogPublisher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("ExecutionBacklogPublisher")
+            .field("published", &state.published)
+            .field("active_paths", &state.active.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -3075,5 +3269,65 @@ mod tests {
             .expect("resource manager snapshot");
         assert_eq!(published.domains[&path].backlog, backlog);
         assert_eq!(published, manager.snapshot());
+    }
+
+    #[test]
+    fn backlog_publisher_ignores_stale_publications() {
+        let manager = Arc::new(InMemoryResourceManager::default());
+        let root = ExecutionDomainPath::root("process");
+        let stale_path = root.child("stale");
+        let fresh_path = root.child("fresh");
+        for path in [&stale_path, &fresh_path] {
+            ResourceManager::register_domain(
+                manager.as_ref(),
+                ExecutionDomainSpec {
+                    path: path.clone(),
+                    owner: ExecutionDomainOwner::Database {
+                        name: "db".to_string(),
+                    },
+                    budget: ExecutionDomainBudget::default(),
+                    placement: ExecutionDomainPlacement::default(),
+                    metadata: BTreeMap::new(),
+                },
+            );
+        }
+
+        let publisher = ExecutionBacklogPublisher::new(manager.clone());
+        let stale = publisher.begin_replace();
+        let fresh = publisher.begin_replace();
+
+        assert!(publisher.replace_all_at(
+            fresh,
+            [(
+                fresh_path.clone(),
+                ExecutionDomainBacklogSnapshot {
+                    queued_work_items: 7,
+                    queued_bytes: 700,
+                },
+            )],
+        ));
+        assert!(!publisher.replace_all_at(
+            stale,
+            [(
+                stale_path.clone(),
+                ExecutionDomainBacklogSnapshot {
+                    queued_work_items: 1,
+                    queued_bytes: 10,
+                },
+            )],
+        ));
+
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.domains[&fresh_path].backlog,
+            ExecutionDomainBacklogSnapshot {
+                queued_work_items: 7,
+                queued_bytes: 700,
+            }
+        );
+        assert_eq!(
+            snapshot.domains[&stale_path].backlog,
+            ExecutionDomainBacklogSnapshot::default()
+        );
     }
 }

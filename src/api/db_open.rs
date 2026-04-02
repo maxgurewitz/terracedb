@@ -603,15 +603,18 @@ impl Db {
     }
 
     pub(super) fn same_persisted_table_config(left: &TableConfig, right: &TableConfig) -> bool {
-        left.name == right.name
-            && left.format == right.format
-            && left.max_merge_operand_chain_length == right.max_merge_operand_chain_length
-            && left.bloom_filter_bits_per_key == right.bloom_filter_bits_per_key
-            && left.history_retention_sequences == right.history_retention_sequences
-            && left.compaction_strategy == right.compaction_strategy
-            && left.schema == right.schema
-            && left.sharding == right.sharding
-            && left.metadata == right.metadata
+        left.persisted_definition_matches(right)
+    }
+
+    pub(super) fn describe_persisted_table_config_difference(
+        existing: &TableConfig,
+        requested: &TableConfig,
+    ) -> String {
+        let mismatches = existing.persisted_definition_mismatches(requested);
+        if mismatches.is_empty() {
+            return "the requested persisted definition matches the existing table".to_string();
+        }
+        format!("persisted fields differ: {}", mismatches.join(", "))
     }
 
     pub(super) fn normalize_value_for_table(
@@ -733,6 +736,12 @@ impl Db {
                 CreateTableError::InvalidConfig(message) => {
                     OpenError::Storage(StorageError::corruption(message))
                 }
+                CreateTableError::DefinitionMismatch {
+                    table_name,
+                    details,
+                } => OpenError::Storage(StorageError::corruption(format!(
+                    "catalog contains mismatched table definition for {table_name}: {details}"
+                ))),
                 CreateTableError::Storage(error) => OpenError::Storage(error),
                 CreateTableError::AlreadyExists(_) | CreateTableError::Unimplemented(_) => {
                     OpenError::Storage(StorageError::corruption(
