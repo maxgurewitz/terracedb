@@ -2526,6 +2526,7 @@ dependencies = [
  "serde_json",
  "terracedb",
  "terracedb-capabilities",
+ "terracedb-git",
  "terracedb-sandbox",
  "terracedb-simulation",
  "terracedb-vfs",
