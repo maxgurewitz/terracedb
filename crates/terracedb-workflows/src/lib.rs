@@ -38,6 +38,10 @@ pub use run_model::{
 };
 pub use terracedb_workflows_core as contracts;
 pub use terracedb_workflows_sandbox as sandbox_contracts;
+use transition_engine::{
+    WorkflowEffectIntent, WorkflowExecutionSnapshot, WorkflowTransitionEngine,
+    WorkflowTransitionProposal,
+};
 
 pub const DEFAULT_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const DEFAULT_SOURCE_BATCH_LIMIT: usize = 128;
@@ -1309,6 +1313,12 @@ pub struct WorkflowRuntimeTask {
     pub admitted_at_millis: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkflowRuntimePlan {
+    pub input: contracts::WorkflowTransitionInput,
+    pub proposal: WorkflowTransitionProposal,
+}
+
 #[async_trait]
 pub trait WorkflowRuntimeHandler: Send + Sync {
     async fn route_event(&self, entry: &ChangeEntry) -> Result<String, WorkflowHandlerError>;
@@ -1326,6 +1336,34 @@ pub trait WorkflowRuntimeHandler: Send + Sync {
         state: Option<Value>,
         trigger: &WorkflowTrigger,
     ) -> Result<WorkflowOutput, WorkflowHandlerError>;
+
+    async fn plan_runtime_task(
+        &self,
+        task: &WorkflowRuntimeTask,
+        current_state: Option<&contracts::WorkflowStateRecord>,
+        trigger: &WorkflowTrigger,
+    ) -> Result<WorkflowRuntimePlan, WorkflowHandlerError> {
+        let state = current_state
+            .map(workflow_state_record_state_to_runtime_value)
+            .transpose()
+            .map_err(WorkflowHandlerError::new)?
+            .flatten();
+        let input = build_transition_input(
+            &task.workflow_name,
+            &task.instance_id,
+            task.trigger_seq,
+            task.admitted_at_millis,
+            current_state,
+            &default_native_bundle_id(&task.workflow_name),
+            trigger,
+        )
+        .map_err(WorkflowHandlerError::new)?;
+        let output = self.handle_runtime_task(task, state, trigger).await?;
+        let proposal = WorkflowTransitionProposal::new(
+            workflow_output_to_transition_output(output).map_err(WorkflowHandlerError::new)?,
+        );
+        Ok(WorkflowRuntimePlan { input, proposal })
+    }
 }
 
 #[async_trait]
@@ -1424,10 +1462,10 @@ where
     async fn handle_runtime_task(
         &self,
         task: &WorkflowRuntimeTask,
-        state: Option<Value>,
+        _state: Option<Value>,
         trigger: &WorkflowTrigger,
     ) -> Result<WorkflowOutput, WorkflowHandlerError> {
-        let input = build_contract_transition_input(task, &self.bundle, state.as_ref(), trigger)
+        let input = build_contract_transition_input(task, &self.bundle, None, trigger)
             .map_err(WorkflowHandlerError::new)?;
         let ctx = contracts::WorkflowDeterministicContext::new(
             &input,
@@ -1442,6 +1480,32 @@ where
             .await
             .map_err(WorkflowHandlerError::new)?;
         contract_output_to_runtime_output(output).map_err(WorkflowHandlerError::new)
+    }
+
+    async fn plan_runtime_task(
+        &self,
+        task: &WorkflowRuntimeTask,
+        current_state: Option<&contracts::WorkflowStateRecord>,
+        trigger: &WorkflowTrigger,
+    ) -> Result<WorkflowRuntimePlan, WorkflowHandlerError> {
+        let input = build_contract_transition_input(task, &self.bundle, current_state, trigger)
+            .map_err(WorkflowHandlerError::new)?;
+        let ctx = contracts::WorkflowDeterministicContext::new(
+            &input,
+            Arc::new(TracingWorkflowObservability {
+                span: tracing::Span::current(),
+            }),
+        )
+        .map_err(WorkflowHandlerError::new)?;
+        let output = self
+            .inner
+            .handle_task(input.clone(), ctx)
+            .await
+            .map_err(WorkflowHandlerError::new)?;
+        Ok(WorkflowRuntimePlan {
+            input,
+            proposal: WorkflowTransitionProposal::new(output),
+        })
     }
 
     async fn validate_runtime_tables(
@@ -1812,6 +1876,7 @@ struct WorkflowRuntimeInner<H> {
     sources: Vec<WorkflowSource>,
     handler: Arc<H>,
     scheduler: Arc<dyn WorkflowScheduler>,
+    transition_engine: WorkflowTransitionEngine,
     reducer: WorkflowTransitionReducer,
     tables: WorkflowTables,
     checkpoint_store: Option<Arc<dyn WorkflowCheckpointStore>>,
@@ -1864,6 +1929,7 @@ where
                     sources: definition.sources,
                     handler: Arc::new(definition.handler),
                     scheduler,
+                    transition_engine: WorkflowTransitionEngine::default(),
                     reducer: WorkflowTransitionReducer::default(),
                     checkpoint_store: definition.checkpoint_store,
                     tables,
@@ -3886,52 +3952,57 @@ where
         let processing_state_record = current_state_record
             .as_ref()
             .filter(|record| !workflow_lifecycle_is_terminal(record.lifecycle));
-        let current_state = processing_state_record
-            .as_ref()
-            .map(|state| workflow_state_record_state_to_runtime_value(state))
-            .transpose()?
-            .flatten();
         let task = WorkflowRuntimeTask {
             workflow_name: runtime.name.clone(),
             instance_id: instance_id.to_string(),
             trigger_seq,
             admitted_at_millis,
         };
-        let runtime_output = runtime
+        let runtime_plan = runtime
             .handler
-            .handle_runtime_task(&task, current_state, &trigger)
+            .plan_runtime_task(&task, processing_state_record, &trigger)
             .await
             .map_err(|source| WorkflowError::Handler {
                 name: runtime.name.clone(),
                 source,
             })?;
-        let transition_input = build_transition_input(
-            &runtime.name,
-            instance_id,
-            trigger_seq,
-            admitted_at_millis,
-            processing_state_record,
-            &trigger,
-        )?;
-        let transition_output = workflow_output_to_transition_output(runtime_output)?;
+        if !runtime_plan.proposal.directives.is_empty() {
+            return Err(WorkflowError::Handler {
+                name: runtime.name.clone(),
+                source: WorkflowHandlerError::new(std::io::Error::other(
+                    "workflow executor directives are not yet supported by this runtime loop",
+                )),
+            });
+        }
         let committed_at_millis = runtime.clock.now().get();
+        let execution_snapshot =
+            synthesize_execution_snapshot(processing_state_record, &runtime_plan.input);
+        let transition_plan = runtime
+            .transition_engine
+            .plan_transition(
+                &execution_snapshot,
+                runtime_plan.input.clone(),
+                runtime_plan.proposal.clone(),
+                committed_at_millis,
+            )
+            .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?;
         let reduction = runtime
             .reducer
             .reduce(
                 processing_state_record,
-                &transition_input,
-                &transition_output,
+                &runtime_plan.input,
+                &runtime_plan.proposal.output,
                 committed_at_millis,
             )
             .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?;
 
         tx.delete(runtime.tables.inbox_table(), inbox_key);
         stage_reduction_plan_in_transaction(runtime, &mut tx, instance_id, reduction)?;
-        stage_workflow_commands_in_transaction(
+        stage_workflow_effect_intents_in_transaction(
             runtime,
             &mut tx,
             instance_id,
-            &transition_output,
+            &transition_plan.effect_intents,
             operation_context.clone(),
         )
         .await?;
@@ -5152,17 +5223,17 @@ fn build_transition_input(
     trigger_seq: u64,
     admitted_at_millis: u64,
     current_state: Option<&contracts::WorkflowStateRecord>,
+    bundle_id: &contracts::WorkflowBundleId,
     trigger: &WorkflowTrigger,
 ) -> Result<contracts::WorkflowTransitionInput, WorkflowError> {
     let run_id = current_state
         .map(|state| state.run_id.clone())
         .unwrap_or_else(|| workflow_run_id_for_admission(workflow_name, instance_id, trigger_seq));
-    let bundle_id = current_state
-        .map(|state| state.bundle_id.clone())
-        .unwrap_or_else(|| default_native_bundle_id(workflow_name));
     Ok(contracts::WorkflowTransitionInput {
         run_id,
-        bundle_id,
+        bundle_id: current_state
+            .map(|state| state.bundle_id.clone())
+            .unwrap_or_else(|| bundle_id.clone()),
         task_id: default_task_id(instance_id, trigger_seq),
         workflow_name: workflow_name.to_string(),
         instance_id: instance_id.to_string(),
@@ -5175,6 +5246,28 @@ fn build_transition_input(
         state: current_state.and_then(|state| state.state.clone()),
         trigger: runtime_trigger_to_transition_trigger(trigger)?,
     })
+}
+
+fn synthesize_execution_snapshot(
+    current_state: Option<&contracts::WorkflowStateRecord>,
+    input: &contracts::WorkflowTransitionInput,
+) -> WorkflowExecutionSnapshot {
+    current_state.map_or_else(
+        || {
+            WorkflowExecutionSnapshot::new(contracts::WorkflowStateRecord {
+                run_id: input.run_id.clone(),
+                bundle_id: input.bundle_id.clone(),
+                workflow_name: input.workflow_name.clone(),
+                instance_id: input.instance_id.clone(),
+                lifecycle: input.lifecycle,
+                current_task_id: None,
+                history_len: input.history_len,
+                state: input.state.clone(),
+                updated_at_millis: input.admitted_at_millis,
+            })
+        },
+        |state| WorkflowExecutionSnapshot::new(state.clone()),
+    )
 }
 
 fn workflow_output_to_transition_output(
@@ -5453,19 +5546,19 @@ where
     Ok(())
 }
 
-async fn stage_workflow_commands_in_transaction<H>(
+async fn stage_workflow_effect_intents_in_transaction<H>(
     runtime: &WorkflowRuntimeInner<H>,
     tx: &mut Transaction,
     instance_id: &str,
-    output: &contracts::WorkflowTransitionOutput,
+    effect_intents: &[WorkflowEffectIntent],
     operation_context: Option<OperationContext>,
 ) -> Result<(), WorkflowError>
 where
     H: WorkflowRuntimeHandler + 'static,
 {
-    for command in &output.commands {
-        match command {
-            contracts::WorkflowCommand::Outbox { entry } => {
+    for effect_intent in effect_intents {
+        match effect_intent {
+            WorkflowEffectIntent::Outbox { entry } => {
                 runtime.tables.outbox.stage_entry_in_transaction(
                     tx,
                     OutboxEntry {
@@ -5475,34 +5568,32 @@ where
                     },
                 )?
             }
-            contracts::WorkflowCommand::Timer { command } => match command {
-                contracts::WorkflowTimerCommand::Schedule {
-                    timer_id,
-                    fire_at_millis,
-                    payload,
-                } => runtime.tables.timers.stage_schedule_in_transaction(
-                    tx,
-                    ScheduledTimer {
-                        timer_id: timer_id.clone(),
-                        fire_at: Timestamp::new(*fire_at_millis),
-                        payload: encode_payload(
-                            &StoredWorkflowTimer {
-                                workflow_instance: instance_id.to_string(),
-                                payload: payload.clone(),
-                                operation_context: operation_context.clone(),
-                            },
-                            "workflow timer payload",
-                        )?,
-                    },
-                )?,
-                contracts::WorkflowTimerCommand::Cancel { timer_id } => {
-                    runtime
-                        .tables
-                        .timers
-                        .cancel_in_transaction(tx, timer_id.clone())
-                        .await?;
-                }
-            },
+            WorkflowEffectIntent::ScheduleTimer {
+                timer_id,
+                fire_at_millis,
+                payload,
+            } => runtime.tables.timers.stage_schedule_in_transaction(
+                tx,
+                ScheduledTimer {
+                    timer_id: timer_id.clone(),
+                    fire_at: Timestamp::new(*fire_at_millis),
+                    payload: encode_payload(
+                        &StoredWorkflowTimer {
+                            workflow_instance: instance_id.to_string(),
+                            payload: payload.clone(),
+                            operation_context: operation_context.clone(),
+                        },
+                        "workflow timer payload",
+                    )?,
+                },
+            )?,
+            WorkflowEffectIntent::CancelTimer { timer_id } => {
+                runtime
+                    .tables
+                    .timers
+                    .cancel_in_transaction(tx, timer_id.clone())
+                    .await?;
+            }
         }
     }
     Ok(())
@@ -5800,7 +5891,7 @@ fn decode_admitted_trigger(
 fn build_contract_transition_input(
     task: &WorkflowRuntimeTask,
     bundle: &contracts::WorkflowBundleMetadata,
-    state: Option<&Value>,
+    current_state: Option<&contracts::WorkflowStateRecord>,
     trigger: &WorkflowTrigger,
 ) -> Result<contracts::WorkflowTransitionInput, contracts::WorkflowTaskError> {
     if task.workflow_name != bundle.workflow_name {
@@ -5811,22 +5902,27 @@ fn build_contract_transition_input(
     }
 
     Ok(contracts::WorkflowTransitionInput {
-        run_id: contracts::WorkflowRunId::new(format!(
-            "run:{}:{}",
-            task.workflow_name, task.instance_id
-        ))?,
-        bundle_id: bundle.bundle_id.clone(),
+        run_id: current_state
+            .map(|state| state.run_id.clone())
+            .unwrap_or_else(|| {
+                default_run_id(&task.workflow_name, &task.instance_id, task.trigger_seq)
+            }),
+        bundle_id: current_state
+            .map(|state| state.bundle_id.clone())
+            .unwrap_or_else(|| bundle.bundle_id.clone()),
         task_id: contracts::WorkflowTaskId::new(format!(
             "task:{}:{:020}",
             task.instance_id, task.trigger_seq
         ))?,
         workflow_name: task.workflow_name.clone(),
         instance_id: task.instance_id.clone(),
-        lifecycle: contracts::WorkflowLifecycleState::Running,
-        history_len: task.trigger_seq.saturating_sub(1),
+        lifecycle: current_state
+            .map(|state| state.lifecycle)
+            .unwrap_or(contracts::WorkflowLifecycleState::Scheduled),
+        history_len: current_state.map(|state| state.history_len).unwrap_or(0),
         attempt: 1,
         admitted_at_millis: task.admitted_at_millis,
-        state: state.map(runtime_value_to_contract_payload).transpose()?,
+        state: current_state.and_then(|state| state.state.clone()),
         trigger: runtime_trigger_to_contract_trigger(trigger)?,
     })
 }

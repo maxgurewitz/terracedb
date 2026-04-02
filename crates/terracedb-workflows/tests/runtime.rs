@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    error::Error as StdError,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -43,6 +44,7 @@ use terracedb_workflows::{
         self, WorkflowHistoryEvent, WorkflowLifecycleRecord, WorkflowLifecycleState,
         WorkflowPayload, WorkflowRunId, WorkflowStateRecord, WorkflowVisibilityRecord,
     },
+    default_run_id,
     failpoints::names as workflow_failpoint_names,
     sandbox_contracts::SandboxModuleWorkflowTaskV1Handler,
 };
@@ -82,6 +84,40 @@ fn decode_count(value: Option<Value>) -> usize {
             .parse()
             .expect("state should encode a count"),
         Some(Value::Record(_)) => panic!("tests only expect byte state"),
+    }
+}
+
+fn assert_unsupported_encoding_workflow_error(error: WorkflowError) {
+    let expected = "workflow state encoding application/x.terracedb-workflow-state is unsupported";
+    match error {
+        WorkflowError::Storage(storage) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage.to_string().contains(expected),
+                "expected unsupported-encoding corruption, got {storage}",
+            );
+        }
+        WorkflowError::Handler { source, .. } => {
+            let inner = StdError::source(&source).unwrap_or_else(|| {
+                panic!("expected handler-wrapped workflow error, got {source:?}")
+            });
+            let storage = if let Some(storage) = inner.downcast_ref::<StorageError>() {
+                storage
+            } else if let Some(workflow) = inner.downcast_ref::<WorkflowError>() {
+                match workflow {
+                    WorkflowError::Storage(storage) => storage,
+                    other => panic!("expected handler-wrapped storage corruption, got {other:?}"),
+                }
+            } else {
+                panic!("expected handler-wrapped storage corruption, got {source:?}");
+            };
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage.to_string().contains(expected),
+                "expected unsupported-encoding corruption, got {storage}",
+            );
+        }
+        other => panic!("expected workflow corruption from unsupported encoding, got {other:?}"),
     }
 }
 
@@ -419,6 +455,17 @@ impl WorkflowHandler for BlockingResumeHandler {
 struct ContractParityLogic;
 
 impl ContractParityLogic {
+    fn next_sequence(&self, input: &contracts::WorkflowTransitionInput) -> u64 {
+        input
+            .state
+            .as_ref()
+            .and_then(|payload| std::str::from_utf8(&payload.bytes).ok())
+            .and_then(|value| value.rsplit(':').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value + 1)
+            .unwrap_or(1)
+    }
+
     fn route(&self, event: &contracts::WorkflowSourceEvent) -> String {
         String::from_utf8_lossy(&event.key)
             .split_once(':')
@@ -431,7 +478,7 @@ impl ContractParityLogic {
         &self,
         input: &contracts::WorkflowTransitionInput,
     ) -> contracts::WorkflowTransitionOutput {
-        let sequence = input.history_len.saturating_add(1);
+        let sequence = self.next_sequence(input);
         let id = format!("{}:{sequence}", input.instance_id);
         let payload = match &input.trigger {
             contracts::WorkflowTrigger::Event { event } => event.key.clone(),
@@ -482,9 +529,60 @@ impl contracts::WorkflowHandlerContract for NativeContractHandler {
     }
 }
 
+#[derive(Debug)]
+struct ContinueAsNewContractHandler;
+
+#[async_trait]
+impl contracts::WorkflowHandlerContract for ContinueAsNewContractHandler {
+    async fn route_event(
+        &self,
+        _event: &contracts::WorkflowSourceEvent,
+    ) -> Result<String, contracts::WorkflowTaskError> {
+        Err(contracts::WorkflowTaskError::invalid_contract(
+            "continue-as-new test only admits callbacks",
+        ))
+    }
+
+    async fn handle_task(
+        &self,
+        input: contracts::WorkflowTransitionInput,
+        _ctx: contracts::WorkflowDeterministicContext,
+    ) -> Result<contracts::WorkflowTransitionOutput, contracts::WorkflowTaskError> {
+        let next_run_id = WorkflowRunId::new(format!(
+            "run:{}:{}:next",
+            input.workflow_name, input.instance_id
+        ))?;
+        let next_bundle_id =
+            contracts::WorkflowBundleId::new("bundle:native-contract-next".to_string())?;
+        Ok(contracts::WorkflowTransitionOutput {
+            state: contracts::WorkflowStateMutation::Put {
+                state: contracts::WorkflowPayload::bytes("handoff-complete"),
+            },
+            lifecycle: Some(contracts::WorkflowLifecycleState::Running),
+            visibility: Some(contracts::WorkflowVisibilityUpdate {
+                summary: BTreeMap::from([("phase".to_string(), "handoff".to_string())]),
+                note: Some("continued".to_string()),
+            }),
+            continue_as_new: Some(contracts::WorkflowContinueAsNew {
+                next_run_id,
+                next_bundle_id,
+                state: Some(contracts::WorkflowPayload::bytes("seeded-next")),
+            }),
+            commands: vec![contracts::WorkflowCommand::Outbox {
+                entry: contracts::WorkflowOutboxCommand {
+                    outbox_id: b"acct-7:handoff".to_vec(),
+                    idempotency_key: "acct-7:handoff".to_string(),
+                    payload: b"handoff".to_vec(),
+                },
+            }],
+        })
+    }
+}
+
 fn contract_bundle(module: &str) -> contracts::WorkflowBundleMetadata {
     contracts::WorkflowBundleMetadata {
-        bundle_id: contracts::WorkflowBundleId::new(format!("bundle:{module}")).expect("bundle id"),
+        bundle_id: contracts::WorkflowBundleId::new("bundle:contract-billing-v1")
+            .expect("bundle id"),
         workflow_name: "contract-billing".to_string(),
         kind: contracts::WorkflowBundleKind::Sandbox {
             abi: terracedb_workflows::sandbox_contracts::WORKFLOW_TASK_V1_ABI.to_string(),
@@ -501,7 +599,8 @@ fn contract_bundle(module: &str) -> contracts::WorkflowBundleMetadata {
 
 fn native_contract_bundle() -> contracts::WorkflowBundleMetadata {
     contracts::WorkflowBundleMetadata {
-        bundle_id: contracts::WorkflowBundleId::new("bundle:native-contract").expect("bundle id"),
+        bundle_id: contracts::WorkflowBundleId::new("bundle:contract-billing-v1")
+            .expect("bundle id"),
         workflow_name: "contract-billing".to_string(),
         kind: contracts::WorkflowBundleKind::NativeRust {
             registration: "tests/native-contract".to_string(),
@@ -640,6 +739,17 @@ where
 const CONTRACT_PARITY_SANDBOX_MODULE: &str = r#"
 const bytes = (value) => Array.from(value).map((char) => char.charCodeAt(0));
 const keyToInstance = (key) => String.fromCharCode(...key).split(":")[0];
+const decodeBytes = (payload) => String.fromCharCode(...payload.bytes);
+
+function nextSequence(input) {
+  if (!input.state) {
+    return 1;
+  }
+
+  const current = decodeBytes(input.state).split(":").pop();
+  const parsed = Number.parseInt(current ?? "0", 10);
+  return Number.isFinite(parsed) ? parsed + 1 : 1;
+}
 
 function payloadFromTrigger(trigger) {
   switch (trigger.kind) {
@@ -663,7 +773,7 @@ export default {
   },
 
   async handleTaskV1(request) {
-    const sequence = request.input.history_len + 1;
+    const sequence = nextSequence(request.input);
     const id = `${request.input.instance_id}:${sequence}`;
     return {
       abi: request.abi,
@@ -1041,18 +1151,7 @@ async fn workflow_state_load_and_processing_fail_closed_on_unknown_payload_encod
         .load_state("order-1")
         .await
         .expect_err("load_state should fail closed on unsupported payload encoding");
-    match load_error {
-        WorkflowError::Storage(storage) => {
-            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
-            assert!(
-                storage.to_string().contains(
-                    "workflow state encoding application/x.terracedb-workflow-state is unsupported"
-                ),
-                "expected unsupported-encoding corruption, got {storage}",
-            );
-        }
-        other => panic!("expected workflow corruption from unsupported encoding, got {other:?}"),
-    }
+    assert_unsupported_encoding_workflow_error(load_error);
 
     let mut handle = runtime.start().await.expect("restart workflow runtime");
     runtime
@@ -1068,18 +1167,7 @@ async fn workflow_state_load_and_processing_fail_closed_on_unknown_payload_encod
         .shutdown()
         .await
         .expect_err("workflow runtime should fail closed on unsupported payload encoding");
-    match error {
-        WorkflowError::Storage(storage) => {
-            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
-            assert!(
-                storage.to_string().contains(
-                    "workflow state encoding application/x.terracedb-workflow-state is unsupported"
-                ),
-                "expected unsupported-encoding corruption, got {storage}",
-            );
-        }
-        other => panic!("expected workflow corruption from unsupported encoding, got {other:?}"),
-    }
+    assert_unsupported_encoding_workflow_error(error);
 }
 
 #[tokio::test]
@@ -4950,6 +5038,169 @@ async fn contract_runtime_keeps_native_and_sandbox_handlers_in_parity() {
     .expect("drive sandbox contract runtime");
 
     assert_eq!(native_snapshot, sandbox_snapshot);
+}
+
+#[tokio::test]
+async fn contract_runtime_supports_visibility_updates_and_continue_as_new() {
+    let clock = Arc::new(StubClock::new(Timestamp::new(150)));
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let path = "/workflow-contract-continue-as-new";
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock.clone(),
+        WorkflowDefinition::new(
+            "contract-billing",
+            std::iter::empty::<Table>(),
+            ContractWorkflowHandler::new(native_contract_bundle(), ContinueAsNewContractHandler)
+                .expect("continue-as-new contract handler"),
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+    let handle = runtime.start().await.expect("start workflow runtime");
+
+    runtime
+        .admit_callback("acct-7", "cb-continue", b"handoff".to_vec())
+        .await
+        .expect("admit callback");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("seeded-next")),
+    )
+    .await
+    .expect("timed out waiting for continued run state")
+    .expect("wait for continued run state");
+
+    let current_state = runtime
+        .load_state_record("acct-7")
+        .await
+        .expect("load current state")
+        .expect("current state should exist");
+    let prior_run_id = default_run_id("contract-billing", "acct-7", 1);
+    let next_run_id = WorkflowRunId::new("run:contract-billing:acct-7:next").expect("next run id");
+
+    assert_eq!(current_state.run_id, next_run_id);
+    assert_eq!(
+        current_state.bundle_id,
+        contracts::WorkflowBundleId::new("bundle:native-contract-next").expect("next bundle id")
+    );
+    assert_eq!(current_state.lifecycle, WorkflowLifecycleState::Scheduled);
+    assert_eq!(
+        current_state.state,
+        Some(WorkflowPayload::bytes("seeded-next"))
+    );
+
+    let prior_visibility = runtime
+        .load_visibility_record(&prior_run_id)
+        .await
+        .expect("load prior visibility record")
+        .expect("prior visibility record should exist");
+    assert_eq!(
+        prior_visibility.summary.get("phase").map(String::as_str),
+        Some("handoff")
+    );
+
+    let next_run = runtime
+        .load_run_record(&next_run_id)
+        .await
+        .expect("load next run record")
+        .expect("next run record should exist");
+    assert_eq!(next_run.continued_from_run_id, Some(prior_run_id.clone()));
+
+    let history = runtime
+        .load_run_history(&prior_run_id)
+        .await
+        .expect("load prior run history");
+    assert!(history.iter().any(|record| {
+        matches!(
+            &record.event,
+            WorkflowHistoryEvent::ContinuedAsNew {
+                from_run_id,
+                next_run_id: recorded_next_run_id,
+                ..
+            } if from_run_id == &prior_run_id && recorded_next_run_id == &next_run_id
+        )
+    }));
+
+    assert!(
+        runtime
+            .tables()
+            .outbox_table()
+            .read(b"acct-7:handoff".to_vec())
+            .await
+            .expect("read handoff outbox")
+            .is_some()
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("timed out shutting down runtime")
+        .expect("shutdown runtime");
+
+    drop(runtime);
+
+    let reopened_db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("reopen db");
+    let reopened_runtime = WorkflowRuntime::open(
+        reopened_db,
+        clock,
+        WorkflowDefinition::new(
+            "contract-billing",
+            std::iter::empty::<Table>(),
+            ContractWorkflowHandler::new(native_contract_bundle(), ContinueAsNewContractHandler)
+                .expect("reopen continue-as-new contract handler"),
+        ),
+    )
+    .await
+    .expect("reopen workflow runtime");
+
+    let recovered_state = reopened_runtime
+        .load_state_record("acct-7")
+        .await
+        .expect("load recovered current state")
+        .expect("recovered current state should exist");
+    assert_eq!(recovered_state, current_state);
+
+    let recovered_visibility = reopened_runtime
+        .load_visibility_record(&prior_run_id)
+        .await
+        .expect("load recovered prior visibility record")
+        .expect("recovered prior visibility record should exist");
+    assert_eq!(recovered_visibility, prior_visibility);
+
+    let recovered_next_run = reopened_runtime
+        .load_run_record(&next_run_id)
+        .await
+        .expect("load recovered next run record")
+        .expect("recovered next run record should exist");
+    assert_eq!(recovered_next_run, next_run);
+
+    let recovered_history = reopened_runtime
+        .load_run_history(&prior_run_id)
+        .await
+        .expect("load recovered prior run history");
+    assert_eq!(recovered_history, history);
+
+    assert!(
+        reopened_runtime
+            .tables()
+            .outbox_table()
+            .read(b"acct-7:handoff".to_vec())
+            .await
+            .expect("read recovered handoff outbox")
+            .is_some()
+    );
 }
 
 #[tokio::test]
