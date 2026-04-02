@@ -19,6 +19,7 @@ members = [
     "examples/sandbox-notes",
     "examples/telemetry-api",
     "examples/todo-api",
+    "examples/workflow-duet",
     "crates/terracedb-records",
     "crates/terracedb-relays",
     "crates/terracedb-simulation",

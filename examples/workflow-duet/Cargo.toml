@@ -1,0 +1,21 @@
+[package]
+name = "terracedb-example-workflow-duet"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+terracedb = { path = "../.." }
+terracedb-sandbox = { path = "../../crates/terracedb-sandbox" }
+terracedb-vfs = { path = "../../crates/terracedb-vfs" }
+terracedb-workflows = { path = "../../crates/terracedb-workflows" }
+terracedb-workflows-sandbox = { path = "../../crates/terracedb-workflows-sandbox" }
+thiserror = "2.0.17"
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+terracedb-simulation = { path = "../../crates/terracedb-simulation" }
+turmoil = "0.7.1"

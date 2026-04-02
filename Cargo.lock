@@ -2553,6 +2553,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-example-workflow-duet"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "terracedb",
+ "terracedb-sandbox",
+ "terracedb-simulation",
+ "terracedb-vfs",
+ "terracedb-workflows",
+ "terracedb-workflows-sandbox",
+ "thiserror 2.0.18",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-fuzz"
 version = "0.1.0"
 dependencies = [
