@@ -226,12 +226,36 @@ pub enum GitStatusKind {
     Added,
     Deleted,
     Untracked,
+    Ignored,
+    Renamed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitStatusEntry {
     pub path: String,
     pub kind: GitStatusKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatusOptions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pathspec: Vec<String>,
+    #[serde(default = "git_status_include_untracked_default")]
+    pub include_untracked: bool,
+    #[serde(default)]
+    pub include_ignored: bool,
+}
+
+impl Default for GitStatusOptions {
+    fn default() -> Self {
+        Self {
+            pathspec: Vec::new(),
+            include_untracked: git_status_include_untracked_default(),
+            include_ignored: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,16 +264,92 @@ pub struct GitStatusReport {
     pub entries: Vec<GitStatusEntry>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitDiffKind {
+    Modified,
+    Added,
+    Deleted,
+    Untracked,
+    Ignored,
+    Renamed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitDiffEntry {
+    pub path: String,
+    pub kind: GitDiffKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_oid: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitDiffRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pathspec: Vec<String>,
+    #[serde(default = "git_status_include_untracked_default")]
+    pub include_untracked: bool,
+    #[serde(default)]
+    pub include_ignored: bool,
+}
+
+impl Default for GitDiffRequest {
+    fn default() -> Self {
+        Self {
+            pathspec: Vec::new(),
+            include_untracked: git_status_include_untracked_default(),
+            include_ignored: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitDiffReport {
+    pub dirty: bool,
+    pub entries: Vec<GitDiffEntry>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCheckoutRequest {
     pub target_ref: String,
     pub materialize_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pathspec: Vec<String>,
+    #[serde(default)]
+    pub update_head: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCheckoutReport {
     pub target_ref: String,
     pub materialized_path: String,
+    #[serde(default)]
+    pub written_paths: usize,
+    #[serde(default)]
+    pub deleted_paths: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRefUpdate {
+    pub name: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_target: Option<String>,
+    #[serde(default)]
+    pub symbolic: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRefUpdateReport {
+    pub reference: GitReference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_target: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -306,7 +406,10 @@ pub enum GitTracePhase {
     ReadHead,
     ReadRefs,
     ReadObject,
+    Status,
+    Diff,
     Checkout,
+    UpdateRef,
     Bridge,
 }
 
@@ -315,6 +418,10 @@ pub struct GitTraceEvent {
     pub phase: GitTracePhase,
     pub label: String,
     pub metadata: BTreeMap<String, JsonValue>,
+}
+
+const fn git_status_include_untracked_default() -> bool {
+    true
 }
 
 #[cfg(test)]

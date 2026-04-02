@@ -64,6 +64,9 @@ struct GitCheckoutCancellationCapture {
 }
 
 async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload: Vec<u8>) {
+    let blob_oid = blob_oid_for_commit(oid);
+    let tree_oid = tree_oid_for_commit(oid);
+    let source = source_bytes_for_commit(oid);
     volume
         .fs()
         .write_file(
@@ -93,7 +96,12 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
         .fs()
         .write_file(
             &format!("{root}/.git/objects/{oid}"),
-            [b"commit\n".as_slice(), payload.as_slice()].concat(),
+            [
+                b"commit\n".as_slice(),
+                format!("tree {tree_oid}\n").as_bytes(),
+                payload.as_slice(),
+            ]
+            .concat(),
             CreateOptions {
                 create_parents: true,
                 overwrite: true,
@@ -105,8 +113,34 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
     volume
         .fs()
         .write_file(
+            &format!("{root}/.git/objects/{blob_oid}"),
+            [b"blob\n".as_slice(), source.as_slice()].concat(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write blob object");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/objects/{tree_oid}"),
+            format!("tree\n100644 blob {blob_oid}\tsrc/lib.rs\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write tree object");
+    volume
+        .fs()
+        .write_file(
             &format!("{root}/src/lib.rs"),
-            format!("export const oid = \"{oid}\";\n").into_bytes(),
+            source,
             CreateOptions {
                 create_parents: true,
                 overwrite: true,
@@ -115,6 +149,18 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
         )
         .await
         .expect("write source file");
+}
+
+fn blob_oid_for_commit(oid: &str) -> String {
+    format!("{oid}-blob")
+}
+
+fn tree_oid_for_commit(oid: &str) -> String {
+    format!("{oid}-tree")
+}
+
+fn source_bytes_for_commit(oid: &str) -> Vec<u8> {
+    format!("export const oid = \"{oid}\";\n").into_bytes()
 }
 
 fn open_request(repository_id: &str, image: &dyn GitRepositoryImage) -> GitOpenRequest {
@@ -350,6 +396,9 @@ impl GitWorktreeMaterializer for SimulatedDelayMaterializer {
         Ok(terracedb_git::GitCheckoutReport {
             target_ref: request.target_ref,
             materialized_path: request.materialize_path,
+            written_paths: 0,
+            deleted_paths: 0,
+            head_oid: None,
         })
     }
 }
@@ -408,6 +457,8 @@ fn run_checkout_cancellation_simulation(
                         GitCheckoutRequest {
                             target_ref: "refs/heads/main".to_string(),
                             materialize_path: "/workspace".to_string(),
+                            pathspec: Vec::new(),
+                            update_head: false,
                         },
                         cancellation,
                     )
@@ -460,7 +511,10 @@ fn git_seeded_simulation_replays_snapshot_overlay_and_imported_images() -> turmo
         capture.outcome.ref_names,
         vec!["refs/heads/main".to_string()]
     );
-    assert_eq!(capture.outcome.imported_payload, b"overlay-6201\n".to_vec());
+    assert!(
+        String::from_utf8_lossy(&capture.outcome.imported_payload).ends_with("overlay-6201\n"),
+        "imported commit payload should preserve the overlay-specific commit body"
+    );
     Ok(())
 }
 

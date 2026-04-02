@@ -12,10 +12,11 @@ use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, Stub
 use terracedb_git::worktree::GitWorktreeMaterializer;
 use terracedb_git::{
     DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutReport, GitCheckoutRequest,
-    GitDiscoverRequest, GitExecutionHooks, GitForkPolicy, GitHeadState, GitIndexEntry,
-    GitIndexSnapshot, GitObject, GitObjectDatabase, GitOpenRequest, GitReference,
-    GitRepositoryHandle, GitRepositoryImage, GitRepositoryPolicy, GitRepositoryProvenance,
-    GitRepositoryStore, GitSubstrateError, NeverCancel, VfsGitRepositoryImage,
+    GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitForkPolicy, GitHeadState,
+    GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase, GitOpenRequest, GitRefUpdate,
+    GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryPolicy,
+    GitRepositoryProvenance, GitRepositoryStore, GitStatusKind, GitStatusOptions,
+    GitSubstrateError, NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, SnapshotOptions, Volume, VolumeConfig,
@@ -51,6 +52,9 @@ async fn open_seeded_volume(seed: u64) -> (Arc<InMemoryVfsStore>, Arc<dyn Volume
 }
 
 async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload: &[u8]) {
+    let blob_oid = blob_oid_for_commit(oid);
+    let tree_oid = tree_oid_for_commit(oid);
+    let source = source_bytes_for_commit(oid);
     volume
         .fs()
         .write_file(
@@ -80,7 +84,12 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
         .fs()
         .write_file(
             &format!("{root}/.git/objects/{oid}"),
-            [b"commit\n".as_slice(), payload].concat(),
+            [
+                b"commit\n".as_slice(),
+                format!("tree {tree_oid}\n").as_bytes(),
+                payload,
+            ]
+            .concat(),
             CreateOptions {
                 create_parents: true,
                 overwrite: true,
@@ -92,8 +101,34 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
     volume
         .fs()
         .write_file(
+            &format!("{root}/.git/objects/{blob_oid}"),
+            [b"blob\n".as_slice(), source.as_slice()].concat(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write git blob object");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/objects/{tree_oid}"),
+            format!("tree\n100644 blob {blob_oid}\tsrc/lib.rs\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write git tree object");
+    volume
+        .fs()
+        .write_file(
             &format!("{root}/src/lib.rs"),
-            format!("pub const SEED: &str = \"{oid}\";\n").into_bytes(),
+            source,
             CreateOptions {
                 create_parents: true,
                 overwrite: true,
@@ -109,7 +144,7 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
             serde_json::to_vec(&GitIndexSnapshot {
                 entries: vec![GitIndexEntry {
                     path: "src/lib.rs".to_string(),
-                    oid: Some(oid.to_string()),
+                    oid: Some(blob_oid),
                     mode: 0o100644,
                 }],
                 metadata: BTreeMap::from([("seed".to_string(), json!(oid))]),
@@ -123,6 +158,18 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
         )
         .await
         .expect("write git index");
+}
+
+fn blob_oid_for_commit(oid: &str) -> String {
+    format!("{oid}-blob")
+}
+
+fn tree_oid_for_commit(oid: &str) -> String {
+    format!("{oid}-tree")
+}
+
+fn source_bytes_for_commit(oid: &str) -> Vec<u8> {
+    format!("pub const SEED: &str = \"{oid}\";\n").into_bytes()
 }
 
 fn open_request(
@@ -200,7 +247,9 @@ async fn public_git_surface_discovers_and_opens_snapshot_repositories() {
         .expect("read object")
         .expect("object exists");
     assert_eq!(object.oid, base_oid);
-    assert_eq!(object.data, b"base-6101\n".to_vec());
+    let object_text = String::from_utf8_lossy(&object.data);
+    assert!(object_text.starts_with(&format!("tree {}\n", tree_oid_for_commit(&base_oid))));
+    assert!(object_text.ends_with("base-6101\n"));
 
     let index = terracedb_git::GitIndexStore::index(repo.as_ref())
         .await
@@ -364,7 +413,10 @@ async fn overlay_and_imported_repository_images_preserve_read_only_git_access() 
         .await
         .expect("read imported object")
         .expect("imported object");
-    assert_eq!(overlay_object.data, b"overlay-6104\n".to_vec());
+    assert!(
+        String::from_utf8_lossy(&overlay_object.data).ends_with("overlay-6104\n"),
+        "overlay commit payload should round-trip through the VFS-backed object store"
+    );
     assert_eq!(imported_object.data, overlay_object.data);
 }
 
@@ -466,6 +518,9 @@ impl GitWorktreeMaterializer for BlockingMaterializer {
         Ok(GitCheckoutReport {
             target_ref: request.target_ref,
             materialized_path: request.materialize_path,
+            written_paths: 0,
+            deleted_paths: 0,
+            head_oid: None,
         })
     }
 }
@@ -499,6 +554,8 @@ async fn execution_hooks_capture_head_refs_objects_and_checkout() {
         GitCheckoutRequest {
             target_ref: "refs/heads/main".to_string(),
             materialize_path: "/workspace".to_string(),
+            pathspec: Vec::new(),
+            update_head: false,
         },
         Arc::new(NeverCancel),
     )
@@ -512,6 +569,9 @@ async fn execution_hooks_capture_head_refs_objects_and_checkout() {
             "head:refs/heads/main".to_string(),
             "refs:1".to_string(),
             format!("object:{base_oid}"),
+            format!("object:{base_oid}"),
+            format!("object:{}", tree_oid_for_commit(&base_oid)),
+            format!("object:{}", blob_oid_for_commit(&base_oid)),
             "checkout:refs/heads/main".to_string(),
         ]
     );
@@ -545,6 +605,8 @@ async fn checkout_passes_cancellation_through_to_the_materializer() {
                 GitCheckoutRequest {
                     target_ref: "refs/heads/main".to_string(),
                     materialize_path: "/workspace".to_string(),
+                    pathspec: Vec::new(),
+                    update_head: false,
                 },
                 cancellation,
             )
@@ -564,4 +626,605 @@ async fn checkout_passes_cancellation_through_to_the_materializer() {
         error,
         GitSubstrateError::Cancelled { repository_id } if repository_id == "repo-cancel"
     ));
+}
+
+#[tokio::test]
+async fn vfs_native_status_and_diff_cover_modified_untracked_ignored_and_pathspec_flows() {
+    let (_store, volume, base_oid) = open_seeded_volume(0x6107).await;
+    volume
+        .fs()
+        .write_file(
+            "/repo/.gitignore",
+            b"ignored.txt\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write gitignore");
+    volume
+        .fs()
+        .write_file(
+            "/repo/src/lib.rs",
+            b"pub const SEED: &str = \"modified\";\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("modify tracked file");
+    volume
+        .fs()
+        .write_file(
+            "/repo/src/new.rs",
+            b"pub const NEW_FILE: bool = true;\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write untracked file");
+    volume
+        .fs()
+        .write_file(
+            "/repo/src/nested/deep.rs",
+            b"pub const DEEP_FILE: bool = true;\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write nested untracked file");
+    volume
+        .fs()
+        .write_file(
+            "/repo/ignored.txt",
+            b"ignored\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write ignored file");
+
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("git image"),
+    );
+    let repo = DeterministicGitRepositoryStore::default()
+        .open(
+            image.clone(),
+            open_request("repo-status", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open repo");
+
+    let status = repo
+        .status_with_options(GitStatusOptions {
+            include_ignored: true,
+            ..Default::default()
+        })
+        .await
+        .expect("status");
+    assert!(status.dirty);
+    assert_eq!(
+        status.entries,
+        vec![
+            terracedb_git::GitStatusEntry {
+                path: ".gitignore".to_string(),
+                kind: GitStatusKind::Untracked,
+                previous_path: None,
+            },
+            terracedb_git::GitStatusEntry {
+                path: "ignored.txt".to_string(),
+                kind: GitStatusKind::Ignored,
+                previous_path: None,
+            },
+            terracedb_git::GitStatusEntry {
+                path: "src/lib.rs".to_string(),
+                kind: GitStatusKind::Modified,
+                previous_path: None,
+            },
+            terracedb_git::GitStatusEntry {
+                path: "src/nested/deep.rs".to_string(),
+                kind: GitStatusKind::Untracked,
+                previous_path: None,
+            },
+            terracedb_git::GitStatusEntry {
+                path: "src/new.rs".to_string(),
+                kind: GitStatusKind::Untracked,
+                previous_path: None,
+            },
+        ]
+    );
+
+    let filtered = repo
+        .status_with_options(GitStatusOptions {
+            pathspec: vec!["src".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("pathspec-filtered status");
+    assert_eq!(
+        filtered
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        vec![
+            "src/lib.rs".to_string(),
+            "src/nested/deep.rs".to_string(),
+            "src/new.rs".to_string()
+        ]
+    );
+
+    let wildcard_filtered = repo
+        .status_with_options(GitStatusOptions {
+            pathspec: vec!["src/*.rs".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("wildcard-filtered status");
+    assert_eq!(
+        wildcard_filtered
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        vec!["src/lib.rs".to_string(), "src/new.rs".to_string()]
+    );
+
+    let diff = repo
+        .diff(GitDiffRequest {
+            pathspec: vec!["src/lib.rs".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("diff");
+    assert_eq!(diff.entries.len(), 1);
+    assert_eq!(diff.entries[0].path, "src/lib.rs");
+    assert_eq!(diff.entries[0].kind, terracedb_git::GitDiffKind::Modified);
+    assert_eq!(
+        diff.entries[0].old_oid.as_deref(),
+        Some(blob_oid_for_commit(&base_oid).as_str())
+    );
+}
+
+#[tokio::test]
+async fn status_collapses_delete_plus_untracked_into_renamed_when_content_matches() {
+    let (_store, volume, base_oid) = open_seeded_volume(0x6109).await;
+    let original = source_bytes_for_commit(&base_oid);
+    volume
+        .fs()
+        .unlink("/repo/src/lib.rs")
+        .await
+        .expect("remove tracked path");
+    volume
+        .fs()
+        .write_file(
+            "/repo/src/renamed.rs",
+            original,
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write renamed path");
+
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("git image"),
+    );
+    let repo = DeterministicGitRepositoryStore::default()
+        .open(
+            image.clone(),
+            open_request("repo-rename", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open repo");
+
+    let status = repo.status().await.expect("status");
+    assert_eq!(
+        status.entries,
+        vec![terracedb_git::GitStatusEntry {
+            path: "src/renamed.rs".to_string(),
+            kind: GitStatusKind::Renamed,
+            previous_path: Some("src/lib.rs".to_string()),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn status_fails_closed_when_head_tree_cannot_be_loaded() {
+    let (_store, volume, base_oid) = open_seeded_volume(0x610a).await;
+    volume
+        .fs()
+        .write_file(
+            &format!("/repo/.git/objects/{base_oid}"),
+            b"commit\ntree missing-tree\nbroken\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("corrupt head commit");
+
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("git image"),
+    );
+    let repo = DeterministicGitRepositoryStore::default()
+        .open(
+            image.clone(),
+            open_request("repo-corrupt-head", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open repo");
+
+    let error = repo.status().await.expect_err("status should fail closed");
+    assert!(matches!(
+        error,
+        GitSubstrateError::ObjectNotFound { oid } if oid == "missing-tree"
+    ));
+}
+
+#[tokio::test]
+async fn checkout_materializes_target_tree_updates_head_and_moves_refs() {
+    let (_store, volume, base_oid) = open_seeded_volume(0x6108).await;
+    let feature_commit = "feature-6108";
+    let feature_blob = blob_oid_for_commit(feature_commit);
+    let feature_tree = tree_oid_for_commit(feature_commit);
+
+    volume
+        .fs()
+        .write_file(
+            "/repo/.git/objects/feature-6108",
+            format!("commit\ntree {feature_tree}\nfeature-6108\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write feature commit");
+    volume
+        .fs()
+        .write_file(
+            &format!("/repo/.git/objects/{feature_blob}"),
+            b"blob\npub const FEATURE: &str = \"feature-6108\";\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write feature blob");
+    volume
+        .fs()
+        .write_file(
+            &format!("/repo/.git/objects/{feature_tree}"),
+            format!("tree\n100644 blob {feature_blob}\tsrc/lib.rs\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write feature tree");
+    volume
+        .fs()
+        .write_file(
+            "/repo/.git/refs/heads/feature",
+            b"feature-6108\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write feature ref");
+
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("git image"),
+    );
+    let repo = DeterministicGitRepositoryStore::default()
+        .open(
+            image.clone(),
+            open_request("repo-checkout", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open repo");
+
+    let export = repo
+        .checkout(
+            GitCheckoutRequest {
+                target_ref: "refs/heads/feature".to_string(),
+                materialize_path: "/workspace/export".to_string(),
+                pathspec: Vec::new(),
+                update_head: false,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("materialize feature tree");
+    assert_eq!(export.head_oid.as_deref(), Some(feature_commit));
+    assert_eq!(
+        volume
+            .fs()
+            .read_file("/workspace/export/src/lib.rs")
+            .await
+            .expect("read exported file"),
+        Some(b"pub const FEATURE: &str = \"feature-6108\";\n".to_vec())
+    );
+
+    let repo_root_checkout = repo
+        .checkout(
+            GitCheckoutRequest {
+                target_ref: "refs/heads/feature".to_string(),
+                materialize_path: "/repo".to_string(),
+                pathspec: Vec::new(),
+                update_head: false,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("checkout feature into repo root without moving head");
+    assert_eq!(repo_root_checkout.head_oid.as_deref(), Some(feature_commit));
+    let still_main = repo.head().await.expect("read unchanged head");
+    assert_eq!(still_main.symbolic_ref.as_deref(), Some("refs/heads/main"));
+    let refreshed_index = terracedb_git::GitIndexStore::index(repo.as_ref())
+        .await
+        .expect("read refreshed index after repo-root checkout");
+    assert_eq!(refreshed_index.entries.len(), 1);
+    assert_eq!(
+        refreshed_index.entries[0].oid.as_deref(),
+        Some(feature_blob.as_str())
+    );
+    let staged_status = repo.status().await.expect("status after staged checkout");
+    assert_eq!(
+        staged_status.entries,
+        vec![terracedb_git::GitStatusEntry {
+            path: "src/lib.rs".to_string(),
+            kind: GitStatusKind::Modified,
+            previous_path: None,
+        }]
+    );
+
+    let ref_update = repo
+        .update_ref(
+            GitRefUpdate {
+                name: "refs/heads/main".to_string(),
+                target: feature_commit.to_string(),
+                previous_target: Some(base_oid.clone()),
+                symbolic: false,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("move main ref");
+    assert_eq!(ref_update.reference.target, feature_commit);
+
+    let report = repo
+        .checkout(
+            GitCheckoutRequest {
+                target_ref: "refs/heads/feature".to_string(),
+                materialize_path: "/repo".to_string(),
+                pathspec: Vec::new(),
+                update_head: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("checkout feature into repo root");
+    assert_eq!(report.head_oid.as_deref(), Some(feature_commit));
+
+    let head = repo.head().await.expect("read updated head");
+    assert_eq!(head.symbolic_ref.as_deref(), Some("refs/heads/feature"));
+    assert_eq!(head.oid.as_deref(), Some(feature_commit));
+    let index = terracedb_git::GitIndexStore::index(repo.as_ref())
+        .await
+        .expect("read updated index");
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.entries[0].oid.as_deref(), Some(feature_blob.as_str()));
+}
+
+#[tokio::test]
+async fn pathspec_checkout_removes_stale_deleted_paths_in_selected_subtree() {
+    let (_store, volume, _base_oid) = open_seeded_volume(0x6110).await;
+    volume
+        .fs()
+        .write_file(
+            "/repo/src/stale.rs",
+            b"pub const STALE: bool = true;\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed stale file");
+    volume
+        .fs()
+        .write_file(
+            "/repo/keep.txt",
+            b"keep me\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed unrelated file");
+
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("git image"),
+    );
+    let repo = DeterministicGitRepositoryStore::default()
+        .open(
+            image.clone(),
+            open_request("repo-pathspec-checkout", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open repo");
+
+    repo.checkout(
+        GitCheckoutRequest {
+            target_ref: "refs/heads/main".to_string(),
+            materialize_path: "/repo".to_string(),
+            pathspec: vec!["src".to_string()],
+            update_head: false,
+        },
+        Arc::new(NeverCancel),
+    )
+    .await
+    .expect("pathspec checkout");
+
+    assert_eq!(
+        volume
+            .fs()
+            .read_file("/repo/src/stale.rs")
+            .await
+            .expect("read stale path"),
+        None
+    );
+    assert_eq!(
+        volume
+            .fs()
+            .read_file("/repo/keep.txt")
+            .await
+            .expect("read unrelated path"),
+        Some(b"keep me\n".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn update_ref_normalizes_symbolic_ref_compare_and_swap_targets() {
+    let (_store, volume, base_oid) = open_seeded_volume(0x6111).await;
+    volume
+        .fs()
+        .write_file(
+            "/repo/.git/refs/heads/feature",
+            format!("{base_oid}\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write feature ref");
+
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("git image"),
+    );
+    let repo = DeterministicGitRepositoryStore::default()
+        .open(
+            image.clone(),
+            open_request("repo-symbolic-update", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open repo");
+
+    let report = repo
+        .update_ref(
+            GitRefUpdate {
+                name: "HEAD".to_string(),
+                target: "refs/heads/feature".to_string(),
+                previous_target: Some("refs/heads/main".to_string()),
+                symbolic: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("update symbolic head ref");
+    assert_eq!(report.previous_target.as_deref(), Some("refs/heads/main"));
+
+    let head = repo.head().await.expect("read updated head");
+    assert_eq!(head.symbolic_ref.as_deref(), Some("refs/heads/feature"));
+    assert_eq!(head.oid.as_deref(), Some(base_oid.as_str()));
+}
+
+#[tokio::test]
+async fn non_head_symbolic_refs_resolve_through_ref_reads_and_checkout() {
+    let (_store, volume, base_oid) = open_seeded_volume(0x6112).await;
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("git image"),
+    );
+    let repo = DeterministicGitRepositoryStore::default()
+        .open(
+            image.clone(),
+            open_request("repo-symbolic-branch", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open repo");
+
+    repo.update_ref(
+        GitRefUpdate {
+            name: "refs/heads/release".to_string(),
+            target: "refs/heads/main".to_string(),
+            previous_target: None,
+            symbolic: true,
+        },
+        Arc::new(NeverCancel),
+    )
+    .await
+    .expect("create symbolic branch ref");
+
+    let refs = repo.list_refs().await.expect("list refs");
+    assert!(refs.contains(&GitReference {
+        name: "refs/heads/release".to_string(),
+        target: base_oid.clone(),
+    }));
+
+    let checkout = repo
+        .checkout(
+            GitCheckoutRequest {
+                target_ref: "refs/heads/release".to_string(),
+                materialize_path: "/workspace/release".to_string(),
+                pathspec: Vec::new(),
+                update_head: false,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("checkout symbolic branch");
+    assert_eq!(checkout.head_oid.as_deref(), Some(base_oid.as_str()));
 }
