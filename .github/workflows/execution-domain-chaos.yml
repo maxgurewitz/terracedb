@@ -1,0 +1,28 @@
+name: execution-domain-chaos
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: Campaign to run
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - smoke
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run selected campaign
+        run: bash scripts/run_execution_domain_chaos_suite.sh "${{ inputs.campaign }}"
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-domain-chaos-${{ inputs.campaign }}
+          path: .tmp/execution-domain-chaos-artifacts
