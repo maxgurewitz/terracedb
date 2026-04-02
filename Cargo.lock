@@ -2651,6 +2651,7 @@ dependencies = [
  "serde_json",
  "terracedb",
  "terracedb-capabilities",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
