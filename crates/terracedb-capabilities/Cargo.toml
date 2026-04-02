@@ -13,4 +13,6 @@ thiserror = "2.0.17"
 terracedb-mcp = { path = "../terracedb-mcp" }
 terracedb-migrate = { path = "../terracedb-migrate" }
 terracedb-procedures = { path = "../terracedb-procedures" }
+terracedb-simulation = { path = "../terracedb-simulation" }
 tokio = { version = "1.48.0", features = ["rt"] }
+turmoil = "0.7.1"

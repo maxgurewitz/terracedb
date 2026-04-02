@@ -2,6 +2,7 @@
 
 This example is a small host application plus a companion sandboxed project tree that shows what `terracedb-sandbox` is for in practice:
 
+- start a draft session from the named `notes-review` preset plus the `foreground` profile
 - hoist a real project directory into a sandbox session
 - inject an explicit app capability at `terrace:host/notes`
 - execute guest code that reads and updates host-side state
@@ -55,7 +56,7 @@ Why the editor view is read-only:
 
 How capabilities are injected:
 
-- The app registers a concrete capability manifest for `terrace:host/notes`.
+- The app resolves a named preset/profile into an expanded capability manifest, then materializes the matching sandbox capability modules for `terrace:host/notes`.
 - Guest code must import that module explicitly; there are no ambient globals.
 - The same note-store implementation is exercised both through direct `invoke_capability` calls and through guest JS imports in the tests.
 
@@ -73,4 +74,3 @@ The example is covered by:
 - local and remote readonly-view smoke tests using the same protocol bridge
 - a git-backed PR/export test over a real temporary repo and bare remote
 - a deterministic simulation replay test for the example capability and session semantics
-

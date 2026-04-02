@@ -12,14 +12,14 @@ use terracedb_capabilities::{
     DraftAuthorizationDecision, DraftAuthorizationFlowError, DraftAuthorizationHistoryKind,
     DraftAuthorizationOutcomeKind, DraftAuthorizationRequestKind, ExecutionDomain,
     ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy, FilteredScanResumeToken,
-    ForegroundSessionStatusProjector, ManifestBinding, PolicyContext, PolicyOutcomeKind,
-    PolicyResolutionRequest, PolicySubject, PresetBinding, RateLimitOutcome, ResolvedSessionPolicy,
-    ResourceKind, ResourcePolicy, ResourceSelector, ResourceTarget, RowDenialContract,
-    RowQueryShape, RowScopeBinding, RowScopeFamily, RowScopePolicy, RowVisibilityOutcomeKind,
-    SessionLifecycleState, SessionMode, SessionStatusSource, SessionStatusUpdate,
-    ShellCommandDescriptor, StaticExecutionPolicyResolver, SubjectResolutionRequest,
-    SubjectSelector, VisibilityIndexSpec, VisibilityIndexSubjectKey,
-    VisibilityMembershipTransition, capability_module_specifier,
+    ForegroundSessionStatusProjector, ManifestBinding, ManifestBindingOverride, PolicyContext,
+    PolicyError, PolicyOutcomeKind, PolicyResolutionRequest, PolicySubject, PresetBinding,
+    RateLimitOutcome, ResolvedSessionPolicy, ResourceKind, ResourcePolicy, ResourceSelector,
+    ResourceTarget, RowDenialContract, RowQueryShape, RowScopeBinding, RowScopeFamily,
+    RowScopePolicy, RowVisibilityOutcomeKind, SessionLifecycleState, SessionMode,
+    SessionPresetRequest, SessionStatusSource, SessionStatusUpdate, ShellCommandDescriptor,
+    StaticExecutionPolicyResolver, SubjectResolutionRequest, SubjectSelector, VisibilityIndexSpec,
+    VisibilityIndexSubjectKey, VisibilityMembershipTransition, capability_module_specifier,
 };
 use terracedb_mcp::{
     DeterministicMcpAuthenticator, McpAuthContext, McpAuthenticationRequest, McpAuthenticator,
@@ -170,7 +170,30 @@ fn sample_resolution_request(profile_name: Option<&str>) -> PolicyResolutionRequ
     }
 }
 
+fn sample_preset_request(profile_name: Option<&str>) -> SessionPresetRequest {
+    SessionPresetRequest {
+        subject: SubjectResolutionRequest {
+            session_id: "session-1".to_string(),
+            auth_subject_hint: Some("alice".to_string()),
+            tenant_hint: Some("tenant-a".to_string()),
+            groups: vec![],
+            attributes: BTreeMap::new(),
+        },
+        preset_name: "draft-support".to_string(),
+        profile_name: profile_name.map(str::to_string),
+        session_mode_override: None,
+        binding_overrides: Vec::new(),
+        metadata: BTreeMap::from([("surface".to_string(), serde_json::json!("host-api"))]),
+    }
+}
+
 fn resolve_sample_policy(rate_limiter: DeterministicRateLimiter) -> ResolvedSessionPolicy {
+    sample_policy_engine(rate_limiter)
+        .resolve(&sample_resolution_request(Some("foreground")))
+        .expect("resolve sample policy")
+}
+
+fn sample_policy_engine(rate_limiter: DeterministicRateLimiter) -> DeterministicPolicyEngine {
     let execution_policy = sample_execution_policy();
     DeterministicPolicyEngine::new(
         vec![sample_template()],
@@ -202,8 +225,6 @@ fn resolve_sample_policy(rate_limiter: DeterministicRateLimiter) -> ResolvedSess
         metadata: BTreeMap::new(),
     })
     .with_rate_limiter(rate_limiter)
-    .resolve(&sample_resolution_request(Some("foreground")))
-    .expect("resolve sample policy")
 }
 
 fn resource_policy_for_tables(tables: &[&str]) -> ResourcePolicy {
@@ -371,6 +392,73 @@ fn interactive_policy_engine() -> DeterministicPolicyEngine {
             expose_in_just_bash: Some(true),
         }],
         drop_bindings: vec!["tickets".to_string()],
+        execution_policy_override: None,
+        metadata: BTreeMap::new(),
+    })
+}
+
+fn interactive_policy_engine_with_private_ticket_access() -> DeterministicPolicyEngine {
+    let execution_policy = sample_execution_policy();
+    DeterministicPolicyEngine::new(
+        vec![
+            named_template(
+                "db.query.v1",
+                "tickets",
+                "Read tenant-scoped tickets",
+                &["tickets"],
+            ),
+            named_template(
+                "db.admin.v1",
+                "admin",
+                "Access admin tables",
+                &["admin_console"],
+            ),
+        ],
+        vec![
+            CapabilityGrant {
+                grant_id: "grant-1".to_string(),
+                subject: SubjectSelector::Exact {
+                    subject_id: "user:alice".to_string(),
+                },
+                template_id: "db.query.v1".to_string(),
+                binding_name: Some("tickets".to_string()),
+                resource_policy: Some(resource_policy_for_tables(&["tickets", "private_tickets"])),
+                budget_policy: None,
+                allow_interactive_widening: true,
+                metadata: BTreeMap::new(),
+            },
+            named_grant("grant-2", "db.admin.v1", "admin"),
+        ],
+        sample_subject_resolver(),
+        StaticExecutionPolicyResolver::new(execution_policy.clone())
+            .with_policy(SessionMode::Draft, execution_policy.clone())
+            .with_policy(SessionMode::ReviewedProcedure, execution_policy),
+    )
+    .with_preset(CapabilityPresetDescriptor {
+        name: "draft-support".to_string(),
+        description: Some("Draft support preset".to_string()),
+        bindings: vec![PresetBinding {
+            template_id: "db.query.v1".to_string(),
+            binding_name: Some("tickets".to_string()),
+            resource_policy: None,
+            budget_policy: None,
+            expose_in_just_bash: Some(true),
+        }],
+        default_session_mode: SessionMode::Draft,
+        default_execution_policy: Some(sample_execution_policy()),
+        metadata: BTreeMap::new(),
+    })
+    .with_profile(CapabilityProfileDescriptor {
+        name: "admin-elevated".to_string(),
+        preset_name: "draft-support".to_string(),
+        add_bindings: vec![PresetBinding {
+            template_id: "db.admin.v1".to_string(),
+            binding_name: Some("admin".to_string()),
+            resource_policy: None,
+            budget_policy: None,
+            expose_in_just_bash: Some(true),
+        }],
+        drop_bindings: vec![],
         execution_policy_override: None,
         metadata: BTreeMap::new(),
     })
@@ -768,6 +856,173 @@ fn deterministic_row_scope_lookup_replays_the_same_visibility_answer() {
 }
 
 #[test]
+fn preset_host_api_lists_describes_and_prepares_selected_manifest() {
+    let engine = sample_policy_engine(DeterministicRateLimiter::default());
+
+    let presets = engine.list_presets();
+    let profiles = engine.list_profiles(Some("draft-support"));
+    let described_preset = engine
+        .describe_preset("draft-support")
+        .expect("describe preset");
+    let described_profile = engine
+        .describe_profile("foreground")
+        .expect("describe profile");
+    let prepared = engine
+        .prepare_session_from_preset(&sample_preset_request(Some("foreground")))
+        .expect("prepare session from preset");
+
+    assert_eq!(presets.len(), 1);
+    assert_eq!(presets[0].name, "draft-support");
+    assert_eq!(presets[0].default_session_mode, SessionMode::Draft);
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].name, "foreground");
+    assert_eq!(described_preset.name, "draft-support");
+    assert_eq!(described_profile.preset_name, "draft-support");
+    assert_eq!(prepared.preset.name, "draft-support");
+    assert_eq!(
+        prepared
+            .profile
+            .as_ref()
+            .map(|profile| profile.name.as_str()),
+        Some("foreground")
+    );
+    assert_eq!(
+        prepared.resolved.manifest.preset_name.as_deref(),
+        Some("draft-support")
+    );
+    assert_eq!(
+        prepared.resolved.manifest.profile_name.as_deref(),
+        Some("foreground")
+    );
+    assert_eq!(
+        prepared.resolved.manifest.bindings[0]
+            .metadata
+            .get("preset_name"),
+        Some(&serde_json::json!("draft-support"))
+    );
+    assert_eq!(
+        prepared.audit_metadata.get("surface"),
+        Some(&serde_json::json!("host-api"))
+    );
+    assert_eq!(
+        prepared.audit_metadata.get("expanded_manifest"),
+        Some(&serde_json::to_value(&prepared.resolved.manifest).expect("manifest json"))
+    );
+}
+
+#[test]
+fn prepared_sessions_can_narrow_bindings_before_open() {
+    let engine = sample_policy_engine(DeterministicRateLimiter::default());
+    let mut request = sample_preset_request(Some("foreground"));
+    request.binding_overrides.push(ManifestBindingOverride {
+        binding_name: "tickets".to_string(),
+        drop_binding: false,
+        resource_policy: Some(ResourcePolicy {
+            allow: vec![ResourceSelector {
+                kind: ResourceKind::Table,
+                pattern: "tickets".to_string(),
+            }],
+            deny: vec![ResourceSelector {
+                kind: ResourceKind::Table,
+                pattern: "tickets/archive".to_string(),
+            }],
+            tenant_scopes: vec!["tenant-a".to_string()],
+            row_scope_binding: Some(sample_row_scope_binding()),
+            visibility_index: Some(sample_visibility_index()),
+            metadata: BTreeMap::from([("narrowed".to_string(), serde_json::json!(true))]),
+        }),
+        budget_policy: Some(BudgetPolicy {
+            max_calls: Some(2),
+            max_scanned_rows: Some(20),
+            max_returned_rows: None,
+            max_bytes: None,
+            max_millis: Some(100),
+            rate_limit_bucket: Some("draft-user".to_string()),
+            labels: BTreeMap::from([("lane".to_string(), "foreground".to_string())]),
+        }),
+        expose_in_just_bash: Some(false),
+        metadata: BTreeMap::from([("override".to_string(), serde_json::json!("session"))]),
+    });
+
+    let prepared = engine
+        .prepare_session_from_preset(&request)
+        .expect("prepare narrowed preset session");
+    let binding = &prepared.resolved.manifest.bindings[0];
+
+    assert_eq!(binding.budget_policy.max_calls, Some(2));
+    assert_eq!(binding.budget_policy.max_scanned_rows, Some(20));
+    assert_eq!(binding.budget_policy.max_bytes, Some(4096));
+    assert_eq!(binding.shell_command, None);
+    assert!(
+        binding
+            .resource_policy
+            .deny
+            .iter()
+            .any(|selector| selector.pattern == "tickets/archive")
+    );
+    assert_eq!(
+        binding.metadata.get("override"),
+        Some(&serde_json::json!("session"))
+    );
+}
+
+#[test]
+fn presets_cannot_widen_authority_beyond_standing_grants() {
+    let engine = sample_policy_engine(DeterministicRateLimiter::default()).with_preset(
+        CapabilityPresetDescriptor {
+            name: "too-wide".to_string(),
+            description: Some("Attempts to widen authority".to_string()),
+            bindings: vec![PresetBinding {
+                template_id: "db.query.v1".to_string(),
+                binding_name: Some("tickets".to_string()),
+                resource_policy: Some(ResourcePolicy {
+                    allow: vec![ResourceSelector {
+                        kind: ResourceKind::Table,
+                        pattern: "private_tickets".to_string(),
+                    }],
+                    deny: vec![],
+                    tenant_scopes: vec![],
+                    row_scope_binding: Some(sample_row_scope_binding()),
+                    visibility_index: Some(sample_visibility_index()),
+                    metadata: BTreeMap::new(),
+                }),
+                budget_policy: None,
+                expose_in_just_bash: Some(true),
+            }],
+            default_session_mode: SessionMode::Draft,
+            default_execution_policy: None,
+            metadata: BTreeMap::new(),
+        },
+    );
+
+    let error = engine
+        .prepare_session_from_preset(&SessionPresetRequest {
+            subject: SubjectResolutionRequest {
+                session_id: "session-1".to_string(),
+                auth_subject_hint: Some("alice".to_string()),
+                tenant_hint: Some("tenant-a".to_string()),
+                groups: vec![],
+                attributes: BTreeMap::new(),
+            },
+            preset_name: "too-wide".to_string(),
+            profile_name: None,
+            session_mode_override: None,
+            binding_overrides: Vec::new(),
+            metadata: BTreeMap::new(),
+        })
+        .expect_err("widening preset should be rejected");
+
+    assert!(matches!(
+        error,
+        PolicyError::UnsafeBindingOverride {
+            override_source,
+            binding_name,
+            ..
+        } if override_source == "preset/profile selection" && binding_name == "tickets"
+    ));
+}
+
+#[test]
 fn draft_authorization_decision_round_trips() {
     let decision = DraftAuthorizationDecision {
         request_id: "auth-1".to_string(),
@@ -887,6 +1142,11 @@ fn policy_decisions_emit_stable_audit_metadata_and_auth_request_kinds() {
         ExecutionDomain::DedicatedSandbox
     );
     assert_eq!(allowed.audit.preset_name.as_deref(), Some("draft-support"));
+    assert_eq!(allowed.audit.profile_name.as_deref(), Some("foreground"));
+    assert_eq!(
+        allowed.audit.expanded_manifest,
+        Some(resolved.manifest.clone())
+    );
     assert_eq!(
         allowed
             .audit
@@ -1252,8 +1512,8 @@ fn trusted_draft_retry_denial_can_be_approved_for_one_call_only() {
                 note: Some("one retry approved".to_string()),
                 metadata: BTreeMap::new(),
             },
+            Some(interactive_policy_engine_with_private_ticket_access()),
             None,
-            Some(sample_resolution_request(Some("private-tickets"))),
         )
         .expect("approve one retry");
     assert!(applied.refreshed_manifest.is_none());
@@ -1437,8 +1697,8 @@ fn draft_authorization_session_state_round_trips_across_restore() {
                 note: Some("retry once".to_string()),
                 metadata: BTreeMap::new(),
             },
+            Some(interactive_policy_engine_with_private_ticket_access()),
             None,
-            Some(sample_resolution_request(Some("private-tickets"))),
         )
         .expect("approve retry");
 

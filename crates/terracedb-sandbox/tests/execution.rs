@@ -2,21 +2,28 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use serde_json::json;
-use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
+use terracedb::{
+    DbDependencies, DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainPath,
+    ExecutionDomainPlacement, ExecutionResourceUsage, InMemoryResourceManager, StubClock,
+    StubFileSystem, StubObjectStore, StubRng, Timestamp,
+};
 use terracedb_capabilities::{
-    CapabilityManifest as PolicyCapabilityManifest, CapabilityUseMetrics, DatabaseAccessRequest,
-    DatabaseActionKind, DatabaseTarget, DeterministicTypedRowPredicate,
+    BudgetPolicy, CapabilityManifest as PolicyCapabilityManifest, CapabilityUseMetrics,
+    DatabaseAccessRequest, DatabaseActionKind, DatabaseTarget, DeterministicTypedRowPredicate,
     DeterministicTypedRowPredicateEvaluator, DeterministicVisibilityIndexStore, ExecutionDomain,
-    ExecutionDomainAssignment, ExecutionPolicy, ManifestBinding, PolicyOutcomeKind, PolicySubject,
-    ResolvedSessionPolicy, ResourceKind, ResourcePolicy, ResourceSelector, RowScopeBinding,
-    RowScopePolicy, SessionMode, capability_module_specifier,
+    ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy, ManifestBinding,
+    PolicyOutcomeKind, PolicySubject, ResolvedSessionPolicy, ResourceKind, ResourcePolicy,
+    ResourceSelector, RowScopeBinding, RowScopePolicy, SessionMode, capability_module_specifier,
 };
 use terracedb_sandbox::{
-    CapabilityRegistry, ConflictPolicy, DefaultSandboxStore, DeterministicCapabilityModule,
-    DeterministicCapabilityRegistry, ManifestBoundCapabilityDispatcher,
+    BashRequest, CapabilityRegistry, ConflictPolicy, DefaultSandboxStore, DeterministicBashService,
+    DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicPackageInstaller,
+    DeterministicRuntimeBackend, DeterministicTypeScriptService, ManifestBoundCapabilityDispatcher,
     ManifestBoundCapabilityInvocation, ManifestBoundCapabilityRegistry,
-    ManifestBoundCapabilityResult, PackageCompatibilityMode, SandboxCapability, SandboxConfig,
-    SandboxError, SandboxServices, SandboxStore, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    ManifestBoundCapabilityResult, PackageCompatibilityMode, ReopenSessionOptions,
+    SandboxCapability, SandboxConfig, SandboxError, SandboxExecutionDomainRoute,
+    SandboxExecutionPlacement, SandboxExecutionRouter, SandboxServices, SandboxStore,
+    TERRACE_RUNTIME_MODULE_CACHE_PATH, TypeCheckRequest,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 use tokio::sync::Mutex;
@@ -486,6 +493,7 @@ async fn guest_modules_read_write_vfs_and_call_explicit_capabilities() {
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: registry.manifest(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
@@ -590,6 +598,7 @@ async fn denied_capabilities_fail_predictably_and_no_runtime_helpers_are_ambient
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: registry.manifest(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
@@ -758,6 +767,7 @@ async fn manifest_bound_registry_generates_modules_and_records_policy_metadata()
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: registry.manifest(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
@@ -863,6 +873,7 @@ async fn manifest_bound_registry_omits_ungranted_bindings_and_surfaces_granted_d
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: registry.manifest(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
@@ -900,6 +911,7 @@ async fn manifest_bound_registry_omits_ungranted_bindings_and_surfaces_granted_d
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: registry.manifest(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
@@ -914,4 +926,888 @@ async fn manifest_bound_registry_omits_ungranted_bindings_and_surfaces_granted_d
         absent,
         SandboxError::CapabilityDenied { ref specifier } if specifier == "terrace:host/admin"
     ));
+}
+
+#[tokio::test]
+async fn execution_policy_routes_runtime_and_rejects_overloaded_typecheck_domains() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(120, 53, services);
+    let base_volume_id = VolumeId::new(0x9020);
+    let session_volume_id = VolumeId::new(0x9021);
+
+    seed_base(&vfs, base_volume_id, "export default { ok: true };", &[]).await;
+
+    let policy = routed_execution_policy();
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: Some(policy.clone()),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open policy-routed session");
+
+    let result = session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("runtime should be admitted in dedicated domain");
+    let info = session.info().await;
+
+    assert_eq!(session.runtime_handle().backend, "routed-runtime-dedicated");
+    assert_eq!(info.services.runtime_backend, "routed-runtime-dedicated");
+    assert_eq!(
+        info.services.execution_bindings[&ExecutionOperation::DraftSession]
+            .domain_path
+            .as_string(),
+        "process/sandbox-tests/dedicated"
+    );
+    assert_eq!(
+        info.services.execution_bindings[&ExecutionOperation::TypeCheck].backend,
+        "routed-typescript-owner-foreground"
+    );
+    assert_eq!(
+        result.metadata["execution_domain_path"],
+        json!("process/sandbox-tests/dedicated")
+    );
+
+    let error = session
+        .typecheck(TypeCheckRequest {
+            roots: vec!["/workspace/main.js".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect_err("typecheck domain should be overloaded");
+    assert!(matches!(
+        error,
+        SandboxError::ExecutionDomainOverloaded { ref operation, ref path, .. }
+            if *operation == ExecutionOperation::TypeCheck
+                && path.as_string() == "process/sandbox-tests/owner-foreground"
+    ));
+
+    let bash = session
+        .run_bash(BashRequest {
+            command: "pwd".to_string(),
+            cwd: "/workspace".to_string(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .expect("bash should be admitted in dedicated domain");
+    assert_eq!(bash.cwd, "/workspace");
+
+    let tool_names = session
+        .volume()
+        .tools()
+        .recent(None)
+        .await
+        .expect("recent tool runs")
+        .into_iter()
+        .map(|run| run.name)
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"sandbox.typescript.check".to_string()));
+    assert!(tool_names.contains(&"sandbox.bash.exec".to_string()));
+    assert_eq!(
+        tool_names
+            .iter()
+            .filter(|name| name.as_str() == "sandbox.typescript.check")
+            .count(),
+        1
+    );
+    assert_eq!(
+        tool_names
+            .iter()
+            .filter(|name| name.as_str() == "sandbox.bash.exec")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn execution_policy_inherits_default_budget_for_operation_overrides() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(125, 530, services);
+    let base_volume_id = VolumeId::new(0x9028);
+    let session_volume_id = VolumeId::new(0x9029);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        "export default { inherited: true };",
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: Some(default_budget_execution_policy()),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open policy-routed session with inherited budget");
+
+    let result = session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("first runtime call should inherit default budget");
+    let info = session.info().await;
+
+    assert_eq!(result.metadata["execution_budget"]["max_calls"], json!(1));
+    assert_eq!(
+        info.services.execution_bindings[&ExecutionOperation::DraftSession]
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.max_calls),
+        Some(1)
+    );
+
+    let error = session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect_err("second runtime call should exceed inherited max_calls budget");
+    assert!(matches!(
+        error,
+        SandboxError::Service { service, ref message }
+            if service == "execution-policy"
+                && message.contains("exceeded max_calls 1")
+    ));
+}
+
+#[tokio::test]
+async fn execution_policy_max_calls_survive_session_reopen() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(130, 54, services);
+    let base_volume_id = VolumeId::new(0x9030);
+    let session_volume_id = VolumeId::new(0x9031);
+
+    seed_base(&vfs, base_volume_id, "export default { once: true };", &[]).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: Some(reopen_budget_execution_policy()),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open budgeted session");
+    session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("first runtime call within budget");
+
+    let reopened = sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen budgeted session");
+    let error = reopened
+        .exec_module("/workspace/main.js")
+        .await
+        .expect_err("reopen should not reset execution max_calls");
+    assert!(matches!(
+        error,
+        SandboxError::Service { service, ref message }
+            if service == "execution-policy"
+                && message.contains("exceeded max_calls 1")
+    ));
+}
+
+#[tokio::test]
+async fn execution_policy_reopen_reconciles_stale_sidecar_counts() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(135, 55, services);
+    let base_volume_id = VolumeId::new(0x9038);
+    let session_volume_id = VolumeId::new(0x9039);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        "export default { crash_safe: true };",
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: Some(reopen_budget_execution_policy()),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open budgeted session");
+
+    session
+        .filesystem()
+        .write_file(
+            "/.terrace/execution-policy-state.json",
+            serde_json::to_vec_pretty(&json!({
+                "format_version": 1,
+                "counts": {
+                    "draft_session": 1
+                }
+            }))
+            .expect("encode stale execution count state"),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write stale execution count state");
+    session
+        .close(terracedb_sandbox::CloseSessionOptions::default())
+        .await
+        .expect("close session with stale sidecar");
+
+    let reopened = sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen session with stale sidecar");
+    reopened
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("stale sidecar should not exhaust max_calls without matching tool run");
+
+    let error = reopened
+        .exec_module("/workspace/main.js")
+        .await
+        .expect_err("second call should still exhaust the real max_calls budget");
+    assert!(matches!(
+        error,
+        SandboxError::Service { service, ref message }
+            if service == "execution-policy"
+                && message.contains("exceeded max_calls 1")
+    ));
+}
+
+#[tokio::test]
+async fn execution_policy_reopen_rejects_unsupported_sidecar_versions() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(136, 57, services);
+    let base_volume_id = VolumeId::new(0x903a);
+    let session_volume_id = VolumeId::new(0x903b);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        "export default { invalid: true };",
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: Some(reopen_budget_execution_policy()),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session for unsupported execution-policy state version");
+
+    session
+        .filesystem()
+        .write_file(
+            "/.terrace/execution-policy-state.json",
+            serde_json::to_vec_pretty(&json!({
+                "format_version": 99,
+                "counts": {
+                    "draft_session": 1
+                }
+            }))
+            .expect("encode unsupported execution count state"),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write unsupported execution count state");
+    session
+        .close(terracedb_sandbox::CloseSessionOptions::default())
+        .await
+        .expect("close session with unsupported sidecar version");
+
+    let error = match sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+    {
+        Ok(_) => panic!("reopen should reject unsupported execution-policy state versions"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SandboxError::InvalidSessionMetadata { ref path, ref reason }
+            if path == "/.terrace/execution-policy-state.json"
+                && reason.contains("unsupported execution policy state format version 99")
+    ));
+}
+
+#[tokio::test]
+async fn execution_policy_concurrent_installs_do_not_regress_reopen_counts() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(140, 56, services);
+    let base_volume_id = VolumeId::new(0x9040);
+    let session_volume_id = VolumeId::new(0x9041);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        "export default { packages: true };",
+        &[],
+    )
+    .await;
+
+    let session = Arc::new(
+        sandbox
+            .open_session(SandboxConfig {
+                session_volume_id,
+                session_chunk_size: Some(4096),
+                base_volume_id,
+                durable_base: false,
+                workspace_root: "/workspace".to_string(),
+                package_compat: PackageCompatibilityMode::NpmPureJs,
+                conflict_policy: ConflictPolicy::Fail,
+                capabilities: Default::default(),
+                execution_policy: Some(concurrent_package_budget_execution_policy()),
+                hoisted_source: None,
+                git_provenance: None,
+            })
+            .await
+            .expect("open policy-routed package session"),
+    );
+
+    let first_session = session.clone();
+    let second_session = session.clone();
+    let (first, second) = tokio::join!(
+        async move {
+            first_session
+                .install_packages(terracedb_sandbox::PackageInstallRequest {
+                    packages: vec!["zod".to_string()],
+                    materialize_compatibility_view: false,
+                })
+                .await
+        },
+        async move {
+            second_session
+                .install_packages(terracedb_sandbox::PackageInstallRequest {
+                    packages: vec!["lodash".to_string()],
+                    materialize_compatibility_view: false,
+                })
+                .await
+        }
+    );
+    first.expect("first routed package install");
+    second.expect("second routed package install");
+
+    session
+        .close(terracedb_sandbox::CloseSessionOptions::default())
+        .await
+        .expect("close session after concurrent package installs");
+
+    let reopened = sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen session after concurrent package installs");
+    let error = reopened
+        .install_packages(terracedb_sandbox::PackageInstallRequest {
+            packages: vec!["dayjs".to_string()],
+            materialize_compatibility_view: false,
+        })
+        .await
+        .expect_err("reopen should retain both completed package install calls");
+    assert!(matches!(
+        error,
+        SandboxError::Service { service, ref message }
+            if service == "execution-policy"
+                && message.contains("exceeded max_calls 2")
+    ));
+}
+
+#[tokio::test]
+async fn execution_policy_reopen_recovers_missing_sidecar_operations_from_tool_history() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(145, 58, services);
+    let base_volume_id = VolumeId::new(0x9048);
+    let session_volume_id = VolumeId::new(0x9049);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        "export default { package_history: true };",
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::NpmPureJs,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: Some(single_package_budget_execution_policy()),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open policy-routed package session");
+
+    session
+        .install_packages(terracedb_sandbox::PackageInstallRequest {
+            packages: vec!["zod".to_string()],
+            materialize_compatibility_view: false,
+        })
+        .await
+        .expect("record package install before sidecar rewrite");
+    session
+        .filesystem()
+        .write_file(
+            "/.terrace/execution-policy-state.json",
+            serde_json::to_vec_pretty(&json!({
+                "format_version": 1,
+                "counts": {
+                    "draft_session": 1
+                }
+            }))
+            .expect("encode sidecar missing package install counts"),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("overwrite sidecar without package install counts");
+    session
+        .close(terracedb_sandbox::CloseSessionOptions::default())
+        .await
+        .expect("close session after sidecar rewrite");
+
+    let reopened = sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen session with sidecar missing package install counts");
+    let error = reopened
+        .install_packages(terracedb_sandbox::PackageInstallRequest {
+            packages: vec!["dayjs".to_string()],
+            materialize_compatibility_view: false,
+        })
+        .await
+        .expect_err("tool history should restore omitted package install counts");
+    assert!(matches!(
+        error,
+        SandboxError::Service { service, ref message }
+            if service == "execution-policy"
+                && message.contains("exceeded max_calls 1")
+    ));
+}
+
+#[tokio::test]
+async fn execution_policy_failed_admission_attempts_do_not_consume_budget() {
+    let services =
+        SandboxServices::deterministic().with_execution_router(routed_execution_router());
+    let (vfs, sandbox) = sandbox_store(146, 59, services);
+    let base_volume_id = VolumeId::new(0x904a);
+    let session_volume_id = VolumeId::new(0x904b);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        "export default { overloaded: true };",
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: Some(overloaded_typecheck_budget_execution_policy()),
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session with overloaded typecheck budget");
+
+    for _ in 0..2 {
+        let error = session
+            .typecheck(TypeCheckRequest {
+                roots: vec!["/workspace/main.js".to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect_err("overloaded typecheck should fail without consuming budget");
+        assert!(matches!(
+            error,
+            SandboxError::ExecutionDomainOverloaded { ref operation, .. }
+                if *operation == ExecutionOperation::TypeCheck
+        ));
+    }
+
+    session
+        .close(terracedb_sandbox::CloseSessionOptions::default())
+        .await
+        .expect("close overloaded typecheck session");
+
+    let reopened = sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen overloaded typecheck session");
+    let error = reopened
+        .typecheck(TypeCheckRequest {
+            roots: vec!["/workspace/main.js".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect_err("reopen should keep overloaded typecheck failures budget-free");
+    assert!(matches!(
+        error,
+        SandboxError::ExecutionDomainOverloaded { ref operation, .. }
+            if *operation == ExecutionOperation::TypeCheck
+    ));
+}
+
+fn routed_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: None,
+            placement_tags: vec!["dedicated".to_string()],
+            metadata: BTreeMap::new(),
+        },
+        operations: BTreeMap::from([
+            (
+                ExecutionOperation::DraftSession,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::DedicatedSandbox,
+                    budget: None,
+                    placement_tags: vec!["draft".to_string()],
+                    metadata: BTreeMap::new(),
+                },
+            ),
+            (
+                ExecutionOperation::PackageInstall,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::DedicatedSandbox,
+                    budget: None,
+                    placement_tags: vec!["packages".to_string()],
+                    metadata: BTreeMap::new(),
+                },
+            ),
+            (
+                ExecutionOperation::BashHelper,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::DedicatedSandbox,
+                    budget: None,
+                    placement_tags: vec!["bash".to_string()],
+                    metadata: BTreeMap::new(),
+                },
+            ),
+            (
+                ExecutionOperation::TypeCheck,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::OwnerForeground,
+                    budget: None,
+                    placement_tags: vec!["foreground".to_string()],
+                    metadata: BTreeMap::new(),
+                },
+            ),
+        ]),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn default_budget_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: Some(BudgetPolicy {
+                max_calls: Some(1),
+                max_scanned_rows: None,
+                max_returned_rows: None,
+                max_bytes: None,
+                max_millis: None,
+                rate_limit_bucket: None,
+                labels: BTreeMap::new(),
+            }),
+            placement_tags: vec!["dedicated".to_string()],
+            metadata: BTreeMap::new(),
+        },
+        operations: BTreeMap::from([(
+            ExecutionOperation::DraftSession,
+            ExecutionDomainAssignment {
+                domain: ExecutionDomain::DedicatedSandbox,
+                budget: None,
+                placement_tags: vec!["draft".to_string()],
+                metadata: BTreeMap::new(),
+            },
+        )]),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn reopen_budget_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: None,
+            placement_tags: vec!["dedicated".to_string()],
+            metadata: BTreeMap::new(),
+        },
+        operations: BTreeMap::from([(
+            ExecutionOperation::DraftSession,
+            ExecutionDomainAssignment {
+                domain: ExecutionDomain::DedicatedSandbox,
+                budget: Some(BudgetPolicy {
+                    max_calls: Some(1),
+                    max_scanned_rows: None,
+                    max_returned_rows: None,
+                    max_bytes: None,
+                    max_millis: None,
+                    rate_limit_bucket: None,
+                    labels: BTreeMap::new(),
+                }),
+                placement_tags: vec!["draft".to_string()],
+                metadata: BTreeMap::new(),
+            },
+        )]),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn concurrent_package_budget_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: None,
+            placement_tags: vec!["dedicated".to_string()],
+            metadata: BTreeMap::new(),
+        },
+        operations: BTreeMap::from([(
+            ExecutionOperation::PackageInstall,
+            ExecutionDomainAssignment {
+                domain: ExecutionDomain::DedicatedSandbox,
+                budget: Some(BudgetPolicy {
+                    max_calls: Some(2),
+                    max_scanned_rows: None,
+                    max_returned_rows: None,
+                    max_bytes: None,
+                    max_millis: None,
+                    rate_limit_bucket: None,
+                    labels: BTreeMap::new(),
+                }),
+                placement_tags: vec!["packages".to_string()],
+                metadata: BTreeMap::new(),
+            },
+        )]),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn single_package_budget_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: None,
+            placement_tags: vec!["dedicated".to_string()],
+            metadata: BTreeMap::new(),
+        },
+        operations: BTreeMap::from([(
+            ExecutionOperation::PackageInstall,
+            ExecutionDomainAssignment {
+                domain: ExecutionDomain::DedicatedSandbox,
+                budget: Some(BudgetPolicy {
+                    max_calls: Some(1),
+                    max_scanned_rows: None,
+                    max_returned_rows: None,
+                    max_bytes: None,
+                    max_millis: None,
+                    rate_limit_bucket: None,
+                    labels: BTreeMap::new(),
+                }),
+                placement_tags: vec!["packages".to_string()],
+                metadata: BTreeMap::new(),
+            },
+        )]),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn overloaded_typecheck_budget_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: None,
+            placement_tags: vec!["dedicated".to_string()],
+            metadata: BTreeMap::new(),
+        },
+        operations: BTreeMap::from([(
+            ExecutionOperation::TypeCheck,
+            ExecutionDomainAssignment {
+                domain: ExecutionDomain::OwnerForeground,
+                budget: Some(BudgetPolicy {
+                    max_calls: Some(1),
+                    max_scanned_rows: None,
+                    max_returned_rows: None,
+                    max_bytes: None,
+                    max_millis: None,
+                    rate_limit_bucket: None,
+                    labels: BTreeMap::new(),
+                }),
+                placement_tags: vec!["foreground".to_string()],
+                metadata: BTreeMap::new(),
+            },
+        )]),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn routed_execution_router() -> SandboxExecutionRouter {
+    let resource_manager = Arc::new(InMemoryResourceManager::new(
+        ExecutionDomainBudget::default(),
+    ));
+    let dedicated_typescript = Arc::new(DeterministicTypeScriptService::new(
+        "routed-typescript-dedicated",
+    ));
+    let dedicated_bash = Arc::new(
+        DeterministicBashService::new("routed-bash-dedicated")
+            .with_typescript_service(dedicated_typescript.clone()),
+    );
+
+    SandboxExecutionRouter::new(resource_manager)
+        .with_domain(
+            ExecutionDomain::DedicatedSandbox,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-tests",
+                    "dedicated",
+                ]))
+                .with_placement(ExecutionDomainPlacement::Dedicated)
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(1),
+                        weight: Some(1),
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::DraftSession,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .with_runtime(Arc::new(DeterministicRuntimeBackend::new(
+                "routed-runtime-dedicated",
+            )))
+            .with_packages(Arc::new(DeterministicPackageInstaller::new(
+                "routed-packages-dedicated",
+            )))
+            .with_bash(dedicated_bash)
+            .with_typescript(dedicated_typescript),
+        )
+        .with_domain(
+            ExecutionDomain::OwnerForeground,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-tests",
+                    "owner-foreground",
+                ]))
+                .with_placement(ExecutionDomainPlacement::SharedWeighted { weight: 3 })
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(0),
+                        weight: Some(3),
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::TypeCheck,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .with_typescript(Arc::new(DeterministicTypeScriptService::new(
+                "routed-typescript-owner-foreground",
+            ))),
+        )
 }

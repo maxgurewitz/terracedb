@@ -1,13 +1,22 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
-use terracedb::{SequenceNumber, Timestamp};
+use serde_json::Value as JsonValue;
+use terracedb::{
+    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionResourceUsage, SequenceNumber,
+    Timestamp,
+};
+use terracedb_capabilities::{BudgetPolicy, ExecutionDomain, ExecutionOperation, ExecutionPolicy};
 use terracedb_vfs::VolumeId;
 
 use crate::{CapabilityManifest, HoistMode, ReadonlyViewHandle};
 
 pub const SANDBOX_SESSION_FORMAT_VERSION: u32 = 1;
+pub const SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 pub const TERRACE_METADATA_DIR: &str = "/.terrace";
 pub const TERRACE_SESSION_METADATA_PATH: &str = "/.terrace/session.json";
+pub const TERRACE_EXECUTION_POLICY_STATE_PATH: &str = "/.terrace/execution-policy-state.json";
 pub const TERRACE_SESSION_INFO_KV_KEY: &str = "sandbox.session.info";
 pub const TERRACE_RUNTIME_CACHE_DIR: &str = "/.terrace/cache/runtime";
 pub const TERRACE_RUNTIME_MODULE_CACHE_PATH: &str = "/.terrace/cache/runtime/modules.json";
@@ -62,6 +71,21 @@ pub enum SandboxSessionState {
     Closed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxExecutionBinding {
+    pub domain: ExecutionDomain,
+    pub backend: String,
+    pub domain_path: ExecutionDomainPath,
+    pub placement: ExecutionDomainPlacement,
+    #[serde(default)]
+    pub requested_usage: ExecutionResourceUsage,
+    pub budget: Option<BudgetPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxServiceBindings {
     pub runtime_backend: String,
@@ -73,6 +97,8 @@ pub struct SandboxServiceBindings {
     pub typescript_service: String,
     #[serde(default)]
     pub bash_service: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub execution_bindings: BTreeMap<ExecutionOperation, SandboxExecutionBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +108,8 @@ pub struct SandboxSessionProvenance {
     pub git: Option<GitProvenance>,
     pub package_compat: PackageCompatibilityMode,
     pub capabilities: CapabilityManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_policy: Option<ExecutionPolicy>,
     pub active_view_handles: Vec<ReadonlyViewHandle>,
 }
 
@@ -110,6 +138,7 @@ pub struct SandboxConfig {
     pub package_compat: PackageCompatibilityMode,
     pub conflict_policy: ConflictPolicy,
     pub capabilities: CapabilityManifest,
+    pub execution_policy: Option<ExecutionPolicy>,
     pub hoisted_source: Option<HoistedSource>,
     pub git_provenance: Option<GitProvenance>,
 }
@@ -125,6 +154,7 @@ impl SandboxConfig {
             package_compat: PackageCompatibilityMode::NpmPureJs,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: CapabilityManifest::default(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         }
@@ -157,6 +187,11 @@ impl SandboxConfig {
 
     pub fn with_capabilities(mut self, capabilities: CapabilityManifest) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_execution_policy(mut self, execution_policy: ExecutionPolicy) -> Self {
+        self.execution_policy = Some(execution_policy);
         self
     }
 

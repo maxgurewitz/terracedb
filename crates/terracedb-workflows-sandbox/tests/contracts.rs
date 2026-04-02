@@ -312,6 +312,7 @@ async fn module_backed_handler_round_trips_workflow_task_v1_requests() {
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: Default::default(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
@@ -396,6 +397,7 @@ async fn module_backed_handler_surfaces_structured_rejections() {
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: Default::default(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })

@@ -121,6 +121,8 @@ Recommended layout inside the session volume:
 /workspace/                 guest-visible project root
 /.terrace/
   session.json             session metadata and config
+  execution-policy-state.json
+                           versioned reopen-time execution budget counters
   cache/
     v8/                    code cache blobs
     transpile/             transpiled TS/JS metadata

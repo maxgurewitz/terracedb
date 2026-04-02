@@ -1,21 +1,37 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
+use terracedb::{
+    DbDependencies, DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainPath,
+    ExecutionDomainPlacement, ExecutionResourceUsage, InMemoryResourceManager, StubClock,
+    StubFileSystem, StubObjectStore, StubRng, Timestamp,
+};
+use terracedb_capabilities::{
+    ExecutionDomain, ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy,
+};
 use terracedb_sandbox::{
     BashRequest, BashService, DefaultSandboxStore, DeterministicBashService,
-    DeterministicTypeScriptService, GitProvenance, PackageCompatibilityMode, PackageInstallRequest,
-    ReopenSessionOptions, SandboxConfig, SandboxServices, SandboxStore,
-    TERRACE_BASH_SESSION_STATE_PATH, TERRACE_NPM_INSTALL_MANIFEST_PATH,
-    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
-    TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH, TypeCheckRequest,
-    TypeScriptService, TypeScriptTranspileRequest,
+    DeterministicPackageInstaller, DeterministicRuntimeBackend, DeterministicTypeScriptService,
+    GitProvenance, PackageCompatibilityMode, PackageInstallRequest, ReopenSessionOptions,
+    SandboxConfig, SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter,
+    SandboxServices, SandboxStore, TERRACE_BASH_SESSION_STATE_PATH,
+    TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH,
+    TERRACE_TYPESCRIPT_STATE_PATH, TypeCheckRequest, TypeScriptService, TypeScriptTranspileRequest,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore,
 };
 
 fn sandbox_store(now: u64, seed: u64) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
+    sandbox_store_with_services(now, seed, SandboxServices::deterministic())
+}
+
+fn sandbox_store_with_services(
+    now: u64,
+    seed: u64,
+    services: SandboxServices,
+) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
     let dependencies = DbDependencies::new(
         Arc::new(StubFileSystem::default()),
         Arc::new(StubObjectStore::default()),
@@ -23,11 +39,7 @@ fn sandbox_store(now: u64, seed: u64) -> (InMemoryVfsStore, DefaultSandboxStore<
         Arc::new(StubRng::seeded(seed)),
     );
     let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
-    let sandbox = DefaultSandboxStore::new(
-        Arc::new(vfs.clone()),
-        dependencies.clock,
-        SandboxServices::deterministic(),
-    );
+    let sandbox = DefaultSandboxStore::new(Arc::new(vfs.clone()), dependencies.clock, services);
     (vfs, sandbox)
 }
 
@@ -481,6 +493,7 @@ async fn package_install_manifest_and_compatibility_view_only_survive_durable_re
             package_compat: PackageCompatibilityMode::NpmPureJs,
             conflict_policy: terracedb_sandbox::ConflictPolicy::Fail,
             capabilities: Default::default(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
@@ -564,4 +577,247 @@ async fn package_install_manifest_and_compatibility_view_only_survive_durable_re
         .await
         .expect("execute recovered package module");
     assert_eq!(result.result, Some(json!("flushedPackageInstall")));
+}
+
+#[tokio::test]
+async fn durable_recovery_preserves_execution_policy_metadata_and_routed_reopen_behavior() {
+    let policy = recovery_execution_policy();
+    let services = SandboxServices::deterministic().with_execution_router(recovery_router());
+    let (source_vfs, sandbox) = sandbox_store_with_services(150, 212, services);
+    let base_volume_id = VolumeId::new(0x8400);
+    let session_volume_id = VolumeId::new(0x8401);
+    seed_runtime_module(&source_vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(
+            SandboxConfig::new(base_volume_id, session_volume_id)
+                .with_chunk_size(4096)
+                .with_execution_policy(policy.clone()),
+        )
+        .await
+        .expect("open policy-enabled session");
+    let first = session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("execute routed module");
+    session.flush().await.expect("flush policy-enabled session");
+
+    let exported = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut");
+    let reopened_services =
+        SandboxServices::deterministic().with_execution_router(recovery_router());
+    let (recovery_vfs, recovery_sandbox) = sandbox_store_with_services(160, 213, reopened_services);
+    recovery_vfs
+        .import_volume(
+            exported,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut");
+    let reopened = recovery_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen policy-enabled durable cut");
+
+    let reopened_info = reopened.info().await;
+    assert_eq!(reopened_info.provenance.execution_policy, Some(policy));
+    assert_eq!(
+        reopened.runtime_handle().backend,
+        "recovery-runtime-dedicated"
+    );
+    assert_eq!(
+        reopened_info.services.execution_bindings[&ExecutionOperation::DraftSession]
+            .domain_path
+            .as_string(),
+        "process/sandbox-recovery/dedicated"
+    );
+    assert_eq!(
+        reopened_info.services.execution_bindings[&ExecutionOperation::TypeCheck].backend,
+        "recovery-typescript-owner-foreground"
+    );
+    assert_eq!(
+        first.metadata["execution_domain_path"],
+        json!("process/sandbox-recovery/dedicated")
+    );
+
+    let second = reopened
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("execute reopened routed module");
+    assert_eq!(second.result, Some(json!("ok")));
+    assert_eq!(
+        second.metadata["execution_domain_path"],
+        json!("process/sandbox-recovery/dedicated")
+    );
+    let third = reopened
+        .exec_module("/workspace/main.js")
+        .await
+        .expect_err("durable recovery should preserve execution call budgets");
+    assert!(matches!(
+        third,
+        terracedb_sandbox::SandboxError::Service { service, ref message }
+            if service == "execution-policy"
+                && message.contains("exceeded max_calls 2")
+    ));
+    assert_eq!(
+        reopened
+            .filesystem()
+            .read_file("/workspace/generated.txt")
+            .await
+            .expect("read generated file"),
+        Some(b"generated".to_vec())
+    );
+}
+
+fn recovery_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: None,
+            placement_tags: vec!["dedicated".to_string()],
+            metadata: Default::default(),
+        },
+        operations: [
+            (
+                ExecutionOperation::DraftSession,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::DedicatedSandbox,
+                    budget: Some(terracedb_capabilities::BudgetPolicy {
+                        max_calls: Some(2),
+                        max_scanned_rows: None,
+                        max_returned_rows: None,
+                        max_bytes: None,
+                        max_millis: None,
+                        rate_limit_bucket: None,
+                        labels: Default::default(),
+                    }),
+                    placement_tags: vec!["draft".to_string()],
+                    metadata: Default::default(),
+                },
+            ),
+            (
+                ExecutionOperation::PackageInstall,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::DedicatedSandbox,
+                    budget: None,
+                    placement_tags: vec!["packages".to_string()],
+                    metadata: Default::default(),
+                },
+            ),
+            (
+                ExecutionOperation::TypeCheck,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::OwnerForeground,
+                    budget: None,
+                    placement_tags: vec!["foreground".to_string()],
+                    metadata: Default::default(),
+                },
+            ),
+            (
+                ExecutionOperation::BashHelper,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::OwnerForeground,
+                    budget: None,
+                    placement_tags: vec!["foreground".to_string()],
+                    metadata: Default::default(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        metadata: Default::default(),
+    }
+}
+
+fn recovery_router() -> SandboxExecutionRouter {
+    let manager = Arc::new(InMemoryResourceManager::new(
+        ExecutionDomainBudget::default(),
+    ));
+    let dedicated_typescript = Arc::new(DeterministicTypeScriptService::new(
+        "recovery-typescript-dedicated",
+    ));
+    let dedicated_bash = Arc::new(
+        DeterministicBashService::new("recovery-bash-dedicated")
+            .with_typescript_service(dedicated_typescript.clone()),
+    );
+
+    SandboxExecutionRouter::new(manager)
+        .with_domain(
+            ExecutionDomain::DedicatedSandbox,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-recovery",
+                    "dedicated",
+                ]))
+                .with_placement(ExecutionDomainPlacement::Dedicated)
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(1),
+                        weight: Some(1),
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::DraftSession,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .with_runtime(Arc::new(DeterministicRuntimeBackend::new(
+                "recovery-runtime-dedicated",
+            )))
+            .with_packages(Arc::new(DeterministicPackageInstaller::new(
+                "recovery-packages-dedicated",
+            )))
+            .with_typescript(dedicated_typescript)
+            .with_bash(dedicated_bash),
+        )
+        .with_domain(
+            ExecutionDomain::OwnerForeground,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-recovery",
+                    "owner-foreground",
+                ]))
+                .with_placement(ExecutionDomainPlacement::SharedWeighted { weight: 2 })
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(1),
+                        weight: Some(2),
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::TypeCheck,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        ..Default::default()
+                    },
+                )
+                .with_usage(
+                    ExecutionOperation::BashHelper,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .with_typescript(Arc::new(DeterministicTypeScriptService::new(
+                "recovery-typescript-owner-foreground",
+            )))
+            .with_bash(Arc::new(DeterministicBashService::new(
+                "recovery-bash-owner-foreground",
+            ))),
+        )
 }

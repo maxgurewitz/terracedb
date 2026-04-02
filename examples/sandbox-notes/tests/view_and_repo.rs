@@ -10,8 +10,8 @@ use terracedb_example_sandbox_notes::{
     unique_temp_path, write_companion_project,
 };
 use terracedb_sandbox::{
-    AuthenticatedReadonlyViewRemoteEndpoint, CapabilityRegistry, HoistMode, HoistRequest,
-    ReadonlyViewClient, SandboxHarness, StaticReadonlyViewRegistry,
+    AuthenticatedReadonlyViewRemoteEndpoint, HoistMode, HoistRequest, ReadonlyViewClient,
+    SandboxHarness, StaticReadonlyViewRegistry,
 };
 use terracedb_vfs::VolumeId;
 
@@ -100,15 +100,24 @@ async fn local_and_remote_view_bridges_browse_the_example_project() {
         .expect("write companion project");
     init_example_repo(&repo, &remote);
 
-    let harness = SandboxHarness::deterministic(30, 74, app.host_git_services());
     let base_volume_id = VolumeId::new(0xa200);
     let session_volume_id = VolumeId::new(0xa201);
+    let policy_session_id = format!("view-{session_volume_id:?}");
+    let prepared = app
+        .prepare_notes_draft_session(policy_session_id.clone())
+        .expect("prepare preset session");
+    let services = app
+        .host_git_services_for_prepared_session(policy_session_id, &prepared)
+        .expect("policy-aware host git services");
+    let sandbox_manifest = services.capabilities.manifest();
+    let harness = SandboxHarness::deterministic(30, 74, services);
 
     let session = harness
         .open_session_with(base_volume_id, session_volume_id, |config| {
             config
-                .with_capabilities(app.notes_registry().manifest())
+                .with_capabilities(sandbox_manifest)
                 .with_package_compat(terracedb_sandbox::PackageCompatibilityMode::NpmPureJs)
+                .with_execution_policy(prepared.resolved.execution_policy.clone())
         })
         .await
         .expect("open session");

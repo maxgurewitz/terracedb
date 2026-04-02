@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -7,13 +8,31 @@ use std::{
     },
 };
 
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
+use terracedb::{
+    DomainBackgroundBudget, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget,
+    ExecutionDomainBudget, ExecutionDomainPath, ExecutionDomainPlacement, ExecutionResourceUsage,
+    InMemoryResourceManager,
+};
+use terracedb_capabilities::{
+    BudgetPolicy, CapabilityGrant, CapabilityPresetDescriptor, CapabilityProfileDescriptor,
+    CapabilityTemplate, CapabilityUseMetrics, CapabilityUseRequest, DeterministicPolicyEngine,
+    DeterministicRateLimiter, DeterministicSubjectResolver, ExecutionDomain,
+    ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy, PolicyDecisionRecord,
+    PolicyOutcomeKind, PolicySubject, PreparedSessionPreset, PresetBinding, ResourceKind,
+    ResourcePolicy, ResourceSelector, SessionMode, SessionPresetRequest,
+    StaticExecutionPolicyResolver, SubjectSelector,
+};
 use terracedb_sandbox::{
-    BashReport, BashRequest, CapabilityMethod0, CapabilityMethod1, CapabilityRegistry,
-    ConflictPolicy, EjectMode, EjectRequest, GitWorkspaceRequest, HoistMode, HoistRequest,
+    BashReport, BashRequest, CapabilityManifest as SandboxCapabilityManifest, CapabilityMethod0,
+    CapabilityMethod1, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
+    DeterministicPackageInstaller, DeterministicRuntimeBackend, DeterministicTypeScriptService,
+    EjectMode, EjectRequest, GitWorkspaceRequest, HoistMode, HoistRequest,
     PackageCompatibilityMode, PackageInstallRequest, PullRequestRequest, ReadonlyViewHandle,
-    ReadonlyViewRequest, SandboxCapability, SandboxError, SandboxHarness, SandboxServices,
-    SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
+    ReadonlyViewRequest, SandboxCapability, SandboxCapabilityModule, SandboxError,
+    SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter, SandboxHarness,
+    SandboxServices, SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
     TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId, VolumeStore};
@@ -22,10 +41,16 @@ use tokio::sync::Mutex;
 use crate::model::{AddCommentInput, DemoReport, ExampleComment, ExampleNote, ReviewSummary};
 
 pub const NOTES_CAPABILITY_SPECIFIER: &str = "terrace:host/notes";
+pub const NOTES_PRESET_NAME: &str = "notes-review";
+pub const NOTES_PROFILE_NAME: &str = "foreground";
 pub const REVIEW_ENTRYPOINT: &str = "/workspace/src/review.js";
 pub const TYPESCRIPT_ENTRYPOINT: &str = "/workspace/src/render.ts";
 pub const GENERATED_SUMMARY_PATH: &str = "/workspace/generated/triage-summary.json";
 pub const GENERATED_REVIEW_NOTES_PATH: &str = "/workspace/docs/review-notes.md";
+
+const NOTES_TEMPLATE_ID: &str = "host.notes.v1";
+const NOTES_SUBJECT_ID: &str = "user:sandbox-notes";
+const NOTES_TENANT_ID: &str = "example-notes";
 
 const PROJECT_FILES: &[(&str, &str)] = &[
     ("README.md", include_str!("../project-template/README.md")),
@@ -84,6 +109,423 @@ impl ExampleHostApp {
 
     pub fn host_git_services(&self) -> SandboxServices {
         SandboxServices::deterministic_with_host_git_and_capabilities(self.notes_registry())
+    }
+
+    pub fn deterministic_services_for_prepared_session(
+        &self,
+        session_id: impl Into<String>,
+        prepared: &PreparedSessionPreset,
+    ) -> Result<SandboxServices, SandboxError> {
+        Ok(SandboxServices::deterministic_with_capabilities(
+            self.prepared_notes_registry(session_id, prepared)?,
+        )
+        .with_execution_router(notes_execution_router()))
+    }
+
+    pub fn host_git_services_for_prepared_session(
+        &self,
+        session_id: impl Into<String>,
+        prepared: &PreparedSessionPreset,
+    ) -> Result<SandboxServices, SandboxError> {
+        Ok(
+            SandboxServices::deterministic_with_host_git_and_capabilities(
+                self.prepared_notes_registry(session_id, prepared)?,
+            )
+            .with_execution_router(notes_execution_router()),
+        )
+    }
+
+    pub fn notes_policy_engine(&self, session_id: impl Into<String>) -> DeterministicPolicyEngine {
+        let session_id = session_id.into();
+        let execution_policy = notes_execution_policy();
+        DeterministicPolicyEngine::new(
+            vec![notes_template()],
+            vec![notes_grant()],
+            DeterministicSubjectResolver::default().with_session_subject(
+                session_id,
+                PolicySubject {
+                    subject_id: NOTES_SUBJECT_ID.to_string(),
+                    tenant_id: Some(NOTES_TENANT_ID.to_string()),
+                    groups: vec!["example-host".to_string()],
+                    attributes: BTreeMap::from([("app".to_string(), "sandbox-notes".to_string())]),
+                },
+            ),
+            StaticExecutionPolicyResolver::new(execution_policy.clone())
+                .with_policy(SessionMode::Draft, execution_policy.clone())
+                .with_preset_policy(NOTES_PRESET_NAME, execution_policy.clone())
+                .with_profile_policy(NOTES_PROFILE_NAME, execution_policy.clone()),
+        )
+        .with_preset(notes_preset())
+        .with_profile(notes_profile())
+        .with_rate_limiter(DeterministicRateLimiter::default())
+    }
+
+    pub fn prepare_notes_draft_session(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<PreparedSessionPreset, SandboxError> {
+        let session_id = session_id.into();
+        self.notes_policy_engine(session_id.clone())
+            .prepare_session_from_preset(&SessionPresetRequest {
+                subject: terracedb_capabilities::SubjectResolutionRequest {
+                    session_id,
+                    auth_subject_hint: Some(NOTES_SUBJECT_ID.to_string()),
+                    tenant_hint: Some(NOTES_TENANT_ID.to_string()),
+                    groups: vec!["example-host".to_string()],
+                    attributes: BTreeMap::new(),
+                },
+                preset_name: NOTES_PRESET_NAME.to_string(),
+                profile_name: Some(NOTES_PROFILE_NAME.to_string()),
+                session_mode_override: Some(SessionMode::Draft),
+                binding_overrides: Vec::new(),
+                metadata: BTreeMap::from([("surface".to_string(), JsonValue::from("example"))]),
+            })
+            .map_err(|error| SandboxError::Service {
+                service: "sandbox-notes",
+                message: format!("prepare notes preset session: {error}"),
+            })
+    }
+
+    pub fn sandbox_manifest_for_prepared_session(
+        &self,
+        session_id: impl Into<String>,
+        prepared: &PreparedSessionPreset,
+    ) -> Result<SandboxCapabilityManifest, SandboxError> {
+        Ok(self
+            .prepared_notes_registry(session_id, prepared)?
+            .manifest())
+    }
+
+    fn prepared_notes_registry(
+        &self,
+        session_id: impl Into<String>,
+        prepared: &PreparedSessionPreset,
+    ) -> Result<Arc<dyn CapabilityRegistry>, SandboxError> {
+        Ok(Arc::new(PreparedNotesPolicyRegistry::new(
+            self.notes_registry(),
+            session_id.into(),
+            prepared,
+        )?))
+    }
+}
+
+#[derive(Clone)]
+struct PreparedNotesPolicyRegistry {
+    inner: Arc<NotesRegistry>,
+    session_id: String,
+    manifest: SandboxCapabilityManifest,
+    modules: BTreeMap<String, SandboxCapabilityModule>,
+    prepared: PreparedSessionPreset,
+    call_counts: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+impl PreparedNotesPolicyRegistry {
+    fn new(
+        inner: Arc<NotesRegistry>,
+        session_id: String,
+        prepared: &PreparedSessionPreset,
+    ) -> Result<Self, SandboxError> {
+        let available = inner.manifest();
+        let mut capabilities = Vec::new();
+        let mut modules = BTreeMap::new();
+        for binding in &prepared.resolved.manifest.bindings {
+            let mut capability = available
+                .get(&binding.module_specifier)
+                .cloned()
+                .ok_or_else(|| SandboxError::CapabilityUnavailable {
+                    specifier: binding.module_specifier.clone(),
+                })?;
+            capability.metadata.extend(capability_policy_metadata(
+                prepared,
+                &binding.binding_name,
+                None,
+            )?);
+            capabilities.push(capability.clone());
+            if let Some(mut module) = inner.module(&binding.module_specifier) {
+                module.capability = capability;
+                module.metadata.extend(capability_policy_metadata(
+                    prepared,
+                    &binding.binding_name,
+                    None,
+                )?);
+                modules.insert(binding.module_specifier.clone(), module);
+            }
+        }
+
+        Ok(Self {
+            inner,
+            session_id,
+            manifest: SandboxCapabilityManifest { capabilities },
+            modules,
+            prepared: prepared.clone(),
+            call_counts: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    fn binding_for_specifier(
+        &self,
+        specifier: &str,
+    ) -> Option<&terracedb_capabilities::ManifestBinding> {
+        self.prepared
+            .resolved
+            .manifest
+            .bindings
+            .iter()
+            .find(|binding| binding.module_specifier == specifier)
+    }
+
+    async fn policy_decision_for(
+        &self,
+        session: &SandboxSession,
+        request: &terracedb_sandbox::CapabilityCallRequest,
+    ) -> Result<PolicyDecisionRecord, SandboxError> {
+        let binding = self
+            .binding_for_specifier(&request.specifier)
+            .ok_or_else(|| SandboxError::CapabilityDenied {
+                specifier: request.specifier.clone(),
+            })?;
+        let call_count = {
+            let mut counts = self.call_counts.lock().await;
+            let next = counts
+                .entry(binding.binding_name.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            *next
+        };
+        let requested_at = session.info().await.updated_at;
+        Ok(self.prepared.resolved.evaluate_use(&CapabilityUseRequest {
+            session_id: self.session_id.clone(),
+            operation: ExecutionOperation::DraftSession,
+            binding_name: binding.binding_name.clone(),
+            capability_family: Some(binding.capability_family.clone()),
+            targets: Vec::new(),
+            metrics: CapabilityUseMetrics {
+                call_count,
+                ..CapabilityUseMetrics::default()
+            },
+            requested_at,
+            metadata: BTreeMap::from([
+                (
+                    "capability_specifier".to_string(),
+                    JsonValue::String(request.specifier.clone()),
+                ),
+                (
+                    "capability_method".to_string(),
+                    JsonValue::String(request.method.clone()),
+                ),
+            ]),
+        }))
+    }
+}
+
+#[async_trait]
+impl CapabilityRegistry for PreparedNotesPolicyRegistry {
+    fn manifest(&self) -> SandboxCapabilityManifest {
+        self.manifest.clone()
+    }
+
+    fn resolve(&self, specifier: &str) -> Option<SandboxCapability> {
+        self.manifest.get(specifier).cloned()
+    }
+
+    fn module(&self, specifier: &str) -> Option<SandboxCapabilityModule> {
+        self.modules.get(specifier).cloned()
+    }
+
+    async fn invoke(
+        &self,
+        session: &SandboxSession,
+        request: terracedb_sandbox::CapabilityCallRequest,
+    ) -> Result<terracedb_sandbox::CapabilityCallResult, SandboxError> {
+        let decision = self.policy_decision_for(session, &request).await?;
+        match decision.outcome.outcome {
+            PolicyOutcomeKind::Allowed => {
+                let binding_name = decision.audit.binding_name.clone();
+                let mut result = self.inner.invoke(session, request).await?;
+                result.metadata.extend(capability_policy_metadata(
+                    &self.prepared,
+                    &binding_name,
+                    Some(&decision),
+                )?);
+                Ok(result)
+            }
+            PolicyOutcomeKind::MissingBinding
+            | PolicyOutcomeKind::Denied
+            | PolicyOutcomeKind::NotVisible => Err(SandboxError::CapabilityDenied {
+                specifier: request.specifier,
+            }),
+            PolicyOutcomeKind::RateLimited | PolicyOutcomeKind::BudgetExhausted => {
+                Err(SandboxError::Service {
+                    service: "sandbox-notes",
+                    message: decision
+                        .outcome
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "prepared preset policy rejected the call".to_string()),
+                })
+            }
+        }
+    }
+}
+
+fn notes_execution_router() -> SandboxExecutionRouter {
+    let process_budget = ExecutionDomainBudget {
+        cpu: DomainCpuBudget {
+            worker_slots: Some(8),
+            weight: Some(1),
+        },
+        memory: DomainMemoryBudget {
+            total_bytes: Some(8 * 1024 * 1024),
+            ..Default::default()
+        },
+        io: DomainIoBudget {
+            local_concurrency: Some(8),
+            ..Default::default()
+        },
+        background: DomainBackgroundBudget {
+            task_slots: Some(8),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let resource_manager = Arc::new(InMemoryResourceManager::new(process_budget));
+
+    let dedicated_runtime_domain = ExecutionDomain::DedicatedSandbox;
+    let dedicated_runtime_name = format!(
+        "notes-runtime-{}",
+        execution_domain_label(dedicated_runtime_domain)
+    );
+    let dedicated_package_name = format!(
+        "notes-packages-{}",
+        execution_domain_label(dedicated_runtime_domain)
+    );
+
+    let owner_foreground_domain = ExecutionDomain::OwnerForeground;
+    let owner_typescript_name = format!(
+        "notes-typescript-{}",
+        execution_domain_label(owner_foreground_domain)
+    );
+    let owner_bash_name = format!(
+        "notes-bash-{}",
+        execution_domain_label(owner_foreground_domain)
+    );
+
+    let owner_typescript: Arc<dyn terracedb_sandbox::TypeScriptService> =
+        Arc::new(DeterministicTypeScriptService::new(owner_typescript_name));
+    let owner_bash = Arc::new(
+        DeterministicBashService::new(owner_bash_name)
+            .with_typescript_service(owner_typescript.clone()),
+    );
+
+    SandboxExecutionRouter::new(resource_manager)
+        .with_domain(
+            ExecutionDomain::DedicatedSandbox,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-notes",
+                    "dedicated-sandbox",
+                ]))
+                .with_placement(ExecutionDomainPlacement::Dedicated)
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(1),
+                        weight: Some(1),
+                    },
+                    memory: DomainMemoryBudget {
+                        total_bytes: Some(512 * 1024),
+                        ..Default::default()
+                    },
+                    io: DomainIoBudget {
+                        local_concurrency: Some(2),
+                        ..Default::default()
+                    },
+                    background: DomainBackgroundBudget {
+                        task_slots: Some(2),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::DraftSession,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        memory_bytes: 256 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_usage(
+                    ExecutionOperation::PackageInstall,
+                    ExecutionResourceUsage {
+                        background_tasks: 1,
+                        local_io_concurrency: 1,
+                        memory_bytes: 128 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_metadata("terracedb.execution.class", "dedicated-sandbox"),
+            )
+            .with_runtime(Arc::new(DeterministicRuntimeBackend::new(
+                dedicated_runtime_name,
+            )))
+            .with_packages(Arc::new(DeterministicPackageInstaller::new(
+                dedicated_package_name,
+            ))),
+        )
+        .with_domain(
+            ExecutionDomain::OwnerForeground,
+            SandboxExecutionDomainRoute::new(
+                SandboxExecutionPlacement::new(ExecutionDomainPath::new([
+                    "process",
+                    "sandbox-notes",
+                    "owner-foreground",
+                ]))
+                .with_placement(ExecutionDomainPlacement::SharedWeighted { weight: 3 })
+                .with_budget(ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(2),
+                        weight: Some(3),
+                    },
+                    memory: DomainMemoryBudget {
+                        total_bytes: Some(512 * 1024),
+                        ..Default::default()
+                    },
+                    io: DomainIoBudget {
+                        local_concurrency: Some(4),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .with_usage(
+                    ExecutionOperation::TypeCheck,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        memory_bytes: 96 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_usage(
+                    ExecutionOperation::BashHelper,
+                    ExecutionResourceUsage {
+                        cpu_workers: 1,
+                        memory_bytes: 32 * 1024,
+                        ..Default::default()
+                    },
+                )
+                .with_metadata("terracedb.execution.class", "owner-foreground"),
+            )
+            .with_typescript(owner_typescript)
+            .with_bash(owner_bash),
+        )
+}
+
+fn execution_domain_label(domain: ExecutionDomain) -> &'static str {
+    match domain {
+        ExecutionDomain::OwnerForeground => "owner-foreground",
+        ExecutionDomain::SharedBackground => "shared-background",
+        ExecutionDomain::DedicatedSandbox => "dedicated-sandbox",
+        ExecutionDomain::ProductionIsolate => "production-isolate",
+        ExecutionDomain::RemoteWorker => "remote-worker",
     }
 }
 
@@ -315,15 +757,20 @@ pub async fn read_summary_from_session(
 
 pub async fn run_demo() -> Result<DemoReport, SandboxError> {
     let app = ExampleHostApp::sample();
-    let harness = SandboxHarness::deterministic(1_000, 41, app.deterministic_services());
     let base_volume_id = VolumeId::new(0x5a00);
     let session_volume_id = VolumeId::new(0x5a01);
+    let policy_session_id = format!("sandbox-notes-demo-{session_volume_id}");
+    let prepared = app.prepare_notes_draft_session(policy_session_id.clone())?;
+    let services = app.deterministic_services_for_prepared_session(policy_session_id, &prepared)?;
+    let sandbox_manifest = services.capabilities.manifest();
+    let harness = SandboxHarness::deterministic(1_000, 41, services);
     let session = harness
         .open_session_with(base_volume_id, session_volume_id, |config| {
             config
                 .with_chunk_size(4096)
                 .with_package_compat(PackageCompatibilityMode::NpmPureJs)
-                .with_capabilities(app.notes_registry().manifest())
+                .with_capabilities(sandbox_manifest)
+                .with_execution_policy(prepared.resolved.execution_policy.clone())
         })
         .await?;
 
@@ -401,6 +848,189 @@ pub async fn guest_add_comment(
             service: "sandbox-notes",
             message: "guest capability call should return a result".to_string(),
         })?)
+}
+
+fn notes_template() -> CapabilityTemplate {
+    CapabilityTemplate {
+        template_id: NOTES_TEMPLATE_ID.to_string(),
+        capability_family: "sandbox.notes.v1".to_string(),
+        default_binding: "notes".to_string(),
+        description: Some("Read and update the example host note store.".to_string()),
+        default_resource_policy: ResourcePolicy {
+            allow: vec![ResourceSelector {
+                kind: ResourceKind::Custom,
+                pattern: "notes".to_string(),
+            }],
+            deny: vec![],
+            tenant_scopes: vec![NOTES_TENANT_ID.to_string()],
+            row_scope_binding: None,
+            visibility_index: None,
+            metadata: BTreeMap::from([("example".to_string(), JsonValue::from(true))]),
+        },
+        default_budget_policy: BudgetPolicy {
+            max_calls: Some(16),
+            max_scanned_rows: None,
+            max_returned_rows: None,
+            max_bytes: Some(8192),
+            max_millis: Some(500),
+            rate_limit_bucket: Some("notes-draft".to_string()),
+            labels: BTreeMap::from([("surface".to_string(), "example".to_string())]),
+        },
+        expose_in_just_bash: false,
+        metadata: BTreeMap::from([("example".to_string(), JsonValue::from("sandbox-notes"))]),
+    }
+}
+
+fn notes_grant() -> CapabilityGrant {
+    CapabilityGrant {
+        grant_id: "grant-notes-example".to_string(),
+        subject: SubjectSelector::Exact {
+            subject_id: NOTES_SUBJECT_ID.to_string(),
+        },
+        template_id: NOTES_TEMPLATE_ID.to_string(),
+        binding_name: Some("notes".to_string()),
+        resource_policy: None,
+        budget_policy: None,
+        allow_interactive_widening: false,
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn notes_execution_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        default_assignment: ExecutionDomainAssignment {
+            domain: ExecutionDomain::DedicatedSandbox,
+            budget: Some(BudgetPolicy {
+                max_calls: Some(32),
+                max_scanned_rows: None,
+                max_returned_rows: None,
+                max_bytes: Some(16_384),
+                max_millis: Some(1_000),
+                rate_limit_bucket: Some("notes-draft".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "draft".to_string())]),
+            }),
+            placement_tags: vec!["example".to_string(), "draft".to_string()],
+            metadata: BTreeMap::new(),
+        },
+        operations: BTreeMap::from([
+            (
+                ExecutionOperation::DraftSession,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::DedicatedSandbox,
+                    budget: None,
+                    placement_tags: vec!["foreground".to_string()],
+                    metadata: BTreeMap::new(),
+                },
+            ),
+            (
+                ExecutionOperation::BashHelper,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::OwnerForeground,
+                    budget: None,
+                    placement_tags: vec!["tooling".to_string()],
+                    metadata: BTreeMap::new(),
+                },
+            ),
+            (
+                ExecutionOperation::TypeCheck,
+                ExecutionDomainAssignment {
+                    domain: ExecutionDomain::OwnerForeground,
+                    budget: None,
+                    placement_tags: vec!["tooling".to_string()],
+                    metadata: BTreeMap::new(),
+                },
+            ),
+        ]),
+        metadata: BTreeMap::from([("example".to_string(), JsonValue::from("sandbox-notes"))]),
+    }
+}
+
+fn notes_preset() -> CapabilityPresetDescriptor {
+    CapabilityPresetDescriptor {
+        name: NOTES_PRESET_NAME.to_string(),
+        description: Some("Named preset for the sandbox-notes authoring flow.".to_string()),
+        bindings: vec![PresetBinding {
+            template_id: NOTES_TEMPLATE_ID.to_string(),
+            binding_name: Some("notes".to_string()),
+            resource_policy: Some(ResourcePolicy {
+                allow: vec![ResourceSelector {
+                    kind: ResourceKind::Custom,
+                    pattern: "notes".to_string(),
+                }],
+                deny: vec![],
+                tenant_scopes: vec![NOTES_TENANT_ID.to_string()],
+                row_scope_binding: None,
+                visibility_index: None,
+                metadata: BTreeMap::new(),
+            }),
+            budget_policy: Some(BudgetPolicy {
+                max_calls: Some(8),
+                max_scanned_rows: None,
+                max_returned_rows: None,
+                max_bytes: Some(4096),
+                max_millis: Some(250),
+                rate_limit_bucket: Some("notes-draft".to_string()),
+                labels: BTreeMap::new(),
+            }),
+            expose_in_just_bash: Some(false),
+        }],
+        default_session_mode: SessionMode::Draft,
+        default_execution_policy: Some(notes_execution_policy()),
+        metadata: BTreeMap::from([("example".to_string(), JsonValue::from("sandbox-notes"))]),
+    }
+}
+
+fn notes_profile() -> CapabilityProfileDescriptor {
+    CapabilityProfileDescriptor {
+        name: NOTES_PROFILE_NAME.to_string(),
+        preset_name: NOTES_PRESET_NAME.to_string(),
+        add_bindings: vec![],
+        drop_bindings: vec![],
+        execution_policy_override: Some(notes_execution_policy()),
+        metadata: BTreeMap::from([("profile".to_string(), JsonValue::from("foreground"))]),
+    }
+}
+
+fn capability_policy_metadata(
+    prepared: &PreparedSessionPreset,
+    binding_name: &str,
+    decision: Option<&PolicyDecisionRecord>,
+) -> Result<BTreeMap<String, JsonValue>, SandboxError> {
+    let mut metadata = BTreeMap::from([
+        (
+            "binding_name".to_string(),
+            JsonValue::String(binding_name.to_string()),
+        ),
+        (
+            "preset_name".to_string(),
+            JsonValue::String(prepared.preset.name.clone()),
+        ),
+        (
+            "expanded_manifest".to_string(),
+            serde_json::to_value(&prepared.resolved.manifest)?,
+        ),
+        (
+            "execution_policy".to_string(),
+            serde_json::to_value(&prepared.resolved.execution_policy)?,
+        ),
+    ]);
+    if let Some(profile) = prepared.profile.as_ref() {
+        metadata.insert(
+            "profile_name".to_string(),
+            JsonValue::String(profile.name.clone()),
+        );
+    }
+    if let Some(decision) = decision {
+        metadata.insert(
+            "policy_outcome".to_string(),
+            serde_json::to_value(&decision.outcome)?,
+        );
+        metadata.insert(
+            "policy_audit".to_string(),
+            serde_json::to_value(&decision.audit)?,
+        );
+    }
+    Ok(metadata)
 }
 
 fn notes_capability() -> SandboxCapability {

@@ -519,6 +519,7 @@ fn run_cross_cutting_simulation(seed: u64) -> turmoil::Result<CrossCuttingSimula
                     package_compat: PackageCompatibilityMode::NpmPureJs,
                     conflict_policy: ConflictPolicy::Fail,
                     capabilities: capabilities.manifest(),
+                    execution_policy: None,
                     hoisted_source: None,
                     git_provenance: None,
                 })
@@ -1196,6 +1197,7 @@ async fn deterministic_git_stub_matches_host_workspace_contract_on_shared_metada
         package_compat: PackageCompatibilityMode::NpmPureJs,
         conflict_policy: ConflictPolicy::Fail,
         capabilities: Default::default(),
+        execution_policy: None,
         hoisted_source: None,
         git_provenance: Some(GitProvenance {
             repo_root: repo.to_string_lossy().into_owned(),
