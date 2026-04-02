@@ -210,17 +210,16 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
         .expect("install packages");
     assert_eq!(package_report.packages, vec!["lodash", "zod"]);
 
-    let git_report = session
-        .prepare_git_workspace(terracedb_sandbox::GitWorkspaceRequest {
-            branch_name: "sandbox/feature".to_string(),
-            base_branch: Some("main".to_string()),
-            target_path: "/tmp/export".to_string(),
-        })
+    let git_error = session
+        .git_head()
         .await
-        .expect("prepare git workspace");
-    assert_eq!(git_report.workspace_path, "/tmp/export");
+        .expect_err("git should require provenance");
+    assert!(matches!(
+        git_error,
+        terracedb_sandbox::SandboxError::MissingGitProvenance
+    ));
 
-    let pr_report = session
+    let pr_error = session
         .create_pull_request(terracedb_sandbox::PullRequestRequest {
             title: "Sandbox PR".to_string(),
             body: "Body".to_string(),
@@ -228,7 +227,27 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
             base_branch: "main".to_string(),
         })
         .await
-        .expect("create pull request");
+        .expect_err("repo-backed PR should fail closed without an imported repo image");
+    assert!(matches!(
+        pr_error,
+        terracedb_sandbox::SandboxError::MissingGitProvenance
+    ));
+
+    let legacy_session = sandbox_store
+        .open_session(
+            SandboxConfig::new(base_volume_id, VolumeId::new(0x5002)).with_chunk_size(4096),
+        )
+        .await
+        .expect("open legacy pull request session");
+    let pr_report = legacy_session
+        .create_pull_request(terracedb_sandbox::PullRequestRequest {
+            title: "Sandbox PR".to_string(),
+            body: "Body".to_string(),
+            head_branch: "sandbox/feature".to_string(),
+            base_branch: "main".to_string(),
+        })
+        .await
+        .expect("create legacy pull request");
     assert!(pr_report.url.contains("example.invalid"));
 
     let view = session
@@ -341,7 +360,7 @@ fn metadata_and_view_uri_round_trip() {
         services: terracedb_sandbox::SandboxServiceBindings {
             runtime_backend: "deterministic-runtime".to_string(),
             package_installer: "deterministic-packages".to_string(),
-            git_workspace_manager: "deterministic-git".to_string(),
+            git_repository_store: "deterministic-git".to_string(),
             pull_request_provider: "deterministic-pr".to_string(),
             readonly_view_provider: "deterministic-view".to_string(),
             typescript_service: "deterministic-typescript".to_string(),

@@ -352,6 +352,32 @@ pub struct GitRefUpdateReport {
     pub previous_target: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitRequest {
+    pub target_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub require_changes: bool,
+    #[serde(default)]
+    pub update_head: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitReport {
+    pub target_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_target: Option<String>,
+    pub commit_oid: String,
+    pub tree_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_oid: Option<String>,
+    #[serde(default)]
+    pub committed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitExportRequest {
     pub target_path: String,

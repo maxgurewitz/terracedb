@@ -35,10 +35,6 @@ pub use disk::{
 };
 pub use error::SandboxError;
 pub use fs::{SandboxFilesystemShim, VfsSandboxFilesystemShim};
-pub use git::{
-    DeterministicGitWorkspaceManager, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest,
-    HostGitWorkspaceManager,
-};
 pub use harness::SandboxHarness;
 pub use loader::{
     HOST_CAPABILITY_PREFIX, LoadedSandboxModule, SANDBOX_BASH_LIBRARY_SPECIFIER,
@@ -91,4 +87,12 @@ pub use view::{
     ReadonlyViewRequest, ReadonlyViewService, ReadonlyViewSessionRegistry,
     ReadonlyViewSessionSummary, ReadonlyViewStat, RemoteReadonlyViewBridge,
     StaticReadonlyViewRegistry,
+};
+
+pub use terracedb_git::{
+    DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
+    GitCheckoutRequest, GitCommitReport, GitDiffReport, GitDiffRequest, GitHeadState,
+    GitHostBridge, GitPullRequestReport as SandboxGitPullRequestReport, GitPushReport,
+    GitRefUpdate, GitRefUpdateReport, GitReference, GitRepositoryStore, GitStatusOptions,
+    GitStatusReport, HostGitBridge,
 };

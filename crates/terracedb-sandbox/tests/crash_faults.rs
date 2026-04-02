@@ -14,9 +14,9 @@ use terracedb_sandbox::{
     ConflictPolicy, DefaultSandboxStore, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
     DeterministicRuntimeBackend, DeterministicTypeScriptService, GitProvenance, HoistMode,
-    HoistRequest, HostGitWorkspaceManager, PackageCompatibilityMode, PullRequestRequest,
-    ReadonlyViewCut, ReadonlyViewRequest, ReopenSessionOptions, SandboxConfig, SandboxError,
-    SandboxServices, SandboxStore, TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH,
+    HoistRequest, PackageCompatibilityMode, PullRequestRequest, ReadonlyViewCut,
+    ReadonlyViewRequest, ReopenSessionOptions, SandboxConfig, SandboxError, SandboxServices,
+    SandboxStore, TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH,
     TERRACE_TYPESCRIPT_STATE_PATH, TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR, TypeCheckRequest,
     TypeScriptService, TypeScriptTranspileRequest,
 };
@@ -55,10 +55,11 @@ fn host_git_services() -> SandboxServices {
     SandboxServices::new(
         Arc::new(DeterministicRuntimeBackend::default()),
         Arc::new(DeterministicPackageInstaller::default()),
-        Arc::new(HostGitWorkspaceManager::default().with_bridge(bridge)),
+        Arc::new(terracedb_sandbox::DeterministicGitRepositoryStore::default()),
         Arc::new(DeterministicPullRequestProviderClient::default()),
         Arc::new(DeterministicReadonlyViewProvider::default()),
     )
+    .with_git_host_bridge(bridge)
 }
 
 async fn create_empty_base(
@@ -685,8 +686,6 @@ async fn pr_export_bookkeeping_tool_runs_only_survive_durable_recovery_after_flu
     let after_tools = chronological_tool_names(&after_flush)
         .await
         .expect("read durable tool names after flush");
-    assert!(after_tools.contains(&"sandbox.git.prepare_workspace".to_string()));
-    assert!(after_tools.contains(&"sandbox.disk.eject".to_string()));
     assert!(after_tools.contains(&"sandbox.pr.create".to_string()));
 
     cleanup(&repo);

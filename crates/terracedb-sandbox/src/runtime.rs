@@ -6,6 +6,7 @@ use std::{
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use terracedb_git::{GitCheckoutRequest, GitDiffRequest, GitRefUpdate, GitStatusOptions};
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, FixedJsClock, JsCompatibilityProfile,
     JsExecutionKind, JsExecutionRequest, JsForkPolicy, JsHostServiceAdapter, JsHostServiceRequest,
@@ -461,22 +462,69 @@ impl SandboxGitHostServiceAdapter {
             });
         }
         match request.operation.as_str() {
-            "prepareWorkspace" => {
-                let args = host_service_argument::<GitHostPrepareWorkspaceRequest>(&request)?;
-                let report = self
-                    .session
-                    .prepare_git_workspace(crate::GitWorkspaceRequest {
-                        branch_name: args.branch_name,
-                        base_branch: args.base_branch,
-                        target_path: args.target_path,
-                    })
-                    .await
-                    .map_err(|error| sandbox_error_to_js_host_service(&request, error))?;
-                Ok(JsHostServiceResponse {
-                    result: Some(serde_json::to_value(report)?),
-                    metadata: BTreeMap::new(),
-                })
-            }
+            "head" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_head()
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "listRefs" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_list_refs()
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "status" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_status(
+                            host_service_optional_argument::<GitHostStatusRequest>(&request)?
+                                .into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "diff" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_diff(
+                            host_service_optional_argument::<GitHostDiffRequest>(&request)?.into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "checkout" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_checkout(
+                            host_service_argument::<GitHostCheckoutRequest>(&request)?.into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "updateRef" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_update_ref(
+                            host_service_argument::<GitHostUpdateRefRequest>(&request)?.into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
             "createPullRequest" => {
                 let args = host_service_argument::<GitHostCreatePullRequestRequest>(&request)?;
                 let report = self
@@ -518,20 +566,97 @@ impl JsHostServiceAdapter for SandboxGitHostServiceAdapter {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GitHostPrepareWorkspaceRequest {
-    branch_name: String,
-    #[serde(default)]
-    base_branch: Option<String>,
-    target_path: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GitHostCreatePullRequestRequest {
     title: String,
     body: String,
     head_branch: String,
     base_branch: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct GitHostStatusRequest {
+    pathspec: Vec<String>,
+    include_untracked: Option<bool>,
+    include_ignored: Option<bool>,
+}
+
+impl From<GitHostStatusRequest> for GitStatusOptions {
+    fn from(value: GitHostStatusRequest) -> Self {
+        let defaults = GitStatusOptions::default();
+        Self {
+            pathspec: value.pathspec,
+            include_untracked: value
+                .include_untracked
+                .unwrap_or(defaults.include_untracked),
+            include_ignored: value.include_ignored.unwrap_or(defaults.include_ignored),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct GitHostDiffRequest {
+    pathspec: Vec<String>,
+    include_untracked: Option<bool>,
+    include_ignored: Option<bool>,
+}
+
+impl From<GitHostDiffRequest> for GitDiffRequest {
+    fn from(value: GitHostDiffRequest) -> Self {
+        let defaults = GitDiffRequest::default();
+        Self {
+            pathspec: value.pathspec,
+            include_untracked: value
+                .include_untracked
+                .unwrap_or(defaults.include_untracked),
+            include_ignored: value.include_ignored.unwrap_or(defaults.include_ignored),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostCheckoutRequest {
+    target_ref: String,
+    materialize_path: String,
+    #[serde(default)]
+    pathspec: Vec<String>,
+    #[serde(default)]
+    update_head: bool,
+}
+
+impl From<GitHostCheckoutRequest> for GitCheckoutRequest {
+    fn from(value: GitHostCheckoutRequest) -> Self {
+        Self {
+            target_ref: value.target_ref,
+            materialize_path: value.materialize_path,
+            pathspec: value.pathspec,
+            update_head: value.update_head,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostUpdateRefRequest {
+    name: String,
+    target: String,
+    #[serde(default)]
+    previous_target: Option<String>,
+    #[serde(default)]
+    symbolic: bool,
+}
+
+impl From<GitHostUpdateRefRequest> for GitRefUpdate {
+    fn from(value: GitHostUpdateRefRequest) -> Self {
+        Self {
+            name: value.name,
+            target: value.target,
+            previous_target: value.previous_target,
+            symbolic: value.symbolic,
+        }
+    }
 }
 
 async fn open_js_runtime(
@@ -825,6 +950,23 @@ where
         JsonValue::Array(values) => values.first().cloned().unwrap_or(JsonValue::Null),
         other => other.clone(),
     };
+    serde_json::from_value(value).map_err(|error| JsSubstrateError::EvaluationFailed {
+        entrypoint: format!("{}::{}", request.service, request.operation),
+        message: format!("invalid host service arguments: {error}"),
+    })
+}
+
+fn host_service_optional_argument<T>(request: &JsHostServiceRequest) -> Result<T, JsSubstrateError>
+where
+    T: DeserializeOwned + Default,
+{
+    let value = match &request.arguments {
+        JsonValue::Array(values) => values.first().cloned().unwrap_or(JsonValue::Null),
+        other => other.clone(),
+    };
+    if value.is_null() {
+        return Ok(T::default());
+    }
     serde_json::from_value(value).map_err(|error| JsSubstrateError::EvaluationFailed {
         entrypoint: format!("{}::{}", request.service, request.operation),
         message: format!("invalid host service arguments: {error}"),

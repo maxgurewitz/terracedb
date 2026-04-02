@@ -30,6 +30,8 @@ pub enum GitSubstrateError {
     InvalidObject { oid: String, message: String },
     #[error("git repository {repository_id} was cancelled")]
     Cancelled { repository_id: String },
+    #[error("git repository has no changes to commit for {target_ref}")]
+    NoChanges { target_ref: String },
     #[error("git export conflict at {path}: {message}")]
     ExportConflict { path: String, message: String },
     #[error("git remote push failed for {remote}/{branch}: {message}")]

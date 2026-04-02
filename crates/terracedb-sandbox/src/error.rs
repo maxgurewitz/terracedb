@@ -73,6 +73,10 @@ pub enum SandboxError {
     MissingHoistProvenance,
     #[error("sandbox session does not have git provenance for this operation")]
     MissingGitProvenance,
+    #[error("sandbox session does not have a git remote for repo-backed push or pull request")]
+    MissingGitRemote,
+    #[error("sandbox git operation has no repository changes to commit for {target_ref}")]
+    NoGitChanges { target_ref: String },
     #[error("host path error at {path}: {message}")]
     Io { path: String, message: String },
     #[error("command failed: {command} (status: {status:?}): {stderr}")]

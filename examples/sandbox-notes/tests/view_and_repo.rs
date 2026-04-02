@@ -1,9 +1,4 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::Arc,
-};
+use std::{fs, path::Path, process::Command, sync::Arc};
 
 use terracedb_example_sandbox_notes::{
     ExampleHostApp, cleanup, install_example_packages, run_example_bash, run_example_review,
@@ -45,23 +40,6 @@ fn git(dir: &Path, args: &[&str]) {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    let output = sanitized_git_command()
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git -C {} {} failed: {}",
-        dir.display(),
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn init_example_repo(repo: &Path, remote: &Path) {
@@ -189,12 +167,6 @@ async fn local_and_remote_view_bridges_browse_the_example_project() {
         })
         .await
         .expect("create pull request");
-    let workspace = PathBuf::from(
-        pr.metadata
-            .get("workspace_path")
-            .and_then(|value| value.as_str())
-            .expect("workspace path"),
-    );
 
     assert_eq!(
         pr.metadata.get("committed"),
@@ -204,15 +176,24 @@ async fn local_and_remote_view_bridges_browse_the_example_project() {
         pr.metadata.get("pushed"),
         Some(&serde_json::Value::Bool(true))
     );
-    assert!(
-        fs::read_to_string(workspace.join("generated/triage-summary.json"))
-            .expect("read exported summary")
-            .contains("documentRepoExportFlow")
-    );
-    assert_eq!(
-        git_stdout(&workspace, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        "sandbox/example-notes"
-    );
+    assert!(pr.metadata.get("workspace_path").is_none());
+    assert!({
+        let remote_summary = sanitized_git_command()
+            .arg("--git-dir")
+            .arg(&remote)
+            .args([
+                "show",
+                "refs/heads/sandbox/example-notes:generated/triage-summary.json",
+            ])
+            .output()
+            .expect("read pushed summary");
+        assert!(
+            remote_summary.status.success(),
+            "expected pushed summary: {}",
+            String::from_utf8_lossy(&remote_summary.stderr)
+        );
+        String::from_utf8_lossy(&remote_summary.stdout).contains("documentRepoExportFlow")
+    });
     let remote_branch = sanitized_git_command()
         .arg("--git-dir")
         .arg(&remote)
@@ -227,5 +208,4 @@ async fn local_and_remote_view_bridges_browse_the_example_project() {
 
     cleanup(&repo);
     cleanup(&remote);
-    cleanup(&workspace);
 }

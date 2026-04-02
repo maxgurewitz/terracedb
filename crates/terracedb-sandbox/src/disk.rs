@@ -5,6 +5,9 @@ use std::{
     process::Command,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use serde::{Deserialize, Serialize};
 use terracedb_vfs::{
     CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, VfsError, VfsFileSystem, Volume,
@@ -124,6 +127,7 @@ pub(crate) enum TreeEntryData {
 pub(crate) struct TreeEntry {
     pub path: String,
     pub data: TreeEntryData,
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +136,8 @@ pub(crate) struct ManifestEntry {
     pub kind: TreeEntryKind,
     pub digest: Option<String>,
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
     pub symlink_target: Option<String>,
 }
 
@@ -163,10 +169,22 @@ struct PatchBundle {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PatchOperation {
-    WriteFile { path: String, data: Vec<u8> },
-    CreateDirectory { path: String },
-    CreateSymlink { path: String, target: String },
-    DeletePath { path: String },
+    WriteFile {
+        path: String,
+        data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
+    CreateDirectory {
+        path: String,
+    },
+    CreateSymlink {
+        path: String,
+        target: String,
+    },
+    DeletePath {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -551,6 +569,7 @@ fn write_patch_bundle(
                         TreeEntryData::File(bytes) => PatchOperation::WriteFile {
                             path: entry.path.clone(),
                             data: bytes.clone(),
+                            mode: entry.mode,
                         },
                         TreeEntryData::Directory => PatchOperation::CreateDirectory {
                             path: entry.path.clone(),
@@ -661,6 +680,7 @@ async fn collect_vfs_tree_recursive(
                 entries.push(TreeEntry {
                     path: child_relative.clone(),
                     data: TreeEntryData::Directory,
+                    mode: None,
                 });
                 Box::pin(collect_vfs_tree_recursive(
                     fs,
@@ -679,6 +699,7 @@ async fn collect_vfs_tree_recursive(
                 entries.push(TreeEntry {
                     path: child_relative,
                     data: TreeEntryData::File(bytes),
+                    mode: Some(entry.stats.mode),
                 });
             }
             FileKind::Symlink => {
@@ -686,6 +707,7 @@ async fn collect_vfs_tree_recursive(
                 entries.push(TreeEntry {
                     path: child_relative,
                     data: TreeEntryData::Symlink(target),
+                    mode: None,
                 });
             }
         }
@@ -799,7 +821,7 @@ async fn write_vfs_entry(
                 CreateOptions {
                     create_parents: true,
                     overwrite: true,
-                    ..Default::default()
+                    mode: entry.mode.unwrap_or(0o644),
                 },
             )
             .await?;
@@ -845,6 +867,7 @@ fn collect_selected_paths(
                 entries.push(TreeEntry {
                     path: ancestor,
                     data: TreeEntryData::Directory,
+                    mode: None,
                 });
             }
         }
@@ -859,6 +882,7 @@ fn collect_selected_paths(
                     path: path.to_string_lossy().into_owned(),
                     message: error.to_string(),
                 })?),
+                mode: Some(host_file_mode(&metadata)),
             });
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path).map_err(|error| SandboxError::Io {
@@ -868,11 +892,13 @@ fn collect_selected_paths(
             entries.push(TreeEntry {
                 path: relative.clone(),
                 data: TreeEntryData::Symlink(target.to_string_lossy().into_owned()),
+                mode: None,
             });
         } else if metadata.file_type().is_dir() && created_dirs.insert(relative.clone()) {
             entries.push(TreeEntry {
                 path: relative.clone(),
                 data: TreeEntryData::Directory,
+                mode: None,
             });
         }
     }
@@ -922,6 +948,7 @@ fn collect_directory_tree_recursive(
             entries.push(TreeEntry {
                 path: relative.clone(),
                 data: TreeEntryData::Directory,
+                mode: None,
             });
             collect_directory_tree_recursive(root, &child_path, skip_git_metadata, entries)?;
         } else if metadata.file_type().is_symlink() {
@@ -932,6 +959,7 @@ fn collect_directory_tree_recursive(
             entries.push(TreeEntry {
                 path: relative,
                 data: TreeEntryData::Symlink(target.to_string_lossy().into_owned()),
+                mode: None,
             });
         } else if metadata.file_type().is_file() {
             entries.push(TreeEntry {
@@ -942,6 +970,7 @@ fn collect_directory_tree_recursive(
                         message: error.to_string(),
                     }
                 })?),
+                mode: Some(host_file_mode(&metadata)),
             });
         }
     }
@@ -991,6 +1020,9 @@ fn write_host_entry(root: &Path, entry: &TreeEntry) -> Result<(), SandboxError> 
                 path: destination.to_string_lossy().into_owned(),
                 message: error.to_string(),
             })?;
+            if let Some(mode) = entry.mode {
+                apply_host_file_mode(&destination, mode)?;
+            }
         }
         TreeEntryData::Symlink(target) => {
             if destination.exists() || destination.symlink_metadata().is_ok() {
@@ -999,6 +1031,38 @@ fn write_host_entry(root: &Path, entry: &TreeEntry) -> Result<(), SandboxError> 
             create_host_symlink(target, &destination)?;
         }
     }
+    Ok(())
+}
+
+fn host_file_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0o644
+    }
+}
+
+fn apply_host_file_mode(path: &Path, mode: u32) -> Result<(), SandboxError> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| SandboxError::Io {
+                path: path.to_string_lossy().into_owned(),
+                message: error.to_string(),
+            })?
+            .permissions();
+        permissions.set_mode(mode & 0o777);
+        fs::set_permissions(path, permissions).map_err(|error| SandboxError::Io {
+            path: path.to_string_lossy().into_owned(),
+            message: error.to_string(),
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
     Ok(())
 }
 
@@ -1349,6 +1413,7 @@ impl ManifestEntry {
                 kind: TreeEntryKind::File,
                 digest: Some(bytes_digest(bytes)),
                 size: Some(bytes.len() as u64),
+                mode: entry.mode,
                 symlink_target: None,
             },
             TreeEntryData::Directory => Self {
@@ -1356,6 +1421,7 @@ impl ManifestEntry {
                 kind: TreeEntryKind::Directory,
                 digest: None,
                 size: None,
+                mode: None,
                 symlink_target: None,
             },
             TreeEntryData::Symlink(target) => Self {
@@ -1363,6 +1429,7 @@ impl ManifestEntry {
                 kind: TreeEntryKind::Symlink,
                 digest: None,
                 size: None,
+                mode: None,
                 symlink_target: Some(target.clone()),
             },
         }
@@ -1374,6 +1441,10 @@ impl ManifestEntry {
             (TreeEntryKind::File, TreeEntryData::File(bytes)) => {
                 self.size == Some(bytes.len() as u64)
                     && self.digest.as_deref() == Some(&bytes_digest(bytes))
+                    && self
+                        .mode
+                        .map(|mode| entry.mode == Some(mode))
+                        .unwrap_or(true)
             }
             (TreeEntryKind::Symlink, TreeEntryData::Symlink(target)) => {
                 self.symlink_target.as_deref() == Some(target)

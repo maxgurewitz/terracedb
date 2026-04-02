@@ -41,7 +41,7 @@ where
     }
 
     fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
-        Ok((self.run)(scenario)?)
+        (self.run)(scenario)
     }
 }
 

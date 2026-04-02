@@ -90,7 +90,8 @@ pub struct SandboxExecutionBinding {
 pub struct SandboxServiceBindings {
     pub runtime_backend: String,
     pub package_installer: String,
-    pub git_workspace_manager: String,
+    #[serde(alias = "git_workspace_manager")]
+    pub git_repository_store: String,
     pub pull_request_provider: String,
     pub readonly_view_provider: String,
     #[serde(default)]

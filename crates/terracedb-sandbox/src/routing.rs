@@ -189,7 +189,7 @@ impl SandboxExecutionRouter {
                 .get(&ExecutionOperation::PackageInstall)
                 .map(|binding| binding.backend.clone())
                 .unwrap_or_else(|| legacy.package_installer.clone()),
-            git_workspace_manager: legacy.git_workspace_manager.clone(),
+            git_repository_store: legacy.git_repository_store.clone(),
             pull_request_provider: legacy.pull_request_provider.clone(),
             readonly_view_provider: legacy.readonly_view_provider.clone(),
             typescript_service: execution_bindings

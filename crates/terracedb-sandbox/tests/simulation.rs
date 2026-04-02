@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use terracedb_simulation::SeededSimulationRunner;
-use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
+use terracedb_vfs::{
+    CreateOptions, InMemoryVfsStore, MkdirOptions, VolumeConfig, VolumeId, VolumeStore,
+};
 
 use terracedb_sandbox::{
     BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
@@ -132,15 +134,20 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 )
                 .await
                 .expect("run bash");
+            seed_repo_backed_workspace(&session, seed).await;
             session
                 .update_provenance(|provenance| {
                     provenance.git = Some(GitProvenance {
                         repo_root: "/repo".to_string(),
-                        head_commit: Some(format!("{seed:x}")),
-                        branch: Some(format!("branch-{seed:x}")),
-                        remote_url: None,
+                        head_commit: Some(format!("{seed:040x}")),
+                        branch: Some("main".to_string()),
+                        remote_url: Some("https://simulation.invalid/repo.git".to_string()),
                         pathspec: vec![".".to_string()],
                         dirty: false,
+                    });
+                    provenance.hoisted_source = Some(terracedb_sandbox::HoistedSource {
+                        source_path: "/repo".to_string(),
+                        mode: terracedb_sandbox::HoistMode::GitHead,
                     });
                 })
                 .await
@@ -218,6 +225,132 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 pr_url: pr.url,
             })
         })
+}
+
+async fn seed_repo_backed_workspace(session: &terracedb_sandbox::SandboxSession, seed: u64) {
+    let commit_oid = format!("{seed:040x}");
+    let tree_oid = format!("{:040x}", seed ^ 0x1111_1111_1111_1111);
+    let blob_oid = format!("{:040x}", seed ^ 0x2222_2222_2222_2222);
+    let fs = session.filesystem();
+    for path in [
+        "/workspace/.git",
+        "/workspace/.git/refs",
+        "/workspace/.git/refs/heads",
+        "/workspace/.git/objects",
+    ] {
+        fs.mkdir(
+            path,
+            MkdirOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create simulated git directory");
+    }
+    fs.write_file(
+        "/workspace/.git/HEAD",
+        b"ref: refs/heads/main\n".to_vec(),
+        CreateOptions {
+            create_parents: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("write simulated git head");
+    fs.write_file(
+        "/workspace/.git/refs/heads/main",
+        format!("{commit_oid}\n").into_bytes(),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("write simulated main ref");
+    fs.write_file(
+        &format!("/workspace/.git/objects/{commit_oid}"),
+        [
+            b"commit\n".as_slice(),
+            format!("tree {tree_oid}\n").as_bytes(),
+        ]
+        .concat(),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("write simulated commit object");
+    fs.write_file(
+        &format!("/workspace/.git/objects/{blob_oid}"),
+        b"blob\nseeded simulation repo\n".to_vec(),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("write simulated blob object");
+    fs.write_file(
+        &format!("/workspace/.git/objects/{tree_oid}"),
+        format!("tree\n100644 blob {blob_oid}\tREADME.md\n").into_bytes(),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("write simulated tree object");
+    fs.write_file(
+        "/workspace/.git/index.json",
+        serde_json::to_vec(&json!({
+            "entries": [{
+                "path": "README.md",
+                "oid": blob_oid,
+                "mode": 0o100644
+            }],
+            "metadata": {}
+        }))
+        .expect("encode simulated index"),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("write simulated index");
+    fs.write_file(
+        terracedb_sandbox::disk::HOIST_MANIFEST_PATH,
+        serde_json::to_vec_pretty(&json!({
+            "format_version": 1,
+            "source_path": "/repo",
+            "target_root": "/workspace",
+            "mode": "git_head",
+            "git_provenance": {
+                "repo_root": "/repo",
+                "head_commit": commit_oid,
+                "branch": "main",
+                "remote_url": "https://simulation.invalid/repo.git",
+                "pathspec": ["."],
+                "dirty": false
+            },
+            "entries": []
+        }))
+        .expect("encode hoist manifest"),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("write hoist manifest");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

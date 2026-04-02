@@ -35,6 +35,8 @@ pub struct GitImportEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
 }
 
@@ -66,39 +68,6 @@ pub struct GitImportReport {
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GitWorkspaceRequest {
-    pub repo_root: String,
-    pub branch_name: String,
-    pub base_ref: String,
-    pub target_path: String,
-    pub metadata: BTreeMap<String, JsonValue>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GitWorkspaceReport {
-    pub bridge: String,
-    pub branch_name: String,
-    pub workspace_path: String,
-    pub metadata: BTreeMap<String, JsonValue>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GitFinalizeExportRequest {
-    pub workspace_path: String,
-    pub head_branch: String,
-    pub title: String,
-    pub body: String,
-    pub metadata: BTreeMap<String, JsonValue>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GitFinalizeExportReport {
-    pub workspace_path: String,
-    pub head_branch: String,
-    pub metadata: BTreeMap<String, JsonValue>,
-}
-
 #[async_trait]
 pub trait GitHostBridge: Send + Sync {
     fn name(&self) -> &str;
@@ -112,32 +81,6 @@ pub trait GitHostBridge: Send + Sync {
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitImportReport, GitSubstrateError>;
 
-    async fn prepare_workspace(
-        &self,
-        _request: GitWorkspaceRequest,
-        _cancellation: Arc<dyn GitCancellationToken>,
-    ) -> Result<GitWorkspaceReport, GitSubstrateError> {
-        Err(GitSubstrateError::Bridge {
-            operation: "prepare_workspace",
-            message: format!("{} does not support workspace preparation", self.name()),
-        })
-    }
-
-    async fn finalize_export(
-        &self,
-        request: GitFinalizeExportRequest,
-        _cancellation: Arc<dyn GitCancellationToken>,
-    ) -> Result<GitFinalizeExportReport, GitSubstrateError> {
-        Err(GitSubstrateError::Bridge {
-            operation: "finalize_export",
-            message: format!(
-                "{} does not support export finalization for {}",
-                self.name(),
-                request.workspace_path
-            ),
-        })
-    }
-
     async fn export_repository(
         &self,
         repository: Arc<dyn GitRepository>,
@@ -147,6 +90,7 @@ pub trait GitHostBridge: Send + Sync {
 
     async fn push(
         &self,
+        repository: Arc<dyn GitRepository>,
         request: GitPushRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPushReport, GitSubstrateError>;
@@ -210,61 +154,6 @@ impl GitHostBridge for DeterministicGitHostBridge {
         })
     }
 
-    async fn prepare_workspace(
-        &self,
-        request: GitWorkspaceRequest,
-        cancellation: Arc<dyn GitCancellationToken>,
-    ) -> Result<GitWorkspaceReport, GitSubstrateError> {
-        if cancellation.is_cancelled() {
-            return Err(GitSubstrateError::Bridge {
-                operation: "prepare_workspace",
-                message: "cancelled".to_string(),
-            });
-        }
-        let mut metadata = request.metadata;
-        metadata
-            .entry("repo_root".to_string())
-            .or_insert_with(|| JsonValue::from(request.repo_root.clone()));
-        metadata
-            .entry("base_ref".to_string())
-            .or_insert_with(|| JsonValue::from(request.base_ref.clone()));
-        Ok(GitWorkspaceReport {
-            bridge: self.name().to_string(),
-            branch_name: request.branch_name,
-            workspace_path: request.target_path,
-            metadata,
-        })
-    }
-
-    async fn finalize_export(
-        &self,
-        request: GitFinalizeExportRequest,
-        cancellation: Arc<dyn GitCancellationToken>,
-    ) -> Result<GitFinalizeExportReport, GitSubstrateError> {
-        if cancellation.is_cancelled() {
-            return Err(GitSubstrateError::Bridge {
-                operation: "finalize_export",
-                message: "cancelled".to_string(),
-            });
-        }
-        let mut metadata = request.metadata;
-        metadata.insert(
-            "workspace_path".to_string(),
-            JsonValue::from(request.workspace_path.clone()),
-        );
-        metadata.insert(
-            "branch_name".to_string(),
-            JsonValue::from(request.head_branch.clone()),
-        );
-        metadata.insert("committed".to_string(), JsonValue::from(false));
-        metadata.insert("pushed".to_string(), JsonValue::from(false));
-        Ok(GitFinalizeExportReport {
-            workspace_path: request.workspace_path,
-            head_branch: request.head_branch,
-            metadata,
-        })
-    }
-
     async fn export_repository(
         &self,
         repository: Arc<dyn GitRepository>,
@@ -289,6 +178,7 @@ impl GitHostBridge for DeterministicGitHostBridge {
 
     async fn push(
         &self,
+        _repository: Arc<dyn GitRepository>,
         request: GitPushRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPushReport, GitSubstrateError> {

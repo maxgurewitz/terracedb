@@ -10,9 +10,13 @@ use serde_json::{Value as JsonValue, json};
 use terracedb::Clock;
 use terracedb_capabilities::{ExecutionOperation, ExecutionPolicy};
 use terracedb_git::{
-    DeterministicGitHostBridge, GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest,
-    GitPullRequestRequest as GitBridgePullRequestRequest, GitPushRequest, HostGitBridge,
-    NeverCancel,
+    DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
+    GitCheckoutRequest, GitCommitRequest, GitDiffReport, GitDiffRequest, GitHeadState,
+    GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest, GitOpenRequest,
+    GitPullRequestRequest as GitBridgePullRequestRequest, GitPushRequest, GitRefUpdate,
+    GitRefUpdateReport, GitReference, GitRepository, GitRepositoryImage, GitRepositoryPolicy,
+    GitRepositoryProvenance, GitRepositoryStore, GitStatusOptions, GitStatusReport, HostGitBridge,
+    NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
     CompletedToolRun, CompletedToolRunOutcome, CreateOptions, DirEntry, MkdirOptions,
@@ -26,10 +30,7 @@ use crate::disk::{
     load_hoist_manifest, materialize_snapshot_to_host, prepare_hoist, replace_vfs_tree,
     write_hoist_manifest,
 };
-use crate::git::{
-    default_export_workspace_path, finalize_export_report_metadata, finalize_export_request,
-    git_substrate_error_to_sandbox,
-};
+use crate::git::git_substrate_error_to_sandbox;
 use crate::routing::{
     RoutedBashService, RoutedPackageInstaller, RoutedRuntimeBackend, RoutedTypeScriptService,
     SandboxExecutionRouter,
@@ -37,23 +38,21 @@ use crate::routing::{
 use crate::{
     BaseSnapshotIdentity, BashReport, BashRequest, BashService, CapabilityCallRequest,
     CapabilityCallResult, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
-    DeterministicGitWorkspaceManager, DeterministicPackageInstaller,
-    DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
-    DeterministicRuntimeBackend, DeterministicTypeScriptService, EjectMode, EjectReport,
-    EjectRequest, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest, HoistReport,
-    HoistRequest, HoistedSource, HostGitWorkspaceManager, PackageInstallReport,
-    PackageInstallRequest, PackageInstaller, PullRequestProviderClient, PullRequestReport,
-    PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle, ReadonlyViewLocation,
-    ReadonlyViewProvider, ReadonlyViewRequest, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION,
-    SandboxConfig, SandboxError, SandboxExecutionRequest, SandboxExecutionResult,
-    SandboxFilesystemShim, SandboxModuleLoader, SandboxRuntimeActor, SandboxRuntimeBackend,
-    SandboxRuntimeHandle, SandboxRuntimeStateHandle, SandboxServiceBindings, SandboxSessionInfo,
-    SandboxSessionProvenance, SandboxSessionState, StaticCapabilityRegistry,
-    TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
-    TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
-    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TypeCheckReport, TypeCheckRequest,
-    TypeScriptEmitReport, TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
-    VfsSandboxFilesystemShim,
+    DeterministicPackageInstaller, DeterministicPullRequestProviderClient,
+    DeterministicReadonlyViewProvider, DeterministicRuntimeBackend, DeterministicTypeScriptService,
+    EjectMode, EjectReport, EjectRequest, HoistReport, HoistRequest, HoistedSource,
+    PackageInstallReport, PackageInstallRequest, PackageInstaller, PullRequestProviderClient,
+    PullRequestReport, PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle,
+    ReadonlyViewLocation, ReadonlyViewProvider, ReadonlyViewRequest,
+    SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION, SandboxConfig, SandboxError,
+    SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim, SandboxModuleLoader,
+    SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeStateHandle,
+    SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
+    StaticCapabilityRegistry, TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR,
+    TERRACE_NPM_COMPATIBILITY_ROOT, TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR,
+    TERRACE_RUNTIME_CACHE_DIR, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
+    TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport, TypeScriptService,
+    TypeScriptTranspileReport, TypeScriptTranspileRequest, VfsSandboxFilesystemShim,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,7 +70,7 @@ pub struct CloseSessionOptions {
 pub struct SandboxServices {
     pub runtime: Arc<dyn SandboxRuntimeBackend>,
     pub packages: Arc<dyn PackageInstaller>,
-    pub git: Arc<dyn GitWorkspaceManager>,
+    pub git: Arc<dyn GitRepositoryStore>,
     pub git_bridge: Arc<dyn GitHostBridge>,
     pub pull_requests: Arc<dyn PullRequestProviderClient>,
     pub readonly_views: Arc<dyn ReadonlyViewProvider>,
@@ -85,7 +84,7 @@ impl SandboxServices {
     pub fn new(
         runtime: Arc<dyn SandboxRuntimeBackend>,
         packages: Arc<dyn PackageInstaller>,
-        git: Arc<dyn GitWorkspaceManager>,
+        git: Arc<dyn GitRepositoryStore>,
         pull_requests: Arc<dyn PullRequestProviderClient>,
         readonly_views: Arc<dyn ReadonlyViewProvider>,
     ) -> Self {
@@ -94,12 +93,11 @@ impl SandboxServices {
         let bash: Arc<dyn BashService> = Arc::new(
             DeterministicBashService::default().with_typescript_service(typescript.clone()),
         );
-        let git_bridge = fallback_git_host_bridge(&git);
         Self {
             runtime,
             packages,
             git,
-            git_bridge,
+            git_bridge: Arc::new(DeterministicGitHostBridge::default()),
             pull_requests,
             readonly_views,
             typescript,
@@ -114,14 +112,12 @@ impl SandboxServices {
         self
     }
 
-    pub fn with_git_workspace_manager(mut self, git: Arc<dyn GitWorkspaceManager>) -> Self {
-        self.git_bridge = fallback_git_host_bridge(&git);
+    pub fn with_git_repository_store(mut self, git: Arc<dyn GitRepositoryStore>) -> Self {
         self.git = git;
         self
     }
 
     pub fn with_git_host_bridge(mut self, git_bridge: Arc<dyn GitHostBridge>) -> Self {
-        self.git = Arc::new(HostGitWorkspaceManager::default().with_bridge(git_bridge.clone()));
         self.git_bridge = git_bridge;
         self
     }
@@ -140,7 +136,7 @@ impl SandboxServices {
         Self::new(
             Arc::new(DeterministicRuntimeBackend::default()),
             Arc::new(DeterministicPackageInstaller::default()),
-            Arc::new(DeterministicGitWorkspaceManager::default()),
+            Arc::new(DeterministicGitRepositoryStore::default()),
             Arc::new(DeterministicPullRequestProviderClient::default()),
             Arc::new(DeterministicReadonlyViewProvider::default()),
         )
@@ -183,7 +179,7 @@ impl SandboxServices {
         SandboxServiceBindings {
             runtime_backend: self.runtime.name().to_string(),
             package_installer: self.packages.name().to_string(),
-            git_workspace_manager: self.git.name().to_string(),
+            git_repository_store: self.git.name().to_string(),
             pull_request_provider: self.pull_requests.name().to_string(),
             readonly_view_provider: self.readonly_views.name().to_string(),
             typescript_service: self.typescript.name().to_string(),
@@ -210,11 +206,6 @@ impl SandboxServices {
             None => Ok(legacy),
         }
     }
-}
-
-fn fallback_git_host_bridge(git: &Arc<dyn GitWorkspaceManager>) -> Arc<dyn GitHostBridge> {
-    git.host_bridge()
-        .unwrap_or_else(|| Arc::new(DeterministicGitHostBridge::default()))
 }
 
 pub struct DefaultSandboxStore<S> {
@@ -985,28 +976,213 @@ impl SandboxSession {
         }
     }
 
-    pub async fn prepare_git_workspace(
-        &self,
-        request: GitWorkspaceRequest,
-    ) -> Result<GitWorkspaceReport, SandboxError> {
-        let params = Some(serde_json::to_value(&request)?);
-        match self.services.git.prepare_workspace(self, request).await {
-            Ok(report) => {
+    pub async fn git_head(&self) -> Result<GitHeadState, SandboxError> {
+        match self.open_git_repository().await {
+            Ok(repository) => {
+                let result = repository
+                    .head()
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
                 record_completed_tool_run(
                     self.volume.as_ref(),
-                    "sandbox.git.prepare_workspace",
-                    params,
+                    "sandbox.git.head",
+                    None,
                     CompletedToolRunOutcome::Success {
-                        result: Some(serde_json::to_value(&report)?),
+                        result: Some(serde_json::to_value(&result)?),
                     },
                 )
                 .await?;
-                Ok(report)
+                Ok(result)
             }
             Err(error) => {
                 let _ = record_completed_tool_run(
                     self.volume.as_ref(),
-                    "sandbox.git.prepare_workspace",
+                    "sandbox.git.head",
+                    None,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn git_list_refs(&self) -> Result<Vec<GitReference>, SandboxError> {
+        match self.open_git_repository().await {
+            Ok(repository) => {
+                let result = repository
+                    .list_refs()
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.list_refs",
+                    None,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&result)?),
+                    },
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.list_refs",
+                    None,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn git_status(
+        &self,
+        options: GitStatusOptions,
+    ) -> Result<GitStatusReport, SandboxError> {
+        let params = Some(serde_json::to_value(&options)?);
+        match self.open_git_repository().await {
+            Ok(repository) => {
+                let result = repository
+                    .status_with_options(options)
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                self.sync_git_provenance(&repository, None, Some(result.dirty))
+                    .await?;
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.status",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&result)?),
+                    },
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.status",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn git_diff(&self, request: GitDiffRequest) -> Result<GitDiffReport, SandboxError> {
+        let params = Some(serde_json::to_value(&request)?);
+        match self.open_git_repository().await {
+            Ok(repository) => {
+                let result = repository
+                    .diff(request)
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                self.sync_git_provenance(&repository, None, Some(result.dirty))
+                    .await?;
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.diff",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&result)?),
+                    },
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.diff",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn git_checkout(
+        &self,
+        request: GitCheckoutRequest,
+    ) -> Result<GitCheckoutReport, SandboxError> {
+        let params = Some(serde_json::to_value(&request)?);
+        match self.open_git_repository().await {
+            Ok(repository) => {
+                let result = repository
+                    .checkout(request, Arc::new(NeverCancel))
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                self.sync_git_provenance(&repository, result.head_oid.clone(), Some(false))
+                    .await?;
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.checkout",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&result)?),
+                    },
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.checkout",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn git_update_ref(
+        &self,
+        request: GitRefUpdate,
+    ) -> Result<GitRefUpdateReport, SandboxError> {
+        let params = Some(serde_json::to_value(&request)?);
+        match self.open_git_repository().await {
+            Ok(repository) => {
+                let result = repository
+                    .update_ref(request, Arc::new(NeverCancel))
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                self.sync_git_provenance(&repository, None, None).await?;
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.update_ref",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&result)?),
+                    },
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.update_ref",
                     params,
                     CompletedToolRunOutcome::Error {
                         message: error.to_string(),
@@ -1179,6 +1355,111 @@ impl SandboxSession {
         self.services.readonly_views.readdir(self, location).await
     }
 
+    async fn open_git_repository(&self) -> Result<Arc<dyn GitRepository>, SandboxError> {
+        let info = self.info().await;
+        let manifest = load_hoist_manifest(self.volume.as_ref())
+            .await?
+            .ok_or(SandboxError::MissingGitProvenance)?;
+        let provenance = info
+            .provenance
+            .git
+            .clone()
+            .ok_or(SandboxError::MissingGitProvenance)?;
+        let image = Arc::new(
+            VfsGitRepositoryImage::from_volume(
+                self.volume.clone(),
+                manifest.target_root.clone(),
+                SnapshotOptions::default(),
+            )
+            .await
+            .map_err(git_substrate_error_to_sandbox)?,
+        );
+        let descriptor = GitRepositoryImage::descriptor(image.as_ref());
+        self.services
+            .git
+            .open(
+                image,
+                GitOpenRequest {
+                    repository_id: format!(
+                        "sandbox-session-{}:{}",
+                        info.session_volume_id, manifest.target_root
+                    ),
+                    repository_image: descriptor.clone(),
+                    policy: GitRepositoryPolicy {
+                        allow_host_bridge: true,
+                        ..Default::default()
+                    },
+                    provenance: GitRepositoryProvenance {
+                        backend: self.services.git.name().to_string(),
+                        repo_root: provenance.repo_root,
+                        imported_from_host: true,
+                        volume_id: descriptor.volume_id,
+                        snapshot_sequence: descriptor.snapshot_sequence,
+                        durable_snapshot: descriptor.durable_snapshot,
+                        fork_policy: self.services.git.fork_policy(),
+                    },
+                    metadata: BTreeMap::from([
+                        (
+                            "session_volume_id".to_string(),
+                            JsonValue::from(info.session_volume_id.to_string()),
+                        ),
+                        (
+                            "workspace_root".to_string(),
+                            JsonValue::from(info.workspace_root),
+                        ),
+                        (
+                            "repository_root".to_string(),
+                            JsonValue::from(manifest.target_root),
+                        ),
+                    ]),
+                },
+                Arc::new(NeverCancel),
+            )
+            .await
+            .map_err(git_substrate_error_to_sandbox)
+    }
+
+    async fn sync_git_provenance(
+        &self,
+        repository: &Arc<dyn GitRepository>,
+        head_oid: Option<String>,
+        dirty: Option<bool>,
+    ) -> Result<(), SandboxError> {
+        let head = repository
+            .head()
+            .await
+            .map_err(git_substrate_error_to_sandbox)?;
+        let dirty = match dirty {
+            Some(value) => value,
+            None => {
+                repository
+                    .status()
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?
+                    .dirty
+            }
+        };
+        let next_head_oid = head_oid.or(head.oid.clone());
+        let next_branch = git_branch_name(&head);
+        let _guard = self.operation_lock.lock().await;
+        let mut current = self.info.lock().await;
+        let mut updated = current.clone();
+        let Some(git) = updated.provenance.git.as_mut() else {
+            return Ok(());
+        };
+        if git.head_commit == next_head_oid && git.branch == next_branch && git.dirty == dirty {
+            return Ok(());
+        }
+        git.head_commit = next_head_oid;
+        git.branch = next_branch;
+        git.dirty = dirty;
+        updated.revision = updated.revision.saturating_add(1);
+        updated.updated_at = self.clock.now();
+        write_session_info_exact(self.volume.as_ref(), &updated).await?;
+        *current = updated;
+        Ok(())
+    }
+
     async fn hoist_from_disk_inner(
         &self,
         request: HoistRequest,
@@ -1264,92 +1545,74 @@ impl SandboxSession {
         &self,
         request: PullRequestRequest,
     ) -> Result<PullRequestReport, SandboxError> {
-        if self.info().await.provenance.git.is_some() {
-            let workspace_path = default_export_workspace_path(
-                &self.info().await.session_volume_id.to_string(),
-                &request.head_branch,
-            );
-            let workspace = self
-                .prepare_git_workspace(GitWorkspaceRequest {
-                    branch_name: request.head_branch.clone(),
-                    base_branch: Some(request.base_branch.clone()),
-                    target_path: workspace_path.to_string_lossy().into_owned(),
-                })
-                .await?;
-            let eject_report = self
-                .eject_to_disk(EjectRequest {
-                    target_path: workspace.workspace_path.clone(),
-                    mode: EjectMode::MaterializeSnapshot,
-                    conflict_policy: ConflictPolicy::Fail,
-                })
-                .await?;
-            let mut git_metadata = workspace.metadata.clone();
-            git_metadata.insert(
-                "workspace_path".to_string(),
-                JsonValue::from(workspace.workspace_path.clone()),
-            );
-            git_metadata.insert(
-                "eject_mode".to_string(),
-                JsonValue::from("materialize_snapshot"),
-            );
-            git_metadata.insert(
-                "provenance_validated".to_string(),
-                JsonValue::from(eject_report.provenance_validated),
-            );
-            let finalize = self
-                .services
-                .git_bridge
-                .finalize_export(
-                    finalize_export_request(
-                        workspace.workspace_path.clone(),
-                        request.title.clone(),
-                        request.body.clone(),
-                        request.head_branch.clone(),
-                        git_metadata.clone(),
-                    ),
+        if let Some(remote_url) = self
+            .info()
+            .await
+            .provenance
+            .git
+            .and_then(|git| git.remote_url)
+            .filter(|url| !url.is_empty())
+        {
+            let repository = self.open_git_repository().await?;
+            let commit = repository
+                .commit(
+                    GitCommitRequest {
+                        target_ref: format!("refs/heads/{}", request.head_branch),
+                        base_ref: Some(format!("refs/heads/{}", request.base_branch)),
+                        title: request.title.clone(),
+                        body: request.body.clone(),
+                        require_changes: true,
+                        update_head: true,
+                    },
                     Arc::new(NeverCancel),
                 )
                 .await
                 .map_err(git_substrate_error_to_sandbox)?;
-            git_metadata = finalize_export_report_metadata(finalize);
-
-            let has_remote = git_metadata
-                .get("push_remote")
-                .and_then(JsonValue::as_str)
-                .is_some()
-                || git_metadata
-                    .get("remote_url")
-                    .and_then(JsonValue::as_str)
-                    .is_some();
-            if has_remote {
-                let push = self
-                    .services
-                    .git_bridge
-                    .push(
-                        GitPushRequest {
-                            remote: "origin".to_string(),
-                            branch_name: request.head_branch.clone(),
-                            head_oid: git_metadata
-                                .get("head_commit")
-                                .and_then(JsonValue::as_str)
-                                .map(ToString::to_string),
-                            metadata: git_metadata.clone(),
-                        },
-                        Arc::new(NeverCancel),
-                    )
-                    .await
-                    .map_err(git_substrate_error_to_sandbox)?;
-                git_metadata = push.metadata;
-                git_metadata.insert("pushed".to_string(), JsonValue::from(true));
-                git_metadata.insert(
-                    "push_remote_name".to_string(),
-                    JsonValue::from(push.remote.clone()),
-                );
-                if let Some(oid) = push.pushed_oid {
-                    git_metadata.insert("pushed_oid".to_string(), JsonValue::from(oid));
-                }
-            } else {
-                git_metadata.insert("pushed".to_string(), JsonValue::from(false));
+            self.sync_git_provenance(&repository, Some(commit.commit_oid.clone()), Some(false))
+                .await?;
+            let mut git_metadata = BTreeMap::from([
+                (
+                    "session_volume_id".to_string(),
+                    JsonValue::from(self.info().await.session_volume_id.to_string()),
+                ),
+                (
+                    "base_branch".to_string(),
+                    JsonValue::from(request.base_branch.clone()),
+                ),
+                (
+                    "head_commit".to_string(),
+                    JsonValue::from(commit.commit_oid.clone()),
+                ),
+                (
+                    "tree_oid".to_string(),
+                    JsonValue::from(commit.tree_oid.clone()),
+                ),
+                ("committed".to_string(), JsonValue::from(commit.committed)),
+                ("remote_url".to_string(), JsonValue::from(remote_url)),
+            ]);
+            let push = self
+                .services
+                .git_bridge
+                .push(
+                    repository.clone(),
+                    GitPushRequest {
+                        remote: "origin".to_string(),
+                        branch_name: request.head_branch.clone(),
+                        head_oid: Some(commit.commit_oid.clone()),
+                        metadata: git_metadata.clone(),
+                    },
+                    Arc::new(NeverCancel),
+                )
+                .await
+                .map_err(git_substrate_error_to_sandbox)?;
+            git_metadata = push.metadata;
+            git_metadata.insert("pushed".to_string(), JsonValue::from(true));
+            git_metadata.insert(
+                "push_remote_name".to_string(),
+                JsonValue::from(push.remote.clone()),
+            );
+            if let Some(oid) = push.pushed_oid {
+                git_metadata.insert("pushed_oid".to_string(), JsonValue::from(oid));
             }
 
             let report = self
@@ -1371,6 +1634,8 @@ impl SandboxSession {
                 self.services.git_bridge.name(),
                 report,
             ));
+        } else if self.info().await.provenance.git.is_some() {
+            return Err(SandboxError::MissingGitRemote);
         }
         self.services
             .pull_requests
@@ -1786,7 +2051,11 @@ fn git_import_entry_to_tree_entry(
             })?)
         }
     };
-    Ok(TreeEntry { path, data })
+    Ok(TreeEntry {
+        path,
+        data,
+        mode: entry.mode,
+    })
 }
 
 fn git_bridge_pull_request_to_sandbox(
@@ -1830,6 +2099,15 @@ fn normalize_bridge_import_path(path: &str) -> Result<String, SandboxError> {
         });
     }
     Ok(normalized)
+}
+
+fn git_branch_name(head: &GitHeadState) -> Option<String> {
+    head.symbolic_ref.as_ref().map(|reference| {
+        reference
+            .strip_prefix("refs/heads/")
+            .unwrap_or(reference)
+            .to_string()
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

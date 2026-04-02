@@ -36,7 +36,15 @@ pub(crate) const FS_HOST_EXPORTS: &[&str] = &[
     "fsync",
 ];
 
-pub(crate) const GIT_HOST_EXPORTS: &[&str] = &["prepareWorkspace", "createPullRequest"];
+pub(crate) const GIT_HOST_EXPORTS: &[&str] = &[
+    "head",
+    "listRefs",
+    "status",
+    "diff",
+    "checkout",
+    "updateRef",
+    "createPullRequest",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxModuleSpecifier {

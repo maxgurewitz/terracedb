@@ -1391,28 +1391,9 @@ async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
         .await
         .expect("create pull request after reopen");
     assert!(report.url.contains("sandbox-bridge.invalid"));
-    assert_eq!(
-        report.metadata.get("eject_mode"),
-        Some(&json!("materialize_snapshot"))
-    );
-    assert_eq!(
-        report.metadata.get("provenance_validated"),
-        Some(&json!(true))
-    );
     assert_eq!(report.metadata.get("committed"), Some(&json!(true)));
     assert_eq!(report.metadata.get("pushed"), Some(&json!(true)));
-
-    let workspace = PathBuf::from(
-        report
-            .metadata
-            .get("workspace_path")
-            .and_then(serde_json::Value::as_str)
-            .expect("workspace path"),
-    );
-    assert_eq!(
-        git_out(&workspace, &["show", "HEAD:tracked.txt"]),
-        "reopened bridge change"
-    );
+    assert!(report.metadata.get("workspace_path").is_none());
     let pushed_head = sanitized_git_command()
         .arg("--git-dir")
         .arg(&remote)
@@ -1424,10 +1405,24 @@ async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
         "recovered remote branch missing: {}",
         String::from_utf8_lossy(&pushed_head.stderr)
     );
+    let pushed_tracked = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["show", "refs/heads/sandbox/recovered-host-git:tracked.txt"])
+        .output()
+        .expect("inspect recovered tracked.txt");
+    assert!(
+        pushed_tracked.status.success(),
+        "recovered tracked.txt missing: {}",
+        String::from_utf8_lossy(&pushed_tracked.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&pushed_tracked.stdout),
+        "reopened bridge change\n"
+    );
 
     cleanup(&repo);
     cleanup(&remote);
-    cleanup(&workspace);
 }
 
 fn recovery_router() -> SandboxExecutionRouter {

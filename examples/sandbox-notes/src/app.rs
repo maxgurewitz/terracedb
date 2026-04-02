@@ -29,11 +29,11 @@ use terracedb_sandbox::{
     BashReport, BashRequest, CapabilityManifest as SandboxCapabilityManifest, CapabilityMethod0,
     CapabilityMethod1, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
     DeterministicPackageInstaller, DeterministicRuntimeBackend, DeterministicTypeScriptService,
-    EjectMode, EjectRequest, GitWorkspaceRequest, HoistMode, HoistRequest,
-    PackageCompatibilityMode, PackageInstallRequest, PullRequestRequest, ReadonlyViewHandle,
-    ReadonlyViewRequest, SandboxCapability, SandboxCapabilityModule, SandboxError,
-    SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter, SandboxHarness,
-    SandboxServices, SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
+    EjectMode, EjectRequest, HoistMode, HoistRequest, PackageCompatibilityMode,
+    PackageInstallRequest, PullRequestRequest, ReadonlyViewHandle, ReadonlyViewRequest,
+    SandboxCapability, SandboxCapabilityModule, SandboxError, SandboxExecutionDomainRoute,
+    SandboxExecutionPlacement, SandboxExecutionRouter, SandboxHarness, SandboxServices,
+    SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
     TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId, VolumeStore};
@@ -723,20 +723,6 @@ pub async fn open_generated_view(
             label: Some("generated".to_string()),
         })
         .await
-}
-
-pub async fn prepare_example_git_workspace(
-    session: &SandboxSession,
-    target_path: &Path,
-) -> Result<String, SandboxError> {
-    Ok(session
-        .prepare_git_workspace(GitWorkspaceRequest {
-            branch_name: "sandbox/example-notes".to_string(),
-            base_branch: Some("main".to_string()),
-            target_path: target_path.to_string_lossy().into_owned(),
-        })
-        .await?
-        .workspace_path)
 }
 
 pub async fn create_example_pull_request(session: &SandboxSession) -> Result<String, SandboxError> {
