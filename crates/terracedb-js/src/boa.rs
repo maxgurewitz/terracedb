@@ -25,8 +25,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::{
     JsForkPolicy, JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule, JsRuntimeHandle,
     JsRuntimeOpenRequest, JsRuntimePolicy, JsSubstrateError, JsonValue,
-    compat::JsHostServices,
     entropy::JsEntropySource,
+    host::JsHostServices,
     runtime::{
         JsCancellationToken, JsRuntime, JsRuntimeHost, NoopJsExecutionHooks,
         ensure_module_kind_allowed,

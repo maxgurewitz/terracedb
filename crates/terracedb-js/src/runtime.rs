@@ -8,8 +8,8 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     JsForkPolicy, JsSubstrateError,
-    compat::JsHostServices,
     entropy::JsEntropySource,
+    host::JsHostServices,
     loader::{JsLoadedModule, JsModuleLoader, JsResolvedModule},
     scheduler::{JsScheduledTask, JsScheduler, JsTaskQueue},
     time::JsClock,

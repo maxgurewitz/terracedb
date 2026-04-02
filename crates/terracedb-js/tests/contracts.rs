@@ -5,8 +5,8 @@ use serde_json::json;
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitDiscoverRequest,
-    GitExportRequest, GitForkPolicy, GitHostBridge, GitImportRequest, GitOpenRequest,
-    GitPullRequestRequest, GitPushRequest, GitRepositoryImage, GitRepositoryPolicy,
+    GitExportRequest, GitForkPolicy, GitHostBridge, GitImportMode, GitImportRequest,
+    GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRepositoryImage, GitRepositoryPolicy,
     GitRepositoryProvenance, GitRepositoryStore, NeverCancel as NeverCancelGit,
     VfsGitRepositoryImage,
 };
@@ -16,7 +16,8 @@ use terracedb_js::{
     FixedJsClock, JsExecutionHooks, JsExecutionRequest, JsForkPolicy, JsHostServiceCallRecord,
     JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsLoadedModule, JsModuleKind,
     JsModuleLoader, JsResolvedModule, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
-    JsRuntimeProvenance, JsSubstrateError, NeverCancel, NoopJsExecutionHooks, VfsJsModuleLoader,
+    JsRuntimeProvenance, JsSubstrateError, NeverCancel, NoopJsExecutionHooks, RoutedJsHostServices,
+    VfsJsHostServiceAdapter, VfsJsModuleLoader,
 };
 use terracedb_vfs::{
     CreateOptions, InMemoryVfsStore, SnapshotOptions, VfsStoreExt, VolumeConfig, VolumeId,
@@ -264,6 +265,7 @@ async fn public_substrate_contracts_are_instantiable() {
             GitImportRequest {
                 source_path: "/host/repo".to_string(),
                 target_root: "/repo".to_string(),
+                mode: GitImportMode::Head,
                 metadata: BTreeMap::new(),
             },
             Arc::new(NeverCancelGit),
@@ -271,6 +273,68 @@ async fn public_substrate_contracts_are_instantiable() {
         .await
         .expect("import repo");
     assert_eq!(imported.target_root, "/repo");
+}
+
+#[tokio::test]
+async fn routed_vfs_host_services_read_files_and_report_missing_paths() {
+    let dependencies = DbDependencies::new(
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+        Arc::new(StubClock::new(Timestamp::new(42))),
+        Arc::new(StubRng::seeded(0x1234)),
+    );
+    let store = InMemoryVfsStore::with_dependencies(dependencies);
+    let volume = store
+        .open_volume(
+            VolumeConfig::new(VolumeId::new(0x9900))
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open volume");
+    volume
+        .fs()
+        .write_file(
+            "/workspace/input.txt",
+            b"hello routed host service".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed input");
+
+    let services = RoutedJsHostServices::new().with_adapter(Arc::new(
+        VfsJsHostServiceAdapter::new(volume.fs(), ["node:fs/promises"]),
+    ));
+    let response = JsHostServices::call(
+        &services,
+        JsHostServiceRequest {
+            service: "node:fs/promises".to_string(),
+            operation: "readTextFile".to_string(),
+            arguments: json!(["/workspace/input.txt"]),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("read file through routed services");
+    assert_eq!(response.result, Some(json!("hello routed host service")));
+    assert_eq!(JsHostServices::calls(&services).await.len(), 1);
+
+    let error = JsHostServices::call(
+        &services,
+        JsHostServiceRequest {
+            service: "node:fs/promises".to_string(),
+            operation: "readTextFile".to_string(),
+            arguments: json!(["/workspace/missing.txt"]),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .await
+    .expect_err("missing path should fail closed");
+    assert!(matches!(error, JsSubstrateError::EvaluationFailed { .. }));
 }
 
 #[tokio::test]

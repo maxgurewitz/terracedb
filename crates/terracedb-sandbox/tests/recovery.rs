@@ -1,4 +1,13 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -15,11 +24,11 @@ use terracedb_capabilities::{
 use terracedb_sandbox::{
     BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
     DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicPackageInstaller,
-    DeterministicRuntimeBackend, DeterministicTypeScriptService, GitProvenance,
-    ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
+    DeterministicRuntimeBackend, DeterministicTypeScriptService, GitProvenance, HoistMode,
+    HoistRequest, ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
     ManifestBoundCapabilityRegistry, ManifestBoundCapabilityResult, PackageCompatibilityMode,
-    PackageInstallRequest, ReopenSessionOptions, SandboxCapability, SandboxConfig,
-    SandboxExecutionDomainRoute, SandboxExecutionKind, SandboxExecutionPlacement,
+    PackageInstallRequest, PullRequestRequest, ReopenSessionOptions, SandboxCapability,
+    SandboxConfig, SandboxExecutionDomainRoute, SandboxExecutionKind, SandboxExecutionPlacement,
     SandboxExecutionRequest, SandboxExecutionRouter, SandboxRuntimeBackend,
     SandboxRuntimeStateHandle, SandboxServices, SandboxStore, TERRACE_BASH_SESSION_STATE_PATH,
     TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_RUNTIME_MODULE_CACHE_PATH,
@@ -29,6 +38,8 @@ use terracedb_sandbox::{
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore,
 };
+
+static HOST_GIT_TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn sandbox_store(now: u64, seed: u64) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
     sandbox_store_with_services(now, seed, SandboxServices::deterministic())
@@ -48,6 +59,116 @@ fn sandbox_store_with_services(
     let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
     let sandbox = DefaultSandboxStore::new(Arc::new(vfs.clone()), dependencies.clock, services);
     (vfs, sandbox)
+}
+
+async fn create_empty_base(store: &InMemoryVfsStore, volume_id: VolumeId) {
+    store
+        .open_volume(
+            VolumeConfig::new(volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open empty base");
+}
+
+fn unique_host_git_test_dir(name: &str) -> PathBuf {
+    let id = HOST_GIT_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "terracedb-sandbox-recovery-{name}-{}-{id}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&path);
+    path
+}
+
+fn cleanup(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
+
+fn write_host_file(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create host parent");
+    }
+    fs::write(path, contents).expect("write host file");
+}
+
+fn sanitized_git_command() -> Command {
+    let mut command = Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = sanitized_git_command()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git -C {} {} failed: {}",
+        dir.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = sanitized_git_command()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git -C {} {} failed: {}",
+        dir.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn init_git_repo(repo: &Path, remote: Option<&Path>) {
+    fs::create_dir_all(repo).expect("create repo dir");
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.name", "Sandbox Tester"]);
+    git(repo, &["config", "user.email", "sandbox@example.invalid"]);
+    write_host_file(&repo.join("tracked.txt"), "tracked\n");
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "initial"]);
+    if let Some(remote) = remote {
+        fs::create_dir_all(remote).expect("create remote parent");
+        let output = sanitized_git_command()
+            .arg("init")
+            .arg("--bare")
+            .arg(remote)
+            .output()
+            .expect("init bare remote");
+        assert!(
+            output.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git(
+            repo,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git(repo, &["push", "-u", "origin", "main"]);
+    }
 }
 
 async fn seed_base(store: &InMemoryVfsStore, volume_id: VolumeId) {
@@ -1115,6 +1236,195 @@ fn recovery_execution_policy() -> ExecutionPolicy {
         .collect(),
         metadata: Default::default(),
     }
+}
+
+#[tokio::test]
+async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
+    let repo = unique_host_git_test_dir("host-git-repo");
+    let remote = unique_host_git_test_dir("host-git-remote");
+    init_git_repo(&repo, Some(&remote));
+    let head_commit = git_out(&repo, &["rev-parse", "HEAD"]);
+    let source_path = repo.to_string_lossy().into_owned();
+    let repo_root = fs::canonicalize(&repo)
+        .expect("canonicalize host git repo")
+        .to_string_lossy()
+        .into_owned();
+    let remote_url = remote.to_string_lossy().into_owned();
+
+    let services = SandboxServices::deterministic_with_host_git();
+    let (source_vfs, sandbox) = sandbox_store_with_services(118, 2084, services.clone());
+    let base_volume_id = VolumeId::new(0x8224);
+    let session_volume_id = VolumeId::new(0x8225);
+    create_empty_base(&source_vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open host git recovery session");
+    let hoist = session
+        .hoist_from_disk(HoistRequest {
+            source_path: source_path.clone(),
+            target_root: "/workspace".to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        })
+        .await
+        .expect("hoist host git repo");
+    let hoisted_git = hoist.git_provenance.expect("hoist git provenance");
+    assert_eq!(hoisted_git.repo_root, repo_root);
+    assert_eq!(
+        hoisted_git.head_commit.as_deref(),
+        Some(head_commit.as_str())
+    );
+    assert_eq!(hoisted_git.branch.as_deref(), Some("main"));
+    assert_eq!(hoisted_git.remote_url.as_deref(), Some(remote_url.as_str()));
+    assert_eq!(hoisted_git.pathspec, vec![".".to_string()]);
+    assert!(!hoisted_git.dirty);
+    session
+        .flush()
+        .await
+        .expect("flush host git hoist for recovery");
+
+    let flushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut for host git recovery");
+    let (recovery_vfs, recovery_sandbox) = sandbox_store_with_services(119, 2085, services);
+    recovery_vfs
+        .import_volume(
+            flushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut for host git recovery");
+    let reopened = recovery_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen host git recovery session");
+
+    let reopened_info = reopened.info().await;
+    assert_eq!(
+        reopened_info.provenance.hoisted_source,
+        Some(terracedb_sandbox::HoistedSource {
+            source_path: repo_root.clone(),
+            mode: HoistMode::GitHead,
+        })
+    );
+    let reopened_git = reopened_info
+        .provenance
+        .git
+        .expect("reopened git provenance");
+    assert_eq!(reopened_git.repo_root, repo_root);
+    assert_eq!(
+        reopened_git.head_commit.as_deref(),
+        Some(head_commit.as_str())
+    );
+    assert_eq!(reopened_git.branch.as_deref(), Some("main"));
+    assert_eq!(
+        reopened_git.remote_url.as_deref(),
+        Some(remote_url.as_str())
+    );
+    assert_eq!(reopened_git.pathspec, vec![".".to_string()]);
+    assert!(!reopened_git.dirty);
+
+    let manifest_bytes = reopened
+        .filesystem()
+        .read_file(terracedb_sandbox::disk::HOIST_MANIFEST_PATH)
+        .await
+        .expect("read persisted hoist manifest")
+        .expect("persisted hoist manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("decode hoist manifest");
+    assert_eq!(manifest["source_path"], json!(repo_root.clone()));
+    assert_eq!(manifest["target_root"], json!("/workspace"));
+    assert_eq!(manifest["mode"], json!("git_head"));
+    assert_eq!(
+        manifest["git_provenance"]["repo_root"],
+        json!(repo_root.clone())
+    );
+    assert_eq!(
+        manifest["git_provenance"]["head_commit"],
+        json!(head_commit.clone())
+    );
+    assert_eq!(manifest["git_provenance"]["branch"], json!("main"));
+    assert_eq!(
+        manifest["git_provenance"]["remote_url"],
+        json!(remote_url.clone())
+    );
+    assert!(
+        manifest["entries"]
+            .as_array()
+            .expect("hoist manifest entries")
+            .iter()
+            .any(|entry| entry["path"] == json!("tracked.txt"))
+    );
+
+    reopened
+        .filesystem()
+        .write_file(
+            "/workspace/tracked.txt",
+            b"reopened bridge change\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update reopened sandbox file");
+
+    let report = reopened
+        .create_pull_request(PullRequestRequest {
+            title: "Recovered host git PR".to_string(),
+            body: "Created after reopen".to_string(),
+            head_branch: "sandbox/recovered-host-git".to_string(),
+            base_branch: "main".to_string(),
+        })
+        .await
+        .expect("create pull request after reopen");
+    assert!(report.url.contains("example.invalid"));
+    assert_eq!(
+        report.metadata.get("eject_mode"),
+        Some(&json!("apply_delta"))
+    );
+    assert_eq!(
+        report.metadata.get("provenance_validated"),
+        Some(&json!(true))
+    );
+    assert_eq!(report.metadata.get("committed"), Some(&json!(true)));
+    assert_eq!(report.metadata.get("pushed"), Some(&json!(true)));
+
+    let workspace = PathBuf::from(
+        report
+            .metadata
+            .get("workspace_path")
+            .and_then(serde_json::Value::as_str)
+            .expect("workspace path"),
+    );
+    assert_eq!(
+        git_out(&workspace, &["show", "HEAD:tracked.txt"]),
+        "reopened bridge change"
+    );
+    let pushed_head = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["rev-parse", "refs/heads/sandbox/recovered-host-git"])
+        .output()
+        .expect("inspect recovered remote branch");
+    assert!(
+        pushed_head.status.success(),
+        "recovered remote branch missing: {}",
+        String::from_utf8_lossy(&pushed_head.stderr)
+    );
+
+    cleanup(&repo);
+    cleanup(&remote);
+    cleanup(&workspace);
 }
 
 fn recovery_router() -> SandboxExecutionRouter {

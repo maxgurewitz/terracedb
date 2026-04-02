@@ -9,6 +9,7 @@ use std::{
 };
 
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
+use terracedb_git::HostGitBridge;
 use terracedb_sandbox::{
     CloseSessionOptions, ConflictPolicy, DefaultSandboxStore, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
@@ -441,6 +442,178 @@ async fn create_pull_request_exports_to_real_git_worktree_and_pushes_branch() {
     assert_eq!(
         git_out(&workspace, &["show", "HEAD:tracked.txt"]),
         "pr branch change"
+    );
+
+    cleanup(&repo);
+    cleanup(&remote);
+    cleanup(&workspace);
+}
+
+#[tokio::test]
+async fn replacing_git_workspace_manager_keeps_host_bridge_in_sync_for_exports() {
+    let repo = unique_test_dir("git-pr-manager-sync-repo");
+    let remote = unique_test_dir("git-pr-manager-sync-remote");
+    init_git_repo(&repo, Some(&remote));
+
+    let services = SandboxServices::deterministic()
+        .with_git_workspace_manager(Arc::new(HostGitWorkspaceManager::default()));
+    let (vfs, sandbox) = sandbox_store(140, 505, services);
+    let base_volume_id = VolumeId::new(0x9040);
+    let session_volume_id = VolumeId::new(0x9041);
+    create_empty_base(&vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open synced host git session");
+    session
+        .hoist_from_disk(HoistRequest {
+            source_path: repo.to_string_lossy().into_owned(),
+            target_root: "/workspace".to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        })
+        .await
+        .expect("hoist synced host git repo");
+    session
+        .filesystem()
+        .write_file(
+            "/workspace/tracked.txt",
+            b"synced host bridge change\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update synced sandbox file");
+
+    let report = session
+        .create_pull_request(PullRequestRequest {
+            title: "Synced Sandbox PR".to_string(),
+            body: "Generated from replaced git manager".to_string(),
+            head_branch: "sandbox/manager-sync".to_string(),
+            base_branch: "main".to_string(),
+        })
+        .await
+        .expect("create synced pull request");
+    assert_eq!(
+        report.metadata.get("committed"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        report.metadata.get("pushed"),
+        Some(&serde_json::Value::Bool(true))
+    );
+
+    let workspace = PathBuf::from(
+        report
+            .metadata
+            .get("workspace_path")
+            .and_then(|value| value.as_str())
+            .expect("workspace path"),
+    );
+    assert_eq!(
+        git_out(&workspace, &["show", "HEAD:tracked.txt"]),
+        "synced host bridge change"
+    );
+    let pushed_head = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["rev-parse", "refs/heads/sandbox/manager-sync"])
+        .output()
+        .expect("inspect synced remote branch");
+    assert!(
+        pushed_head.status.success(),
+        "synced remote branch missing: {}",
+        String::from_utf8_lossy(&pushed_head.stderr)
+    );
+
+    cleanup(&repo);
+    cleanup(&remote);
+    cleanup(&workspace);
+}
+
+#[tokio::test]
+async fn replacing_git_host_bridge_keeps_workspace_manager_in_sync_for_exports() {
+    let repo = unique_test_dir("git-pr-bridge-sync-repo");
+    let remote = unique_test_dir("git-pr-bridge-sync-remote");
+    init_git_repo(&repo, Some(&remote));
+
+    let services =
+        SandboxServices::deterministic().with_git_host_bridge(Arc::new(HostGitBridge::default()));
+    let (vfs, sandbox) = sandbox_store(150, 506, services);
+    let base_volume_id = VolumeId::new(0x9050);
+    let session_volume_id = VolumeId::new(0x9051);
+    create_empty_base(&vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open bridge-synced host git session");
+    session
+        .hoist_from_disk(HoistRequest {
+            source_path: repo.to_string_lossy().into_owned(),
+            target_root: "/workspace".to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        })
+        .await
+        .expect("hoist bridge-synced host git repo");
+    session
+        .filesystem()
+        .write_file(
+            "/workspace/tracked.txt",
+            b"bridge-synced host change\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update bridge-synced sandbox file");
+
+    let report = session
+        .create_pull_request(PullRequestRequest {
+            title: "Bridge Synced Sandbox PR".to_string(),
+            body: "Generated from replaced git bridge".to_string(),
+            head_branch: "sandbox/bridge-sync".to_string(),
+            base_branch: "main".to_string(),
+        })
+        .await
+        .expect("create bridge-synced pull request");
+    assert_eq!(
+        report.metadata.get("committed"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        report.metadata.get("pushed"),
+        Some(&serde_json::Value::Bool(true))
+    );
+
+    let workspace = PathBuf::from(
+        report
+            .metadata
+            .get("workspace_path")
+            .and_then(|value| value.as_str())
+            .expect("workspace path"),
+    );
+    assert_eq!(
+        git_out(&workspace, &["show", "HEAD:tracked.txt"]),
+        "bridge-synced host change"
+    );
+    let pushed_head = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["rev-parse", "refs/heads/sandbox/bridge-sync"])
+        .output()
+        .expect("inspect bridge-synced remote branch");
+    assert!(
+        pushed_head.status.success(),
+        "bridge-synced remote branch missing: {}",
+        String::from_utf8_lossy(&pushed_head.stderr)
     );
 
     cleanup(&repo);

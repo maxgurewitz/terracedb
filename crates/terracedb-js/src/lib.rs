@@ -9,6 +9,7 @@ mod boa;
 pub mod compat;
 pub mod entropy;
 pub mod error;
+pub mod host;
 pub mod loader;
 pub mod runtime;
 pub mod scheduler;
@@ -17,9 +18,12 @@ pub mod types;
 
 pub use adapters::{SandboxJsRuntimeBinding, SandboxJsRuntimeRequest};
 pub use boa::{BoaJsExecutionHooks, BoaJsRuntimeHost, BoaJsScheduler};
-pub use compat::{DeterministicJsHostServices, DeterministicJsServiceOutcome, JsHostServices};
 pub use entropy::{DeterministicJsEntropySource, JsEntropySnapshot, JsEntropySource};
 pub use error::JsSubstrateError;
+pub use host::{
+    DeterministicJsHostServices, DeterministicJsServiceOutcome, JsHostServiceAdapter,
+    JsHostServices, RoutedJsHostServices, VfsJsHostServiceAdapter,
+};
 pub use loader::{
     JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule, VfsJsModuleLoader,
 };

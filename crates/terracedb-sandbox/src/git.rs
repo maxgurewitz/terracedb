@@ -1,13 +1,19 @@
 use std::{
     collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use terracedb_git::{
+    GitFinalizeExportReport, GitFinalizeExportRequest, GitHostBridge,
+    GitWorkspaceRequest as BridgeGitWorkspaceRequest, HostGitBridge as DefaultHostGitBridge,
+    NeverCancel,
+};
 use terracedb_vfs::JsonValue;
 
 use crate::{SandboxError, SandboxSession};
@@ -32,6 +38,9 @@ pub struct GitWorkspaceReport {
 #[async_trait]
 pub trait GitWorkspaceManager: Send + Sync {
     fn name(&self) -> &str;
+    fn host_bridge(&self) -> Option<Arc<dyn GitHostBridge>> {
+        None
+    }
     async fn prepare_workspace(
         &self,
         session: &SandboxSession,
@@ -119,14 +128,32 @@ impl GitWorkspaceManager for DeterministicGitWorkspaceManager {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HostGitWorkspaceManager {
     name: String,
+    bridge: Arc<dyn GitHostBridge>,
+}
+
+impl std::fmt::Debug for HostGitWorkspaceManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostGitWorkspaceManager")
+            .field("name", &self.name)
+            .field("bridge", &self.bridge.name())
+            .finish()
+    }
 }
 
 impl HostGitWorkspaceManager {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            bridge: Arc::new(DefaultHostGitBridge::default()),
+        }
+    }
+
+    pub fn with_bridge(mut self, bridge: Arc<dyn GitHostBridge>) -> Self {
+        self.bridge = bridge;
+        self
     }
 }
 
@@ -142,6 +169,10 @@ impl GitWorkspaceManager for HostGitWorkspaceManager {
         &self.name
     }
 
+    fn host_bridge(&self) -> Option<Arc<dyn GitHostBridge>> {
+        Some(self.bridge.clone())
+    }
+
     async fn prepare_workspace(
         &self,
         session: &SandboxSession,
@@ -152,86 +183,43 @@ impl GitWorkspaceManager for HostGitWorkspaceManager {
             .provenance
             .git
             .ok_or(SandboxError::MissingGitProvenance)?;
-        let repo_root = PathBuf::from(provenance.repo_root.clone());
         let base_ref = provenance
             .head_commit
             .clone()
             .or(request.base_branch.clone())
             .or(provenance.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
-        let workspace_path = PathBuf::from(&request.target_path);
-        if workspace_path.exists() {
-            if workspace_path.is_dir() {
-                let mut entries =
-                    fs::read_dir(&workspace_path).map_err(|error| SandboxError::Io {
-                        path: workspace_path.to_string_lossy().into_owned(),
-                        message: error.to_string(),
-                    })?;
-                if entries
-                    .next()
-                    .transpose()
-                    .map_err(|error| SandboxError::Io {
-                        path: workspace_path.to_string_lossy().into_owned(),
-                        message: error.to_string(),
-                    })?
-                    .is_some()
-                {
-                    return Err(SandboxError::Io {
-                        path: workspace_path.to_string_lossy().into_owned(),
-                        message: "target workspace path must be empty".to_string(),
-                    });
-                }
-                fs::remove_dir(&workspace_path).map_err(|error| SandboxError::Io {
-                    path: workspace_path.to_string_lossy().into_owned(),
-                    message: error.to_string(),
-                })?;
-            } else {
-                return Err(SandboxError::Io {
-                    path: workspace_path.to_string_lossy().into_owned(),
-                    message: "target workspace path must be a directory".to_string(),
-                });
-            }
-        }
-        if let Some(parent) = workspace_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| SandboxError::Io {
-                path: parent.to_string_lossy().into_owned(),
-                message: error.to_string(),
-            })?;
-        }
-        run_git(
-            &repo_root,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                &request.target_path,
-                &base_ref,
-            ],
-        )?;
-        run_git(
-            &workspace_path,
-            &["checkout", "-B", &request.branch_name, &base_ref],
-        )?;
-        let head_commit = git_stdout(&workspace_path, &["rev-parse", "HEAD"])?;
+        let report = self
+            .bridge
+            .prepare_workspace(
+                BridgeGitWorkspaceRequest {
+                    repo_root: provenance.repo_root.clone(),
+                    branch_name: request.branch_name.clone(),
+                    base_ref,
+                    target_path: request.target_path.clone(),
+                    metadata: BTreeMap::from([
+                        (
+                            "session_volume_id".to_string(),
+                            JsonValue::from(info.session_volume_id.to_string()),
+                        ),
+                        (
+                            "base_branch".to_string(),
+                            request
+                                .base_branch
+                                .map(JsonValue::from)
+                                .unwrap_or(JsonValue::Null),
+                        ),
+                    ]),
+                },
+                Arc::new(NeverCancel),
+            )
+            .await
+            .map_err(git_substrate_error_to_sandbox)?;
         Ok(GitWorkspaceReport {
             manager: self.name.clone(),
-            branch_name: request.branch_name.clone(),
-            workspace_path: request.target_path.clone(),
-            metadata: BTreeMap::from([
-                (
-                    "repo_root".to_string(),
-                    JsonValue::from(provenance.repo_root.clone()),
-                ),
-                ("base_ref".to_string(), JsonValue::from(base_ref)),
-                ("head_commit".to_string(), JsonValue::from(head_commit)),
-                (
-                    "remote_url".to_string(),
-                    provenance
-                        .remote_url
-                        .map(JsonValue::from)
-                        .unwrap_or(JsonValue::Null),
-                ),
-            ]),
+            branch_name: report.branch_name,
+            workspace_path: report.workspace_path,
+            metadata: report.metadata,
         })
     }
 }
@@ -250,123 +238,103 @@ pub(crate) fn default_export_workspace_path(session_id: &str, branch_name: &str)
     }
 }
 
-pub(crate) fn finalize_git_export(
-    workspace_path: &Path,
-    title: &str,
-    body: &str,
-    head_branch: &str,
-) -> Result<BTreeMap<String, JsonValue>, SandboxError> {
-    if !is_git_workspace(workspace_path) {
-        return Ok(BTreeMap::new());
-    }
-    run_git(workspace_path, &["add", "-A"])?;
-    let status = git_stdout(workspace_path, &["status", "--porcelain=v1"])?;
-    let mut metadata = BTreeMap::new();
-    metadata.insert(
-        "workspace_path".to_string(),
-        JsonValue::from(workspace_path.to_string_lossy().into_owned()),
-    );
-    metadata.insert(
-        "branch_name".to_string(),
-        JsonValue::from(head_branch.to_string()),
-    );
-    if status.trim().is_empty() {
-        metadata.insert("committed".to_string(), JsonValue::from(false));
-        metadata.insert(
-            "head_commit".to_string(),
-            JsonValue::from(git_stdout(workspace_path, &["rev-parse", "HEAD"])?),
-        );
-        return Ok(metadata);
-    }
-    let mut commit = git_command(workspace_path);
-    commit
-        .arg("commit")
-        .arg("-m")
-        .arg(title)
-        .env("GIT_AUTHOR_NAME", "TerraceDB Sandbox")
-        .env("GIT_AUTHOR_EMAIL", "sandbox@example.invalid")
-        .env("GIT_COMMITTER_NAME", "TerraceDB Sandbox")
-        .env("GIT_COMMITTER_EMAIL", "sandbox@example.invalid");
-    if !body.trim().is_empty() {
-        commit.arg("-m").arg(body);
-    }
-    let output = commit.output().map_err(|error| SandboxError::Io {
-        path: workspace_path.to_string_lossy().into_owned(),
-        message: error.to_string(),
-    })?;
-    if !output.status.success() {
-        return Err(SandboxError::CommandFailed {
-            command: format!("git -C {} commit", workspace_path.display()),
-            status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    let commit_sha = git_stdout(workspace_path, &["rev-parse", "HEAD"])?;
-    metadata.insert("committed".to_string(), JsonValue::from(true));
-    metadata.insert("head_commit".to_string(), JsonValue::from(commit_sha));
-    let remote = git_stdout_optional(workspace_path, &["remote", "get-url", "origin"])?;
-    if remote.is_some() {
-        run_git(workspace_path, &["push", "-u", "origin", head_branch])?;
-        metadata.insert("pushed".to_string(), JsonValue::from(true));
-        metadata.insert(
-            "push_remote".to_string(),
-            JsonValue::from(remote.unwrap_or_default()),
-        );
-    } else {
-        metadata.insert("pushed".to_string(), JsonValue::from(false));
-    }
-    Ok(metadata)
+pub(crate) fn finalize_export_report_metadata(
+    report: GitFinalizeExportReport,
+) -> BTreeMap<String, JsonValue> {
+    report.metadata
 }
 
-fn is_git_workspace(path: &Path) -> bool {
-    path.join(".git").exists()
-        || matches!(
-            git_stdout_optional(path, &["rev-parse", "--git-dir"]),
-            Ok(Some(_))
-        )
-}
-
-fn run_git(repo_root: &Path, args: &[&str]) -> Result<(), SandboxError> {
-    let output = git_command(repo_root)
-        .args(args)
-        .output()
-        .map_err(|error| SandboxError::Io {
-            path: repo_root.to_string_lossy().into_owned(),
-            message: error.to_string(),
-        })?;
-    if output.status.success() {
-        return Ok(());
+pub(crate) fn finalize_export_request(
+    workspace_path: String,
+    title: String,
+    body: String,
+    head_branch: String,
+    metadata: BTreeMap<String, JsonValue>,
+) -> GitFinalizeExportRequest {
+    GitFinalizeExportRequest {
+        workspace_path,
+        head_branch,
+        title,
+        body,
+        metadata,
     }
-    Err(SandboxError::CommandFailed {
-        command: format!("git -C {} {}", repo_root.display(), args.join(" ")),
-        status: output.status.code(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
 }
 
-fn git_stdout(repo_root: &Path, args: &[&str]) -> Result<String, SandboxError> {
-    let output = git_command(repo_root)
-        .args(args)
-        .output()
-        .map_err(|error| SandboxError::Io {
-            path: repo_root.to_string_lossy().into_owned(),
-            message: error.to_string(),
-        })?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-    }
-    Err(SandboxError::CommandFailed {
-        command: format!("git -C {} {}", repo_root.display(), args.join(" ")),
-        status: output.status.code(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
-}
-
-fn git_stdout_optional(repo_root: &Path, args: &[&str]) -> Result<Option<String>, SandboxError> {
-    match git_stdout(repo_root, args) {
-        Ok(stdout) => Ok(Some(stdout)),
-        Err(SandboxError::CommandFailed { .. }) => Ok(None),
-        Err(error) => Err(error),
+pub(crate) fn git_substrate_error_to_sandbox(
+    error: terracedb_git::GitSubstrateError,
+) -> SandboxError {
+    match error {
+        terracedb_git::GitSubstrateError::ExportConflict { path, message } => {
+            SandboxError::Io { path, message }
+        }
+        terracedb_git::GitSubstrateError::RemotePushFailed {
+            remote,
+            branch,
+            message,
+        } => SandboxError::Service {
+            service: "git",
+            message: format!("remote push failed for {remote}/{branch}: {message}"),
+        },
+        terracedb_git::GitSubstrateError::PullRequestProvider { provider, message } => {
+            SandboxError::Service {
+                service: "git",
+                message: format!("pull-request provider {provider} failed: {message}"),
+            }
+        }
+        terracedb_git::GitSubstrateError::Bridge { operation, message } => SandboxError::Service {
+            service: "git",
+            message: format!("{operation}: {message}"),
+        },
+        terracedb_git::GitSubstrateError::Cancelled { repository_id } => SandboxError::Service {
+            service: "git",
+            message: format!("cancelled: {repository_id}"),
+        },
+        terracedb_git::GitSubstrateError::RepositoryNotFound { path } => SandboxError::Io {
+            path,
+            message: "git repository was not found".to_string(),
+        },
+        terracedb_git::GitSubstrateError::RepositoryReadOnly { repository_id } => {
+            SandboxError::Service {
+                service: "git",
+                message: format!("repository is read-only: {repository_id}"),
+            }
+        }
+        terracedb_git::GitSubstrateError::RepositoryImageDescriptorMismatch {
+            field,
+            expected,
+            found,
+        } => SandboxError::Service {
+            service: "git",
+            message: format!(
+                "repository image descriptor mismatch for {field}: expected {expected}, found {found}"
+            ),
+        },
+        terracedb_git::GitSubstrateError::ReferenceNotFound { reference } => {
+            SandboxError::Service {
+                service: "git",
+                message: format!("reference not found: {reference}"),
+            }
+        }
+        terracedb_git::GitSubstrateError::ReferenceConflict {
+            reference,
+            expected,
+            found,
+        } => SandboxError::Service {
+            service: "git",
+            message: format!(
+                "reference conflict for {reference}: expected {expected:?}, found {found:?}"
+            ),
+        },
+        terracedb_git::GitSubstrateError::ObjectNotFound { oid } => SandboxError::Service {
+            service: "git",
+            message: format!("object not found: {oid}"),
+        },
+        terracedb_git::GitSubstrateError::InvalidObject { oid, message } => SandboxError::Service {
+            service: "git",
+            message: format!("invalid object {oid}: {message}"),
+        },
+        terracedb_git::GitSubstrateError::SerdeJson(error) => SandboxError::SerdeJson(error),
+        terracedb_git::GitSubstrateError::Vfs(error) => SandboxError::Vfs(error),
     }
 }
 
@@ -385,23 +353,6 @@ fn sanitize_label(value: &str) -> String {
         sanitized = sanitized.replace("--", "-");
     }
     sanitized.trim_matches('-').to_string()
-}
-
-fn git_command(repo_root: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(repo_root);
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_PREFIX",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    ] {
-        command.env_remove(key);
-    }
-    command
 }
 
 #[cfg(test)]

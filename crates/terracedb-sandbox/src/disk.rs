@@ -1342,7 +1342,7 @@ fn ancestor_relatives(path: &str) -> Vec<String> {
 }
 
 impl ManifestEntry {
-    fn from_tree_entry(entry: &TreeEntry) -> Self {
+    pub(crate) fn from_tree_entry(entry: &TreeEntry) -> Self {
         match &entry.data {
             TreeEntryData::File(bytes) => Self {
                 path: entry.path.clone(),

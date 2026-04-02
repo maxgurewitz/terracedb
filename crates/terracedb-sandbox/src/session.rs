@@ -1,10 +1,18 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use terracedb::Clock;
 use terracedb_capabilities::{ExecutionOperation, ExecutionPolicy};
+use terracedb_git::{
+    DeterministicGitHostBridge, GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest,
+    HostGitBridge, NeverCancel,
+};
 use terracedb_vfs::{
     CompletedToolRun, CompletedToolRunOutcome, CreateOptions, DirEntry, MkdirOptions,
     ReadOnlyVfsFileSystem, SnapshotOptions, Stats, ToolRunId, ToolRunStatus, VfsError, VfsKvStore,
@@ -13,10 +21,14 @@ use terracedb_vfs::{
 use tokio::sync::Mutex;
 
 use crate::disk::{
-    apply_delta_to_host, load_hoist_manifest, materialize_snapshot_to_host, prepare_hoist,
-    replace_vfs_tree, write_hoist_manifest,
+    HoistManifest, ManifestEntry, PreparedHoist, TreeEntry, TreeEntryData, apply_delta_to_host,
+    load_hoist_manifest, materialize_snapshot_to_host, prepare_hoist, replace_vfs_tree,
+    write_hoist_manifest,
 };
-use crate::git::{default_export_workspace_path, finalize_git_export};
+use crate::git::{
+    default_export_workspace_path, finalize_export_report_metadata, finalize_export_request,
+    git_substrate_error_to_sandbox,
+};
 use crate::routing::{
     RoutedBashService, RoutedPackageInstaller, RoutedRuntimeBackend, RoutedTypeScriptService,
     SandboxExecutionRouter,
@@ -59,6 +71,7 @@ pub struct SandboxServices {
     pub runtime: Arc<dyn SandboxRuntimeBackend>,
     pub packages: Arc<dyn PackageInstaller>,
     pub git: Arc<dyn GitWorkspaceManager>,
+    pub git_bridge: Arc<dyn GitHostBridge>,
     pub pull_requests: Arc<dyn PullRequestProviderClient>,
     pub readonly_views: Arc<dyn ReadonlyViewProvider>,
     pub typescript: Arc<dyn TypeScriptService>,
@@ -80,10 +93,12 @@ impl SandboxServices {
         let bash: Arc<dyn BashService> = Arc::new(
             DeterministicBashService::default().with_typescript_service(typescript.clone()),
         );
+        let git_bridge = fallback_git_host_bridge(&git);
         Self {
             runtime,
             packages,
             git,
+            git_bridge,
             pull_requests,
             readonly_views,
             typescript,
@@ -99,7 +114,14 @@ impl SandboxServices {
     }
 
     pub fn with_git_workspace_manager(mut self, git: Arc<dyn GitWorkspaceManager>) -> Self {
+        self.git_bridge = fallback_git_host_bridge(&git);
         self.git = git;
+        self
+    }
+
+    pub fn with_git_host_bridge(mut self, git_bridge: Arc<dyn GitHostBridge>) -> Self {
+        self.git = Arc::new(HostGitWorkspaceManager::default().with_bridge(git_bridge.clone()));
+        self.git_bridge = git_bridge;
         self
     }
 
@@ -128,8 +150,7 @@ impl SandboxServices {
     }
 
     pub fn deterministic_with_host_git() -> Self {
-        Self::deterministic()
-            .with_git_workspace_manager(Arc::new(HostGitWorkspaceManager::default()))
+        Self::deterministic().with_git_host_bridge(Arc::new(HostGitBridge::default()))
     }
 
     pub fn deterministic_with_host_git_and_capabilities(
@@ -188,6 +209,11 @@ impl SandboxServices {
             None => Ok(legacy),
         }
     }
+}
+
+fn fallback_git_host_bridge(git: &Arc<dyn GitWorkspaceManager>) -> Arc<dyn GitHostBridge> {
+    git.host_bridge()
+        .unwrap_or_else(|| Arc::new(DeterministicGitHostBridge::default()))
 }
 
 pub struct DefaultSandboxStore<S> {
@@ -1156,7 +1182,22 @@ impl SandboxSession {
         &self,
         request: HoistRequest,
     ) -> Result<HoistReport, SandboxError> {
-        let prepared = prepare_hoist(&request)?;
+        let prepared = match &request.mode {
+            crate::HoistMode::DirectorySnapshot => prepare_hoist(&request)?,
+            crate::HoistMode::GitHead
+                if self.services.git_bridge.supports_host_filesystem_bridge() =>
+            {
+                prepare_git_hoist_via_bridge(self.services.git_bridge.clone(), &request).await?
+            }
+            crate::HoistMode::GitWorkingTree { .. }
+                if self.services.git_bridge.supports_host_filesystem_bridge() =>
+            {
+                prepare_git_hoist_via_bridge(self.services.git_bridge.clone(), &request).await?
+            }
+            crate::HoistMode::GitHead | crate::HoistMode::GitWorkingTree { .. } => {
+                prepare_hoist(&request)?
+            }
+        };
         let _guard = self.operation_lock.lock().await;
         let deleted_paths = replace_vfs_tree(
             self.volume.fs().as_ref(),
@@ -1258,14 +1299,30 @@ impl SandboxSession {
                 JsonValue::from(eject_report.provenance_validated),
             );
             if workspace.metadata.contains_key("repo_root") {
-                let workspace_path = PathBuf::from(&workspace.workspace_path);
-                git_metadata.extend(finalize_git_export(
-                    workspace_path.as_path(),
-                    &request.title,
-                    &request.body,
-                    &request.head_branch,
-                )?);
+                let finalize = self
+                    .services
+                    .git_bridge
+                    .finalize_export(
+                        finalize_export_request(
+                            workspace.workspace_path.clone(),
+                            request.title.clone(),
+                            request.body.clone(),
+                            request.head_branch.clone(),
+                            git_metadata.clone(),
+                        ),
+                        Arc::new(NeverCancel),
+                    )
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                git_metadata = finalize_export_report_metadata(finalize);
             }
+            let mut report = self
+                .services
+                .pull_requests
+                .create_pull_request(self, request)
+                .await?;
+            report.metadata.extend(git_metadata);
+            return Ok(report);
         }
         let mut report = self
             .services
@@ -1609,6 +1666,106 @@ fn execution_operation_for_tool_run(name: &str) -> Option<ExecutionOperation> {
         "sandbox.bash.exec" => Some(ExecutionOperation::BashHelper),
         _ => None,
     }
+}
+
+async fn prepare_git_hoist_via_bridge(
+    bridge: Arc<dyn GitHostBridge>,
+    request: &HoistRequest,
+) -> Result<PreparedHoist, SandboxError> {
+    let report = bridge
+        .import_repository(
+            GitImportRequest {
+                source_path: request.source_path.clone(),
+                target_root: request.target_root.clone(),
+                mode: match &request.mode {
+                    crate::HoistMode::GitHead => GitImportMode::Head,
+                    crate::HoistMode::GitWorkingTree {
+                        include_untracked,
+                        include_ignored,
+                    } => GitImportMode::WorkingTree {
+                        include_untracked: *include_untracked,
+                        include_ignored: *include_ignored,
+                    },
+                    crate::HoistMode::DirectorySnapshot => {
+                        return Err(SandboxError::Service {
+                            service: "git",
+                            message: "git bridge cannot import directory snapshots".to_string(),
+                        });
+                    }
+                },
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .map_err(git_substrate_error_to_sandbox)?;
+    let entries = report
+        .entries
+        .iter()
+        .map(git_import_entry_to_tree_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest = HoistManifest {
+        format_version: 1,
+        source_path: report.source_path,
+        target_root: report.target_root,
+        mode: request.mode.clone(),
+        git_provenance: Some(crate::GitProvenance {
+            repo_root: report.repository_root,
+            head_commit: report.head_commit,
+            branch: report.branch,
+            remote_url: report.remote_url,
+            pathspec: report.pathspec,
+            dirty: report.dirty,
+        }),
+        entries: entries.iter().map(ManifestEntry::from_tree_entry).collect(),
+    };
+    Ok(PreparedHoist { manifest, entries })
+}
+
+fn git_import_entry_to_tree_entry(
+    entry: &terracedb_git::GitImportEntry,
+) -> Result<TreeEntry, SandboxError> {
+    let path = normalize_bridge_import_path(&entry.path)?;
+    let data = match entry.kind {
+        GitImportEntryKind::File => {
+            TreeEntryData::File(entry.data.clone().ok_or(SandboxError::Service {
+                service: "git",
+                message: format!("missing file payload for imported path {}", entry.path),
+            })?)
+        }
+        GitImportEntryKind::Directory => TreeEntryData::Directory,
+        GitImportEntryKind::Symlink => {
+            TreeEntryData::Symlink(entry.symlink_target.clone().ok_or(SandboxError::Service {
+                service: "git",
+                message: format!("missing symlink target for imported path {}", entry.path),
+            })?)
+        }
+    };
+    Ok(TreeEntry { path, data })
+}
+
+fn normalize_bridge_import_path(path: &str) -> Result<String, SandboxError> {
+    let mut normalized = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => normalized.push(segment.to_string_lossy().into_owned()),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(SandboxError::Service {
+                    service: "git",
+                    message: format!("bridge import path escapes sandbox root: {path}"),
+                });
+            }
+        }
+    }
+    let normalized = normalized.join("/");
+    if normalized.is_empty() {
+        return Err(SandboxError::Service {
+            service: "git",
+            message: format!("bridge import path must not be empty: {path}"),
+        });
+    }
+    Ok(normalized)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
