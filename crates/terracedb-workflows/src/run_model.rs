@@ -1,11 +1,16 @@
+use async_trait::async_trait;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use terracedb_workflows_core::{
     AppendOnlyWorkflowHistoryOrderer, PassthroughWorkflowVisibilityProjector, WorkflowBundleId,
-    WorkflowHistoryEvent, WorkflowHistoryOrderer, WorkflowLifecycleRecord, WorkflowLifecycleState,
-    WorkflowRunId, WorkflowStateRecord, WorkflowTaskError, WorkflowTaskId, WorkflowTransitionInput,
-    WorkflowTransitionOutput, WorkflowVisibilityProjector, WorkflowVisibilityRecord,
+    WorkflowDescribeRequest, WorkflowDescribeResponse, WorkflowHistoryEvent,
+    WorkflowHistoryOrderer, WorkflowHistoryPageEntry, WorkflowHistoryPageRequest,
+    WorkflowHistoryPageResponse, WorkflowLifecycleRecord, WorkflowLifecycleState, WorkflowRunId,
+    WorkflowStateRecord, WorkflowTaskError, WorkflowTaskId, WorkflowTransitionInput,
+    WorkflowTransitionOutput, WorkflowVisibilityApi, WorkflowVisibilityEntry,
+    WorkflowVisibilityListRequest, WorkflowVisibilityListResponse, WorkflowVisibilityProjector,
+    WorkflowVisibilityRecord,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,6 +582,140 @@ impl InMemoryWorkflowRunStore {
         self.apply_plan(plan.clone());
         Ok(plan)
     }
+
+    fn describe_response(
+        &self,
+        run_id: &WorkflowRunId,
+    ) -> Result<WorkflowDescribeResponse, WorkflowTaskError> {
+        let run = self.runs.get(run_id).ok_or_else(|| {
+            WorkflowTaskError::new("missing-run", format!("unknown workflow run {run_id}"))
+        })?;
+        let visibility = self.visibility_by_run.get(run_id).cloned().ok_or_else(|| {
+            WorkflowTaskError::new(
+                "missing-visibility",
+                format!("missing visibility for workflow run {run_id}"),
+            )
+        })?;
+        let lifecycle = self.lifecycle_by_run.get(run_id).cloned();
+        let state = self
+            .active_state_by_instance
+            .get(&run.instance_id)
+            .filter(|state| state.run_id == *run_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                reconstruct_state_for_run(
+                    run,
+                    lifecycle.as_ref(),
+                    &visibility,
+                    self.history(run_id),
+                )
+            });
+        Ok(WorkflowDescribeResponse {
+            state,
+            lifecycle,
+            visibility: WorkflowVisibilityEntry {
+                record: visibility,
+                execution: None,
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl WorkflowVisibilityApi for InMemoryWorkflowRunStore {
+    async fn list(
+        &self,
+        request: WorkflowVisibilityListRequest,
+    ) -> Result<WorkflowVisibilityListResponse, WorkflowTaskError> {
+        let limit = if request.page_size == 0 {
+            usize::MAX
+        } else {
+            request.page_size as usize
+        };
+        let mut entries = Vec::new();
+        let mut next_cursor = None;
+        for (run_id, record) in &self.visibility_by_run {
+            if request
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| run_id <= cursor)
+            {
+                continue;
+            }
+            if request
+                .workflow_name
+                .as_ref()
+                .is_some_and(|workflow_name| &record.workflow_name != workflow_name)
+            {
+                continue;
+            }
+            if request
+                .lifecycle
+                .is_some_and(|lifecycle| record.lifecycle != lifecycle)
+            {
+                continue;
+            }
+            if request.deployment_id.is_some() || request.target.is_some() {
+                continue;
+            }
+            if entries.len() == limit {
+                next_cursor = entries
+                    .last()
+                    .map(|entry: &WorkflowVisibilityEntry| entry.record.run_id.clone());
+                break;
+            }
+            entries.push(WorkflowVisibilityEntry {
+                record: record.clone(),
+                execution: None,
+            });
+        }
+        Ok(WorkflowVisibilityListResponse {
+            entries,
+            next_cursor,
+        })
+    }
+
+    async fn describe(
+        &self,
+        request: WorkflowDescribeRequest,
+    ) -> Result<WorkflowDescribeResponse, WorkflowTaskError> {
+        self.describe_response(&request.run_id)
+    }
+
+    async fn history(
+        &self,
+        request: WorkflowHistoryPageRequest,
+    ) -> Result<WorkflowHistoryPageResponse, WorkflowTaskError> {
+        let limit = if request.limit == 0 {
+            usize::MAX
+        } else {
+            request.limit as usize
+        };
+        let mut entries = Vec::new();
+        let mut next_after_sequence = None;
+        for record in self.history(&request.run_id) {
+            if request
+                .after_sequence
+                .is_some_and(|after_sequence| record.sequence <= after_sequence)
+            {
+                continue;
+            }
+            if entries.len() == limit {
+                next_after_sequence = entries
+                    .last()
+                    .map(|entry: &WorkflowHistoryPageEntry| entry.sequence);
+                break;
+            }
+            entries.push(WorkflowHistoryPageEntry {
+                sequence: record.sequence,
+                event: record.event.clone(),
+            });
+        }
+        Ok(WorkflowHistoryPageResponse {
+            entries,
+            next_after_sequence,
+        })
+    }
 }
 
 pub fn default_native_bundle_id(workflow_name: &str) -> WorkflowBundleId {
@@ -649,12 +788,45 @@ fn default_lifecycle_after_apply(
     }
 }
 
+fn reconstruct_state_for_run(
+    run: &WorkflowRunRecord,
+    lifecycle: Option<&WorkflowLifecycleRecord>,
+    visibility: &WorkflowVisibilityRecord,
+    history: &[WorkflowHistoryRecord],
+) -> WorkflowStateRecord {
+    let mut state = None;
+    for record in history {
+        if let WorkflowHistoryEvent::TaskApplied { output, .. } = &record.event {
+            match &output.state {
+                terracedb_workflows_core::WorkflowStateMutation::Unchanged => {}
+                terracedb_workflows_core::WorkflowStateMutation::Put { state: next_state } => {
+                    state = Some(next_state.clone())
+                }
+                terracedb_workflows_core::WorkflowStateMutation::Delete => state = None,
+            }
+        }
+    }
+    WorkflowStateRecord {
+        run_id: run.run_id.clone(),
+        bundle_id: run.bundle_id.clone(),
+        workflow_name: run.workflow_name.clone(),
+        instance_id: run.instance_id.clone(),
+        lifecycle: lifecycle
+            .map(|record| record.lifecycle)
+            .unwrap_or(visibility.lifecycle),
+        current_task_id: visibility.last_task_id.clone(),
+        history_len: visibility.history_len,
+        state,
+        updated_at_millis: visibility.updated_at_millis,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use terracedb_workflows_core::{
-        WorkflowChangeKind, WorkflowContinueAsNew, WorkflowPayload, WorkflowSourceEvent,
-        WorkflowStateMutation, WorkflowTransitionOutput, WorkflowTrigger,
+        WorkflowChangeKind, WorkflowContinueAsNew, WorkflowDescribeRequest, WorkflowPayload,
+        WorkflowSourceEvent, WorkflowStateMutation, WorkflowTransitionOutput, WorkflowTrigger,
     };
 
     fn sample_trigger() -> WorkflowTrigger {
@@ -858,5 +1030,43 @@ mod tests {
             .reduce(None, &input, &WorkflowTransitionOutput::default(), 15)
             .expect("reduce event transition");
         assert_eq!(plan.active_state.lifecycle, WorkflowLifecycleState::Running);
+    }
+
+    #[tokio::test]
+    async fn visibility_api_reconstructs_terminal_run_state_after_continue_as_new() {
+        let input = sample_input("task:1");
+        let next_run_id = WorkflowRunId::new("run:orders:order-1:next").expect("next run id");
+        let next_bundle_id =
+            WorkflowBundleId::new("native:orders:v2").expect("next bundle id should be valid");
+        let output = WorkflowTransitionOutput {
+            state: WorkflowStateMutation::Put {
+                state: WorkflowPayload::bytes("done"),
+            },
+            continue_as_new: Some(WorkflowContinueAsNew {
+                next_run_id: next_run_id.clone(),
+                next_bundle_id,
+                state: Some(WorkflowPayload::bytes("carry")),
+            }),
+            ..WorkflowTransitionOutput::default()
+        };
+
+        let mut store = InMemoryWorkflowRunStore::default();
+        store
+            .apply_transition(&input, &output, 30)
+            .expect("apply continue-as-new transition");
+
+        let describe = store
+            .describe(WorkflowDescribeRequest {
+                run_id: input.run_id.clone(),
+            })
+            .await
+            .expect("describe prior run");
+        assert_eq!(describe.state.run_id, input.run_id);
+        assert_eq!(describe.state.state, Some(WorkflowPayload::bytes("done")));
+        assert_eq!(describe.state.lifecycle, WorkflowLifecycleState::Completed);
+        assert_eq!(
+            describe.visibility.record.lifecycle,
+            WorkflowLifecycleState::Completed
+        );
     }
 }
