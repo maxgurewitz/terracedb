@@ -707,7 +707,7 @@ fn default_registry() -> BTreeMap<String, BTreeMap<String, DeterministicPackageD
             r#"
             import { readTextFile } from "node:fs/promises";
 
-            export function read(path) {
+            export async function read(path) {
               return readTextFile(path);
             }
 

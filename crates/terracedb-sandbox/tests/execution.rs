@@ -473,11 +473,11 @@ async fn guest_modules_read_write_vfs_and_call_explicit_capabilities() {
         import { readTextFile, writeTextFile } from "@terracedb/sandbox/fs";
         import { echo } from "terrace:host/tickets";
 
-        const input = readTextFile("/workspace/input.txt");
-        writeTextFile("/workspace/output.txt", `${input} + runtime`);
+        const input = await readTextFile("/workspace/input.txt");
+        await writeTextFile("/workspace/output.txt", `${input} + runtime`);
 
-        export default echo({
-          text: readTextFile("/workspace/output.txt"),
+        export default await echo({
+          text: await readTextFile("/workspace/output.txt"),
         });
         "#,
         &[("/workspace/input.txt", "hello sandbox")],
@@ -583,7 +583,7 @@ async fn denied_capabilities_fail_predictably_and_no_runtime_helpers_are_ambient
         base_volume_id,
         r#"
         import { echo } from "terrace:host/admin";
-        export default echo({ denied: true });
+        export default await echo({ denied: true });
         "#,
         &[],
     )
@@ -752,7 +752,7 @@ async fn manifest_bound_registry_generates_modules_and_records_policy_metadata()
         base_volume_id,
         r#"
         import { get } from "terrace:host/tickets";
-        export default get({ key: "ticket:t-1" });
+        export default await get({ key: "ticket:t-1" });
         "#,
         &[],
     )
@@ -855,7 +855,7 @@ async fn manifest_bound_registry_omits_ungranted_bindings_and_surfaces_granted_d
         base_volume_id,
         r#"
         import { put } from "terrace:host/tickets";
-        export default put({
+        export default await put({
           key: "ticket:t-1",
           row: { owner_id: "user:bob" },
           occReadSet: ["ticket:t-1"],
@@ -897,7 +897,7 @@ async fn manifest_bound_registry_omits_ungranted_bindings_and_surfaces_granted_d
         absent_base_volume_id,
         r#"
         import { get } from "terrace:host/admin";
-        export default get({ key: "t-1" });
+        export default await get({ key: "t-1" });
         "#,
         &[],
     )
@@ -980,7 +980,7 @@ async fn manifest_bound_shell_bridge_matches_typed_import_metadata_and_audit_nam
         base_volume_id,
         r#"
         import { get } from "terrace:host/tickets";
-        export default get({ key: "ticket:t-1" });
+        export default await get({ key: "ticket:t-1" });
         "#,
         &[],
     )

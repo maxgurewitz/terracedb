@@ -2,9 +2,7 @@
 //! - `DeterministicJsRuntimeHost` is the default simulation/oracle backend for deterministic,
 //!   async-friendly tests and host seams.
 //! - `BoaJsRuntimeHost` is the real `boa_engine` backend for guest-visible JS semantics, using
-//!   TerraceDB-owned scheduler, host-service, and module-loader seams.
-//! - `ImmediateBoaModuleLoader` adapts an async `JsModuleLoader` onto Boa's same-thread loader
-//!   boundary only when the loader future completes without yielding.
+//!   the same async TerraceDB-owned scheduler, host-service, and module-loader seams.
 
 pub mod adapters;
 mod boa;
@@ -18,10 +16,7 @@ pub mod time;
 pub mod types;
 
 pub use adapters::{SandboxJsRuntimeBinding, SandboxJsRuntimeRequest};
-pub use boa::{
-    BoaJsExecutionHooks, BoaJsHostServices, BoaJsModuleLoader, BoaJsRuntimeHost, BoaJsScheduler,
-    ImmediateBoaModuleLoader,
-};
+pub use boa::{BoaJsExecutionHooks, BoaJsRuntimeHost, BoaJsScheduler};
 pub use compat::{DeterministicJsHostServices, DeterministicJsServiceOutcome, JsHostServices};
 pub use entropy::{DeterministicJsEntropySource, JsEntropySnapshot, JsEntropySource};
 pub use error::JsSubstrateError;

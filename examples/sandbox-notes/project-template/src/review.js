@@ -3,14 +3,14 @@ import { camelCase } from "lodash";
 import { z } from "zod";
 import { listNotes, addComment } from "terrace:host/notes";
 
-const config = readJsonFile("/workspace/inbox.json");
+const config = await readJsonFile("/workspace/inbox.json");
 const noteSchema = z.object({
   id: z.string(),
   title: z.string(),
   status: z.string(),
   comments: z.string(),
 });
-const notes = listNotes().map((note) =>
+const notes = (await listNotes()).map((note) =>
   noteSchema.parse({
     ...note,
     comments: JSON.stringify(note.comments),
@@ -26,10 +26,10 @@ const summary = {
   slugs: openNotes.map((note) => camelCase(note.title)),
 };
 
-mkdir("/workspace/generated");
-writeJsonFile("/workspace/generated/triage-summary.json", summary);
+await mkdir("/workspace/generated");
+await writeJsonFile("/workspace/generated/triage-summary.json", summary);
 
-const updatedNote = addComment({
+const updatedNote = await addComment({
   noteId: openNotes[0].id,
   author: config.reviewer,
   body: `Reviewed ${config.project} with ${summary.openCount} open notes`,

@@ -14,15 +14,17 @@ use terracedb_capabilities::{
 };
 use terracedb_sandbox::{
     BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
-    DeterministicPackageInstaller, DeterministicRuntimeBackend, DeterministicTypeScriptService,
-    GitProvenance, ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
+    DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicPackageInstaller,
+    DeterministicRuntimeBackend, DeterministicTypeScriptService, GitProvenance,
+    ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
     ManifestBoundCapabilityRegistry, ManifestBoundCapabilityResult, PackageCompatibilityMode,
-    PackageInstallRequest, ReopenSessionOptions, SandboxConfig, SandboxExecutionDomainRoute,
-    SandboxExecutionPlacement, SandboxExecutionRouter, SandboxServices, SandboxStore,
-    TERRACE_BASH_SESSION_STATE_PATH, TERRACE_NPM_INSTALL_MANIFEST_PATH,
-    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
-    TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH, TypeCheckRequest,
-    TypeScriptService, TypeScriptTranspileRequest,
+    PackageInstallRequest, ReopenSessionOptions, SandboxCapability, SandboxConfig,
+    SandboxExecutionDomainRoute, SandboxExecutionKind, SandboxExecutionPlacement,
+    SandboxExecutionRequest, SandboxExecutionRouter, SandboxRuntimeBackend,
+    SandboxRuntimeStateHandle, SandboxServices, SandboxStore, TERRACE_BASH_SESSION_STATE_PATH,
+    TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH,
+    TERRACE_TYPESCRIPT_STATE_PATH, TypeCheckRequest, TypeScriptService, TypeScriptTranspileRequest,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore,
@@ -95,7 +97,7 @@ async fn seed_runtime_module(store: &InMemoryVfsStore, volume_id: VolumeId) {
             "/workspace/main.js",
             br#"
             import { writeTextFile } from "@terracedb/sandbox/fs";
-            writeTextFile("/workspace/generated.txt", "generated");
+            await writeTextFile("/workspace/generated.txt", "generated");
             export default "ok";
             "#
             .to_vec(),
@@ -605,6 +607,252 @@ async fn runtime_cache_manifest_only_survives_durable_recovery_after_flush() {
             .expect("runtime cache entries array")
             .iter()
             .any(|entry| entry["specifier"] == "terrace:/workspace/main.js")
+    );
+}
+
+#[tokio::test]
+async fn recovered_runtime_cache_preserves_inline_eval_and_host_service_entries() {
+    let capabilities = DeterministicCapabilityRegistry::new(vec![
+        DeterministicCapabilityModule::new(SandboxCapability::host_module("tickets"))
+            .expect("valid capability")
+            .with_echo_method("echo"),
+    ])
+    .expect("registry");
+    let services =
+        SandboxServices::deterministic().with_capabilities(Arc::new(capabilities.clone()));
+    let (source_vfs, sandbox) = sandbox_store_with_services(115, 2081, services.clone());
+    let base_volume_id = VolumeId::new(0x8220);
+    let session_volume_id = VolumeId::new(0x8221);
+    seed_base(&source_vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: terracedb_sandbox::ConflictPolicy::Fail,
+            capabilities: capabilities.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open runtime session");
+    session
+        .flush()
+        .await
+        .expect("flush initial runtime session");
+
+    let backend = DeterministicRuntimeBackend::default();
+    let handle = backend
+        .start_session(&session.info().await)
+        .await
+        .expect("start runtime session");
+    let request = SandboxExecutionRequest {
+        kind: SandboxExecutionKind::Eval {
+            source: r#"
+                import { readTextFile } from "@terracedb/sandbox/fs";
+                import { echo } from "terrace:host/tickets";
+                export default await echo({
+                    value: await readTextFile("/workspace/repo.txt")
+                });
+            "#
+            .to_string(),
+            virtual_specifier: Some(
+                "terrace:/workspace/.terrace/runtime/recovery-eval.mjs".to_string(),
+            ),
+        },
+        metadata: Default::default(),
+    };
+    backend
+        .execute(&session, &handle, request, SandboxRuntimeStateHandle::new())
+        .await
+        .expect("execute runtime eval");
+    session
+        .flush()
+        .await
+        .expect("flush session with runtime cache manifest");
+
+    let flushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut after runtime cache flush");
+    let (flushed_vfs, flushed_sandbox) = sandbox_store_with_services(116, 2082, services);
+    flushed_vfs
+        .import_volume(
+            flushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut");
+    let reopened = flushed_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen flushed runtime session");
+
+    let reopened_backend = DeterministicRuntimeBackend::default();
+    let reopened_handle = reopened_backend
+        .start_session(&reopened.info().await)
+        .await
+        .expect("start reopened runtime session");
+    reopened_backend
+        .execute(
+            &reopened,
+            &reopened_handle,
+            SandboxExecutionRequest {
+                kind: SandboxExecutionKind::Eval {
+                    source: "export default \"narrow\";".to_string(),
+                    virtual_specifier: Some(
+                        "terrace:/workspace/.terrace/runtime/recovery-narrow.mjs".to_string(),
+                    ),
+                },
+                metadata: Default::default(),
+            },
+            SandboxRuntimeStateHandle::new(),
+        )
+        .await
+        .expect("execute narrower reopened runtime eval");
+    reopened
+        .flush()
+        .await
+        .expect("flush reopened session with narrower eval cache");
+
+    let cache = reopened
+        .filesystem()
+        .read_file(TERRACE_RUNTIME_MODULE_CACHE_PATH)
+        .await
+        .expect("read recovered runtime cache")
+        .expect("runtime cache should survive durable recovery");
+    let specifiers = serde_json::from_slice::<serde_json::Value>(&cache)
+        .expect("decode recovered runtime cache")
+        .as_array()
+        .expect("runtime cache entries array")
+        .iter()
+        .map(|entry| {
+            entry["specifier"]
+                .as_str()
+                .expect("runtime cache specifier")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        specifiers.contains(&"terrace:/workspace/.terrace/runtime/recovery-eval.mjs".to_string())
+    );
+    assert!(
+        specifiers.contains(&"terrace:/workspace/.terrace/runtime/recovery-narrow.mjs".to_string())
+    );
+    assert!(specifiers.contains(&"@terracedb/sandbox/fs".to_string()));
+    assert!(specifiers.contains(&"terrace:host/tickets".to_string()));
+}
+
+#[tokio::test]
+async fn recovered_runtime_cache_restores_inline_eval_counter() {
+    let (source_vfs, sandbox) = sandbox_store(117, 2083);
+    let base_volume_id = VolumeId::new(0x8222);
+    let session_volume_id = VolumeId::new(0x8223);
+    seed_base(&source_vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: terracedb_sandbox::ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open runtime session");
+    session
+        .flush()
+        .await
+        .expect("flush initial runtime session");
+
+    let backend = DeterministicRuntimeBackend::default();
+    let handle = backend
+        .start_session(&session.info().await)
+        .await
+        .expect("start runtime session");
+    let first = backend
+        .execute(
+            &session,
+            &handle,
+            SandboxExecutionRequest::eval("export default \"first\";"),
+            SandboxRuntimeStateHandle::new(),
+        )
+        .await
+        .expect("execute first inline eval");
+    assert_eq!(
+        first.entrypoint,
+        "terrace:/workspace/.terrace/runtime/eval-1.mjs"
+    );
+    session
+        .flush()
+        .await
+        .expect("flush session with first inline eval");
+
+    let flushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut after inline eval flush");
+    let (flushed_vfs, flushed_sandbox) = sandbox_store(118, 2084);
+    flushed_vfs
+        .import_volume(
+            flushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut");
+    let reopened = flushed_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen flushed runtime session");
+
+    let reopened_backend = DeterministicRuntimeBackend::default();
+    let reopened_handle = reopened_backend
+        .start_session(&reopened.info().await)
+        .await
+        .expect("start reopened runtime session");
+    let second = reopened_backend
+        .execute(
+            &reopened,
+            &reopened_handle,
+            SandboxExecutionRequest::eval("export default \"second\";"),
+            SandboxRuntimeStateHandle::new(),
+        )
+        .await
+        .expect("execute second inline eval after recovery");
+    assert_eq!(
+        second.entrypoint,
+        "terrace:/workspace/.terrace/runtime/eval-2.mjs"
+    );
+    assert!(
+        second
+            .cache_misses
+            .contains(&"terrace:/workspace/.terrace/runtime/eval-2.mjs".to_string())
+    );
+    assert!(
+        !second
+            .cache_hits
+            .contains(&"terrace:/workspace/.terrace/runtime/eval-2.mjs".to_string())
     );
 }
 
