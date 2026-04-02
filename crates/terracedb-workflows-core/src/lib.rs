@@ -100,6 +100,13 @@ pub enum WorkflowTrigger {
         callback_id: String,
         response: Vec<u8>,
     },
+    Update {
+        update_id: WorkflowUpdateId,
+        lane: WorkflowUpdateLane,
+        name: String,
+        payload: Option<WorkflowPayload>,
+        requested_at_millis: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -112,7 +112,7 @@ impl WorkflowHandler for EventTimerWorkflow {
         _ctx: &WorkflowContext,
     ) -> Result<WorkflowOutput, WorkflowHandlerError> {
         match trigger {
-            WorkflowTrigger::Event(_) => Ok(WorkflowOutput {
+            WorkflowTrigger::Event(_) | WorkflowTrigger::Update { .. } => Ok(WorkflowOutput {
                 state: WorkflowStateMutation::Put(Value::bytes("scheduled")),
                 outbox_entries: Vec::new(),
                 timers: vec![WorkflowTimerCommand::Schedule {

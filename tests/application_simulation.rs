@@ -150,6 +150,11 @@ impl WorkflowHandler for OrderWorkflow {
                     "order workflow does not process source events in the application simulation",
                 )))
             }
+            terracedb_workflows::WorkflowTrigger::Update { .. } => {
+                Err(WorkflowHandlerError::new(std::io::Error::other(
+                    "order workflow does not process update triggers in the application simulation",
+                )))
+            }
         }
     }
 }
