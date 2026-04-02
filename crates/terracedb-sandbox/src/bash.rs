@@ -409,13 +409,16 @@ async fn shell_bridge_command(
                 &tokens[0],
                 None,
                 None,
-                (
-                    "binding_not_available",
-                    format!("{} is not available in this session", tokens[1]),
-                    BTreeMap::from([("available_bindings".to_string(), json!(available))]),
-                    69,
-                    false,
-                ),
+                ShellBridgeErrorDetails {
+                    kind: "binding_not_available",
+                    message: format!("{} is not available in this session", tokens[1]),
+                    metadata: BTreeMap::from([(
+                        "available_bindings".to_string(),
+                        json!(available),
+                    )]),
+                    exit_code: 69,
+                    compact: false,
+                },
             )));
         }
     };
@@ -435,16 +438,16 @@ async fn shell_bridge_command(
             &tokens[0],
             Some(command),
             Some(method_name),
-            (
-                "method_not_available",
-                format!(
+            ShellBridgeErrorDetails {
+                kind: "method_not_available",
+                message: format!(
                     "method {method_name} is not available for {}",
                     render_shell_command_prefix(command)
                 ),
-                BTreeMap::new(),
-                69,
-                false,
-            ),
+                metadata: BTreeMap::new(),
+                exit_code: 69,
+                compact: false,
+            },
         )));
     };
 
@@ -537,7 +540,13 @@ struct ShellBridgeInvocation {
     input: Option<JsonValue>,
 }
 
-type ShellBridgeErrorDetails<'a> = (&'a str, String, BTreeMap<String, JsonValue>, i32, bool);
+struct ShellBridgeErrorDetails<'a> {
+    kind: &'a str,
+    message: String,
+    metadata: BTreeMap<String, JsonValue>,
+    exit_code: i32,
+    compact: bool,
+}
 
 async fn available_shell_commands(session: &SandboxSession) -> Vec<SandboxShellCommand> {
     let allowed = session.info().await.provenance.capabilities;
@@ -574,13 +583,13 @@ async fn parse_shell_bridge_invocation(
                         &command.descriptor.command_name,
                         Some(command),
                         Some(&method.name),
-                        (
-                            "usage_error",
-                            "--input requires a JSON argument".to_string(),
-                            BTreeMap::new(),
-                            64,
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "--input requires a JSON argument".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
                             compact,
-                        ),
+                        },
                     ));
                 };
                 if input
@@ -591,13 +600,13 @@ async fn parse_shell_bridge_invocation(
                         &command.descriptor.command_name,
                         Some(command),
                         Some(&method.name),
-                        (
-                            "usage_error",
-                            "provide only one JSON input value".to_string(),
-                            BTreeMap::new(),
-                            64,
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "provide only one JSON input value".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
                             compact,
-                        ),
+                        },
                     ));
                 }
                 index += 2;
@@ -608,13 +617,13 @@ async fn parse_shell_bridge_invocation(
                         &command.descriptor.command_name,
                         Some(command),
                         Some(&method.name),
-                        (
-                            "usage_error",
-                            "--input-file requires a path".to_string(),
-                            BTreeMap::new(),
-                            64,
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "--input-file requires a path".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
                             compact,
-                        ),
+                        },
                     ));
                 };
                 if input
@@ -628,13 +637,13 @@ async fn parse_shell_bridge_invocation(
                         &command.descriptor.command_name,
                         Some(command),
                         Some(&method.name),
-                        (
-                            "usage_error",
-                            "provide only one JSON input value".to_string(),
-                            BTreeMap::new(),
-                            64,
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "provide only one JSON input value".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
                             compact,
-                        ),
+                        },
                     ));
                 }
                 index += 2;
@@ -644,13 +653,13 @@ async fn parse_shell_bridge_invocation(
                     &command.descriptor.command_name,
                     Some(command),
                     Some(&method.name),
-                    (
-                        "usage_error",
-                        format!("unknown option: {flag}"),
-                        BTreeMap::new(),
-                        64,
+                    ShellBridgeErrorDetails {
+                        kind: "usage_error",
+                        message: format!("unknown option: {flag}"),
+                        metadata: BTreeMap::new(),
+                        exit_code: 64,
                         compact,
-                    ),
+                    },
                 ));
             }
             raw => {
@@ -662,13 +671,13 @@ async fn parse_shell_bridge_invocation(
                         &command.descriptor.command_name,
                         Some(command),
                         Some(&method.name),
-                        (
-                            "usage_error",
-                            "provide only one JSON input value".to_string(),
-                            BTreeMap::new(),
-                            64,
+                        ShellBridgeErrorDetails {
+                            kind: "usage_error",
+                            message: "provide only one JSON input value".to_string(),
+                            metadata: BTreeMap::new(),
+                            exit_code: 64,
                             compact,
-                        ),
+                        },
                     ));
                 }
                 index += 1;
@@ -681,19 +690,19 @@ async fn parse_shell_bridge_invocation(
             &command.descriptor.command_name,
             Some(command),
             Some(&method.name),
-            (
-                "unsupported_signature",
-                format!(
+            ShellBridgeErrorDetails {
+                kind: "unsupported_signature",
+                message: format!(
                     "{} currently supports only methods with zero or one JSON argument",
                     render_shell_command_prefix(command)
                 ),
-                BTreeMap::from([
+                metadata: BTreeMap::from([
                     ("min_args".to_string(), json!(method.min_args)),
                     ("max_args".to_string(), json!(method.max_args)),
                 ]),
-                64,
+                exit_code: 64,
                 compact,
-            ),
+            },
         ));
     }
     if method.min_args == 0 && method.max_args == 0 && input.is_some() {
@@ -701,13 +710,13 @@ async fn parse_shell_bridge_invocation(
             &command.descriptor.command_name,
             Some(command),
             Some(&method.name),
-            (
-                "usage_error",
-                format!("{} does not accept a JSON input value", method.name),
-                BTreeMap::new(),
-                64,
+            ShellBridgeErrorDetails {
+                kind: "usage_error",
+                message: format!("{} does not accept a JSON input value", method.name),
+                metadata: BTreeMap::new(),
+                exit_code: 64,
                 compact,
-            ),
+            },
         ));
     }
     if method.requires_args() && input.is_none() {
@@ -715,13 +724,13 @@ async fn parse_shell_bridge_invocation(
             &command.descriptor.command_name,
             Some(command),
             Some(&method.name),
-            (
-                "usage_error",
-                format!("{} requires one JSON input value", method.name),
-                BTreeMap::new(),
-                64,
+            ShellBridgeErrorDetails {
+                kind: "usage_error",
+                message: format!("{} requires one JSON input value", method.name),
+                metadata: BTreeMap::new(),
+                exit_code: 64,
                 compact,
-            ),
+            },
         ));
     }
 
@@ -739,13 +748,13 @@ fn parse_shell_json_input(
             &command.descriptor.command_name,
             Some(command),
             Some(method_name),
-            (
-                "invalid_json_input",
-                format!("invalid JSON input: {error}"),
-                BTreeMap::new(),
-                65,
+            ShellBridgeErrorDetails {
+                kind: "invalid_json_input",
+                message: format!("invalid JSON input: {error}"),
+                metadata: BTreeMap::new(),
+                exit_code: 65,
                 compact,
-            ),
+            },
         )
     })
 }
@@ -762,13 +771,13 @@ async fn read_shell_json_input_file(
             &command.descriptor.command_name,
             Some(command),
             Some(method_name),
-            (
-                "input_file_error",
-                error.to_string(),
-                BTreeMap::from([("path".to_string(), json!(path))]),
-                66,
+            ShellBridgeErrorDetails {
+                kind: "input_file_error",
+                message: error.to_string(),
+                metadata: BTreeMap::from([("path".to_string(), json!(path))]),
+                exit_code: 66,
                 compact,
-            ),
+            },
         )
     })?
     else {
@@ -776,13 +785,13 @@ async fn read_shell_json_input_file(
             &command.descriptor.command_name,
             Some(command),
             Some(method_name),
-            (
-                "input_file_missing",
-                format!("JSON input file not found: {path}"),
-                BTreeMap::from([("path".to_string(), json!(path))]),
-                66,
+            ShellBridgeErrorDetails {
+                kind: "input_file_missing",
+                message: format!("JSON input file not found: {path}"),
+                metadata: BTreeMap::from([("path".to_string(), json!(path))]),
+                exit_code: 66,
                 compact,
-            ),
+            },
         ));
     };
     parse_shell_json_input(&contents, compact, command, method_name)
@@ -948,7 +957,13 @@ fn shell_bridge_error_from_invocation(
         &command.descriptor.command_name,
         Some(command),
         Some(method_name),
-        (kind, message, metadata, exit_code, compact),
+        ShellBridgeErrorDetails {
+            kind,
+            message,
+            metadata,
+            exit_code,
+            compact,
+        },
     )
 }
 
@@ -958,7 +973,6 @@ fn shell_bridge_error(
     method_name: Option<&str>,
     details: ShellBridgeErrorDetails<'_>,
 ) -> CommandOutcome {
-    let (kind, message, metadata, exit_code, compact) = details;
     let payload = json!({
         "ok": false,
         "command": command
@@ -973,15 +987,15 @@ fn shell_bridge_error(
         "specifier": command.and_then(capability_specifier_for_command),
         "method": method_name,
         "error": {
-            "kind": kind,
-            "message": message,
+            "kind": details.kind,
+            "message": details.message,
         },
-        "metadata": metadata,
+        "metadata": details.metadata,
     });
     CommandOutcome {
-        exit_code,
+        exit_code: details.exit_code,
         stdout: String::new(),
-        stderr: format!("{}\n", render_json(&payload, compact)),
+        stderr: format!("{}\n", render_json(&payload, details.compact)),
     }
 }
 
