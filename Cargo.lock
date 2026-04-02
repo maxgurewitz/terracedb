@@ -2451,6 +2451,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "terracedb-example-chat-rooms-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "terracedb",
+ "terracedb-http",
+ "terracedb-records",
+ "terracedb-simulation",
+ "thiserror 2.0.18",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "terracedb-example-domains-api"
 version = "0.1.0"
 dependencies = [
