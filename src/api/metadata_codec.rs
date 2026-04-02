@@ -279,6 +279,7 @@ impl Db {
         let persisted_metadata = crate::sharding::encode_persisted_table_metadata(
             &entry.config.metadata,
             &entry.config.sharding,
+            entry.config.resharding.as_ref(),
         )?;
         let metadata_entries = Self::encode_metadata_entries_flatbuffer(fbb, &persisted_metadata)?;
         let schema = match &entry.config.schema {
@@ -331,7 +332,7 @@ impl Db {
             Self::decode_metadata_entries_flatbuffer(config.metadata_entries().ok_or_else(
                 || StorageError::corruption("catalog entry is missing metadata entries"),
             )?)?;
-        let (metadata, sharding) =
+        let (metadata, sharding, resharding) =
             crate::sharding::decode_persisted_table_metadata(encoded_metadata)?;
         Ok(PersistedCatalogEntry {
             id: TableId::new(entry.id()),
@@ -356,6 +357,7 @@ impl Db {
                 },
                 sharding,
                 metadata,
+                resharding,
             },
         })
     }

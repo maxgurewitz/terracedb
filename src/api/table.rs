@@ -42,6 +42,36 @@ impl Table {
         self.db.publish_table_shard_map(self, sharding).await
     }
 
+    pub fn resharding_state(&self) -> Option<crate::TableReshardingState> {
+        self.db.table_resharding_state(self)
+    }
+
+    pub async fn create_reshard_plan(
+        &self,
+        sharding: crate::ShardingConfig,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        self.db.create_table_reshard_plan(self, sharding).await
+    }
+
+    pub async fn run_reshard_plan(
+        &self,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        self.db.run_table_reshard_plan(self).await
+    }
+
+    pub async fn abort_reshard_plan(
+        &self,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        self.db.abort_table_reshard_plan(self).await
+    }
+
+    pub async fn reshard_to(
+        &self,
+        sharding: crate::ShardingConfig,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        self.db.reshard_table_to(self, sharding).await
+    }
+
     pub async fn read(&self, key: Key) -> Result<Option<Value>, ReadError> {
         self.read_at(key, self.db.current_sequence()).await
     }

@@ -1133,6 +1133,7 @@ impl Db {
             meta.shard_ownership.as_ref(),
             footer.shard_ownership.as_ref(),
         ) && manifest_ownership != footer_ownership
+            && !manifest_ownership.compatible_relocation(footer_ownership)
         {
             return Err(StorageError::corruption(format!(
                 "manifest shard ownership does not match SSTable {location}",
@@ -1324,11 +1325,10 @@ impl Db {
         )?;
 
         let mut resident_meta = meta.clone();
-        resident_meta.shard_ownership = footer
-            .footer
+        resident_meta.shard_ownership = meta
             .shard_ownership
             .clone()
-            .or_else(|| meta.shard_ownership.clone());
+            .or_else(|| footer.footer.shard_ownership.clone());
 
         Ok(ResidentRowSstable {
             meta: resident_meta,
@@ -1389,6 +1389,7 @@ impl Db {
             meta.shard_ownership.as_ref(),
             file.body.shard_ownership.as_ref(),
         ) && manifest_ownership != body_ownership
+            && !manifest_ownership.compatible_relocation(body_ownership)
         {
             return Err(StorageError::corruption(format!(
                 "manifest shard ownership does not match SSTable {location}",
@@ -1412,11 +1413,10 @@ impl Db {
         }
 
         let mut resident_meta = meta.clone();
-        resident_meta.shard_ownership = file
-            .body
+        resident_meta.shard_ownership = meta
             .shard_ownership
             .clone()
-            .or_else(|| meta.shard_ownership.clone());
+            .or_else(|| file.body.shard_ownership.clone());
 
         Ok(ResidentRowSstable {
             meta: resident_meta,
@@ -1623,10 +1623,10 @@ impl Db {
         }
 
         let mut resident_meta = meta.clone();
-        resident_meta.shard_ownership = footer
+        resident_meta.shard_ownership = meta
             .shard_ownership
             .clone()
-            .or_else(|| meta.shard_ownership.clone());
+            .or_else(|| footer.shard_ownership.clone());
 
         Ok(ResidentRowSstable {
             meta: resident_meta,

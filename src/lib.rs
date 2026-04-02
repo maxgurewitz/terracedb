@@ -166,11 +166,12 @@ pub use scheduler::{
 };
 pub use sharding::{
     BatchShardLocalityError, HashShardingConfig, KeyShardRoute, PhysicalShardId,
-    PublishShardMapError, ReshardPartitionMove, ReshardPlanSkeleton, ShardAssignment,
-    ShardChangeCursor, ShardCommitLaneId, ShardExecutionPlacement, ShardHashAlgorithm,
-    ShardMapRevision, ShardMemtableOwner, ShardOpenRequest, ShardSstableOwnership, ShardingConfig,
-    ShardingError, TableBatchShardingPlan, TableShardingState, VirtualPartitionCoverage,
-    VirtualPartitionId, VirtualPartitionRange, WriteBatchShardingError, WriteBatchShardingPlan,
+    PublishShardMapError, ReshardPartitionMove, ReshardPlanError, ReshardPlanPhase,
+    ReshardPlanSkeleton, ShardAssignment, ShardChangeCursor, ShardCommitLaneId,
+    ShardExecutionPlacement, ShardHashAlgorithm, ShardMapRevision, ShardMemtableOwner,
+    ShardOpenRequest, ShardSstableOwnership, ShardingConfig, ShardingError, TableBatchShardingPlan,
+    TableReshardingState, TableShardingState, VirtualPartitionCoverage, VirtualPartitionId,
+    VirtualPartitionRange, WriteBatchShardingError, WriteBatchShardingPlan,
 };
 pub use stubs::{StubClock, StubFileSystem, StubObjectStore, StubRng};
 pub use telemetry::{
