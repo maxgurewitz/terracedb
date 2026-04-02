@@ -629,7 +629,12 @@ fn sandbox_store(now: u64, seed: u64) -> (InMemoryVfsStore, DefaultSandboxStore<
     (vfs, sandbox)
 }
 
-async fn seed_sandbox_workflow_module(store: &InMemoryVfsStore, volume_id: VolumeId, path: &str) {
+async fn seed_sandbox_workflow_module(
+    store: &InMemoryVfsStore,
+    volume_id: VolumeId,
+    path: &str,
+    module_source: &str,
+) {
     let base = store
         .open_volume(
             VolumeConfig::new(volume_id)
@@ -641,7 +646,7 @@ async fn seed_sandbox_workflow_module(store: &InMemoryVfsStore, volume_id: Volum
     base.fs()
         .write_file(
             path,
-            CONTRACT_PARITY_SANDBOX_MODULE.as_bytes().to_vec(),
+            module_source.as_bytes().to_vec(),
             CreateOptions {
                 create_parents: true,
                 ..Default::default()
@@ -657,6 +662,7 @@ async fn open_sandbox_contract_handler(
     base_volume_id: VolumeId,
     session_volume_id: VolumeId,
     module_path: &str,
+    module_source: &str,
     bundle: contracts::WorkflowBundleMetadata,
 ) -> ContractWorkflowHandler<
     terracedb_workflows::sandbox_contracts::SandboxWorkflowHandlerAdapter<
@@ -664,7 +670,7 @@ async fn open_sandbox_contract_handler(
     >,
 > {
     let (vfs, sandbox) = sandbox_store(now, seed);
-    seed_sandbox_workflow_module(&vfs, base_volume_id, module_path).await;
+    seed_sandbox_workflow_module(&vfs, base_volume_id, module_path, module_source).await;
     let session = sandbox
         .open_session(SandboxConfig {
             session_volume_id,
@@ -798,6 +804,184 @@ export default {
             },
           },
         ],
+      },
+    };
+  },
+};
+"#;
+
+#[derive(Clone, Debug, Default)]
+struct ScriptedContractLogic;
+
+impl ScriptedContractLogic {
+    fn next_sequence(&self, input: &contracts::WorkflowTransitionInput) -> u64 {
+        input
+            .state
+            .as_ref()
+            .and_then(|payload| std::str::from_utf8(&payload.bytes).ok())
+            .and_then(|value| value.rsplit(':').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value + 1)
+            .unwrap_or(1)
+    }
+
+    fn route(&self, event: &contracts::WorkflowSourceEvent) -> String {
+        String::from_utf8_lossy(&event.key)
+            .split_once(':')
+            .expect("event key should contain an instance prefix")
+            .0
+            .to_string()
+    }
+
+    fn payload_from_trigger(&self, trigger: &contracts::WorkflowTrigger) -> Vec<u8> {
+        match trigger {
+            contracts::WorkflowTrigger::Event { event } => event.key.clone(),
+            contracts::WorkflowTrigger::Timer { payload, .. } => payload.clone(),
+            contracts::WorkflowTrigger::Callback { response, .. } => response.clone(),
+        }
+    }
+
+    fn handle(
+        &self,
+        input: &contracts::WorkflowTransitionInput,
+    ) -> contracts::WorkflowTransitionOutput {
+        let sequence = self.next_sequence(input);
+        let outbox_id = format!("{}:{sequence}", input.instance_id);
+        let mut commands = vec![contracts::WorkflowCommand::Outbox {
+            entry: contracts::WorkflowOutboxCommand {
+                outbox_id: outbox_id.clone().into_bytes(),
+                idempotency_key: outbox_id,
+                payload: self.payload_from_trigger(&input.trigger),
+            },
+        }];
+
+        if let contracts::WorkflowTrigger::Callback { callback_id, .. } = &input.trigger
+            && callback_id.starts_with("timer:")
+        {
+            commands.push(contracts::WorkflowCommand::Timer {
+                command: contracts::WorkflowTimerCommand::Schedule {
+                    timer_id: format!("timer:{}:{sequence}", input.instance_id).into_bytes(),
+                    fire_at_millis: input.admitted_at_millis.saturating_add(5),
+                    payload: format!("timer-fired:{sequence}").into_bytes(),
+                },
+            });
+        }
+
+        contracts::WorkflowTransitionOutput {
+            state: contracts::WorkflowStateMutation::Put {
+                state: contracts::WorkflowPayload::bytes(format!(
+                    "scripted:{}:{sequence}",
+                    input.workflow_name
+                )),
+            },
+            lifecycle: None,
+            visibility: None,
+            continue_as_new: None,
+            commands,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeScriptedContractHandler {
+    logic: ScriptedContractLogic,
+}
+
+#[async_trait]
+impl contracts::WorkflowHandlerContract for NativeScriptedContractHandler {
+    async fn route_event(
+        &self,
+        event: &contracts::WorkflowSourceEvent,
+    ) -> Result<String, contracts::WorkflowTaskError> {
+        Ok(self.logic.route(event))
+    }
+
+    async fn handle_task(
+        &self,
+        input: contracts::WorkflowTransitionInput,
+        _ctx: contracts::WorkflowDeterministicContext,
+    ) -> Result<contracts::WorkflowTransitionOutput, contracts::WorkflowTaskError> {
+        Ok(self.logic.handle(&input))
+    }
+}
+
+const SCRIPTED_CONTRACT_PARITY_SANDBOX_MODULE: &str = r#"
+const bytes = (value) => Array.from(value).map((char) => char.charCodeAt(0));
+const keyToInstance = (key) => String.fromCharCode(...key).split(":")[0];
+const decodeBytes = (payload) => String.fromCharCode(...payload.bytes);
+
+function nextSequence(input) {
+  if (!input.state) {
+    return 1;
+  }
+
+  const current = decodeBytes(input.state).split(":").pop();
+  const parsed = Number.parseInt(current ?? "0", 10);
+  return Number.isFinite(parsed) ? parsed + 1 : 1;
+}
+
+function payloadFromTrigger(trigger) {
+  switch (trigger.kind) {
+    case "event":
+      return trigger.event.key;
+    case "timer":
+      return trigger.payload;
+    case "callback":
+      return trigger.response;
+    default:
+      throw { code: "invalid-contract", message: `unknown trigger kind ${trigger.kind}` };
+  }
+}
+
+export default {
+  routeEventV1(request) {
+    return {
+      abi: request.abi,
+      instance_id: keyToInstance(request.event.key),
+    };
+  },
+
+  async handleTaskV1(request) {
+    const sequence = nextSequence(request.input);
+    const id = `${request.input.instance_id}:${sequence}`;
+    const commands = [
+      {
+        kind: "outbox",
+        entry: {
+          outbox_id: bytes(id),
+          idempotency_key: id,
+          payload: payloadFromTrigger(request.input.trigger),
+        },
+      },
+    ];
+
+    if (request.input.trigger.kind === "callback" &&
+        request.input.trigger.callback_id.startsWith("timer:")) {
+      commands.push({
+        kind: "timer",
+        command: {
+          kind: "schedule",
+          timer_id: bytes(`timer:${request.input.instance_id}:${sequence}`),
+          fire_at_millis: request.input.admitted_at_millis + 5,
+          payload: bytes(`timer-fired:${sequence}`),
+        },
+      });
+    }
+
+    return {
+      abi: request.abi,
+      output: {
+        state: {
+          kind: "put",
+          state: {
+            encoding: "application/octet-stream",
+            bytes: bytes(`scripted:${request.input.workflow_name}:${sequence}`),
+          },
+        },
+        lifecycle: null,
+        visibility: null,
+        continue_as_new: null,
+        commands,
       },
     };
   },
@@ -2650,6 +2834,259 @@ async fn clear_workflow_tables(
     clear_table(tables.outbox_table()).await?;
     clear_table(tables.trigger_journal_table()).await?;
     Ok(())
+}
+
+type BoxedTestError = Box<dyn StdError + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScriptedContractAction {
+    SourceEvent {
+        key_suffix: String,
+        value: String,
+    },
+    Callback {
+        callback_id: String,
+        response: String,
+    },
+    AdvanceClock {
+        millis: u64,
+    },
+    Restart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScriptedContractCampaignScenario {
+    seed: u64,
+    actions: Vec<ScriptedContractAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScriptedContractCampaignCapture {
+    final_run_id: String,
+    final_bundle_id: String,
+    final_state: String,
+    source_cursor: String,
+    history: Vec<String>,
+    outbox_ids: Vec<String>,
+    snapshot: BTreeMap<String, Vec<String>>,
+}
+
+fn generate_scripted_contract_campaign(seed: u64) -> ScriptedContractCampaignScenario {
+    let rng = DeterministicRng::seeded(seed);
+    let mut actions = vec![
+        ScriptedContractAction::SourceEvent {
+            key_suffix: "created".to_string(),
+            value: format!("created-{seed:x}"),
+        },
+        ScriptedContractAction::Callback {
+            callback_id: format!("timer:initial-{}", rng.next_u64() % 3),
+            response: format!("arm-{seed:x}"),
+        },
+    ];
+
+    if rng.next_u64().is_multiple_of(2) {
+        actions.push(ScriptedContractAction::Restart);
+    }
+
+    for index in 0..(1 + (rng.next_u64() % 2) as usize) {
+        let callback_id = if rng.next_u64().is_multiple_of(2) {
+            format!("cb-{index}")
+        } else {
+            format!("timer:extra-{index}")
+        };
+        actions.push(ScriptedContractAction::Callback {
+            callback_id,
+            response: format!("cb-{seed:x}-{index}"),
+        });
+        if rng.next_u64().is_multiple_of(4) {
+            actions.push(ScriptedContractAction::Restart);
+        }
+    }
+
+    actions.push(ScriptedContractAction::AdvanceClock { millis: 20 });
+    if rng.next_u64().is_multiple_of(2) {
+        actions.push(ScriptedContractAction::Restart);
+        actions.push(ScriptedContractAction::AdvanceClock { millis: 1 });
+    }
+
+    ScriptedContractCampaignScenario { seed, actions }
+}
+
+async fn wait_for_scripted_contract_state<H>(
+    runtime: &WorkflowRuntime<H>,
+    expected_sequence: u64,
+) -> Result<(), WorkflowError>
+where
+    H: terracedb_workflows::WorkflowRuntimeHandler + 'static,
+{
+    runtime
+        .wait_for_state_where("acct-7", move |state| {
+            state
+                .and_then(|value| match value {
+                    Value::Bytes(bytes) => std::str::from_utf8(bytes)
+                        .ok()
+                        .and_then(|decoded| decoded.rsplit(':').next())
+                        .and_then(|suffix| suffix.parse::<u64>().ok()),
+                    Value::Record(_) => None,
+                })
+                .is_some_and(|observed| observed >= expected_sequence)
+        })
+        .await
+        .map(|_| ())
+}
+
+async fn run_scripted_contract_campaign<H, F, Fut>(
+    path: &str,
+    clock: Arc<StubClock>,
+    handler_factory: F,
+    scenario: &ScriptedContractCampaignScenario,
+) -> Result<ScriptedContractCampaignCapture, BoxedTestError>
+where
+    H: terracedb_workflows::WorkflowRuntimeHandler + 'static,
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = H>,
+{
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await?;
+    let source = db.create_table(row_table_config("contract_source")).await?;
+
+    let mut restart_index = 0_usize;
+    let mut runtime = WorkflowRuntime::open(
+        db.clone(),
+        clock.clone(),
+        WorkflowDefinition::new(
+            "contract-billing",
+            [source.clone()],
+            handler_factory(restart_index).await,
+        ),
+    )
+    .await?;
+    let mut handle = runtime.start().await?;
+
+    let mut expected_sequence = 0_u64;
+    let mut pending_timer_count = 0_u64;
+
+    for action in &scenario.actions {
+        match action {
+            ScriptedContractAction::SourceEvent { key_suffix, value } => {
+                source
+                    .write(
+                        format!("acct-7:{key_suffix}").into_bytes(),
+                        Value::bytes(value.clone()),
+                    )
+                    .await?;
+                expected_sequence = expected_sequence.saturating_add(1);
+                wait_for_scripted_contract_state(&runtime, expected_sequence).await?;
+            }
+            ScriptedContractAction::Callback {
+                callback_id,
+                response,
+            } => {
+                runtime
+                    .admit_callback("acct-7", callback_id.clone(), response.as_bytes().to_vec())
+                    .await?;
+                expected_sequence = expected_sequence.saturating_add(1);
+                if callback_id.starts_with("timer:") {
+                    pending_timer_count = pending_timer_count.saturating_add(1);
+                }
+                wait_for_scripted_contract_state(&runtime, expected_sequence).await?;
+            }
+            ScriptedContractAction::AdvanceClock { millis } => {
+                clock.advance(Duration::from_millis(*millis));
+                if pending_timer_count > 0 {
+                    expected_sequence = expected_sequence.saturating_add(pending_timer_count);
+                    pending_timer_count = 0;
+                    wait_for_scripted_contract_state(&runtime, expected_sequence).await?;
+                }
+            }
+            ScriptedContractAction::Restart => {
+                handle.abort().await?;
+                restart_index = restart_index.saturating_add(1);
+                runtime = WorkflowRuntime::open(
+                    db.clone(),
+                    clock.clone(),
+                    WorkflowDefinition::new(
+                        "contract-billing",
+                        [source.clone()],
+                        handler_factory(restart_index).await,
+                    ),
+                )
+                .await?;
+                handle = runtime.start().await?;
+            }
+        }
+    }
+
+    let state_record = runtime
+        .load_state_record("acct-7")
+        .await?
+        .expect("scripted contract state should exist");
+    let final_state = runtime
+        .load_state("acct-7")
+        .await?
+        .and_then(|value| match value {
+            Value::Bytes(bytes) => {
+                Some(String::from_utf8(bytes).expect("scripted contract state should be utf-8"))
+            }
+            Value::Record(_) => None,
+        })
+        .expect("scripted contract state should decode");
+    let history = runtime
+        .load_run_history(&state_record.run_id)
+        .await?
+        .into_iter()
+        .map(|record| format!("{record:?}"))
+        .collect::<Vec<_>>();
+    let outbox_ids = scan_table_rows(runtime.tables().outbox_table())
+        .await?
+        .into_iter()
+        .map(|(key, _)| hex_bytes(&key))
+        .collect::<Vec<_>>();
+    let snapshot = workflow_snapshot_digest(
+        &snapshot_workflow_tables(runtime.tables())
+            .await
+            .expect("snapshot scripted contract tables"),
+    );
+    let source_cursor = format!("{:?}", runtime.load_source_cursor(&source).await?);
+
+    handle.abort().await?;
+
+    Ok(ScriptedContractCampaignCapture {
+        final_run_id: state_record.run_id.to_string(),
+        final_bundle_id: state_record.bundle_id.to_string(),
+        final_state,
+        source_cursor,
+        history,
+        outbox_ids,
+        snapshot,
+    })
+}
+
+fn workflow_snapshot_digest(snapshot: &WorkflowTablesSnapshot) -> BTreeMap<String, Vec<String>> {
+    snapshot
+        .rows
+        .iter()
+        .map(|(table, rows)| {
+            (
+                table.clone(),
+                rows.iter()
+                    .map(|(key, value)| format!("{}={value:?}", hex_bytes(key)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 async fn open_checkpointed_runtime(
@@ -5029,6 +5466,7 @@ async fn contract_runtime_keeps_native_and_sandbox_handlers_in_parity() {
             VolumeId::new(0x9400),
             VolumeId::new(0x9401),
             "/workspace/billing.js",
+            CONTRACT_PARITY_SANDBOX_MODULE,
             sandbox_bundle,
         )
         .await,
@@ -5362,6 +5800,7 @@ async fn sandbox_contract_runtime_reopen_preserves_replay_semantics() {
                     VolumeId::new(0x9410),
                     VolumeId::new(0x9411),
                     "/workspace/billing.js",
+                    CONTRACT_PARITY_SANDBOX_MODULE,
                     bundle.clone(),
                 )
                 .await,
@@ -5406,6 +5845,7 @@ async fn sandbox_contract_runtime_reopen_preserves_replay_semantics() {
                     VolumeId::new(0x9420),
                     VolumeId::new(0x9421),
                     "/workspace/billing.js",
+                    CONTRACT_PARITY_SANDBOX_MODULE,
                     bundle,
                 )
                 .await,
@@ -5462,4 +5902,132 @@ async fn sandbox_contract_runtime_reopen_preserves_replay_semantics() {
         .await
         .expect("timed out aborting reopened runtime")
         .expect("abort reopened runtime");
+}
+
+struct ScriptedContractCampaignHarness;
+
+impl terracedb_fuzz::GeneratedScenarioHarness for ScriptedContractCampaignHarness {
+    type Scenario = ScriptedContractCampaignScenario;
+    type Outcome = ScriptedContractCampaignCapture;
+    type Error = BoxedTestError;
+
+    fn generate(&self, seed: u64) -> Self::Scenario {
+        generate_scripted_contract_campaign(seed)
+    }
+
+    fn run(&self, scenario: Self::Scenario) -> Result<Self::Outcome, Self::Error> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move {
+            let seed = scenario.seed;
+            let native_clock = Arc::new(StubClock::new(Timestamp::new(100)));
+            let sandbox_clock = Arc::new(StubClock::new(Timestamp::new(100)));
+
+            let native = run_scripted_contract_campaign(
+                &format!("/workflow-scripted-contract-native-{seed:x}"),
+                native_clock,
+                |_| async {
+                    ContractWorkflowHandler::new(
+                        native_contract_bundle(),
+                        NativeScriptedContractHandler {
+                            logic: ScriptedContractLogic,
+                        },
+                    )
+                    .expect("native scripted contract handler")
+                },
+                &scenario,
+            )
+            .await?;
+
+            let sandbox_bundle = contract_bundle("/workspace/scripted.js");
+            let sandbox = run_scripted_contract_campaign(
+                &format!("/workflow-scripted-contract-sandbox-{seed:x}"),
+                sandbox_clock,
+                move |restart_index| {
+                    let bundle = sandbox_bundle.clone();
+                    async move {
+                        open_sandbox_contract_handler(
+                            100,
+                            seed.wrapping_add(0x700 + restart_index as u64),
+                            VolumeId::new(
+                                0x9800 + (u128::from(seed) * 8) + (restart_index as u128 * 2),
+                            ),
+                            VolumeId::new(
+                                0x9801 + (u128::from(seed) * 8) + (restart_index as u128 * 2),
+                            ),
+                            "/workspace/scripted.js",
+                            SCRIPTED_CONTRACT_PARITY_SANDBOX_MODULE,
+                            bundle,
+                        )
+                        .await
+                    }
+                },
+                &scenario,
+            )
+            .await?;
+
+            assert_eq!(
+                native, sandbox,
+                "seed {seed:#x} scripted native and sandbox runs diverged\nscenario={scenario:#?}"
+            );
+
+            Ok(native)
+        })
+    }
+}
+
+fn assert_scripted_contract_runtime_cross_cutting_campaign_seed(seed: u64) {
+    let harness = ScriptedContractCampaignHarness;
+    let replay = assert_seed_replays(&harness, seed)
+        .expect("scripted contract cross-cutting seed should replay identically");
+
+    assert_eq!(replay.outcome.final_bundle_id, "bundle:contract-billing-v1");
+    assert!(
+        !replay.outcome.outbox_ids.is_empty(),
+        "seed {seed:#x} should retain outbox replay metadata"
+    );
+    assert!(
+        replay
+            .outcome
+            .history
+            .iter()
+            .any(|entry| entry.contains("TaskApplied")),
+        "seed {seed:#x} should retain task-application history metadata"
+    );
+    assert!(
+        replay
+            .outcome
+            .snapshot
+            .keys()
+            .any(|table| table.contains("runs")),
+        "seed {seed:#x} should retain a durable table digest for replay"
+    );
+}
+
+#[test]
+fn scripted_contract_runtime_cross_cutting_campaign_seed_0x11311_replays_and_preserves_metadata() {
+    assert_scripted_contract_runtime_cross_cutting_campaign_seed(0x11311);
+}
+
+#[test]
+fn scripted_contract_runtime_cross_cutting_campaign_seed_0x11312_replays_and_preserves_metadata() {
+    assert_scripted_contract_runtime_cross_cutting_campaign_seed(0x11312);
+}
+
+#[test]
+fn scripted_contract_runtime_cross_cutting_campaign_seed_0x11313_replays_and_preserves_metadata() {
+    assert_scripted_contract_runtime_cross_cutting_campaign_seed(0x11313);
+}
+
+#[test]
+fn scripted_contract_runtime_cross_cutting_campaign_seed_variation_changes_shape() {
+    let harness = ScriptedContractCampaignHarness;
+
+    let _ = assert_seed_replays(&harness, 0x11311)
+        .expect("same scripted contract seed should replay identically");
+    let _ = assert_seed_variation(&harness, 0x11311, 0x11312, |left, right| {
+        left.scenario != right.scenario || left.outcome != right.outcome
+    })
+    .expect("distinct scripted contract seeds should vary");
 }
