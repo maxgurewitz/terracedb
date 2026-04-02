@@ -297,6 +297,115 @@ impl CapabilityManifest {
     pub fn contains(&self, specifier: &str) -> bool {
         self.get(specifier).is_some()
     }
+
+    pub fn catalog_export_name(&self, specifier: &str) -> Option<String> {
+        self.catalog_export_names().remove(specifier)
+    }
+
+    pub fn catalog_export_names(&self) -> BTreeMap<String, String> {
+        let mut used_exports = std::collections::BTreeSet::<String>::new();
+        let mut exports = BTreeMap::new();
+        for capability in &self.capabilities {
+            let base = capability_catalog_export_name(&capability.name);
+            let mut export_name = base.clone();
+            let mut suffix = 2_u32;
+            while !used_exports.insert(export_name.clone()) {
+                export_name = format!("{base}{suffix}");
+                suffix = suffix.saturating_add(1);
+            }
+            exports.insert(capability.specifier.clone(), export_name);
+        }
+        exports
+    }
+
+    pub fn generated_catalog_typescript_declarations(&self) -> String {
+        let export_names = self.catalog_export_names();
+        let mut lines = Vec::<String>::new();
+        lines.push("declare module \"@terrace/capabilities\" {".to_string());
+        for capability in &self.capabilities {
+            let export_name = export_names
+                .get(&capability.specifier)
+                .expect("capability export names should exist");
+            lines.push(format!(
+                "  export const {export_name}: Record<string, (...args: any[]) => Promise<any>>;"
+            ));
+        }
+        lines.push("  export const capabilities: {".to_string());
+        for capability in &self.capabilities {
+            let export_name = export_names
+                .get(&capability.specifier)
+                .expect("capability export names should exist");
+            lines.push(format!("    {export_name}: typeof {export_name};"));
+        }
+        lines.push("  };".to_string());
+        lines.push("  export default capabilities;".to_string());
+        lines.push("}".to_string());
+        lines.join("\n")
+    }
+
+    pub fn generated_ambient_typescript_declarations(&self) -> String {
+        let mut sections = self
+            .capabilities
+            .iter()
+            .filter_map(|capability| capability.typescript_declarations.clone())
+            .collect::<Vec<_>>();
+        sections.push(self.generated_catalog_typescript_declarations());
+        sections.join("\n\n")
+    }
+}
+
+pub fn capability_catalog_export_name(name: &str) -> String {
+    let mut result = String::new();
+    let mut uppercase_next = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if result.is_empty() && ch.is_ascii_digit() {
+                result.push('C');
+            }
+            if uppercase_next {
+                result.push(ch.to_ascii_uppercase());
+            } else {
+                result.push(ch);
+            }
+            uppercase_next = false;
+        } else {
+            uppercase_next = true;
+        }
+    }
+    if result.is_empty() {
+        "Capability".to_string()
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CapabilityManifest, SandboxCapability};
+
+    #[test]
+    fn generated_catalog_typescript_declarations_disambiguate_colliding_export_names() {
+        let manifest = CapabilityManifest {
+            capabilities: vec![
+                SandboxCapability::host_module("foo-bar"),
+                SandboxCapability::host_module("foo_bar"),
+            ],
+        };
+
+        let export_names = manifest.catalog_export_names();
+        assert_eq!(
+            export_names.get("terrace:host/foo-bar").map(String::as_str),
+            Some("FooBar")
+        );
+        assert_eq!(
+            export_names.get("terrace:host/foo_bar").map(String::as_str),
+            Some("FooBar2")
+        );
+
+        let declarations = manifest.generated_catalog_typescript_declarations();
+        assert!(declarations.contains("export const FooBar:"));
+        assert!(declarations.contains("export const FooBar2:"));
+    }
 }
 
 #[async_trait]

@@ -204,6 +204,13 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
         }
     );
     assert_eq!(
+        terracedb_sandbox::SandboxModuleSpecifier::parse("@terrace/workflow")
+            .expect("workflow sdk"),
+        terracedb_sandbox::SandboxModuleSpecifier::BuiltinLibrary {
+            specifier: "@terrace/workflow".to_string()
+        }
+    );
+    assert_eq!(
         terracedb_sandbox::SandboxModuleSpecifier::parse("@terrace/capabilities")
             .expect("generated capability catalog"),
         terracedb_sandbox::SandboxModuleSpecifier::BuiltinLibrary {

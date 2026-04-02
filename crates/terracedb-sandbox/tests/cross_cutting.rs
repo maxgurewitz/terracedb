@@ -605,7 +605,7 @@ fn run_cross_cutting_simulation(seed: u64) -> turmoil::Result<CrossCuttingSimula
                             .expect("run deterministic typecheck");
                         assert_eq!(report.diagnostics.len(), 1);
                         shadow.typescript_roots = vec!["/workspace/src/bad.ts".to_string()];
-                        shadow.typescript_file_count = 1;
+                        shadow.typescript_file_count = 2;
                     }
                     CrossCuttingOperation::BashWrite => {
                         let note = format!("note-{seed:x}-{}", context.rng().next_u64() % 10_000);

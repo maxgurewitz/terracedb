@@ -1516,6 +1516,85 @@ Rework the premature example-app implementation after the runtime and SDK direct
 
 ---
 
+## Implementation Lessons
+
+Implementing the first real version of this model surfaced a few useful simplifications.
+
+### 1. `@terrace/workflow` should be a built-in module
+
+Seeding a helper file like `./sdk/workflow.js` into each sandbox worked as a prototype, but it is the wrong long-term shape.
+
+The better model is:
+
+- `@terrace/workflow` is always available in sandbox-authored workflow code,
+- it is versioned as part of the sandbox runtime surface,
+- and examples/tests should not need to copy helper files into the workspace.
+
+This removes one source of version drift and makes agent-authored code more obvious.
+
+### 2. Generated capabilities need to exist for tooling too, not just runtime loading
+
+It is not enough for `@terrace/capabilities` to resolve only when the code executes.
+
+Tooling should also know about it.
+
+That means:
+
+- generated capability exports should be part of the typecheck/preflight world,
+- generated declarations should be materialized for the sandbox,
+- and unknown non-relative imports should fail clearly instead of slipping through.
+
+This is especially important for agent-authored code because we want mistakes to fail early and loudly.
+
+### 3. The live runtime should prefer one transition path
+
+The implementation originally kept two different runtime paths alive:
+
+- one reducer-shaped path,
+- and one transition-engine path.
+
+That turned out to be more confusing than helpful.
+
+The better direction is:
+
+- route ordinary transitions through one transition engine,
+- keep the hidden execution snapshot model there,
+- and only keep special handling where the model truly differs, such as active-run rollover for `continue-as-new`.
+
+### 4. Internal savepoints should be cheaper and more selective
+
+Writing a savepoint after every transition was a good correctness-first move, but it is not the right long-term default.
+
+The runtime should only need an internal savepoint when the execution snapshot contains information that cannot be reconstructed cheaply from current state alone, such as:
+
+- pending waiters,
+- retry state,
+- owned timers,
+- or richer applied-task state.
+
+This keeps the automatic-compaction model while making the hot path cheaper.
+
+### 5. Recovery progress should not be tied too closely to visible-history accounting
+
+Using visible-history-style counters for savepoint coverage was convenient while the implementation was in flux, but it risks coupling recovery internals back to the projection layer.
+
+The long-term direction should be:
+
+- visible history remains a projection for humans,
+- recovery keeps its own progress watermark,
+- and savepoint coverage is tracked in recovery terms rather than history-UI terms.
+
+### 6. Keep sandbox conveniences out of the native Rust path
+
+The implementation work reinforced the original architectural split:
+
+- sandbox TypeScript wants built-in modules, generated capability imports, permission-aware diagnostics, and deterministic git,
+- native Rust wants direct handwritten code over first-party interfaces.
+
+Trying to make native Rust look sandbox-shaped adds confusion without improving the core durable workflow model.
+
+---
+
 ## Short Version
 
 The intended model is:

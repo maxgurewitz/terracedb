@@ -14,6 +14,7 @@ pub mod session;
 pub mod types;
 pub mod typescript;
 pub mod view;
+pub mod workflow_sdk;
 
 pub use bash::{
     BashReport, BashRequest, BashService, BashSessionState, DeterministicBashService,
@@ -75,7 +76,8 @@ pub use types::{
     TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
 };
 pub use typescript::{
-    DeterministicTypeScriptService, TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,
+    DeterministicTypeScriptService, TERRACE_TYPESCRIPT_DECLARATIONS_PATH,
+    TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,
     TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR, TypeCheckReport, TypeCheckRequest,
     TypeScriptDiagnostic, TypeScriptEmitReport, TypeScriptMirrorEntry, TypeScriptMirrorState,
     TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
@@ -90,7 +92,6 @@ pub use view::{
     ReadonlyViewSessionSummary, ReadonlyViewStat, RemoteReadonlyViewBridge,
     StaticReadonlyViewRegistry,
 };
-
 pub use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
     GitCheckoutRequest, GitCommitReport, GitDiffReport, GitDiffRequest, GitHeadState,
@@ -98,4 +99,8 @@ pub use terracedb_git::{
     GitPullRequestReport as SandboxGitPullRequestReport, GitPushReport, GitRefUpdate,
     GitRefUpdateReport, GitReference, GitRepositoryOrigin, GitRepositoryStore, GitStatusOptions,
     GitStatusReport, HostGitBridge,
+};
+pub use workflow_sdk::{
+    SANDBOX_WORKFLOW_LIBRARY_SOURCE, SANDBOX_WORKFLOW_LIBRARY_SPECIFIER,
+    SANDBOX_WORKFLOW_LIBRARY_TYPESCRIPT_DECLARATIONS,
 };

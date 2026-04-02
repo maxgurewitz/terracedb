@@ -5,11 +5,19 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use terracedb_vfs::{CompletedToolRunOutcome, CreateOptions, MkdirOptions};
 
-use crate::{SandboxError, SandboxSession, session::record_completed_tool_run};
+use crate::{
+    CapabilityManifest, HOST_CAPABILITY_PREFIX, PackageCompatibilityMode,
+    SANDBOX_BASH_LIBRARY_SPECIFIER, SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER,
+    SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER,
+    SANDBOX_WORKFLOW_LIBRARY_SPECIFIER, SANDBOX_WORKFLOW_LIBRARY_TYPESCRIPT_DECLARATIONS,
+    SandboxError, SandboxSession, packages::read_package_install_manifest,
+    session::record_completed_tool_run,
+};
 
 pub const TERRACE_TYPESCRIPT_STATE_PATH: &str = "/.terrace/typescript/state.json";
 pub const TERRACE_TYPESCRIPT_MIRROR_PATH: &str = "/.terrace/typescript/mirror.json";
 pub const TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR: &str = "/.terrace/typescript/transpile";
+pub const TERRACE_TYPESCRIPT_DECLARATIONS_PATH: &str = "/.terrace/typescript/generated.d.ts";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeCheckRequest {
@@ -91,6 +99,13 @@ struct MirrorBuild {
     contents: BTreeMap<String, String>,
     missing_roots: Vec<String>,
     missing_imports: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct TypeScriptImportSurface {
+    builtins: BTreeSet<String>,
+    capabilities: CapabilityManifest,
+    packages: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,7 +270,7 @@ impl DeterministicTypeScriptService {
         diagnostics.extend(build.missing_imports.iter().map(|(path, specifier)| {
             TypeScriptDiagnostic {
                 path: path.clone(),
-                message: format!("cannot resolve relative import `{specifier}`"),
+                message: format!("cannot resolve import `{specifier}`"),
                 code: Some("TS2307".to_string()),
             }
         }));
@@ -520,6 +535,19 @@ async fn build_mirror(
 ) -> Result<MirrorBuild, SandboxError> {
     let info = session.info().await;
     let fs = session.filesystem();
+    let import_surface = build_import_surface(session).await?;
+    let generated_declarations =
+        generated_typescript_declarations(&info.provenance.capabilities).to_string();
+    fs.write_file(
+        TERRACE_TYPESCRIPT_DECLARATIONS_PATH,
+        generated_declarations.as_bytes().to_vec(),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await?;
     let mut pending = VecDeque::new();
     let mut root_set = BTreeSet::new();
     for root in roots {
@@ -527,6 +555,7 @@ async fn build_mirror(
         root_set.insert(normalized.clone());
         pending.push_back(normalized);
     }
+    pending.push_back(TERRACE_TYPESCRIPT_DECLARATIONS_PATH.to_string());
 
     let mut contents = BTreeMap::new();
     let mut visited = BTreeSet::new();
@@ -548,12 +577,13 @@ async fn build_mirror(
             message: format!("{path} is not valid utf-8: {error}"),
         })?;
         for specifier in extract_module_specifiers(&source) {
-            if !is_relative_specifier(&specifier) {
-                continue;
-            }
-            match resolve_import_path(session, &path, &specifier).await? {
-                Some(resolved) => pending.push_back(resolved),
-                None => missing_imports.push((path.clone(), specifier)),
+            if is_relative_specifier(&specifier) {
+                match resolve_import_path(session, &path, &specifier).await? {
+                    Some(resolved) => pending.push_back(resolved),
+                    None => missing_imports.push((path.clone(), specifier)),
+                }
+            } else if !import_surface.allows(&specifier) {
+                missing_imports.push((path.clone(), specifier));
             }
         }
         contents.insert(path, source);
@@ -578,6 +608,72 @@ async fn build_mirror(
         missing_roots,
         missing_imports,
     })
+}
+
+async fn build_import_surface(
+    session: &SandboxSession,
+) -> Result<TypeScriptImportSurface, SandboxError> {
+    let info = session.info().await;
+    let filesystem = session.filesystem();
+    let installed_packages = read_package_install_manifest(filesystem.as_ref()).await?;
+    let packages = installed_packages
+        .map(|manifest| {
+            manifest
+                .packages
+                .into_iter()
+                .map(|package| package.package)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut builtins = BTreeSet::from([
+        SANDBOX_WORKFLOW_LIBRARY_SPECIFIER.to_string(),
+        SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER.to_string(),
+        SANDBOX_FS_LIBRARY_SPECIFIER.to_string(),
+        SANDBOX_BASH_LIBRARY_SPECIFIER.to_string(),
+        SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER.to_string(),
+    ]);
+    if info.provenance.package_compat == PackageCompatibilityMode::NpmWithNodeBuiltins {
+        builtins.insert("node:fs".to_string());
+        builtins.insert("node:fs/promises".to_string());
+    }
+    Ok(TypeScriptImportSurface {
+        builtins,
+        capabilities: info.provenance.capabilities,
+        packages,
+    })
+}
+
+impl TypeScriptImportSurface {
+    fn allows(&self, specifier: &str) -> bool {
+        self.builtins.contains(specifier)
+            || self.capabilities.contains(specifier)
+            || package_name_for_import(specifier)
+                .is_some_and(|package| self.packages.contains(&package))
+    }
+}
+
+fn generated_typescript_declarations(manifest: &CapabilityManifest) -> String {
+    [
+        SANDBOX_WORKFLOW_LIBRARY_TYPESCRIPT_DECLARATIONS.to_string(),
+        manifest.generated_ambient_typescript_declarations(),
+    ]
+    .into_iter()
+    .filter(|section| !section.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+fn package_name_for_import(specifier: &str) -> Option<String> {
+    if specifier.starts_with(HOST_CAPABILITY_PREFIX) || specifier.starts_with("node:") {
+        return None;
+    }
+    if let Some(package) = specifier.strip_prefix("npm:") {
+        return (!package.is_empty()).then_some(package.to_string());
+    }
+    if !specifier.contains(':') && !specifier.starts_with('.') && !specifier.starts_with('/') {
+        return Some(specifier.to_string());
+    }
+    None
 }
 
 async fn resolve_import_path(

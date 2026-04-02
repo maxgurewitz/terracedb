@@ -8,7 +8,7 @@ This example shows the workflow model we have been moving toward:
 - automatic savepoints inside the runtime,
 - and separate visible workflow history for inspection.
 
-The native workflow lives in [src/app.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/src/app.rs). The shared transition rules live in [src/model.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/src/model.rs). The sandbox workflow lives in [sandbox/review_workflow.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/sandbox/review_workflow.js) and is authored with the higher-level helper from `crates/terracedb-workflows-sandbox/sdk/workflow.js`.
+The native workflow lives in [src/app.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/src/app.rs). The shared transition rules live in [src/model.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/src/model.rs). The sandbox workflow lives in [sandbox/review_workflow.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/sandbox/review_workflow.js) and imports the built-in sandbox workflow SDK from `@terrace/workflow`.
 
 ## What It Demonstrates
 

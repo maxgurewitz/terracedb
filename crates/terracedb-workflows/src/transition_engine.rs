@@ -388,6 +388,14 @@ where
         }
     }
 
+    pub fn project_visibility(
+        &self,
+        state: &contracts::WorkflowStateRecord,
+        output: &contracts::WorkflowTransitionOutput,
+    ) -> contracts::WorkflowVisibilityRecord {
+        self.visibility_projector.project_visibility(state, output)
+    }
+
     pub fn plan_transition(
         &self,
         snapshot: &WorkflowExecutionSnapshot,

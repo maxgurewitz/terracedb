@@ -1,4 +1,4 @@
-import { schema, text, wf } from "./sdk/workflow.js";
+import { schema, text, wf } from "@terrace/workflow";
 
 const START_CALLBACK_ID = "start";
 const APPROVE_CALLBACK_ID = "approve";

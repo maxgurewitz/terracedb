@@ -18,7 +18,7 @@ use terracedb_workflows::{
     contracts::{self, NativeWorkflowHandlerAdapter, WorkflowHandlerContract, WorkflowTaskError},
 };
 use terracedb_workflows_sandbox::{
-    SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter, WORKFLOW_SANDBOX_SDK_SOURCE,
+    SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter,
 };
 use thiserror::Error;
 
@@ -31,7 +31,6 @@ use crate::model::{
 const BASE_VOLUME_ID: VolumeId = VolumeId::new(0x7700);
 const SESSION_VOLUME_ID: VolumeId = VolumeId::new(0x7701);
 const WORKFLOW_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(2);
-const SANDBOX_SDK_MODULE_PATH: &str = "/workspace/sdk/workflow.js";
 
 type NativeRuntimeHandler =
     ContractWorkflowHandler<NativeWorkflowHandlerAdapter<NativeReviewWorkflow>>;
@@ -527,16 +526,6 @@ async fn seed_sandbox_module(vfs: &InMemoryVfsStore) -> Result<(), WorkflowDuetE
             include_str!("../sandbox/review_workflow.js")
                 .as_bytes()
                 .to_vec(),
-            CreateOptions {
-                create_parents: true,
-                ..Default::default()
-            },
-        )
-        .await?;
-    base.fs()
-        .write_file(
-            SANDBOX_SDK_MODULE_PATH,
-            WORKFLOW_SANDBOX_SDK_SOURCE.as_bytes().to_vec(),
             CreateOptions {
                 create_parents: true,
                 ..Default::default()

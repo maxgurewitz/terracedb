@@ -32,7 +32,6 @@ pub use run_model::{
     InMemoryWorkflowRunStore, WorkflowHistoryRecord, WorkflowRunBuilder, WorkflowRunRecord,
     default_native_target, default_run_id, default_task_id,
 };
-use run_model::{WorkflowReductionPlan, WorkflowTransitionReducer};
 pub use terracedb_workflows_core as contracts;
 pub use terracedb_workflows_sandbox as sandbox_contracts;
 use transition_engine::{
@@ -1337,12 +1336,22 @@ pub trait WorkflowRuntimeHandler: Send + Sync {
         Ok(())
     }
 
-    async fn handle_runtime_task(
+    async fn plan_runtime_task(
         &self,
         task: &WorkflowRuntimeTask,
-        state: Option<Value>,
+        current_state: Option<&contracts::WorkflowStateRecord>,
         trigger: &WorkflowTrigger,
-    ) -> Result<WorkflowOutput, WorkflowHandlerError>;
+    ) -> Result<WorkflowRuntimePlan, WorkflowHandlerError>;
+}
+
+#[async_trait]
+impl<T> WorkflowRuntimeHandler for T
+where
+    T: WorkflowHandler,
+{
+    async fn route_event(&self, entry: &ChangeEntry) -> Result<String, WorkflowHandlerError> {
+        WorkflowHandler::route_event(self, entry).await
+    }
 
     async fn plan_runtime_task(
         &self,
@@ -1355,6 +1364,13 @@ pub trait WorkflowRuntimeHandler: Send + Sync {
             .transpose()
             .map_err(WorkflowHandlerError::new)?
             .flatten();
+        let ctx = WorkflowContext::new(
+            &task.workflow_name,
+            &task.instance_id,
+            trigger,
+            state.as_ref(),
+        )
+        .map_err(WorkflowHandlerError::new)?;
         let input = build_transition_input(
             &task.workflow_name,
             &task.instance_id,
@@ -1365,37 +1381,11 @@ pub trait WorkflowRuntimeHandler: Send + Sync {
             trigger,
         )
         .map_err(WorkflowHandlerError::new)?;
-        let output = self.handle_runtime_task(task, state, trigger).await?;
+        let output = self.handle(&task.instance_id, state, trigger, &ctx).await?;
         let proposal = WorkflowTransitionProposal::new(
             workflow_output_to_transition_output(output).map_err(WorkflowHandlerError::new)?,
         );
         Ok(WorkflowRuntimePlan { input, proposal })
-    }
-}
-
-#[async_trait]
-impl<T> WorkflowRuntimeHandler for T
-where
-    T: WorkflowHandler,
-{
-    async fn route_event(&self, entry: &ChangeEntry) -> Result<String, WorkflowHandlerError> {
-        WorkflowHandler::route_event(self, entry).await
-    }
-
-    async fn handle_runtime_task(
-        &self,
-        task: &WorkflowRuntimeTask,
-        state: Option<Value>,
-        trigger: &WorkflowTrigger,
-    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
-        let ctx = WorkflowContext::new(
-            &task.workflow_name,
-            &task.instance_id,
-            trigger,
-            state.as_ref(),
-        )
-        .map_err(WorkflowHandlerError::new)?;
-        self.handle(&task.instance_id, state, trigger, &ctx).await
     }
 }
 
@@ -1468,29 +1458,6 @@ where
             .route_event(&event)
             .await
             .map_err(WorkflowHandlerError::new)
-    }
-
-    async fn handle_runtime_task(
-        &self,
-        task: &WorkflowRuntimeTask,
-        _state: Option<Value>,
-        trigger: &WorkflowTrigger,
-    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
-        let input = build_contract_transition_input(task, &self.execution, None, trigger)
-            .map_err(WorkflowHandlerError::new)?;
-        let ctx = contracts::WorkflowDeterministicContext::new(
-            &input,
-            Arc::new(TracingWorkflowObservability {
-                span: tracing::Span::current(),
-            }),
-        )
-        .map_err(WorkflowHandlerError::new)?;
-        let output = self
-            .inner
-            .handle_task(input, ctx)
-            .await
-            .map_err(WorkflowHandlerError::new)?;
-        contract_output_to_runtime_output(output).map_err(WorkflowHandlerError::new)
     }
 
     async fn plan_runtime_task(
@@ -1934,7 +1901,6 @@ struct WorkflowRuntimeInner<H> {
     handler: Arc<H>,
     scheduler: Arc<dyn WorkflowScheduler>,
     transition_engine: WorkflowTransitionEngine,
-    reducer: WorkflowTransitionReducer,
     tables: WorkflowTables,
     checkpoint_store: Option<Arc<dyn WorkflowCheckpointStore>>,
     timer_poll_interval: Duration,
@@ -1987,7 +1953,6 @@ where
                     handler: Arc::new(definition.handler),
                     scheduler,
                     transition_engine: WorkflowTransitionEngine::default(),
-                    reducer: WorkflowTransitionReducer::default(),
                     checkpoint_store: definition.checkpoint_store,
                     tables,
                     timer_poll_interval: definition.timer_poll_interval,
@@ -4519,82 +4484,41 @@ where
         );
         let committed_at_millis = runtime.clock.now().get();
         tx.delete(runtime.tables.inbox_table(), inbox_key);
-        if runtime_plan.proposal.directives.is_empty() {
-            let reduction = runtime
-                .reducer
-                .reduce(
-                    processing_state_record,
-                    &runtime_plan.input,
-                    &runtime_plan.proposal.output,
-                    committed_at_millis,
-                )
-                .map_err(|error| {
-                    WorkflowError::Storage(StorageError::corruption(error.to_string()))
-                })?;
-            stage_reduction_plan_in_transaction(runtime, &mut tx, instance_id, reduction)?;
-            let effect_intents = runtime
-                .transition_engine
-                .plan_transition(
-                    &synthesize_execution_snapshot(processing_state_record, &runtime_plan.input),
-                    runtime_plan.input.clone(),
-                    runtime_plan.proposal.clone(),
-                    committed_at_millis,
-                )
-                .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?
-                .effect_intents;
-            stage_workflow_effect_intents_in_transaction(
-                runtime,
-                &mut tx,
-                instance_id,
-                &effect_intents,
-                operation_context.clone(),
-            )
-            .await?;
-        } else {
-            if runtime_plan.proposal.output.continue_as_new.is_some() {
-                return Err(WorkflowError::Handler {
-                    name: runtime.name.clone(),
-                    source: WorkflowHandlerError::new(std::io::Error::other(
-                        "continue-as-new is not yet supported by directive-backed workflow execution",
-                    )),
-                });
-            }
-            let execution_snapshot = load_workflow_execution_snapshot(
-                &mut tx,
-                &runtime.tables,
-                processing_state_record,
-                &runtime_plan.input,
-            )
-            .await?;
-            let transition_plan = runtime
-                .transition_engine
-                .plan_transition(
-                    &execution_snapshot,
-                    runtime_plan.input.clone(),
-                    runtime_plan.proposal.clone(),
-                    committed_at_millis,
-                )
-                .map_err(|error| {
-                    WorkflowError::Storage(StorageError::corruption(error.to_string()))
-                })?;
-            stage_transition_plan_in_transaction(
-                runtime,
-                &mut tx,
-                instance_id,
-                processing_state_record,
-                &runtime_plan.input,
-                &transition_plan,
+        let execution_snapshot = load_workflow_execution_snapshot(
+            &mut tx,
+            &runtime.tables,
+            processing_state_record,
+            &runtime_plan.input,
+        )
+        .await?;
+        let transition_plan = runtime
+            .transition_engine
+            .plan_transition(
+                &execution_snapshot,
+                runtime_plan.input.clone(),
+                runtime_plan.proposal.clone(),
                 committed_at_millis,
-            )?;
-            stage_workflow_effect_intents_in_transaction(
-                runtime,
-                &mut tx,
-                instance_id,
-                &transition_plan.effect_intents,
-                operation_context.clone(),
             )
-            .await?;
-        }
+            .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?;
+        stage_transition_plan_in_transaction(
+            runtime,
+            &mut tx,
+            instance_id,
+            processing_state_record,
+            &runtime_plan.input,
+            task.trigger_seq,
+            &runtime_plan.proposal.output.continue_as_new,
+            &transition_plan,
+            committed_at_millis,
+        )?;
+        stage_workflow_effect_intents_in_transaction(
+            runtime,
+            &mut tx,
+            instance_id,
+            &transition_plan.effect_intents,
+            operation_context.clone(),
+        )
+        .await?;
 
         let _ = runtime
             .db
@@ -6357,7 +6281,7 @@ fn synthesize_execution_snapshot(
     current_state: Option<&contracts::WorkflowStateRecord>,
     input: &contracts::WorkflowTransitionInput,
 ) -> WorkflowExecutionSnapshot {
-    current_state.map_or_else(
+    let mut snapshot = current_state.map_or_else(
         || {
             WorkflowExecutionSnapshot::new(contracts::WorkflowStateRecord {
                 run_id: input.run_id.clone(),
@@ -6372,7 +6296,11 @@ fn synthesize_execution_snapshot(
             })
         },
         |state| WorkflowExecutionSnapshot::new(state.clone()),
-    )
+    );
+    if let Some(task_id) = snapshot.state.current_task_id.clone() {
+        snapshot = snapshot.with_applied_task(task_id);
+    }
+    snapshot
 }
 
 fn workflow_output_to_transition_output(
@@ -6663,11 +6591,12 @@ fn decode_workflow_savepoint_record_opt(
 fn encode_execution_snapshot_payload(
     snapshot: &WorkflowExecutionSnapshot,
 ) -> Result<contracts::WorkflowPayload, WorkflowError> {
-    let bytes = serde_json::to_vec(snapshot).map_err(|error| {
-        StorageError::corruption(format!(
-            "workflow execution snapshot serialization failed: {error}"
-        ))
-    })?;
+    let bytes =
+        serde_json::to_vec(&StoredWorkflowExecutionSnapshot::from(snapshot)).map_err(|error| {
+            StorageError::corruption(format!(
+                "workflow execution snapshot serialization failed: {error}"
+            ))
+        })?;
     Ok(contracts::WorkflowPayload::with_encoding(
         "application/vnd.terracedb.workflow-execution-snapshot+json",
         bytes,
@@ -6684,12 +6613,52 @@ fn decode_execution_snapshot_payload(
         ))
         .into());
     }
-    serde_json::from_slice(&payload.bytes).map_err(|error| {
-        StorageError::corruption(format!(
-            "workflow execution snapshot decoding failed: {error}"
-        ))
-        .into()
-    })
+    let stored: StoredWorkflowExecutionSnapshot =
+        serde_json::from_slice(&payload.bytes).map_err(|error| {
+            StorageError::corruption(format!(
+                "workflow execution snapshot decoding failed: {error}"
+            ))
+        })?;
+    Ok(stored.into())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredWorkflowExecutionSnapshot {
+    state: contracts::WorkflowStateRecord,
+    attempt: u32,
+    waiter_set: crate::transition_engine::WorkflowWaiterSet,
+    retry_state: Option<crate::transition_engine::WorkflowRetryState>,
+    owned_timers: Vec<crate::transition_engine::WorkflowOwnedTimer>,
+    applied_tasks: Vec<contracts::WorkflowTaskId>,
+}
+
+impl From<&WorkflowExecutionSnapshot> for StoredWorkflowExecutionSnapshot {
+    fn from(snapshot: &WorkflowExecutionSnapshot) -> Self {
+        Self {
+            state: snapshot.state.clone(),
+            attempt: snapshot.attempt,
+            waiter_set: snapshot.waiter_set.clone(),
+            retry_state: snapshot.retry_state.clone(),
+            owned_timers: snapshot.owned_timers.values().cloned().collect(),
+            applied_tasks: snapshot.applied_tasks.iter().cloned().collect(),
+        }
+    }
+}
+
+impl From<StoredWorkflowExecutionSnapshot> for WorkflowExecutionSnapshot {
+    fn from(stored: StoredWorkflowExecutionSnapshot) -> Self {
+        let mut snapshot =
+            WorkflowExecutionSnapshot::new(stored.state).with_attempt(stored.attempt);
+        snapshot.waiter_set = stored.waiter_set;
+        snapshot.retry_state = stored.retry_state;
+        snapshot.owned_timers = stored
+            .owned_timers
+            .into_iter()
+            .map(|timer| (timer.timer_id.clone(), timer))
+            .collect();
+        snapshot.applied_tasks = stored.applied_tasks.into_iter().collect();
+        snapshot
+    }
 }
 
 fn workflow_default_recovery_segment_id(
@@ -6717,6 +6686,8 @@ fn stage_transition_plan_in_transaction<H>(
     instance_id: &str,
     current_state: Option<&contracts::WorkflowStateRecord>,
     input: &contracts::WorkflowTransitionInput,
+    covered_through_sequence: u64,
+    continue_as_new: &Option<contracts::WorkflowContinueAsNew>,
     transition_plan: &WorkflowTransitionPlan,
     committed_at_millis: u64,
 ) -> Result<(), WorkflowError>
@@ -6738,14 +6709,6 @@ where
             Value::bytes(encode_workflow_run_record(&run_record)?),
         );
     }
-
-    tx.write(
-        runtime.tables.state_table(),
-        instance_key(instance_id),
-        Value::bytes(encode_workflow_state_record(
-            &transition_plan.next_snapshot.state,
-        )?),
-    );
 
     if let Some(lifecycle_record) = transition_plan.lifecycle.as_ref() {
         tx.write(
@@ -6774,73 +6737,105 @@ where
         );
     }
 
-    stage_execution_savepoint_in_transaction(
-        runtime.tables.savepoint_table(),
-        tx,
-        &transition_plan.next_snapshot,
-        committed_at_millis,
-    )?;
-
-    Ok(())
-}
-
-fn stage_reduction_plan_in_transaction<H>(
-    runtime: &WorkflowRuntimeInner<H>,
-    tx: &mut Transaction,
-    instance_id: &str,
-    reduction: WorkflowReductionPlan,
-) -> Result<(), WorkflowError>
-where
-    H: WorkflowRuntimeHandler + 'static,
-{
-    for run_record in reduction.run_records {
+    if let Some(continue_as_new) = continue_as_new.as_ref() {
+        let next_run_record = WorkflowRunRecord {
+            run_id: continue_as_new.next_run_id.clone(),
+            target: continue_as_new.next_target.clone(),
+            workflow_name: input.workflow_name.clone(),
+            instance_id: input.instance_id.clone(),
+            created_at_millis: committed_at_millis,
+            continued_from_run_id: Some(input.run_id.clone()),
+        };
         tx.write(
             runtime.tables.run_table(),
-            workflow_run_key(&run_record.run_id),
-            Value::bytes(encode_workflow_run_record(&run_record)?),
+            workflow_run_key(&next_run_record.run_id),
+            Value::bytes(encode_workflow_run_record(&next_run_record)?),
         );
-    }
 
-    tx.write(
-        runtime.tables.state_table(),
-        instance_key(instance_id),
-        Value::bytes(encode_workflow_state_record(&reduction.active_state)?),
-    );
-
-    for lifecycle_record in reduction.lifecycle_records {
+        let scheduled_record = contracts::WorkflowLifecycleRecord {
+            run_id: continue_as_new.next_run_id.clone(),
+            lifecycle: contracts::WorkflowLifecycleState::Scheduled,
+            updated_at_millis: committed_at_millis,
+            reason: Some("continue-as-new".to_string()),
+            task_id: None,
+            attempt: 0,
+        };
         tx.write(
             runtime.tables.lifecycle_table(),
-            workflow_run_key(&lifecycle_record.run_id),
-            Value::bytes(encode_workflow_lifecycle_record(&lifecycle_record)?),
+            workflow_run_key(&scheduled_record.run_id),
+            Value::bytes(encode_workflow_lifecycle_record(&scheduled_record)?),
         );
-    }
 
-    for visibility_record in reduction.visibility_records {
+        let next_history = [
+            contracts::WorkflowHistoryEvent::RunCreated {
+                run_id: continue_as_new.next_run_id.clone(),
+                target: continue_as_new.next_target.clone(),
+                instance_id: input.instance_id.clone(),
+                scheduled_at_millis: committed_at_millis,
+            },
+            contracts::WorkflowHistoryEvent::LifecycleChanged {
+                record: scheduled_record.clone(),
+            },
+        ];
+        for (sequence, event) in next_history.into_iter().enumerate() {
+            tx.write(
+                runtime.tables.history_table(),
+                workflow_history_key(&continue_as_new.next_run_id, (sequence + 1) as u64),
+                Value::bytes(encode_workflow_history_event(&event)?),
+            );
+        }
+
+        let next_state = contracts::WorkflowStateRecord {
+            run_id: continue_as_new.next_run_id.clone(),
+            target: continue_as_new.next_target.clone(),
+            workflow_name: input.workflow_name.clone(),
+            instance_id: input.instance_id.clone(),
+            lifecycle: contracts::WorkflowLifecycleState::Scheduled,
+            current_task_id: None,
+            history_len: 3,
+            state: continue_as_new.state.clone(),
+            updated_at_millis: committed_at_millis,
+        };
+        let next_visibility = runtime
+            .transition_engine
+            .project_visibility(&next_state, &contracts::WorkflowTransitionOutput::default());
         tx.write(
             runtime.tables.visibility_table(),
-            workflow_run_key(&visibility_record.run_id),
-            Value::bytes(encode_workflow_visibility_record(&visibility_record)?),
+            workflow_run_key(&next_visibility.run_id),
+            Value::bytes(encode_workflow_visibility_record(&next_visibility)?),
         );
-    }
-
-    for history_record in reduction.history {
         tx.write(
             runtime.tables.history_table(),
-            workflow_history_key(&history_record.run_id, history_record.sequence),
-            Value::bytes(encode_workflow_history_event(&history_record.event)?),
+            workflow_history_key(&continue_as_new.next_run_id, next_state.history_len),
+            Value::bytes(encode_workflow_history_event(
+                &contracts::WorkflowHistoryEvent::VisibilityUpdated {
+                    record: next_visibility,
+                },
+            )?),
         );
+        tx.write(
+            runtime.tables.state_table(),
+            instance_key(instance_id),
+            Value::bytes(encode_workflow_state_record(&next_state)?),
+        );
+    } else {
+        tx.write(
+            runtime.tables.state_table(),
+            instance_key(instance_id),
+            Value::bytes(encode_workflow_state_record(
+                &transition_plan.next_snapshot.state,
+            )?),
+        );
+        if should_persist_execution_savepoint(&transition_plan.next_snapshot) {
+            stage_execution_savepoint_in_transaction(
+                runtime.tables.savepoint_table(),
+                tx,
+                &transition_plan.next_snapshot,
+                covered_through_sequence,
+                committed_at_millis,
+            )?;
+        }
     }
-
-    let mut snapshot = WorkflowExecutionSnapshot::new(reduction.active_state.clone());
-    if let Some(task_id) = reduction.active_state.current_task_id.clone() {
-        snapshot = snapshot.with_applied_task(task_id);
-    }
-    stage_execution_savepoint_in_transaction(
-        runtime.tables.savepoint_table(),
-        tx,
-        &snapshot,
-        reduction.active_state.updated_at_millis,
-    )?;
 
     Ok(())
 }
@@ -6849,10 +6844,10 @@ fn stage_execution_savepoint_in_transaction(
     savepoint_table: &Table,
     tx: &mut Transaction,
     snapshot: &WorkflowExecutionSnapshot,
+    covered_through_sequence: u64,
     committed_at_millis: u64,
 ) -> Result<(), WorkflowError> {
     let run_id = &snapshot.state.run_id;
-    let covered_through_sequence = snapshot.state.history_len;
     let savepoint_record = contracts::WorkflowSavepointRecord {
         run_id: run_id.clone(),
         savepoint_id: workflow_savepoint_id(run_id, covered_through_sequence),
@@ -6868,6 +6863,16 @@ fn stage_execution_savepoint_in_transaction(
         Value::bytes(encode_workflow_savepoint_record(&savepoint_record)?),
     );
     Ok(())
+}
+
+fn should_persist_execution_savepoint(snapshot: &WorkflowExecutionSnapshot) -> bool {
+    !snapshot.waiter_set.is_empty()
+        || snapshot.retry_state.is_some()
+        || !snapshot.owned_timers.is_empty()
+        || snapshot
+            .applied_tasks
+            .iter()
+            .any(|task_id| Some(task_id) != snapshot.state.current_task_id.as_ref())
 }
 
 async fn stage_workflow_effect_intents_in_transaction<H>(
@@ -7345,71 +7350,6 @@ fn workflow_contract_trigger_kind(trigger: &contracts::WorkflowTrigger) -> &'sta
     }
 }
 
-fn contract_output_to_runtime_output(
-    output: contracts::WorkflowTransitionOutput,
-) -> Result<WorkflowOutput, contracts::WorkflowTaskError> {
-    if output.lifecycle.is_some() {
-        return Err(contracts::WorkflowTaskError::new(
-            "unsupported-contract",
-            "workflow lifecycle transitions are not yet supported by this runtime adapter",
-        ));
-    }
-    if output.visibility.is_some() {
-        return Err(contracts::WorkflowTaskError::new(
-            "unsupported-contract",
-            "workflow visibility updates are not yet supported by this runtime adapter",
-        ));
-    }
-    if output.continue_as_new.is_some() {
-        return Err(contracts::WorkflowTaskError::new(
-            "unsupported-contract",
-            "continue-as-new is not yet supported by this runtime adapter",
-        ));
-    }
-
-    let state = match output.state {
-        contracts::WorkflowStateMutation::Unchanged => WorkflowStateMutation::Unchanged,
-        contracts::WorkflowStateMutation::Put { state } => {
-            WorkflowStateMutation::Put(contract_payload_to_runtime_value(state)?)
-        }
-        contracts::WorkflowStateMutation::Delete => WorkflowStateMutation::Delete,
-    };
-
-    let mut outbox_entries = Vec::new();
-    let mut timers = Vec::new();
-    for command in output.commands {
-        match command {
-            contracts::WorkflowCommand::Outbox { entry } => {
-                outbox_entries.push(OutboxEntry {
-                    outbox_id: entry.outbox_id,
-                    idempotency_key: entry.idempotency_key,
-                    payload: entry.payload,
-                });
-            }
-            contracts::WorkflowCommand::Timer { command } => match command {
-                contracts::WorkflowTimerCommand::Schedule {
-                    timer_id,
-                    fire_at_millis,
-                    payload,
-                } => timers.push(WorkflowTimerCommand::Schedule {
-                    timer_id,
-                    fire_at: Timestamp::new(fire_at_millis),
-                    payload,
-                }),
-                contracts::WorkflowTimerCommand::Cancel { timer_id } => {
-                    timers.push(WorkflowTimerCommand::Cancel { timer_id })
-                }
-            },
-        }
-    }
-
-    Ok(WorkflowOutput {
-        state,
-        outbox_entries,
-        timers,
-    })
-}
-
 fn runtime_value_to_contract_payload(
     value: &Value,
 ) -> Result<contracts::WorkflowPayload, contracts::WorkflowTaskError> {
@@ -7423,17 +7363,6 @@ fn runtime_value_to_contract_payload(
                 )
             })
             .map_err(|error| contracts::WorkflowTaskError::serialization("workflow state", error)),
-    }
-}
-
-fn contract_payload_to_runtime_value(
-    payload: contracts::WorkflowPayload,
-) -> Result<Value, contracts::WorkflowTaskError> {
-    match payload.encoding.as_str() {
-        "application/octet-stream" => Ok(Value::bytes(payload.bytes)),
-        WORKFLOW_CONTRACT_VALUE_JSON_ENCODING => serde_json::from_slice(&payload.bytes)
-            .map_err(|error| contracts::WorkflowTaskError::serialization("workflow state", error)),
-        _ => Ok(Value::bytes(payload.bytes)),
     }
 }
 

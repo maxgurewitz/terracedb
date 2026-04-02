@@ -16,8 +16,8 @@ use terracedb_workflows_core::{
     WorkflowTrigger,
 };
 use terracedb_workflows_sandbox::{
-    SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter, WORKFLOW_SANDBOX_SDK_SOURCE,
-    WORKFLOW_TASK_V1_ABI, WorkflowTaskV1Handler, WorkflowTaskV1Request, WorkflowTaskV1Response,
+    SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter, WORKFLOW_TASK_V1_ABI,
+    WorkflowTaskV1Handler, WorkflowTaskV1Request, WorkflowTaskV1Response,
     WorkflowTaskV1RouteRequest, WorkflowTaskV1RouteResponse,
 };
 
@@ -461,16 +461,9 @@ async fn sdk_defined_module_wraps_plain_handle_logic_into_workflow_task_contract
     seed_module(
         &vfs,
         base_volume_id,
-        "/workspace/sdk/workflow.js",
-        WORKFLOW_SANDBOX_SDK_SOURCE,
-    )
-    .await;
-    seed_module(
-        &vfs,
-        base_volume_id,
         "/workspace/billing.js",
         r#"
-        import { schema, text, wf } from "./sdk/workflow.js";
+        import { schema, text, wf } from "@terrace/workflow";
 
         const BillingState = wf.jsonState(
           schema.object({
@@ -581,17 +574,10 @@ async fn sdk_defined_module_can_import_generated_capability_catalog() {
     seed_module(
         &vfs,
         base_volume_id,
-        "/workspace/sdk/workflow.js",
-        WORKFLOW_SANDBOX_SDK_SOURCE,
-    )
-    .await;
-    seed_module(
-        &vfs,
-        base_volume_id,
         "/workspace/billing.js",
         r#"
         import { Tickets } from "@terrace/capabilities";
-        import { schema, wf } from "./sdk/workflow.js";
+        import { schema, wf } from "@terrace/workflow";
 
         const BillingState = wf.jsonState(
           schema.object({

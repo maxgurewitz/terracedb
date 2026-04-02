@@ -24,7 +24,7 @@ use terracedb_sandbox::{
     ManifestBoundCapabilityResult, PackageCompatibilityMode, ReopenSessionOptions,
     SandboxCapability, SandboxConfig, SandboxError, SandboxExecutionDomainRoute,
     SandboxExecutionPlacement, SandboxExecutionRouter, SandboxServices, SandboxStore,
-    TERRACE_RUNTIME_MODULE_CACHE_PATH, TypeCheckRequest,
+    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_TYPESCRIPT_DECLARATIONS_PATH, TypeCheckRequest,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 use tokio::sync::Mutex;
@@ -711,6 +711,129 @@ async fn denied_capabilities_fail_predictably_and_no_runtime_helpers_are_ambient
             "host": "undefined"
         }))
     );
+}
+
+#[tokio::test]
+async fn typecheck_allows_generated_workflow_and_capability_imports_and_rejects_unknown_modules() {
+    let registry = deterministic_capabilities();
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store(111, 53, services);
+    let base_volume_id = VolumeId::new(0x9012);
+    let session_volume_id = VolumeId::new(0x9013);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        r#"
+        import { wf } from "@terrace/workflow";
+        import { Tickets } from "@terrace/capabilities";
+        import { readTextFile } from "@terracedb/sandbox/fs";
+        import nope from "@terrace/not-real";
+
+        export default [wf, Tickets, readTextFile, nope];
+        "#,
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: registry.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let report = session
+        .typecheck(TypeCheckRequest {
+            roots: vec!["/workspace/main.js".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("run typecheck");
+
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "/workspace/main.js"
+            && diagnostic
+                .message
+                .contains("cannot resolve import `@terrace/not-real`")
+    }));
+    assert!(!report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains("@terrace/workflow")
+            || diagnostic.message.contains("@terrace/capabilities")
+            || diagnostic.message.contains("@terracedb/sandbox/fs")
+    }));
+
+    let generated = session
+        .filesystem()
+        .read_file(TERRACE_TYPESCRIPT_DECLARATIONS_PATH)
+        .await
+        .expect("read generated declarations")
+        .expect("generated declarations should exist");
+    let generated = String::from_utf8(generated).expect("generated declarations utf-8");
+    assert!(generated.contains("declare module \"@terrace/workflow\""));
+    assert!(generated.contains("declare module \"@terrace/capabilities\""));
+}
+
+#[tokio::test]
+async fn typecheck_rejects_node_builtins_when_compat_mode_disables_them() {
+    let registry = deterministic_capabilities();
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store(112, 54, services);
+    let base_volume_id = VolumeId::new(0x9014);
+    let session_volume_id = VolumeId::new(0x9015);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        r#"
+        import { readFileSync } from "node:fs";
+        export default readFileSync;
+        "#,
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::NpmPureJs,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: registry.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let report = session
+        .typecheck(TypeCheckRequest {
+            roots: vec!["/workspace/main.js".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("run typecheck");
+
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "/workspace/main.js"
+            && diagnostic
+                .message
+                .contains("cannot resolve import `node:fs`")
+    }));
 }
 
 fn resolved_policy_for_manifest(manifest: PolicyCapabilityManifest) -> ResolvedSessionPolicy {
