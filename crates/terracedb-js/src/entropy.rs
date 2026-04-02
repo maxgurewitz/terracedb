@@ -2,8 +2,15 @@ use std::sync::Arc;
 
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 pub trait JsEntropySource: Send + Sync {
     fn fill_bytes(&self, len: usize) -> Vec<u8>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsEntropySnapshot {
+    pub state: u64,
 }
 
 #[derive(Debug)]
@@ -16,6 +23,26 @@ impl DeterministicJsEntropySource {
         Self {
             state: Arc::new(Mutex::new(seed.max(1))),
         }
+    }
+
+    pub fn snapshot(&self) -> JsEntropySnapshot {
+        JsEntropySnapshot {
+            state: *self.state.lock().expect("entropy mutex poisoned"),
+        }
+    }
+
+    pub fn restore(&self, snapshot: JsEntropySnapshot) {
+        *self.state.lock().expect("entropy mutex poisoned") = snapshot.state.max(1);
+    }
+
+    pub fn next_u64(&self) -> u64 {
+        let mut locked = self.state.lock().expect("entropy mutex poisoned");
+        let mut x = *locked;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *locked = x;
+        x
     }
 }
 
@@ -35,15 +62,9 @@ impl Clone for DeterministicJsEntropySource {
 
 impl JsEntropySource for DeterministicJsEntropySource {
     fn fill_bytes(&self, len: usize) -> Vec<u8> {
-        let mut locked = self.state.lock().expect("entropy mutex poisoned");
         let mut bytes = Vec::with_capacity(len);
         while bytes.len() < len {
-            let mut x = *locked;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *locked = x;
-            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&self.next_u64().to_le_bytes());
         }
         bytes.truncate(len);
         bytes
@@ -53,5 +74,24 @@ impl JsEntropySource for DeterministicJsEntropySource {
 impl From<DeterministicJsEntropySource> for Arc<dyn JsEntropySource> {
     fn from(value: DeterministicJsEntropySource) -> Self {
         Arc::new(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeterministicJsEntropySource, JsEntropySnapshot, JsEntropySource};
+
+    #[test]
+    fn deterministic_entropy_replays_from_snapshots() {
+        let entropy = DeterministicJsEntropySource::new(0x1234);
+        let snapshot = entropy.snapshot();
+        assert_eq!(snapshot, JsEntropySnapshot { state: 0x1234 });
+
+        let first = entropy.fill_bytes(16);
+        let second = entropy.fill_bytes(16);
+        assert_ne!(first, second);
+
+        entropy.restore(snapshot);
+        assert_eq!(entropy.fill_bytes(16), first);
     }
 }

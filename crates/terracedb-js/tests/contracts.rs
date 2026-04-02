@@ -13,11 +13,13 @@ use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, DeterministicJsHostServices,
     DeterministicJsRuntimeHost, DeterministicJsScheduler, DeterministicJsServiceOutcome,
     FixedJsClock, ImmediateBoaModuleLoader, JsExecutionHooks, JsExecutionRequest, JsForkPolicy,
-    JsHostServices, JsModuleLoader, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
-    JsRuntimeProvenance, JsSubstrateError, NeverCancel, NoopJsExecutionHooks, VfsJsModuleLoader,
+    JsHostServices, JsModuleKind, JsModuleLoader, JsRuntimeHost, JsRuntimeOpenRequest,
+    JsRuntimePolicy, JsRuntimeProvenance, JsSubstrateError, NeverCancel, NoopJsExecutionHooks,
+    VfsJsModuleLoader,
 };
 use terracedb_vfs::{
-    CreateOptions, InMemoryVfsStore, SnapshotOptions, VolumeConfig, VolumeId, VolumeStore,
+    CreateOptions, InMemoryVfsStore, SnapshotOptions, VfsStoreExt, VolumeConfig, VolumeId,
+    VolumeStore,
 };
 
 async fn seeded_snapshot() -> Arc<dyn terracedb_vfs::VolumeSnapshot> {
@@ -597,5 +599,129 @@ export default {
         denied,
         JsSubstrateError::EvaluationFailed { ref message, .. }
             if message.contains("package module loading is disabled by policy")
+    ));
+}
+
+#[tokio::test]
+async fn vfs_loader_reads_overlay_modules_and_resolves_bare_packages() {
+    let dependencies = DbDependencies::new(
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+        Arc::new(StubClock::new(Timestamp::new(77))),
+        Arc::new(StubRng::seeded(123)),
+    );
+    let store = InMemoryVfsStore::with_dependencies(dependencies);
+    let base = store
+        .open_volume(
+            VolumeConfig::new(VolumeId::new(0x9100))
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open base volume");
+    base.fs()
+        .write_file(
+            "/workspace/nested/helper.mjs",
+            br#"export default {"version":"base"};"#.to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write base helper");
+
+    let overlay = store
+        .create_overlay_from_volume(
+            base,
+            SnapshotOptions::default(),
+            VolumeConfig::new(VolumeId::new(0x9101))
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("create overlay");
+    overlay
+        .fs()
+        .write_file(
+            "/workspace/nested/helper.mjs",
+            br#"export default {"version":"overlay"};"#.to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("overwrite helper in overlay");
+
+    let snapshot = overlay
+        .snapshot(SnapshotOptions::default())
+        .await
+        .expect("snapshot overlay");
+    let loader = VfsJsModuleLoader::with_workspace_root_and_package_modules(
+        snapshot,
+        "/workspace",
+        BTreeMap::from([(
+            "npm:left-pad".to_string(),
+            r#"export default {"package":true};"#.to_string(),
+        )]),
+    );
+
+    let absolute = loader
+        .resolve("/workspace/nested/helper.mjs", None)
+        .await
+        .expect("resolve absolute workspace path");
+    assert_eq!(
+        absolute.canonical_specifier,
+        "terrace:/workspace/nested/helper.mjs"
+    );
+    assert_eq!(absolute.kind, JsModuleKind::Workspace);
+
+    let relative = loader
+        .resolve("./helper.mjs", Some("terrace:/workspace/nested/main.mjs"))
+        .await
+        .expect("resolve relative workspace path");
+    assert_eq!(relative.canonical_specifier, absolute.canonical_specifier);
+    assert_eq!(relative.kind, JsModuleKind::Workspace);
+    assert!(matches!(
+        loader
+            .resolve("../../escape.mjs", Some("terrace:/workspace/nested/main.mjs"))
+            .await,
+        Err(JsSubstrateError::UnsupportedSpecifier { ref specifier })
+            if specifier == "../../escape.mjs"
+    ));
+
+    let loaded = loader.load(&absolute).await.expect("load overlay helper");
+    assert!(loaded.source.contains("overlay"));
+
+    let bare_package = loader
+        .resolve("left-pad", None)
+        .await
+        .expect("resolve bare package import");
+    assert_eq!(bare_package.canonical_specifier, "npm:left-pad");
+    assert_eq!(bare_package.kind, JsModuleKind::Package);
+    assert!(
+        loader
+            .load(&bare_package)
+            .await
+            .expect("load package module")
+            .source
+            .contains("\"package\":true")
+    );
+
+    let denied = loader
+        .resolve("/outside/helper.mjs", None)
+        .await
+        .expect_err("paths outside the workspace root should be rejected");
+    assert!(matches!(
+        denied,
+        JsSubstrateError::UnsupportedSpecifier { ref specifier }
+            if specifier == "/outside/helper.mjs"
+    ));
+    assert!(matches!(
+        loader.resolve("terrace:/outside/helper.mjs", None).await,
+        Err(JsSubstrateError::UnsupportedSpecifier { ref specifier })
+            if specifier == "terrace:/outside/helper.mjs"
     ));
 }
