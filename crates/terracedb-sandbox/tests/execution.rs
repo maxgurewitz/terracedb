@@ -571,6 +571,73 @@ async fn guest_modules_read_write_vfs_and_call_explicit_capabilities() {
 }
 
 #[tokio::test]
+async fn guest_modules_can_import_generated_capability_catalog() {
+    let registry = deterministic_capabilities();
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store(101, 53, services);
+    let base_volume_id = VolumeId::new(0x9002);
+    let session_volume_id = VolumeId::new(0x9003);
+
+    seed_base(
+        &vfs,
+        base_volume_id,
+        r#"
+        import { Tickets } from "@terrace/capabilities";
+
+        export default await Tickets.echo({
+          text: "hello generated capabilities",
+        });
+        "#,
+        &[],
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: registry.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let result = session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("execute module");
+
+    assert_eq!(
+        result.result,
+        Some(json!({
+            "specifier": "terrace:host/tickets",
+            "method": "echo",
+            "args": [{
+                "text": "hello generated capabilities"
+            }]
+        }))
+    );
+    assert!(
+        result
+            .module_graph
+            .contains(&"@terrace/capabilities".to_string())
+    );
+    assert!(
+        result
+            .module_graph
+            .contains(&"terrace:host/tickets".to_string())
+    );
+    assert_eq!(result.capability_calls.len(), 1);
+}
+
+#[tokio::test]
 async fn denied_capabilities_fail_predictably_and_no_runtime_helpers_are_ambient() {
     let registry = deterministic_capabilities();
     let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));

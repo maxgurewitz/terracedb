@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use terracedb_js::{
     JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule, JsSubstrateError,
 };
+use serde_json::to_string as json_quote;
 use terracedb_vfs::JsonValue;
 use tokio::sync::Mutex;
 
@@ -17,6 +18,7 @@ use crate::{
 
 pub const TERRACE_WORKSPACE_PREFIX: &str = "terrace:/workspace";
 pub const HOST_CAPABILITY_PREFIX: &str = "terrace:host/";
+pub const SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER: &str = "@terrace/capabilities";
 pub const SANDBOX_FS_LIBRARY_SPECIFIER: &str = "@terracedb/sandbox/fs";
 pub const SANDBOX_BASH_LIBRARY_SPECIFIER: &str = "@terracedb/sandbox/bash";
 pub const SANDBOX_GIT_LIBRARY_SPECIFIER: &str = "@terracedb/sandbox/git";
@@ -112,7 +114,8 @@ impl SandboxModuleSpecifier {
 
         if matches!(
             specifier,
-            SANDBOX_FS_LIBRARY_SPECIFIER
+            SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER
+                | SANDBOX_FS_LIBRARY_SPECIFIER
                 | SANDBOX_BASH_LIBRARY_SPECIFIER
                 | SANDBOX_GIT_LIBRARY_SPECIFIER
                 | SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER
@@ -321,6 +324,12 @@ impl SandboxModuleLoader {
     fn load_builtin_module(&self, specifier: &str) -> Result<LoadedSandboxModule, SandboxError> {
         let source = match specifier {
             SANDBOX_FS_LIBRARY_SPECIFIER => fs_preview_source(),
+            SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER => {
+                capability_catalog_preview_source(
+                    &self.session_info.provenance.capabilities,
+                    self.capabilities.as_ref(),
+                )
+            }
             SANDBOX_BASH_LIBRARY_SPECIFIER => {
                 "export const unavailable = true;\nexport const service = 'bash';\n".to_string()
             }
@@ -779,6 +788,83 @@ fn git_preview_source() -> String {
         .map(|name| format!("export async function {name}(...args) {{ /* synthetic */ }}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn capability_catalog_preview_source(
+    manifest: &crate::CapabilityManifest,
+    registry: &dyn CapabilityRegistry,
+) -> String {
+    let mut used_exports = std::collections::BTreeSet::<String>::new();
+    let mut imports = Vec::new();
+    let mut bindings = Vec::new();
+    let mut object_entries = Vec::new();
+
+    for capability in &manifest.capabilities {
+        let base = capability_catalog_export_name(&capability.name);
+        let mut export_name = base.clone();
+        let mut suffix = 2_u32;
+        while !used_exports.insert(export_name.clone()) {
+            export_name = format!("{base}{suffix}");
+            suffix = suffix.saturating_add(1);
+        }
+        let specifier = json_quote(&capability.specifier)
+            .expect("capability specifier should serialize as JSON");
+        if let Some(module) = registry.module(&capability.specifier) {
+            let mut method_entries = Vec::new();
+            for method in module.methods {
+                let method_export =
+                    capability_catalog_export_name(&format!("{}_{}", capability.name, method.name));
+                let property = json_quote(&method.name)
+                    .expect("capability method name should serialize as JSON");
+                imports.push(format!(
+                    "import {{ {} as {} }} from {};",
+                    method.name, method_export, specifier
+                ));
+                method_entries.push(format!("  {property}: {method_export},"));
+            }
+            bindings.push(format!("export const {export_name} = {{"));
+            bindings.extend(method_entries);
+            bindings.push("};".to_string());
+        } else {
+            imports.push(format!("import * as {export_name} from {specifier};"));
+            bindings.push(format!("export {{ {export_name} }};"));
+        }
+        object_entries.push(format!("  {export_name},"));
+    }
+
+    let mut lines = Vec::<String>::new();
+    lines.extend(imports);
+    lines.extend(bindings);
+    lines.push("export const capabilities = {".to_string());
+    lines.extend(object_entries);
+    lines.push("};".to_string());
+    lines.push("export default capabilities;".to_string());
+    lines.join("\n")
+}
+
+fn capability_catalog_export_name(name: &str) -> String {
+    let mut result = String::new();
+    let mut uppercase_next = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if result.is_empty() && ch.is_ascii_digit() {
+                result.push('C');
+            }
+            if uppercase_next {
+                result.push(ch.to_ascii_uppercase());
+            } else {
+                result.push(ch);
+            }
+            uppercase_next = false;
+        } else {
+            uppercase_next = true;
+        }
+    }
+    if result.is_empty() {
+        "Capability".to_string()
+    } else {
+        result
+    }
 }
 
 fn capability_preview_source(module: &SandboxCapabilityModule) -> String {

@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_sandbox::{
-    ConflictPolicy, DefaultSandboxStore, PackageCompatibilityMode, SandboxConfig, SandboxServices,
-    SandboxStore,
+    CapabilityRegistry, ConflictPolicy, DefaultSandboxStore, DeterministicCapabilityModule,
+    DeterministicCapabilityRegistry, PackageCompatibilityMode, SandboxCapability, SandboxConfig,
+    SandboxServices, SandboxStore,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 use terracedb_workflows_core::{
@@ -174,6 +175,31 @@ fn sandbox_store(now: u64, seed: u64) -> (InMemoryVfsStore, DefaultSandboxStore<
         SandboxServices::deterministic(),
     );
     (vfs, sandbox)
+}
+
+fn sandbox_store_with_services(
+    now: u64,
+    seed: u64,
+    services: SandboxServices,
+) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
+    let dependencies = DbDependencies::new(
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+        Arc::new(StubClock::new(Timestamp::new(now))),
+        Arc::new(StubRng::seeded(seed)),
+    );
+    let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
+    let sandbox = DefaultSandboxStore::new(Arc::new(vfs.clone()), dependencies.clock, services);
+    (vfs, sandbox)
+}
+
+fn deterministic_capabilities() -> DeterministicCapabilityRegistry {
+    DeterministicCapabilityRegistry::new(vec![
+        DeterministicCapabilityModule::new(SandboxCapability::host_module("tickets"))
+            .expect("valid capability")
+            .with_echo_method("echo"),
+    ])
+    .expect("build registry")
 }
 
 async fn seed_module(store: &InMemoryVfsStore, volume_id: VolumeId, path: &str, source: &str) {
@@ -542,5 +568,105 @@ async fn sdk_defined_module_wraps_plain_handle_logic_into_workflow_task_contract
             ("workflow".to_string(), "billing".to_string()),
             ("task".to_string(), "acct-7:1".to_string()),
         ])
+    );
+}
+
+#[tokio::test]
+async fn sdk_defined_module_can_import_generated_capability_catalog() {
+    let registry = deterministic_capabilities();
+    let services = SandboxServices::deterministic().with_capabilities(Arc::new(registry.clone()));
+    let (vfs, sandbox) = sandbox_store_with_services(130, 94, services);
+    let base_volume_id = VolumeId::new(0x9330);
+    let session_volume_id = VolumeId::new(0x9331);
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/sdk/workflow.js",
+        WORKFLOW_SANDBOX_SDK_SOURCE,
+    )
+    .await;
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/billing.js",
+        r#"
+        import { Tickets } from "@terrace/capabilities";
+        import { schema, wf } from "./sdk/workflow.js";
+
+        const BillingState = wf.jsonState(
+          schema.object({
+            echoed: schema.string(),
+          }),
+        );
+
+        export default wf.define({
+          state: BillingState,
+
+          routeEvent({ event }) {
+            return String.fromCharCode(...event.key).split(":")[0];
+          },
+
+          async handle({ workflowName, instanceId, running }) {
+            const echoed = await Tickets.echo({
+              workflow: workflowName,
+              instance_id: instanceId,
+            });
+            return running({
+              putState: {
+                echoed: `${echoed.method}:${echoed.specifier}`,
+              },
+            });
+          },
+        });
+        "#,
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: registry.manifest(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let bundle = sample_bundle();
+    let handler =
+        SandboxModuleWorkflowTaskV1Handler::new(session, bundle.clone()).expect("module handler");
+    let mut input = sample_input(&bundle);
+    input.state = None;
+    input.history_len = 0;
+
+    let response = handler
+        .handle_task_v1(WorkflowTaskV1Request {
+            abi: WORKFLOW_TASK_V1_ABI.to_string(),
+            input,
+            deterministic: terracedb_workflows_core::WorkflowDeterministicSeed {
+                workflow_name: "billing".to_string(),
+                instance_id: "acct-7".to_string(),
+                run_id: terracedb_workflows_core::WorkflowRunId::new("run:acct-7").expect("run id"),
+                task_id: WorkflowTaskId::new("task:acct-7:1").expect("task id"),
+                trigger_hash: 11,
+                state_hash: 22,
+            },
+        })
+        .await
+        .expect("handle task");
+
+    assert_eq!(response.abi, WORKFLOW_TASK_V1_ABI);
+    assert_eq!(
+        response.output.state,
+        WorkflowStateMutation::Put {
+            state: WorkflowPayload::bytes(r#"{"echoed":"echo:terrace:host/tickets"}"#),
+        }
     );
 }

@@ -203,6 +203,13 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
             name: "tickets".to_string()
         }
     );
+    assert_eq!(
+        terracedb_sandbox::SandboxModuleSpecifier::parse("@terrace/capabilities")
+            .expect("generated capability catalog"),
+        terracedb_sandbox::SandboxModuleSpecifier::BuiltinLibrary {
+            specifier: "@terrace/capabilities".to_string()
+        }
+    );
 
     let package_report = session
         .install_packages(terracedb_sandbox::PackageInstallRequest {
