@@ -20,7 +20,9 @@ These are the architectural choices that most constrain the rest of the design:
 - **Public API is async.** Operations may involve commit log durability or cold storage access. `WriteBatch` and `ReadSet` construction are the only sync operations.
 - **Colocated derived state is synchronous** (one `WriteBatch`). Cross-entity derived state is asynchronous via `scanSince` with notification-driven consistency (`subscribe` + `waitForWatermark`).
 - **Projections are deterministic state updaters with read access.** They declare output writes; they do not cause side effects or commit their own batches.
-- **Workflows are stateful orchestrators with side effects.** They use the outbox pattern for at-least-once external delivery and durable timers for scheduling.
+- **Workflows are stateful orchestrators over runtime-managed primitive effects.** High-level helper functions are plain code, not a separate user-defined activity layer; the durable boundaries are primitive effects, timers, and spawned child runs. External delivery still uses the outbox pattern and durable timers under the hood.
+- **Workflow recovery state is not the same thing as user-visible history.** The runtime may keep a fine-grained hidden recovery journal plus opaque checkpoints while exposing a coarser operator-facing history surface.
+- **Workflow checkpointing and segment rotation are automatic runtime responsibilities.** Authors should not need manual `continue-as-new`-style hygiene just to stay within replay or history budgets.
 - **Historical workflow processing is configurable.** A workflow source may bootstrap from the beginning, from the current durable frontier, or from restored checkpoint/replay state; running a workflow "from the start" is not mandatory.
 - **External stream ingress is a library boundary, not an engine feature.** Kafka consumers persist source progress atomically with writes into ordinary Terracedb tables; Debezium support composes on top of Kafka ingress rather than extending the engine.
 - **Embedded virtual filesystems are libraries, not engine modes.** Their current-state filesystem/KV/tool rows live in ordinary tables; timelines and watchers are layered on top of append-only activity rows and change capture.
@@ -3095,16 +3097,17 @@ Projection library ──→ DB
 Workflow library   ──→ DB
 ```
 
-The stronger long-term model for workflows should be explicitly **run-based and history-first**.
+The stronger long-term model for workflows should be explicitly **run-based, recovery-first, and runtime-managed**.
 
 - a **workflow definition** names long-lived logic and routing,
 - a **workflow bundle** is an immutable implementation artifact for that logic,
 - a **workflow run** is one execution epoch pinned to one bundle,
-- **workflow history** is the append-only durable replay record,
+- a **workflow recovery journal** is the append-only internal durable replay record for admitted triggers and primitive effects,
+- **workflow checkpoints** are opaque resumable snapshots used to bound replay and allow old journal segments to be compacted,
 - **workflow state** is the current mutable summary used for fast execution, and
-- **workflow visibility** is a separate operator-facing projection optimized for list/search/describe/history APIs.
+- **workflow visibility / visible history** is a separate operator-facing projection optimized for list/search/describe/history APIs.
 
-This split matters. History is the durable source of truth. State is a speed-oriented summary derived from history and current execution tables. Visibility is a separate product for operators and tooling. These should not collapse into one table or one API.
+This split matters. The recovery journal is for correctness; visible history is for humans. Terracedb should be free to checkpoint and compact journal segments automatically without forcing authors to manually use `continue-as-new` or to wrap noisy I/O in fake activities just to control history growth. State remains a speed-oriented summary derived from the recovery surface and current execution tables. Visibility is a separate product for operators and tooling. These should not collapse into one table or one API.
 
 One design constraint should stay explicit throughout the workflow library:
 
@@ -3113,17 +3116,35 @@ One design constraint should stay explicit throughout the workflow library:
 
 ---
 
+## Workflow Programming Model
+
+The intended **author-facing** workflow model should be plain Rust or TypeScript running on a deterministic TerraceDB-owned runtime, not a mandatory split between "workflow code" and user-authored "activity code."
+
+- Primitive effects such as injected DB/app APIs, `fetch`, timers, and other host capabilities are the real durable boundaries.
+- High-level helpers and library functions are ordinary code composition. They do not need separate registration, separate files, or a separate serialization boundary just to be replay-safe.
+- Deterministic runtime ownership should cover ordinary language/runtime surfaces as well as explicit capabilities. In JavaScript that means guest code should use normal globals such as `Date`, `Math.random`, and `setTimeout`, with the runtime providing deterministic and replayable implementations.
+- Automatic checkpoints should happen at safe suspension points such as awaited effect/timer boundaries. If replay cost, journal bytes, or effect count grows too large, the runtime should checkpoint and roll to a new hidden segment under the same logical run, applying backpressure if necessary rather than failing with a history-size error.
+- Visible history should be synthesized separately from the fine-grained recovery journal. Optional grouping or span metadata may improve observability, but they are not required correctness boundaries in the way activities often become in other systems.
+- The explicit "separate durable execution" primitive should be **spawn child workflow / child run**, not "activity scope for history hygiene." Child runs are for isolation, fanout, lifecycle separation, and independent budgets.
+
+The rest of this part describes one viable Rust-owned executor architecture for implementing that model: durable admission into inbox rows, deterministic per-instance ordering, hidden recovery state, checkpoint-backed replay, durable timers, and outbox delivery.
+
+---
+
 ## Workflow Instances
 
 A workflow instance is a persistent state machine. Its state is stored in a DB table and advanced by processing durably admitted events, timer firings, or external responses.
+
+The tables below are primarily **executor-internal durability state**, not the recommended public SDK surface.
 
 ```typescript
 interface WorkflowDefinition {
   name: string
   runTable: Table                 // durable workflow runs and lifecycle metadata, keyed by runId
-  historyTable: Table             // append-only replay record, keyed by (runId, historySeq)
+  recoveryJournalTable: Table     // append-only internal replay journal, keyed by (runId, segmentId, journalSeq)
+  checkpointTable: Table          // opaque resumable checkpoints and segment metadata, keyed by runId / segment boundary
   stateTable: Table               // current mutable workflow state summary, keyed by active run or instance
-  visibilityTable: Table          // operator-facing projection for list/search/describe
+  visibilityTable: Table          // operator-facing projection for list/search/describe and paginated visible history
   inboxTable: Table               // durably admitted event/timer/callback triggers awaiting execution, keyed by (instanceId, triggerSeq)
   triggerOrderTable: Table        // per-instance next trigger sequence for durable ordering
   sourceCursorTable: Table        // progress of durable event-ingress per source table
@@ -3135,6 +3156,8 @@ interface WorkflowDefinition {
 }
 
 interface WorkflowHandler {
+  // Executor-private lowering boundary. A higher-level SDK may compile/lower onto this.
+
   // Determine which workflow instance should process a given event
   routeToInstance(entry: ChangeEntry): string
 
@@ -3147,8 +3170,9 @@ interface WorkflowHandler {
 }
 
 interface WorkflowContext {
-  // Deterministic helpers only. Implementations derive values from trigger/state/history,
-  // not from ambient wall-clock time or randomness.
+  // Deterministic helpers only. Implementations derive values from trigger/state/journal,
+  // not from ambient wall-clock time or randomness. In JS-facing SDKs the runtime should
+  // also own globals such as Date, Math.random, and timers directly.
   stableId(scope: string): string
   stableTime(scope: string): Timestamp
 }
@@ -3173,7 +3197,7 @@ interface AdmittedWorkflowTrigger {
 
 In simple single-run-per-instance configurations, the active `runId` may line up naturally with the logical instance identity. The architecture should still model runs explicitly so upgrades, restarts-as-new, and bundle pinning remain first-class rather than implicit.
 
-The handler is a pure function of `(currentState, trigger) → output`. Every trigger type is first turned into a **self-contained durable inbox row** before execution. The inbox row is the replay unit; the executor then applies the handler output atomically with inbox acknowledgement and timer deletion where relevant.
+One viable internal implementation is to lower the public workflow API onto a pure transition contract of `(currentState, trigger) → output`. Even if the author-facing API is more imperative, every trigger type is first turned into a **self-contained durable inbox row** before execution. The inbox row is the replay unit; the executor then applies the lowered output atomically with inbox acknowledgement and timer deletion where relevant.
 
 **Per-instance ordering rule:** every admitted trigger (event, callback, or timer) is assigned a durable, monotonically increasing `triggerSeq` for its workflow instance at admission time. `inboxTable` is keyed by `(instanceId, triggerSeq)`, and the executor processes the **lowest pending** row for each instance. That defines one durable order across competing trigger kinds such as "payment confirmed" versus "payment timeout".
 
@@ -3334,7 +3358,9 @@ The sandbox-facing boundary should be treated as a real versioned contract, for 
 
 If the current executor surface is too compile-time-oriented for dynamic workflow loading, it is reasonable to extend it with a type-erased handler adapter or factory. That is an implementation detail; the important architectural rule is that TypeScript plugs into the existing executor contract rather than replacing it.
 
-Recommended TypeScript authoring surface:
+The public TypeScript workflow API does not need to literally expose the internal `handle(state, trigger) -> WorkflowOutput` contract. It is acceptable, and likely preferable, for the user-facing SDK to present ordinary deterministic TypeScript over primitive effects, normal JavaScript timers, and child-run spawning, then lower that onto the executor's narrower transition/effects contract.
+
+One possible TypeScript authoring surface:
 
 ```typescript
 export default defineWorkflow({
@@ -3344,11 +3370,21 @@ export default defineWorkflow({
     return entry.key.accountId
   },
 
-  async handle({ instanceId, state, trigger, ctx }) {
-    return {
-      newState: nextState(state, trigger),
-      outboxEntries: buildOutbox(instanceId, state, trigger, ctx),
-      timers: buildTimers(instanceId, state, trigger, ctx),
+  async run({ trigger, state, payments, orders, spawn }) {
+    if (!state && trigger.kind === "event") {
+      const order = deserialize(trigger.entry.value)
+
+      const auth = await payments.authorize({
+        orderId: order.orderId,
+        cents: order.totalCents,
+      })
+
+      await orders.markAuthorized({
+        orderId: order.orderId,
+        authId: auth.id,
+      })
+
+      await spawn("receipt-workflow", { orderId: order.orderId })
     }
   },
 })
@@ -3358,14 +3394,16 @@ Execution-time workflow APIs should remain much narrower than general sandbox AP
 
 - the admitted trigger,
 - the current state,
-- deterministic helpers equivalent to `WorkflowContext`, and
-- optional workflow-scoped observability hooks or narrowly scoped reviewed read capabilities.
+- deterministic runtime-owned globals and/or helpers equivalent to `WorkflowContext`, and
+- optional workflow-scoped observability hooks or narrowly scoped reviewed capabilities.
 
-It should not receive arbitrary database handles, shell access, live package installation, host-disk writes, or unrestricted network access. Side effects should still be expressed declaratively through `WorkflowOutput`, with the Rust executor applying them atomically. This keeps replay and recovery semantics identical between Rust-authored and TypeScript-authored workflows.
+It should not receive arbitrary database handles, shell access, live package installation, host-disk writes, or unrestricted network access. Under the hood, those capability calls may still lower to an internal `WorkflowOutput`-style transition/effects contract that the Rust executor applies atomically. This keeps replay and recovery semantics identical between Rust-authored and TypeScript-authored workflows without forcing authors to write in that lower-level shape directly.
 
-For correctness, workflow execution must not depend on mutable guest-global state. The host may cache transpiled modules or sealed bundles, but each `routeToInstance` and `handle` call must behave as a pure function of admitted input, current state, and deterministic context.
+That declarative `WorkflowOutput` boundary is an executor concern, not necessarily the user-facing programming model. The intended advantage of TerraceDB-owned runtime determinism is that workflow authors should usually write plain code over durable primitive effects rather than manually splitting helper logic into separate "activity" modules for replay hygiene.
 
-Near-term implementation note: if the older runtime is bridged to the shared handler contract before the fuller run/history engine lands, that bridge should stay explicitly gated to the subset of contract semantics the runtime can actually preserve. In practice that means a compatibility marker for the state/outbox/timer surface only, rather than silently accepting lifecycle, visibility, or continue-as-new outputs that the older runtime cannot yet durably represent.
+For correctness, workflow execution must not depend on mutable guest-global state. The host may cache transpiled modules or sealed bundles, but each execution turn and its lowering boundary must behave as a pure function of admitted input, current state, and deterministic context.
+
+Near-term implementation note: if the older runtime is bridged to the shared handler contract before the fuller run/history engine lands, that bridge should stay explicitly gated to the subset of contract semantics the runtime can actually preserve. In practice that means a compatibility marker for the state/outbox/timer surface only, rather than silently accepting lifecycle, visibility, or automatic checkpoint/segment semantics that the older runtime cannot yet durably represent.
 
 ---
 
@@ -3691,12 +3729,12 @@ class WorkflowOutboxProcessor {
 
 ## Queries, Updates, Visibility, and Upgrades
 
-Not every interaction with a running workflow should become a durable workflow-history event.
+Not every interaction with a running workflow should become a durable visible-history event.
 
 The library should support three distinct lanes:
 
-1. **durable admitted triggers** that become part of run history and participate in replay,
-2. **read-only queries** that inspect current state or derived visibility without mutating run history, and
+1. **durable admitted triggers** that become part of the run's recovery record and replay surface,
+2. **read-only queries** that inspect current state or derived visibility without mutating the run's recovery record,
 3. **update/control requests** that may validate against live state first and become durable only if accepted.
 
 This keeps cheap inspection and validation-style interaction from paying the full history-append cost when no state transition is accepted.
@@ -3705,14 +3743,15 @@ Visibility should also be a first-class workflow product rather than a side effe
 
 - list and search over runs,
 - describe-style live inspection of one run,
-- paginated history retrieval for one run, and
+- paginated visible-history retrieval for one run, and
 - optional lower-level SQL or raw-table introspection for deeper operator forensics.
 
 The key split is:
 
-- `historyTable` is the authoritative replay record,
-- `stateTable` is the fast mutable summary,
-- `visibilityTable` is the operator-facing projection.
+- `recoveryJournalTable` is the internal authoritative replay surface for correctness,
+- `checkpointTable` bounds replay and enables automatic segment compaction / rotation,
+- `stateTable` is the fast mutable summary, and
+- `visibilityTable` is the operator-facing projection, including user-visible history views that need not expose every primitive effect.
 
 Raw table access may still exist for debugging or advanced tooling, but common operator paths should not require distributed scans or bespoke joins over raw workflow storage.
 
@@ -3720,7 +3759,7 @@ Workflow upgrades should also remain explicit. A run should be pinned to an immu
 
 - keep the current run pinned,
 - let new runs start on the new bundle,
-- and use continue-as-new / restart-as-new style transitions when a running execution must migrate to new code with a clean compatibility boundary.
+- prefer automatic checkpointed segment rollover for ordinary replay hygiene, and reserve explicit restart-as-new / new-run migration for semantic or compatibility boundaries where a running execution must intentionally move to new code.
 
 This applies equally to:
 
@@ -3741,7 +3780,7 @@ On restart, the workflow library:
 4. **Admits overdue timers.** The timer scanner then scans the durable prefix of `timerScheduleTable` for rows with fire time ≤ now and admits timer triggers for anything that should have fired during downtime.
 5. **Workflow state is already consistent.** Because state transitions, outbox writes, timer updates, and inbox acknowledgement are all in the same `WriteBatch`, there is no partial state to reconcile.
 
-The recovery model is simple because all workflow state lives in DB tables and all state transitions are atomic. There is no in-memory state to reconstruct beyond loading durable cursors and replaying durable inbox/outbox work.
+The recovery model is simple because all workflow state lives in DB tables and all state transitions are atomic. Replay should not require scanning an ever-growing user-visible history. The runtime should restore the latest checkpoint for each active run, then replay only the post-checkpoint hidden journal tail and any pending durable inbox/outbox work. Automatic segment rolling keeps that tail bounded without requiring author-managed `continue-as-new` hygiene.
 
 If a persisted source cursor is older than the retained source history, recovery follows the source's configured **recovery policy** rather than always implying a single behavior. Some workflows should fail closed; some should restore from checkpoint; some live-only workflows may explicitly fast-forward to the current durable frontier. Historical replay without checkpoints is only appropriate for replayable append-only ordered sources.
 
