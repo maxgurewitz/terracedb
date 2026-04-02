@@ -10,8 +10,10 @@ use terracedb_sandbox::{
     GitProvenance, LocalReadonlyViewBridge, PackageCompatibilityMode, PackageInstallRequest,
     PullRequestRequest, ReadonlyViewCut, ReadonlyViewProtocolRequest, ReadonlyViewProtocolResponse,
     ReadonlyViewProtocolTransport, ReadonlyViewRequest, ReopenSessionOptions, SandboxCapability,
-    SandboxConfig, SandboxServices, SandboxStore, StaticReadonlyViewRegistry, TypeCheckRequest,
-    TypeScriptService, read_package_install_manifest,
+    SandboxConfig, SandboxExecutionKind, SandboxExecutionRequest, SandboxRuntimeBackend,
+    SandboxRuntimeStateHandle, SandboxServices, SandboxStore, StaticReadonlyViewRegistry,
+    TERRACE_RUNTIME_MODULE_CACHE_PATH, TypeCheckRequest, TypeScriptService,
+    read_package_install_manifest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,6 +227,10 @@ struct SandboxRuntimeSimulationCapture {
     tool_names: Vec<String>,
     module_graph: Vec<String>,
     cache_entries: usize,
+    eval_first_cache_misses: Vec<String>,
+    eval_second_cache_hits: Vec<String>,
+    eval_capability_calls: usize,
+    runtime_cache_specifiers: Vec<String>,
 }
 
 fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulationCapture> {
@@ -261,9 +267,11 @@ fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulation
                     br#"
                     import { readTextFile, writeTextFile } from "@terracedb/sandbox/fs";
                     import { echo } from "terrace:host/tickets";
-                    const input = readTextFile("/workspace/input.txt");
-                    writeTextFile("/workspace/out.txt", `${input}:${input.length}`);
-                    export default echo({ value: readTextFile("/workspace/out.txt") });
+                    const input = await readTextFile("/workspace/input.txt");
+                    await writeTextFile("/workspace/out.txt", `${input}:${input.length}`);
+                    export default await echo({
+                        value: await readTextFile("/workspace/out.txt")
+                    });
                     "#
                     .to_vec(),
                     CreateOptions {
@@ -306,6 +314,55 @@ fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulation
                 .exec_module("/workspace/main.js")
                 .await
                 .expect("execute module");
+            let backend = terracedb_sandbox::DeterministicRuntimeBackend::default();
+            let handle = backend
+                .start_session(&session.info().await)
+                .await
+                .expect("start direct runtime backend");
+            let state = SandboxRuntimeStateHandle::new();
+            let eval_request = SandboxExecutionRequest {
+                kind: SandboxExecutionKind::Eval {
+                    source: r#"
+                        import { readTextFile } from "@terracedb/sandbox/fs";
+                        import { echo } from "terrace:host/tickets";
+                        export default await echo({
+                            value: await readTextFile("/workspace/input.txt")
+                        });
+                    "#
+                    .to_string(),
+                    virtual_specifier: Some(
+                        "terrace:/workspace/.terrace/runtime/reused-sim.mjs".to_string(),
+                    ),
+                },
+                metadata: Default::default(),
+            };
+            let first_eval = backend
+                .execute(&session, &handle, eval_request.clone(), state.clone())
+                .await
+                .expect("execute first eval");
+            let second_eval = backend
+                .execute(&session, &handle, eval_request, state)
+                .await
+                .expect("execute second eval");
+            let runtime_cache = session
+                .filesystem()
+                .read_file(TERRACE_RUNTIME_MODULE_CACHE_PATH)
+                .await
+                .expect("read runtime cache")
+                .expect("runtime cache should exist");
+            let runtime_cache_specifiers =
+                serde_json::from_slice::<serde_json::Value>(&runtime_cache)
+                    .expect("decode runtime cache")
+                    .as_array()
+                    .expect("runtime cache array")
+                    .iter()
+                    .map(|entry| {
+                        entry["specifier"]
+                            .as_str()
+                            .expect("runtime cache specifier")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>();
             let tool_names = session
                 .volume()
                 .tools()
@@ -321,6 +378,10 @@ fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulation
                 tool_names,
                 module_graph: result.module_graph,
                 cache_entries: result.cache_entries.len(),
+                eval_first_cache_misses: first_eval.cache_misses,
+                eval_second_cache_hits: second_eval.cache_hits,
+                eval_capability_calls: second_eval.capability_calls.len(),
+                runtime_cache_specifiers,
             })
         })
 }
@@ -416,6 +477,27 @@ fn seeded_runtime_execution_replays_module_graph_and_capability_calls() -> turmo
         })
     );
     assert!(first.cache_entries >= 2);
+    assert!(
+        first
+            .eval_first_cache_misses
+            .contains(&"terrace:/workspace/.terrace/runtime/reused-sim.mjs".to_string())
+    );
+    assert!(
+        first
+            .eval_second_cache_hits
+            .contains(&"terrace:/workspace/.terrace/runtime/reused-sim.mjs".to_string())
+    );
+    assert_eq!(first.eval_capability_calls, 1);
+    assert!(
+        first
+            .runtime_cache_specifiers
+            .contains(&"terrace:/workspace/.terrace/runtime/reused-sim.mjs".to_string())
+    );
+    assert!(
+        first
+            .runtime_cache_specifiers
+            .contains(&"@terracedb/sandbox/fs".to_string())
+    );
     Ok(())
 }
 

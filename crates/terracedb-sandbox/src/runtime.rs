@@ -1,17 +1,24 @@
-use std::{collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use boa_engine::{Context, Module, builtins::promise::PromiseState, js_string};
 use serde::{Deserialize, Serialize};
-use terracedb_vfs::JsonValue;
+use terracedb_js::{
+    BoaJsRuntimeHost, DeterministicJsEntropySource, FixedJsClock, JsCompatibilityProfile,
+    JsExecutionKind, JsExecutionRequest, JsForkPolicy, JsHostServiceCallRecord,
+    JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsRuntime, JsRuntimeHost,
+    JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsSubstrateError, NeverCancel,
+};
+use terracedb_vfs::{CreateOptions, JsonValue, Stats};
 use tokio::sync::Mutex;
 
 use crate::{
-    SandboxError, SandboxSession, SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
-    loader::{
-        ActiveGuestHost, LoadedSandboxModule, SandboxModuleCacheEntry, SandboxModuleKind,
-        SandboxModuleLoadTrace, with_active_guest_host,
-    },
+    CapabilityCallRequest, CapabilityCallResult, HOST_CAPABILITY_PREFIX, LoadedSandboxModule,
+    PackageCompatibilityMode, SandboxError, SandboxModuleCacheEntry, SandboxModuleKind,
+    SandboxModuleLoadTrace, SandboxSession, SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    loader::{FS_HOST_EXPORTS, SANDBOX_FS_LIBRARY_SPECIFIER, SandboxModuleLoader},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -120,6 +127,18 @@ impl SandboxRuntimeStateHandle {
             .await
             .module_cache
             .insert(entry.specifier.clone(), entry);
+    }
+
+    pub async fn hydrate_module_cache(
+        &self,
+        entries: Vec<SandboxModuleCacheEntry>,
+        next_eval_id: u64,
+    ) {
+        let mut state = self.inner.lock().await;
+        for entry in entries {
+            state.module_cache.insert(entry.specifier.clone(), entry);
+        }
+        state.next_eval_id = state.next_eval_id.max(next_eval_id);
     }
 }
 
@@ -245,112 +264,74 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
         state: SandboxRuntimeStateHandle,
     ) -> Result<SandboxExecutionResult, SandboxError> {
         let session_info = session.info().await;
+        hydrate_runtime_cache_state(session, &session_info, &state).await?;
         let loader = session
             .module_loader_with_state(session_info.clone(), state.clone())
             .await;
-        let (entrypoint, root) = match request.kind.clone() {
-            SandboxExecutionKind::Module { specifier } => {
-                let resolved = loader.resolve(&specifier, None).await?;
-                let loaded = loader.load(&resolved, None).await?;
-                (resolved, loaded)
-            }
-            SandboxExecutionKind::Eval {
-                source,
-                virtual_specifier,
-            } => {
-                let specifier = match virtual_specifier {
-                    Some(specifier) => specifier,
-                    None => {
-                        state
-                            .next_eval_specifier(&session_info.workspace_root)
-                            .await
-                    }
-                };
-                let loaded = inline_eval_module(&specifier, source);
-                if !state.is_module_cache_hit(&loaded.cache_entry).await {
-                    state.upsert_module_cache(loaded.cache_entry.clone()).await;
-                }
-                (specifier, loaded)
-            }
-        };
+        let host_services = Arc::new(SandboxJsHostServices::new(session.clone()));
+        let (entrypoint, js_request, inline_eval_cache) =
+            prepare_js_execution_request(&request, &session_info, &state, &loader).await?;
+        let runtime = open_js_runtime(
+            handle,
+            &session_info,
+            session,
+            loader.clone(),
+            host_services.clone(),
+        )
+        .await?;
+        let report = runtime
+            .execute(js_request, Arc::new(NeverCancel))
+            .await
+            .map_err(|error| js_substrate_error_to_sandbox(error, &entrypoint))?;
+        runtime
+            .close()
+            .await
+            .map_err(|error| js_substrate_error_to_sandbox(error, &entrypoint))?;
 
-        let host = Arc::new(ActiveGuestHost::new(session.clone()));
-        with_active_guest_host(host.clone(), async move {
-            let runtime = Rc::new(loader.clone());
-            let mut context = Context::builder()
-                .module_loader(runtime.clone())
-                .build()
-                .map_err(|error| SandboxError::Execution {
-                    entrypoint: entrypoint.clone(),
-                    message: error.to_string(),
-                })?;
-            let root_module = runtime.to_boa_module(root, &mut context).map_err(|error| {
-                SandboxError::Execution {
-                    entrypoint: entrypoint.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-            let promise = root_module.load_link_evaluate(&mut context);
-            context
-                .run_jobs()
-                .map_err(|error| SandboxError::Execution {
-                    entrypoint: entrypoint.clone(),
-                    message: error.to_string(),
-                })?;
-            let result = match promise.state() {
-                PromiseState::Pending => {
-                    return Err(SandboxError::Execution {
-                        entrypoint: entrypoint.clone(),
-                        message: "module evaluation is still pending after the job queue drained"
-                            .to_string(),
-                    });
-                }
-                PromiseState::Fulfilled(_) => export_default_value(&root_module, &mut context)?,
-                PromiseState::Rejected(reason) => {
-                    return Err(SandboxError::Execution {
-                        entrypoint: entrypoint.clone(),
-                        message: format!("{}", reason.display()),
-                    });
-                }
-            };
-            let trace = loader.trace_snapshot().await;
-            persist_runtime_cache(session, &trace).await?;
-            let module_count = trace.module_graph.len();
-            let package_import_count = trace.package_imports.len();
-            let module_graph = trace.module_graph;
-            let package_imports = trace.package_imports;
-            let cache_hits = trace.cache_hits;
-            let cache_misses = trace.cache_misses;
-            let cache_entries = trace.cache_entries;
-            Ok(SandboxExecutionResult {
-                backend: self.name.clone(),
-                actor_id: handle.actor_id.clone(),
-                entrypoint,
-                result,
-                module_graph,
-                package_imports,
-                cache_hits,
-                cache_misses,
-                cache_entries,
-                capability_calls: host.capability_calls(),
-                metadata: BTreeMap::from([
-                    (
-                        "session_revision".to_string(),
-                        JsonValue::from(session_info.revision),
-                    ),
-                    (
-                        "workspace_root".to_string(),
-                        JsonValue::from(session_info.workspace_root),
-                    ),
-                    ("module_count".to_string(), JsonValue::from(module_count)),
-                    (
-                        "package_import_count".to_string(),
-                        JsonValue::from(package_import_count),
-                    ),
-                ]),
-            })
+        let mut trace = loader.trace_snapshot().await;
+        if let Some((cache_entry, was_hit)) = inline_eval_cache {
+            merge_inline_eval_trace(&mut trace, cache_entry, was_hit);
+        }
+        persist_runtime_cache(session, &state).await?;
+
+        let module_graph = if report.module_graph.is_empty() {
+            trace.module_graph.clone()
+        } else {
+            report.module_graph
+        };
+        let package_import_count = trace.package_imports.len();
+
+        Ok(SandboxExecutionResult {
+            backend: self.name.clone(),
+            actor_id: handle.actor_id.clone(),
+            entrypoint,
+            result: report.result,
+            module_graph: module_graph.clone(),
+            package_imports: trace.package_imports,
+            cache_hits: trace.cache_hits,
+            cache_misses: trace.cache_misses,
+            cache_entries: trace.cache_entries,
+            capability_calls: host_services.capability_calls().await,
+            metadata: BTreeMap::from([
+                (
+                    "session_revision".to_string(),
+                    JsonValue::from(session_info.revision),
+                ),
+                (
+                    "workspace_root".to_string(),
+                    JsonValue::from(session_info.workspace_root),
+                ),
+                (
+                    "module_count".to_string(),
+                    JsonValue::from(module_graph.len()),
+                ),
+                (
+                    "package_import_count".to_string(),
+                    JsonValue::from(package_import_count),
+                ),
+                ("js_backend".to_string(), JsonValue::from(report.backend)),
+            ]),
         })
-        .await
     }
 
     async fn close_session(
@@ -359,6 +340,430 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
         _handle: &SandboxRuntimeHandle,
     ) -> Result<(), SandboxError> {
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SandboxJsHostServices {
+    session: SandboxSession,
+    calls: Arc<Mutex<Vec<JsHostServiceCallRecord>>>,
+    capability_calls: Arc<Mutex<Vec<CapabilityCallResult>>>,
+}
+
+impl SandboxJsHostServices {
+    fn new(session: SandboxSession) -> Self {
+        Self {
+            session,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            capability_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    async fn capability_calls(&self) -> Vec<CapabilityCallResult> {
+        self.capability_calls.lock().await.clone()
+    }
+
+    async fn call_async(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        let response = if request.service.starts_with(HOST_CAPABILITY_PREFIX) {
+            self.call_capability(request.clone()).await?
+        } else if is_filesystem_service(&request.service) {
+            self.call_filesystem(request.clone()).await?
+        } else {
+            return Err(JsSubstrateError::HostServiceUnavailable {
+                service: request.service,
+                operation: request.operation,
+            });
+        };
+        self.calls.lock().await.push(JsHostServiceCallRecord {
+            service: request.service,
+            operation: request.operation,
+            arguments: request.arguments,
+            result: response.result.clone(),
+            metadata: response.metadata.clone(),
+        });
+        Ok(response)
+    }
+
+    async fn call_capability(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        let result = self
+            .session
+            .invoke_capability(CapabilityCallRequest {
+                specifier: request.service.clone(),
+                method: request.operation.clone(),
+                args: host_service_arguments(&request.arguments),
+            })
+            .await
+            .map_err(|error| match error {
+                SandboxError::CapabilityDenied { .. } => JsSubstrateError::HostServiceDenied {
+                    service: request.service.clone(),
+                    operation: request.operation.clone(),
+                    message: error.to_string(),
+                },
+                SandboxError::CapabilityUnavailable { .. } => {
+                    JsSubstrateError::HostServiceUnavailable {
+                        service: request.service.clone(),
+                        operation: request.operation.clone(),
+                    }
+                }
+                other => JsSubstrateError::EvaluationFailed {
+                    entrypoint: format!("{}::{}", request.service, request.operation),
+                    message: other.to_string(),
+                },
+            })?;
+        self.capability_calls.lock().await.push(result.clone());
+        Ok(JsHostServiceResponse {
+            result: Some(result.value),
+            metadata: result.metadata,
+        })
+    }
+
+    async fn call_filesystem(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        let filesystem = self.session.filesystem();
+        let args = host_service_arguments(&request.arguments);
+        match request.operation.as_str() {
+            "readTextFile" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                let bytes = filesystem
+                    .read_file(&path)
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?
+                    .ok_or_else(|| {
+                        host_service_error(
+                            &request,
+                            SandboxError::Service {
+                                service: "filesystem",
+                                message: format!("path not found: {path}"),
+                            },
+                        )
+                    })?;
+                let contents = String::from_utf8(bytes).map_err(|error| {
+                    host_service_error(
+                        &request,
+                        SandboxError::Service {
+                            service: "filesystem",
+                            message: format!("path {path} is not valid UTF-8: {error}"),
+                        },
+                    )
+                })?;
+                Ok(json_response(JsonValue::String(contents)))
+            }
+            "writeTextFile" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                let contents = required_string_arg(&request, &args, 1, "contents")?;
+                filesystem
+                    .write_file(
+                        &path,
+                        contents.into_bytes(),
+                        CreateOptions {
+                            create_parents: true,
+                            overwrite: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(empty_response())
+            }
+            "readJsonFile" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                let bytes = filesystem
+                    .read_file(&path)
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?
+                    .ok_or_else(|| {
+                        host_service_error(
+                            &request,
+                            SandboxError::Service {
+                                service: "filesystem",
+                                message: format!("path not found: {path}"),
+                            },
+                        )
+                    })?;
+                let contents = String::from_utf8(bytes).map_err(|error| {
+                    host_service_error(
+                        &request,
+                        SandboxError::Service {
+                            service: "filesystem",
+                            message: format!("path {path} is not valid UTF-8: {error}"),
+                        },
+                    )
+                })?;
+                let value = serde_json::from_str(&contents).map_err(|error| {
+                    host_service_error(
+                        &request,
+                        SandboxError::Service {
+                            service: "filesystem",
+                            message: format!("json parse failed: {error}"),
+                        },
+                    )
+                })?;
+                Ok(json_response(value))
+            }
+            "writeJsonFile" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                let value = args.get(1).cloned().unwrap_or(JsonValue::Null);
+                let encoded = serde_json::to_vec_pretty(&value).map_err(|error| {
+                    host_service_error(&request, SandboxError::SerdeJson(error))
+                })?;
+                filesystem
+                    .write_file(
+                        &path,
+                        encoded,
+                        CreateOptions {
+                            create_parents: true,
+                            overwrite: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(empty_response())
+            }
+            "mkdir" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                filesystem
+                    .mkdir(
+                        &path,
+                        terracedb_vfs::MkdirOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(empty_response())
+            }
+            "readdir" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                let entries = filesystem
+                    .readdir(&path)
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                let json = entries
+                    .into_iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "name": entry.name,
+                            "inode": entry.inode.to_string(),
+                            "kind": format!("{:?}", entry.kind).to_lowercase(),
+                        })
+                    })
+                    .collect();
+                Ok(json_response(JsonValue::Array(json)))
+            }
+            "stat" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                let stats = filesystem
+                    .stat(&path)
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(json_response(
+                    stats.map(stats_to_json).unwrap_or(JsonValue::Null),
+                ))
+            }
+            "unlink" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                filesystem
+                    .unlink(&path)
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(empty_response())
+            }
+            "rmdir" => {
+                let path = required_string_arg(&request, &args, 0, "path")?;
+                filesystem
+                    .rmdir(&path)
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(empty_response())
+            }
+            "rename" => {
+                let from = required_string_arg(&request, &args, 0, "from")?;
+                let to = required_string_arg(&request, &args, 1, "to")?;
+                filesystem
+                    .rename(&from, &to)
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(empty_response())
+            }
+            "fsync" => {
+                let path = optional_string_arg(&args, 0);
+                filesystem
+                    .fsync(path.as_deref())
+                    .await
+                    .map_err(|error| host_service_error(&request, error))?;
+                Ok(empty_response())
+            }
+            _ => Err(JsSubstrateError::HostServiceUnavailable {
+                service: request.service,
+                operation: request.operation,
+            }),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl JsHostServices for SandboxJsHostServices {
+    async fn call(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        self.call_async(request).await
+    }
+
+    async fn calls(&self) -> Vec<JsHostServiceCallRecord> {
+        self.calls.lock().await.clone()
+    }
+}
+
+async fn open_js_runtime(
+    handle: &SandboxRuntimeHandle,
+    session_info: &SandboxSessionInfo,
+    session: &SandboxSession,
+    loader: SandboxModuleLoader,
+    host_services: Arc<SandboxJsHostServices>,
+) -> Result<Arc<dyn JsRuntime>, SandboxError> {
+    let runtime_host = BoaJsRuntimeHost::new(Arc::new(loader), host_services)
+        .with_clock(Arc::new(FixedJsClock::new(session_info.updated_at.get())))
+        .with_entropy(Arc::new(DeterministicJsEntropySource::new(
+            js_entropy_seed(session_info),
+        )));
+    runtime_host
+        .open_runtime(JsRuntimeOpenRequest {
+            runtime_id: handle.actor_id.clone(),
+            policy: runtime_policy_for_session(session, session_info),
+            provenance: JsRuntimeProvenance {
+                backend: handle.backend.clone(),
+                host_model: "sandbox-session".to_string(),
+                module_root: session_info.workspace_root.clone(),
+                volume_id: Some(session_info.session_volume_id),
+                snapshot_sequence: Some(session_info.provenance.base_snapshot.sequence.get()),
+                durable_snapshot: session_info.provenance.base_snapshot.durable,
+                fork_policy: JsForkPolicy::simulation_native_baseline(),
+            },
+            metadata: BTreeMap::from([
+                (
+                    "session_revision".to_string(),
+                    JsonValue::from(session_info.revision),
+                ),
+                (
+                    "workspace_root".to_string(),
+                    JsonValue::from(session_info.workspace_root.clone()),
+                ),
+            ]),
+        })
+        .await
+        .map_err(|error| js_substrate_error_to_sandbox(error, &handle.actor_id))
+}
+
+async fn prepare_js_execution_request(
+    request: &SandboxExecutionRequest,
+    session_info: &SandboxSessionInfo,
+    state: &SandboxRuntimeStateHandle,
+    loader: &SandboxModuleLoader,
+) -> Result<
+    (
+        String,
+        JsExecutionRequest,
+        Option<(SandboxModuleCacheEntry, bool)>,
+    ),
+    SandboxError,
+> {
+    match request.kind.clone() {
+        SandboxExecutionKind::Module { specifier } => {
+            let entrypoint = loader.resolve(&specifier, None).await?;
+            Ok((
+                entrypoint.clone(),
+                JsExecutionRequest {
+                    kind: JsExecutionKind::Module {
+                        specifier: entrypoint,
+                    },
+                    metadata: request.metadata.clone(),
+                },
+                None,
+            ))
+        }
+        SandboxExecutionKind::Eval {
+            source,
+            virtual_specifier,
+        } => {
+            let entrypoint = match virtual_specifier {
+                Some(specifier) => specifier,
+                None => {
+                    state
+                        .next_eval_specifier(&session_info.workspace_root)
+                        .await
+                }
+            };
+            let inline = inline_eval_module(&entrypoint, source.clone());
+            let was_hit = state.is_module_cache_hit(&inline.cache_entry).await;
+            state.upsert_module_cache(inline.cache_entry.clone()).await;
+            Ok((
+                entrypoint.clone(),
+                JsExecutionRequest {
+                    kind: JsExecutionKind::Eval {
+                        source,
+                        virtual_specifier: Some(entrypoint),
+                    },
+                    metadata: request.metadata.clone(),
+                },
+                Some((inline.cache_entry, was_hit)),
+            ))
+        }
+    }
+}
+
+fn runtime_policy_for_session(
+    session: &SandboxSession,
+    session_info: &SandboxSessionInfo,
+) -> JsRuntimePolicy {
+    let mut visible_host_services = BTreeSet::new();
+
+    for operation in FS_HOST_EXPORTS {
+        visible_host_services.insert(format!("{SANDBOX_FS_LIBRARY_SPECIFIER}::{operation}"));
+    }
+
+    if session_info.provenance.package_compat == PackageCompatibilityMode::NpmWithNodeBuiltins {
+        for service in ["node:fs", "node:fs/promises"] {
+            for operation in FS_HOST_EXPORTS {
+                visible_host_services.insert(format!("{service}::{operation}"));
+            }
+        }
+    }
+
+    let capabilities = session.capability_registry();
+    for capability in &session_info.provenance.capabilities.capabilities {
+        if let Some(module) = capabilities.module(&capability.specifier) {
+            for method in module.methods {
+                visible_host_services.insert(format!("{}::{}", capability.specifier, method.name));
+            }
+        }
+    }
+
+    JsRuntimePolicy {
+        execution_domain: None,
+        compatibility_profile: match session_info.provenance.package_compat {
+            PackageCompatibilityMode::TerraceOnly => JsCompatibilityProfile::TerraceOnly,
+            PackageCompatibilityMode::NpmPureJs | PackageCompatibilityMode::NpmWithNodeBuiltins => {
+                JsCompatibilityProfile::SandboxCompat
+            }
+        },
+        allow_workspace_modules: true,
+        allow_host_modules: true,
+        allow_package_modules: session_info.provenance.package_compat
+            != PackageCompatibilityMode::TerraceOnly,
+        visible_host_services: visible_host_services.into_iter().collect(),
+        forbidden_ambient_defaults: JsForkPolicy::simulation_native_baseline()
+            .forbidden_ambient_defaults,
     }
 }
 
@@ -399,36 +804,42 @@ fn inline_eval_module(specifier: &str, source: String) -> LoadedSandboxModule {
     }
 }
 
-fn export_default_value(
-    module: &Module,
-    context: &mut Context,
-) -> Result<Option<JsonValue>, SandboxError> {
-    let default_value = module
-        .namespace(context)
-        .get(js_string!("default"), context);
-    match default_value {
-        Ok(value) if value.is_undefined() => Ok(None),
-        Ok(value) => value
-            .to_json(context)
-            .map_err(|error| SandboxError::Execution {
-                entrypoint: "<namespace>".to_string(),
-                message: error.to_string(),
-            }),
-        Err(_) => Ok(None),
+fn merge_inline_eval_trace(
+    trace: &mut SandboxModuleLoadTrace,
+    cache_entry: SandboxModuleCacheEntry,
+    was_hit: bool,
+) {
+    if !trace.cache_entries.contains(&cache_entry) {
+        trace.cache_entries.push(cache_entry.clone());
+    }
+    let bucket = if was_hit {
+        &mut trace.cache_hits
+    } else {
+        &mut trace.cache_misses
+    };
+    if !bucket.contains(&cache_entry.specifier) {
+        bucket.push(cache_entry.specifier);
     }
 }
 
 async fn persist_runtime_cache(
     session: &SandboxSession,
-    trace: &SandboxModuleLoadTrace,
+    state: &SandboxRuntimeStateHandle,
 ) -> Result<(), SandboxError> {
+    let mut cache_entries = state
+        .snapshot()
+        .await
+        .module_cache
+        .into_values()
+        .collect::<Vec<_>>();
+    cache_entries.sort_by(|left, right| left.specifier.cmp(&right.specifier));
     session
         .volume()
         .fs()
         .write_file(
             TERRACE_RUNTIME_MODULE_CACHE_PATH,
-            serde_json::to_vec_pretty(&trace.cache_entries)?,
-            terracedb_vfs::CreateOptions {
+            serde_json::to_vec_pretty(&cache_entries)?,
+            CreateOptions {
                 create_parents: true,
                 overwrite: true,
                 ..Default::default()
@@ -436,4 +847,185 @@ async fn persist_runtime_cache(
         )
         .await?;
     Ok(())
+}
+
+async fn hydrate_runtime_cache_state(
+    session: &SandboxSession,
+    session_info: &SandboxSessionInfo,
+    state: &SandboxRuntimeStateHandle,
+) -> Result<(), SandboxError> {
+    if !state.snapshot().await.module_cache.is_empty() {
+        return Ok(());
+    }
+    let Some(bytes) = session
+        .filesystem()
+        .read_file(TERRACE_RUNTIME_MODULE_CACHE_PATH)
+        .await?
+    else {
+        return Ok(());
+    };
+    let entries = serde_json::from_slice::<Vec<SandboxModuleCacheEntry>>(&bytes)?;
+    let next_eval_id = recovered_next_eval_id(&session_info.workspace_root, &entries);
+    state.hydrate_module_cache(entries, next_eval_id).await;
+    Ok(())
+}
+
+fn recovered_next_eval_id(workspace_root: &str, entries: &[SandboxModuleCacheEntry]) -> u64 {
+    let prefix = format!("terrace:{workspace_root}/.terrace/runtime/eval-");
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .specifier
+                .strip_prefix(&prefix)?
+                .strip_suffix(".mjs")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn js_entropy_seed(session_info: &SandboxSessionInfo) -> u64 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(session_info.session_volume_id.to_string().as_bytes());
+    hasher.update(session_info.workspace_root.as_bytes());
+    hasher.update(&session_info.revision.to_le_bytes());
+    u64::from(hasher.finalize())
+}
+
+fn host_service_arguments(arguments: &JsonValue) -> Vec<JsonValue> {
+    match arguments {
+        JsonValue::Null => Vec::new(),
+        JsonValue::Array(values) => values.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+fn required_string_arg(
+    request: &JsHostServiceRequest,
+    args: &[JsonValue],
+    index: usize,
+    name: &str,
+) -> Result<String, JsSubstrateError> {
+    let value = args
+        .get(index)
+        .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+            entrypoint: format!("{}::{}", request.service, request.operation),
+            message: format!("missing required argument: {name}"),
+        })?;
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+            entrypoint: format!("{}::{}", request.service, request.operation),
+            message: format!("argument {name} must be a string"),
+        })
+}
+
+fn optional_string_arg(args: &[JsonValue], index: usize) -> Option<String> {
+    args.get(index)
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+}
+
+fn empty_response() -> JsHostServiceResponse {
+    JsHostServiceResponse {
+        result: None,
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn json_response(result: JsonValue) -> JsHostServiceResponse {
+    JsHostServiceResponse {
+        result: Some(result),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn is_filesystem_service(service: &str) -> bool {
+    matches!(
+        service,
+        SANDBOX_FS_LIBRARY_SPECIFIER | "node:fs" | "node:fs/promises"
+    )
+}
+
+fn stats_to_json(stats: Stats) -> JsonValue {
+    serde_json::json!({
+        "inode": stats.inode.to_string(),
+        "kind": format!("{:?}", stats.kind).to_lowercase(),
+        "mode": stats.mode,
+        "nlink": stats.nlink,
+        "uid": stats.uid,
+        "gid": stats.gid,
+        "size": stats.size,
+        "created_at": stats.created_at.get(),
+        "modified_at": stats.modified_at.get(),
+        "changed_at": stats.changed_at.get(),
+        "accessed_at": stats.accessed_at.get(),
+        "rdev": stats.rdev,
+    })
+}
+
+fn host_service_error(request: &JsHostServiceRequest, error: SandboxError) -> JsSubstrateError {
+    match error {
+        SandboxError::Vfs(error) => JsSubstrateError::Vfs(error),
+        other => JsSubstrateError::EvaluationFailed {
+            entrypoint: format!("{}::{}", request.service, request.operation),
+            message: other.to_string(),
+        },
+    }
+}
+
+fn js_substrate_error_to_sandbox(
+    error: JsSubstrateError,
+    fallback_entrypoint: &str,
+) -> SandboxError {
+    match error {
+        JsSubstrateError::EvaluationFailed {
+            entrypoint,
+            message,
+        } => SandboxError::Execution {
+            entrypoint,
+            message,
+        },
+        JsSubstrateError::UnsupportedSpecifier { specifier } => SandboxError::Execution {
+            entrypoint: fallback_entrypoint.to_string(),
+            message: format!("unsupported js module specifier: {specifier}"),
+        },
+        JsSubstrateError::ModuleNotFound { specifier } => SandboxError::Execution {
+            entrypoint: fallback_entrypoint.to_string(),
+            message: format!("js module not found: {specifier}"),
+        },
+        JsSubstrateError::ModulePolicyDenied {
+            specifier, message, ..
+        } => SandboxError::Execution {
+            entrypoint: fallback_entrypoint.to_string(),
+            message: format!("{specifier}: {message}"),
+        },
+        JsSubstrateError::HostServiceUnavailable { service, operation } => {
+            SandboxError::Execution {
+                entrypoint: fallback_entrypoint.to_string(),
+                message: format!("js host service is unavailable: {service}::{operation}"),
+            }
+        }
+        JsSubstrateError::HostServiceDenied {
+            service,
+            operation,
+            message,
+        } => SandboxError::Execution {
+            entrypoint: fallback_entrypoint.to_string(),
+            message: format!("js host service denied {service}::{operation}: {message}"),
+        },
+        JsSubstrateError::Cancelled { runtime_id } => SandboxError::Execution {
+            entrypoint: fallback_entrypoint.to_string(),
+            message: format!("js runtime {runtime_id} was cancelled"),
+        },
+        JsSubstrateError::InvalidDirective { module, message } => SandboxError::Execution {
+            entrypoint: module,
+            message,
+        },
+        JsSubstrateError::SerdeJson(error) => SandboxError::SerdeJson(error),
+        JsSubstrateError::Vfs(error) => SandboxError::Vfs(error),
+    }
 }

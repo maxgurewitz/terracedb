@@ -1,5 +1,6 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use serde_json::json;
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_git::{
@@ -12,15 +13,16 @@ use terracedb_git::{
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, DeterministicJsHostServices,
     DeterministicJsRuntimeHost, DeterministicJsScheduler, DeterministicJsServiceOutcome,
-    FixedJsClock, ImmediateBoaModuleLoader, JsExecutionHooks, JsExecutionRequest, JsForkPolicy,
-    JsHostServices, JsModuleKind, JsModuleLoader, JsRuntimeHost, JsRuntimeOpenRequest,
-    JsRuntimePolicy, JsRuntimeProvenance, JsSubstrateError, NeverCancel, NoopJsExecutionHooks,
-    VfsJsModuleLoader,
+    FixedJsClock, JsExecutionHooks, JsExecutionRequest, JsForkPolicy, JsHostServiceCallRecord,
+    JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsLoadedModule, JsModuleKind,
+    JsModuleLoader, JsResolvedModule, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
+    JsRuntimeProvenance, JsSubstrateError, NeverCancel, NoopJsExecutionHooks, VfsJsModuleLoader,
 };
 use terracedb_vfs::{
     CreateOptions, InMemoryVfsStore, SnapshotOptions, VfsStoreExt, VolumeConfig, VolumeId,
     VolumeStore,
 };
+use tokio::{sync::Mutex, task::yield_now, time::sleep};
 
 async fn seeded_snapshot() -> Arc<dyn terracedb_vfs::VolumeSnapshot> {
     let dependencies = DbDependencies::new(
@@ -411,12 +413,120 @@ async fn deterministic_smoke_executes_fake_runtime_and_repo_over_vfs() {
     assert!(pr.url.starts_with("https://example.invalid/pull/"));
 }
 
+#[derive(Clone, Default)]
+struct YieldingAsyncBoaHostServices {
+    calls: Arc<Mutex<Vec<JsHostServiceCallRecord>>>,
+}
+
+#[async_trait(?Send)]
+impl JsHostServices for YieldingAsyncBoaHostServices {
+    async fn call(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        yield_now().await;
+        sleep(Duration::from_millis(1)).await;
+
+        let echoed = request
+            .arguments
+            .get("message")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let response = JsHostServiceResponse {
+            result: Some(json!({ "echoed": echoed })),
+            metadata: BTreeMap::new(),
+        };
+        self.calls.lock().await.push(JsHostServiceCallRecord {
+            service: request.service,
+            operation: request.operation,
+            arguments: request.arguments,
+            result: response.result.clone(),
+            metadata: response.metadata.clone(),
+        });
+        Ok(response)
+    }
+
+    async fn calls(&self) -> Vec<JsHostServiceCallRecord> {
+        self.calls.lock().await.clone()
+    }
+}
+
+struct YieldingAsyncBoaLoader;
+
+#[async_trait(?Send)]
+impl JsModuleLoader for YieldingAsyncBoaLoader {
+    async fn resolve(
+        &self,
+        specifier: &str,
+        referrer: Option<&str>,
+    ) -> Result<JsResolvedModule, JsSubstrateError> {
+        yield_now().await;
+        let canonical = match (specifier, referrer) {
+            ("terrace:/async-main.mjs", None) => "terrace:/async-main.mjs",
+            ("./async-helper.mjs", Some("terrace:/async-main.mjs")) => "terrace:/async-helper.mjs",
+            ("terrace:host/echo", Some("terrace:/async-main.mjs")) => "terrace:host/echo",
+            _ => {
+                return Err(JsSubstrateError::UnsupportedSpecifier {
+                    specifier: specifier.to_string(),
+                });
+            }
+        };
+        Ok(JsResolvedModule {
+            requested_specifier: specifier.to_string(),
+            canonical_specifier: canonical.to_string(),
+            kind: if canonical.starts_with("terrace:host/") {
+                JsModuleKind::HostCapability
+            } else {
+                JsModuleKind::Workspace
+            },
+        })
+    }
+
+    async fn load(&self, resolved: &JsResolvedModule) -> Result<JsLoadedModule, JsSubstrateError> {
+        sleep(Duration::from_millis(1)).await;
+        let (source, metadata) = match resolved.canonical_specifier.as_str() {
+            "terrace:/async-main.mjs" => (
+                r#"
+import helper from "./async-helper.mjs";
+import { echo } from "terrace:host/echo";
+
+const response = await echo({ message: helper.message });
+export default { helper: helper.helper, echoed: response.echoed };
+"#
+                .to_string(),
+                BTreeMap::new(),
+            ),
+            "terrace:/async-helper.mjs" => (
+                r#"export default { helper: true, message: "from async loader" };"#.to_string(),
+                BTreeMap::new(),
+            ),
+            "terrace:host/echo" => (
+                String::new(),
+                BTreeMap::from([
+                    ("synthetic".to_string(), json!(true)),
+                    ("host_service".to_string(), json!("terrace:host/echo")),
+                    ("host_exports".to_string(), json!(["echo"])),
+                ]),
+            ),
+            _ => {
+                return Err(JsSubstrateError::ModuleNotFound {
+                    specifier: resolved.canonical_specifier.clone(),
+                });
+            }
+        };
+        Ok(JsLoadedModule {
+            resolved: resolved.clone(),
+            source,
+            trace: Vec::new(),
+            metadata,
+        })
+    }
+}
+
 #[tokio::test]
 async fn boa_runtime_executes_modules_and_capability_imports_over_frozen_interfaces() {
     let snapshot = seeded_snapshot().await;
-    let loader = Arc::new(ImmediateBoaModuleLoader::new(Arc::new(
-        VfsJsModuleLoader::new(snapshot),
-    )));
+    let loader = Arc::new(VfsJsModuleLoader::new(snapshot));
     let host_services = DeterministicJsHostServices::new();
     host_services
         .register_outcome(
@@ -492,20 +602,79 @@ async fn boa_runtime_executes_modules_and_capability_imports_over_frozen_interfa
 }
 
 #[tokio::test]
+async fn boa_runtime_async_bridge_waits_for_executor_driven_loaders_and_host_services() {
+    let host_services = Arc::new(YieldingAsyncBoaHostServices::default());
+    let runtime = BoaJsRuntimeHost::new(Arc::new(YieldingAsyncBoaLoader), host_services.clone())
+        .with_scheduler(Arc::new(DeterministicJsScheduler::default()))
+        .with_clock(Arc::new(FixedJsClock::new(4_200)))
+        .with_entropy(Arc::new(DeterministicJsEntropySource::new(0xabba)))
+        .open_runtime(JsRuntimeOpenRequest {
+            runtime_id: "boa-runtime-async-bridge".to_string(),
+            policy: JsRuntimePolicy {
+                visible_host_services: vec!["terrace:host/echo::echo".to_string()],
+                ..Default::default()
+            },
+            provenance: JsRuntimeProvenance {
+                backend: "boa-js".to_string(),
+                host_model: "host-owned".to_string(),
+                module_root: "/workspace".to_string(),
+                volume_id: Some(VolumeId::new(0x9001)),
+                snapshot_sequence: Some(1),
+                durable_snapshot: false,
+                fork_policy: JsForkPolicy::simulation_native_baseline(),
+            },
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("open async boa runtime");
+    let report = runtime
+        .execute(
+            JsExecutionRequest::module("terrace:/async-main.mjs"),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("execute async boa runtime");
+
+    assert_eq!(
+        report.result,
+        Some(json!({
+            "helper": true,
+            "echoed": "from async loader"
+        }))
+    );
+    assert_eq!(
+        report
+            .module_graph
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "terrace:/async-main.mjs".to_string(),
+            "terrace:/async-helper.mjs".to_string(),
+            "terrace:host/echo".to_string(),
+        ])
+    );
+    assert_eq!(report.host_calls.len(), 1);
+    assert_eq!(
+        report.host_calls[0].arguments,
+        json!({ "message": "from async loader" })
+    );
+    assert_eq!(host_services.calls().await.len(), 1);
+}
+
+#[tokio::test]
 async fn boa_runtime_replaces_ambient_rng_and_denies_package_modules_by_default() {
     let snapshot = seeded_snapshot().await;
     let run_eval = |seed| {
         let snapshot = snapshot.clone();
         async move {
-            let loader = Arc::new(ImmediateBoaModuleLoader::new(Arc::new(
-                VfsJsModuleLoader::with_package_modules(
-                    snapshot,
-                    BTreeMap::from([(
-                        "npm:test".to_string(),
-                        "export default {\"package\":true};".to_string(),
-                    )]),
-                ),
-            )));
+            let loader = Arc::new(VfsJsModuleLoader::with_package_modules(
+                snapshot,
+                BTreeMap::from([(
+                    "npm:test".to_string(),
+                    "export default {\"package\":true};".to_string(),
+                )]),
+            ));
             let runtime =
                 BoaJsRuntimeHost::new(loader, Arc::new(DeterministicJsHostServices::new()))
                     .with_scheduler(Arc::new(DeterministicJsScheduler::default()))
@@ -559,15 +728,13 @@ export default {
         }))
     );
 
-    let loader = Arc::new(ImmediateBoaModuleLoader::new(Arc::new(
-        VfsJsModuleLoader::with_package_modules(
-            seeded_snapshot().await,
-            BTreeMap::from([(
-                "npm:test".to_string(),
-                "export default {\"package\":true};".to_string(),
-            )]),
-        ),
-    )));
+    let loader = Arc::new(VfsJsModuleLoader::with_package_modules(
+        seeded_snapshot().await,
+        BTreeMap::from([(
+            "npm:test".to_string(),
+            "export default {\"package\":true};".to_string(),
+        )]),
+    ));
     let runtime = BoaJsRuntimeHost::new(loader, Arc::new(DeterministicJsHostServices::new()))
         .with_scheduler(Arc::new(DeterministicJsScheduler::default()))
         .with_clock(Arc::new(FixedJsClock::new(2_468)))

@@ -2605,6 +2605,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "boa_engine",
+ "boa_gc",
  "futures",
  "serde",
  "serde_json",
@@ -2743,13 +2744,13 @@ name = "terracedb-sandbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "boa_engine",
  "crc32fast",
  "futures",
  "serde",
  "serde_json",
  "terracedb",
  "terracedb-capabilities",
+ "terracedb-js",
  "terracedb-simulation",
  "terracedb-vfs",
  "thiserror 2.0.18",

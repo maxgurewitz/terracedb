@@ -26,7 +26,7 @@ The demo will:
 2. hoist the companion project from disk into `/workspace`
 3. install `lodash` and `zod`
 4. check and emit the TypeScript helper in `src/render.ts`
-5. execute `src/review.js`, which imports the injected `terrace:host/notes` capability
+5. execute `src/review.js`, which imports the injected async `terrace:host/notes` capability
 6. create `docs/review-notes.md` through the bash adapter
 7. open a read-only view for `/workspace/generated`
 8. export the resulting snapshot to a temp directory
@@ -39,7 +39,7 @@ The companion tree is intentionally small:
 - [`project-template/src/render.ts`](/Users/maxwellgurewitz/dev/terracedb/examples/sandbox-notes/project-template/src/render.ts) is the TypeScript file checked and emitted through the sandbox tooling APIs
 - [`project-template/inbox.json`](/Users/maxwellgurewitz/dev/terracedb/examples/sandbox-notes/project-template/inbox.json) is read through the sandbox filesystem shim
 
-`review.js` reads the host notes capability, validates the payload with `zod`, derives slugs with `lodash`, writes `generated/triage-summary.json`, and appends a host-side comment back to the note store.
+`review.js` awaits the sandbox FS helpers and host notes capability, validates the payload with `zod`, derives slugs with `lodash`, writes `generated/triage-summary.json`, and appends a host-side comment back to the note store.
 
 ## Boundaries
 

@@ -834,7 +834,7 @@ pub async fn guest_add_comment(
         .eval(format!(
             r#"
             import {{ addComment }} from "{specifier}";
-            export default addComment({{
+            export default await addComment({{
               noteId: "{note_id}",
               author: "{author}",
               body: "{body}",
@@ -1040,8 +1040,8 @@ fn notes_capability() -> SandboxCapability {
             [
                 "export type ExampleComment = { author: string; body: string };",
                 "export type ExampleNote = { id: string; title: string; status: string; comments: ExampleComment[] };",
-                "export function listNotes(): ExampleNote[];",
-                "export function addComment(input: { noteId: string; author: string; body: string }): ExampleNote;",
+                "export function listNotes(): Promise<ExampleNote[]>;",
+                "export function addComment(input: { noteId: string; author: string; body: string }): Promise<ExampleNote>;",
             ]
             .join("\n"),
         )

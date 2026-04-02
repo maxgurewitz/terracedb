@@ -9,16 +9,17 @@ use std::{
 
 use async_trait::async_trait;
 use boa_engine::{
-    Context, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction, Script, Source,
+    Context, Finalize, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction, Script,
+    Source, Trace,
     builtins::promise::PromiseState,
     context::{Clock as BoaClock, DefaultHooks, time::JsInstant},
     job::{GenericJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob},
     js_string,
     module::{ModuleLoader as BoaModuleLoader, Referrer, SyntheticModuleInitializer},
-    object::{FunctionObjectBuilder, ObjectInitializer},
+    object::builtins::JsPromise,
+    object::{FunctionObjectBuilder, JsData, ObjectInitializer},
     property::{Attribute, PropertyDescriptor},
 };
-use futures::{FutureExt, executor::block_on, pin_mut};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
@@ -40,32 +41,11 @@ use crate::{
 
 const HOST_CAPTURE_SEPARATOR: &str = "\u{001f}";
 
-thread_local! {
-    static ACTIVE_BOA_RUNTIME: RefCell<Option<Arc<ActiveBoaRuntime>>> = const { RefCell::new(None) };
-}
-
 pub trait BoaJsScheduler: Send + Sync {
     fn name(&self) -> &str;
     fn schedule(&self, task: JsScheduledTask);
     fn drain(&self) -> Vec<JsScheduledTask>;
     fn snapshot(&self) -> JsSchedulerSnapshot;
-}
-
-pub trait BoaJsHostServices: Send + Sync {
-    fn call(
-        &self,
-        request: JsHostServiceRequest,
-    ) -> Result<crate::JsHostServiceResponse, JsSubstrateError>;
-    fn calls(&self) -> Vec<JsHostServiceCallRecord>;
-}
-
-pub trait BoaJsModuleLoader: Send + Sync {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: Option<&str>,
-    ) -> Result<JsResolvedModule, JsSubstrateError>;
-    fn load(&self, resolved: &JsResolvedModule) -> Result<JsLoadedModule, JsSubstrateError>;
 }
 
 pub trait BoaJsExecutionHooks: Send + Sync {
@@ -119,97 +99,6 @@ impl JsScheduler for AsyncBoaSchedulerAdapter {
     }
 }
 
-struct AsyncBoaHostServicesAdapter {
-    inner: Arc<dyn BoaJsHostServices>,
-}
-
-impl AsyncBoaHostServicesAdapter {
-    fn new(inner: Arc<dyn BoaJsHostServices>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait(?Send)]
-impl JsHostServices for AsyncBoaHostServicesAdapter {
-    async fn call(
-        &self,
-        request: JsHostServiceRequest,
-    ) -> Result<crate::JsHostServiceResponse, JsSubstrateError> {
-        self.inner.call(request)
-    }
-
-    async fn calls(&self) -> Vec<JsHostServiceCallRecord> {
-        self.inner.calls()
-    }
-}
-
-#[derive(Clone)]
-pub struct ImmediateBoaModuleLoader {
-    inner: Arc<dyn JsModuleLoader>,
-}
-
-impl ImmediateBoaModuleLoader {
-    pub fn new(inner: Arc<dyn JsModuleLoader>) -> Self {
-        Self { inner }
-    }
-}
-
-impl BoaJsModuleLoader for ImmediateBoaModuleLoader {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: Option<&str>,
-    ) -> Result<JsResolvedModule, JsSubstrateError> {
-        immediate_loader_result(
-            self.inner.resolve(specifier, referrer),
-            specifier.to_string(),
-        )
-    }
-
-    fn load(&self, resolved: &JsResolvedModule) -> Result<JsLoadedModule, JsSubstrateError> {
-        immediate_loader_result(
-            self.inner.load(resolved),
-            resolved.canonical_specifier.clone(),
-        )
-    }
-}
-
-struct AsyncBoaModuleLoaderAdapter {
-    inner: Arc<dyn BoaJsModuleLoader>,
-}
-
-impl AsyncBoaModuleLoaderAdapter {
-    fn new(inner: Arc<dyn BoaJsModuleLoader>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait(?Send)]
-impl JsModuleLoader for AsyncBoaModuleLoaderAdapter {
-    async fn resolve(
-        &self,
-        specifier: &str,
-        referrer: Option<&str>,
-    ) -> Result<JsResolvedModule, JsSubstrateError> {
-        self.inner.resolve(specifier, referrer)
-    }
-
-    async fn load(&self, resolved: &JsResolvedModule) -> Result<JsLoadedModule, JsSubstrateError> {
-        self.inner.load(resolved)
-    }
-}
-
-fn immediate_loader_result<T>(
-    future: impl std::future::Future<Output = Result<T, JsSubstrateError>>,
-    entrypoint: String,
-) -> Result<T, JsSubstrateError> {
-    pin_mut!(future);
-    future.now_or_never().ok_or_else(|| JsSubstrateError::EvaluationFailed {
-        entrypoint,
-        message: "boa immediate module loader adapter requires loader futures to complete without yielding".to_string(),
-    })?
-}
-
 impl BoaJsScheduler for crate::DeterministicJsScheduler {
     fn name(&self) -> &str {
         <Self as JsScheduler>::name(self)
@@ -242,61 +131,6 @@ impl BoaJsScheduler for crate::DeterministicJsScheduler {
     }
 }
 
-impl BoaJsHostServices for crate::DeterministicJsHostServices {
-    fn call(
-        &self,
-        request: JsHostServiceRequest,
-    ) -> Result<crate::JsHostServiceResponse, JsSubstrateError> {
-        let key = (request.service.clone(), request.operation.clone());
-        let outcome = self
-            .outcomes
-            .lock()
-            .expect("boa host services outcomes mutex poisoned")
-            .get(&key)
-            .cloned()
-            .unwrap_or(crate::DeterministicJsServiceOutcome::Unavailable);
-        match outcome {
-            crate::DeterministicJsServiceOutcome::Response { result, metadata } => {
-                let response = crate::JsHostServiceResponse {
-                    result: Some(result),
-                    metadata,
-                };
-                self.calls
-                    .lock()
-                    .expect("boa host services calls mutex poisoned")
-                    .push(JsHostServiceCallRecord {
-                        service: request.service,
-                        operation: request.operation,
-                        arguments: request.arguments,
-                        result: response.result.clone(),
-                        metadata: response.metadata.clone(),
-                    });
-                Ok(response)
-            }
-            crate::DeterministicJsServiceOutcome::Denied { message } => {
-                Err(JsSubstrateError::HostServiceDenied {
-                    service: request.service,
-                    operation: request.operation,
-                    message,
-                })
-            }
-            crate::DeterministicJsServiceOutcome::Unavailable => {
-                Err(JsSubstrateError::HostServiceUnavailable {
-                    service: request.service,
-                    operation: request.operation,
-                })
-            }
-        }
-    }
-
-    fn calls(&self) -> Vec<JsHostServiceCallRecord> {
-        self.calls
-            .lock()
-            .expect("boa host services calls mutex poisoned")
-            .clone()
-    }
-}
-
 impl BoaJsExecutionHooks for NoopJsExecutionHooks {}
 
 #[derive(Clone)]
@@ -306,30 +140,34 @@ pub struct BoaJsRuntimeHost {
     scheduler_async: Arc<dyn JsScheduler>,
     clock: Arc<dyn JsClock>,
     entropy: Arc<dyn JsEntropySource>,
-    module_loader: Arc<dyn BoaJsModuleLoader>,
-    module_loader_async: Arc<dyn JsModuleLoader>,
-    host_services: Arc<dyn BoaJsHostServices>,
-    host_services_async: Arc<dyn JsHostServices>,
+    module_loader: Arc<dyn JsModuleLoader>,
+    host_services: Arc<dyn JsHostServices>,
     hooks: Arc<dyn BoaJsExecutionHooks>,
     fork_policy: JsForkPolicy,
 }
 
 impl BoaJsRuntimeHost {
     pub fn new(
-        module_loader: Arc<dyn BoaJsModuleLoader>,
-        host_services: Arc<dyn BoaJsHostServices>,
+        module_loader: Arc<dyn JsModuleLoader>,
+        host_services: Arc<dyn JsHostServices>,
     ) -> Self {
         let scheduler: Arc<dyn BoaJsScheduler> =
             Arc::new(crate::DeterministicJsScheduler::default());
+        Self::from_parts(scheduler, module_loader, host_services)
+    }
+
+    fn from_parts(
+        scheduler: Arc<dyn BoaJsScheduler>,
+        module_loader: Arc<dyn JsModuleLoader>,
+        host_services: Arc<dyn JsHostServices>,
+    ) -> Self {
         Self {
             name: Arc::from("boa-js"),
             scheduler_async: Arc::new(AsyncBoaSchedulerAdapter::new(scheduler.clone())),
             scheduler,
             clock: Arc::new(crate::FixedJsClock::default()),
             entropy: Arc::new(crate::DeterministicJsEntropySource::default()),
-            module_loader_async: Arc::new(AsyncBoaModuleLoaderAdapter::new(module_loader.clone())),
             module_loader,
-            host_services_async: Arc::new(AsyncBoaHostServicesAdapter::new(host_services.clone())),
             host_services,
             hooks: Arc::new(NoopJsExecutionHooks),
             fork_policy: JsForkPolicy::simulation_native_baseline(),
@@ -378,11 +216,11 @@ impl JsRuntimeHost for BoaJsRuntimeHost {
     }
 
     fn module_loader(&self) -> Arc<dyn JsModuleLoader> {
-        self.module_loader_async.clone()
+        self.module_loader.clone()
     }
 
     fn host_services(&self) -> Arc<dyn JsHostServices> {
-        self.host_services_async.clone()
+        self.host_services.clone()
     }
 
     async fn open_runtime(
@@ -415,8 +253,8 @@ struct BoaJsRuntime {
     scheduler: Arc<dyn BoaJsScheduler>,
     clock: Arc<dyn JsClock>,
     entropy: Arc<dyn JsEntropySource>,
-    module_loader: Arc<dyn BoaJsModuleLoader>,
-    host_services: Arc<dyn BoaJsHostServices>,
+    module_loader: Arc<dyn JsModuleLoader>,
+    host_services: Arc<dyn JsHostServices>,
     hooks: Arc<dyn BoaJsExecutionHooks>,
     execution_lock: AsyncMutex<()>,
 }
@@ -453,14 +291,14 @@ impl JsRuntime for BoaJsRuntime {
         let clock_now_millis = self.clock.now_millis();
         let entropy_sample = self.entropy.fill_bytes(8);
         let execution_state = Arc::new(SharedExecutionState::default());
-        let active_runtime = Arc::new(ActiveBoaRuntime {
+        let context_state = BoaContextRuntimeState {
             policy: self.handle.policy.clone(),
             entropy: self.entropy.clone(),
             host_services: self.host_services.clone(),
             hooks: self.hooks.clone(),
             scheduler: self.scheduler.clone(),
             state: execution_state.clone(),
-        });
+        };
         let module_loader = Rc::new(BoaModuleLoaderBridge::new(
             self.handle.runtime_id.clone(),
             self.handle.policy.clone(),
@@ -470,7 +308,6 @@ impl JsRuntime for BoaJsRuntime {
             execution_state.clone(),
             cancellation.clone(),
         ));
-        let prepared_request = self.prepare_request(request, module_loader.as_ref())?;
         let job_executor = Rc::new(BoaJobExecutor::new(self.scheduler.clone()));
         let mut context = Context::builder()
             .clock(Rc::new(BoaClockAdapter::new(self.clock.clone())))
@@ -479,11 +316,20 @@ impl JsRuntime for BoaJsRuntime {
             .module_loader(module_loader.clone())
             .build()
             .map_err(|error| execution_error("<runtime>", error))?;
+        context.insert_data(context_state);
         install_runtime_overrides(&mut context)?;
+        let prepared_request = self
+            .prepare_request(request, module_loader.as_ref())
+            .await?;
 
-        let (entrypoint, result) = with_active_boa_runtime(active_runtime, || {
-            self.execute_request(prepared_request, module_loader.as_ref(), &mut context)
-        })?;
+        let (entrypoint, result) = self
+            .execute_request(
+                prepared_request,
+                module_loader.as_ref(),
+                job_executor.clone(),
+                &mut context,
+            )
+            .await?;
         job_executor.flush_scheduled_tasks();
         let (module_graph, host_calls, trace) = execution_state.snapshot();
         let mut trace = trace;
@@ -517,16 +363,16 @@ impl JsRuntime for BoaJsRuntime {
 }
 
 impl BoaJsRuntime {
-    fn prepare_request(
+    async fn prepare_request(
         &self,
         request: JsExecutionRequest,
         loader: &BoaModuleLoaderBridge,
     ) -> Result<PreparedBoaExecution, JsSubstrateError> {
         match request.kind {
             JsExecutionKind::Module { specifier } => {
-                let resolved = loader.resolve_requested(&specifier, None)?;
+                let resolved = loader.resolve_requested(&specifier, None).await?;
                 let entrypoint = resolved.canonical_specifier.clone();
-                let loaded = loader.load_resolved(&resolved)?;
+                let loaded = loader.load_resolved(&resolved).await?;
                 Ok(PreparedBoaExecution::Module { entrypoint, loaded })
             }
             JsExecutionKind::Eval {
@@ -539,16 +385,18 @@ impl BoaJsRuntime {
         }
     }
 
-    fn execute_request(
+    async fn execute_request(
         &self,
         request: PreparedBoaExecution,
         loader: &BoaModuleLoaderBridge,
+        job_executor: Rc<BoaJobExecutor>,
         context: &mut Context,
     ) -> Result<(String, Option<JsonValue>), JsSubstrateError> {
         match request {
             PreparedBoaExecution::Module { entrypoint, loaded } => {
                 let module = loader.materialize_module(loaded, context)?;
-                let result = run_module_to_completion(&module, context, &entrypoint)?;
+                let result =
+                    run_module_to_completion(&module, job_executor, context, &entrypoint).await?;
                 Ok((entrypoint, result))
             }
             PreparedBoaExecution::Eval {
@@ -568,9 +416,7 @@ impl BoaJsRuntime {
                         let value = script
                             .evaluate(context)
                             .map_err(|error| execution_error(&entrypoint, error))?;
-                        context
-                            .run_jobs()
-                            .map_err(|error| execution_error(&entrypoint, error))?;
+                        drain_jobs(job_executor, context, &entrypoint).await?;
                         value
                             .to_json(context)
                             .map_err(|error| execution_error(&entrypoint, error))?
@@ -578,7 +424,8 @@ impl BoaJsRuntime {
                     Err(_) => {
                         let module =
                             loader.load_inline_module(entrypoint.clone(), source, context)?;
-                        run_module_to_completion(&module, context, &entrypoint)?
+                        run_module_to_completion(&module, job_executor, context, &entrypoint)
+                            .await?
                     }
                 };
                 Ok((entrypoint, result))
@@ -587,20 +434,28 @@ impl BoaJsRuntime {
     }
 }
 
-#[derive(Clone)]
-struct ActiveBoaRuntime {
+#[derive(Clone, Finalize)]
+struct BoaContextRuntimeState {
     policy: JsRuntimePolicy,
     entropy: Arc<dyn JsEntropySource>,
-    host_services: Arc<dyn BoaJsHostServices>,
+    host_services: Arc<dyn JsHostServices>,
     hooks: Arc<dyn BoaJsExecutionHooks>,
     scheduler: Arc<dyn BoaJsScheduler>,
     state: Arc<SharedExecutionState>,
 }
 
+impl JsData for BoaContextRuntimeState {}
+
+// SAFETY: runtime state only stores Rust-owned handles and does not contain GC-managed values.
+unsafe impl Trace for BoaContextRuntimeState {
+    boa_gc::empty_trace!();
+}
+
 #[derive(Default)]
 struct SharedExecutionState {
     module_graph: Mutex<Vec<String>>,
-    seen: Mutex<BTreeSet<String>>,
+    module_graph_seen: Mutex<BTreeSet<String>>,
+    loaded_seen: Mutex<BTreeSet<String>>,
     host_calls: Mutex<Vec<JsHostServiceCallRecord>>,
     trace: Mutex<Vec<JsTraceEvent>>,
 }
@@ -612,6 +467,17 @@ impl SharedExecutionState {
         canonical_specifier: &str,
         referrer: Option<&str>,
     ) {
+        if self
+            .module_graph_seen
+            .lock()
+            .expect("boa module graph seen mutex poisoned")
+            .insert(canonical_specifier.to_string())
+        {
+            self.module_graph
+                .lock()
+                .expect("boa module graph mutex poisoned")
+                .push(canonical_specifier.to_string());
+        }
         self.trace
             .lock()
             .expect("boa trace mutex poisoned")
@@ -636,17 +502,13 @@ impl SharedExecutionState {
     fn record_module_loaded(&self, module: &JsLoadedModule) {
         let canonical = module.resolved.canonical_specifier.clone();
         if !self
-            .seen
+            .loaded_seen
             .lock()
-            .expect("boa seen mutex poisoned")
+            .expect("boa loaded-seen mutex poisoned")
             .insert(canonical.clone())
         {
             return;
         }
-        self.module_graph
-            .lock()
-            .expect("boa module graph mutex poisoned")
-            .push(canonical.clone());
         self.trace
             .lock()
             .expect("boa trace mutex poisoned")
@@ -690,7 +552,7 @@ impl SharedExecutionState {
 struct BoaModuleLoaderBridge {
     runtime_id: String,
     policy: JsRuntimePolicy,
-    module_loader: Arc<dyn BoaJsModuleLoader>,
+    module_loader: Arc<dyn JsModuleLoader>,
     scheduler: Arc<dyn BoaJsScheduler>,
     hooks: Arc<dyn BoaJsExecutionHooks>,
     state: Arc<SharedExecutionState>,
@@ -702,7 +564,7 @@ impl BoaModuleLoaderBridge {
     fn new(
         runtime_id: String,
         policy: JsRuntimePolicy,
-        module_loader: Arc<dyn BoaJsModuleLoader>,
+        module_loader: Arc<dyn JsModuleLoader>,
         scheduler: Arc<dyn BoaJsScheduler>,
         hooks: Arc<dyn BoaJsExecutionHooks>,
         state: Arc<SharedExecutionState>,
@@ -739,7 +601,7 @@ impl BoaModuleLoaderBridge {
         self.materialize_module(loaded, context)
     }
 
-    fn resolve_requested(
+    async fn resolve_requested(
         &self,
         specifier: &str,
         referrer: Option<&str>,
@@ -749,14 +611,14 @@ impl BoaModuleLoaderBridge {
                 runtime_id: self.runtime_id.clone(),
             });
         }
-        let resolved = self.module_loader.resolve(specifier, referrer)?;
+        let resolved = self.module_loader.resolve(specifier, referrer).await?;
         self.state
             .record_resolve(specifier, &resolved.canonical_specifier, referrer);
         ensure_module_kind_allowed(&BTreeMap::new(), &self.policy, &resolved)?;
         Ok(resolved)
     }
 
-    fn load_resolved(
+    async fn load_resolved(
         &self,
         resolved: &JsResolvedModule,
     ) -> Result<JsLoadedModule, JsSubstrateError> {
@@ -765,7 +627,7 @@ impl BoaModuleLoaderBridge {
                 runtime_id: self.runtime_id.clone(),
             });
         }
-        self.module_loader.load(resolved)
+        self.module_loader.load(resolved).await
     }
 
     fn materialize_module(
@@ -825,38 +687,14 @@ impl BoaModuleLoader for BoaModuleLoaderBridge {
         }
         let resolved = self
             .resolve_requested(&requested, referrer.as_deref())
+            .await
             .map_err(js_error)?;
-        let loaded = self.load_resolved(&resolved).map_err(js_error)?;
-        let canonical = loaded.resolved.canonical_specifier.clone();
-        if let Some(module) = self.modules.borrow().get(&canonical).cloned() {
-            return Ok(module);
-        }
-        if matches!(loaded.resolved.kind, JsModuleKind::HostCapability) {
-            ensure_visible_host_surface(&self.policy, &loaded).map_err(js_error)?;
-        }
-        self.scheduler.schedule(JsScheduledTask {
-            queue: JsTaskQueue::ModuleLoader,
-            label: canonical.clone(),
-            deadline_millis: None,
-        });
-        self.hooks.on_module_loaded(&loaded).map_err(js_error)?;
-        self.state.record_module_loaded(&loaded);
-
+        let loaded = self.load_resolved(&resolved).await.map_err(js_error)?;
         let module = {
             let mut context = context.borrow_mut();
-            match loaded.resolved.kind {
-                JsModuleKind::HostCapability => synthetic_host_module(&loaded, &mut context)?,
-                JsModuleKind::Workspace | JsModuleKind::Package => {
-                    let path = PathBuf::from(loaded.resolved.canonical_specifier.clone());
-                    Module::parse(
-                        Source::from_bytes(loaded.source.as_bytes()).with_path(&path),
-                        None,
-                        &mut context,
-                    )?
-                }
-            }
+            self.materialize_module(loaded, &mut context)
+                .map_err(js_error)?
         };
-        self.modules.borrow_mut().insert(canonical, module.clone());
         Ok(module)
     }
 }
@@ -922,6 +760,54 @@ impl BoaJobExecutor {
             self.scheduler.schedule(task);
         }
     }
+
+    fn has_ready_timeout_jobs(&self, context: &RefCell<&mut Context>) -> bool {
+        let now = context.borrow().clock().now();
+        self.timeout_jobs
+            .borrow()
+            .iter()
+            .any(|(instant, _)| &now >= instant)
+    }
+
+    fn run_ready_timeout_jobs(&self, context: &RefCell<&mut Context>) -> JsResult<()> {
+        let now = context.borrow().clock().now();
+        let ready_instants = self
+            .timeout_jobs
+            .borrow()
+            .range(..=now)
+            .map(|(instant, _)| *instant)
+            .collect::<Vec<_>>();
+        let mut ready_jobs = Vec::new();
+        {
+            let mut timeouts = self.timeout_jobs.borrow_mut();
+            for instant in ready_instants {
+                if let Some(mut jobs) = timeouts.remove(&instant) {
+                    jobs.retain(|job| !job.is_cancelled());
+                    ready_jobs.extend(jobs);
+                }
+            }
+        }
+        for job in ready_jobs {
+            job.call(&mut context.borrow_mut())?;
+        }
+        Ok(())
+    }
+
+    fn run_promise_jobs(&self, context: &RefCell<&mut Context>) -> JsResult<()> {
+        let promise_jobs = mem::take(&mut *self.promise_jobs.borrow_mut());
+        for job in promise_jobs {
+            job.call(&mut context.borrow_mut())?;
+        }
+        Ok(())
+    }
+
+    fn run_generic_jobs(&self, context: &RefCell<&mut Context>) -> JsResult<()> {
+        let generic_jobs = mem::take(&mut *self.generic_jobs.borrow_mut());
+        for job in generic_jobs {
+            job.call(&mut context.borrow_mut())?;
+        }
+        Ok(())
+    }
 }
 
 impl JobExecutor for BoaJobExecutor {
@@ -982,72 +868,32 @@ impl JobExecutor for BoaJobExecutor {
     }
 
     fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()> {
-        let context = RefCell::new(context);
+        futures::executor::block_on(self.run_jobs_async(&RefCell::new(context)))
+    }
+
+    async fn run_jobs_async(self: Rc<Self>, context: &RefCell<&mut Context>) -> JsResult<()>
+    where
+        Self: Sized,
+    {
         loop {
-            let no_timeout_jobs_to_run = {
-                let now = context.borrow().clock().now();
-                !self
-                    .timeout_jobs
-                    .borrow()
-                    .iter()
-                    .any(|(instant, _)| &now >= instant)
-            };
             if self.promise_jobs.borrow().is_empty()
                 && self.async_jobs.borrow().is_empty()
                 && self.generic_jobs.borrow().is_empty()
-                && no_timeout_jobs_to_run
+                && !self.has_ready_timeout_jobs(context)
             {
                 break;
             }
 
-            let async_jobs = mem::take(&mut *self.async_jobs.borrow_mut());
-            for job in async_jobs {
-                if let Err(error) = block_on(job.call(&context)) {
-                    self.clear();
-                    return Err(error);
-                }
-            }
+            self.run_ready_timeout_jobs(context)?;
+            self.run_promise_jobs(context)?;
+            self.run_generic_jobs(context)?;
 
+            let next_async_job = { self.async_jobs.borrow_mut().pop_front() };
+            if let Some(job) = next_async_job
+                && let Err(error) = job.call(context).await
             {
-                let now = context.borrow().clock().now();
-                let ready_instants = self
-                    .timeout_jobs
-                    .borrow()
-                    .range(..=now)
-                    .map(|(instant, _)| *instant)
-                    .collect::<Vec<_>>();
-                let mut ready_jobs = Vec::new();
-                {
-                    let mut timeouts = self.timeout_jobs.borrow_mut();
-                    for instant in ready_instants {
-                        if let Some(mut jobs) = timeouts.remove(&instant) {
-                            jobs.retain(|job| !job.is_cancelled());
-                            ready_jobs.extend(jobs);
-                        }
-                    }
-                }
-                for job in ready_jobs {
-                    if let Err(error) = job.call(&mut context.borrow_mut()) {
-                        self.clear();
-                        return Err(error);
-                    }
-                }
-            }
-
-            let promise_jobs = mem::take(&mut *self.promise_jobs.borrow_mut());
-            for job in promise_jobs {
-                if let Err(error) = job.call(&mut context.borrow_mut()) {
-                    self.clear();
-                    return Err(error);
-                }
-            }
-
-            let generic_jobs = mem::take(&mut *self.generic_jobs.borrow_mut());
-            for job in generic_jobs {
-                if let Err(error) = job.call(&mut context.borrow_mut()) {
-                    self.clear();
-                    return Err(error);
-                }
+                self.clear();
+                return Err(error);
             }
 
             context.borrow_mut().clear_kept_objects();
@@ -1172,84 +1018,74 @@ fn host_capability_dispatch(
         .split_once(HOST_CAPTURE_SEPARATOR)
         .ok_or_else(|| js_error_message("host capability capture is invalid"))?;
     let arguments = js_args_to_json(args, context)?;
-    with_active_runtime(|active| {
-        if !active.policy.allows_host_service(service, operation) {
-            return Err(js_error(JsSubstrateError::HostServiceDenied {
-                service: service.to_string(),
-                operation: operation.to_string(),
-                message: "host service is not visible in this runtime policy".to_string(),
-            }));
-        }
-
-        let request = JsHostServiceRequest {
+    let runtime = context_runtime(context)?;
+    if !runtime.policy.allows_host_service(service, operation) {
+        return Err(js_error(JsSubstrateError::HostServiceDenied {
             service: service.to_string(),
             operation: operation.to_string(),
-            arguments,
-            metadata: BTreeMap::new(),
-        };
-        active.scheduler.schedule(JsScheduledTask {
-            queue: JsTaskQueue::HostCallbacks,
-            label: format!("{service}::{operation}"),
-            deadline_millis: None,
-        });
-        let response = active
-            .host_services
-            .call(request.clone())
-            .map_err(js_error)?;
-        let record = JsHostServiceCallRecord {
-            service: request.service.clone(),
-            operation: request.operation.clone(),
-            arguments: request.arguments.clone(),
-            result: response.result.clone(),
-            metadata: response.metadata.clone(),
-        };
-        active
-            .hooks
-            .on_host_service_call(&request, &record)
-            .map_err(js_error)?;
-        active.state.record_host_call(record);
+            message: "host service is not visible in this runtime policy".to_string(),
+        }));
+    }
+    let request = JsHostServiceRequest {
+        service: service.to_string(),
+        operation: operation.to_string(),
+        arguments,
+        metadata: BTreeMap::new(),
+    };
+    runtime.scheduler.schedule(JsScheduledTask {
+        queue: JsTaskQueue::HostCallbacks,
+        label: format!("{service}::{operation}"),
+        deadline_millis: None,
+    });
+    let host_services = runtime.host_services.clone();
+    let hooks = runtime.hooks.clone();
+    let state = runtime.state.clone();
+    let promise = JsPromise::from_async_fn(
+        async move |context: &RefCell<&mut Context>| {
+            let response = host_services
+                .call(request.clone())
+                .await
+                .map_err(js_error)?;
+            let record = JsHostServiceCallRecord {
+                service: request.service.clone(),
+                operation: request.operation.clone(),
+                arguments: request.arguments.clone(),
+                result: response.result.clone(),
+                metadata: response.metadata.clone(),
+            };
+            hooks
+                .on_host_service_call(&request, &record)
+                .map_err(js_error)?;
+            state.record_host_call(record);
 
-        match response.result {
-            Some(result) => JsValue::from_json(&result, context),
-            None => Ok(JsValue::undefined()),
-        }
-    })
+            let context = &mut context.borrow_mut();
+            match response.result {
+                Some(result) => JsValue::from_json(&result, context),
+                None => Ok(JsValue::undefined()),
+            }
+        },
+        context,
+    );
+    Ok(promise.into())
 }
 
 fn math_random_dispatch(
     _this: &JsValue,
     _args: &[JsValue],
-    _context: &mut Context,
+    context: &mut Context,
 ) -> JsResult<JsValue> {
-    with_active_runtime(|active| {
-        let bytes = active.entropy.fill_bytes(8);
-        let mut sample = [0_u8; 8];
-        sample.copy_from_slice(&bytes[..8]);
-        let mantissa = u64::from_le_bytes(sample) >> 11;
-        Ok(JsValue::from(mantissa as f64 / ((1_u64 << 53) as f64)))
-    })
+    let runtime = context_runtime(context)?;
+    let bytes = runtime.entropy.fill_bytes(8);
+    let mut sample = [0_u8; 8];
+    sample.copy_from_slice(&bytes[..8]);
+    let mantissa = u64::from_le_bytes(sample) >> 11;
+    Ok(JsValue::from(mantissa as f64 / ((1_u64 << 53) as f64)))
 }
 
-fn with_active_boa_runtime<T>(
-    active: Arc<ActiveBoaRuntime>,
-    f: impl FnOnce() -> Result<T, JsSubstrateError>,
-) -> Result<T, JsSubstrateError> {
-    ACTIVE_BOA_RUNTIME.with(|slot| {
-        let previous = slot.replace(Some(active));
-        let result = f();
-        slot.replace(previous);
-        result
-    })
-}
-
-fn with_active_runtime<T>(f: impl FnOnce(&ActiveBoaRuntime) -> JsResult<T>) -> JsResult<T> {
-    ACTIVE_BOA_RUNTIME.with(|slot| {
-        let active = slot.borrow();
-        let runtime = active
-            .as_ref()
-            .ok_or_else(|| js_error_message("boa runtime host is not active"))?;
-        f(runtime)
-    })
+fn context_runtime(context: &Context) -> JsResult<&BoaContextRuntimeState> {
+    context
+        .get_data::<BoaContextRuntimeState>()
+        .ok_or_else(|| js_error_message("boa runtime host is not active"))
 }
 
 fn ensure_visible_host_surface(
@@ -1311,15 +1147,14 @@ fn host_module_surface(module: &JsLoadedModule) -> HostModuleSurface {
     HostModuleSurface { service, exports }
 }
 
-fn run_module_to_completion(
+async fn run_module_to_completion(
     module: &Module,
+    job_executor: Rc<BoaJobExecutor>,
     context: &mut Context,
     entrypoint: &str,
 ) -> Result<Option<JsonValue>, JsSubstrateError> {
     let promise = module.load_link_evaluate(context);
-    context
-        .run_jobs()
-        .map_err(|error| execution_error(entrypoint, error))?;
+    drain_jobs(job_executor, context, entrypoint).await?;
     match promise.state() {
         PromiseState::Pending => Err(JsSubstrateError::EvaluationFailed {
             entrypoint: entrypoint.to_string(),
@@ -1331,6 +1166,18 @@ fn run_module_to_completion(
             message: format!("{}", reason.display()),
         }),
     }
+}
+
+async fn drain_jobs(
+    job_executor: Rc<BoaJobExecutor>,
+    context: &mut Context,
+    entrypoint: &str,
+) -> Result<(), JsSubstrateError> {
+    let context = RefCell::new(context);
+    job_executor
+        .run_jobs_async(&context)
+        .await
+        .map_err(|error| execution_error(entrypoint, error))
 }
 
 fn export_default_value(
@@ -1387,29 +1234,28 @@ fn js_error_message(message: impl Into<String>) -> boa_engine::JsError {
 mod tests {
     use std::{cell::Cell, collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
 
+    use async_trait::async_trait;
     use boa_engine::{
         Context, JsValue,
         job::{Job, JobExecutor, TimeoutJob},
     };
     use serde_json::json;
 
-    use super::{
-        BoaClockAdapter, BoaJobExecutor, BoaJsHostServices, BoaJsModuleLoader, BoaJsRuntimeHost,
-        BoaJsScheduler,
-    };
+    use super::{BoaClockAdapter, BoaJobExecutor, BoaJsRuntimeHost, BoaJsScheduler};
     use crate::{
         DeterministicJsClock, DeterministicJsEntropySource, DeterministicJsHostServices,
         DeterministicJsScheduler, DeterministicJsServiceOutcome, FixedJsClock, JsExecutionRequest,
         JsForkPolicy, JsHostServiceRequest, JsHostServices, JsLoadedModule, JsModuleKind,
-        JsResolvedModule, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
+        JsModuleLoader, JsResolvedModule, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
         JsRuntimeProvenance, JsScheduledTask, JsScheduler, JsSubstrateError, JsTaskQueue,
         NeverCancel,
     };
 
     struct EmptyLoader;
 
-    impl BoaJsModuleLoader for EmptyLoader {
-        fn resolve(
+    #[async_trait(?Send)]
+    impl JsModuleLoader for EmptyLoader {
+        async fn resolve(
             &self,
             specifier: &str,
             _referrer: Option<&str>,
@@ -1419,7 +1265,10 @@ mod tests {
             })
         }
 
-        fn load(&self, resolved: &JsResolvedModule) -> Result<JsLoadedModule, JsSubstrateError> {
+        async fn load(
+            &self,
+            resolved: &JsResolvedModule,
+        ) -> Result<JsLoadedModule, JsSubstrateError> {
             Err(JsSubstrateError::ModuleNotFound {
                 specifier: resolved.canonical_specifier.clone(),
             })
@@ -1428,8 +1277,9 @@ mod tests {
 
     struct ImportingLoader;
 
-    impl BoaJsModuleLoader for ImportingLoader {
-        fn resolve(
+    #[async_trait(?Send)]
+    impl JsModuleLoader for ImportingLoader {
+        async fn resolve(
             &self,
             specifier: &str,
             referrer: Option<&str>,
@@ -1450,7 +1300,10 @@ mod tests {
             })
         }
 
-        fn load(&self, resolved: &JsResolvedModule) -> Result<JsLoadedModule, JsSubstrateError> {
+        async fn load(
+            &self,
+            resolved: &JsResolvedModule,
+        ) -> Result<JsLoadedModule, JsSubstrateError> {
             let source = match resolved.canonical_specifier.as_str() {
                 "terrace:/importing-root.mjs" => {
                     "import helper from './helper.mjs'; export default helper;"
@@ -1718,8 +1571,7 @@ state;
                 },
             )
             .await;
-        let host_guard = host_services.gate.lock().await;
-        let response = BoaJsHostServices::call(
+        let response = JsHostServices::call(
             &host_services,
             JsHostServiceRequest {
                 service: "capability".to_string(),
@@ -1728,8 +1580,8 @@ state;
                 metadata: BTreeMap::new(),
             },
         )
+        .await
         .expect("call host service");
-        drop(host_guard);
         assert_eq!(response.result, Some(json!({"ok": true})));
         assert_eq!(JsHostServices::calls(&host_services).await.len(), 1);
     }

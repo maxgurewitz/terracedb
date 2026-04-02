@@ -376,10 +376,10 @@ impl DeterministicJsRuntime {
                 });
                 state.host_calls.push(record);
             }
-            if canonical == entrypoint {
-                if let Some(result) = directives.export_default {
-                    state.result = Some(result);
-                }
+            if canonical == entrypoint
+                && let Some(result) = directives.export_default
+            {
+                state.result = Some(result);
             }
         }
         Ok(())

@@ -225,8 +225,8 @@ async fn compatibility_modes_and_supported_surface_fail_predictably() {
         import { writeTextFile } from "@terracedb/sandbox/fs";
         import { read } from "node-reader";
 
-        writeTextFile("/workspace/data.txt", "node builtins ok");
-        export default read("/workspace/data.txt");
+        await writeTextFile("/workspace/data.txt", "node builtins ok");
+        export default await read("/workspace/data.txt");
         "#,
     )
     .await;

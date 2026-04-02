@@ -82,10 +82,10 @@ async fn seed_cross_cutting_base(
         import { readTextFile, writeTextFile } from "@terracedb/sandbox/fs";
         import { echo } from "terrace:host/tickets";
 
-        const message = readTextFile("/workspace/message.txt");
+        const message = await readTextFile("/workspace/message.txt");
         const rendered = `${message}:${message.length}`;
-        writeTextFile("/workspace/runtime.txt", rendered);
-        export default echo({ value: rendered });
+        await writeTextFile("/workspace/runtime.txt", rendered);
+        export default await echo({ value: rendered });
         "#
         .to_vec(),
         CreateOptions {
