@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub(crate) const SHARDING_METADATA_KEY: &str = "terracedb.sharding";
+pub(crate) const RESHARDING_METADATA_KEY: &str = "terracedb.resharding";
 
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -573,6 +574,30 @@ impl VirtualPartitionCoverage {
             )],
         }
     }
+
+    pub fn partitions(&self) -> Vec<VirtualPartitionId> {
+        let mut partitions = Vec::new();
+        for range in &self.ranges {
+            for partition in range.start.get()..=range.end_inclusive.get() {
+                partitions.push(VirtualPartitionId::new(partition));
+            }
+        }
+        partitions
+    }
+
+    pub fn partition_set(&self) -> BTreeSet<VirtualPartitionId> {
+        self.partitions().into_iter().collect()
+    }
+
+    pub fn routed_shards(
+        &self,
+        config: &ShardingConfig,
+    ) -> Result<BTreeSet<PhysicalShardId>, ShardingError> {
+        self.partitions()
+            .into_iter()
+            .map(|partition| config.physical_shard_for_partition(partition))
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +658,10 @@ impl ShardSstableOwnership {
             virtual_partitions,
         }
     }
+
+    pub fn compatible_relocation(&self, other: &Self) -> bool {
+        self.table_id == other.table_id && self.virtual_partitions == other.virtual_partitions
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,7 +718,7 @@ pub struct ShardExecutionPlacement {
     pub control_plane: ExecutionDomainPath,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReshardPartitionMove {
     pub virtual_partition: VirtualPartitionId,
     pub from_physical_shard: PhysicalShardId,
@@ -746,6 +775,157 @@ impl ReshardPlanSkeleton {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReshardPlanPhase {
+    Planned,
+    Copying,
+    ManifestInstalled,
+    RevisionPublished,
+    Completed,
+    Aborted,
+}
+
+impl ReshardPlanPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Aborted)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableReshardingState {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub source_revision: ShardMapRevision,
+    pub target_revision: ShardMapRevision,
+    pub phase: ReshardPlanPhase,
+    pub moves: Vec<ReshardPartitionMove>,
+    pub source_physical_shards: BTreeSet<PhysicalShardId>,
+    pub target_physical_shards: BTreeSet<PhysicalShardId>,
+    pub paused_partitions: BTreeSet<VirtualPartitionId>,
+    pub artifacts_total: usize,
+    pub artifacts_moved: usize,
+    pub bytes_total: u64,
+    pub bytes_moved: u64,
+    pub published_revision: Option<ShardMapRevision>,
+    pub failure: Option<String>,
+}
+
+impl TableReshardingState {
+    pub fn new(plan: &ReshardPlanSkeleton) -> Self {
+        Self {
+            table_id: plan.table_id,
+            table_name: plan.table_name.clone(),
+            source_revision: plan.source_revision,
+            target_revision: plan.target_revision,
+            phase: ReshardPlanPhase::Planned,
+            moves: plan.moves.clone(),
+            source_physical_shards: plan
+                .moves
+                .iter()
+                .map(|entry| entry.from_physical_shard)
+                .collect(),
+            target_physical_shards: plan
+                .moves
+                .iter()
+                .map(|entry| entry.to_physical_shard)
+                .collect(),
+            paused_partitions: BTreeSet::new(),
+            artifacts_total: 0,
+            artifacts_moved: 0,
+            bytes_total: 0,
+            bytes_moved: 0,
+            published_revision: None,
+            failure: None,
+        }
+    }
+
+    pub fn moved_partitions(&self) -> BTreeSet<VirtualPartitionId> {
+        self.moves
+            .iter()
+            .map(|entry| entry.virtual_partition)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PersistedReshardArtifactSource {
+    LocalFile { path: String },
+    RemoteObject { key: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PersistedReshardArtifactCleanup {
+    pub(crate) source: PersistedReshardArtifactSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sidecars: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PersistedTableReshardingPlan {
+    pub(crate) state: TableReshardingState,
+    pub(crate) source_sharding: ShardingConfig,
+    pub(crate) target_sharding: ShardingConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pending_cleanup: Vec<PersistedReshardArtifactCleanup>,
+}
+
+impl PersistedTableReshardingPlan {
+    pub(crate) fn new(
+        plan: ReshardPlanSkeleton,
+        source_sharding: ShardingConfig,
+        target_sharding: ShardingConfig,
+    ) -> Self {
+        Self {
+            state: TableReshardingState::new(&plan),
+            source_sharding,
+            target_sharding,
+            pending_cleanup: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ReshardPlanError {
+    #[error("table does not exist: {table_name}")]
+    MissingTable { table_name: String },
+    #[error("cannot build a reshard plan for table {table_name}: {error}")]
+    InvalidShardMap {
+        table_name: String,
+        #[source]
+        error: ShardingError,
+    },
+    #[error(
+        "table {table_name} already has a reshard plan from revision {source_revision} to {target_revision} in phase {phase:?}"
+    )]
+    PlanAlreadyExists {
+        table_name: String,
+        source_revision: ShardMapRevision,
+        target_revision: ShardMapRevision,
+        phase: ReshardPlanPhase,
+    },
+    #[error("table {table_name} does not have a reshard plan")]
+    MissingPlan { table_name: String },
+    #[error(
+        "table {table_name} cannot abort its reshard plan after phase {phase:?}; resume it to completion instead"
+    )]
+    AbortRequiresResume {
+        table_name: String,
+        phase: ReshardPlanPhase,
+    },
+    #[error(
+        "cannot move SSTable {local_id} for table {table_name} without rewriting bytes; coverage {coverage:?} spans incompatible target shards"
+    )]
+    ArtifactRewriteRequired {
+        table_name: String,
+        local_id: String,
+        coverage: VirtualPartitionCoverage,
+    },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ShardingError {
     #[error("table metadata key {key} is reserved for terracedb sharding")]
@@ -795,12 +975,18 @@ pub(crate) fn validate_user_table_metadata(metadata: &TableMetadata) -> Result<(
             key: SHARDING_METADATA_KEY.to_string(),
         });
     }
+    if metadata.contains_key(RESHARDING_METADATA_KEY) {
+        return Err(ShardingError::ReservedMetadataKey {
+            key: RESHARDING_METADATA_KEY.to_string(),
+        });
+    }
     Ok(())
 }
 
 pub(crate) fn encode_persisted_table_metadata(
     metadata: &TableMetadata,
     sharding: &ShardingConfig,
+    resharding: Option<&PersistedTableReshardingPlan>,
 ) -> Result<TableMetadata, StorageError> {
     validate_user_table_metadata(metadata)
         .map_err(|error| StorageError::unsupported(error.to_string()))?;
@@ -817,14 +1003,38 @@ pub(crate) fn encode_persisted_table_metadata(
         })?;
         persisted.insert(SHARDING_METADATA_KEY.to_string(), encoded);
     }
+    if let Some(resharding) = resharding {
+        let encoded = serde_json::to_value(resharding).map_err(|error| {
+            StorageError::unsupported(format!("encode terracedb reshard metadata failed: {error}"))
+        })?;
+        persisted.insert(RESHARDING_METADATA_KEY.to_string(), encoded);
+    }
     Ok(persisted)
 }
 
 pub(crate) fn decode_persisted_table_metadata(
     mut metadata: TableMetadata,
-) -> Result<(TableMetadata, ShardingConfig), StorageError> {
+) -> Result<
+    (
+        TableMetadata,
+        ShardingConfig,
+        Option<PersistedTableReshardingPlan>,
+    ),
+    StorageError,
+> {
+    let resharding = match metadata.remove(RESHARDING_METADATA_KEY) {
+        Some(encoded) => Some(serde_json::from_value(encoded).map_err(|error| {
+            StorageError::corruption(format!(
+                "{}",
+                ShardingError::InvalidPersistedMetadata {
+                    message: format!("decode terracedb reshard metadata failed: {error}"),
+                }
+            ))
+        })?),
+        None => None,
+    };
     let Some(encoded) = metadata.remove(SHARDING_METADATA_KEY) else {
-        return Ok((metadata, ShardingConfig::default()));
+        return Ok((metadata, ShardingConfig::default(), resharding));
     };
 
     let sharding: ShardingConfig = serde_json::from_value(encoded).map_err(|error| {
@@ -843,5 +1053,5 @@ pub(crate) fn decode_persisted_table_metadata(
             }
         ))
     })?;
-    Ok((metadata, sharding))
+    Ok((metadata, sharding, resharding))
 }

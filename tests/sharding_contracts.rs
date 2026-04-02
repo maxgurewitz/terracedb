@@ -2,13 +2,14 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use terracedb::{
     AdmissionDiagnostics, AdmissionPressureLevel, BatchShardLocalityError,
-    ColocatedDatabasePlacement, CommitId, CommitOptions, Db, DurabilityClass, ExecutionDomainOwner,
-    ExecutionDomainPath, ExecutionLane, LogCursor, ObjectKeyLayout, PendingWork, PhysicalShardId,
-    PublishShardMapError, ReshardPlanSkeleton, S3Location, ScheduleDecision, Scheduler,
-    SequenceNumber, ShardChangeCursor, ShardCommitLaneId, ShardHashAlgorithm, ShardMapRevision,
-    ShardMemtableOwner, ShardOpenRequest, ShardReadyPlacementLayout, ShardSstableOwnership,
-    ShardingConfig, ShardingError, TableConfig, TableId, TableStats, Value,
-    VirtualPartitionCoverage, VirtualPartitionId, WriteBatchShardingError,
+    ColocatedDatabasePlacement, CommitError, CommitId, CommitOptions, Db, DurabilityClass,
+    ExecutionDomainOwner, ExecutionDomainPath, ExecutionLane, FailpointMode, FileSystem, LogCursor,
+    ObjectKeyLayout, OpenOptions, PendingWork, PhysicalShardId, PublishShardMapError,
+    ReshardPlanError, ReshardPlanPhase, ReshardPlanSkeleton, S3Location, ScheduleDecision,
+    Scheduler, SequenceNumber, ShardChangeCursor, ShardCommitLaneId, ShardHashAlgorithm,
+    ShardMapRevision, ShardMemtableOwner, ShardOpenRequest, ShardReadyPlacementLayout,
+    ShardSstableOwnership, ShardingConfig, ShardingError, StorageErrorKind, TableConfig, TableId,
+    TableStats, Value, VirtualPartitionCoverage, VirtualPartitionId, WriteBatchShardingError,
 };
 use terracedb_simulation::SeededSimulationRunner;
 
@@ -64,6 +65,21 @@ fn sharded_row_table_config(name: &str) -> TableConfig {
     config
 }
 
+fn moved_partition_one_sharding() -> ShardingConfig {
+    ShardingConfig::hash(
+        4,
+        ShardHashAlgorithm::Crc32,
+        ShardMapRevision::new(8),
+        vec![
+            PhysicalShardId::new(0),
+            PhysicalShardId::new(1),
+            PhysicalShardId::new(1),
+            PhysicalShardId::new(1),
+        ],
+    )
+    .expect("valid target sharding")
+}
+
 fn find_key_for_shard(config: &ShardingConfig, target: PhysicalShardId, prefix: &str) -> Vec<u8> {
     for index in 0..10_000_u32 {
         let candidate = format!("{prefix}-{index}").into_bytes();
@@ -101,6 +117,45 @@ async fn open_test_db(
     )
     .await
     .expect("open test db")
+}
+
+async fn read_all_file(file_system: &StubFileSystem, path: &str) -> Vec<u8> {
+    let handle = file_system
+        .open(
+            path,
+            OpenOptions {
+                create: false,
+                read: true,
+                write: false,
+                truncate: false,
+                append: false,
+            },
+        )
+        .await
+        .expect("open file for read");
+    let mut offset = 0_u64;
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = file_system
+            .read_at(&handle, offset, 8 * 1024)
+            .await
+            .expect("read file chunk");
+        if chunk.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(chunk.len() as u64);
+        bytes.extend(chunk);
+    }
+    bytes
+}
+
+fn sstable_dir_in_shard(root: &str, table_id: TableId, shard: PhysicalShardId) -> String {
+    let shard_dir = if shard == PhysicalShardId::UNSHARDED {
+        "0000".to_string()
+    } else {
+        shard.to_string()
+    };
+    format!("{root}/sst/table-{:06}/{shard_dir}", table_id.get())
 }
 
 #[tokio::test]
@@ -675,6 +730,459 @@ async fn shard_map_publication_requires_cutover_once_table_contains_data() {
     );
 }
 
+#[tokio::test]
+async fn reshard_plan_moves_live_artifacts_without_rewriting_row_bytes() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let path = "/sharding-contracts-reshard-success";
+    let db = open_test_db(path, file_system.clone(), object_store.clone()).await;
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let table_id = table.id().expect("table id");
+    let key = find_key_for_partition(
+        &table.sharding_state().expect("initial state").config,
+        VirtualPartitionId::new(1),
+        "move-me",
+    );
+    let source_route = table.route_key(&key).expect("source route");
+
+    table
+        .write(key.clone(), Value::bytes("before"))
+        .await
+        .expect("write row before reshard");
+    db.flush().await.expect("flush source artifact");
+
+    let source_dir = sstable_dir_in_shard(path, table_id, source_route.physical_shard);
+    let source_paths = file_system
+        .list(&source_dir)
+        .await
+        .expect("list source shard files");
+    assert_eq!(source_paths.len(), 1);
+    let source_bytes = read_all_file(file_system.as_ref(), &source_paths[0]).await;
+
+    let completed = table
+        .reshard_to(moved_partition_one_sharding())
+        .await
+        .expect("run reshard plan");
+    assert_eq!(completed.phase, ReshardPlanPhase::Completed);
+    assert_eq!(completed.published_revision, Some(ShardMapRevision::new(8)));
+    assert_eq!(completed.artifacts_total, 1);
+    assert_eq!(completed.artifacts_moved, 1);
+
+    let moved_route = table.route_key(&key).expect("moved route");
+    assert_eq!(
+        moved_route.virtual_partition,
+        source_route.virtual_partition
+    );
+    assert_eq!(moved_route.physical_shard, PhysicalShardId::new(1));
+    assert_eq!(moved_route.shard_map_revision, ShardMapRevision::new(8));
+    assert_eq!(
+        table.read(key.clone()).await.expect("read after reshard"),
+        Some(Value::bytes("before"))
+    );
+
+    assert!(
+        file_system
+            .list(&source_dir)
+            .await
+            .expect("list source shard after cleanup")
+            .is_empty()
+    );
+    let target_dir = sstable_dir_in_shard(path, table_id, moved_route.physical_shard);
+    let target_paths = file_system
+        .list(&target_dir)
+        .await
+        .expect("list target shard files");
+    assert_eq!(target_paths.len(), 1);
+    let target_bytes = read_all_file(file_system.as_ref(), &target_paths[0]).await;
+    assert_eq!(target_bytes, source_bytes);
+
+    drop(db);
+
+    let reopened = open_test_db(path, file_system, object_store).await;
+    let reopened_table = reopened.table("orders");
+    assert_eq!(
+        reopened_table
+            .read(key)
+            .await
+            .expect("read moved value after reopen"),
+        Some(Value::bytes("before"))
+    );
+    assert_eq!(
+        reopened_table
+            .resharding_state()
+            .expect("persisted completed reshard state")
+            .phase,
+        ReshardPlanPhase::Completed
+    );
+}
+
+#[tokio::test]
+async fn reshard_plan_can_be_aborted_before_cutover_begins() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = open_test_db(
+        "/sharding-contracts-reshard-abort",
+        file_system,
+        object_store,
+    )
+    .await;
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let key = find_key_for_partition(
+        &table.sharding_state().expect("initial state").config,
+        VirtualPartitionId::new(1),
+        "abort-me",
+    );
+
+    let planned = table
+        .create_reshard_plan(moved_partition_one_sharding())
+        .await
+        .expect("create reshard plan");
+    assert_eq!(planned.phase, ReshardPlanPhase::Planned);
+
+    let aborted = table
+        .abort_reshard_plan()
+        .await
+        .expect("abort planned reshard");
+    assert_eq!(aborted.phase, ReshardPlanPhase::Aborted);
+    assert!(aborted.paused_partitions.is_empty());
+    assert_eq!(
+        table
+            .route_key(&key)
+            .expect("route after abort")
+            .physical_shard,
+        PhysicalShardId::new(0)
+    );
+
+    table
+        .write(key.clone(), Value::bytes("after-abort"))
+        .await
+        .expect("writes should resume after abort");
+    assert_eq!(
+        table.read(key).await.expect("read after abort"),
+        Some(Value::bytes("after-abort"))
+    );
+}
+
+#[tokio::test]
+async fn reshard_plan_fails_closed_when_a_compacted_artifact_would_need_rewriting() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = open_test_db(
+        "/sharding-contracts-reshard-no-rewrite-fail",
+        file_system,
+        object_store,
+    )
+    .await;
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let initial = table.sharding_state().expect("initial state");
+    let key_zero = find_key_for_partition(&initial.config, VirtualPartitionId::new(0), "left");
+    let key_one = find_key_for_partition(&initial.config, VirtualPartitionId::new(1), "right");
+
+    table
+        .write(key_zero.clone(), Value::bytes("v0"))
+        .await
+        .expect("write partition zero");
+    db.flush().await.expect("flush partition zero");
+    table
+        .write(key_one.clone(), Value::bytes("v1"))
+        .await
+        .expect("write partition one");
+    db.flush().await.expect("flush partition one");
+    assert!(db.run_next_compaction().await.expect("run compaction"));
+
+    table
+        .create_reshard_plan(moved_partition_one_sharding())
+        .await
+        .expect("create reshard plan");
+    let error = table
+        .run_reshard_plan()
+        .await
+        .expect_err("mixed-coverage compaction output should fail closed");
+    assert!(matches!(
+        error,
+        ReshardPlanError::ArtifactRewriteRequired { .. }
+    ));
+
+    let failed = table
+        .resharding_state()
+        .expect("persisted failed reshard state");
+    assert_eq!(failed.phase, ReshardPlanPhase::Copying);
+    assert!(
+        failed
+            .failure
+            .as_deref()
+            .is_some_and(|message| message.contains("without rewriting bytes"))
+    );
+
+    let blocked = table
+        .write(key_zero.clone(), Value::bytes("blocked"))
+        .await
+        .expect_err("failed reshard should keep writes paused until resolved");
+    match blocked {
+        terracedb::WriteError::Commit(CommitError::Storage(error)) => {
+            assert_eq!(error.kind(), StorageErrorKind::Timeout);
+            assert!(error.message().contains("paused for resharding"));
+        }
+        other => panic!("expected paused write timeout, got {other:?}"),
+    }
+
+    let aborted = table
+        .abort_reshard_plan()
+        .await
+        .expect("abort failed copy-phase reshard");
+    assert_eq!(aborted.phase, ReshardPlanPhase::Aborted);
+    table
+        .write(key_zero.clone(), Value::bytes("after-abort"))
+        .await
+        .expect("writes should resume after abort");
+    assert_eq!(
+        table.read(key_zero).await.expect("read after abort"),
+        Some(Value::bytes("after-abort"))
+    );
+}
+
+#[tokio::test]
+async fn reshard_plan_resumes_after_restart_from_manifest_installed_phase() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let path = "/sharding-contracts-reshard-restart";
+    let db = open_test_db(path, file_system.clone(), object_store.clone()).await;
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let key = find_key_for_partition(
+        &table.sharding_state().expect("initial state").config,
+        VirtualPartitionId::new(1),
+        "restart-me",
+    );
+
+    table
+        .write(key.clone(), Value::bytes("before"))
+        .await
+        .expect("write before restart");
+    db.flush().await.expect("flush before restart");
+    table
+        .create_reshard_plan(moved_partition_one_sharding())
+        .await
+        .expect("create reshard plan");
+
+    let _fail = db.__failpoint_registry().arm_timeout(
+        terracedb::failpoints::names::DB_RESHARD_MANIFEST_INSTALLED,
+        "interrupt after manifest install",
+        FailpointMode::Once,
+    );
+    let interrupted = table
+        .run_reshard_plan()
+        .await
+        .expect_err("manifest-installed failpoint should interrupt the plan");
+    match interrupted {
+        ReshardPlanError::Storage(error) => {
+            assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("expected storage timeout, got {other:?}"),
+    }
+
+    let interrupted_state = table
+        .resharding_state()
+        .expect("manifest-installed state should persist");
+    assert_eq!(interrupted_state.phase, ReshardPlanPhase::ManifestInstalled);
+    assert!(interrupted_state.failure.is_some());
+    assert_eq!(
+        table
+            .route_key(&key)
+            .expect("route before resume")
+            .physical_shard,
+        PhysicalShardId::new(0)
+    );
+    assert_eq!(
+        table.read(key.clone()).await.expect("read before resume"),
+        Some(Value::bytes("before"))
+    );
+
+    let blocked = table
+        .write(key.clone(), Value::bytes("blocked"))
+        .await
+        .expect_err("writes should remain paused while the plan is incomplete");
+    match blocked {
+        terracedb::WriteError::Commit(CommitError::Storage(error)) => {
+            assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("expected paused write timeout, got {other:?}"),
+    }
+
+    drop(db);
+
+    let reopened = open_test_db(path, file_system, object_store).await;
+    let reopened_table = reopened.table("orders");
+    assert_eq!(
+        reopened_table
+            .resharding_state()
+            .expect("reopened reshard state")
+            .phase,
+        ReshardPlanPhase::ManifestInstalled
+    );
+    assert_eq!(
+        reopened_table
+            .read(key.clone())
+            .await
+            .expect("read across restart"),
+        Some(Value::bytes("before"))
+    );
+
+    let completed = reopened_table
+        .run_reshard_plan()
+        .await
+        .expect("resume reshard after restart");
+    assert_eq!(completed.phase, ReshardPlanPhase::Completed);
+    assert_eq!(
+        reopened_table
+            .route_key(&key)
+            .expect("route after resume")
+            .physical_shard,
+        PhysicalShardId::new(1)
+    );
+    assert_eq!(
+        reopened_table
+            .read(key)
+            .await
+            .expect("read after resumed reshard"),
+        Some(Value::bytes("before"))
+    );
+}
+
+#[tokio::test]
+async fn reshard_plan_resumes_after_restart_from_revision_published_phase() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let path = "/sharding-contracts-reshard-restart-revision-published";
+    let db = open_test_db(path, file_system.clone(), object_store.clone()).await;
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let table_id = table.id().expect("table id");
+    let key = find_key_for_partition(
+        &table.sharding_state().expect("initial state").config,
+        VirtualPartitionId::new(1),
+        "restart-after-publish",
+    );
+    let source_route = table.route_key(&key).expect("source route");
+
+    table
+        .write(key.clone(), Value::bytes("before"))
+        .await
+        .expect("write before restart");
+    db.flush().await.expect("flush before restart");
+    table
+        .create_reshard_plan(moved_partition_one_sharding())
+        .await
+        .expect("create reshard plan");
+
+    let source_dir = sstable_dir_in_shard(path, table_id, source_route.physical_shard);
+    assert_eq!(
+        file_system
+            .list(&source_dir)
+            .await
+            .expect("list source shard before reshard")
+            .len(),
+        1
+    );
+
+    let _fail = db.__failpoint_registry().arm_timeout(
+        terracedb::failpoints::names::DB_RESHARD_REVISION_PUBLISHED,
+        "interrupt after revision publish",
+        FailpointMode::Once,
+    );
+    let interrupted = table
+        .run_reshard_plan()
+        .await
+        .expect_err("revision-published failpoint should interrupt the plan");
+    match interrupted {
+        ReshardPlanError::Storage(error) => {
+            assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("expected storage timeout, got {other:?}"),
+    }
+
+    let interrupted_state = table
+        .resharding_state()
+        .expect("revision-published state should persist");
+    assert_eq!(interrupted_state.phase, ReshardPlanPhase::RevisionPublished);
+    assert!(interrupted_state.failure.is_some());
+    assert_eq!(
+        table
+            .route_key(&key)
+            .expect("route after published revision")
+            .physical_shard,
+        PhysicalShardId::new(1)
+    );
+    assert_eq!(
+        file_system
+            .list(&source_dir)
+            .await
+            .expect("source cleanup should still be pending")
+            .len(),
+        1
+    );
+
+    drop(db);
+
+    let reopened = open_test_db(path, file_system.clone(), object_store).await;
+    let reopened_table = reopened.table("orders");
+    assert_eq!(
+        reopened_table
+            .resharding_state()
+            .expect("reopened published reshard state")
+            .phase,
+        ReshardPlanPhase::RevisionPublished
+    );
+    assert_eq!(
+        reopened_table
+            .route_key(&key)
+            .expect("route after reopen")
+            .physical_shard,
+        PhysicalShardId::new(1)
+    );
+    assert_eq!(
+        file_system
+            .list(&source_dir)
+            .await
+            .expect("source cleanup should still be pending after reopen")
+            .len(),
+        1
+    );
+
+    let completed = reopened_table
+        .run_reshard_plan()
+        .await
+        .expect("resume reshard cleanup after restart");
+    assert_eq!(completed.phase, ReshardPlanPhase::Completed);
+    assert!(
+        file_system
+            .list(&source_dir)
+            .await
+            .expect("source shard should be cleaned after resume")
+            .is_empty()
+    );
+    assert_eq!(
+        reopened_table
+            .read(key)
+            .await
+            .expect("read after resumed cleanup"),
+        Some(Value::bytes("before"))
+    );
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ShardingSimulationOutcome {
     seed: u64,
@@ -761,6 +1269,90 @@ fn run_sharding_simulation(seed: u64) -> turmoil::Result<ShardingSimulationOutco
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReshardSimulationOutcome {
+    seed: u64,
+    interrupted_phase: ReshardPlanPhase,
+    paused_before_resume: bool,
+    final_phase: ReshardPlanPhase,
+    final_route: (VirtualPartitionId, PhysicalShardId, ShardMapRevision),
+    final_value_preserved: bool,
+}
+
+fn run_reshard_resume_simulation(seed: u64) -> turmoil::Result<ReshardSimulationOutcome> {
+    SeededSimulationRunner::new(seed).run_with(move |context| async move {
+        let path = format!("/terracedb/sim/reshard-restart-{seed}");
+        let db = Db::open(tiered_test_config(&path), context.dependencies())
+            .await
+            .expect("open simulated db");
+        let table = db
+            .create_table(sharded_row_table_config("orders"))
+            .await
+            .expect("create sharded table");
+        let key = find_key_for_partition(
+            &table.sharding_state().expect("initial state").config,
+            VirtualPartitionId::new(1),
+            &format!("seed-{seed}"),
+        );
+
+        table
+            .write(key.clone(), Value::bytes("before"))
+            .await
+            .expect("write before simulated restart");
+        db.flush().await.expect("flush before simulated restart");
+        table
+            .create_reshard_plan(moved_partition_one_sharding())
+            .await
+            .expect("create simulated reshard plan");
+
+        let _fail = db.__failpoint_registry().arm_timeout(
+            terracedb::failpoints::names::DB_RESHARD_MANIFEST_INSTALLED,
+            "interrupt after manifest install",
+            FailpointMode::Once,
+        );
+        table
+            .run_reshard_plan()
+            .await
+            .expect_err("simulated reshard should be interrupted");
+        let interrupted_phase = table.resharding_state().expect("interrupted state").phase;
+        let paused_before_resume = matches!(
+            table.write(key.clone(), Value::bytes("blocked")).await,
+            Err(terracedb::WriteError::Commit(CommitError::Storage(error)))
+                if error.kind() == StorageErrorKind::Timeout
+        );
+
+        drop(db);
+
+        let reopened = Db::open(tiered_test_config(&path), context.dependencies())
+            .await
+            .expect("reopen simulated db");
+        let reopened_table = reopened.table("orders");
+        let completed = reopened_table
+            .run_reshard_plan()
+            .await
+            .expect("resume simulated reshard");
+        let final_route = reopened_table.route_key(&key).expect("final route");
+        let final_value_preserved = reopened_table
+            .read(key)
+            .await
+            .expect("read after simulated resume")
+            == Some(Value::bytes("before"));
+
+        Ok(ReshardSimulationOutcome {
+            seed,
+            interrupted_phase,
+            paused_before_resume,
+            final_phase: completed.phase,
+            final_route: (
+                final_route.virtual_partition,
+                final_route.physical_shard,
+                final_route.shard_map_revision,
+            ),
+            final_value_preserved,
+        })
+    })
+}
+
 #[test]
 fn sharding_simulation_replays_same_seed_routing_and_restart_behavior() -> turmoil::Result {
     let first = run_sharding_simulation(0x78_01)?;
@@ -788,6 +1380,28 @@ fn sharding_simulation_replays_same_seed_routing_and_restart_behavior() -> turmo
         BTreeMap::from([(PhysicalShardId::new(0), 1), (PhysicalShardId::new(1), 3)])
     );
     assert_eq!(first.mixed_commit_hint, Some(PhysicalShardId::new(0)));
+
+    Ok(())
+}
+
+#[test]
+fn reshard_simulation_replays_same_seed_manifest_restart_behavior() -> turmoil::Result {
+    let first = run_reshard_resume_simulation(0x81_19)?;
+    let second = run_reshard_resume_simulation(0x81_19)?;
+
+    assert_eq!(first, second);
+    assert_eq!(first.interrupted_phase, ReshardPlanPhase::ManifestInstalled);
+    assert!(first.paused_before_resume);
+    assert_eq!(first.final_phase, ReshardPlanPhase::Completed);
+    assert_eq!(
+        first.final_route,
+        (
+            VirtualPartitionId::new(1),
+            PhysicalShardId::new(1),
+            ShardMapRevision::new(8)
+        )
+    );
+    assert!(first.final_value_preserved);
 
     Ok(())
 }

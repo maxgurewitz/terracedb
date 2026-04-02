@@ -1098,6 +1098,21 @@ fn sharded_row_table_config(name: &str) -> TableConfig {
     config
 }
 
+fn moved_partition_one_sharding() -> crate::ShardingConfig {
+    crate::ShardingConfig::hash(
+        4,
+        crate::ShardHashAlgorithm::Crc32,
+        crate::ShardMapRevision::new(8),
+        vec![
+            crate::PhysicalShardId::new(0),
+            crate::PhysicalShardId::new(1),
+            crate::PhysicalShardId::new(1),
+            crate::PhysicalShardId::new(1),
+        ],
+    )
+    .expect("valid target sharding")
+}
+
 fn find_key_for_shard(
     config: &crate::ShardingConfig,
     target: crate::PhysicalShardId,
@@ -1111,6 +1126,21 @@ fn find_key_for_shard(
         }
     }
     panic!("failed to find key for shard {target}");
+}
+
+fn find_key_for_partition(
+    config: &crate::ShardingConfig,
+    target: crate::VirtualPartitionId,
+    prefix: &str,
+) -> Vec<u8> {
+    for index in 0..10_000_u32 {
+        let candidate = format!("{prefix}-{index}").into_bytes();
+        let route = config.route_key(&candidate).expect("route candidate");
+        if route.virtual_partition == target {
+            return candidate;
+        }
+    }
+    panic!("failed to find key for partition {target}");
 }
 
 fn columnar_table_config(name: &str) -> TableConfig {
@@ -1698,6 +1728,7 @@ fn durable_format_tables() -> BTreeMap<String, StoredTable> {
                     .into_iter()
                     .collect(),
                 },
+                resharding: None,
             },
         ),
         (
@@ -1722,6 +1753,7 @@ fn durable_format_tables() -> BTreeMap<String, StoredTable> {
                     .into_iter()
                     .collect(),
                 },
+                resharding: None,
             },
         ),
     ]
@@ -1774,6 +1806,313 @@ fn durable_format_local_manifest_sstables() -> Vec<PersistedManifestSstable> {
             shard_ownership: None,
         },
     ]
+}
+
+#[test]
+fn reshard_cleanup_prefers_local_manifest_path_over_backup_key() {
+    let meta = PersistedManifestSstable {
+        table_id: TableId::new(7),
+        level: 0,
+        local_id: "SST-000111".to_string(),
+        file_path: Db::local_sstable_path_in_shard(
+            "/durable-fixtures",
+            TableId::new(7),
+            crate::PhysicalShardId::new(3),
+            "SST-000111",
+        ),
+        remote_key: Some("tiered/backup/sst/table-000007/0003/SST-000111.sst".to_string()),
+        length: 512,
+        checksum: 0x1a2b3c4d,
+        data_checksum: 0x0badf00d,
+        min_key: b"alpha".to_vec(),
+        max_key: b"omega".to_vec(),
+        min_sequence: SequenceNumber::new(11),
+        max_sequence: SequenceNumber::new(19),
+        schema_version: None,
+        shard_ownership: None,
+    };
+
+    assert_eq!(
+        Db::persisted_reshard_cleanup_source_for_manifest(&meta),
+        crate::sharding::PersistedReshardArtifactSource::LocalFile {
+            path: meta.file_path.clone(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn reshard_target_backup_key_tracks_new_shard_for_local_tiered_sstable() {
+    let db = Db::open(
+        tiered_config("/reshard-backup-key"),
+        dependencies(
+            Arc::new(crate::StubFileSystem::default()),
+            Arc::new(StubObjectStore::default()),
+        ),
+    )
+    .await
+    .expect("open db");
+    let layout = tiered_layout();
+    let meta = PersistedManifestSstable {
+        table_id: TableId::new(7),
+        level: 0,
+        local_id: "SST-000111".to_string(),
+        file_path: Db::local_sstable_path_in_shard(
+            "/reshard-backup-key",
+            TableId::new(7),
+            crate::PhysicalShardId::new(0),
+            "SST-000111",
+        ),
+        remote_key: Some(layout.backup_sstable_in_shard(
+            TableId::new(7),
+            crate::PhysicalShardId::new(0),
+            "SST-000111",
+        )),
+        length: 512,
+        checksum: 0x1a2b3c4d,
+        data_checksum: 0x0badf00d,
+        min_key: b"alpha".to_vec(),
+        max_key: b"omega".to_vec(),
+        min_sequence: SequenceNumber::new(11),
+        max_sequence: SequenceNumber::new(19),
+        schema_version: None,
+        shard_ownership: None,
+    };
+
+    assert_eq!(
+        db.target_remote_backup_key_for_reshard(&meta, crate::PhysicalShardId::new(3))
+            .expect("target backup key"),
+        Some(layout.backup_sstable_in_shard(
+            TableId::new(7),
+            crate::PhysicalShardId::new(3),
+            "SST-000111",
+        ))
+    );
+}
+
+#[tokio::test]
+async fn s3_primary_reshard_plan_rejects_non_memory_commit_backend_before_cutover() {
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store.clone());
+    let db = Db::open(
+        s3_primary_config("reshard-backend-gate"),
+        dependencies.clone(),
+    )
+    .await
+    .expect("open s3 db");
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let local_runtime = Db::open_commit_runtime(
+        &tiered_config("/reshard-backend-gate-local").storage,
+        &dependencies,
+    )
+    .await
+    .expect("open local commit runtime");
+    {
+        let mut runtime = db.inner.commit_runtime.lock().await;
+        runtime.backend = local_runtime.backend;
+    }
+
+    let error = table
+        .create_reshard_plan(moved_partition_one_sharding())
+        .await
+        .expect_err("unsupported s3 reshard backend should fail before plan creation");
+    match error {
+        crate::ReshardPlanError::Storage(error) => {
+            assert_eq!(error.kind(), StorageErrorKind::Unsupported);
+            assert!(error.message().contains("memory commit-log backend"));
+        }
+        other => panic!("expected unsupported storage error, got {other:?}"),
+    }
+    assert!(table.resharding_state().is_none());
+}
+
+#[tokio::test]
+async fn tiered_mixed_local_remote_reshard_recovery_preserves_backup_keys() {
+    let root = "/reshard-tiered-mixed-recovery";
+    let file_system = Arc::new(crate::StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let dependencies = dependencies(file_system.clone(), object_store.clone());
+    let db = Db::open(tiered_config(root), dependencies.clone())
+        .await
+        .expect("open tiered db");
+    let table = db
+        .create_table(sharded_row_table_config("orders"))
+        .await
+        .expect("create sharded table");
+    let table_id = table.id().expect("table id");
+    let key = find_key_for_partition(
+        &table.sharding_state().expect("initial sharding").config,
+        crate::VirtualPartitionId::new(1),
+        "tiered-reshard",
+    );
+    let source_route = table.route_key(&key).expect("source route");
+
+    table
+        .write(key.clone(), Value::bytes("before"))
+        .await
+        .expect("write before reshard");
+    db.flush().await.expect("flush source sstable");
+
+    let mut state = db.sstables_read().clone();
+    let source_sstable = state
+        .live
+        .iter_mut()
+        .find(|sstable| sstable.meta.table_id == table_id)
+        .expect("live source sstable");
+    let local_id = source_sstable.meta.local_id.clone();
+    let source_local_path = source_sstable.meta.file_path.clone();
+    let source_local_bytes = read_path(&dependencies, &source_local_path)
+        .await
+        .expect("read local source bytes");
+    let layout = tiered_layout();
+    let source_backup_key =
+        layout.backup_sstable_in_shard(table_id, source_route.physical_shard, &local_id);
+    object_store
+        .put(&source_backup_key, &source_local_bytes)
+        .await
+        .expect("seed source backup object");
+    source_sstable.meta.remote_key = Some(source_backup_key.clone());
+
+    let next_generation = ManifestId::new(state.manifest_generation.get().saturating_add(1));
+    db.install_manifest(next_generation, state.last_flushed_sequence, &state.live)
+        .await
+        .expect("persist mixed local/remote manifest");
+    state.manifest_generation = next_generation;
+    *db.sstables_write() = state.clone();
+
+    table
+        .create_reshard_plan(moved_partition_one_sharding())
+        .await
+        .expect("create reshard plan");
+    let _fail = db.__failpoint_registry().arm_timeout(
+        crate::failpoints::names::DB_RESHARD_REVISION_PUBLISHED,
+        "interrupt after revision publish",
+        crate::FailpointMode::Once,
+    );
+    let interrupted = table
+        .run_reshard_plan()
+        .await
+        .expect_err("revision-published failpoint should interrupt the plan");
+    match interrupted {
+        crate::ReshardPlanError::Storage(error) => {
+            assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        }
+        other => panic!("expected timeout, got {other:?}"),
+    }
+
+    let target_backup_key =
+        layout.backup_sstable_in_shard(table_id, crate::PhysicalShardId::new(1), &local_id);
+    assert_eq!(
+        table
+            .resharding_state()
+            .expect("interrupted state should persist")
+            .phase,
+        crate::ReshardPlanPhase::RevisionPublished
+    );
+    assert_eq!(
+        db.sstables_read()
+            .live
+            .iter()
+            .find(|sstable| sstable.meta.table_id == table_id)
+            .and_then(|sstable| sstable.meta.remote_key.clone()),
+        Some(target_backup_key.clone())
+    );
+    assert_eq!(
+        Db::read_optional_source(
+            &dependencies,
+            &StorageSource::remote_object(source_backup_key.clone()),
+        )
+        .await
+        .expect("read source backup before restart"),
+        Some(source_local_bytes.clone())
+    );
+    assert_eq!(
+        Db::read_optional_source(
+            &dependencies,
+            &StorageSource::remote_object(target_backup_key.clone()),
+        )
+        .await
+        .expect("read target backup before restart"),
+        Some(source_local_bytes.clone())
+    );
+
+    drop(db);
+    file_system.crash();
+
+    let reopened = Db::open(tiered_config(root), dependencies)
+        .await
+        .expect("reopen mixed reshard db");
+    let reopened_table = reopened.table("orders");
+    assert_eq!(
+        reopened_table
+            .resharding_state()
+            .expect("reopened resharding state")
+            .phase,
+        crate::ReshardPlanPhase::RevisionPublished
+    );
+    assert_eq!(
+        reopened
+            .sstables_read()
+            .live
+            .iter()
+            .find(|sstable| sstable.meta.table_id == table_id)
+            .and_then(|sstable| sstable.meta.remote_key.clone()),
+        Some(target_backup_key.clone())
+    );
+
+    let completed = reopened_table
+        .run_reshard_plan()
+        .await
+        .expect("resume mixed reshard after restart");
+    assert_eq!(completed.phase, crate::ReshardPlanPhase::Completed);
+    assert_eq!(
+        reopened_table
+            .read(key)
+            .await
+            .expect("read after resumed reshard"),
+        Some(Value::bytes("before"))
+    );
+    assert!(
+        file_system
+            .list(&sstable_dir_in_shard(
+                root,
+                table_id,
+                source_route.physical_shard
+            ))
+            .await
+            .expect("list source shard after cleanup")
+            .is_empty()
+    );
+    assert!(
+        Db::read_optional_source(
+            &reopened.inner.dependencies,
+            &StorageSource::remote_object(source_backup_key.clone()),
+        )
+        .await
+        .expect("read cleaned source backup")
+        .is_none()
+    );
+    assert_eq!(
+        Db::read_optional_source(
+            &reopened.inner.dependencies,
+            &StorageSource::remote_object(target_backup_key.clone()),
+        )
+        .await
+        .expect("read target backup after cleanup"),
+        Some(source_local_bytes)
+    );
+    assert_eq!(
+        reopened
+            .sstables_read()
+            .live
+            .iter()
+            .find(|sstable| sstable.meta.table_id == table_id)
+            .and_then(|sstable| sstable.meta.remote_key.clone()),
+        Some(target_backup_key)
+    );
 }
 
 fn durable_format_remote_manifest_sstables() -> Vec<PersistedManifestSstable> {

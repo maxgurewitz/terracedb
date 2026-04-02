@@ -275,6 +275,12 @@ pub mod names {
         "db.remote_manifest.before_latest_pointer";
     pub const DB_REMOTE_MANIFEST_RECOVERY_AFTER_POINTER_READ: &str =
         "db.remote_manifest.recovery.after_pointer_read";
+    pub const DB_RESHARD_ABORTED: &str = "db.reshard.aborted";
+    pub const DB_RESHARD_COMPLETED: &str = "db.reshard.completed";
+    pub const DB_RESHARD_COPYING: &str = "db.reshard.copying";
+    pub const DB_RESHARD_MANIFEST_INSTALLED: &str = "db.reshard.manifest_installed";
+    pub const DB_RESHARD_PLANNED: &str = "db.reshard.planned";
+    pub const DB_RESHARD_REVISION_PUBLISHED: &str = "db.reshard.revision_published";
     pub const OUTBOX_CURSOR_PERSIST_BEFORE_COMMIT: &str = "outbox.cursor_persist.before_commit";
 }
 

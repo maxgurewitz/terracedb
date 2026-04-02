@@ -2027,6 +2027,7 @@ impl PersistedCatalogEntry {
                 schema: table.config.schema.clone(),
                 sharding: table.config.sharding.clone(),
                 metadata: table.config.metadata.clone(),
+                resharding: table.resharding.clone(),
             },
         }
     }
@@ -2047,6 +2048,7 @@ impl PersistedCatalogEntry {
                 sharding: self.config.sharding,
                 metadata: self.config.metadata,
             },
+            resharding: self.config.resharding,
         }
     }
 }

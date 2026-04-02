@@ -73,6 +73,7 @@ pub(super) struct DbInner {
 pub(super) struct StoredTable {
     pub(super) id: TableId,
     pub(super) config: TableConfig,
+    pub(super) resharding: Option<crate::sharding::PersistedTableReshardingPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +113,8 @@ pub(super) struct PersistedTableConfig {
     #[serde(default)]
     pub(super) sharding: crate::ShardingConfig,
     pub(super) metadata: TableMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) resharding: Option<crate::sharding::PersistedTableReshardingPlan>,
 }
 
 #[derive(Clone, Debug, Default)]

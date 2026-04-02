@@ -82,6 +82,22 @@ struct PressureAccountingSnapshot {
     flushing_immutable_memtables: u32,
 }
 
+#[derive(Clone, Debug)]
+struct ReshardArtifactCopy {
+    source: StorageSource,
+    target: StorageSource,
+    sidecars: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ReshardArtifactMove {
+    local_id: String,
+    copies: Vec<ReshardArtifactCopy>,
+    cleanup_sources: Vec<crate::sharding::PersistedReshardArtifactCleanup>,
+    base_bytes: u64,
+    updated_sstable: ResidentRowSstable,
+}
+
 impl PressureAccountingSnapshot {
     fn metadata(&self) -> BTreeMap<String, JsonValue> {
         let mut metadata = BTreeMap::from([
@@ -535,7 +551,14 @@ impl Db {
             return Err(CreateTableError::AlreadyExists(name));
         }
 
-        updated_tables.insert(name.clone(), StoredTable { id, config });
+        updated_tables.insert(
+            name.clone(),
+            StoredTable {
+                id,
+                config,
+                resharding: None,
+            },
+        );
         self.persist_tables(&updated_tables).await?;
 
         self.inner
@@ -663,6 +686,7 @@ impl Db {
             StoredTable {
                 id: stored.id,
                 config: updated_config,
+                resharding: stored.resharding.clone(),
             },
         );
         self.persist_tables(&updated_tables)
@@ -672,6 +696,236 @@ impl Db {
 
         let _ = self.sync_tiered_backup_catalog().await;
         Ok(projected)
+    }
+
+    pub fn table_resharding_state(&self, table: &Table) -> Option<crate::TableReshardingState> {
+        self.resolve_stored_table(table)
+            .and_then(|stored| stored.resharding.map(|plan| plan.state))
+    }
+
+    fn reshard_write_pause_error(
+        stored: &StoredTable,
+        partition: crate::VirtualPartitionId,
+    ) -> StorageError {
+        let plan = stored
+            .resharding
+            .as_ref()
+            .expect("paused write validation requires a reshard plan");
+        StorageError::timeout(format!(
+            "table {} is paused for resharding in phase {:?}; virtual partition {} is temporarily blocked",
+            stored.config.name, plan.state.phase, partition
+        ))
+    }
+
+    fn validate_reshard_write_allowed(
+        stored: &StoredTable,
+        partition: crate::VirtualPartitionId,
+    ) -> Result<(), CommitError> {
+        let Some(plan) = stored.resharding.as_ref() else {
+            return Ok(());
+        };
+        if plan.state.paused_partitions.contains(&partition) {
+            return Err(CommitError::Storage(Self::reshard_write_pause_error(
+                stored, partition,
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn create_table_reshard_plan(
+        &self,
+        table: &Table,
+        sharding: crate::ShardingConfig,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        self.validate_reshard_storage_support().await?;
+        let _catalog_guard = self.inner.catalog_write_lock.lock().await;
+        let stored = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::ReshardPlanError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        if let Some(existing) = stored.resharding.as_ref()
+            && !existing.state.phase.is_terminal()
+        {
+            return Err(crate::ReshardPlanError::PlanAlreadyExists {
+                table_name: stored.config.name.clone(),
+                source_revision: existing.state.source_revision,
+                target_revision: existing.state.target_revision,
+                phase: existing.state.phase,
+            });
+        }
+
+        let skeleton = crate::ReshardPlanSkeleton::build(
+            stored.id,
+            table.name().to_string(),
+            &stored.config.sharding,
+            &sharding,
+        )
+        .map_err(|error| crate::ReshardPlanError::InvalidShardMap {
+            table_name: stored.config.name.clone(),
+            error,
+        })?;
+        let plan = crate::sharding::PersistedTableReshardingPlan::new(
+            skeleton,
+            stored.config.sharding.clone(),
+            sharding,
+        );
+        let state = plan.state.clone();
+
+        let mut updated_tables = self.tables_read().clone();
+        updated_tables.insert(
+            stored.config.name.clone(),
+            StoredTable {
+                id: stored.id,
+                config: stored.config.clone(),
+                resharding: Some(plan),
+            },
+        );
+        self.persist_updated_tables(&updated_tables).await?;
+        self.maybe_pause_reshard_phase(crate::ReshardPlanPhase::Planned)
+            .await?;
+        Ok(state)
+    }
+
+    pub async fn abort_table_reshard_plan(
+        &self,
+        table: &Table,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        let _catalog_guard = self.inner.catalog_write_lock.lock().await;
+        let stored = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::ReshardPlanError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        let Some(mut plan) = stored.resharding.clone() else {
+            return Err(crate::ReshardPlanError::MissingPlan {
+                table_name: stored.config.name.clone(),
+            });
+        };
+        if !matches!(
+            plan.state.phase,
+            crate::ReshardPlanPhase::Planned | crate::ReshardPlanPhase::Copying
+        ) || stored.config.sharding != plan.source_sharding
+        {
+            return Err(crate::ReshardPlanError::AbortRequiresResume {
+                table_name: stored.config.name.clone(),
+                phase: plan.state.phase,
+            });
+        }
+
+        plan.state.phase = crate::ReshardPlanPhase::Aborted;
+        plan.state.failure = None;
+        plan.state.paused_partitions.clear();
+        plan.state.published_revision = None;
+
+        let mut updated_tables = self.tables_read().clone();
+        updated_tables.insert(
+            stored.config.name.clone(),
+            StoredTable {
+                id: stored.id,
+                config: stored.config.clone(),
+                resharding: Some(plan.clone()),
+            },
+        );
+        self.persist_updated_tables(&updated_tables).await?;
+        self.maybe_pause_reshard_phase(crate::ReshardPlanPhase::Aborted)
+            .await?;
+        Ok(plan.state)
+    }
+
+    pub async fn run_table_reshard_plan(
+        &self,
+        table: &Table,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        let stored = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::ReshardPlanError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        let Some(plan) = stored.resharding.clone() else {
+            return Err(crate::ReshardPlanError::MissingPlan {
+                table_name: stored.config.name.clone(),
+            });
+        };
+        if plan.state.phase.is_terminal() {
+            return Ok(plan.state);
+        }
+        self.validate_reshard_storage_support().await?;
+
+        if matches!(plan.state.phase, crate::ReshardPlanPhase::Planned) {
+            let mut updated = plan.clone();
+            updated.state.phase = crate::ReshardPlanPhase::Copying;
+            updated.state.failure = None;
+            updated.state.paused_partitions =
+                crate::VirtualPartitionCoverage::full_table(&updated.source_sharding)
+                    .partition_set();
+            let mut updated_tables = self.tables_read().clone();
+            updated_tables.insert(
+                stored.config.name.clone(),
+                StoredTable {
+                    id: stored.id,
+                    config: stored.config.clone(),
+                    resharding: Some(updated),
+                },
+            );
+            self.persist_updated_tables(&updated_tables).await?;
+            self.maybe_pause_reshard_phase(crate::ReshardPlanPhase::Copying)
+                .await?;
+        }
+
+        let refreshed = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::ReshardPlanError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        let active_plan =
+            refreshed
+                .resharding
+                .clone()
+                .ok_or_else(|| crate::ReshardPlanError::MissingPlan {
+                    table_name: refreshed.config.name.clone(),
+                })?;
+        if refreshed.config.sharding != active_plan.target_sharding {
+            self.flush()
+                .await
+                .map_err(Self::storage_error_from_flush_error)?;
+        }
+
+        let result = self.run_table_reshard_plan_after_flush(table).await;
+        if let Err(error) = &result {
+            let _ = self
+                .record_table_reshard_failure(table, error.to_string())
+                .await;
+        }
+        result
+    }
+
+    pub async fn reshard_table_to(
+        &self,
+        table: &Table,
+        sharding: crate::ShardingConfig,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        let Some(existing) = self.resolve_stored_table(table) else {
+            return Err(crate::ReshardPlanError::MissingTable {
+                table_name: table.name().to_string(),
+            });
+        };
+        match existing.resharding.as_ref() {
+            Some(plan) if !plan.state.phase.is_terminal() => {
+                if plan.target_sharding != sharding {
+                    return Err(crate::ReshardPlanError::PlanAlreadyExists {
+                        table_name: existing.config.name.clone(),
+                        source_revision: plan.state.source_revision,
+                        target_revision: plan.state.target_revision,
+                        phase: plan.state.phase,
+                    });
+                }
+            }
+            _ => {
+                self.create_table_reshard_plan(table, sharding).await?;
+            }
+        }
+        self.run_table_reshard_plan(table).await
     }
 
     /// Returns the lane bindings configured for this database.
@@ -3114,6 +3368,26 @@ impl Db {
         Ok(())
     }
 
+    pub(super) async fn maybe_pause_reshard_phase(
+        &self,
+        phase: crate::ReshardPlanPhase,
+    ) -> Result<(), StorageError> {
+        let name = match phase {
+            crate::ReshardPlanPhase::Planned => crate::failpoints::names::DB_RESHARD_PLANNED,
+            crate::ReshardPlanPhase::Copying => crate::failpoints::names::DB_RESHARD_COPYING,
+            crate::ReshardPlanPhase::ManifestInstalled => {
+                crate::failpoints::names::DB_RESHARD_MANIFEST_INSTALLED
+            }
+            crate::ReshardPlanPhase::RevisionPublished => {
+                crate::failpoints::names::DB_RESHARD_REVISION_PUBLISHED
+            }
+            crate::ReshardPlanPhase::Completed => crate::failpoints::names::DB_RESHARD_COMPLETED,
+            crate::ReshardPlanPhase::Aborted => crate::failpoints::names::DB_RESHARD_ABORTED,
+        };
+        let _ = self.__run_failpoint(name, BTreeMap::new()).await?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn dependencies(&self) -> &DbDependencies {
         &self.inner.dependencies
@@ -3150,6 +3424,7 @@ impl Db {
                             table.name()
                         )))
                     })?;
+                    Self::validate_reshard_write_allowed(&stored, route.virtual_partition)?;
                     let value = Self::normalize_value_for_table(&stored, value)
                         .map_err(CommitError::Storage)?;
                     Ok(ResolvedBatchOperation {
@@ -3173,6 +3448,7 @@ impl Db {
                             table.name()
                         )))
                     })?;
+                    Self::validate_reshard_write_allowed(&stored, route.virtual_partition)?;
                     if stored.config.merge_operator.is_none() {
                         return Err(CommitError::Storage(StorageError::unsupported(format!(
                             "merge operator is not configured for table {}",
@@ -3202,6 +3478,7 @@ impl Db {
                             table.name()
                         )))
                     })?;
+                    Self::validate_reshard_write_allowed(&stored, route.virtual_partition)?;
                     Ok(ResolvedBatchOperation {
                         table_id: stored.id,
                         table_name: table.name().to_string(),
@@ -3363,6 +3640,581 @@ impl Db {
                 crate::PublishShardMapError::Storage(StorageError::unsupported(message))
             }
         }
+    }
+
+    fn storage_error_from_persist_error(error: CreateTableError) -> StorageError {
+        match error {
+            CreateTableError::Storage(error) => error,
+            CreateTableError::InvalidConfig(message) => StorageError::unsupported(message),
+            CreateTableError::Unimplemented(message) => StorageError::unsupported(message),
+            CreateTableError::AlreadyExists(table_name) => StorageError::unsupported(format!(
+                "catalog persist unexpectedly reported duplicate table {table_name}"
+            )),
+        }
+    }
+
+    fn storage_error_from_flush_error(error: FlushError) -> StorageError {
+        match error {
+            FlushError::Storage(error) => error,
+            FlushError::Unimplemented(message) => StorageError::unsupported(message),
+        }
+    }
+
+    async fn persist_updated_tables(
+        &self,
+        updated_tables: &BTreeMap<String, StoredTable>,
+    ) -> Result<(), StorageError> {
+        self.persist_tables(updated_tables)
+            .await
+            .map_err(Self::storage_error_from_persist_error)?;
+        *self.tables_write() = updated_tables.clone();
+        let _ = self.sync_tiered_backup_catalog().await;
+        Ok(())
+    }
+
+    async fn record_table_reshard_failure(
+        &self,
+        table: &Table,
+        failure: String,
+    ) -> Result<(), StorageError> {
+        let _catalog_guard = self.inner.catalog_write_lock.lock().await;
+        let Some(stored) = self.resolve_stored_table(table) else {
+            return Ok(());
+        };
+        let Some(mut plan) = stored.resharding.clone() else {
+            return Ok(());
+        };
+        if plan.state.phase.is_terminal() {
+            return Ok(());
+        }
+        plan.state.failure = Some(failure);
+
+        let mut updated_tables = self.tables_read().clone();
+        updated_tables.insert(
+            stored.config.name.clone(),
+            StoredTable {
+                id: stored.id,
+                config: stored.config.clone(),
+                resharding: Some(plan),
+            },
+        );
+        self.persist_updated_tables(&updated_tables).await
+    }
+
+    async fn run_table_reshard_plan_after_flush(
+        &self,
+        table: &Table,
+    ) -> Result<crate::TableReshardingState, crate::ReshardPlanError> {
+        let _maintenance_guard = self.inner.maintenance_lock.lock().await;
+        let _catalog_guard = self.inner.catalog_write_lock.lock().await;
+        let stored = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::ReshardPlanError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        let Some(mut plan) = stored.resharding.clone() else {
+            return Err(crate::ReshardPlanError::MissingPlan {
+                table_name: stored.config.name.clone(),
+            });
+        };
+        if plan.state.phase.is_terminal() {
+            return Ok(plan.state);
+        }
+
+        if stored.config.sharding != plan.target_sharding {
+            let pending_moves = self.collect_reshard_artifact_moves(&stored, &plan).await?;
+            if !pending_moves.is_empty() {
+                self.copy_reshard_artifact_moves(&pending_moves).await?;
+                let moved_bytes = pending_moves
+                    .iter()
+                    .map(|entry| entry.base_bytes)
+                    .sum::<u64>();
+                plan.state.phase = crate::ReshardPlanPhase::ManifestInstalled;
+                plan.state.failure = None;
+                plan.state.artifacts_total = pending_moves.len();
+                plan.state.artifacts_moved = pending_moves.len();
+                plan.state.bytes_total = moved_bytes;
+                plan.state.bytes_moved = moved_bytes;
+                plan.pending_cleanup = pending_moves
+                    .iter()
+                    .flat_map(Self::persisted_reshard_cleanup_for_move)
+                    .collect();
+
+                let mut updated_tables = self.tables_read().clone();
+                updated_tables.insert(
+                    stored.config.name.clone(),
+                    StoredTable {
+                        id: stored.id,
+                        config: stored.config.clone(),
+                        resharding: Some(plan.clone()),
+                    },
+                );
+                self.persist_updated_tables(&updated_tables).await?;
+                self.install_table_reshard_manifest(&stored, &plan.target_sharding, &pending_moves)
+                    .await?;
+                self.maybe_pause_reshard_phase(crate::ReshardPlanPhase::ManifestInstalled)
+                    .await?;
+            }
+
+            plan.state.phase = crate::ReshardPlanPhase::RevisionPublished;
+            plan.state.failure = None;
+            plan.state.published_revision = Some(plan.target_sharding.current_revision());
+            let mut updated_config = stored.config.clone();
+            updated_config.sharding = plan.target_sharding.clone();
+
+            let mut updated_tables = self.tables_read().clone();
+            updated_tables.insert(
+                stored.config.name.clone(),
+                StoredTable {
+                    id: stored.id,
+                    config: updated_config,
+                    resharding: Some(plan.clone()),
+                },
+            );
+            self.persist_updated_tables(&updated_tables).await?;
+            self.maybe_pause_reshard_phase(crate::ReshardPlanPhase::RevisionPublished)
+                .await?;
+        }
+
+        self.cleanup_reshard_artifact_moves(&plan.pending_cleanup)
+            .await?;
+
+        let final_stored = self.resolve_stored_table(table).ok_or_else(|| {
+            crate::ReshardPlanError::MissingTable {
+                table_name: table.name().to_string(),
+            }
+        })?;
+        let Some(mut final_plan) = final_stored.resharding.clone() else {
+            return Err(crate::ReshardPlanError::MissingPlan {
+                table_name: final_stored.config.name.clone(),
+            });
+        };
+        final_plan.state.phase = crate::ReshardPlanPhase::Completed;
+        final_plan.state.failure = None;
+        final_plan.state.paused_partitions.clear();
+        final_plan.state.published_revision = Some(final_plan.target_sharding.current_revision());
+        final_plan.pending_cleanup.clear();
+
+        let mut final_tables = self.tables_read().clone();
+        final_tables.insert(
+            final_stored.config.name.clone(),
+            StoredTable {
+                id: final_stored.id,
+                config: final_stored.config.clone(),
+                resharding: Some(final_plan.clone()),
+            },
+        );
+        self.persist_updated_tables(&final_tables).await?;
+        self.maybe_pause_reshard_phase(crate::ReshardPlanPhase::Completed)
+            .await?;
+        Ok(final_plan.state)
+    }
+
+    async fn validate_reshard_storage_support(&self) -> Result<(), crate::ReshardPlanError> {
+        if matches!(self.inner.config.storage, StorageConfig::S3Primary(_)) {
+            let runtime = self.inner.commit_runtime.lock().await;
+            if !matches!(runtime.backend, CommitLogBackend::Memory(_)) {
+                return Err(crate::ReshardPlanError::Storage(StorageError::unsupported(
+                    "S3Primary resharding requires the memory commit-log backend",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn collect_reshard_artifact_moves(
+        &self,
+        stored: &StoredTable,
+        plan: &crate::sharding::PersistedTableReshardingPlan,
+    ) -> Result<Vec<ReshardArtifactMove>, crate::ReshardPlanError> {
+        let live = self.sstables_read().live.clone();
+        let mut moves = Vec::new();
+
+        for sstable in live
+            .into_iter()
+            .filter(|sstable| sstable.meta.table_id == stored.id)
+        {
+            let ownership = sstable.meta.shard_ownership();
+            let target_shards = ownership
+                .virtual_partitions
+                .routed_shards(&plan.target_sharding)
+                .map_err(|error| crate::ReshardPlanError::InvalidShardMap {
+                    table_name: stored.config.name.clone(),
+                    error,
+                })?;
+            if target_shards.len() > 1 {
+                return Err(crate::ReshardPlanError::ArtifactRewriteRequired {
+                    table_name: stored.config.name.clone(),
+                    local_id: sstable.meta.local_id.clone(),
+                    coverage: ownership.virtual_partitions.clone(),
+                });
+            }
+            let Some(target_shard) = target_shards.iter().copied().next() else {
+                continue;
+            };
+            if target_shard == ownership.physical_shard {
+                continue;
+            }
+
+            let target = self.target_storage_source_for_reshard(&sstable.meta, target_shard)?;
+            let sidecars = if sstable.columnar.is_some() {
+                sstable
+                    .load_columnar_metadata(
+                        self.columnar_read_context(),
+                        ColumnarReadAccessPattern::Background,
+                    )
+                    .await?
+                    .footer
+                    .optional_sidecars
+                    .iter()
+                    .map(|descriptor| match descriptor {
+                        PersistedOptionalSidecarDescriptor::SkipIndex(descriptor) => {
+                            descriptor.file_name.clone()
+                        }
+                        PersistedOptionalSidecarDescriptor::Projection(descriptor) => {
+                            descriptor.file_name.clone()
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Persist the pre-cutover manifest location directly so recovery keeps the
+            // original cleanup target even when local artifacts also carry backup keys.
+            let cleanup_source = Self::persisted_reshard_cleanup_source_for_manifest(&sstable.meta);
+            let target_remote_backup_key =
+                self.target_remote_backup_key_for_reshard(&sstable.meta, target_shard)?;
+
+            let mut updated_sstable = sstable.clone();
+            updated_sstable.meta.shard_ownership = Some(crate::ShardSstableOwnership::new(
+                stored.id,
+                target_shard,
+                plan.target_sharding.current_revision(),
+                ownership.virtual_partitions.clone(),
+            ));
+            match &target {
+                StorageSource::LocalFile { path } => {
+                    updated_sstable.meta.file_path = path.clone();
+                    updated_sstable.meta.remote_key = target_remote_backup_key.clone();
+                }
+                StorageSource::RemoteObject { key } => {
+                    updated_sstable.meta.file_path.clear();
+                    updated_sstable.meta.remote_key = Some(key.clone());
+                }
+            }
+            if updated_sstable.columnar.is_some() {
+                updated_sstable.columnar = Some(ResidentColumnarSstable {
+                    source: target.clone(),
+                });
+            }
+            let mut copies = vec![ReshardArtifactCopy {
+                source: sstable.meta.storage_source(),
+                target: target.clone(),
+                sidecars: sidecars.clone(),
+            }];
+            let mut cleanup_sources = vec![crate::sharding::PersistedReshardArtifactCleanup {
+                source: cleanup_source,
+                sidecars: sidecars.clone(),
+            }];
+            if matches!(target, StorageSource::LocalFile { .. })
+                && let (Some(source_key), Some(target_key)) =
+                    (&sstable.meta.remote_key, target_remote_backup_key)
+            {
+                copies.push(ReshardArtifactCopy {
+                    source: StorageSource::remote_object(source_key.clone()),
+                    target: StorageSource::remote_object(target_key.clone()),
+                    sidecars: sidecars.clone(),
+                });
+                cleanup_sources.push(crate::sharding::PersistedReshardArtifactCleanup {
+                    source: crate::sharding::PersistedReshardArtifactSource::RemoteObject {
+                        key: source_key.clone(),
+                    },
+                    sidecars: sidecars.clone(),
+                });
+            }
+
+            moves.push(ReshardArtifactMove {
+                local_id: sstable.meta.local_id.clone(),
+                copies,
+                cleanup_sources,
+                base_bytes: sstable.meta.length,
+                updated_sstable,
+            });
+        }
+
+        Ok(moves)
+    }
+
+    fn target_storage_source_for_reshard(
+        &self,
+        meta: &PersistedManifestSstable,
+        target_shard: crate::PhysicalShardId,
+    ) -> Result<StorageSource, StorageError> {
+        if !meta.file_path.is_empty() {
+            let root = self.local_storage_root().ok_or_else(|| {
+                StorageError::unsupported("local resharding requires a local storage root")
+            })?;
+            return Ok(StorageSource::local_file(
+                Self::local_sstable_path_in_shard(
+                    root,
+                    meta.table_id,
+                    target_shard,
+                    &meta.local_id,
+                ),
+            ));
+        }
+
+        let remote_key = meta.remote_key.as_ref().ok_or_else(|| {
+            StorageError::corruption(format!(
+                "SSTable {} is missing both file_path and remote_key during resharding",
+                meta.local_id
+            ))
+        })?;
+        match &self.inner.config.storage {
+            StorageConfig::S3Primary(config) => Ok(StorageSource::remote_object(
+                Self::remote_sstable_key_in_shard(
+                    config,
+                    meta.table_id,
+                    target_shard,
+                    &meta.local_id,
+                ),
+            )),
+            StorageConfig::Tiered(config) => {
+                let layout = Self::tiered_object_layout(config);
+                let target_key = if remote_key.contains("/cold/") {
+                    layout.cold_sstable_in_shard(
+                        meta.table_id,
+                        target_shard,
+                        meta.min_sequence,
+                        meta.max_sequence,
+                        &meta.local_id,
+                    )
+                } else {
+                    layout.backup_sstable_in_shard(meta.table_id, target_shard, &meta.local_id)
+                };
+                Ok(StorageSource::remote_object(target_key))
+            }
+        }
+    }
+
+    async fn copy_reshard_artifact_moves(
+        &self,
+        moves: &[ReshardArtifactMove],
+    ) -> Result<(), StorageError> {
+        for entry in moves {
+            for copy in &entry.copies {
+                self.copy_source_verbatim(&copy.source, &copy.target)
+                    .await?;
+                for sidecar in &copy.sidecars {
+                    let source = Self::sibling_source(&copy.source, sidecar);
+                    let target = Self::sibling_source(&copy.target, sidecar);
+                    self.copy_source_verbatim(&source, &target).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn persisted_reshard_cleanup_for_move(
+        entry: &ReshardArtifactMove,
+    ) -> Vec<crate::sharding::PersistedReshardArtifactCleanup> {
+        entry.cleanup_sources.clone()
+    }
+
+    pub(super) fn persisted_reshard_cleanup_source_for_manifest(
+        meta: &PersistedManifestSstable,
+    ) -> crate::sharding::PersistedReshardArtifactSource {
+        if !meta.file_path.is_empty() {
+            return crate::sharding::PersistedReshardArtifactSource::LocalFile {
+                path: meta.file_path.clone(),
+            };
+        }
+        match &meta.remote_key {
+            Some(key) => {
+                crate::sharding::PersistedReshardArtifactSource::RemoteObject { key: key.clone() }
+            }
+            None => crate::sharding::PersistedReshardArtifactSource::LocalFile {
+                path: meta.file_path.clone(),
+            },
+        }
+    }
+
+    pub(super) fn target_remote_backup_key_for_reshard(
+        &self,
+        meta: &PersistedManifestSstable,
+        target_shard: crate::PhysicalShardId,
+    ) -> Result<Option<String>, StorageError> {
+        let Some(remote_key) = meta.remote_key.as_ref() else {
+            return Ok(None);
+        };
+        let target_key = match &self.inner.config.storage {
+            StorageConfig::S3Primary(config) => Self::remote_sstable_key_in_shard(
+                config,
+                meta.table_id,
+                target_shard,
+                &meta.local_id,
+            ),
+            StorageConfig::Tiered(config) => {
+                let layout = Self::tiered_object_layout(config);
+                if remote_key.contains("/cold/") {
+                    layout.cold_sstable_in_shard(
+                        meta.table_id,
+                        target_shard,
+                        meta.min_sequence,
+                        meta.max_sequence,
+                        &meta.local_id,
+                    )
+                } else {
+                    layout.backup_sstable_in_shard(meta.table_id, target_shard, &meta.local_id)
+                }
+            }
+        };
+        Ok(Some(target_key))
+    }
+
+    fn storage_source_from_persisted_reshard_source(
+        source: &crate::sharding::PersistedReshardArtifactSource,
+    ) -> StorageSource {
+        match source {
+            crate::sharding::PersistedReshardArtifactSource::LocalFile { path } => {
+                StorageSource::local_file(path.clone())
+            }
+            crate::sharding::PersistedReshardArtifactSource::RemoteObject { key } => {
+                StorageSource::remote_object(key.clone())
+            }
+        }
+    }
+
+    async fn copy_source_verbatim(
+        &self,
+        source: &StorageSource,
+        target: &StorageSource,
+    ) -> Result<(), StorageError> {
+        if source == target {
+            return Ok(());
+        }
+        match (source, target) {
+            (
+                StorageSource::RemoteObject { key: from },
+                StorageSource::RemoteObject { key: to },
+            ) => {
+                self.inner.dependencies.object_store.copy(from, to).await?;
+            }
+            _ => {
+                let bytes = read_source(&self.inner.dependencies, source).await?;
+                Self::write_source_atomic(
+                    &self.inner.dependencies,
+                    &self.inner.dependencies.rng,
+                    target,
+                    &bytes,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_reshard_artifact_moves(
+        &self,
+        cleanup: &[crate::sharding::PersistedReshardArtifactCleanup],
+    ) -> Result<(), StorageError> {
+        for entry in cleanup {
+            let source = Self::storage_source_from_persisted_reshard_source(&entry.source);
+            Self::delete_source_if_exists(&self.inner.dependencies, &source).await?;
+            for sidecar in &entry.sidecars {
+                let source = Self::sibling_source(&source, sidecar);
+                Self::delete_source_if_exists(&self.inner.dependencies, &source).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn install_table_reshard_manifest(
+        &self,
+        stored: &StoredTable,
+        _target_sharding: &crate::ShardingConfig,
+        moves: &[ReshardArtifactMove],
+    ) -> Result<(), StorageError> {
+        let mut state = self.sstables_read().clone();
+        let replacements = moves
+            .iter()
+            .map(|entry| (entry.local_id.clone(), entry.updated_sstable.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut replaced = 0_usize;
+        let mut new_live = state
+            .live
+            .into_iter()
+            .map(|sstable| {
+                if let Some(updated) = replacements.get(&sstable.meta.local_id) {
+                    replaced += 1;
+                    updated.clone()
+                } else {
+                    sstable
+                }
+            })
+            .collect::<Vec<_>>();
+        if replaced != moves.len() {
+            return Err(StorageError::corruption(format!(
+                "reshard for table {} replaced {} of {} live SSTables",
+                stored.config.name,
+                replaced,
+                moves.len()
+            )));
+        }
+        Self::sort_live_sstables(&mut new_live);
+
+        let next_generation = ManifestId::new(state.manifest_generation.get().saturating_add(1));
+        match &self.inner.config.storage {
+            StorageConfig::Tiered(_) => {
+                self.install_manifest(next_generation, state.last_flushed_sequence, &new_live)
+                    .await?;
+            }
+            StorageConfig::S3Primary(config) => {
+                let durable_segments = self.current_remote_manifest_durable_segments().await?;
+                self.install_remote_manifest(
+                    config,
+                    next_generation,
+                    state.last_flushed_sequence,
+                    &new_live,
+                    &durable_segments,
+                )
+                .await?;
+            }
+        }
+
+        state.live = new_live;
+        state.manifest_generation = next_generation;
+        *self.sstables_write() = state.clone();
+        self.retain_compact_to_wide_stats_for_live(&state.live);
+
+        if matches!(self.inner.config.storage, StorageConfig::Tiered(_)) {
+            let _ = self
+                .sync_tiered_backup_manifest(
+                    state.manifest_generation,
+                    state.last_flushed_sequence,
+                    &state.live,
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn current_remote_manifest_durable_segments(
+        &self,
+    ) -> Result<Vec<DurableRemoteCommitLogSegment>, StorageError> {
+        let runtime = self.inner.commit_runtime.lock().await;
+        let CommitLogBackend::Memory(log) = &runtime.backend else {
+            return Err(StorageError::unsupported(
+                "resharding remote manifests requires the memory commit-log backend",
+            ));
+        };
+        let mut segments = log
+            .lanes
+            .values()
+            .flat_map(|lane| lane.durable_commit_log_segments.iter().cloned())
+            .collect::<Vec<_>>();
+        segments.sort_by(|left, right| left.object_key.cmp(&right.object_key));
+        Ok(segments)
     }
 
     pub(super) fn resolve_stored_table(&self, table: &Table) -> Option<StoredTable> {
