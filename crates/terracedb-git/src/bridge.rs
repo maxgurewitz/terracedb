@@ -6,8 +6,8 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::{
-    GitCancellationToken, GitPullRequestReport, GitPullRequestRequest, GitPushReport,
-    GitPushRequest, GitRepository, GitSubstrateError,
+    GitCancellationToken, GitObjectFormat, GitPullRequestReport, GitPullRequestRequest,
+    GitPushReport, GitPushRequest, GitRepository, GitSubstrateError,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +53,7 @@ pub struct GitImportReport {
     pub source_path: String,
     pub target_root: String,
     pub repository_root: String,
+    pub object_format: GitObjectFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +145,7 @@ impl GitHostBridge for DeterministicGitHostBridge {
             repository_root: request.source_path.clone(),
             source_path: request.source_path,
             target_root: request.target_root,
+            object_format: GitObjectFormat::Sha1,
             head_commit: None,
             branch: None,
             remote_url: None,

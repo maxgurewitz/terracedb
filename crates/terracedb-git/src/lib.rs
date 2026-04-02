@@ -28,11 +28,12 @@ pub use types::{
     GitAmbientDefault, GitCheckoutReport, GitCheckoutRequest, GitCommitReport, GitCommitRequest,
     GitDiffEntry, GitDiffKind, GitDiffReport, GitDiffRequest, GitDiscoverReport,
     GitDiscoverRequest, GitExportReport, GitExportRequest, GitForkPolicy, GitForkSurface,
-    GitForkSurfacePolicy, GitHeadState, GitIndexEntry, GitIndexSnapshot, GitObject, GitOpenRequest,
-    GitOwnershipMode, GitPullRequestReport, GitPullRequestRequest, GitPushReport, GitPushRequest,
-    GitRefUpdate, GitRefUpdateReport, GitReference, GitRepositoryHandle,
-    GitRepositoryImageDescriptor, GitRepositoryPolicy, GitRepositoryProvenance, GitStatusEntry,
-    GitStatusKind, GitStatusOptions, GitStatusReport, GitTraceEvent, GitTracePhase,
+    GitForkSurfacePolicy, GitHeadState, GitIndexEntry, GitIndexSnapshot, GitObject,
+    GitObjectFormat, GitOpenRequest, GitOwnershipMode, GitPullRequestReport, GitPullRequestRequest,
+    GitPushReport, GitPushRequest, GitRefUpdate, GitRefUpdateReport, GitReference,
+    GitRepositoryHandle, GitRepositoryImageDescriptor, GitRepositoryPolicy,
+    GitRepositoryProvenance, GitStatusEntry, GitStatusKind, GitStatusOptions, GitStatusReport,
+    GitTraceEvent, GitTracePhase,
 };
 
 pub use serde_json::Value as JsonValue;

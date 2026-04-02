@@ -347,6 +347,7 @@ async fn reopen_prefers_file_metadata_and_repairs_missing_kv_mirror() {
         head_commit: Some("cafebabe".to_string()),
         branch: Some("file-first".to_string()),
         remote_url: None,
+        object_format: None,
         pathspec: vec![".".to_string()],
         dirty: false,
     });
@@ -412,6 +413,7 @@ async fn durable_recovery_only_sees_flushed_provenance_updates() {
                 head_commit: Some("1".to_string()),
                 branch: Some("pending".to_string()),
                 remote_url: None,
+                object_format: None,
                 pathspec: vec![".".to_string()],
                 dirty: false,
             });

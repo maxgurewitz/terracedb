@@ -738,6 +738,7 @@ fn run_cross_cutting_simulation(seed: u64) -> turmoil::Result<CrossCuttingSimula
                                         remote_url: Some(
                                             "git@example.invalid:terrace/sandbox.git".to_string(),
                                         ),
+                                        object_format: None,
                                         pathspec: vec![".".to_string()],
                                         dirty: false,
                                     });

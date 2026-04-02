@@ -21,10 +21,10 @@ use terracedb_git::{
     GitCommitRequest, GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitForkPolicy,
     GitHeadState, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportMode,
     GitImportRequest, GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase,
-    GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRefUpdate, GitReference,
-    GitRepositoryHandle, GitRepositoryImage, GitRepositoryPolicy, GitRepositoryProvenance,
-    GitRepositoryStore, GitStatusKind, GitStatusOptions, GitSubstrateError, HostGitBridge,
-    NeverCancel, VfsGitRepositoryImage,
+    GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRefUpdate,
+    GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryPolicy,
+    GitRepositoryProvenance, GitRepositoryStore, GitStatusKind, GitStatusOptions,
+    GitSubstrateError, HostGitBridge, NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, MkdirOptions, SnapshotOptions, Volume,
@@ -370,6 +370,35 @@ fn init_git_repo(repo: &Path, remote: Option<&Path>) {
     }
 }
 
+fn init_empty_git_repo(repo: &Path, object_format: GitObjectFormat) {
+    fs::create_dir_all(repo).expect("create repo dir");
+    let object_format = match object_format {
+        GitObjectFormat::Sha1 => "sha1",
+        GitObjectFormat::Sha256 => "sha256",
+    };
+    git(
+        repo,
+        &["init", "--object-format", object_format, "-b", "main"],
+    );
+    git(repo, &["config", "user.name", "Sandbox Tester"]);
+    git(repo, &["config", "user.email", "sandbox@example.invalid"]);
+}
+
+fn host_git_supports_sha256() -> bool {
+    let probe = unique_test_dir("sha256-probe");
+    let supported = sanitized_git_command()
+        .arg("init")
+        .arg("--object-format=sha256")
+        .arg("-b")
+        .arg("main")
+        .arg(&probe)
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success());
+    cleanup(&probe);
+    supported
+}
+
 async fn open_empty_volume(seed: u64) -> Arc<dyn Volume> {
     let dependencies = DbDependencies::new(
         Arc::new(StubFileSystem::default()),
@@ -458,6 +487,7 @@ fn open_request(
             backend: "deterministic-git".to_string(),
             repo_root: descriptor.root_path.clone(),
             imported_from_host: false,
+            object_format: GitObjectFormat::Sha256,
             volume_id: descriptor.volume_id,
             snapshot_sequence: descriptor.snapshot_sequence,
             durable_snapshot: descriptor.durable_snapshot,
@@ -1622,6 +1652,7 @@ async fn host_git_bridge_imports_vfs_repository_images_and_pushes_commits() {
     request.policy.allow_host_bridge = true;
     request.provenance.repo_root = imported.repository_root.clone();
     request.provenance.imported_from_host = true;
+    request.provenance.object_format = imported.object_format;
     let opened = repo_store
         .open(image, request, Arc::new(NeverCancel))
         .await
@@ -1925,6 +1956,95 @@ async fn host_git_bridge_imports_vfs_repository_images_and_pushes_commits() {
 
     cleanup(&repo);
     cleanup(&remote);
+}
+
+#[tokio::test]
+async fn host_git_bridge_preserves_empty_sha256_repo_format_for_first_commit() {
+    if !host_git_supports_sha256() {
+        return;
+    }
+
+    let repo = unique_test_dir("host-import-empty-sha256");
+    init_empty_git_repo(&repo, GitObjectFormat::Sha256);
+
+    let bridge = HostGitBridge::default();
+    let imported = bridge
+        .import_repository(
+            GitImportRequest {
+                source_path: repo.to_string_lossy().into_owned(),
+                target_root: "/repo".to_string(),
+                mode: GitImportMode::Head,
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("import empty sha256 host repo");
+    assert_eq!(imported.object_format, GitObjectFormat::Sha256);
+    assert_eq!(imported.head_commit, None);
+
+    let volume = open_empty_volume(0x6112).await;
+    apply_import_entries(volume.clone(), "/repo", &imported.entries).await;
+    volume
+        .fs()
+        .write_file(
+            "/repo/src/lib.rs",
+            b"pub const FORMAT: &str = \"sha256\";\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed imported sha256 worktree");
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume, "/repo", SnapshotOptions::default())
+            .await
+            .expect("snapshot imported sha256 repo image"),
+    );
+    let repo_store = DeterministicGitRepositoryStore::default();
+    let mut request = open_request(
+        "repo-imported-empty-sha256",
+        image.as_ref(),
+        BTreeMap::new(),
+    );
+    request.policy.allow_host_bridge = true;
+    request.provenance.repo_root = imported.repository_root;
+    request.provenance.imported_from_host = true;
+    request.provenance.object_format = imported.object_format;
+    let opened = repo_store
+        .open(image, request, Arc::new(NeverCancel))
+        .await
+        .expect("open imported empty sha256 repo");
+
+    let report = opened
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/main".to_string(),
+                base_ref: None,
+                title: "Initial sha256 commit".to_string(),
+                body: "Created from imported empty sha256 repo".to_string(),
+                require_changes: true,
+                update_head: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("commit imported empty sha256 repo");
+    assert!(report.committed);
+    assert_eq!(report.parent_oid, None);
+    assert_eq!(report.commit_oid.len(), 64);
+    assert_eq!(report.tree_oid.len(), 64);
+    assert!(
+        report
+            .commit_oid
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    assert!(report.tree_oid.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    cleanup(&repo);
 }
 
 #[tokio::test]

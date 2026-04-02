@@ -12,11 +12,11 @@ use terracedb_capabilities::{ExecutionOperation, ExecutionPolicy};
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
     GitCheckoutRequest, GitCommitRequest, GitDiffReport, GitDiffRequest, GitHeadState,
-    GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest, GitOpenRequest,
-    GitPullRequestRequest as GitBridgePullRequestRequest, GitPushRequest, GitRefUpdate,
-    GitRefUpdateReport, GitReference, GitRepository, GitRepositoryImage, GitRepositoryPolicy,
-    GitRepositoryProvenance, GitRepositoryStore, GitStatusOptions, GitStatusReport, HostGitBridge,
-    NeverCancel, VfsGitRepositoryImage,
+    GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest, GitObjectFormat,
+    GitOpenRequest, GitPullRequestRequest as GitBridgePullRequestRequest, GitPushRequest,
+    GitRefUpdate, GitRefUpdateReport, GitReference, GitRepository, GitRepositoryImage,
+    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore, GitStatusOptions,
+    GitStatusReport, HostGitBridge, NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
     CompletedToolRun, CompletedToolRunOutcome, CreateOptions, DirEntry, MkdirOptions,
@@ -1375,6 +1375,7 @@ impl SandboxSession {
             .map_err(git_substrate_error_to_sandbox)?,
         );
         let descriptor = GitRepositoryImage::descriptor(image.as_ref());
+        let object_format = resolve_git_object_format(&provenance)?;
         self.services
             .git
             .open(
@@ -1393,6 +1394,7 @@ impl SandboxSession {
                         backend: self.services.git.name().to_string(),
                         repo_root: provenance.repo_root,
                         imported_from_host: true,
+                        object_format,
                         volume_id: descriptor.volume_id,
                         snapshot_sequence: descriptor.snapshot_sequence,
                         durable_snapshot: descriptor.durable_snapshot,
@@ -2024,6 +2026,7 @@ async fn prepare_git_hoist_via_bridge(
             head_commit: report.head_commit,
             branch: report.branch,
             remote_url: report.remote_url,
+            object_format: Some(report.object_format),
             pathspec: report.pathspec,
             dirty: report.dirty,
         }),
@@ -2075,6 +2078,20 @@ fn git_bridge_pull_request_to_sandbox(
         url: report.url,
         metadata: report.metadata,
     }
+}
+
+fn resolve_git_object_format(
+    provenance: &crate::GitProvenance,
+) -> Result<GitObjectFormat, SandboxError> {
+    provenance
+        .object_format
+        .or_else(|| {
+            provenance
+                .head_commit
+                .as_deref()
+                .and_then(GitObjectFormat::from_oid)
+        })
+        .ok_or(SandboxError::MissingGitObjectFormat)
 }
 
 fn normalize_bridge_import_path(path: &str) -> Result<String, SandboxError> {

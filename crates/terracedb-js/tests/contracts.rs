@@ -6,9 +6,9 @@ use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, Stub
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitDiscoverRequest,
     GitExportRequest, GitForkPolicy, GitHostBridge, GitImportMode, GitImportRequest,
-    GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRepositoryImage, GitRepositoryPolicy,
-    GitRepositoryProvenance, GitRepositoryStore, NeverCancel as NeverCancelGit,
-    VfsGitRepositoryImage,
+    GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRepositoryImage,
+    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
+    NeverCancel as NeverCancelGit, VfsGitRepositoryImage,
 };
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, DeterministicJsHostServices,
@@ -239,6 +239,7 @@ async fn public_substrate_contracts_are_instantiable() {
                     backend: "deterministic-git".to_string(),
                     repo_root: repo_descriptor.root_path.clone(),
                     imported_from_host: false,
+                    object_format: GitObjectFormat::Sha256,
                     volume_id: repo_descriptor.volume_id,
                     snapshot_sequence: repo_descriptor.snapshot_sequence,
                     durable_snapshot: repo_descriptor.durable_snapshot,
@@ -413,6 +414,7 @@ async fn deterministic_smoke_executes_fake_runtime_and_repo_over_vfs() {
                     backend: "deterministic-git".to_string(),
                     repo_root: repo_descriptor.root_path.clone(),
                     imported_from_host: false,
+                    object_format: GitObjectFormat::Sha256,
                     volume_id: repo_descriptor.volume_id,
                     snapshot_sequence: repo_descriptor.snapshot_sequence,
                     durable_snapshot: repo_descriptor.durable_snapshot,

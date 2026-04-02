@@ -16,7 +16,7 @@ use crate::{
     GitCheckoutReport, GitCheckoutRequest, GitCommitReport, GitCommitRequest, GitDiffEntry,
     GitDiffKind, GitDiffReport, GitDiffRequest, GitDiscoverReport, GitDiscoverRequest,
     GitHeadState, GitIndexEntry, GitIndexSnapshot, GitIndexStore, GitObject, GitObjectDatabase,
-    GitObjectKind, GitRefDatabase, GitRefUpdate, GitRefUpdateReport, GitReference,
+    GitObjectFormat, GitObjectKind, GitRefDatabase, GitRefUpdate, GitRefUpdateReport, GitReference,
     GitRepositoryHandle, GitRepositoryImageDescriptor, GitStatusEntry, GitStatusKind,
     GitStatusOptions, GitStatusReport, GitSubstrateError, worktree::GitWorktreeMaterializer,
 };
@@ -517,10 +517,8 @@ impl GitRepository for DeterministicGitRepository {
         } else {
             self.head().await?.oid
         };
-        let object_id_algorithm = repository_object_id_algorithm(
-            self.handle.provenance.imported_from_host,
-            parent_oid.as_deref(),
-        );
+        let object_id_algorithm =
+            repository_object_id_algorithm(self.handle.provenance.object_format);
         let worktree = collect_worktree_entries(fs.clone(), &self.handle.root_path).await?;
         let parent_tree_oid = if let Some(parent_oid) = parent_oid.as_deref() {
             self.commit_tree_oid(parent_oid).await?
@@ -1617,23 +1615,10 @@ fn content_fingerprint(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn repository_object_id_algorithm(
-    imported_from_host: bool,
-    parent_oid: Option<&str>,
-) -> GitObjectIdAlgorithm {
-    if !imported_from_host {
-        return GitObjectIdAlgorithm::Sha256;
-    }
-    oid_algorithm_for_oid(parent_oid.unwrap_or("")).unwrap_or(GitObjectIdAlgorithm::Sha1)
-}
-
-fn oid_algorithm_for_oid(oid: &str) -> Option<GitObjectIdAlgorithm> {
-    if oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Some(GitObjectIdAlgorithm::Sha1)
-    } else if oid.len() == 64 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Some(GitObjectIdAlgorithm::Sha256)
-    } else {
-        None
+fn repository_object_id_algorithm(object_format: GitObjectFormat) -> GitObjectIdAlgorithm {
+    match object_format {
+        GitObjectFormat::Sha1 => GitObjectIdAlgorithm::Sha1,
+        GitObjectFormat::Sha256 => GitObjectIdAlgorithm::Sha256,
     }
 }
 

@@ -9,7 +9,7 @@ use std::{
 };
 
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
-use terracedb_git::HostGitBridge;
+use terracedb_git::{GitObjectFormat, HostGitBridge};
 use terracedb_sandbox::{
     ConflictPolicy, DefaultSandboxStore, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
@@ -623,6 +623,7 @@ async fn pr_export_bookkeeping_tool_runs_only_survive_durable_recovery_after_flu
                 head_commit: Some("HEAD".to_string()),
                 branch: Some("main".to_string()),
                 remote_url: Some(remote.to_string_lossy().into_owned()),
+                object_format: Some(GitObjectFormat::Sha1),
                 pathspec: vec![".".to_string()],
                 dirty: false,
             }),

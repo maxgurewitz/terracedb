@@ -9,13 +9,13 @@ use terracedb_vfs::{
 use terracedb_sandbox::{
     BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
     DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicTypeScriptService,
-    GitProvenance, LocalReadonlyViewBridge, PackageCompatibilityMode, PackageInstallRequest,
-    PullRequestRequest, ReadonlyViewCut, ReadonlyViewProtocolRequest, ReadonlyViewProtocolResponse,
-    ReadonlyViewProtocolTransport, ReadonlyViewRequest, ReopenSessionOptions, SandboxCapability,
-    SandboxConfig, SandboxExecutionKind, SandboxExecutionRequest, SandboxRuntimeBackend,
-    SandboxRuntimeStateHandle, SandboxServices, SandboxStore, StaticReadonlyViewRegistry,
-    TERRACE_RUNTIME_MODULE_CACHE_PATH, TypeCheckRequest, TypeScriptService,
-    read_package_install_manifest,
+    GitObjectFormat, GitProvenance, LocalReadonlyViewBridge, PackageCompatibilityMode,
+    PackageInstallRequest, PullRequestRequest, ReadonlyViewCut, ReadonlyViewProtocolRequest,
+    ReadonlyViewProtocolResponse, ReadonlyViewProtocolTransport, ReadonlyViewRequest,
+    ReopenSessionOptions, SandboxCapability, SandboxConfig, SandboxExecutionKind,
+    SandboxExecutionRequest, SandboxRuntimeBackend, SandboxRuntimeStateHandle, SandboxServices,
+    SandboxStore, StaticReadonlyViewRegistry, TERRACE_RUNTIME_MODULE_CACHE_PATH, TypeCheckRequest,
+    TypeScriptService, read_package_install_manifest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +142,7 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                         head_commit: Some(format!("{seed:040x}")),
                         branch: Some("main".to_string()),
                         remote_url: Some("https://simulation.invalid/repo.git".to_string()),
+                        object_format: Some(GitObjectFormat::Sha1),
                         pathspec: vec![".".to_string()],
                         dirty: false,
                     });

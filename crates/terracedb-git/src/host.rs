@@ -19,8 +19,8 @@ use tokio::sync::Mutex;
 use crate::{
     GitCancellationToken, GitExportReport, GitExportRequest, GitHeadState, GitHostBridge,
     GitImportEntry, GitImportEntryKind, GitImportMode, GitImportReport, GitImportRequest,
-    GitIndexEntry, GitIndexSnapshot, GitObjectKind, GitPullRequestReport, GitPullRequestRequest,
-    GitPushReport, GitPushRequest, GitRepository, GitSubstrateError,
+    GitIndexEntry, GitIndexSnapshot, GitObjectFormat, GitObjectKind, GitPullRequestReport,
+    GitPullRequestRequest, GitPushReport, GitPushRequest, GitRepository, GitSubstrateError,
 };
 
 static IMPORT_EXPORT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +88,7 @@ impl GitHostBridge for HostGitBridge {
             &["remote", "get-url", "origin"],
             OptionalGitLookup::OriginRemote,
         )?;
+        let object_format = git_object_format(&repo_root)?;
         let worktree_entries = match &request.mode {
             GitImportMode::Head => {
                 let export_root = export_git_head(&repo_root)?;
@@ -119,6 +120,7 @@ impl GitHostBridge for HostGitBridge {
             source_path,
             target_root: request.target_root,
             repository_root: canonicalize_for_storage(&repo_root)?,
+            object_format,
             head_commit,
             branch,
             remote_url,
@@ -441,6 +443,10 @@ fn collect_directory_tree_recursive(
 
 fn export_git_head(repo_root: &Path) -> Result<PathBuf, GitSubstrateError> {
     let export_root = temp_export_path("git-head");
+    fs::create_dir_all(&export_root).map_err(|error| GitSubstrateError::Bridge {
+        operation: "import_repository",
+        message: format!("{}: {}", export_root.display(), error),
+    })?;
     let prefix = format!("{}/", export_root.to_string_lossy());
     run_git(repo_root, &["checkout-index", "--all", "--prefix", &prefix])?;
     Ok(export_root)
@@ -764,6 +770,35 @@ fn git_object_kind_name(kind: GitObjectKind) -> &'static str {
         GitObjectKind::Tree => "tree",
         GitObjectKind::Tag => "tag",
         GitObjectKind::Unknown => "unknown",
+    }
+}
+
+fn git_object_format(repo_root: &Path) -> Result<GitObjectFormat, GitSubstrateError> {
+    if let Some(value) = git_stdout_optional(
+        repo_root,
+        &["rev-parse", "--show-object-format"],
+        OptionalGitLookup::HeadCommit,
+    )? {
+        return parse_git_object_format(&value);
+    }
+    if let Some(value) = git_stdout_optional(
+        repo_root,
+        &["config", "--get", "extensions.objectformat"],
+        OptionalGitLookup::HeadCommit,
+    )? {
+        return parse_git_object_format(&value);
+    }
+    Ok(GitObjectFormat::Sha1)
+}
+
+fn parse_git_object_format(value: &str) -> Result<GitObjectFormat, GitSubstrateError> {
+    match value.trim() {
+        "sha1" => Ok(GitObjectFormat::Sha1),
+        "sha256" => Ok(GitObjectFormat::Sha256),
+        other => Err(GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: format!("unsupported git object format: {other}"),
+        }),
     }
 }
 

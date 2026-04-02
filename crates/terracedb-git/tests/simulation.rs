@@ -14,9 +14,9 @@ use terracedb_fuzz::{GeneratedScenarioHarness, assert_seed_replays, assert_seed_
 use terracedb_git::worktree::GitWorktreeMaterializer;
 use terracedb_git::{
     DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutRequest, GitDiscoverRequest,
-    GitForkPolicy, GitObjectDatabase, GitOpenRequest, GitRepositoryImage, GitRepositoryPolicy,
-    GitRepositoryProvenance, GitRepositoryStore, GitSubstrateError, NeverCancel,
-    VfsGitRepositoryImage,
+    GitForkPolicy, GitObjectDatabase, GitObjectFormat, GitOpenRequest, GitRepositoryImage,
+    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore, GitSubstrateError,
+    NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{
@@ -173,6 +173,7 @@ fn open_request(repository_id: &str, image: &dyn GitRepositoryImage) -> GitOpenR
             backend: "deterministic-git".to_string(),
             repo_root: descriptor.root_path.clone(),
             imported_from_host: false,
+            object_format: GitObjectFormat::Sha256,
             volume_id: descriptor.volume_id,
             snapshot_sequence: descriptor.snapshot_sequence,
             durable_snapshot: descriptor.durable_snapshot,

@@ -7,6 +7,7 @@ use terracedb::{
     Timestamp,
 };
 use terracedb_capabilities::{BudgetPolicy, ExecutionDomain, ExecutionOperation, ExecutionPolicy};
+use terracedb_git::GitObjectFormat;
 use terracedb_vfs::VolumeId;
 
 use crate::{CapabilityManifest, HoistMode, ReadonlyViewHandle};
@@ -38,6 +39,8 @@ pub struct GitProvenance {
     pub head_commit: Option<String>,
     pub branch: Option<String>,
     pub remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_format: Option<GitObjectFormat>,
     pub pathspec: Vec<String>,
     pub dirty: bool,
 }

@@ -1031,10 +1031,12 @@ fn sandbox_error_to_js_host_service(
     error: SandboxError,
 ) -> JsSubstrateError {
     match error {
-        SandboxError::MissingGitProvenance => JsSubstrateError::HostServiceUnavailable {
-            service: request.service.clone(),
-            operation: request.operation.clone(),
-        },
+        SandboxError::MissingGitProvenance | SandboxError::MissingGitObjectFormat => {
+            JsSubstrateError::HostServiceUnavailable {
+                service: request.service.clone(),
+                operation: request.operation.clone(),
+            }
+        }
         other => JsSubstrateError::EvaluationFailed {
             entrypoint: format!("{}::{}", request.service, request.operation),
             message: other.to_string(),

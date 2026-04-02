@@ -9,6 +9,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use serde::{Deserialize, Serialize};
+use terracedb_git::GitObjectFormat;
 use terracedb_vfs::{
     CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, VfsError, VfsFileSystem, Volume,
 };
@@ -1179,6 +1180,7 @@ fn capture_git_provenance(repo_root: &Path) -> Result<GitProvenance, SandboxErro
     let head_commit = git_stdout_optional(repo_root, &["rev-parse", "HEAD"])?;
     let branch = git_stdout_optional(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let remote_url = git_stdout_optional(repo_root, &["remote", "get-url", "origin"])?;
+    let object_format = detect_git_object_format(repo_root)?;
     let dirty = !git_stdout(
         repo_root,
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -1189,9 +1191,33 @@ fn capture_git_provenance(repo_root: &Path) -> Result<GitProvenance, SandboxErro
         head_commit,
         branch,
         remote_url,
+        object_format: Some(object_format),
         pathspec: vec![".".to_string()],
         dirty,
     })
+}
+
+fn detect_git_object_format(repo_root: &Path) -> Result<GitObjectFormat, SandboxError> {
+    if let Some(value) = git_stdout_optional(repo_root, &["rev-parse", "--show-object-format"])? {
+        return parse_git_object_format(&value);
+    }
+    if let Some(value) =
+        git_stdout_optional(repo_root, &["config", "--get", "extensions.objectformat"])?
+    {
+        return parse_git_object_format(&value);
+    }
+    Ok(GitObjectFormat::Sha1)
+}
+
+fn parse_git_object_format(value: &str) -> Result<GitObjectFormat, SandboxError> {
+    match value.trim() {
+        "sha1" => Ok(GitObjectFormat::Sha1),
+        "sha256" => Ok(GitObjectFormat::Sha256),
+        other => Err(SandboxError::Service {
+            service: "git",
+            message: format!("unsupported git object format: {other}"),
+        }),
+    }
 }
 
 fn git_working_tree_paths(

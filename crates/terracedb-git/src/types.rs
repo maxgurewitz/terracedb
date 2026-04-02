@@ -132,11 +132,31 @@ pub struct GitRepositoryImageDescriptor {
     pub durable_snapshot: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl GitObjectFormat {
+    pub fn from_oid(oid: &str) -> Option<Self> {
+        if oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Some(Self::Sha1)
+        } else if oid.len() == 64 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Some(Self::Sha256)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRepositoryProvenance {
     pub backend: String,
     pub repo_root: String,
     pub imported_from_host: bool,
+    pub object_format: GitObjectFormat,
     pub volume_id: Option<VolumeId>,
     pub snapshot_sequence: Option<u64>,
     pub durable_snapshot: bool,
@@ -459,8 +479,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        GitDiscoverRequest, GitForkPolicy, GitOpenRequest, GitRepositoryImageDescriptor,
-        GitRepositoryPolicy, GitRepositoryProvenance, GitTraceEvent, GitTracePhase,
+        GitDiscoverRequest, GitForkPolicy, GitObjectFormat, GitOpenRequest,
+        GitRepositoryImageDescriptor, GitRepositoryPolicy, GitRepositoryProvenance, GitTraceEvent,
+        GitTracePhase,
     };
 
     #[test]
@@ -478,6 +499,7 @@ mod tests {
                 backend: "deterministic-git".to_string(),
                 repo_root: "/repo".to_string(),
                 imported_from_host: false,
+                object_format: GitObjectFormat::Sha256,
                 volume_id: Some(terracedb_vfs::VolumeId::new(0x8000)),
                 snapshot_sequence: Some(9),
                 durable_snapshot: false,

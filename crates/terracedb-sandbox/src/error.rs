@@ -73,6 +73,8 @@ pub enum SandboxError {
     MissingHoistProvenance,
     #[error("sandbox session does not have git provenance for this operation")]
     MissingGitProvenance,
+    #[error("sandbox session does not record a git object format for this imported repository")]
+    MissingGitObjectFormat,
     #[error("sandbox session does not have a git remote for repo-backed push or pull request")]
     MissingGitRemote,
     #[error("sandbox git operation has no repository changes to commit for {target_ref}")]

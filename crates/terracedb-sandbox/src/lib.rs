@@ -92,7 +92,7 @@ pub use view::{
 pub use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
     GitCheckoutRequest, GitCommitReport, GitDiffReport, GitDiffRequest, GitHeadState,
-    GitHostBridge, GitPullRequestReport as SandboxGitPullRequestReport, GitPushReport,
-    GitRefUpdate, GitRefUpdateReport, GitReference, GitRepositoryStore, GitStatusOptions,
-    GitStatusReport, HostGitBridge,
+    GitHostBridge, GitObjectFormat, GitPullRequestReport as SandboxGitPullRequestReport,
+    GitPushReport, GitRefUpdate, GitRefUpdateReport, GitReference, GitRepositoryStore,
+    GitStatusOptions, GitStatusReport, HostGitBridge,
 };

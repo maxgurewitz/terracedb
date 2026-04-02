@@ -82,6 +82,7 @@ async fn reopen_preserves_session_metadata_and_provenance() {
                 head_commit: Some("abc".to_string()),
                 branch: Some("main".to_string()),
                 remote_url: None,
+                object_format: None,
                 pathspec: vec![".".to_string()],
                 dirty: false,
             }),
