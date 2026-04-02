@@ -645,8 +645,11 @@ impl contracts::WorkflowHandlerContract for ContinueAsNewContractHandler {
             "run:{}:{}:next",
             input.workflow_name, input.instance_id
         ))?;
-        let next_bundle_id =
-            contracts::WorkflowBundleId::new("bundle:native-contract-next".to_string())?;
+        let next_target = contracts::WorkflowExecutionTarget::NativeRegistration {
+            registration_id: contracts::WorkflowRegistrationId::new(
+                "native:contract-billing-next".to_string(),
+            )?,
+        };
         Ok(contracts::WorkflowTransitionOutput {
             state: contracts::WorkflowStateMutation::Put {
                 state: contracts::WorkflowPayload::bytes("handoff-complete"),
@@ -658,7 +661,7 @@ impl contracts::WorkflowHandlerContract for ContinueAsNewContractHandler {
             }),
             continue_as_new: Some(contracts::WorkflowContinueAsNew {
                 next_run_id,
-                next_bundle_id,
+                next_target,
                 state: Some(contracts::WorkflowPayload::bytes("seeded-next")),
             }),
             commands: vec![contracts::WorkflowCommand::Outbox {
@@ -1218,12 +1221,12 @@ async fn callback_admission_failpoint_surfaces_storage_error_before_commit() {
 }
 
 #[tokio::test]
-async fn workflow_processing_fails_closed_when_active_run_metadata_is_missing() {
+async fn workflow_processing_requires_run_record_but_tolerates_projection_gaps() {
     for (case, expected_error) in [
-        ("run", "workflow run record missing"),
-        ("lifecycle", "workflow lifecycle record missing"),
-        ("visibility", "workflow visibility record missing"),
-        ("history", "workflow history event"),
+        ("run", Some("workflow run record missing")),
+        ("lifecycle", None),
+        ("visibility", None),
+        ("history", None),
     ] {
         let clock = Arc::new(StubClock::default());
         let file_system = Arc::new(StubFileSystem::default());
@@ -1338,28 +1341,44 @@ async fn workflow_processing_fails_closed_when_active_run_metadata_is_missing() 
             .admit_callback("order-1", "cb-2", b"approved".to_vec())
             .await
             .expect("admit callback with missing metadata");
-        tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
-            .await
-            .expect("runtime should fail closed on missing metadata")
-            .expect("wait for workflow termination");
+        if let Some(expected_error) = expected_error {
+            tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
+                .await
+                .expect("runtime should fail closed on missing required metadata")
+                .expect("wait for workflow termination");
 
-        let error = handle
-            .shutdown()
-            .await
-            .expect_err("workflow runtime should fail closed on missing metadata");
-        match error {
-            WorkflowError::Storage(storage) => {
-                assert_eq!(storage.kind(), StorageErrorKind::Corruption);
-                assert!(
-                    storage.to_string().contains(expected_error),
-                    "expected corruption containing {expected_error}, got {storage}",
-                );
-                assert!(
-                    storage.to_string().contains(state.run_id.as_str()),
-                    "expected corruption to name the active run id, got {storage}",
-                );
+            let error = handle
+                .shutdown()
+                .await
+                .expect_err("workflow runtime should fail closed on missing required metadata");
+            match error {
+                WorkflowError::Storage(storage) => {
+                    assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+                    assert!(
+                        storage.to_string().contains(expected_error),
+                        "expected corruption containing {expected_error}, got {storage}",
+                    );
+                    assert!(
+                        storage.to_string().contains(state.run_id.as_str()),
+                        "expected corruption to name the active run id, got {storage}",
+                    );
+                }
+                other => panic!(
+                    "expected workflow corruption from missing required metadata, got {other:?}"
+                ),
             }
-            other => panic!("expected workflow corruption from missing metadata, got {other:?}"),
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.wait_for_state("order-1", Value::bytes("processed:cb-2")),
+            )
+            .await
+            .expect("projection loss should not block workflow progress")
+            .expect("workflow state wait should not fail");
+            handle
+                .shutdown()
+                .await
+                .expect("runtime should stay healthy when only projections are damaged");
         }
     }
 }
@@ -1731,7 +1750,7 @@ async fn workflow_processing_fails_closed_when_state_row_is_missing_but_run_meta
 }
 
 #[tokio::test]
-async fn workflow_processing_fails_closed_on_gapped_extra_history_events() {
+async fn workflow_processing_tolerates_gapped_extra_visible_history_events() {
     let clock = Arc::new(StubClock::default());
     let file_system = Arc::new(StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
@@ -1806,32 +1825,22 @@ async fn workflow_processing_fails_closed_on_gapped_extra_history_events() {
         .await
         .expect("persist gapped extra history event");
 
-    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    let handle = runtime.start().await.expect("restart workflow runtime");
     runtime
         .admit_callback("order-1", "cb-2", b"approved".to_vec())
         .await
         .expect("admit callback with extra history event");
-    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
-        .await
-        .expect("runtime should fail closed on gapped extra history")
-        .expect("wait for workflow termination");
-
-    let error = handle
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-2")),
+    )
+    .await
+    .expect("visible history gaps should not block workflow progress")
+    .expect("workflow state wait should not fail");
+    handle
         .shutdown()
         .await
-        .expect_err("workflow runtime should fail closed on gapped extra history");
-    match error {
-        WorkflowError::Storage(storage) => {
-            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
-            assert!(
-                storage
-                    .to_string()
-                    .contains(&format!("workflow history sequence {extra_sequence}")),
-                "expected gapped-history corruption, got {storage}",
-            );
-        }
-        other => panic!("expected workflow corruption from gapped extra history, got {other:?}"),
-    }
+        .expect("runtime should stay healthy despite gapped visible history");
 }
 
 #[tokio::test]
@@ -2064,7 +2073,7 @@ async fn workflow_processing_fails_closed_when_state_row_is_missing_and_only_lif
 }
 
 #[tokio::test]
-async fn workflow_processing_fails_closed_when_state_row_is_missing_and_only_history_remains() {
+async fn workflow_processing_ignores_history_only_orphans_when_state_is_missing() {
     let clock = Arc::new(StubClock::default());
     let file_system = Arc::new(StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
@@ -2163,34 +2172,22 @@ async fn workflow_processing_fails_closed_when_state_row_is_missing_and_only_his
         .await
         .expect("delete run-created history row");
 
-    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    let handle = runtime.start().await.expect("restart workflow runtime");
     runtime
         .admit_callback("order-1", "cb-2", b"approved".to_vec())
         .await
         .expect("admit callback after leaving history-only leftovers");
-    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
-        .await
-        .expect("runtime should fail closed when only history remains")
-        .expect("wait for workflow termination");
-
-    let error = handle
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-2")),
+    )
+    .await
+    .expect("history-only projection leftovers should not block new work")
+    .expect("workflow state wait should not fail");
+    handle
         .shutdown()
         .await
-        .expect_err("workflow runtime should fail closed when only history remains");
-    match error {
-        WorkflowError::Storage(storage) => {
-            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
-            assert!(
-                storage
-                    .to_string()
-                    .contains("workflow state record is missing while history for run"),
-                "expected missing-state history corruption, got {storage}",
-            );
-        }
-        other => panic!(
-            "expected workflow corruption from missing state row with only history remaining, got {other:?}"
-        ),
-    }
+        .expect("runtime should stay healthy when only visible history remains");
 }
 
 #[tokio::test]
@@ -2294,7 +2291,7 @@ async fn workflow_processing_fails_closed_on_custom_run_id_lifecycle_orphans_whe
 }
 
 #[tokio::test]
-async fn workflow_processing_fails_closed_on_custom_run_id_history_orphans_when_state_is_missing() {
+async fn workflow_processing_ignores_custom_visible_history_orphans_when_state_is_missing() {
     let clock = Arc::new(StubClock::default());
     let file_system = Arc::new(StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
@@ -2365,36 +2362,22 @@ async fn workflow_processing_fails_closed_on_custom_run_id_history_orphans_when_
         .await
         .expect("persist orphan history record");
 
-    let mut handle = runtime.start().await.expect("restart workflow runtime");
+    let handle = runtime.start().await.expect("restart workflow runtime");
     runtime
         .admit_callback("order-1", "cb-2", b"approved".to_vec())
         .await
         .expect("admit callback with orphan custom history");
-    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_terminal())
-        .await
-        .expect("runtime should fail closed on orphan custom history")
-        .expect("wait for workflow termination");
-
-    let error = handle
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_state("order-1", Value::bytes("processed:cb-2")),
+    )
+    .await
+    .expect("custom visible-history orphans should not block new work")
+    .expect("workflow state wait should not fail");
+    handle
         .shutdown()
         .await
-        .expect_err("workflow runtime should fail closed on orphan custom history");
-    match error {
-        WorkflowError::Storage(storage) => {
-            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
-            assert!(
-                storage
-                    .to_string()
-                    .contains("workflow state record is missing while orphan history for run"),
-                "expected orphan-history corruption, got {storage}",
-            );
-            assert!(
-                storage.to_string().contains(custom_run_id.as_str()),
-                "expected corruption to name the custom run id, got {storage}",
-            );
-        }
-        other => panic!("expected workflow corruption from orphan custom history, got {other:?}"),
-    }
+        .expect("runtime should stay healthy with custom visible-history orphans");
 }
 
 struct WorkflowStack<H> {
@@ -4662,7 +4645,7 @@ async fn workflow_checkpoints_restore_workflow_owned_tables_exactly() {
         .expect("load checkpointed run record")
         .expect("checkpointed run record should exist");
     let checkpointed_history = runtime
-        .load_run_history(&checkpointed_state.run_id)
+        .load_visible_history(&checkpointed_state.run_id)
         .await
         .expect("load checkpointed run history");
     let checkpointed_lifecycle = runtime
@@ -4771,7 +4754,7 @@ async fn workflow_checkpoints_restore_workflow_owned_tables_exactly() {
     );
     assert_eq!(
         restored_runtime
-            .load_run_history(&checkpointed_run.run_id)
+            .load_visible_history(&checkpointed_run.run_id)
             .await
             .expect("load restored run history"),
         checkpointed_history
@@ -5176,7 +5159,7 @@ async fn workflow_restore_checkpoint_recovery_replays_restored_callback_and_new_
         .expect("load checkpointed run record")
         .expect("checkpointed run record should exist");
     let checkpointed_history = runtime
-        .load_run_history(&checkpointed_state.run_id)
+        .load_visible_history(&checkpointed_state.run_id)
         .await
         .expect("load checkpointed history");
     let checkpointed_lifecycle = runtime
@@ -5272,7 +5255,7 @@ async fn workflow_restore_checkpoint_recovery_replays_restored_callback_and_new_
         .expect("load recovered run record")
         .expect("recovered run record should exist");
     let recovered_history = recovery_runtime
-        .load_run_history(&checkpointed_run.run_id)
+        .load_visible_history(&checkpointed_run.run_id)
         .await
         .expect("load recovered run history");
     let recovered_lifecycle = recovery_runtime
@@ -5293,7 +5276,7 @@ async fn workflow_restore_checkpoint_recovery_replays_restored_callback_and_new_
     assert_eq!(recovered_visibility.run_id, recovered_state.run_id);
     assert_eq!(recovered_visibility.lifecycle, recovered_state.lifecycle);
     assert_eq!(
-        recovered_visibility.history_len,
+        recovered_visibility.visible_history_len,
         recovered_state.history_len
     );
     assert_eq!(
@@ -5654,8 +5637,12 @@ async fn contract_runtime_supports_visibility_updates_and_continue_as_new() {
 
     assert_eq!(current_state.run_id, next_run_id);
     assert_eq!(
-        current_state.bundle_id,
-        contracts::WorkflowBundleId::new("bundle:native-contract-next").expect("next bundle id")
+        current_state.target,
+        contracts::WorkflowExecutionTarget::NativeRegistration {
+            registration_id:
+                contracts::WorkflowRegistrationId::new("native:contract-billing-next",)
+                    .expect("next registration id"),
+        }
     );
     assert_eq!(current_state.lifecycle, WorkflowLifecycleState::Scheduled);
     assert_eq!(
@@ -5681,7 +5668,7 @@ async fn contract_runtime_supports_visibility_updates_and_continue_as_new() {
     assert_eq!(next_run.continued_from_run_id, Some(prior_run_id.clone()));
 
     let history = runtime
-        .load_run_history(&prior_run_id)
+        .load_visible_history(&prior_run_id)
         .await
         .expect("load prior run history");
     assert!(history.iter().any(|record| {
@@ -5753,7 +5740,7 @@ async fn contract_runtime_supports_visibility_updates_and_continue_as_new() {
     assert_eq!(recovered_next_run, next_run);
 
     let recovered_history = reopened_runtime
-        .load_run_history(&prior_run_id)
+        .load_visible_history(&prior_run_id)
         .await
         .expect("load recovered prior run history");
     assert_eq!(recovered_history, history);

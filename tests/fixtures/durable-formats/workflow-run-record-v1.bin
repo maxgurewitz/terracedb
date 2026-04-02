@@ -1,1 +1,1 @@
-{"run_id":"run:orders:order-1:1","bundle_id":"native:orders","workflow_name":"orders","instance_id":"order-1","created_at_millis":7,"continued_from_run_id":null}
+{"run_id":"run:orders:order-1:1","target":{"kind":"native-registration","registration_id":"native:orders"},"workflow_name":"orders","instance_id":"order-1","created_at_millis":7,"continued_from_run_id":null}

@@ -15,8 +15,8 @@ use terracedb_workflows_core::{
     WorkflowTrigger,
 };
 use terracedb_workflows_sandbox::{
-    SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter, WORKFLOW_TASK_V1_ABI,
-    WorkflowTaskV1Handler, WorkflowTaskV1Request, WorkflowTaskV1Response,
+    SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter, WORKFLOW_SANDBOX_SDK_SOURCE,
+    WORKFLOW_TASK_V1_ABI, WorkflowTaskV1Handler, WorkflowTaskV1Request, WorkflowTaskV1Response,
     WorkflowTaskV1RouteRequest, WorkflowTaskV1RouteResponse,
 };
 
@@ -145,7 +145,7 @@ fn sample_event() -> WorkflowSourceEvent {
 fn sample_input(bundle: &WorkflowBundleMetadata) -> WorkflowTransitionInput {
     WorkflowTransitionInput {
         run_id: terracedb_workflows_core::WorkflowRunId::new("run:acct-7").expect("run id"),
-        bundle_id: bundle.bundle_id.clone(),
+        target: bundle.target(),
         task_id: WorkflowTaskId::new("task:acct-7:1").expect("task id"),
         workflow_name: bundle.workflow_name.clone(),
         instance_id: "acct-7".to_string(),
@@ -425,4 +425,122 @@ async fn module_backed_handler_surfaces_structured_rejections() {
     assert_eq!(error.code, "guest-rejected");
     assert!(error.message.contains("task rejected"));
     assert!(error.message.contains("retryable"));
+}
+
+#[tokio::test]
+async fn sdk_defined_module_wraps_plain_handle_logic_into_workflow_task_contract() {
+    let (vfs, sandbox) = sandbox_store(120, 93);
+    let base_volume_id = VolumeId::new(0x9320);
+    let session_volume_id = VolumeId::new(0x9321);
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/sdk/workflow.js",
+        WORKFLOW_SANDBOX_SDK_SOURCE,
+    )
+    .await;
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/billing.js",
+        r#"
+        import { schema, text, wf } from "./sdk/workflow.js";
+
+        const BillingState = wf.jsonState(
+          schema.object({
+            status: schema.string(),
+            task: schema.string(),
+          }),
+        );
+
+        const taskLabel = (taskId) => taskId.replace(/^task:/, "");
+
+        export default wf.define({
+          state: BillingState,
+
+          routeEvent({ event }) {
+            return text(event.key).split(":")[0];
+          },
+
+          async handle({ input, state, running, visibility }) {
+            const task = taskLabel(input.task_id);
+            return running({
+              putState: {
+                status: state ? "updated" : "created",
+                task,
+              },
+              visibility: visibility({
+                workflow: input.workflow_name,
+                task,
+              }),
+            });
+          },
+        });
+        "#,
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let bundle = sample_bundle();
+    let handler =
+        SandboxModuleWorkflowTaskV1Handler::new(session, bundle.clone()).expect("module handler");
+
+    let route = handler
+        .route_event_v1(WorkflowTaskV1RouteRequest {
+            abi: WORKFLOW_TASK_V1_ABI.to_string(),
+            event: sample_event(),
+        })
+        .await
+        .expect("route event");
+    assert_eq!(route.instance_id, "acct-7");
+
+    let mut input = sample_input(&bundle);
+    input.state = None;
+    input.history_len = 0;
+    let response = handler
+        .handle_task_v1(WorkflowTaskV1Request {
+            abi: WORKFLOW_TASK_V1_ABI.to_string(),
+            input,
+            deterministic: terracedb_workflows_core::WorkflowDeterministicSeed {
+                workflow_name: "billing".to_string(),
+                instance_id: "acct-7".to_string(),
+                run_id: terracedb_workflows_core::WorkflowRunId::new("run:acct-7").expect("run id"),
+                task_id: WorkflowTaskId::new("task:acct-7:1").expect("task id"),
+                trigger_hash: 11,
+                state_hash: 22,
+            },
+        })
+        .await
+        .expect("handle task");
+
+    assert_eq!(response.abi, WORKFLOW_TASK_V1_ABI);
+    assert_eq!(
+        response.output.state,
+        WorkflowStateMutation::Put {
+            state: WorkflowPayload::bytes(r#"{"status":"created","task":"acct-7:1"}"#),
+        }
+    );
+    assert_eq!(
+        response.output.visibility.expect("visibility").summary,
+        BTreeMap::from([
+            ("workflow".to_string(), "billing".to_string()),
+            ("task".to_string(), "acct-7:1".to_string()),
+        ])
+    );
 }

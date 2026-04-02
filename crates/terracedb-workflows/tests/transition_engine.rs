@@ -6,9 +6,9 @@ use terracedb_fuzz::{GeneratedScenarioHarness, assert_seed_replays, assert_seed_
 use terracedb_workflows::{
     contracts::{
         WorkflowBundleId, WorkflowChangeKind, WorkflowCommand, WorkflowContinueAsNew,
-        WorkflowLifecycleState, WorkflowOutboxCommand, WorkflowPayload, WorkflowRunId,
-        WorkflowSourceEvent, WorkflowStateMutation, WorkflowStateRecord, WorkflowTaskId,
-        WorkflowTransitionInput, WorkflowTransitionOutput, WorkflowTrigger,
+        WorkflowExecutionTarget, WorkflowLifecycleState, WorkflowOutboxCommand, WorkflowPayload,
+        WorkflowRunId, WorkflowSourceEvent, WorkflowStateMutation, WorkflowStateRecord,
+        WorkflowTaskId, WorkflowTransitionInput, WorkflowTransitionOutput, WorkflowTrigger,
         WorkflowVisibilityUpdate,
     },
     transition_engine::{
@@ -21,7 +21,9 @@ use terracedb_workflows::{
 fn workflow_state_record(lifecycle: WorkflowLifecycleState) -> WorkflowStateRecord {
     WorkflowStateRecord {
         run_id: WorkflowRunId::new("run:payments-1").expect("run id"),
-        bundle_id: WorkflowBundleId::new("bundle:payments-v1").expect("bundle id"),
+        target: WorkflowExecutionTarget::Bundle {
+            bundle_id: WorkflowBundleId::new("bundle:payments-v1").expect("bundle id"),
+        },
         workflow_name: "payments".to_string(),
         instance_id: "acct-7".to_string(),
         lifecycle,
@@ -64,7 +66,7 @@ fn transition_input(
 ) -> WorkflowTransitionInput {
     WorkflowTransitionInput {
         run_id: snapshot.state.run_id.clone(),
-        bundle_id: snapshot.state.bundle_id.clone(),
+        target: snapshot.state.target.clone(),
         task_id: WorkflowTaskId::new(task_id).expect("task id"),
         workflow_name: snapshot.state.workflow_name.clone(),
         instance_id: snapshot.state.instance_id.clone(),
@@ -745,7 +747,9 @@ fn transition_engine_records_continue_as_new_edges() {
         visibility: None,
         continue_as_new: Some(WorkflowContinueAsNew {
             next_run_id: WorkflowRunId::new("run:payments-2").expect("next run id"),
-            next_bundle_id: WorkflowBundleId::new("bundle:payments-v2").expect("next bundle id"),
+            next_target: WorkflowExecutionTarget::Bundle {
+                bundle_id: WorkflowBundleId::new("bundle:payments-v2").expect("next bundle id"),
+            },
             state: Some(WorkflowPayload::bytes("carry-forward")),
         }),
         commands: Vec::new(),

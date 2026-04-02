@@ -29,15 +29,15 @@ mod run_model;
 pub mod transition_engine;
 
 pub use run_model::{
-    InMemoryWorkflowRunStore, WorkflowHistoryRecord, WorkflowReductionPlan, WorkflowRunBuilder,
-    WorkflowRunRecord, WorkflowTransitionReducer, default_native_bundle_id, default_run_id,
-    default_task_id,
+    InMemoryWorkflowRunStore, WorkflowHistoryRecord, WorkflowRunBuilder, WorkflowRunRecord,
+    default_native_target, default_run_id, default_task_id,
 };
+use run_model::{WorkflowReductionPlan, WorkflowTransitionReducer};
 pub use terracedb_workflows_core as contracts;
 pub use terracedb_workflows_sandbox as sandbox_contracts;
 use transition_engine::{
     WorkflowEffectIntent, WorkflowExecutionSnapshot, WorkflowTransitionEngine,
-    WorkflowTransitionProposal,
+    WorkflowTransitionPlan, WorkflowTransitionProposal,
 };
 
 pub const DEFAULT_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -833,6 +833,7 @@ impl std::fmt::Display for WorkflowCheckpointId {
 pub enum WorkflowCheckpointArtifactKind {
     Runs,
     State,
+    Savepoints,
     History,
     Lifecycle,
     Visibility,
@@ -850,6 +851,7 @@ impl WorkflowCheckpointArtifactKind {
         match self {
             Self::Runs => "runs",
             Self::State => "state",
+            Self::Savepoints => "savepoints",
             Self::History => "history",
             Self::Lifecycle => "lifecycle",
             Self::Visibility => "visibility",
@@ -1359,7 +1361,7 @@ pub trait WorkflowRuntimeHandler: Send + Sync {
             task.trigger_seq,
             task.admitted_at_millis,
             current_state,
-            &default_native_bundle_id(&task.workflow_name),
+            &default_native_target(&task.workflow_name),
             trigger,
         )
         .map_err(WorkflowHandlerError::new)?;
@@ -1399,35 +1401,39 @@ where
 
 #[derive(Clone, Debug)]
 pub struct ContractWorkflowHandler<H> {
-    bundle: contracts::WorkflowBundleMetadata,
+    execution: contracts::WorkflowExecutionDescriptor,
     inner: H,
 }
 
 impl<H> ContractWorkflowHandler<H> {
-    pub fn new(
-        bundle: contracts::WorkflowBundleMetadata,
-        inner: H,
-    ) -> Result<Self, contracts::WorkflowTaskError> {
-        if bundle.workflow_name.trim().is_empty() {
+    pub fn new<D>(execution: D, inner: H) -> Result<Self, contracts::WorkflowTaskError>
+    where
+        D: Into<contracts::WorkflowExecutionDescriptor>,
+    {
+        let execution = execution.into();
+        if execution.workflow_name().trim().is_empty() {
             return Err(contracts::WorkflowTaskError::invalid_contract(
-                "workflow bundle name cannot be empty",
+                "workflow execution name cannot be empty",
             ));
         }
-        let Some(runtime_surface) = bundle.labels.get(WORKFLOW_RUNTIME_SURFACE_LABEL) else {
+        let Some(runtime_surface) = execution.labels().get(WORKFLOW_RUNTIME_SURFACE_LABEL) else {
             return Err(contracts::WorkflowTaskError::invalid_contract(format!(
-                "workflow bundle {} must declare {}={} before it can run on the current runtime adapter",
-                bundle.bundle_id,
+                "workflow execution target {:?} must declare {}={} before it can run on the current runtime adapter",
+                execution.target(),
                 WORKFLOW_RUNTIME_SURFACE_LABEL,
                 WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1
             )));
         };
         if runtime_surface != WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1 {
             return Err(contracts::WorkflowTaskError::invalid_contract(format!(
-                "workflow bundle {} declares unsupported runtime surface {}; expected {}",
-                bundle.bundle_id, runtime_surface, WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1
+                "workflow execution target {:?} declares unsupported runtime surface {}; expected {}",
+                execution.target(),
+                runtime_surface,
+                WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1
             )));
         }
-        if let contracts::WorkflowBundleKind::Sandbox { abi, .. } = &bundle.kind
+        if let contracts::WorkflowExecutionDescriptor::Bundle { bundle } = &execution
+            && let contracts::WorkflowBundleKind::Sandbox { abi, .. } = &bundle.kind
             && abi != sandbox_contracts::WORKFLOW_TASK_V1_ABI
         {
             return Err(contracts::WorkflowTaskError::new(
@@ -1439,11 +1445,11 @@ impl<H> ContractWorkflowHandler<H> {
                 ),
             ));
         }
-        Ok(Self { bundle, inner })
+        Ok(Self { execution, inner })
     }
 
-    pub fn bundle(&self) -> &contracts::WorkflowBundleMetadata {
-        &self.bundle
+    pub fn execution(&self) -> &contracts::WorkflowExecutionDescriptor {
+        &self.execution
     }
 
     pub fn into_inner(self) -> H {
@@ -1470,7 +1476,7 @@ where
         _state: Option<Value>,
         trigger: &WorkflowTrigger,
     ) -> Result<WorkflowOutput, WorkflowHandlerError> {
-        let input = build_contract_transition_input(task, &self.bundle, None, trigger)
+        let input = build_contract_transition_input(task, &self.execution, None, trigger)
             .map_err(WorkflowHandlerError::new)?;
         let ctx = contracts::WorkflowDeterministicContext::new(
             &input,
@@ -1493,7 +1499,7 @@ where
         current_state: Option<&contracts::WorkflowStateRecord>,
         trigger: &WorkflowTrigger,
     ) -> Result<WorkflowRuntimePlan, WorkflowHandlerError> {
-        let input = build_contract_transition_input(task, &self.bundle, current_state, trigger)
+        let input = build_contract_transition_input(task, &self.execution, current_state, trigger)
             .map_err(WorkflowHandlerError::new)?;
         let ctx = contracts::WorkflowDeterministicContext::new(
             &input,
@@ -1531,15 +1537,18 @@ where
                     )));
                 }
             };
-            let _stored: StoredAdmittedWorkflowTrigger =
-                decode_payload(bytes, "workflow inbox trigger").map_err(|error| {
-                    WorkflowHandlerError::new(std::io::Error::other(format!(
-                        "workflow bundle {} rejects unsupported pending inbox row {:?}: {}",
-                        self.bundle.bundle_id,
-                        String::from_utf8_lossy(&key),
-                        error
-                    )))
-                })?;
+            let _stored: StoredAdmittedWorkflowTrigger = decode_payload(
+                bytes,
+                "workflow inbox trigger",
+            )
+            .map_err(|error| {
+                WorkflowHandlerError::new(std::io::Error::other(format!(
+                    "workflow execution target {:?} rejects unsupported pending inbox row {:?}: {}",
+                    self.execution.target(),
+                    String::from_utf8_lossy(&key),
+                    error
+                )))
+            })?;
         }
         Ok(())
     }
@@ -1623,6 +1632,7 @@ impl WorkflowScheduler for RoundRobinWorkflowScheduler {
 pub struct WorkflowTableNames {
     pub runs: String,
     pub state: String,
+    pub savepoints: String,
     pub history: String,
     pub lifecycle: String,
     pub visibility: String,
@@ -1641,6 +1651,7 @@ impl WorkflowTableNames {
         Self {
             runs: format!("{prefix}_runs"),
             state: format!("{prefix}_state"),
+            savepoints: format!("{prefix}_savepoints"),
             history: format!("{prefix}_history"),
             lifecycle: format!("{prefix}_lifecycle"),
             visibility: format!("{prefix}_visibility"),
@@ -1659,6 +1670,7 @@ impl WorkflowTableNames {
 pub struct WorkflowTables {
     runs: Table,
     state: Table,
+    savepoints: Table,
     history: Table,
     lifecycle: Table,
     visibility: Table,
@@ -1677,6 +1689,10 @@ impl WorkflowTables {
 
     pub fn state_table(&self) -> &Table {
         &self.state
+    }
+
+    pub fn savepoint_table(&self) -> &Table {
+        &self.savepoints
     }
 
     pub fn history_table(&self) -> &Table {
@@ -2067,7 +2083,21 @@ where
         )
     }
 
-    pub async fn load_run_history(
+    pub async fn load_savepoint_record(
+        &self,
+        run_id: &contracts::WorkflowRunId,
+    ) -> Result<Option<contracts::WorkflowSavepointRecord>, WorkflowError> {
+        decode_workflow_savepoint_record_opt(
+            self.inner
+                .tables
+                .savepoint_table()
+                .read(workflow_run_key(run_id))
+                .await?
+                .as_ref(),
+        )
+    }
+
+    pub async fn load_visible_history(
         &self,
         run_id: &contracts::WorkflowRunId,
     ) -> Result<Vec<WorkflowHistoryRecord>, WorkflowError> {
@@ -2090,12 +2120,12 @@ where
         describe_run_at_snapshot(&self.inner, &mut tx, &request.run_id).await
     }
 
-    pub async fn load_run_history_page(
+    pub async fn load_visible_history_page(
         &self,
-        request: contracts::WorkflowHistoryPageRequest,
-    ) -> Result<contracts::WorkflowHistoryPageResponse, contracts::WorkflowTaskError> {
+        request: contracts::WorkflowVisibleHistoryPageRequest,
+    ) -> Result<contracts::WorkflowVisibleHistoryPageResponse, contracts::WorkflowTaskError> {
         let mut tx = Transaction::begin(&self.inner.db).await;
-        history_page_at_snapshot(&self.inner, &mut tx, request).await
+        visible_history_page_at_snapshot(&self.inner, &mut tx, request).await
     }
 
     pub async fn load_run_forensics(
@@ -2823,11 +2853,11 @@ where
         self.describe_run(request).await
     }
 
-    async fn history(
+    async fn visible_history(
         &self,
-        request: contracts::WorkflowHistoryPageRequest,
-    ) -> Result<contracts::WorkflowHistoryPageResponse, contracts::WorkflowTaskError> {
-        self.load_run_history_page(request).await
+        request: contracts::WorkflowVisibleHistoryPageRequest,
+    ) -> Result<contracts::WorkflowVisibleHistoryPageResponse, contracts::WorkflowTaskError> {
+        self.load_visible_history_page(request).await
     }
 }
 
@@ -4487,46 +4517,84 @@ where
             &runtime_plan.input,
             operation_context.as_ref(),
         );
-        if !runtime_plan.proposal.directives.is_empty() {
-            return Err(WorkflowError::Handler {
-                name: runtime.name.clone(),
-                source: WorkflowHandlerError::new(std::io::Error::other(
-                    "workflow executor directives are not yet supported by this runtime loop",
-                )),
-            });
-        }
         let committed_at_millis = runtime.clock.now().get();
-        let execution_snapshot =
-            synthesize_execution_snapshot(processing_state_record, &runtime_plan.input);
-        let transition_plan = runtime
-            .transition_engine
-            .plan_transition(
-                &execution_snapshot,
-                runtime_plan.input.clone(),
-                runtime_plan.proposal.clone(),
-                committed_at_millis,
+        tx.delete(runtime.tables.inbox_table(), inbox_key);
+        if runtime_plan.proposal.directives.is_empty() {
+            let reduction = runtime
+                .reducer
+                .reduce(
+                    processing_state_record,
+                    &runtime_plan.input,
+                    &runtime_plan.proposal.output,
+                    committed_at_millis,
+                )
+                .map_err(|error| {
+                    WorkflowError::Storage(StorageError::corruption(error.to_string()))
+                })?;
+            stage_reduction_plan_in_transaction(runtime, &mut tx, instance_id, reduction)?;
+            let effect_intents = runtime
+                .transition_engine
+                .plan_transition(
+                    &synthesize_execution_snapshot(processing_state_record, &runtime_plan.input),
+                    runtime_plan.input.clone(),
+                    runtime_plan.proposal.clone(),
+                    committed_at_millis,
+                )
+                .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?
+                .effect_intents;
+            stage_workflow_effect_intents_in_transaction(
+                runtime,
+                &mut tx,
+                instance_id,
+                &effect_intents,
+                operation_context.clone(),
             )
-            .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?;
-        let reduction = runtime
-            .reducer
-            .reduce(
+            .await?;
+        } else {
+            if runtime_plan.proposal.output.continue_as_new.is_some() {
+                return Err(WorkflowError::Handler {
+                    name: runtime.name.clone(),
+                    source: WorkflowHandlerError::new(std::io::Error::other(
+                        "continue-as-new is not yet supported by directive-backed workflow execution",
+                    )),
+                });
+            }
+            let execution_snapshot = load_workflow_execution_snapshot(
+                &mut tx,
+                &runtime.tables,
                 processing_state_record,
                 &runtime_plan.input,
-                &runtime_plan.proposal.output,
-                committed_at_millis,
             )
-            .map_err(|error| WorkflowError::Storage(StorageError::corruption(error.to_string())))?;
-
-        tx.delete(runtime.tables.inbox_table(), inbox_key);
-        stage_reduction_plan_in_transaction(runtime, &mut tx, instance_id, reduction)?;
-        stage_workflow_effect_intents_in_transaction(
-            runtime,
-            &mut tx,
-            instance_id,
-            &transition_plan.effect_intents,
-            operation_context.clone(),
-        )
-        .await?;
+            .await?;
+            let transition_plan = runtime
+                .transition_engine
+                .plan_transition(
+                    &execution_snapshot,
+                    runtime_plan.input.clone(),
+                    runtime_plan.proposal.clone(),
+                    committed_at_millis,
+                )
+                .map_err(|error| {
+                    WorkflowError::Storage(StorageError::corruption(error.to_string()))
+                })?;
+            stage_transition_plan_in_transaction(
+                runtime,
+                &mut tx,
+                instance_id,
+                processing_state_record,
+                &runtime_plan.input,
+                &transition_plan,
+                committed_at_millis,
+            )?;
+            stage_workflow_effect_intents_in_transaction(
+                runtime,
+                &mut tx,
+                instance_id,
+                &transition_plan.effect_intents,
+                operation_context.clone(),
+            )
+            .await?;
+        }
 
         let _ = runtime
             .db
@@ -4716,6 +4784,8 @@ where
         scan_table_rows_at_sequence(runtime.tables.run_table(), durable_sequence).await?;
     let state_rows =
         scan_table_rows_at_sequence(runtime.tables.state_table(), durable_sequence).await?;
+    let savepoint_rows =
+        scan_table_rows_at_sequence(runtime.tables.savepoint_table(), durable_sequence).await?;
     let history_rows =
         scan_table_rows_at_sequence(runtime.tables.history_table(), durable_sequence).await?;
     let lifecycle_rows =
@@ -4757,6 +4827,13 @@ where
             bytes: encode_checkpoint_table_artifact(
                 WorkflowCheckpointArtifactKind::State,
                 &state_rows,
+            )?,
+        },
+        WorkflowCheckpointArtifactPayload {
+            kind: WorkflowCheckpointArtifactKind::Savepoints,
+            bytes: encode_checkpoint_table_artifact(
+                WorkflowCheckpointArtifactKind::Savepoints,
+                &savepoint_rows,
             )?,
         },
         WorkflowCheckpointArtifactPayload {
@@ -4881,6 +4958,13 @@ where
         WorkflowCheckpointArtifactKind::State,
     )
     .await?;
+    let savepoint_rows = load_required_checkpoint_rows(
+        checkpoint_store.as_ref(),
+        &runtime.name,
+        manifest.checkpoint_id,
+        WorkflowCheckpointArtifactKind::Savepoints,
+    )
+    .await?;
     let history_rows = load_required_checkpoint_rows(
         checkpoint_store.as_ref(),
         &runtime.name,
@@ -4980,6 +5064,8 @@ where
         scan_table_keys_at_sequence(runtime.tables.run_table(), durable_sequence).await?;
     let existing_state_keys =
         scan_table_keys_at_sequence(runtime.tables.state_table(), durable_sequence).await?;
+    let existing_savepoint_keys =
+        scan_table_keys_at_sequence(runtime.tables.savepoint_table(), durable_sequence).await?;
     let existing_history_keys =
         scan_table_keys_at_sequence(runtime.tables.history_table(), durable_sequence).await?;
     let existing_lifecycle_keys =
@@ -5016,6 +5102,12 @@ where
         runtime.tables.state_table(),
         &existing_state_keys,
         &state_rows,
+    );
+    replace_table_rows_in_transaction(
+        &mut tx,
+        runtime.tables.savepoint_table(),
+        &existing_savepoint_keys,
+        &savepoint_rows,
     );
     replace_table_rows_in_transaction(
         &mut tx,
@@ -5197,6 +5289,7 @@ async fn ensure_workflow_tables(
 ) -> Result<WorkflowTables, WorkflowError> {
     let runs = ensure_table(db, &table_names.runs).await?;
     let state = ensure_table(db, &table_names.state).await?;
+    let savepoints = ensure_table(db, &table_names.savepoints).await?;
     let history = ensure_table(db, &table_names.history).await?;
     let lifecycle = ensure_table(db, &table_names.lifecycle).await?;
     let visibility = ensure_table(db, &table_names.visibility).await?;
@@ -5211,6 +5304,7 @@ async fn ensure_workflow_tables(
     Ok(WorkflowTables {
         runs,
         state,
+        savepoints,
         history,
         lifecycle,
         visibility,
@@ -5296,15 +5390,6 @@ fn decode_workflow_history_key_sequence(
     let mut sequence = [0_u8; 8];
     sequence.copy_from_slice(&key[prefix.len()..]);
     Ok(u64::from_be_bytes(sequence))
-}
-
-fn decode_workflow_history_key_run_id(
-    key: &[u8],
-) -> Result<contracts::WorkflowRunId, WorkflowError> {
-    if key.len() < 9 || key[key.len() - 9] != INBOX_KEY_SEPARATOR {
-        return Err(StorageError::corruption("workflow history key encoding is invalid").into());
-    }
-    decode_workflow_run_id_key(&key[..key.len() - 9], "workflow history key")
 }
 
 fn default_run_id_instance_id<'a>(workflow_name: &str, run_id: &'a str) -> Option<&'a str> {
@@ -5559,11 +5644,11 @@ where
     })
 }
 
-async fn history_page_at_snapshot<H>(
+async fn visible_history_page_at_snapshot<H>(
     runtime: &WorkflowRuntimeInner<H>,
     tx: &mut Transaction,
-    request: contracts::WorkflowHistoryPageRequest,
-) -> Result<contracts::WorkflowHistoryPageResponse, contracts::WorkflowTaskError>
+    request: contracts::WorkflowVisibleHistoryPageRequest,
+) -> Result<contracts::WorkflowVisibleHistoryPageResponse, contracts::WorkflowTaskError>
 where
     H: WorkflowRuntimeHandler + 'static,
 {
@@ -5574,8 +5659,8 @@ where
     )
     .await
     .map_err(map_workflow_runtime_error_to_task_error)?;
-    Ok(paginate_workflow_history(
-        history.iter().map(workflow_history_page_entry),
+    Ok(paginate_visible_history(
+        history.iter().filter_map(workflow_visible_history_page_entry),
         request.after_sequence,
         request.limit,
     ))
@@ -5588,7 +5673,7 @@ fn reconstruct_workflow_state_from_history(
     history: &[WorkflowHistoryRecord],
 ) -> Result<contracts::WorkflowStateRecord, WorkflowError> {
     if visibility_record.run_id != run_record.run_id
-        || visibility_record.bundle_id != run_record.bundle_id
+        || visibility_record.target != run_record.target
         || visibility_record.workflow_name != run_record.workflow_name
         || visibility_record.instance_id != run_record.instance_id
     {
@@ -5620,24 +5705,24 @@ fn reconstruct_workflow_state_from_history(
             }
         }
     }
-    if seen < visibility_record.history_len {
+    if seen < visibility_record.visible_history_len {
         return Err(StorageError::corruption(format!(
             "workflow history for run {} ended at {} before visibility length {}",
-            run_record.run_id, seen, visibility_record.history_len
+            run_record.run_id, seen, visibility_record.visible_history_len
         ))
         .into());
     }
 
     Ok(contracts::WorkflowStateRecord {
         run_id: run_record.run_id.clone(),
-        bundle_id: run_record.bundle_id.clone(),
+        target: run_record.target.clone(),
         workflow_name: run_record.workflow_name.clone(),
         instance_id: run_record.instance_id.clone(),
         lifecycle: lifecycle_record
             .map(|record| record.lifecycle)
             .unwrap_or(visibility_record.lifecycle),
         current_task_id: visibility_record.last_task_id.clone(),
-        history_len: visibility_record.history_len,
+        history_len: visibility_record.visible_history_len,
         state,
         updated_at_millis: visibility_record.updated_at_millis,
     })
@@ -5652,22 +5737,32 @@ fn workflow_visibility_entry(
     }
 }
 
-fn workflow_history_page_entry(
+fn workflow_visible_history_page_entry(
     record: &WorkflowHistoryRecord,
-) -> contracts::WorkflowHistoryPageEntry {
-    contracts::WorkflowHistoryPageEntry {
+) -> Option<contracts::WorkflowVisibleHistoryEntry> {
+    let contracts::WorkflowHistoryEvent::VisibilityUpdated {
+        record: visibility_record,
+    } = &record.event
+    else {
+        return None;
+    };
+    Some(contracts::WorkflowVisibleHistoryEntry {
         sequence: record.sequence,
-        event: record.event.clone(),
-    }
+        lifecycle: visibility_record.lifecycle,
+        task_id: visibility_record.last_task_id.clone(),
+        summary: visibility_record.summary.clone(),
+        note: None,
+        recorded_at_millis: visibility_record.updated_at_millis,
+    })
 }
 
-fn paginate_workflow_history<I>(
+fn paginate_visible_history<I>(
     entries: I,
     after_sequence: Option<u64>,
     limit: u32,
-) -> contracts::WorkflowHistoryPageResponse
+) -> contracts::WorkflowVisibleHistoryPageResponse
 where
-    I: IntoIterator<Item = contracts::WorkflowHistoryPageEntry>,
+    I: IntoIterator<Item = contracts::WorkflowVisibleHistoryEntry>,
 {
     let limit = if limit == 0 {
         usize::MAX
@@ -5683,12 +5778,12 @@ where
         if page.len() == limit {
             next_after_sequence = page
                 .last()
-                .map(|entry: &contracts::WorkflowHistoryPageEntry| entry.sequence);
+                .map(|entry: &contracts::WorkflowVisibleHistoryEntry| entry.sequence);
             break;
         }
         page.push(entry);
     }
-    contracts::WorkflowHistoryPageResponse {
+    contracts::WorkflowVisibleHistoryPageResponse {
         entries: page,
         next_after_sequence,
     }
@@ -5924,6 +6019,54 @@ fn task_error_from_handler_error(
     contracts::WorkflowTaskError::new(code, error.to_string())
 }
 
+async fn load_workflow_execution_snapshot(
+    tx: &mut Transaction,
+    tables: &WorkflowTables,
+    current_state: Option<&contracts::WorkflowStateRecord>,
+    input: &contracts::WorkflowTransitionInput,
+) -> Result<WorkflowExecutionSnapshot, WorkflowError> {
+    let Some(current_state) = current_state else {
+        return Ok(synthesize_execution_snapshot(None, input));
+    };
+    let savepoint = decode_workflow_savepoint_record_opt(
+        tx.read(
+            tables.savepoint_table(),
+            workflow_run_key(&current_state.run_id),
+        )
+        .await?
+        .as_ref(),
+    )?;
+    let Some(savepoint) = savepoint else {
+        return Ok(synthesize_execution_snapshot(Some(current_state), input));
+    };
+    let Some(payload) = savepoint.state.as_ref() else {
+        return Ok(synthesize_execution_snapshot(Some(current_state), input));
+    };
+    let snapshot = decode_execution_snapshot_payload(payload)?;
+    if snapshot.state.run_id != current_state.run_id
+        || snapshot.state.target != current_state.target
+        || snapshot.state.workflow_name != current_state.workflow_name
+        || snapshot.state.instance_id != current_state.instance_id
+    {
+        return Err(active_run_metadata_corruption(
+            &current_state.run_id,
+            "workflow savepoint snapshot does not match active state identity",
+        ));
+    }
+    if snapshot.state.lifecycle != current_state.lifecycle
+        || snapshot.state.current_task_id != current_state.current_task_id
+        || snapshot.state.history_len != current_state.history_len
+        || snapshot.state.state != current_state.state
+        || snapshot.state.updated_at_millis != current_state.updated_at_millis
+    {
+        return Err(active_run_metadata_corruption(
+            &current_state.run_id,
+            "workflow savepoint snapshot does not match active state summary",
+        ));
+    }
+    Ok(snapshot)
+}
+
 async fn validate_active_run_metadata(
     tx: &mut Transaction,
     workflow_name: &str,
@@ -5945,22 +6088,19 @@ async fn validate_active_run_metadata(
         tx.read(tables.lifecycle_table(), workflow_run_key(&state.run_id))
             .await?
             .as_ref(),
-    )?
-    .ok_or_else(|| {
-        active_run_metadata_corruption(&state.run_id, "workflow lifecycle record missing")
-    })?;
-    validate_active_lifecycle_record(state, &lifecycle_record)?;
+    )?;
+    if let Some(lifecycle_record) = lifecycle_record.as_ref() {
+        validate_active_lifecycle_record(state, lifecycle_record)?;
+    }
 
     let visibility_record = decode_workflow_visibility_record_opt(
         tx.read(tables.visibility_table(), workflow_run_key(&state.run_id))
             .await?
             .as_ref(),
-    )?
-    .ok_or_else(|| {
-        active_run_metadata_corruption(&state.run_id, "workflow visibility record missing")
-    })?;
-    validate_active_visibility_record(state, &visibility_record)?;
-    validate_active_run_history(tx, tables.history_table(), state, &visibility_record).await?;
+    )?;
+    if let Some(visibility_record) = visibility_record.as_ref() {
+        validate_active_visibility_record(state, visibility_record)?;
+    }
     Ok(())
 }
 
@@ -5972,7 +6112,6 @@ async fn validate_missing_state_row(
 ) -> Result<(), WorkflowError> {
     let snapshot_sequence = tx.snapshot_sequence();
     let mut run_ids = BTreeSet::new();
-    let mut visibility_run_ids = BTreeSet::new();
 
     let mut run_rows = tables
         .run_table()
@@ -5999,33 +6138,6 @@ async fn validate_missing_state_row(
         }
     }
 
-    let mut visibility_rows = tables
-        .visibility_table()
-        .scan_at(
-            FULL_SCAN_START.to_vec(),
-            FULL_SCAN_END.to_vec(),
-            snapshot_sequence,
-            ScanOptions::default(),
-        )
-        .await?;
-    while let Some((_, value)) = visibility_rows.next().await {
-        let Some(visibility_record) = decode_workflow_visibility_record_opt(Some(&value))? else {
-            continue;
-        };
-        visibility_run_ids.insert(visibility_record.run_id.clone());
-        if visibility_record.workflow_name == workflow_name
-            && visibility_record.instance_id == instance_id
-        {
-            return Err(missing_state_row_corruption(
-                instance_id,
-                format!(
-                    "workflow state record is missing while visibility for run {} still exists",
-                    visibility_record.run_id.as_str()
-                ),
-            ));
-        }
-    }
-
     let mut lifecycle_rows = tables
         .lifecycle_table()
         .scan_at(
@@ -6046,58 +6158,11 @@ async fn validate_missing_state_row(
                 ),
             ));
         }
-        if !run_ids.contains(&run_id) || !visibility_run_ids.contains(&run_id) {
+        if !run_ids.contains(&run_id) {
             return Err(missing_state_row_corruption(
                 instance_id,
                 format!(
                     "workflow state record is missing while orphan lifecycle for run {} still exists",
-                    run_id.as_str()
-                ),
-            ));
-        }
-    }
-
-    let mut history_rows = tables
-        .history_table()
-        .scan_at(
-            FULL_SCAN_START.to_vec(),
-            FULL_SCAN_END.to_vec(),
-            snapshot_sequence,
-            ScanOptions::default(),
-        )
-        .await?;
-    while let Some((key, value)) = history_rows.next().await {
-        let run_id = decode_workflow_history_key_run_id(&key)?;
-        if default_run_id_instance_id(workflow_name, run_id.as_str()) == Some(instance_id) {
-            return Err(missing_state_row_corruption(
-                instance_id,
-                format!(
-                    "workflow state record is missing while history for run {} still exists",
-                    run_id.as_str()
-                ),
-            ));
-        }
-        let event = decode_workflow_history_event_value(&value)?;
-        if let contracts::WorkflowHistoryEvent::RunCreated {
-            run_id,
-            instance_id: history_instance_id,
-            ..
-        } = event
-            && history_instance_id == instance_id
-        {
-            return Err(missing_state_row_corruption(
-                instance_id,
-                format!(
-                    "workflow state record is missing while history for run {} still exists",
-                    run_id.as_str()
-                ),
-            ));
-        }
-        if !run_ids.contains(&run_id) || !visibility_run_ids.contains(&run_id) {
-            return Err(missing_state_row_corruption(
-                instance_id,
-                format!(
-                    "workflow state record is missing while orphan history for run {} still exists",
                     run_id.as_str()
                 ),
             ));
@@ -6143,10 +6208,10 @@ fn validate_active_run_record(
             "workflow run record id does not match active state",
         ));
     }
-    if run_record.bundle_id != state.bundle_id {
+    if run_record.target != state.target {
         return Err(active_run_metadata_corruption(
             &state.run_id,
-            "workflow run record bundle id does not match active state",
+            "workflow run record target does not match active state",
         ));
     }
     if run_record.workflow_name != state.workflow_name {
@@ -6193,10 +6258,10 @@ fn validate_active_visibility_record(
             "workflow visibility record id does not match active state",
         ));
     }
-    if visibility_record.bundle_id != state.bundle_id {
+    if visibility_record.target != state.target {
         return Err(active_run_metadata_corruption(
             &state.run_id,
-            "workflow visibility record bundle id does not match active state",
+            "workflow visibility record target does not match active state",
         ));
     }
     if visibility_record.workflow_name != state.workflow_name {
@@ -6223,10 +6288,10 @@ fn validate_active_visibility_record(
             "workflow visibility record task id does not match active state",
         ));
     }
-    if visibility_record.history_len != state.history_len {
+    if visibility_record.visible_history_len != state.history_len {
         return Err(active_run_metadata_corruption(
             &state.run_id,
-            "workflow visibility record history length does not match active state",
+            "workflow visibility record visible history length does not match active state",
         ));
     }
     if visibility_record.updated_at_millis != state.updated_at_millis {
@@ -6236,68 +6301,6 @@ fn validate_active_visibility_record(
         ));
     }
     Ok(())
-}
-
-async fn validate_active_run_history(
-    tx: &Transaction,
-    history_table: &Table,
-    state: &contracts::WorkflowStateRecord,
-    visibility_record: &contracts::WorkflowVisibilityRecord,
-) -> Result<(), WorkflowError> {
-    let mut last_event = None;
-    let mut seen = 0_u64;
-    let mut rows = history_table
-        .scan_at(
-            workflow_history_start_key(&state.run_id),
-            workflow_history_end_key(&state.run_id),
-            tx.snapshot_sequence(),
-            ScanOptions::default(),
-        )
-        .await?;
-    while let Some((key, value)) = rows.next().await {
-        let sequence = decode_workflow_history_key_sequence(&state.run_id, &key)?;
-        let expected = seen.saturating_add(1);
-        if sequence != expected {
-            return Err(active_run_metadata_corruption(
-                &state.run_id,
-                format!("workflow history sequence {sequence} is not contiguous"),
-            ));
-        }
-        if sequence > state.history_len {
-            return Err(active_run_metadata_corruption(
-                &state.run_id,
-                format!(
-                    "workflow history contains event {sequence} beyond the active state history length {}",
-                    state.history_len
-                ),
-            ));
-        }
-        seen = sequence;
-        last_event = Some(decode_workflow_history_event_value(&value)?);
-    }
-
-    if seen < state.history_len {
-        return Err(active_run_metadata_corruption(
-            &state.run_id,
-            format!("workflow history event {} missing", seen.saturating_add(1)),
-        ));
-    }
-
-    match last_event {
-        Some(contracts::WorkflowHistoryEvent::VisibilityUpdated { record })
-            if record == *visibility_record =>
-        {
-            Ok(())
-        }
-        Some(_) => Err(active_run_metadata_corruption(
-            &state.run_id,
-            "workflow history does not end with the active visibility record",
-        )),
-        None => Err(active_run_metadata_corruption(
-            &state.run_id,
-            "workflow history is empty for active state",
-        )),
-    }
 }
 
 fn active_run_metadata_corruption(
@@ -6325,7 +6328,7 @@ fn build_transition_input(
     trigger_seq: u64,
     admitted_at_millis: u64,
     current_state: Option<&contracts::WorkflowStateRecord>,
-    bundle_id: &contracts::WorkflowBundleId,
+    target: &contracts::WorkflowExecutionTarget,
     trigger: &WorkflowTrigger,
 ) -> Result<contracts::WorkflowTransitionInput, WorkflowError> {
     let run_id = current_state
@@ -6333,9 +6336,9 @@ fn build_transition_input(
         .unwrap_or_else(|| workflow_run_id_for_admission(workflow_name, instance_id, trigger_seq));
     Ok(contracts::WorkflowTransitionInput {
         run_id,
-        bundle_id: current_state
-            .map(|state| state.bundle_id.clone())
-            .unwrap_or_else(|| bundle_id.clone()),
+        target: current_state
+            .map(|state| state.target.clone())
+            .unwrap_or_else(|| target.clone()),
         task_id: default_task_id(instance_id, trigger_seq),
         workflow_name: workflow_name.to_string(),
         instance_id: instance_id.to_string(),
@@ -6358,7 +6361,7 @@ fn synthesize_execution_snapshot(
         || {
             WorkflowExecutionSnapshot::new(contracts::WorkflowStateRecord {
                 run_id: input.run_id.clone(),
-                bundle_id: input.bundle_id.clone(),
+                target: input.target.clone(),
                 workflow_name: input.workflow_name.clone(),
                 instance_id: input.instance_id.clone(),
                 lifecycle: input.lifecycle,
@@ -6641,6 +6644,146 @@ fn decode_workflow_history_event_value(
     decode_payload(bytes, "workflow history event")
 }
 
+fn encode_workflow_savepoint_record(
+    record: &contracts::WorkflowSavepointRecord,
+) -> Result<Vec<u8>, WorkflowError> {
+    encode_payload(record, "workflow savepoint record")
+}
+
+fn decode_workflow_savepoint_record_opt(
+    value: Option<&Value>,
+) -> Result<Option<contracts::WorkflowSavepointRecord>, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = expect_bytes_value(value, "workflow savepoint record")?;
+    Ok(Some(decode_payload(bytes, "workflow savepoint record")?))
+}
+
+fn encode_execution_snapshot_payload(
+    snapshot: &WorkflowExecutionSnapshot,
+) -> Result<contracts::WorkflowPayload, WorkflowError> {
+    let bytes = serde_json::to_vec(snapshot).map_err(|error| {
+        StorageError::corruption(format!(
+            "workflow execution snapshot serialization failed: {error}"
+        ))
+    })?;
+    Ok(contracts::WorkflowPayload::with_encoding(
+        "application/vnd.terracedb.workflow-execution-snapshot+json",
+        bytes,
+    ))
+}
+
+fn decode_execution_snapshot_payload(
+    payload: &contracts::WorkflowPayload,
+) -> Result<WorkflowExecutionSnapshot, WorkflowError> {
+    if payload.encoding != "application/vnd.terracedb.workflow-execution-snapshot+json" {
+        return Err(StorageError::corruption(format!(
+            "workflow execution snapshot encoding {} is unsupported",
+            payload.encoding
+        ))
+        .into());
+    }
+    serde_json::from_slice(&payload.bytes).map_err(|error| {
+        StorageError::corruption(format!(
+            "workflow execution snapshot decoding failed: {error}"
+        ))
+        .into()
+    })
+}
+
+fn workflow_default_recovery_segment_id(
+    run_id: &contracts::WorkflowRunId,
+) -> contracts::WorkflowRecoverySegmentId {
+    contracts::WorkflowRecoverySegmentId::new(format!("segment:{}:0", run_id.as_str()))
+        .expect("default workflow recovery segment ids should always be valid")
+}
+
+fn workflow_savepoint_id(
+    run_id: &contracts::WorkflowRunId,
+    covered_through_sequence: u64,
+) -> contracts::WorkflowSavepointId {
+    contracts::WorkflowSavepointId::new(format!(
+        "savepoint:{}:{}",
+        run_id.as_str(),
+        covered_through_sequence
+    ))
+    .expect("workflow savepoint ids should always be valid")
+}
+
+fn stage_transition_plan_in_transaction<H>(
+    runtime: &WorkflowRuntimeInner<H>,
+    tx: &mut Transaction,
+    instance_id: &str,
+    current_state: Option<&contracts::WorkflowStateRecord>,
+    input: &contracts::WorkflowTransitionInput,
+    transition_plan: &WorkflowTransitionPlan,
+    committed_at_millis: u64,
+) -> Result<(), WorkflowError>
+where
+    H: WorkflowRuntimeHandler + 'static,
+{
+    if current_state.is_none() {
+        let run_record = WorkflowRunRecord {
+            run_id: input.run_id.clone(),
+            target: input.target.clone(),
+            workflow_name: input.workflow_name.clone(),
+            instance_id: input.instance_id.clone(),
+            created_at_millis: input.admitted_at_millis,
+            continued_from_run_id: None,
+        };
+        tx.write(
+            runtime.tables.run_table(),
+            workflow_run_key(&run_record.run_id),
+            Value::bytes(encode_workflow_run_record(&run_record)?),
+        );
+    }
+
+    tx.write(
+        runtime.tables.state_table(),
+        instance_key(instance_id),
+        Value::bytes(encode_workflow_state_record(
+            &transition_plan.next_snapshot.state,
+        )?),
+    );
+
+    if let Some(lifecycle_record) = transition_plan.lifecycle.as_ref() {
+        tx.write(
+            runtime.tables.lifecycle_table(),
+            workflow_run_key(&lifecycle_record.run_id),
+            Value::bytes(encode_workflow_lifecycle_record(lifecycle_record)?),
+        );
+    }
+
+    if let Some(visibility_record) = transition_plan.visibility.as_ref() {
+        tx.write(
+            runtime.tables.visibility_table(),
+            workflow_run_key(&visibility_record.run_id),
+            Value::bytes(encode_workflow_visibility_record(visibility_record)?),
+        );
+    }
+
+    for history_record in &transition_plan.history {
+        tx.write(
+            runtime.tables.history_table(),
+            workflow_history_key(
+                &transition_plan.next_snapshot.state.run_id,
+                history_record.sequence,
+            ),
+            Value::bytes(encode_workflow_history_event(&history_record.event)?),
+        );
+    }
+
+    stage_execution_savepoint_in_transaction(
+        runtime.tables.savepoint_table(),
+        tx,
+        &transition_plan.next_snapshot,
+        committed_at_millis,
+    )?;
+
+    Ok(())
+}
+
 fn stage_reduction_plan_in_transaction<H>(
     runtime: &WorkflowRuntimeInner<H>,
     tx: &mut Transaction,
@@ -6688,6 +6831,42 @@ where
         );
     }
 
+    let mut snapshot = WorkflowExecutionSnapshot::new(reduction.active_state.clone());
+    if let Some(task_id) = reduction.active_state.current_task_id.clone() {
+        snapshot = snapshot.with_applied_task(task_id);
+    }
+    stage_execution_savepoint_in_transaction(
+        runtime.tables.savepoint_table(),
+        tx,
+        &snapshot,
+        reduction.active_state.updated_at_millis,
+    )?;
+
+    Ok(())
+}
+
+fn stage_execution_savepoint_in_transaction(
+    savepoint_table: &Table,
+    tx: &mut Transaction,
+    snapshot: &WorkflowExecutionSnapshot,
+    committed_at_millis: u64,
+) -> Result<(), WorkflowError> {
+    let run_id = &snapshot.state.run_id;
+    let covered_through_sequence = snapshot.state.history_len;
+    let savepoint_record = contracts::WorkflowSavepointRecord {
+        run_id: run_id.clone(),
+        savepoint_id: workflow_savepoint_id(run_id, covered_through_sequence),
+        checkpoint_kind: contracts::WorkflowCheckpointKind::InternalSavepoint,
+        covering_segment_id: workflow_default_recovery_segment_id(run_id),
+        covered_through_sequence,
+        state: Some(encode_execution_snapshot_payload(snapshot)?),
+        created_at_millis: committed_at_millis,
+    };
+    tx.write(
+        savepoint_table,
+        workflow_run_key(run_id),
+        Value::bytes(encode_workflow_savepoint_record(&savepoint_record)?),
+    );
     Ok(())
 }
 
@@ -7062,14 +7241,15 @@ fn decode_admitted_trigger(
 
 fn build_contract_transition_input(
     task: &WorkflowRuntimeTask,
-    bundle: &contracts::WorkflowBundleMetadata,
+    execution: &contracts::WorkflowExecutionDescriptor,
     current_state: Option<&contracts::WorkflowStateRecord>,
     trigger: &WorkflowTrigger,
 ) -> Result<contracts::WorkflowTransitionInput, contracts::WorkflowTaskError> {
-    if task.workflow_name != bundle.workflow_name {
+    if task.workflow_name != execution.workflow_name() {
         return Err(contracts::WorkflowTaskError::invalid_contract(format!(
-            "workflow runtime name {} does not match bundle workflow {}",
-            task.workflow_name, bundle.workflow_name
+            "workflow runtime name {} does not match execution workflow {}",
+            task.workflow_name,
+            execution.workflow_name()
         )));
     }
 
@@ -7079,9 +7259,9 @@ fn build_contract_transition_input(
             .unwrap_or_else(|| {
                 default_run_id(&task.workflow_name, &task.instance_id, task.trigger_seq)
             }),
-        bundle_id: current_state
-            .map(|state| state.bundle_id.clone())
-            .unwrap_or_else(|| bundle.bundle_id.clone()),
+        target: current_state
+            .map(|state| state.target.clone())
+            .unwrap_or_else(|| execution.target()),
         task_id: contracts::WorkflowTaskId::new(format!(
             "task:{}:{:020}",
             task.instance_id, task.trigger_seq
@@ -7574,7 +7754,10 @@ mod durable_format_tests {
     fn durable_format_fixtures_match_golden_files() {
         let run = WorkflowRunRecord {
             run_id: contracts::WorkflowRunId::new("run:orders:order-1:1").expect("run id"),
-            bundle_id: contracts::WorkflowBundleId::new("native:orders").expect("bundle id"),
+            target: contracts::WorkflowExecutionTarget::NativeRegistration {
+                registration_id: contracts::WorkflowRegistrationId::new("native:orders")
+                    .expect("registration id"),
+            },
             workflow_name: "orders".to_string(),
             instance_id: "order-1".to_string(),
             created_at_millis: 7,
@@ -7583,7 +7766,7 @@ mod durable_format_tests {
         let task_id = contracts::WorkflowTaskId::new("task:order-1:1").expect("task id");
         let state = contracts::WorkflowStateRecord {
             run_id: run.run_id.clone(),
-            bundle_id: run.bundle_id.clone(),
+            target: run.target.clone(),
             workflow_name: run.workflow_name.clone(),
             instance_id: run.instance_id.clone(),
             lifecycle: contracts::WorkflowLifecycleState::Running,
@@ -7602,12 +7785,12 @@ mod durable_format_tests {
         };
         let visibility = contracts::WorkflowVisibilityRecord {
             run_id: run.run_id.clone(),
-            bundle_id: run.bundle_id.clone(),
+            target: run.target.clone(),
             workflow_name: run.workflow_name.clone(),
             instance_id: run.instance_id.clone(),
             lifecycle: contracts::WorkflowLifecycleState::Running,
             last_task_id: Some(task_id.clone()),
-            history_len: 3,
+            visible_history_len: 3,
             summary: BTreeMap::from([("lifecycle".to_string(), "running".to_string())]),
             updated_at_millis: 11,
         };

@@ -5439,17 +5439,17 @@ Add a small, teachable example repo/app that demonstrates the intended way to us
 
 ## Phase 21 — Workflow runs, history, transition-engine contracts, and shared native/sandbox execution
 
-**Phase rule:** T108 freezes the workflow run/history/state model and the public handler contracts first so the rest of the phase can parallelize cleanly. Every implementation task in this phase must add deterministic simulation coverage for the semantics it introduces instead of waiting until the end. T113 is the capstone cross-cutting deterministic hardening task for the combined runtime, and T114 adds a small example repo/app with its own simulation tests that demonstrates both native Rust and sandbox-authored workflows on the same engine.
+**Phase rule:** T108 freezes the workflow run/recovery/state/savepoint model and the public handler contracts first so the rest of the phase can parallelize cleanly. Every implementation task in this phase must add deterministic simulation coverage for the semantics it introduces instead of waiting until the end. T113 is the capstone cross-cutting deterministic hardening task for the combined runtime, and T114 adds a small example repo/app with its own simulation tests that demonstrates both native Rust and sandbox-authored workflows on the same engine.
 
 **Parallelization:** T108 first. T109, T110, and T111 can proceed in parallel once T108 exists. T112 depends on T109 + T110 + T111. T113 depends on T33 + T109 + T110 + T111 + T112. T114 depends on T109 + T110 + T111 + T112 + T113.
 
-### T108. Freeze workflow run, bundle, history, lifecycle, and handler contracts
+### T108. Freeze workflow run, execution, recovery-journal, savepoint, visibility, and handler contracts
 
 **Depends on:** T32, T40a, T84, T100
 
 **Description**
 
-Freeze the stronger workflow model up front: explicit runs pinned to immutable bundles, append-only run history, current mutable state, lifecycle metadata, and separate operator-facing visibility contracts. This task should also freeze the dual handler boundary: native Rust handlers remain first-class, while sandbox handlers plug in through a narrower versioned task ABI.
+Freeze the stronger workflow model up front: explicit runs pinned to immutable execution targets, hidden recovery journals, lightweight internal savepoints, current mutable state, lifecycle metadata, and separate operator-facing visibility contracts. This task should also freeze the dual handler boundary: native Rust handlers remain first-class, while sandbox handlers plug in through a narrower versioned task ABI.
 
 **Implementation note**
 
@@ -5462,10 +5462,13 @@ This task may reserve the refined crate boundaries before every runtime file mov
    - `terracedb-workflows-runtime`,
    - `terracedb-workflows-sandbox` as an adapter layer rather than the whole workflow library.
 2. Freeze the public contracts for:
-   - `WorkflowBundleId`,
+   - `WorkflowExecutionEpoch`,
+   - `WorkflowRunRecord`,
    - `WorkflowRunId`,
    - `WorkflowTaskId`,
-   - `WorkflowHistoryEvent`,
+   - `WorkflowRecoveryJournalRecord`,
+   - `WorkflowSavepointRecord`,
+   - `WorkflowVisibleHistoryEntry`,
    - `WorkflowLifecycleState`,
    - `WorkflowStateRecord`,
    - `WorkflowVisibilityRecord`,
@@ -5477,49 +5480,51 @@ This task may reserve the refined crate boundaries before every runtime file mov
    - the deterministic context helpers and observability hooks visible to both.
 4. Freeze the rule that public handler contracts and private executor/effects contracts are distinct; guest code should never receive the richer internal reducer/effects surface directly.
 5. Freeze deterministic seams for:
-   - bundle resolution,
-   - history append ordering,
+   - execution-target resolution,
+   - recovery-journal append ordering,
+   - lightweight savepoint coverage and segment sealing,
    - retry/timer wakeups,
    - visibility projection updates,
    - native-Rust-vs-sandbox parity testing.
 
 **Verification**
 
-- Compile-only tests that instantiate the new run/history/state/visibility contracts together with both native and sandbox handler adapters.
-- Round-trip tests for bundle metadata, lifecycle records, and history-event encodings.
+- Compile-only tests that instantiate the new run/recovery/state/visibility contracts together with both native and sandbox handler adapters.
+- Round-trip tests for execution metadata, lifecycle records, recovery-journal records, and visible-history encodings.
 - A deterministic smoke test that runs one fake Rust handler and one fake sandbox handler through the same frozen task contract.
 
 ---
 
-### T109. Implement explicit workflow runs, history storage, state reduction, and lifecycle records
+### T109. Implement explicit workflow runs, recovery-journal storage, savepoints, state reduction, and lifecycle records
 
 **Depends on:** T108, T32, T84
 
 **Description**
 
-Implement the refined durable data model for workflows: explicit run records, append-only history, mutable state summaries, and durable lifecycle state. This task owns the storage model and deterministic reducer boundaries, not the higher-level operator surfaces.
+Implement the refined durable data model for workflows: explicit run records, append-only hidden recovery journals, lightweight internal savepoints, mutable state summaries, and durable lifecycle state. This task owns the storage model and deterministic reducer boundaries, not the higher-level operator surfaces.
 
 **Implementation note**
 
-T109 should store and reduce the T108 contract types rather than introducing parallel run/history/state/lifecycle record structs in the runtime layer. If runtime code has not yet moved into a dedicated `terracedb-workflows-runtime` crate, that crate split can still land incrementally during T109/T110/T112 without blocking the semantics in this task.
+T109 should store and reduce the T108 contract types rather than introducing parallel run/recovery/state/lifecycle record structs in the runtime layer. If runtime code has not yet moved into a dedicated `terracedb-workflows-runtime` crate, that crate split can still land incrementally during T109/T110/T112 without blocking the semantics in this task.
 
 **Implementation steps**
 
 1. Implement durable storage for:
-   - workflow runs and pinned bundle identity,
-   - append-only per-run history,
+   - workflow runs and pinned execution identity,
+   - append-only per-run recovery journal segments,
+   - lightweight internal savepoints,
    - current mutable state summary,
    - lifecycle metadata such as scheduled, running, suspended, paused, retry-waiting, completed, or failed.
-2. Implement the state-reduction path that derives current state from admitted transition output and appends matching history events in the same durable unit.
+2. Implement the state-reduction path that derives current state from admitted transition output and appends matching recovery-journal records in the same durable unit.
 3. Record run creation, run completion, continue-as-new edges, and lifecycle changes as explicit durable records instead of burying them in inbox/timer tables only.
 4. Make the runtime robust to simple single-run-per-instance cases while still keeping run IDs explicit for later upgrades and restart-as-new behavior.
 5. Add deterministic helper builders and fake stores so later tasks can exercise the new model without the full runtime being present.
 
 **Verification**
 
-- Deterministic simulation tests proving run creation, replay, lifecycle transitions, and state reduction remain stable across crash/restart.
-- Tests proving history append order and reduced state stay identical for the same admitted trigger sequence.
-- Restart tests showing partially written run metadata or history fails closed and replays deterministically.
+- Deterministic simulation tests proving run creation, replay, lifecycle transitions, state reduction, and savepoint coverage remain stable across crash/restart.
+- Tests proving recovery-journal append order and reduced state stay identical for the same admitted trigger sequence.
+- Restart tests showing partially written run metadata, journal segments, or savepoints fail closed and replay deterministically.
 
 ---
 
@@ -5529,7 +5534,7 @@ T109 should store and reduce the T108 contract types rather than introducing par
 
 **Description**
 
-Implement the Rust-owned transition engine that all workflow inputs must pass through. This task owns the durable-apply-before-side-effects rule, explicit waiter sets, retry state, timer ownership, and the transition from admitted input into history/state/effect proposals.
+Implement the Rust-owned transition engine that all workflow inputs must pass through. This task owns the durable-apply-before-side-effects rule, explicit waiter sets, retry state, timer ownership, and the transition from admitted input into recovery-journal, state, visibility, and effect proposals.
 
 **Implementation note**
 
@@ -5545,7 +5550,7 @@ T110 owns the private executor and effects model that sits behind the frozen T10
    - and future control/update messages.
 2. Implement explicit durable waiter-set storage so suspended work records exactly what completion, signal, or wakeup it is waiting on.
 3. Implement durable retry state with keyed timers so stale retry firings can be detected and ignored safely.
-4. Ensure the transition engine appends history, updates state/lifecycle, and schedules effect intents atomically before any external effect delivery path runs.
+4. Ensure the transition engine appends recovery-journal records, updates state/lifecycle, advances visible-history projections, and schedules effect intents atomically before any external effect delivery path runs.
 5. Keep promise/awakeable-style coordination and timer ownership in the engine-owned data model rather than relying on transient guest-runtime memory.
 
 **Verification**
@@ -5596,7 +5601,7 @@ T108 may already provide the first pass of the shared handler traits, determinis
 
 **Description**
 
-Implement the runtime loop around the new transition engine: owner-local ready-instance scheduling, event-driven wakeups, post-commit effect handoff, and execution-domain-aware placement. This task should preserve the shorter event-driven control loop that the Restate exploration suggested, without abandoning the stronger run/history model.
+Implement the runtime loop around the new transition engine: owner-local ready-instance scheduling, event-driven wakeups, post-commit effect handoff, and execution-domain-aware placement. This task should preserve the shorter event-driven control loop that the Restate exploration suggested, without abandoning the stronger run/recovery/savepoint model.
 
 **Implementation steps**
 
@@ -5614,23 +5619,25 @@ Implement the runtime loop around the new transition engine: owner-local ready-i
 
 ---
 
-### T113. Build cross-cutting deterministic simulation suites for run/history replay, waits, retries, and Rust-vs-sandbox parity
+### T113. Build cross-cutting deterministic simulation suites for run/recovery replay, waits, retries, and Rust-vs-sandbox parity
 
 **Depends on:** T33, T109, T110, T111, T112
 
 **Description**
 
-Bring the redesigned workflow core up to the same correctness bar as the rest of Terracedb by adding whole-system deterministic simulation and crash/fault campaigns for the new run/history model, the transition engine, and the dual native/sandbox execution surface.
+Bring the redesigned workflow core up to the same correctness bar as the rest of Terracedb by adding whole-system deterministic simulation and crash/fault campaigns for the new run/recovery/savepoint model, the transition engine, and the dual native/sandbox execution surface.
 
 **Implementation steps**
 
 1. Extend the workflow shadow/oracle model to cover:
-   - explicit runs and bundles,
-   - append-only history,
+   - explicit runs and execution epochs,
+   - append-only recovery-journal segments,
+   - lightweight internal savepoints,
    - lifecycle transitions,
    - waiter sets,
    - retry state,
    - timer ownership,
+   - visible-history projections,
    - effect proposals,
    - native-Rust-vs-sandbox handler equivalence.
 2. Add randomized workloads that mix:
@@ -5642,7 +5649,8 @@ Bring the redesigned workflow core up to the same correctness bar as the rest of
    - continue-as-new,
    - Rust and sandbox handlers for the same logical workflow.
 3. Add crash cut points around:
-   - history append,
+   - recovery-journal append,
+   - savepoint creation and segment sealing,
    - lifecycle updates,
    - retry-timer registration,
    - effect-proposal persistence,
@@ -5658,7 +5666,7 @@ Bring the redesigned workflow core up to the same correctness bar as the rest of
 **Verification**
 
 - Large-seed deterministic suites covering the combined workflow runtime.
-- Cross-cutting crash/recovery tests for the new run/history model and dual handler surface.
+- Cross-cutting crash/recovery tests for the new run/recovery/savepoint model and dual handler surface.
 - Oracle-backed parity tests proving Rust and sandbox handlers stay behaviorally aligned.
 - Reproducibility tests proving failure artifacts preserve the necessary run and bundle context.
 
@@ -5670,7 +5678,7 @@ Bring the redesigned workflow core up to the same correctness bar as the rest of
 
 **Description**
 
-Add a small, teachable example repo/app that demonstrates the intended workflow-core model in practice: explicit runs/history, the same durable engine driving both native Rust and sandbox-authored workflows, explicit waits/retries/timers, and simulation-backed recovery behavior.
+Add a small, teachable example repo/app that demonstrates the intended workflow-core model in practice: explicit runs and execution identity, hidden recovery journals, automatic savepoints and segment rollover, the same durable engine driving both native Rust and sandbox-authored workflows, explicit waits/retries/timers, and simulation-backed recovery behavior.
 
 **Implementation steps**
 
@@ -5679,10 +5687,11 @@ Add a small, teachable example repo/app that demonstrates the intended workflow-
    - one sandbox-authored workflow,
    - explicit timer and retry behavior,
    - a simple callback or wakeup path.
-2. Show both workflows running against the same run/history/runtime model rather than two different executors.
+2. Show both workflows running against the same run/recovery/runtime model rather than two different executors.
 3. Include enough example docs to explain:
-   - runs vs bundles,
-   - history vs state,
+   - runs vs execution targets,
+   - hidden recovery journal vs visible history,
+   - savepoints and automatic compaction,
    - why waits and retries are durable data,
    - why sandbox execution is optional rather than required.
 4. Make the example own its own deterministic simulation tests and failure/restart scenarios.
@@ -5702,13 +5711,13 @@ Add a small, teachable example repo/app that demonstrates the intended workflow-
 
 **Parallelization:** T115 first. T116, T117, and T118 can proceed in parallel once T115 exists. T119 depends on T116 + T117 + T118. T120 depends on T116 + T119 + T40i. T121 depends on T33 + T116 + T117 + T118 + T119 + T120. T122 depends on T116 + T117 + T118 + T119 + T120 + T121.
 
-### T115. Freeze workflow deployment, visibility, query/update, and upgrade contracts
+### T115. Freeze workflow deployment, visibility, query/update, visible-history, and upgrade contracts
 
 **Depends on:** T108, T109, T111, T100
 
 **Description**
 
-Freeze the operator- and deployment-facing contracts on top of the redesigned workflow core: immutable bundle and deployment metadata, native Rust registration identity, list/describe/history visibility APIs, query/update message lanes, compatibility manifests, and continue-as-new / restart-as-new upgrade semantics.
+Freeze the operator- and deployment-facing contracts on top of the redesigned workflow core: immutable bundle and deployment metadata, native Rust registration identity, list/describe/visible-history visibility APIs, query/update message lanes, compatibility manifests, and explicit continue-as-new / restart-as-new upgrade semantics.
 
 **Implementation note**
 
@@ -5721,7 +5730,7 @@ T115 should build on the bundle/run/visibility contracts frozen in T108 instead 
    - native Rust workflow registration metadata,
    - deployment records and rollout policy,
    - query/update request and response types,
-   - describe/list/history visibility APIs,
+   - describe/list/visible-history visibility APIs,
    - compatibility and upgrade policy metadata.
 2. Freeze the rule that runs pin one bundle or native registration identity for an execution epoch unless an explicit upgrade transition occurs.
 3. Decide the public deployment-manager seams for:
@@ -5781,13 +5790,13 @@ Implement the workflow deployment substrate: immutable bundle records, native Ru
 
 ---
 
-### T117. Implement workflow visibility projection, describe/history APIs, and operator forensics hooks
+### T117. Implement workflow visibility projection, describe/visible-history APIs, and operator forensics hooks
 
 **Depends on:** T115, T109, T112, T32b
 
 **Description**
 
-Implement the operator-facing visibility layer on top of explicit runs/history/state: list/search projections, describe APIs, paginated history APIs, trace/correlation fields, and lower-level hooks for operator forensics. This task should preserve the clear split between authoritative history, mutable state, and operator projection.
+Implement the operator-facing visibility layer on top of explicit runs/recovery/state: list/search projections, describe APIs, paginated visible-history APIs, trace/correlation fields, and lower-level hooks for operator forensics. This task should preserve the clear split between authoritative recovery data, mutable state, and operator projection.
 
 **Implementation steps**
 
@@ -5801,15 +5810,15 @@ Implement the operator-facing visibility layer on top of explicit runs/history/s
 2. Implement dedicated APIs or helper surfaces for:
    - list/search,
    - describe one run,
-   - paginated run history retrieval.
+   - paginated visible-history retrieval.
 3. Keep raw-table or SQL-style introspection as an optional deeper layer rather than the required path for common operator flows.
-4. Add operator-forensics hooks that expose enough metadata to correlate visibility rows with raw history, scheduler state, and deployment identity.
-5. Keep projection rebuild and backfill paths deterministic so visibility can be reconstructed from authoritative history when needed.
+4. Add operator-forensics hooks that expose enough metadata to correlate visibility rows with recovery-journal state, scheduler state, and deployment identity.
+5. Keep projection rebuild and backfill paths deterministic so visibility can be reconstructed from authoritative recovery data when needed.
 
 **Verification**
 
-- Deterministic simulation tests for visibility projection maintenance, rebuild, and list/describe/history behavior across restart.
-- Tests proving visibility rows do not drift from authoritative history/state under randomized workloads.
+- Deterministic simulation tests for visibility projection maintenance, rebuild, and list/describe/visible-history behavior across restart.
+- Tests proving visibility rows do not drift from authoritative recovery/state under randomized workloads.
 - Trace/correlation tests showing runs can be inspected without coupling core correctness to tracing success.
 
 ---
@@ -5820,24 +5829,24 @@ Implement the operator-facing visibility layer on top of explicit runs/history/s
 
 **Description**
 
-Implement the non-history-everything interaction model: read-only queries, validation-style updates, and control messages that only become durable when accepted. This task should let the workflow system support cheap inspection and controlled mutation without forcing every interaction through the same durable path.
+Implement the non-history-everything interaction model: read-only queries, validation-style updates, and control messages that only become durable when accepted. This task should let the workflow system support cheap inspection and controlled mutation without forcing every interaction through the same visible-history or recovery path.
 
 **Implementation steps**
 
-1. Implement read-only workflow queries against current state and/or visibility data without mutating run history.
+1. Implement read-only workflow queries against current state and/or visibility data without mutating the run recovery journal or visible history.
 2. Implement update/control request handling that may:
    - inspect live state,
    - validate against workflow-local policy,
    - reject without appending history,
    - or accept and become a normal durable transition through the engine.
-3. Keep accepted updates on the same transition-engine path as ordinary workflow triggers so history and state stay coherent.
+3. Keep accepted updates on the same transition-engine path as ordinary workflow triggers so recovery state, visible history, and mutable state stay coherent.
 4. Ensure query/update handling works for both native Rust and sandbox-authored workflows without widening the sandbox execution surface.
 5. Add deterministic request IDs or equivalent idempotency hooks for externally initiated update/control flows.
 
 **Verification**
 
 - Deterministic simulation tests for query consistency, accepted vs rejected updates, and idempotent control handling.
-- Tests proving rejected updates leave no durable history while accepted ones reduce through the same durable path as ordinary triggers.
+- Tests proving rejected updates leave no durable recovery or visible-history entry while accepted ones reduce through the same durable path as ordinary triggers.
 - Restart/replay tests around pending or duplicated control requests.
 
 ---
@@ -5848,7 +5857,7 @@ Implement the non-history-everything interaction model: read-only queries, valid
 
 **Description**
 
-Implement the explicit upgrade model for long-running workflows: compatibility gates, pinned runs, continue-as-new boundaries, restart-as-new controls, and rollout policy for new runs. This task should codify the “runs pin one bundle by default” rule instead of leaving upgrades as ad hoc deployment behavior.
+Implement the explicit upgrade model for long-running workflows: compatibility gates, pinned runs, continue-as-new boundaries, restart-as-new controls, and rollout policy for new runs. This task should codify the “runs pin one execution target by default” rule while keeping ordinary replay hygiene on the automatic savepoint and segment-rotation path rather than on manual continue-as-new.
 
 **Implementation steps**
 
@@ -5864,7 +5873,8 @@ Implement the explicit upgrade model for long-running workflows: compatibility g
    - manual override or operator escape hatch where appropriate.
 3. Record upgrade and compatibility decisions in history and visibility so operators can explain why a run stayed pinned, rolled forward, or required restart.
 4. Keep the default safe rule that new bundles affect new runs first, while live runs remain pinned unless an explicit upgrade transition occurs.
-5. Ensure the same upgrade model works for both native Rust registrations and sandbox-authored published bundles.
+5. Keep automatic savepoint creation and segment rotation separate from explicit continue-as-new or restart-as-new upgrade boundaries.
+6. Ensure the same upgrade model works for both native Rust registrations and sandbox-authored published bundles.
 
 **Verification**
 
@@ -5884,7 +5894,7 @@ Implement the development and deployment flow for sandbox-authored workflows wit
 
 **Implementation steps**
 
-1. Implement draft preview flows that resolve workflow code from mutable sandbox sessions but still run through the same Rust executor and run/history model.
+1. Implement draft preview flows that resolve workflow code from mutable sandbox sessions but still run through the same Rust executor and run/recovery/savepoint model.
 2. Implement strict-preview flows that package the exact published artifact and run it locally or in preview under production-equivalent execution semantics.
 3. Ensure production deployment consumes only immutable bundle artifacts or native Rust registrations, never mutable draft sandboxes.
 4. Keep preview/prod table naming, namespace, or run isolation explicit so draft work cannot collide with production state.
@@ -6198,12 +6208,12 @@ At this point the system should additionally support:
 - execution-domain isolation for sandbox, procedure, publication, and MCP work so resource exhaustion cannot trivially starve the enclosing app, and
 - a small reference example app with its own deterministic simulation suites covering the intended end-to-end usage.
 
-### Milestone U — Workflow runs, history, transition engine, and shared native/sandbox execution
+### Milestone U — Workflow runs, recovery journals, transition engine, and shared native/sandbox execution
 Complete: T108–T114
 
 At this point the system should additionally support:
-- explicit workflow runs pinned to immutable bundle or native-registration identities,
-- append-only workflow history plus explicit lifecycle state and reduced mutable workflow state,
+- explicit workflow runs pinned to immutable execution targets,
+- append-only hidden recovery journals plus lightweight savepoints, explicit lifecycle state, and reduced mutable workflow state,
 - a single Rust-owned transition engine that applies admitted workflow input before any side effects escape,
 - durable wait-set, retry, timer, and coordination semantics rather than transient worker-local state,
 - both native Rust workflows and sandbox-authored workflows running on the same durable engine semantics, and

@@ -46,6 +46,8 @@ workflow_id_type!(WorkflowRunId);
 workflow_id_type!(WorkflowTaskId);
 workflow_id_type!(WorkflowQueryId);
 workflow_id_type!(WorkflowUpdateId);
+workflow_id_type!(WorkflowRecoverySegmentId);
+workflow_id_type!(WorkflowSavepointId);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowPayload {
@@ -190,6 +192,18 @@ impl WorkflowNativeRegistrationMetadata {
         WorkflowExecutionTarget::NativeRegistration {
             registration_id: self.registration_id.clone(),
         }
+    }
+}
+
+impl From<WorkflowBundleMetadata> for WorkflowExecutionDescriptor {
+    fn from(bundle: WorkflowBundleMetadata) -> Self {
+        Self::Bundle { bundle }
+    }
+}
+
+impl From<WorkflowNativeRegistrationMetadata> for WorkflowExecutionDescriptor {
+    fn from(registration: WorkflowNativeRegistrationMetadata) -> Self {
+        Self::NativeRegistration { registration }
     }
 }
 
@@ -423,10 +437,31 @@ pub struct WorkflowLifecycleRecord {
     pub attempt: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowCheckpointKind {
+    InternalSavepoint,
+    Export,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunRecord {
+    pub run_id: WorkflowRunId,
+    pub workflow_name: String,
+    pub instance_id: String,
+    pub lifecycle: WorkflowLifecycleState,
+    pub execution: WorkflowExecutionEpoch,
+    pub current_task_id: Option<WorkflowTaskId>,
+    pub active_recovery_segment_id: Option<WorkflowRecoverySegmentId>,
+    pub latest_savepoint_id: Option<WorkflowSavepointId>,
+    pub visible_history_len: u64,
+    pub updated_at_millis: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStateRecord {
     pub run_id: WorkflowRunId,
-    pub bundle_id: WorkflowBundleId,
+    pub target: WorkflowExecutionTarget,
     pub workflow_name: String,
     pub instance_id: String,
     pub lifecycle: WorkflowLifecycleState,
@@ -434,6 +469,52 @@ pub struct WorkflowStateRecord {
     pub history_len: u64,
     pub state: Option<WorkflowPayload>,
     pub updated_at_millis: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum WorkflowRecoveryJournalEntry {
+    TriggerAdmitted {
+        task_id: WorkflowTaskId,
+        trigger: WorkflowTrigger,
+        admitted_at_millis: u64,
+    },
+    TransitionApplied {
+        task_id: WorkflowTaskId,
+        output: WorkflowTransitionOutput,
+        committed_at_millis: u64,
+    },
+    LifecycleChanged {
+        record: WorkflowLifecycleRecord,
+    },
+    SavepointCreated {
+        savepoint_id: WorkflowSavepointId,
+        covered_through_sequence: u64,
+        created_at_millis: u64,
+    },
+    SegmentSealed {
+        segment_id: WorkflowRecoverySegmentId,
+        sealed_at_millis: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRecoveryJournalRecord {
+    pub run_id: WorkflowRunId,
+    pub segment_id: WorkflowRecoverySegmentId,
+    pub sequence: u64,
+    pub entry: WorkflowRecoveryJournalEntry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSavepointRecord {
+    pub run_id: WorkflowRunId,
+    pub savepoint_id: WorkflowSavepointId,
+    pub checkpoint_kind: WorkflowCheckpointKind,
+    pub covering_segment_id: WorkflowRecoverySegmentId,
+    pub covered_through_sequence: u64,
+    pub state: Option<WorkflowPayload>,
+    pub created_at_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -445,12 +526,12 @@ pub struct WorkflowVisibilityUpdate {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowVisibilityRecord {
     pub run_id: WorkflowRunId,
-    pub bundle_id: WorkflowBundleId,
+    pub target: WorkflowExecutionTarget,
     pub workflow_name: String,
     pub instance_id: String,
     pub lifecycle: WorkflowLifecycleState,
     pub last_task_id: Option<WorkflowTaskId>,
-    pub history_len: u64,
+    pub visible_history_len: u64,
     pub summary: BTreeMap<String, String>,
     pub updated_at_millis: u64,
 }
@@ -490,21 +571,25 @@ pub struct WorkflowDescribeResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowHistoryPageRequest {
+pub struct WorkflowVisibleHistoryPageRequest {
     pub run_id: WorkflowRunId,
     pub after_sequence: Option<u64>,
     pub limit: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowHistoryPageEntry {
+pub struct WorkflowVisibleHistoryEntry {
     pub sequence: u64,
-    pub event: WorkflowHistoryEvent,
+    pub lifecycle: WorkflowLifecycleState,
+    pub task_id: Option<WorkflowTaskId>,
+    pub summary: BTreeMap<String, String>,
+    pub note: Option<String>,
+    pub recorded_at_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowHistoryPageResponse {
-    pub entries: Vec<WorkflowHistoryPageEntry>,
+pub struct WorkflowVisibleHistoryPageResponse {
+    pub entries: Vec<WorkflowVisibleHistoryEntry>,
     pub next_after_sequence: Option<u64>,
 }
 
@@ -613,14 +698,14 @@ pub enum WorkflowCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowContinueAsNew {
     pub next_run_id: WorkflowRunId,
-    pub next_bundle_id: WorkflowBundleId,
+    pub next_target: WorkflowExecutionTarget,
     pub state: Option<WorkflowPayload>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowTransitionInput {
     pub run_id: WorkflowRunId,
-    pub bundle_id: WorkflowBundleId,
+    pub target: WorkflowExecutionTarget,
     pub task_id: WorkflowTaskId,
     pub workflow_name: String,
     pub instance_id: String,
@@ -658,7 +743,7 @@ impl Default for WorkflowTransitionOutput {
 pub enum WorkflowHistoryEvent {
     RunCreated {
         run_id: WorkflowRunId,
-        bundle_id: WorkflowBundleId,
+        target: WorkflowExecutionTarget,
         instance_id: String,
         scheduled_at_millis: u64,
     },
@@ -681,7 +766,7 @@ pub enum WorkflowHistoryEvent {
     ContinuedAsNew {
         from_run_id: WorkflowRunId,
         next_run_id: WorkflowRunId,
-        next_bundle_id: WorkflowBundleId,
+        next_target: WorkflowExecutionTarget,
         continued_at_millis: u64,
     },
     RunCompleted {
@@ -1041,31 +1126,33 @@ pub trait WorkflowVisibilityApi: Send + Sync {
         request: WorkflowDescribeRequest,
     ) -> Result<WorkflowDescribeResponse, WorkflowTaskError>;
 
-    async fn history(
+    async fn visible_history(
         &self,
-        request: WorkflowHistoryPageRequest,
-    ) -> Result<WorkflowHistoryPageResponse, WorkflowTaskError>;
+        request: WorkflowVisibleHistoryPageRequest,
+    ) -> Result<WorkflowVisibleHistoryPageResponse, WorkflowTaskError>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct StaticWorkflowVisibilityApi {
     descriptions: BTreeMap<WorkflowRunId, WorkflowDescribeResponse>,
-    history_by_run: BTreeMap<WorkflowRunId, Vec<WorkflowHistoryPageEntry>>,
+    visible_history_by_run: BTreeMap<WorkflowRunId, Vec<WorkflowVisibleHistoryEntry>>,
 }
 
 impl StaticWorkflowVisibilityApi {
     pub fn new(
         descriptions: impl IntoIterator<Item = WorkflowDescribeResponse>,
-        history_by_run: impl IntoIterator<Item = (WorkflowRunId, Vec<WorkflowHistoryPageEntry>)>,
+        visible_history_by_run: impl IntoIterator<
+            Item = (WorkflowRunId, Vec<WorkflowVisibleHistoryEntry>),
+        >,
     ) -> Self {
         let descriptions = descriptions
             .into_iter()
             .map(|description| (description.state.run_id.clone(), description))
             .collect();
-        let history_by_run = history_by_run.into_iter().collect();
+        let visible_history_by_run = visible_history_by_run.into_iter().collect();
         Self {
             descriptions,
-            history_by_run,
+            visible_history_by_run,
         }
     }
 }
@@ -1154,12 +1241,12 @@ impl WorkflowVisibilityApi for StaticWorkflowVisibilityApi {
             })
     }
 
-    async fn history(
+    async fn visible_history(
         &self,
-        request: WorkflowHistoryPageRequest,
-    ) -> Result<WorkflowHistoryPageResponse, WorkflowTaskError> {
+        request: WorkflowVisibleHistoryPageRequest,
+    ) -> Result<WorkflowVisibleHistoryPageResponse, WorkflowTaskError> {
         let entries = self
-            .history_by_run
+            .visible_history_by_run
             .get(&request.run_id)
             .cloned()
             .unwrap_or_default();
@@ -1169,7 +1256,7 @@ impl WorkflowVisibilityApi for StaticWorkflowVisibilityApi {
             request.limit as usize
         };
 
-        let mut page = Vec::<WorkflowHistoryPageEntry>::new();
+        let mut page = Vec::<WorkflowVisibleHistoryEntry>::new();
         let mut next_after_sequence = None;
         for entry in entries {
             if request
@@ -1185,7 +1272,7 @@ impl WorkflowVisibilityApi for StaticWorkflowVisibilityApi {
             page.push(entry);
         }
 
-        Ok(WorkflowHistoryPageResponse {
+        Ok(WorkflowVisibleHistoryPageResponse {
             entries: page,
             next_after_sequence,
         })
@@ -1763,12 +1850,12 @@ impl WorkflowVisibilityProjector for PassthroughWorkflowVisibilityProjector {
             .or_insert_with(|| lifecycle.as_str().to_string());
         WorkflowVisibilityRecord {
             run_id: state.run_id.clone(),
-            bundle_id: state.bundle_id.clone(),
+            target: state.target.clone(),
             workflow_name: state.workflow_name.clone(),
             instance_id: state.instance_id.clone(),
             lifecycle,
             last_task_id: state.current_task_id.clone(),
-            history_len: state.history_len,
+            visible_history_len: state.history_len,
             summary,
             updated_at_millis: state.updated_at_millis,
         }
@@ -1964,9 +2051,13 @@ mod durable_format_tests {
             }),
         );
 
+        let target = WorkflowExecutionTarget::Bundle {
+            bundle_id: bundle_id.clone(),
+        };
+
         let state = WorkflowStateRecord {
             run_id: run_id.clone(),
-            bundle_id: bundle_id.clone(),
+            target: target.clone(),
             workflow_name: "orders".to_string(),
             instance_id: "order-1".to_string(),
             lifecycle: WorkflowLifecycleState::Running,
@@ -1978,12 +2069,12 @@ mod durable_format_tests {
         let visibility = WorkflowVisibilityEntry {
             record: WorkflowVisibilityRecord {
                 run_id: run_id.clone(),
-                bundle_id: bundle_id.clone(),
+                target: target.clone(),
                 workflow_name: "orders".to_string(),
                 instance_id: "order-1".to_string(),
                 lifecycle: WorkflowLifecycleState::Running,
                 last_task_id: Some(task_id.clone()),
-                history_len: 7,
+                visible_history_len: 7,
                 summary: BTreeMap::from([
                     ("lifecycle".to_string(), "running".to_string()),
                     ("deployment".to_string(), deployment_id.to_string()),
@@ -2055,49 +2146,29 @@ mod durable_format_tests {
             &encode_fixture(&describe_response),
         );
 
-        let history_page_request = WorkflowHistoryPageRequest {
+        let history_page_request = WorkflowVisibleHistoryPageRequest {
             run_id: run_id.clone(),
             after_sequence: Some(6),
             limit: 25,
         };
         assert_durable_format_fixture(
-            "workflow-history-page-request-v1.bin",
+            "workflow-visible-history-page-request-v1.bin",
             &encode_fixture(&history_page_request),
         );
 
-        let history_page_response = WorkflowHistoryPageResponse {
-            entries: vec![WorkflowHistoryPageEntry {
+        let history_page_response = WorkflowVisibleHistoryPageResponse {
+            entries: vec![WorkflowVisibleHistoryEntry {
                 sequence: 7,
-                event: WorkflowHistoryEvent::TaskApplied {
-                    task_id: task_id.clone(),
-                    output: WorkflowTransitionOutput {
-                        state: WorkflowStateMutation::Put {
-                            state: WorkflowPayload::bytes("state"),
-                        },
-                        lifecycle: Some(WorkflowLifecycleState::Running),
-                        visibility: Some(WorkflowVisibilityUpdate {
-                            summary: BTreeMap::from([(
-                                "lifecycle".to_string(),
-                                "running".to_string(),
-                            )]),
-                            note: Some("visible".to_string()),
-                        }),
-                        continue_as_new: None,
-                        commands: vec![WorkflowCommand::Outbox {
-                            entry: WorkflowOutboxCommand {
-                                outbox_id: b"order-1:notify".to_vec(),
-                                idempotency_key: "order-1:notify".to_string(),
-                                payload: b"notify".to_vec(),
-                            },
-                        }],
-                    },
-                    committed_at_millis: 13,
-                },
+                lifecycle: WorkflowLifecycleState::Running,
+                task_id: Some(task_id.clone()),
+                summary: BTreeMap::from([("lifecycle".to_string(), "running".to_string())]),
+                note: Some("visible".to_string()),
+                recorded_at_millis: 13,
             }],
             next_after_sequence: Some(7),
         };
         assert_durable_format_fixture(
-            "workflow-history-page-response-v1.bin",
+            "workflow-visible-history-page-response-v1.bin",
             &encode_fixture(&history_page_response),
         );
 
@@ -2295,5 +2366,111 @@ mod durable_format_tests {
 
     fn encode_fixture<T: serde::Serialize>(value: &T) -> Vec<u8> {
         serde_json::to_vec(value).expect("encode durable fixture")
+    }
+
+    #[test]
+    fn revised_recovery_contract_types_round_trip() {
+        let bundle_id = WorkflowBundleId::new("bundle:orders:v2").expect("bundle id");
+        let deployment_id =
+            WorkflowDeploymentId::new("deploy:orders:prod:v2").expect("deployment id");
+        let run_id = WorkflowRunId::new("run:orders:order-1:2").expect("run id");
+        let task_id = WorkflowTaskId::new("task:order-1:update-1").expect("task id");
+        let segment_id =
+            WorkflowRecoverySegmentId::new("segment:orders:order-1:2:0").expect("segment id");
+        let savepoint_id =
+            WorkflowSavepointId::new("savepoint:orders:order-1:2:0").expect("savepoint id");
+
+        let assignment = WorkflowRunAssignment {
+            workflow_name: "orders".to_string(),
+            environment: WorkflowDeploymentEnvironment::Production,
+            deployment_id: Some(deployment_id.clone()),
+            target: WorkflowExecutionTarget::Bundle {
+                bundle_id: bundle_id.clone(),
+            },
+            pinned_epoch: 2,
+            assigned_at_millis: 13,
+        };
+        let execution = WorkflowExecutionEpoch::from_assignment(run_id.clone(), assignment, 14);
+
+        let run = WorkflowRunRecord {
+            run_id: run_id.clone(),
+            workflow_name: "orders".to_string(),
+            instance_id: "order-1".to_string(),
+            lifecycle: WorkflowLifecycleState::Running,
+            execution: execution.clone(),
+            current_task_id: Some(task_id.clone()),
+            active_recovery_segment_id: Some(segment_id.clone()),
+            latest_savepoint_id: Some(savepoint_id.clone()),
+            visible_history_len: 3,
+            updated_at_millis: 15,
+        };
+        assert_json_round_trip(&run);
+
+        let transition_output = WorkflowTransitionOutput {
+            state: WorkflowStateMutation::Put {
+                state: WorkflowPayload::bytes("state"),
+            },
+            lifecycle: Some(WorkflowLifecycleState::Running),
+            visibility: Some(WorkflowVisibilityUpdate {
+                summary: BTreeMap::from([("stage".to_string(), "authorized".to_string())]),
+                note: Some("payment authorized".to_string()),
+            }),
+            continue_as_new: None,
+            commands: vec![WorkflowCommand::Outbox {
+                entry: WorkflowOutboxCommand {
+                    outbox_id: b"order-1:notify".to_vec(),
+                    idempotency_key: "order-1:notify".to_string(),
+                    payload: b"notify".to_vec(),
+                },
+            }],
+        };
+
+        let journal = WorkflowRecoveryJournalRecord {
+            run_id: run_id.clone(),
+            segment_id: segment_id.clone(),
+            sequence: 9,
+            entry: WorkflowRecoveryJournalEntry::TransitionApplied {
+                task_id: task_id.clone(),
+                output: transition_output.clone(),
+                committed_at_millis: 16,
+            },
+        };
+        assert_json_round_trip(&journal);
+
+        let savepoint = WorkflowSavepointRecord {
+            run_id: run_id.clone(),
+            savepoint_id: savepoint_id.clone(),
+            checkpoint_kind: WorkflowCheckpointKind::InternalSavepoint,
+            covering_segment_id: segment_id.clone(),
+            covered_through_sequence: 9,
+            state: Some(WorkflowPayload::bytes("opaque-savepoint-state")),
+            created_at_millis: 17,
+        };
+        assert_json_round_trip(&savepoint);
+
+        let visible_history = WorkflowVisibleHistoryPageResponse {
+            entries: vec![WorkflowVisibleHistoryEntry {
+                sequence: 3,
+                lifecycle: WorkflowLifecycleState::Running,
+                task_id: Some(task_id.clone()),
+                summary: BTreeMap::from([
+                    ("step".to_string(), "authorize-payment".to_string()),
+                    ("status".to_string(), "ok".to_string()),
+                ]),
+                note: Some("collapsed from multiple primitive effects".to_string()),
+                recorded_at_millis: 16,
+            }],
+            next_after_sequence: Some(3),
+        };
+        assert_json_round_trip(&visible_history);
+    }
+
+    fn assert_json_round_trip<T>(value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let encoded = serde_json::to_vec(value).expect("encode json round trip");
+        let decoded = serde_json::from_slice::<T>(&encoded).expect("decode json round trip");
+        assert_eq!(&decoded, value);
     }
 }

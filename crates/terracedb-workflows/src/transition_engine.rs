@@ -327,10 +327,10 @@ pub enum WorkflowTransitionEngineError {
         expected: contracts::WorkflowRunId,
         received: contracts::WorkflowRunId,
     },
-    #[error("workflow bundle mismatch: expected {expected}, got {received}")]
-    BundleMismatch {
-        expected: contracts::WorkflowBundleId,
-        received: contracts::WorkflowBundleId,
+    #[error("workflow target mismatch: expected {expected:?}, got {received:?}")]
+    TargetMismatch {
+        expected: contracts::WorkflowExecutionTarget,
+        received: contracts::WorkflowExecutionTarget,
     },
     #[error("workflow name mismatch: expected {expected}, got {received}")]
     WorkflowNameMismatch { expected: String, received: String },
@@ -440,6 +440,8 @@ where
 
         let mut lifecycle = proposal.output.lifecycle.unwrap_or({
             if waiter_trigger_match {
+                WorkflowLifecycleState::Running
+            } else if snapshot.state.lifecycle == WorkflowLifecycleState::Scheduled {
                 WorkflowLifecycleState::Running
             } else {
                 snapshot.state.lifecycle
@@ -631,7 +633,7 @@ where
                 contracts::WorkflowHistoryEvent::ContinuedAsNew {
                     from_run_id: next_snapshot.state.run_id.clone(),
                     next_run_id: next_run.next_run_id,
-                    next_bundle_id: next_run.next_bundle_id,
+                    next_target: next_run.next_target,
                     continued_at_millis: committed_at_millis,
                 },
             );
@@ -858,10 +860,10 @@ where
                 received: input.run_id.clone(),
             });
         }
-        if snapshot.state.bundle_id != input.bundle_id {
-            return Err(WorkflowTransitionEngineError::BundleMismatch {
-                expected: snapshot.state.bundle_id.clone(),
-                received: input.bundle_id.clone(),
+        if snapshot.state.target != input.target {
+            return Err(WorkflowTransitionEngineError::TargetMismatch {
+                expected: snapshot.state.target.clone(),
+                received: input.target.clone(),
             });
         }
         if snapshot.state.workflow_name != input.workflow_name {

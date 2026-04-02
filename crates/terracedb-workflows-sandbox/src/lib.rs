@@ -9,6 +9,7 @@ use terracedb_workflows_core::{
 };
 
 pub const WORKFLOW_TASK_V1_ABI: &str = "workflow-task/v1";
+pub const WORKFLOW_SANDBOX_SDK_SOURCE: &str = include_str!("../sdk/workflow.js");
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowTaskV1RouteRequest {

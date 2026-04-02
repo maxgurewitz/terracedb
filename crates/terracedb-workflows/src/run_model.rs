@@ -3,20 +3,21 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use terracedb_workflows_core::{
-    AppendOnlyWorkflowHistoryOrderer, PassthroughWorkflowVisibilityProjector, WorkflowBundleId,
-    WorkflowDescribeRequest, WorkflowDescribeResponse, WorkflowHistoryEvent,
-    WorkflowHistoryOrderer, WorkflowHistoryPageEntry, WorkflowHistoryPageRequest,
-    WorkflowHistoryPageResponse, WorkflowLifecycleRecord, WorkflowLifecycleState, WorkflowRunId,
-    WorkflowStateRecord, WorkflowTaskError, WorkflowTaskId, WorkflowTransitionInput,
-    WorkflowTransitionOutput, WorkflowVisibilityApi, WorkflowVisibilityEntry,
-    WorkflowVisibilityListRequest, WorkflowVisibilityListResponse, WorkflowVisibilityProjector,
-    WorkflowVisibilityRecord,
+    AppendOnlyWorkflowHistoryOrderer, PassthroughWorkflowVisibilityProjector,
+    WorkflowDescribeRequest, WorkflowDescribeResponse, WorkflowExecutionTarget,
+    WorkflowHistoryEvent, WorkflowHistoryOrderer, WorkflowLifecycleRecord,
+    WorkflowLifecycleState, WorkflowRegistrationId, WorkflowRunId, WorkflowStateRecord,
+    WorkflowTaskError, WorkflowTaskId, WorkflowTransitionInput, WorkflowTransitionOutput,
+    WorkflowVisibilityApi, WorkflowVisibilityEntry, WorkflowVisibilityListRequest,
+    WorkflowVisibilityListResponse, WorkflowVisibilityProjector, WorkflowVisibilityRecord,
+    WorkflowVisibleHistoryEntry, WorkflowVisibleHistoryPageRequest,
+    WorkflowVisibleHistoryPageResponse,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunRecord {
     pub run_id: WorkflowRunId,
-    pub bundle_id: WorkflowBundleId,
+    pub target: WorkflowExecutionTarget,
     pub workflow_name: String,
     pub instance_id: String,
     pub created_at_millis: u64,
@@ -66,7 +67,7 @@ impl WorkflowTransitionReducer {
         if is_new_run {
             let run_record = WorkflowRunRecord {
                 run_id: input.run_id.clone(),
-                bundle_id: input.bundle_id.clone(),
+                target: input.target.clone(),
                 workflow_name: input.workflow_name.clone(),
                 instance_id: input.instance_id.clone(),
                 created_at_millis: input.admitted_at_millis,
@@ -81,7 +82,7 @@ impl WorkflowTransitionReducer {
                 input.run_id.clone(),
                 WorkflowHistoryEvent::RunCreated {
                     run_id: input.run_id.clone(),
-                    bundle_id: input.bundle_id.clone(),
+                    target: input.target.clone(),
                     instance_id: input.instance_id.clone(),
                     scheduled_at_millis: input.admitted_at_millis,
                 },
@@ -197,7 +198,7 @@ impl WorkflowTransitionReducer {
                     WorkflowHistoryEvent::ContinuedAsNew {
                         from_run_id: input.run_id.clone(),
                         next_run_id: continue_as_new.next_run_id.clone(),
-                        next_bundle_id: continue_as_new.next_bundle_id.clone(),
+                        next_target: continue_as_new.next_target.clone(),
                         continued_at_millis: committed_at_millis,
                     },
                 );
@@ -213,7 +214,7 @@ impl WorkflowTransitionReducer {
                 );
                 Some(WorkflowStateRecord {
                     run_id: input.run_id.clone(),
-                    bundle_id: input.bundle_id.clone(),
+                    target: input.target.clone(),
                     workflow_name: input.workflow_name.clone(),
                     instance_id: input.instance_id.clone(),
                     lifecycle: WorkflowLifecycleState::Completed,
@@ -251,7 +252,7 @@ impl WorkflowTransitionReducer {
 
                 Some(WorkflowStateRecord {
                     run_id: input.run_id.clone(),
-                    bundle_id: input.bundle_id.clone(),
+                    target: input.target.clone(),
                     workflow_name: input.workflow_name.clone(),
                     instance_id: input.instance_id.clone(),
                     lifecycle: current_lifecycle,
@@ -279,7 +280,7 @@ impl WorkflowTransitionReducer {
         let active_state = if let Some(continue_as_new) = output.continue_as_new.as_ref() {
             let next_run_record = WorkflowRunRecord {
                 run_id: continue_as_new.next_run_id.clone(),
-                bundle_id: continue_as_new.next_bundle_id.clone(),
+                target: continue_as_new.next_target.clone(),
                 workflow_name: input.workflow_name.clone(),
                 instance_id: input.instance_id.clone(),
                 created_at_millis: committed_at_millis,
@@ -295,7 +296,7 @@ impl WorkflowTransitionReducer {
                 continue_as_new.next_run_id.clone(),
                 WorkflowHistoryEvent::RunCreated {
                     run_id: continue_as_new.next_run_id.clone(),
-                    bundle_id: continue_as_new.next_bundle_id.clone(),
+                    target: continue_as_new.next_target.clone(),
                     instance_id: input.instance_id.clone(),
                     scheduled_at_millis: committed_at_millis,
                 },
@@ -322,7 +323,7 @@ impl WorkflowTransitionReducer {
 
             let next_state = WorkflowStateRecord {
                 run_id: continue_as_new.next_run_id.clone(),
-                bundle_id: continue_as_new.next_bundle_id.clone(),
+                target: continue_as_new.next_target.clone(),
                 workflow_name: input.workflow_name.clone(),
                 instance_id: input.instance_id.clone(),
                 lifecycle: WorkflowLifecycleState::Scheduled,
@@ -377,7 +378,7 @@ pub struct WorkflowRunBuilder {
     workflow_name: String,
     instance_id: String,
     run_id: Option<WorkflowRunId>,
-    bundle_id: Option<WorkflowBundleId>,
+    target: Option<WorkflowExecutionTarget>,
     lifecycle: WorkflowLifecycleState,
     state: Option<terracedb_workflows_core::WorkflowPayload>,
     updated_at_millis: u64,
@@ -392,7 +393,7 @@ impl WorkflowRunBuilder {
             workflow_name: workflow_name.into(),
             instance_id: instance_id.into(),
             run_id: None,
-            bundle_id: None,
+            target: None,
             lifecycle: WorkflowLifecycleState::Scheduled,
             state: None,
             updated_at_millis: 0,
@@ -407,8 +408,8 @@ impl WorkflowRunBuilder {
         self
     }
 
-    pub fn with_bundle_id(mut self, bundle_id: WorkflowBundleId) -> Self {
-        self.bundle_id = Some(bundle_id);
+    pub fn with_target(mut self, target: WorkflowExecutionTarget) -> Self {
+        self.target = Some(target);
         self
     }
 
@@ -448,7 +449,7 @@ impl WorkflowRunBuilder {
     pub fn build_run_record(&self) -> WorkflowRunRecord {
         WorkflowRunRecord {
             run_id: self.run_id(),
-            bundle_id: self.bundle_id(),
+            target: self.target(),
             workflow_name: self.workflow_name.clone(),
             instance_id: self.instance_id.clone(),
             created_at_millis: self.updated_at_millis,
@@ -459,7 +460,7 @@ impl WorkflowRunBuilder {
     pub fn build_state_record(&self) -> WorkflowStateRecord {
         WorkflowStateRecord {
             run_id: self.run_id(),
-            bundle_id: self.bundle_id(),
+            target: self.target(),
             workflow_name: self.workflow_name.clone(),
             instance_id: self.instance_id.clone(),
             lifecycle: self.lifecycle,
@@ -500,10 +501,10 @@ impl WorkflowRunBuilder {
             .unwrap_or_else(|| default_run_id(&self.workflow_name, &self.instance_id, 1))
     }
 
-    fn bundle_id(&self) -> WorkflowBundleId {
-        self.bundle_id
+    fn target(&self) -> WorkflowExecutionTarget {
+        self.target
             .clone()
-            .unwrap_or_else(|| default_native_bundle_id(&self.workflow_name))
+            .unwrap_or_else(|| default_native_target(&self.workflow_name))
     }
 }
 
@@ -682,10 +683,10 @@ impl WorkflowVisibilityApi for InMemoryWorkflowRunStore {
         self.describe_response(&request.run_id)
     }
 
-    async fn history(
+    async fn visible_history(
         &self,
-        request: WorkflowHistoryPageRequest,
-    ) -> Result<WorkflowHistoryPageResponse, WorkflowTaskError> {
+        request: WorkflowVisibleHistoryPageRequest,
+    ) -> Result<WorkflowVisibleHistoryPageResponse, WorkflowTaskError> {
         let limit = if request.limit == 0 {
             usize::MAX
         } else {
@@ -694,33 +695,35 @@ impl WorkflowVisibilityApi for InMemoryWorkflowRunStore {
         let mut entries = Vec::new();
         let mut next_after_sequence = None;
         for record in self.history(&request.run_id) {
+            let Some(entry) = workflow_visible_history_entry(record) else {
+                continue;
+            };
             if request
                 .after_sequence
-                .is_some_and(|after_sequence| record.sequence <= after_sequence)
+                .is_some_and(|after_sequence| entry.sequence <= after_sequence)
             {
                 continue;
             }
             if entries.len() == limit {
                 next_after_sequence = entries
                     .last()
-                    .map(|entry: &WorkflowHistoryPageEntry| entry.sequence);
+                    .map(|entry: &WorkflowVisibleHistoryEntry| entry.sequence);
                 break;
             }
-            entries.push(WorkflowHistoryPageEntry {
-                sequence: record.sequence,
-                event: record.event.clone(),
-            });
+            entries.push(entry);
         }
-        Ok(WorkflowHistoryPageResponse {
+        Ok(WorkflowVisibleHistoryPageResponse {
             entries,
             next_after_sequence,
         })
     }
 }
 
-pub fn default_native_bundle_id(workflow_name: &str) -> WorkflowBundleId {
-    WorkflowBundleId::new(format!("native:{workflow_name}"))
-        .expect("default workflow bundle ids should always be valid")
+pub fn default_native_target(workflow_name: &str) -> WorkflowExecutionTarget {
+    WorkflowExecutionTarget::NativeRegistration {
+        registration_id: WorkflowRegistrationId::new(format!("native:{workflow_name}"))
+            .expect("default workflow registration ids should always be valid"),
+    }
 }
 
 pub fn default_run_id(workflow_name: &str, instance_id: &str, trigger_seq: u64) -> WorkflowRunId {
@@ -754,9 +757,9 @@ fn validate_reduction_input(
                 "workflow state run id does not match transition input",
             ));
         }
-        if current_state.bundle_id != input.bundle_id {
+        if current_state.target != input.target {
             return Err(WorkflowTaskError::invalid_contract(
-                "workflow state bundle id does not match transition input",
+                "workflow state target does not match transition input",
             ));
         }
     }
@@ -808,25 +811,47 @@ fn reconstruct_state_for_run(
     }
     WorkflowStateRecord {
         run_id: run.run_id.clone(),
-        bundle_id: run.bundle_id.clone(),
+        target: run.target.clone(),
         workflow_name: run.workflow_name.clone(),
         instance_id: run.instance_id.clone(),
         lifecycle: lifecycle
             .map(|record| record.lifecycle)
             .unwrap_or(visibility.lifecycle),
         current_task_id: visibility.last_task_id.clone(),
-        history_len: visibility.history_len,
+        history_len: visibility.visible_history_len,
         state,
         updated_at_millis: visibility.updated_at_millis,
     }
+}
+
+fn workflow_visible_history_entry(
+    record: &WorkflowHistoryRecord,
+) -> Option<WorkflowVisibleHistoryEntry> {
+    let WorkflowHistoryEvent::VisibilityUpdated {
+        record: visibility_record,
+    } = &record.event
+    else {
+        return None;
+    };
+
+    Some(WorkflowVisibleHistoryEntry {
+        sequence: record.sequence,
+        lifecycle: visibility_record.lifecycle,
+        task_id: visibility_record.last_task_id.clone(),
+        summary: visibility_record.summary.clone(),
+        note: None,
+        recorded_at_millis: visibility_record.updated_at_millis,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use terracedb_workflows_core::{
-        WorkflowChangeKind, WorkflowContinueAsNew, WorkflowDescribeRequest, WorkflowPayload,
-        WorkflowSourceEvent, WorkflowStateMutation, WorkflowTransitionOutput, WorkflowTrigger,
+        WorkflowChangeKind, WorkflowContinueAsNew, WorkflowExecutionTarget, WorkflowPayload,
+        WorkflowRegistrationId, WorkflowSourceEvent, WorkflowStateMutation,
+        WorkflowTransitionOutput, WorkflowTrigger,
+        WorkflowDescribeRequest,
     };
 
     fn sample_trigger() -> WorkflowTrigger {
@@ -839,7 +864,7 @@ mod tests {
     fn sample_input(task_id: &str) -> WorkflowTransitionInput {
         WorkflowTransitionInput {
             run_id: default_run_id("orders", "order-1", 1),
-            bundle_id: default_native_bundle_id("orders"),
+            target: default_native_target("orders"),
             task_id: WorkflowTaskId::new(task_id).expect("task id"),
             workflow_name: "orders".to_string(),
             instance_id: "order-1".to_string(),
@@ -910,15 +935,17 @@ mod tests {
         let reducer = WorkflowTransitionReducer::default();
         let input = sample_input("task:1");
         let next_run_id = WorkflowRunId::new("run:orders:order-1:next").expect("next run id");
-        let next_bundle_id =
-            WorkflowBundleId::new("native:orders:v2").expect("next bundle id should be valid");
+        let next_target = WorkflowExecutionTarget::NativeRegistration {
+            registration_id: WorkflowRegistrationId::new("native:orders:v2")
+                .expect("next registration id should be valid"),
+        };
         let output = WorkflowTransitionOutput {
             state: WorkflowStateMutation::Put {
                 state: WorkflowPayload::bytes("done"),
             },
             continue_as_new: Some(WorkflowContinueAsNew {
                 next_run_id: next_run_id.clone(),
-                next_bundle_id: next_bundle_id.clone(),
+                next_target: next_target.clone(),
                 state: Some(WorkflowPayload::bytes("carry")),
             }),
             ..WorkflowTransitionOutput::default()
@@ -930,7 +957,7 @@ mod tests {
 
         assert_eq!(plan.run_records.len(), 2);
         assert_eq!(plan.active_state.run_id, next_run_id);
-        assert_eq!(plan.active_state.bundle_id, next_bundle_id);
+        assert_eq!(plan.active_state.target, next_target);
         assert_eq!(
             plan.active_state.lifecycle,
             WorkflowLifecycleState::Scheduled
@@ -1007,7 +1034,7 @@ mod tests {
             .build_store();
         let state = store.active_state("order-1").expect("seeded active state");
         assert_eq!(state.run_id, default_run_id("orders", "order-1", 1));
-        assert_eq!(state.bundle_id, default_native_bundle_id("orders"));
+        assert_eq!(state.target, default_native_target("orders"));
         assert_eq!(state.state, Some(WorkflowPayload::bytes("seeded")));
     }
 
@@ -1036,15 +1063,17 @@ mod tests {
     async fn visibility_api_reconstructs_terminal_run_state_after_continue_as_new() {
         let input = sample_input("task:1");
         let next_run_id = WorkflowRunId::new("run:orders:order-1:next").expect("next run id");
-        let next_bundle_id =
-            WorkflowBundleId::new("native:orders:v2").expect("next bundle id should be valid");
+        let next_target = WorkflowExecutionTarget::NativeRegistration {
+            registration_id: WorkflowRegistrationId::new("native:orders:v2")
+                .expect("next target registration id should be valid"),
+        };
         let output = WorkflowTransitionOutput {
             state: WorkflowStateMutation::Put {
                 state: WorkflowPayload::bytes("done"),
             },
             continue_as_new: Some(WorkflowContinueAsNew {
                 next_run_id: next_run_id.clone(),
-                next_bundle_id,
+                next_target,
                 state: Some(WorkflowPayload::bytes("carry")),
             }),
             ..WorkflowTransitionOutput::default()
