@@ -8,13 +8,16 @@ use std::{
     },
 };
 
+use async_trait::async_trait;
+use serde_json::json;
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_git::HostGitBridge;
 use terracedb_sandbox::{
     CloseSessionOptions, ConflictPolicy, DefaultSandboxStore, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
     DeterministicRuntimeBackend, EjectMode, EjectRequest, HoistMode, HoistRequest,
-    HostGitWorkspaceManager, PullRequestRequest, SandboxConfig, SandboxServices, SandboxStore,
+    HostGitWorkspaceManager, PullRequestProviderClient, PullRequestReport, PullRequestRequest,
+    SANDBOX_GIT_LIBRARY_SPECIFIER, SandboxConfig, SandboxError, SandboxServices, SandboxStore,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 
@@ -65,14 +68,49 @@ fn deterministic_services() -> SandboxServices {
     SandboxServices::deterministic()
 }
 
+fn configured_host_git_bridge() -> Arc<HostGitBridge> {
+    Arc::new(HostGitBridge::new(
+        "host-git",
+        "https://sandbox-bridge.invalid",
+    ))
+}
+
 fn host_git_services() -> SandboxServices {
+    host_git_services_with_provider(Arc::new(DeterministicPullRequestProviderClient::default()))
+}
+
+fn host_git_services_with_provider(
+    provider: Arc<dyn PullRequestProviderClient>,
+) -> SandboxServices {
+    let bridge = configured_host_git_bridge();
     SandboxServices::new(
         Arc::new(DeterministicRuntimeBackend::default()),
         Arc::new(DeterministicPackageInstaller::default()),
-        Arc::new(HostGitWorkspaceManager::default()),
-        Arc::new(DeterministicPullRequestProviderClient::default()),
+        Arc::new(HostGitWorkspaceManager::default().with_bridge(bridge)),
+        provider,
         Arc::new(DeterministicReadonlyViewProvider::default()),
     )
+}
+
+#[derive(Clone, Debug)]
+struct FailingPullRequestProvider;
+
+#[async_trait]
+impl PullRequestProviderClient for FailingPullRequestProvider {
+    fn name(&self) -> &str {
+        "failing-pr-provider"
+    }
+
+    async fn create_pull_request(
+        &self,
+        _session: &terracedb_sandbox::SandboxSession,
+        _request: PullRequestRequest,
+    ) -> Result<PullRequestReport, SandboxError> {
+        Err(SandboxError::Service {
+            service: "pull-request",
+            message: "legacy provider should not be called".to_string(),
+        })
+    }
 }
 
 fn write_host_file(path: &Path, contents: &str) {
@@ -307,7 +345,7 @@ async fn git_working_tree_hoist_captures_dirty_provenance_and_untracked_files() 
     write_host_file(&repo.join("tracked.txt"), "dirty tracked\n");
     write_host_file(&repo.join("untracked.txt"), "untracked\n");
 
-    let (vfs, sandbox) = sandbox_store(120, 503, deterministic_services());
+    let (vfs, sandbox) = sandbox_store(120, 503, host_git_services());
     let base_volume_id = VolumeId::new(0x9020);
     let session_volume_id = VolumeId::new(0x9021);
     create_empty_base(&vfs, base_volume_id).await;
@@ -361,6 +399,37 @@ async fn git_working_tree_hoist_captures_dirty_provenance_and_untracked_files() 
 }
 
 #[tokio::test]
+async fn git_hoist_without_host_bridge_fails_closed() {
+    let repo = unique_test_dir("git-no-bridge");
+    init_git_repo(&repo, None);
+
+    let (vfs, sandbox) = sandbox_store(121, 5031, deterministic_services());
+    let base_volume_id = VolumeId::new(0x9022);
+    let session_volume_id = VolumeId::new(0x9023);
+    create_empty_base(&vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open session");
+    let error = session
+        .hoist_from_disk(HoistRequest {
+            source_path: repo.to_string_lossy().into_owned(),
+            target_root: "/workspace".to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        })
+        .await
+        .expect_err("git hoist should require a host bridge");
+    assert!(matches!(
+        error,
+        SandboxError::Service { service: "git", .. }
+    ));
+
+    cleanup(&repo);
+}
+
+#[tokio::test]
 async fn create_pull_request_exports_to_real_git_worktree_and_pushes_branch() {
     let repo = unique_test_dir("git-pr-repo");
     let remote = unique_test_dir("git-pr-remote");
@@ -407,7 +476,7 @@ async fn create_pull_request_exports_to_real_git_worktree_and_pushes_branch() {
         })
         .await
         .expect("create pull request");
-    assert!(report.url.contains("example.invalid"));
+    assert!(report.url.contains("sandbox-bridge.invalid"));
     assert_eq!(
         report.metadata.get("committed"),
         Some(&serde_json::Value::Bool(true))
@@ -450,13 +519,154 @@ async fn create_pull_request_exports_to_real_git_worktree_and_pushes_branch() {
 }
 
 #[tokio::test]
+async fn repo_backed_pull_request_uses_git_bridge_not_legacy_provider() {
+    let repo = unique_test_dir("git-pr-bridge-provider-repo");
+    let remote = unique_test_dir("git-pr-bridge-provider-remote");
+    init_git_repo(&repo, Some(&remote));
+
+    let services = host_git_services_with_provider(Arc::new(FailingPullRequestProvider));
+    let (vfs, sandbox) = sandbox_store(131, 5041, services);
+    let base_volume_id = VolumeId::new(0x9032);
+    let session_volume_id = VolumeId::new(0x9033);
+    create_empty_base(&vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open session");
+    session
+        .hoist_from_disk(HoistRequest {
+            source_path: repo.to_string_lossy().into_owned(),
+            target_root: "/workspace".to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        })
+        .await
+        .expect("hoist git repo");
+    session
+        .filesystem()
+        .write_file(
+            "/workspace/tracked.txt",
+            b"bridge provider path\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update sandbox file");
+
+    let report = session
+        .create_pull_request(PullRequestRequest {
+            title: "Bridge Provider PR".to_string(),
+            body: "Should bypass legacy provider".to_string(),
+            head_branch: "sandbox/bridge-provider".to_string(),
+            base_branch: "main".to_string(),
+        })
+        .await
+        .expect("create pull request through git bridge");
+    assert_eq!(report.provider, "host-git");
+    assert_eq!(report.metadata.get("pushed"), Some(&json!(true)));
+
+    cleanup(&repo);
+    cleanup(&remote);
+}
+
+#[tokio::test]
+async fn repo_backed_js_git_library_can_create_pull_request() {
+    let repo = unique_test_dir("git-pr-js-repo");
+    let remote = unique_test_dir("git-pr-js-remote");
+    init_git_repo(&repo, Some(&remote));
+
+    let (vfs, sandbox) = sandbox_store(132, 5042, host_git_services());
+    let base_volume_id = VolumeId::new(0x9034);
+    let session_volume_id = VolumeId::new(0x9035);
+    create_empty_base(&vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open session");
+    session
+        .hoist_from_disk(HoistRequest {
+            source_path: repo.to_string_lossy().into_owned(),
+            target_root: "/workspace".to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        })
+        .await
+        .expect("hoist git repo");
+    session
+        .filesystem()
+        .write_file(
+            "/workspace/tracked.txt",
+            b"js bridge change\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update sandbox file");
+    session
+        .filesystem()
+        .write_file(
+            "/workspace/main.js",
+            format!(
+                "import {{ createPullRequest }} from \"{SANDBOX_GIT_LIBRARY_SPECIFIER}\";\n\
+const report = await createPullRequest({{\n  title: \"JS Sandbox PR\",\n  body: \"Created through the sandbox git host surface\",\n  headBranch: \"sandbox/js-bridge\",\n  baseBranch: \"main\"\n}});\n\
+export default report;\n"
+            )
+            .into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write js entrypoint");
+
+    let result = session
+        .exec_module("/workspace/main.js")
+        .await
+        .expect("execute js git module");
+    let report = result.result.expect("js result");
+    assert_eq!(report["provider"], json!("host-git"));
+    assert_eq!(report["metadata"]["pushed"], json!(true));
+    assert!(
+        result
+            .module_graph
+            .contains(&SANDBOX_GIT_LIBRARY_SPECIFIER.to_string())
+    );
+
+    let pushed_head = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["rev-parse", "refs/heads/sandbox/js-bridge"])
+        .output()
+        .expect("inspect js remote branch");
+    assert!(
+        pushed_head.status.success(),
+        "js remote branch missing: {}",
+        String::from_utf8_lossy(&pushed_head.stderr)
+    );
+
+    cleanup(&repo);
+    cleanup(&remote);
+}
+
+#[tokio::test]
 async fn replacing_git_workspace_manager_keeps_host_bridge_in_sync_for_exports() {
     let repo = unique_test_dir("git-pr-manager-sync-repo");
     let remote = unique_test_dir("git-pr-manager-sync-remote");
     init_git_repo(&repo, Some(&remote));
 
-    let services = SandboxServices::deterministic()
-        .with_git_workspace_manager(Arc::new(HostGitWorkspaceManager::default()));
+    let services = SandboxServices::deterministic().with_git_workspace_manager(Arc::new(
+        HostGitWorkspaceManager::default().with_bridge(configured_host_git_bridge()),
+    ));
     let (vfs, sandbox) = sandbox_store(140, 505, services);
     let base_volume_id = VolumeId::new(0x9040);
     let session_volume_id = VolumeId::new(0x9041);
@@ -542,7 +752,7 @@ async fn replacing_git_host_bridge_keeps_workspace_manager_in_sync_for_exports()
     init_git_repo(&repo, Some(&remote));
 
     let services =
-        SandboxServices::deterministic().with_git_host_bridge(Arc::new(HostGitBridge::default()));
+        SandboxServices::deterministic().with_git_host_bridge(configured_host_git_bridge());
     let (vfs, sandbox) = sandbox_store(150, 506, services);
     let base_volume_id = VolumeId::new(0x9050);
     let session_volume_id = VolumeId::new(0x9051);

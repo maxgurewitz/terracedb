@@ -253,23 +253,9 @@ impl GitHostBridge for HostGitBridge {
             OptionalGitLookup::OriginRemote,
         )?;
         if let Some(remote_url) = remote {
-            run_git(
-                &workspace_path,
-                &["push", "-u", "origin", &request.head_branch],
-            )
-            .map_err(|error| match error {
-                GitSubstrateError::Bridge { message, .. } => GitSubstrateError::RemotePushFailed {
-                    remote: "origin".to_string(),
-                    branch: request.head_branch.clone(),
-                    message,
-                },
-                other => other,
-            })?;
-            metadata.insert("pushed".to_string(), JsonValue::from(true));
             metadata.insert("push_remote".to_string(), JsonValue::from(remote_url));
-        } else {
-            metadata.insert("pushed".to_string(), JsonValue::from(false));
         }
+        metadata.insert("pushed".to_string(), JsonValue::from(false));
         Ok(GitFinalizeExportReport {
             workspace_path: request.workspace_path,
             head_branch: request.head_branch,
@@ -322,7 +308,6 @@ impl GitHostBridge for HostGitBridge {
 
     async fn push(
         &self,
-        _repository: Arc<dyn GitRepository>,
         request: GitPushRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPushReport, GitSubstrateError> {
@@ -336,6 +321,18 @@ impl GitHostBridge for HostGitBridge {
                 operation: "push",
                 message: "workspace_path metadata is required for host push".to_string(),
             })?;
+        let current_head = git_stdout(&workspace_path, &["rev-parse", "HEAD"])?;
+        if let Some(expected) = request.head_oid.as_deref()
+            && expected != current_head.as_str()
+        {
+            return Err(GitSubstrateError::RemotePushFailed {
+                remote: request.remote.clone(),
+                branch: request.branch_name.clone(),
+                message: format!(
+                    "workspace HEAD mismatch before push: expected {expected}, found {current_head}"
+                ),
+            });
+        }
         run_git(
             &workspace_path,
             &["push", "-u", &request.remote, &request.branch_name],
@@ -351,7 +348,7 @@ impl GitHostBridge for HostGitBridge {
         Ok(GitPushReport {
             remote: request.remote,
             branch_name: request.branch_name,
-            pushed_oid: Some(git_stdout(&workspace_path, &["rev-parse", "HEAD"])?),
+            pushed_oid: Some(current_head),
             metadata: request.metadata,
         })
     }

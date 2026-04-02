@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use terracedb::{
     DbDependencies, LogCursor, Rng, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp,
 };
+use terracedb_git::HostGitBridge;
 use terracedb_sandbox::{
     BashReport, BashRequest, BashService, BashSessionState, CapabilityRegistry, ConflictPolicy,
     DefaultSandboxStore, DeterministicBashService, DeterministicCapabilityModule,
@@ -961,10 +962,14 @@ fn init_git_repo(repo: &Path, remote: Option<&Path>, seed: u64) {
 }
 
 fn host_git_services() -> SandboxServices {
+    let bridge = Arc::new(HostGitBridge::new(
+        "host-git",
+        "https://sandbox-bridge.invalid",
+    ));
     SandboxServices::new(
         Arc::new(DeterministicRuntimeBackend::default()),
         Arc::new(DeterministicPackageInstaller::default()),
-        Arc::new(HostGitWorkspaceManager::default()),
+        Arc::new(HostGitWorkspaceManager::default().with_bridge(bridge)),
         Arc::new(DeterministicPullRequestProviderClient::default()),
         Arc::new(DeterministicReadonlyViewProvider::default()),
     )

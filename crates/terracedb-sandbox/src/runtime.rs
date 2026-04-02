@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, FixedJsClock, JsCompatibilityProfile,
@@ -19,7 +20,10 @@ use crate::{
     CapabilityCallRequest, CapabilityCallResult, HOST_CAPABILITY_PREFIX, LoadedSandboxModule,
     PackageCompatibilityMode, SandboxError, SandboxModuleCacheEntry, SandboxModuleKind,
     SandboxModuleLoadTrace, SandboxSession, SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
-    loader::{FS_HOST_EXPORTS, SANDBOX_FS_LIBRARY_SPECIFIER, SandboxModuleLoader},
+    loader::{
+        FS_HOST_EXPORTS, GIT_HOST_EXPORTS, SANDBOX_FS_LIBRARY_SPECIFIER,
+        SANDBOX_GIT_LIBRARY_SPECIFIER, SandboxModuleLoader,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -277,6 +281,7 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
                     session.volume().fs(),
                     [SANDBOX_FS_LIBRARY_SPECIFIER, "node:fs", "node:fs/promises"],
                 )))
+                .with_adapter(Arc::new(SandboxGitHostServiceAdapter::new(session.clone())))
                 .with_adapter(capability_services.clone()),
         );
         let (entrypoint, js_request, inline_eval_cache) =
@@ -435,6 +440,100 @@ impl JsHostServiceAdapter for SandboxCapabilityHostServiceAdapter {
     }
 }
 
+#[derive(Clone)]
+struct SandboxGitHostServiceAdapter {
+    session: SandboxSession,
+}
+
+impl SandboxGitHostServiceAdapter {
+    fn new(session: SandboxSession) -> Self {
+        Self { session }
+    }
+
+    async fn call_async(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        if request.service != SANDBOX_GIT_LIBRARY_SPECIFIER {
+            return Err(JsSubstrateError::HostServiceUnavailable {
+                service: request.service,
+                operation: request.operation,
+            });
+        }
+        match request.operation.as_str() {
+            "prepareWorkspace" => {
+                let args = host_service_argument::<GitHostPrepareWorkspaceRequest>(&request)?;
+                let report = self
+                    .session
+                    .prepare_git_workspace(crate::GitWorkspaceRequest {
+                        branch_name: args.branch_name,
+                        base_branch: args.base_branch,
+                        target_path: args.target_path,
+                    })
+                    .await
+                    .map_err(|error| sandbox_error_to_js_host_service(&request, error))?;
+                Ok(JsHostServiceResponse {
+                    result: Some(serde_json::to_value(report)?),
+                    metadata: BTreeMap::new(),
+                })
+            }
+            "createPullRequest" => {
+                let args = host_service_argument::<GitHostCreatePullRequestRequest>(&request)?;
+                let report = self
+                    .session
+                    .create_pull_request(crate::PullRequestRequest {
+                        title: args.title,
+                        body: args.body,
+                        head_branch: args.head_branch,
+                        base_branch: args.base_branch,
+                    })
+                    .await
+                    .map_err(|error| sandbox_error_to_js_host_service(&request, error))?;
+                Ok(JsHostServiceResponse {
+                    result: Some(serde_json::to_value(report)?),
+                    metadata: BTreeMap::new(),
+                })
+            }
+            _ => Err(JsSubstrateError::HostServiceUnavailable {
+                service: request.service,
+                operation: request.operation,
+            }),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl JsHostServiceAdapter for SandboxGitHostServiceAdapter {
+    fn handles_service(&self, service: &str) -> bool {
+        service == SANDBOX_GIT_LIBRARY_SPECIFIER
+    }
+
+    async fn call(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        self.call_async(request).await
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostPrepareWorkspaceRequest {
+    branch_name: String,
+    #[serde(default)]
+    base_branch: Option<String>,
+    target_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostCreatePullRequestRequest {
+    title: String,
+    body: String,
+    head_branch: String,
+    base_branch: String,
+}
+
 async fn open_js_runtime(
     handle: &SandboxRuntimeHandle,
     session_info: &SandboxSessionInfo,
@@ -547,6 +646,12 @@ fn runtime_policy_for_session(
             for operation in FS_HOST_EXPORTS {
                 visible_host_services.insert(format!("{service}::{operation}"));
             }
+        }
+    }
+
+    if session_info.provenance.git.is_some() {
+        for operation in GIT_HOST_EXPORTS {
+            visible_host_services.insert(format!("{SANDBOX_GIT_LIBRARY_SPECIFIER}::{operation}"));
         }
     }
 
@@ -712,6 +817,20 @@ fn host_service_arguments(arguments: &JsonValue) -> Vec<JsonValue> {
     }
 }
 
+fn host_service_argument<T>(request: &JsHostServiceRequest) -> Result<T, JsSubstrateError>
+where
+    T: DeserializeOwned,
+{
+    let value = match &request.arguments {
+        JsonValue::Array(values) => values.first().cloned().unwrap_or(JsonValue::Null),
+        other => other.clone(),
+    };
+    serde_json::from_value(value).map_err(|error| JsSubstrateError::EvaluationFailed {
+        entrypoint: format!("{}::{}", request.service, request.operation),
+        message: format!("invalid host service arguments: {error}"),
+    })
+}
+
 fn js_substrate_error_to_sandbox(
     error: JsSubstrateError,
     fallback_entrypoint: &str,
@@ -762,5 +881,21 @@ fn js_substrate_error_to_sandbox(
         },
         JsSubstrateError::SerdeJson(error) => SandboxError::SerdeJson(error),
         JsSubstrateError::Vfs(error) => SandboxError::Vfs(error),
+    }
+}
+
+fn sandbox_error_to_js_host_service(
+    request: &JsHostServiceRequest,
+    error: SandboxError,
+) -> JsSubstrateError {
+    match error {
+        SandboxError::MissingGitProvenance => JsSubstrateError::HostServiceUnavailable {
+            service: request.service.clone(),
+            operation: request.operation.clone(),
+        },
+        other => JsSubstrateError::EvaluationFailed {
+            entrypoint: format!("{}::{}", request.service, request.operation),
+            message: other.to_string(),
+        },
     }
 }

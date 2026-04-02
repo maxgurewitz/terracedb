@@ -24,6 +24,7 @@ use terracedb_capabilities::{
     ResourcePolicy, ResourceSelector, SessionMode, SessionPresetRequest,
     StaticExecutionPolicyResolver, SubjectSelector,
 };
+use terracedb_git::HostGitBridge;
 use terracedb_sandbox::{
     BashReport, BashRequest, CapabilityManifest as SandboxCapabilityManifest, CapabilityMethod0,
     CapabilityMethod1, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
@@ -109,6 +110,7 @@ impl ExampleHostApp {
 
     pub fn host_git_services(&self) -> SandboxServices {
         SandboxServices::deterministic_with_host_git_and_capabilities(self.notes_registry())
+            .with_git_host_bridge(configured_host_git_bridge())
     }
 
     pub fn deterministic_services_for_prepared_session(
@@ -131,6 +133,7 @@ impl ExampleHostApp {
             SandboxServices::deterministic_with_host_git_and_capabilities(
                 self.prepared_notes_registry(session_id, prepared)?,
             )
+            .with_git_host_bridge(configured_host_git_bridge())
             .with_execution_router(notes_execution_router()),
         )
     }
@@ -207,6 +210,13 @@ impl ExampleHostApp {
             prepared,
         )?))
     }
+}
+
+fn configured_host_git_bridge() -> Arc<HostGitBridge> {
+    Arc::new(HostGitBridge::new(
+        "host-git",
+        "https://sandbox-notes.invalid",
+    ))
 }
 
 #[derive(Clone)]

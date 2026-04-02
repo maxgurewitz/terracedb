@@ -450,10 +450,10 @@ async fn deterministic_smoke_executes_fake_runtime_and_repo_over_vfs() {
     assert_eq!(export.target_path, "/tmp/export");
     let push = bridge
         .push(
-            repo.clone(),
             GitPushRequest {
                 remote: "origin".to_string(),
                 branch_name: "sandbox/test".to_string(),
+                head_oid: Some("1111".to_string()),
                 metadata: BTreeMap::new(),
             },
             Arc::new(NeverCancelGit),

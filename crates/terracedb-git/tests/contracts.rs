@@ -1443,7 +1443,7 @@ async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports()
         .await
         .expect("finalize export");
     assert_eq!(finalized.metadata.get("committed"), Some(&json!(true)));
-    assert_eq!(finalized.metadata.get("pushed"), Some(&json!(true)));
+    assert_eq!(finalized.metadata.get("pushed"), Some(&json!(false)));
     assert_eq!(
         git_out(&workspace, &["log", "-1", "--format=%aI"]),
         "2024-01-02T03:04:05+00:00"
@@ -1471,6 +1471,30 @@ async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports()
         Some(&json!(false))
     );
     assert_eq!(finalized_noop.metadata.get("pushed"), Some(&json!(false)));
+
+    let pushed = bridge
+        .push(
+            terracedb_git::GitPushRequest {
+                remote: "origin".to_string(),
+                branch_name: "sandbox/feature".to_string(),
+                head_oid: finalized_noop
+                    .metadata
+                    .get("head_commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                metadata: finalized_noop.metadata.clone(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("push export branch");
+    assert_eq!(
+        pushed.pushed_oid,
+        finalized_noop
+            .metadata
+            .get("head_commit")
+            .and_then(|value| { value.as_str().map(ToString::to_string) })
+    );
 
     let remote_head = sanitized_git_command()
         .arg("--git-dir")

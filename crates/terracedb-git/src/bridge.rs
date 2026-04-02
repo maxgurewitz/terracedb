@@ -147,7 +147,6 @@ pub trait GitHostBridge: Send + Sync {
 
     async fn push(
         &self,
-        repository: Arc<dyn GitRepository>,
         request: GitPushRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPushReport, GitSubstrateError>;
@@ -290,7 +289,6 @@ impl GitHostBridge for DeterministicGitHostBridge {
 
     async fn push(
         &self,
-        repository: Arc<dyn GitRepository>,
         request: GitPushRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPushReport, GitSubstrateError> {
@@ -300,11 +298,10 @@ impl GitHostBridge for DeterministicGitHostBridge {
                 message: "cancelled".to_string(),
             });
         }
-        let head = repository.head().await?;
         Ok(GitPushReport {
             remote: request.remote,
             branch_name: request.branch_name,
-            pushed_oid: head.oid,
+            pushed_oid: request.head_oid,
             metadata: request.metadata,
         })
     }

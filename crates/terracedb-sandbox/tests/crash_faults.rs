@@ -9,6 +9,7 @@ use std::{
 };
 
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
+use terracedb_git::HostGitBridge;
 use terracedb_sandbox::{
     ConflictPolicy, DefaultSandboxStore, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
@@ -47,10 +48,14 @@ fn deterministic_services() -> SandboxServices {
 }
 
 fn host_git_services() -> SandboxServices {
+    let bridge = Arc::new(HostGitBridge::new(
+        "host-git",
+        "https://sandbox-bridge.invalid",
+    ));
     SandboxServices::new(
         Arc::new(DeterministicRuntimeBackend::default()),
         Arc::new(DeterministicPackageInstaller::default()),
-        Arc::new(HostGitWorkspaceManager::default()),
+        Arc::new(HostGitWorkspaceManager::default().with_bridge(bridge)),
         Arc::new(DeterministicPullRequestProviderClient::default()),
         Arc::new(DeterministicReadonlyViewProvider::default()),
     )
