@@ -219,6 +219,12 @@ impl JsRuntime for DeterministicJsRuntime {
         let (entrypoint, root_source) = match request.kind {
             JsExecutionKind::Module { specifier } => {
                 let resolved = self.module_loader.resolve(&specifier, None).await?;
+                state.trace.push(module_resolve_event(
+                    &specifier,
+                    &resolved.canonical_specifier,
+                    None,
+                    resolved.kind,
+                ));
                 ensure_module_kind_allowed(&request.metadata, &self.handle.policy, &resolved)?;
                 let loaded = self.module_loader.load(&resolved).await?;
                 (resolved.canonical_specifier, loaded)
@@ -227,8 +233,9 @@ impl JsRuntime for DeterministicJsRuntime {
                 source,
                 virtual_specifier,
             } => {
-                let specifier =
-                    virtual_specifier.unwrap_or_else(|| "terrace:/eval/inline.mjs".to_string());
+                let specifier = virtual_specifier.unwrap_or_else(|| {
+                    "terrace:/workspace/.terrace/runtime/eval/inline.mjs".to_string()
+                });
                 let loaded = JsLoadedModule {
                     resolved: crate::JsResolvedModule {
                         requested_specifier: specifier.clone(),
@@ -309,10 +316,10 @@ impl DeterministicJsRuntime {
                 continue;
             }
             self.scheduler
-                .schedule(JsScheduledTask {
-                    queue: JsTaskQueue::ModuleLoader,
-                    label: canonical.clone(),
-                })
+                .schedule(JsScheduledTask::ready(
+                    JsTaskQueue::ModuleLoader,
+                    canonical.clone(),
+                ))
                 .await;
             self.hooks.on_module_loaded(&module).await?;
             state.module_graph.push(canonical.clone());
@@ -328,6 +335,12 @@ impl DeterministicJsRuntime {
                     .module_loader
                     .resolve(&import, Some(&canonical))
                     .await?;
+                state.trace.push(module_resolve_event(
+                    &import,
+                    &resolved.canonical_specifier,
+                    Some(&canonical),
+                    resolved.kind,
+                ));
                 ensure_module_kind_allowed(&BTreeMap::new(), policy, &resolved)?;
                 imports.push(self.module_loader.load(&resolved).await?);
             }
@@ -342,10 +355,10 @@ impl DeterministicJsRuntime {
                     });
                 }
                 self.scheduler
-                    .schedule(JsScheduledTask {
-                        queue: JsTaskQueue::HostCallbacks,
-                        label: format!("{}::{}", host_call.service, host_call.operation),
-                    })
+                    .schedule(JsScheduledTask::ready(
+                        JsTaskQueue::HostCallbacks,
+                        format!("{}::{}", host_call.service, host_call.operation),
+                    ))
                     .await;
                 let response = self.host_services.call(host_call.clone()).await?;
                 let record = JsHostServiceCallRecord {
@@ -451,6 +464,41 @@ fn extract_quoted_string(line: &str) -> Option<String> {
     let (_, tail) = line.split_once(quote)?;
     let (value, _) = tail.split_once(quote)?;
     Some(value.to_string())
+}
+
+fn module_resolve_event(
+    requested_specifier: &str,
+    canonical_specifier: &str,
+    referrer: Option<&str>,
+    kind: crate::JsModuleKind,
+) -> JsTraceEvent {
+    JsTraceEvent {
+        phase: JsTracePhase::ModuleResolve,
+        label: canonical_specifier.to_string(),
+        metadata: BTreeMap::from([
+            (
+                "requested_specifier".to_string(),
+                JsonValue::String(requested_specifier.to_string()),
+            ),
+            (
+                "referrer".to_string(),
+                referrer
+                    .map(|value| JsonValue::String(value.to_string()))
+                    .unwrap_or(JsonValue::Null),
+            ),
+            (
+                "module_kind".to_string(),
+                JsonValue::String(
+                    match kind {
+                        crate::JsModuleKind::Workspace => "workspace",
+                        crate::JsModuleKind::HostCapability => "host_capability",
+                        crate::JsModuleKind::Package => "package",
+                    }
+                    .to_string(),
+                ),
+            ),
+        ]),
+    }
 }
 
 pub(crate) fn ensure_module_kind_allowed(

@@ -23,7 +23,7 @@ pub use boa::{
     ImmediateBoaModuleLoader,
 };
 pub use compat::{DeterministicJsHostServices, DeterministicJsServiceOutcome, JsHostServices};
-pub use entropy::{DeterministicJsEntropySource, JsEntropySource};
+pub use entropy::{DeterministicJsEntropySource, JsEntropySnapshot, JsEntropySource};
 pub use error::JsSubstrateError;
 pub use loader::{
     JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule, VfsJsModuleLoader,
@@ -35,7 +35,7 @@ pub use runtime::{
 pub use scheduler::{
     DeterministicJsScheduler, JsScheduledTask, JsScheduler, JsSchedulerSnapshot, JsTaskQueue,
 };
-pub use time::{FixedJsClock, JsClock};
+pub use time::{DeterministicJsClock, FixedJsClock, JsClock, JsClockSnapshot};
 pub use types::{
     JsAmbientDefault, JsCompatibilityProfile, JsExecutionKind, JsExecutionReport,
     JsExecutionRequest, JsForkPolicy, JsForkSurface, JsForkSurfacePolicy, JsHostServiceCallRecord,

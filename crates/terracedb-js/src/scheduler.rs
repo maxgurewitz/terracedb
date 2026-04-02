@@ -17,6 +17,26 @@ pub enum JsTaskQueue {
 pub struct JsScheduledTask {
     pub queue: JsTaskQueue,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_millis: Option<u64>,
+}
+
+impl JsScheduledTask {
+    pub fn ready(queue: JsTaskQueue, label: impl Into<String>) -> Self {
+        Self {
+            queue,
+            label: label.into(),
+            deadline_millis: None,
+        }
+    }
+
+    pub fn deadline(queue: JsTaskQueue, label: impl Into<String>, deadline_millis: u64) -> Self {
+        Self {
+            queue,
+            label: label.into(),
+            deadline_millis: Some(deadline_millis),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +67,41 @@ impl DeterministicJsScheduler {
             gate: Arc::new(Mutex::new(())),
             scheduled_tasks: Arc::new(StdMutex::new(Vec::new())),
         }
+    }
+
+    pub async fn schedule_deadline(
+        &self,
+        queue: JsTaskQueue,
+        label: impl Into<String>,
+        deadline_millis: u64,
+    ) {
+        self.schedule(JsScheduledTask::deadline(queue, label, deadline_millis))
+            .await;
+    }
+
+    pub async fn drain_ready(&self, now_millis: u64) -> Vec<JsScheduledTask> {
+        let _guard = self.gate.lock().await;
+        let mut tasks = self
+            .scheduled_tasks
+            .lock()
+            .expect("deterministic scheduler mutex poisoned");
+        let all: Vec<JsScheduledTask> = std::mem::take(tasks.as_mut());
+        let (ready, pending): (Vec<_>, Vec<_>) = all.into_iter().partition(|task| {
+            task.deadline_millis
+                .is_none_or(|deadline| deadline <= now_millis)
+        });
+        *tasks = pending;
+        ready
+    }
+
+    pub async fn next_deadline_millis(&self) -> Option<u64> {
+        let _guard = self.gate.lock().await;
+        self.scheduled_tasks
+            .lock()
+            .expect("deterministic scheduler mutex poisoned")
+            .iter()
+            .filter_map(|task| task.deadline_millis)
+            .min()
     }
 }
 
@@ -89,5 +144,44 @@ impl JsScheduler for DeterministicJsScheduler {
                 .expect("deterministic scheduler mutex poisoned")
                 .clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeterministicJsScheduler, JsScheduledTask, JsScheduler, JsTaskQueue};
+
+    #[tokio::test]
+    async fn deterministic_scheduler_drains_ready_tasks_by_deadline() {
+        let scheduler = DeterministicJsScheduler::default();
+        JsScheduler::schedule(
+            &scheduler,
+            JsScheduledTask::deadline(JsTaskQueue::Timers, "late", 200),
+        )
+        .await;
+        JsScheduler::schedule(
+            &scheduler,
+            JsScheduledTask::ready(JsTaskQueue::PromiseJobs, "promise"),
+        )
+        .await;
+        scheduler
+            .schedule_deadline(JsTaskQueue::Timers, "early", 100)
+            .await;
+
+        assert_eq!(scheduler.next_deadline_millis().await, Some(100));
+        assert_eq!(
+            scheduler.drain_ready(0).await,
+            vec![JsScheduledTask::ready(JsTaskQueue::PromiseJobs, "promise")]
+        );
+        assert_eq!(
+            scheduler.drain_ready(100).await,
+            vec![JsScheduledTask::deadline(JsTaskQueue::Timers, "early", 100)]
+        );
+        assert_eq!(scheduler.next_deadline_millis().await, Some(200));
+        assert_eq!(
+            scheduler.drain_ready(200).await,
+            vec![JsScheduledTask::deadline(JsTaskQueue::Timers, "late", 200)]
+        );
+        assert!(JsScheduler::drain(&scheduler).await.is_empty());
     }
 }

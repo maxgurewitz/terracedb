@@ -555,8 +555,9 @@ impl BoaJsRuntime {
                 source,
                 virtual_specifier,
             } => {
-                let entrypoint =
-                    virtual_specifier.unwrap_or_else(|| "terrace:/eval/inline.mjs".to_string());
+                let entrypoint = virtual_specifier.unwrap_or_else(|| {
+                    "terrace:/workspace/.terrace/runtime/eval/inline.mjs".to_string()
+                });
                 let entrypoint_path = PathBuf::from(entrypoint.clone());
                 let result = match Script::parse(
                     Source::from_bytes(source.as_bytes()).with_path(&entrypoint_path),
@@ -783,6 +784,7 @@ impl BoaModuleLoaderBridge {
         self.scheduler.schedule(JsScheduledTask {
             queue: JsTaskQueue::ModuleLoader,
             label: canonical.clone(),
+            deadline_millis: None,
         });
         self.hooks.on_module_loaded(&loaded)?;
         self.state.record_module_loaded(&loaded);
@@ -835,6 +837,7 @@ impl BoaModuleLoader for BoaModuleLoaderBridge {
         self.scheduler.schedule(JsScheduledTask {
             queue: JsTaskQueue::ModuleLoader,
             label: canonical.clone(),
+            deadline_millis: None,
         });
         self.hooks.on_module_loaded(&loaded).map_err(js_error)?;
         self.state.record_module_loaded(&loaded);
@@ -932,6 +935,7 @@ impl JobExecutor for BoaJobExecutor {
                     .push(JsScheduledTask {
                         queue: JsTaskQueue::PromiseJobs,
                         label: "promise-job".to_string(),
+                        deadline_millis: None,
                     });
             }
             Job::AsyncJob(job) => {
@@ -942,13 +946,15 @@ impl JobExecutor for BoaJobExecutor {
                     .push(JsScheduledTask {
                         queue: JsTaskQueue::PromiseJobs,
                         label: "async-job".to_string(),
+                        deadline_millis: None,
                     });
             }
             Job::TimeoutJob(job) => {
                 let now = context.clock().now();
+                let deadline = now + job.timeout();
                 self.timeout_jobs
                     .borrow_mut()
-                    .entry(now + job.timeout())
+                    .entry(deadline)
                     .or_default()
                     .push(job);
                 self.buffered_tasks
@@ -957,6 +963,7 @@ impl JobExecutor for BoaJobExecutor {
                     .push(JsScheduledTask {
                         queue: JsTaskQueue::Timers,
                         label: "timeout-job".to_string(),
+                        deadline_millis: Some(deadline.millis_since_epoch()),
                     });
             }
             Job::GenericJob(job) => {
@@ -967,6 +974,7 @@ impl JobExecutor for BoaJobExecutor {
                     .push(JsScheduledTask {
                         queue: JsTaskQueue::PromiseJobs,
                         label: "generic-job".to_string(),
+                        deadline_millis: None,
                     });
             }
             _ => {}
@@ -1182,6 +1190,7 @@ fn host_capability_dispatch(
         active.scheduler.schedule(JsScheduledTask {
             queue: JsTaskQueue::HostCallbacks,
             label: format!("{service}::{operation}"),
+            deadline_millis: None,
         });
         let response = active
             .host_services
@@ -1389,11 +1398,12 @@ mod tests {
         BoaJsScheduler,
     };
     use crate::{
-        DeterministicJsEntropySource, DeterministicJsHostServices, DeterministicJsScheduler,
-        DeterministicJsServiceOutcome, FixedJsClock, JsExecutionRequest, JsForkPolicy,
-        JsHostServiceRequest, JsHostServices, JsLoadedModule, JsModuleKind, JsResolvedModule,
-        JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsScheduledTask,
-        JsScheduler, JsSubstrateError, JsTaskQueue, NeverCancel,
+        DeterministicJsClock, DeterministicJsEntropySource, DeterministicJsHostServices,
+        DeterministicJsScheduler, DeterministicJsServiceOutcome, FixedJsClock, JsExecutionRequest,
+        JsForkPolicy, JsHostServiceRequest, JsHostServices, JsLoadedModule, JsModuleKind,
+        JsResolvedModule, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
+        JsRuntimeProvenance, JsScheduledTask, JsScheduler, JsSubstrateError, JsTaskQueue,
+        NeverCancel,
     };
 
     struct EmptyLoader;
@@ -1628,12 +1638,59 @@ state;
         assert!(fired.get());
     }
 
+    #[test]
+    fn delayed_timeout_jobs_wait_for_clock_advance_and_record_deadline() {
+        let scheduler = Arc::new(DeterministicJsScheduler::default());
+        let job_executor = Rc::new(BoaJobExecutor::new(scheduler.clone()));
+        let clock = Arc::new(DeterministicJsClock::new(1_000));
+        let mut context = Context::builder()
+            .clock(Rc::new(BoaClockAdapter::new(clock.clone())))
+            .build()
+            .expect("build context");
+        let fired = Rc::new(Cell::new(false));
+        let fired_clone = fired.clone();
+
+        job_executor.clone().enqueue_job(
+            Job::TimeoutJob(TimeoutJob::from_duration(
+                move |_context| {
+                    fired_clone.set(true);
+                    Ok(JsValue::undefined())
+                },
+                Duration::from_millis(250),
+            )),
+            &mut context,
+        );
+        job_executor.flush_scheduled_tasks();
+        assert_eq!(
+            BoaJsScheduler::snapshot(scheduler.as_ref()).scheduled_tasks,
+            vec![JsScheduledTask::deadline(
+                JsTaskQueue::Timers,
+                "timeout-job",
+                1_250,
+            )]
+        );
+
+        job_executor
+            .clone()
+            .run_jobs(&mut context)
+            .expect("run jobs before timer deadline");
+        assert!(!fired.get());
+
+        clock.advance_millis(250);
+        job_executor
+            .clone()
+            .run_jobs(&mut context)
+            .expect("run jobs after timer deadline");
+        assert!(fired.get());
+    }
+
     #[tokio::test]
     async fn deterministic_boa_adapters_tolerate_async_observers() {
         let scheduler = DeterministicJsScheduler::default();
         let scheduled = JsScheduledTask {
             queue: JsTaskQueue::PromiseJobs,
             label: "observer-safe".to_string(),
+            deadline_millis: None,
         };
         let scheduler_guard = scheduler.gate.lock().await;
         BoaJsScheduler::schedule(&scheduler, scheduled.clone());
