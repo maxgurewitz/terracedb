@@ -1,13 +1,21 @@
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
-use terracedb_vfs::{FileKind, ReadOnlyVfsFileSystem, SnapshotOptions, Volume, VolumeSnapshot};
+use terracedb_vfs::{
+    CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, SnapshotOptions, Stats,
+    VfsFileSystem, Volume, VolumeSnapshot,
+};
 
 use crate::{
-    GitCheckoutReport, GitCheckoutRequest, GitDiscoverReport, GitDiscoverRequest, GitHeadState,
-    GitIndexSnapshot, GitObject, GitObjectDatabase, GitObjectKind, GitRefDatabase, GitReference,
-    GitRepositoryHandle, GitRepositoryImageDescriptor, GitStatusReport, GitSubstrateError,
-    worktree::GitWorktreeMaterializer,
+    GitCheckoutReport, GitCheckoutRequest, GitDiffEntry, GitDiffKind, GitDiffReport,
+    GitDiffRequest, GitDiscoverReport, GitDiscoverRequest, GitHeadState, GitIndexEntry,
+    GitIndexSnapshot, GitIndexStore, GitObject, GitObjectDatabase, GitObjectKind, GitRefDatabase,
+    GitRefUpdate, GitRefUpdateReport, GitReference, GitRepositoryHandle,
+    GitRepositoryImageDescriptor, GitStatusEntry, GitStatusKind, GitStatusOptions, GitStatusReport,
+    GitSubstrateError, worktree::GitWorktreeMaterializer,
 };
 
 pub trait GitCancellationToken: Send + Sync {
@@ -45,7 +53,19 @@ pub trait GitExecutionHooks: Send + Sync {
         Ok(())
     }
 
+    async fn on_status(&self, _report: &GitStatusReport) -> Result<(), GitSubstrateError> {
+        Ok(())
+    }
+
+    async fn on_diff(&self, _report: &GitDiffReport) -> Result<(), GitSubstrateError> {
+        Ok(())
+    }
+
     async fn on_checkout(&self, _report: &GitCheckoutReport) -> Result<(), GitSubstrateError> {
+        Ok(())
+    }
+
+    async fn on_update_ref(&self, _report: &GitRefUpdateReport) -> Result<(), GitSubstrateError> {
         Ok(())
     }
 }
@@ -60,12 +80,17 @@ pub trait GitRepositoryImage: Send + Sync {
     fn descriptor(&self) -> GitRepositoryImageDescriptor;
     fn root_path(&self) -> &str;
     fn snapshot(&self) -> Arc<dyn VolumeSnapshot>;
+
+    fn writable_volume(&self) -> Option<Arc<dyn Volume>> {
+        None
+    }
 }
 
 #[derive(Clone)]
 pub struct VfsGitRepositoryImage {
     root_path: Arc<str>,
     snapshot: Arc<dyn VolumeSnapshot>,
+    volume: Option<Arc<dyn Volume>>,
 }
 
 impl VfsGitRepositoryImage {
@@ -74,6 +99,7 @@ impl VfsGitRepositoryImage {
         Self {
             root_path: Arc::from(normalize_path(root_path.as_ref())),
             snapshot,
+            volume: None,
         }
     }
 
@@ -82,7 +108,11 @@ impl VfsGitRepositoryImage {
         root_path: impl Into<Arc<str>>,
         snapshot: SnapshotOptions,
     ) -> Result<Self, GitSubstrateError> {
-        Ok(Self::new(volume.snapshot(snapshot).await?, root_path))
+        Ok(Self {
+            root_path: Arc::from(normalize_path(root_path.into().as_ref())),
+            snapshot: volume.snapshot(snapshot).await?,
+            volume: Some(volume),
+        })
     }
 }
 
@@ -102,6 +132,10 @@ impl GitRepositoryImage for VfsGitRepositoryImage {
 
     fn snapshot(&self) -> Arc<dyn VolumeSnapshot> {
         self.snapshot.clone()
+    }
+
+    fn writable_volume(&self) -> Option<Arc<dyn Volume>> {
+        self.volume.clone()
     }
 }
 
@@ -129,19 +163,36 @@ pub trait GitRepository:
 {
     fn handle(&self) -> GitRepositoryHandle;
     async fn head(&self) -> Result<GitHeadState, GitSubstrateError>;
-    async fn status(&self) -> Result<GitStatusReport, GitSubstrateError>;
+
+    async fn status(&self) -> Result<GitStatusReport, GitSubstrateError> {
+        self.status_with_options(GitStatusOptions::default()).await
+    }
+
+    async fn status_with_options(
+        &self,
+        options: GitStatusOptions,
+    ) -> Result<GitStatusReport, GitSubstrateError>;
+
+    async fn diff(&self, request: GitDiffRequest) -> Result<GitDiffReport, GitSubstrateError>;
+
     async fn checkout(
         &self,
         request: GitCheckoutRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitCheckoutReport, GitSubstrateError>;
+
+    async fn update_ref(
+        &self,
+        request: GitRefUpdate,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitRefUpdateReport, GitSubstrateError>;
 }
 
 #[derive(Clone)]
 pub struct DeterministicGitRepositoryStore {
     name: Arc<str>,
     hooks: Arc<dyn GitExecutionHooks>,
-    materializer: Arc<dyn GitWorktreeMaterializer>,
+    materializer: Option<Arc<dyn GitWorktreeMaterializer>>,
     fork_policy: crate::GitForkPolicy,
 }
 
@@ -150,7 +201,7 @@ impl DeterministicGitRepositoryStore {
         Self {
             name: Arc::from("deterministic-git"),
             hooks: Arc::new(NoopGitExecutionHooks),
-            materializer: Arc::new(crate::worktree::DeterministicGitWorktreeMaterializer),
+            materializer: None,
             fork_policy: crate::GitForkPolicy::simulation_native_baseline(),
         }
     }
@@ -161,7 +212,7 @@ impl DeterministicGitRepositoryStore {
     }
 
     pub fn with_materializer(mut self, materializer: Arc<dyn GitWorktreeMaterializer>) -> Self {
-        self.materializer = materializer;
+        self.materializer = Some(materializer);
         self
     }
 }
@@ -239,6 +290,7 @@ impl GitRepositoryStore for DeterministicGitRepositoryStore {
         };
         self.hooks.on_open(&handle).await?;
         Ok(Arc::new(DeterministicGitRepository {
+            snapshot_view: RwLock::new(image.snapshot()),
             image,
             handle,
             hooks: self.hooks.clone(),
@@ -248,17 +300,18 @@ impl GitRepositoryStore for DeterministicGitRepositoryStore {
 }
 
 struct DeterministicGitRepository {
+    snapshot_view: RwLock<Arc<dyn VolumeSnapshot>>,
     image: Arc<dyn GitRepositoryImage>,
     handle: GitRepositoryHandle,
     hooks: Arc<dyn GitExecutionHooks>,
-    materializer: Arc<dyn GitWorktreeMaterializer>,
+    materializer: Option<Arc<dyn GitWorktreeMaterializer>>,
 }
 
 #[async_trait]
 impl GitObjectDatabase for DeterministicGitRepository {
     async fn read_object(&self, oid: &str) -> Result<Option<GitObject>, GitSubstrateError> {
         let path = join_virtual(&self.handle.root_path, &format!(".git/objects/{oid}"));
-        let Some(bytes) = self.image.snapshot().fs().read_file(&path).await? else {
+        let Some(bytes) = self.current_fs().await?.read_file(&path).await? else {
             return Ok(None);
         };
         let (kind, data) = match bytes
@@ -283,7 +336,13 @@ impl GitObjectDatabase for DeterministicGitRepository {
 impl GitRefDatabase for DeterministicGitRepository {
     async fn list_refs(&self) -> Result<Vec<GitReference>, GitSubstrateError> {
         let refs_root = join_virtual(&self.handle.root_path, ".git/refs");
-        let refs = collect_refs(self.image.snapshot().fs(), &refs_root, "refs").await?;
+        let refs = collect_refs(
+            self.current_fs().await?,
+            &self.handle.root_path,
+            &refs_root,
+            "refs",
+        )
+        .await?;
         self.hooks.on_read_refs(&refs).await?;
         Ok(refs)
     }
@@ -293,7 +352,7 @@ impl GitRefDatabase for DeterministicGitRepository {
 impl crate::GitIndexStore for DeterministicGitRepository {
     async fn index(&self) -> Result<GitIndexSnapshot, GitSubstrateError> {
         let path = join_virtual(&self.handle.root_path, ".git/index.json");
-        let Some(bytes) = self.image.snapshot().fs().read_file(&path).await? else {
+        let Some(bytes) = self.current_fs().await?.read_file(&path).await? else {
             return Ok(GitIndexSnapshot::default());
         };
         Ok(serde_json::from_slice(&bytes)?)
@@ -308,26 +367,17 @@ impl GitRepository for DeterministicGitRepository {
 
     async fn head(&self) -> Result<GitHeadState, GitSubstrateError> {
         let head_path = join_virtual(&self.handle.root_path, ".git/HEAD");
-        let head = self
-            .image
-            .snapshot()
-            .fs()
-            .read_file(&head_path)
-            .await?
-            .ok_or_else(|| GitSubstrateError::RepositoryNotFound {
+        let fs = self.current_fs().await?;
+        let head = fs.read_file(&head_path).await?.ok_or_else(|| {
+            GitSubstrateError::RepositoryNotFound {
                 path: self.handle.root_path.clone(),
-            })?;
+            }
+        })?;
         let head_text = String::from_utf8_lossy(&head).trim().to_string();
         if let Some(reference) = head_text.strip_prefix("ref: ") {
             let reference = reference.to_string();
-            let ref_path = join_virtual(&self.handle.root_path, &format!(".git/{reference}"));
-            let oid = self
-                .image
-                .snapshot()
-                .fs()
-                .read_file(&ref_path)
-                .await?
-                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string());
+            let oid =
+                resolve_reference_to_oid(fs.clone(), &self.handle.root_path, &reference).await?;
             let state = GitHeadState {
                 symbolic_ref: Some(reference),
                 oid,
@@ -344,8 +394,61 @@ impl GitRepository for DeterministicGitRepository {
         }
     }
 
-    async fn status(&self) -> Result<GitStatusReport, GitSubstrateError> {
-        Ok(GitStatusReport::default())
+    async fn status_with_options(
+        &self,
+        options: GitStatusOptions,
+    ) -> Result<GitStatusReport, GitSubstrateError> {
+        let scan = self
+            .scan_repository(&options.pathspec, options.include_ignored)
+            .await?;
+        let report = GitStatusReport {
+            dirty: scan.dirty,
+            entries: scan
+                .entries
+                .into_iter()
+                .filter(|entry| match entry.kind {
+                    GitStatusKind::Ignored => options.include_ignored,
+                    GitStatusKind::Untracked => options.include_untracked,
+                    _ => true,
+                })
+                .filter(|entry| status_entry_matches_pathspec(entry, &options.pathspec))
+                .map(|entry| GitStatusEntry {
+                    path: entry.path,
+                    kind: entry.kind,
+                    previous_path: entry.previous_path,
+                })
+                .collect(),
+        };
+        self.hooks.on_status(&report).await?;
+        Ok(report)
+    }
+
+    async fn diff(&self, request: GitDiffRequest) -> Result<GitDiffReport, GitSubstrateError> {
+        let scan = self
+            .scan_repository(&request.pathspec, request.include_ignored)
+            .await?;
+        let report = GitDiffReport {
+            dirty: scan.dirty,
+            entries: scan
+                .entries
+                .into_iter()
+                .filter(|entry| match entry.kind {
+                    GitStatusKind::Ignored => request.include_ignored,
+                    GitStatusKind::Untracked => request.include_untracked,
+                    _ => true,
+                })
+                .filter(|entry| status_entry_matches_pathspec(entry, &request.pathspec))
+                .map(|entry| GitDiffEntry {
+                    path: entry.path,
+                    kind: diff_kind_for_status(entry.kind),
+                    previous_path: entry.previous_path,
+                    old_oid: entry.old_oid,
+                    new_oid: entry.new_oid,
+                })
+                .collect(),
+        };
+        self.hooks.on_diff(&report).await?;
+        Ok(report)
     }
 
     async fn checkout(
@@ -358,13 +461,851 @@ impl GitRepository for DeterministicGitRepository {
                 repository_id: self.handle.repository_id.clone(),
             });
         }
-        let report = self
-            .materializer
-            .materialize(&self.handle.repository_id, request, cancellation)
-            .await?;
+        let report = if let Some(materializer) = &self.materializer {
+            materializer
+                .materialize(&self.handle.repository_id, request, cancellation)
+                .await?
+        } else {
+            self.checkout_into_vfs(request, cancellation).await?
+        };
         self.hooks.on_checkout(&report).await?;
         Ok(report)
     }
+
+    async fn update_ref(
+        &self,
+        request: GitRefUpdate,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitRefUpdateReport, GitSubstrateError> {
+        if cancellation.is_cancelled() {
+            return Err(GitSubstrateError::Cancelled {
+                repository_id: self.handle.repository_id.clone(),
+            });
+        }
+        let volume = self.writable_volume()?;
+        let fs = volume.fs();
+        let reference_name = normalize_ref_name(&request.name);
+        let reference_path = git_control_path(&self.handle.root_path, &reference_name);
+        let current_target = fs
+            .read_file(&reference_path)
+            .await?
+            .map(|bytes| decode_reference_target(&bytes));
+        if request.previous_target != current_target {
+            return Err(GitSubstrateError::ReferenceConflict {
+                reference: reference_name.clone(),
+                expected: request.previous_target,
+                found: current_target,
+            });
+        }
+
+        let payload = if request.symbolic {
+            format!("ref: {}\n", request.target)
+        } else {
+            format!("{}\n", request.target)
+        };
+        fs.write_file(
+            &reference_path,
+            payload.into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.refresh_snapshot().await?;
+
+        let report = GitRefUpdateReport {
+            reference: GitReference {
+                name: reference_name,
+                target: request.target,
+            },
+            previous_target: current_target,
+        };
+        self.hooks.on_update_ref(&report).await?;
+        Ok(report)
+    }
+}
+
+impl DeterministicGitRepository {
+    async fn current_snapshot(&self) -> Result<Arc<dyn VolumeSnapshot>, GitSubstrateError> {
+        Ok(self
+            .snapshot_view
+            .read()
+            .expect("git snapshot view lock poisoned")
+            .clone())
+    }
+
+    async fn current_fs(&self) -> Result<Arc<dyn ReadOnlyVfsFileSystem>, GitSubstrateError> {
+        Ok(self.current_snapshot().await?.fs())
+    }
+
+    async fn refresh_snapshot(&self) -> Result<(), GitSubstrateError> {
+        let Some(volume) = self.image.writable_volume() else {
+            return Ok(());
+        };
+        let snapshot = volume.snapshot(SnapshotOptions::default()).await?;
+        *self
+            .snapshot_view
+            .write()
+            .expect("git snapshot view lock poisoned") = snapshot;
+        Ok(())
+    }
+
+    fn writable_volume(&self) -> Result<Arc<dyn Volume>, GitSubstrateError> {
+        self.image
+            .writable_volume()
+            .ok_or_else(|| GitSubstrateError::RepositoryReadOnly {
+                repository_id: self.handle.repository_id.clone(),
+            })
+    }
+
+    async fn scan_repository(
+        &self,
+        pathspec: &[String],
+        include_ignored: bool,
+    ) -> Result<RepositoryScan, GitSubstrateError> {
+        let fs = self.current_fs().await?;
+        let head = self.head().await?;
+        let head_tree = if let Some(oid) = head.oid.as_deref() {
+            self.tree_entries_for_target_oid(oid).await?
+        } else {
+            BTreeMap::new()
+        };
+        let index = GitIndexStore::index(self).await?;
+        let tracked = build_tracked_entries(&index, &head_tree);
+        let ignore_patterns = load_ignore_patterns(fs.clone(), &self.handle.root_path).await?;
+        let mut worktree = collect_worktree_entries(fs, &self.handle.root_path).await?;
+        let mut entries = Vec::new();
+
+        for (path, tracked_entry) in tracked {
+            let current = worktree.remove(&path);
+            let staged_kind = tracked_entry.staged_kind();
+            let rename_fingerprint = tracked_entry.rename_fingerprint(self).await?;
+            match current {
+                None => {
+                    if tracked_entry.index_oid.is_some() {
+                        entries.push(ScanEntry::deleted(
+                            path,
+                            tracked_entry.comparison_oid(),
+                            rename_fingerprint,
+                        ));
+                    } else if staged_kind != GitStatusKind::Clean {
+                        entries.push(scan_entry_from_staged_kind(
+                            path,
+                            &tracked_entry,
+                            rename_fingerprint,
+                        ));
+                    }
+                }
+                Some(current) => {
+                    if tracked_entry.index_oid.is_some()
+                        && tracked_entry.worktree_matches_index(self, &current).await?
+                    {
+                        if staged_kind != GitStatusKind::Clean {
+                            entries.push(scan_entry_from_staged_kind(
+                                path,
+                                &tracked_entry,
+                                rename_fingerprint,
+                            ));
+                        }
+                        continue;
+                    }
+                    if staged_kind != GitStatusKind::Clean {
+                        entries.push(scan_entry_from_staged_kind(
+                            path,
+                            &tracked_entry,
+                            rename_fingerprint,
+                        ));
+                    } else {
+                        entries.push(ScanEntry::modified(
+                            path,
+                            tracked_entry.comparison_oid(),
+                            current.oid_hint(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for (path, current) in worktree {
+            if is_ignored_path(&path, &ignore_patterns) {
+                if include_ignored {
+                    entries.push(ScanEntry::ignored(path));
+                }
+                continue;
+            }
+            entries.push(ScanEntry::untracked(
+                path,
+                current.oid_hint(),
+                Some(content_fingerprint(&current.payload_bytes())),
+            ));
+        }
+
+        collapse_renames(&mut entries);
+        entries.retain(|entry| status_entry_matches_pathspec(entry, pathspec));
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let dirty = entries
+            .iter()
+            .any(|entry| !matches!(entry.kind, GitStatusKind::Ignored));
+        Ok(RepositoryScan { dirty, entries })
+    }
+
+    async fn checkout_into_vfs(
+        &self,
+        request: GitCheckoutRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitCheckoutReport, GitSubstrateError> {
+        let volume = self.writable_volume()?;
+        let fs = volume.fs();
+        let target = normalize_path(&request.materialize_path);
+        let resolved = self.resolve_target_ref(&request.target_ref).await?;
+        let entries = self.tree_entries_for_target_oid(&resolved.oid).await?;
+        let filtered = entries
+            .into_values()
+            .filter(|entry| pathspec_matches(&entry.path, &request.pathspec))
+            .collect::<Vec<_>>();
+
+        let deleted_paths = if request.pathspec.is_empty() {
+            clear_checkout_target(
+                fs.as_ref(),
+                &target,
+                target == self.handle.root_path,
+                &self.handle.repository_id,
+                cancellation.as_ref(),
+            )
+            .await?
+        } else {
+            clear_checkout_pathspec(
+                fs.as_ref(),
+                &target,
+                target == self.handle.root_path,
+                &request.pathspec,
+                &self.handle.repository_id,
+                cancellation.as_ref(),
+            )
+            .await?
+        };
+
+        ensure_directory(fs.as_ref(), &target).await?;
+        let written_paths = self
+            .materialize_tree_entries(fs.as_ref(), &target, &filtered, cancellation.as_ref())
+            .await?;
+
+        if target == self.handle.root_path {
+            if request.update_head && request.pathspec.is_empty() {
+                self.write_checkout_head(fs.as_ref(), &request.target_ref, &resolved)
+                    .await?;
+            }
+            let existing_index = GitIndexStore::index(self).await?;
+            write_index_snapshot(
+                fs.as_ref(),
+                &self.handle.root_path,
+                checkout_index_snapshot(&existing_index, &filtered, &request.pathspec),
+            )
+            .await?;
+        }
+        self.refresh_snapshot().await?;
+
+        Ok(GitCheckoutReport {
+            target_ref: request.target_ref,
+            materialized_path: target,
+            written_paths,
+            deleted_paths,
+            head_oid: Some(resolved.oid),
+        })
+    }
+
+    async fn materialize_tree_entries(
+        &self,
+        fs: &dyn VfsFileSystem,
+        target_root: &str,
+        entries: &[TreeEntry],
+        cancellation: &dyn GitCancellationToken,
+    ) -> Result<usize, GitSubstrateError> {
+        let mut written = 0;
+        for entry in entries {
+            if cancellation.is_cancelled() {
+                return Err(GitSubstrateError::Cancelled {
+                    repository_id: self.handle.repository_id.clone(),
+                });
+            }
+            let destination = join_virtual(target_root, &entry.path);
+            if let Some(parent) = parent_path(&destination) {
+                ensure_directory(fs, &parent).await?;
+            }
+            if is_symlink_mode(entry.mode) {
+                let target =
+                    String::from_utf8(self.read_blob_payload(&entry.oid).await?).map_err(|_| {
+                        GitSubstrateError::InvalidObject {
+                            oid: entry.oid.clone(),
+                            message: "symlink blob is not valid UTF-8".to_string(),
+                        }
+                    })?;
+                remove_existing_path(fs, &destination).await?;
+                fs.symlink(&target, &destination).await?;
+            } else {
+                fs.write_file(
+                    &destination,
+                    self.read_blob_payload(&entry.oid).await?,
+                    CreateOptions {
+                        create_parents: true,
+                        overwrite: true,
+                        mode: entry.mode & 0o777,
+                    },
+                )
+                .await?;
+            }
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    async fn write_checkout_head(
+        &self,
+        fs: &dyn VfsFileSystem,
+        target_ref: &str,
+        resolved: &ResolvedTarget,
+    ) -> Result<(), GitSubstrateError> {
+        let head_path = git_control_path(&self.handle.root_path, "HEAD");
+        let payload = if let Some(reference) = &resolved.symbolic_ref {
+            format!("ref: {}\n", reference)
+        } else if target_ref == "HEAD" {
+            return Ok(());
+        } else {
+            format!("{}\n", resolved.oid)
+        };
+        fs.write_file(
+            &head_path,
+            payload.into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn resolve_target_ref(
+        &self,
+        target_ref: &str,
+    ) -> Result<ResolvedTarget, GitSubstrateError> {
+        if target_ref == "HEAD" {
+            let head = self.head().await?;
+            let oid = head
+                .oid
+                .ok_or_else(|| GitSubstrateError::ReferenceNotFound {
+                    reference: "HEAD".to_string(),
+                })?;
+            return Ok(ResolvedTarget {
+                oid,
+                symbolic_ref: head.symbolic_ref,
+            });
+        }
+
+        let candidates = if target_ref.starts_with("refs/") {
+            vec![target_ref.to_string()]
+        } else {
+            vec![
+                target_ref.to_string(),
+                format!("refs/heads/{target_ref}"),
+                format!("refs/tags/{target_ref}"),
+            ]
+        };
+        for candidate in candidates {
+            let path = git_control_path(&self.handle.root_path, &candidate);
+            if self.current_fs().await?.read_file(&path).await?.is_some() {
+                return Ok(ResolvedTarget {
+                    oid: resolve_reference_to_oid(
+                        self.current_fs().await?,
+                        &self.handle.root_path,
+                        &candidate,
+                    )
+                    .await?
+                    .ok_or_else(|| GitSubstrateError::ReferenceNotFound {
+                        reference: candidate.clone(),
+                    })?,
+                    symbolic_ref: Some(candidate),
+                });
+            }
+        }
+        if self.read_object(target_ref).await?.is_some() {
+            return Ok(ResolvedTarget {
+                oid: target_ref.to_string(),
+                symbolic_ref: None,
+            });
+        }
+        Err(GitSubstrateError::ReferenceNotFound {
+            reference: target_ref.to_string(),
+        })
+    }
+
+    async fn tree_entries_for_target_oid(
+        &self,
+        oid: &str,
+    ) -> Result<BTreeMap<String, TreeEntry>, GitSubstrateError> {
+        let object =
+            self.read_object(oid)
+                .await?
+                .ok_or_else(|| GitSubstrateError::ObjectNotFound {
+                    oid: oid.to_string(),
+                })?;
+        match object.kind {
+            GitObjectKind::Commit => {
+                let tree_oid = parse_commit_tree_oid(&object)?;
+                let mut entries = BTreeMap::new();
+                self.collect_tree_entries(&tree_oid, "", &mut entries)
+                    .await?;
+                Ok(entries)
+            }
+            GitObjectKind::Tree => {
+                let mut entries = BTreeMap::new();
+                self.collect_tree_entries(oid, "", &mut entries).await?;
+                Ok(entries)
+            }
+            other => Err(GitSubstrateError::InvalidObject {
+                oid: oid.to_string(),
+                message: format!("expected commit or tree object, found {other:?}"),
+            }),
+        }
+    }
+
+    async fn collect_tree_entries(
+        &self,
+        tree_oid: &str,
+        prefix: &str,
+        output: &mut BTreeMap<String, TreeEntry>,
+    ) -> Result<(), GitSubstrateError> {
+        let object =
+            self.read_object(tree_oid)
+                .await?
+                .ok_or_else(|| GitSubstrateError::ObjectNotFound {
+                    oid: tree_oid.to_string(),
+                })?;
+        if object.kind != GitObjectKind::Tree {
+            return Err(GitSubstrateError::InvalidObject {
+                oid: tree_oid.to_string(),
+                message: "tree traversal encountered a non-tree object".to_string(),
+            });
+        }
+
+        for record in parse_tree_entries(&object)? {
+            let path = if prefix.is_empty() {
+                record.path.clone()
+            } else {
+                format!("{prefix}/{}", record.path)
+            };
+            if record.kind == GitObjectKind::Tree {
+                Box::pin(self.collect_tree_entries(&record.oid, &path, output)).await?;
+            } else {
+                output.insert(
+                    path.clone(),
+                    TreeEntry {
+                        path,
+                        oid: record.oid,
+                        mode: record.mode,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_blob_payload(&self, oid: &str) -> Result<Vec<u8>, GitSubstrateError> {
+        let object =
+            self.read_object(oid)
+                .await?
+                .ok_or_else(|| GitSubstrateError::ObjectNotFound {
+                    oid: oid.to_string(),
+                })?;
+        match object.kind {
+            GitObjectKind::Blob | GitObjectKind::Unknown => Ok(object.data),
+            other => Err(GitSubstrateError::InvalidObject {
+                oid: oid.to_string(),
+                message: format!("expected blob object, found {other:?}"),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RepositoryScan {
+    dirty: bool,
+    entries: Vec<ScanEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct ScanEntry {
+    path: String,
+    kind: GitStatusKind,
+    previous_path: Option<String>,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
+    rename_fingerprint: Option<String>,
+}
+
+impl ScanEntry {
+    fn modified(path: String, old_oid: Option<String>, new_oid: Option<String>) -> Self {
+        Self {
+            path,
+            kind: GitStatusKind::Modified,
+            previous_path: None,
+            old_oid,
+            new_oid,
+            rename_fingerprint: None,
+        }
+    }
+
+    fn added(path: String, new_oid: Option<String>, rename_fingerprint: Option<String>) -> Self {
+        Self {
+            path,
+            kind: GitStatusKind::Added,
+            previous_path: None,
+            old_oid: None,
+            new_oid,
+            rename_fingerprint,
+        }
+    }
+
+    fn deleted(path: String, old_oid: Option<String>, rename_fingerprint: Option<String>) -> Self {
+        Self {
+            path,
+            kind: GitStatusKind::Deleted,
+            previous_path: None,
+            old_oid,
+            new_oid: None,
+            rename_fingerprint,
+        }
+    }
+
+    fn untracked(
+        path: String,
+        new_oid: Option<String>,
+        rename_fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            kind: GitStatusKind::Untracked,
+            previous_path: None,
+            old_oid: None,
+            new_oid,
+            rename_fingerprint,
+        }
+    }
+
+    fn ignored(path: String) -> Self {
+        Self {
+            path,
+            kind: GitStatusKind::Ignored,
+            previous_path: None,
+            old_oid: None,
+            new_oid: None,
+            rename_fingerprint: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrackedEntry {
+    head_oid: Option<String>,
+    head_mode: Option<u32>,
+    index_oid: Option<String>,
+    index_mode: Option<u32>,
+}
+
+impl TrackedEntry {
+    fn staged_kind(&self) -> GitStatusKind {
+        match (&self.head_oid, &self.index_oid) {
+            (None, Some(_)) => GitStatusKind::Added,
+            (Some(_), None) => GitStatusKind::Deleted,
+            (Some(head_oid), Some(index_oid))
+                if head_oid != index_oid || self.head_mode != self.index_mode =>
+            {
+                GitStatusKind::Modified
+            }
+            _ => GitStatusKind::Clean,
+        }
+    }
+
+    fn comparison_oid(&self) -> Option<String> {
+        self.index_oid.clone().or_else(|| self.head_oid.clone())
+    }
+
+    fn comparison_mode(&self) -> Option<u32> {
+        self.index_mode.or(self.head_mode)
+    }
+
+    async fn worktree_matches_index(
+        &self,
+        repository: &DeterministicGitRepository,
+        current: &WorktreeEntry,
+    ) -> Result<bool, GitSubstrateError> {
+        let Some(mode) = self.comparison_mode() else {
+            return Ok(false);
+        };
+        if !mode_matches(mode, current.kind, current.stats.mode) {
+            return Ok(false);
+        }
+        let Some(oid) = self.comparison_oid() else {
+            return Ok(true);
+        };
+        let Some(object) = repository.read_object(&oid).await? else {
+            return Ok(true);
+        };
+        if !matches!(object.kind, GitObjectKind::Blob | GitObjectKind::Unknown) {
+            return Ok(true);
+        }
+        Ok(object.data == current.payload_bytes())
+    }
+
+    async fn rename_fingerprint(
+        &self,
+        repository: &DeterministicGitRepository,
+    ) -> Result<Option<String>, GitSubstrateError> {
+        let Some(oid) = self.comparison_oid() else {
+            return Ok(None);
+        };
+        let Some(object) = repository.read_object(&oid).await? else {
+            return Ok(None);
+        };
+        if !matches!(object.kind, GitObjectKind::Blob | GitObjectKind::Unknown) {
+            return Ok(None);
+        }
+        Ok(Some(content_fingerprint(&object.data)))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorktreeEntry {
+    kind: FileKind,
+    stats: Stats,
+    payload: WorktreePayload,
+}
+
+impl WorktreeEntry {
+    fn payload_bytes(&self) -> Vec<u8> {
+        match &self.payload {
+            WorktreePayload::File(bytes) => bytes.clone(),
+            WorktreePayload::Symlink(target) => target.as_bytes().to_vec(),
+        }
+    }
+
+    fn oid_hint(&self) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+enum WorktreePayload {
+    File(Vec<u8>),
+    Symlink(String),
+}
+
+#[derive(Clone, Debug)]
+struct TreeEntry {
+    path: String,
+    oid: String,
+    mode: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedTreeRecord {
+    path: String,
+    oid: String,
+    mode: u32,
+    kind: GitObjectKind,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedTarget {
+    oid: String,
+    symbolic_ref: Option<String>,
+}
+
+fn build_tracked_entries(
+    index: &GitIndexSnapshot,
+    head_tree: &BTreeMap<String, TreeEntry>,
+) -> BTreeMap<String, TrackedEntry> {
+    let mut tracked = BTreeMap::new();
+    for (path, entry) in head_tree {
+        tracked.insert(
+            path.clone(),
+            TrackedEntry {
+                head_oid: Some(entry.oid.clone()),
+                head_mode: Some(entry.mode),
+                index_oid: None,
+                index_mode: None,
+            },
+        );
+    }
+    if index.entries.is_empty() {
+        return tracked;
+    }
+    for entry in &index.entries {
+        tracked
+            .entry(entry.path.clone())
+            .and_modify(|tracked_entry| {
+                tracked_entry.index_oid = entry.oid.clone();
+                tracked_entry.index_mode = Some(entry.mode);
+            })
+            .or_insert_with(|| TrackedEntry {
+                head_oid: None,
+                head_mode: None,
+                index_oid: entry.oid.clone(),
+                index_mode: Some(entry.mode),
+            });
+    }
+    tracked
+}
+
+fn checkout_index_snapshot(
+    existing: &GitIndexSnapshot,
+    target_entries: &[TreeEntry],
+    pathspec: &[String],
+) -> GitIndexSnapshot {
+    let mut entries = existing
+        .entries
+        .iter()
+        .filter(|entry| !pathspec_matches(&entry.path, pathspec))
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.extend(target_entries.iter().map(|entry| GitIndexEntry {
+        path: entry.path.clone(),
+        oid: Some(entry.oid.clone()),
+        mode: entry.mode,
+    }));
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    GitIndexSnapshot {
+        entries,
+        metadata: existing.metadata.clone(),
+    }
+}
+
+fn scan_entry_from_staged_kind(
+    path: String,
+    tracked_entry: &TrackedEntry,
+    rename_fingerprint: Option<String>,
+) -> ScanEntry {
+    match tracked_entry.staged_kind() {
+        GitStatusKind::Added => {
+            ScanEntry::added(path, tracked_entry.index_oid.clone(), rename_fingerprint)
+        }
+        GitStatusKind::Deleted => {
+            ScanEntry::deleted(path, tracked_entry.head_oid.clone(), rename_fingerprint)
+        }
+        GitStatusKind::Modified => ScanEntry::modified(
+            path,
+            tracked_entry.head_oid.clone(),
+            tracked_entry.index_oid.clone(),
+        ),
+        GitStatusKind::Clean
+        | GitStatusKind::Untracked
+        | GitStatusKind::Ignored
+        | GitStatusKind::Renamed => ScanEntry::modified(
+            path,
+            tracked_entry.head_oid.clone(),
+            tracked_entry.index_oid.clone(),
+        ),
+    }
+}
+
+fn collapse_renames(entries: &mut Vec<ScanEntry>) {
+    let deleted = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind == GitStatusKind::Deleted && entry.rename_fingerprint.is_some()
+        })
+        .map(|(index, entry)| {
+            (
+                entry
+                    .rename_fingerprint
+                    .clone()
+                    .expect("rename fingerprint"),
+                index,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut paired_deleted = Vec::new();
+    let mut renamed = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.kind != GitStatusKind::Untracked {
+            continue;
+        }
+        let Some(fingerprint) = entry.rename_fingerprint.as_ref() else {
+            continue;
+        };
+        let Some(deleted_index) = deleted.get(fingerprint) else {
+            continue;
+        };
+        paired_deleted.push(*deleted_index);
+        renamed.push((
+            index,
+            ScanEntry {
+                path: entry.path.clone(),
+                kind: GitStatusKind::Renamed,
+                previous_path: Some(entries[*deleted_index].path.clone()),
+                old_oid: entries[*deleted_index].old_oid.clone(),
+                new_oid: entry.new_oid.clone(),
+                rename_fingerprint: None,
+            },
+        ));
+    }
+
+    if renamed.is_empty() {
+        return;
+    }
+
+    let deleted_set = paired_deleted
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let renamed_map = renamed.into_iter().collect::<BTreeMap<_, _>>();
+    let mut next = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        if deleted_set.contains(&index) {
+            continue;
+        }
+        if let Some(replacement) = renamed_map.get(&index) {
+            next.push(replacement.clone());
+            continue;
+        }
+        next.push(entry.clone());
+    }
+    *entries = next;
+}
+
+fn diff_kind_for_status(kind: GitStatusKind) -> GitDiffKind {
+    match kind {
+        GitStatusKind::Clean => GitDiffKind::Modified,
+        GitStatusKind::Modified => GitDiffKind::Modified,
+        GitStatusKind::Added => GitDiffKind::Added,
+        GitStatusKind::Deleted => GitDiffKind::Deleted,
+        GitStatusKind::Untracked => GitDiffKind::Untracked,
+        GitStatusKind::Ignored => GitDiffKind::Ignored,
+        GitStatusKind::Renamed => GitDiffKind::Renamed,
+    }
+}
+
+fn content_fingerprint(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn status_entry_matches_pathspec(entry: &ScanEntry, pathspec: &[String]) -> bool {
+    if pathspec.is_empty() {
+        return true;
+    }
+    pathspec_matches(&entry.path, pathspec)
+        || entry
+            .previous_path
+            .as_ref()
+            .is_some_and(|path| pathspec_matches(path, pathspec))
 }
 
 async fn discover_repository_root(
@@ -401,6 +1342,7 @@ async fn read_head_ref(
 
 async fn collect_refs(
     fs: Arc<dyn ReadOnlyVfsFileSystem>,
+    root: &str,
     path: &str,
     relative: &str,
 ) -> Result<Vec<GitReference>, GitSubstrateError> {
@@ -418,9 +1360,20 @@ async fn collect_refs(
                 FileKind::Directory => stack.push((child_path, child_relative)),
                 FileKind::File => {
                     if let Some(bytes) = fs.read_file(&child_path).await? {
+                        let target = if bytes.starts_with(b"ref: ") {
+                            resolve_reference_to_oid(
+                                fs.clone(),
+                                root,
+                                &decode_reference_target(&bytes),
+                            )
+                            .await?
+                            .unwrap_or_else(|| decode_reference_target(&bytes))
+                        } else {
+                            decode_reference_target(&bytes)
+                        };
                         output.push(GitReference {
                             name: child_relative,
-                            target: String::from_utf8_lossy(&bytes).trim().to_string(),
+                            target,
                         });
                     }
                 }
@@ -432,6 +1385,212 @@ async fn collect_refs(
     Ok(output)
 }
 
+async fn resolve_reference_to_oid(
+    fs: Arc<dyn ReadOnlyVfsFileSystem>,
+    root: &str,
+    reference: &str,
+) -> Result<Option<String>, GitSubstrateError> {
+    let mut current = reference.to_string();
+    for _ in 0..16 {
+        let path = git_control_path(root, &current);
+        let Some(bytes) = fs.read_file(&path).await? else {
+            return Ok(None);
+        };
+        let target = decode_reference_target(&bytes);
+        if bytes.starts_with(b"ref: ") {
+            current = target;
+        } else {
+            return Ok(Some(target));
+        }
+    }
+    Err(GitSubstrateError::ReferenceNotFound {
+        reference: reference.to_string(),
+    })
+}
+
+async fn collect_worktree_entries(
+    fs: Arc<dyn ReadOnlyVfsFileSystem>,
+    root: &str,
+) -> Result<BTreeMap<String, WorktreeEntry>, GitSubstrateError> {
+    let mut output = BTreeMap::new();
+    let mut stack = vec![(normalize_path(root), String::new())];
+    while let Some((directory, relative_prefix)) = stack.pop() {
+        for child in fs.readdir_plus(&directory).await? {
+            if directory == normalize_path(root) && child.entry.name == ".git" {
+                continue;
+            }
+            let child_path = join_virtual(&directory, &child.entry.name);
+            let relative_path = if relative_prefix.is_empty() {
+                child.entry.name.clone()
+            } else {
+                format!("{relative_prefix}/{}", child.entry.name)
+            };
+            match child.entry.kind {
+                FileKind::Directory => stack.push((child_path, relative_path)),
+                FileKind::File => {
+                    let payload = fs.read_file(&child_path).await?.ok_or_else(|| {
+                        GitSubstrateError::RepositoryNotFound {
+                            path: child_path.clone(),
+                        }
+                    })?;
+                    output.insert(
+                        relative_path,
+                        WorktreeEntry {
+                            kind: FileKind::File,
+                            stats: child.stats,
+                            payload: WorktreePayload::File(payload),
+                        },
+                    );
+                }
+                FileKind::Symlink => {
+                    let target = fs.readlink(&child_path).await?;
+                    output.insert(
+                        relative_path,
+                        WorktreeEntry {
+                            kind: FileKind::Symlink,
+                            stats: child.stats,
+                            payload: WorktreePayload::Symlink(target),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+async fn load_ignore_patterns(
+    fs: Arc<dyn ReadOnlyVfsFileSystem>,
+    root: &str,
+) -> Result<Vec<String>, GitSubstrateError> {
+    let path = join_virtual(root, ".gitignore");
+    let Some(bytes) = fs.read_file(&path).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
+}
+
+fn is_ignored_path(path: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| ignore_pattern_matches(pattern, path))
+}
+
+fn ignore_pattern_matches(pattern: &str, path: &str) -> bool {
+    let mut pattern = pattern.trim();
+    let anchored = pattern.starts_with('/');
+    if anchored {
+        pattern = pattern.trim_start_matches('/');
+    }
+    let directory_only = pattern.ends_with('/');
+    let pattern = pattern.trim_end_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
+    if directory_only {
+        return if anchored {
+            path == pattern || path.starts_with(&format!("{pattern}/"))
+        } else {
+            path_components(path)
+                .into_iter()
+                .scan(String::new(), |prefix, component| {
+                    if prefix.is_empty() {
+                        *prefix = component.to_string();
+                    } else {
+                        prefix.push('/');
+                        prefix.push_str(component);
+                    }
+                    Some(prefix.clone())
+                })
+                .any(|candidate| {
+                    candidate == pattern || candidate.starts_with(&format!("{pattern}/"))
+                })
+        };
+    }
+    if anchored || pattern.contains('/') {
+        return pathspec_component_matches(path, pattern);
+    }
+    path_components(path)
+        .into_iter()
+        .any(|component| wildcard_matches(component, pattern))
+}
+
+fn pathspec_matches(path: &str, pathspec: &[String]) -> bool {
+    if pathspec.is_empty() {
+        return true;
+    }
+    pathspec
+        .iter()
+        .map(|entry| entry.trim())
+        .any(|entry| match entry {
+            "" | "." | "./" => true,
+            _ => {
+                let entry = entry.trim_start_matches("./").trim_start_matches('/');
+                if entry.ends_with('/') {
+                    path == entry.trim_end_matches('/')
+                        || path.starts_with(&format!("{}/", entry.trim_end_matches('/')))
+                } else if entry.contains('*') || entry.contains('?') {
+                    pathspec_component_matches(path, entry)
+                } else {
+                    path == entry || path.starts_with(&format!("{entry}/"))
+                }
+            }
+        })
+}
+
+fn pathspec_component_matches(path: &str, pattern: &str) -> bool {
+    if !pattern.contains('/') {
+        return wildcard_matches(path, pattern)
+            || path_components(path)
+                .into_iter()
+                .any(|component| wildcard_matches(component, pattern));
+    }
+    wildcard_path_matches(path, pattern)
+}
+
+fn wildcard_matches(input: &str, pattern: &str) -> bool {
+    wildcard_match_bytes(input.as_bytes(), pattern.as_bytes())
+}
+
+fn wildcard_path_matches(path: &str, pattern: &str) -> bool {
+    let path_segments = path_components(path);
+    let pattern_segments = path_components(pattern);
+    path_segments.len() == pattern_segments.len()
+        && path_segments
+            .iter()
+            .zip(pattern_segments.iter())
+            .all(|(path, pattern)| wildcard_matches(path, pattern))
+}
+
+fn wildcard_match_bytes(input: &[u8], pattern: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return input.is_empty();
+    }
+    match pattern[0] {
+        b'*' => {
+            wildcard_match_bytes(input, &pattern[1..])
+                || (!input.is_empty() && wildcard_match_bytes(&input[1..], pattern))
+        }
+        b'?' => !input.is_empty() && wildcard_match_bytes(&input[1..], &pattern[1..]),
+        byte => {
+            !input.is_empty()
+                && input[0] == byte
+                && wildcard_match_bytes(&input[1..], &pattern[1..])
+        }
+    }
+}
+
+fn path_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
 fn parse_object_kind(kind: &[u8]) -> GitObjectKind {
     match kind {
         b"blob" => GitObjectKind::Blob,
@@ -440,6 +1599,314 @@ fn parse_object_kind(kind: &[u8]) -> GitObjectKind {
         b"tag" => GitObjectKind::Tag,
         _ => GitObjectKind::Unknown,
     }
+}
+
+fn parse_commit_tree_oid(object: &GitObject) -> Result<String, GitSubstrateError> {
+    let text = String::from_utf8_lossy(&object.data);
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix("tree ")
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| GitSubstrateError::InvalidObject {
+            oid: object.oid.clone(),
+            message: "commit object is missing a tree header".to_string(),
+        })
+}
+
+fn parse_tree_entries(object: &GitObject) -> Result<Vec<ParsedTreeRecord>, GitSubstrateError> {
+    let mut entries = Vec::new();
+    for line in String::from_utf8_lossy(&object.data).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (header, path) =
+            line.split_once('\t')
+                .ok_or_else(|| GitSubstrateError::InvalidObject {
+                    oid: object.oid.clone(),
+                    message: format!("tree entry is missing a tab separator: {line}"),
+                })?;
+        let mut parts = header.split_whitespace();
+        let mode = parts
+            .next()
+            .ok_or_else(|| GitSubstrateError::InvalidObject {
+                oid: object.oid.clone(),
+                message: format!("tree entry is missing a mode: {line}"),
+            })
+            .and_then(|mode| {
+                u32::from_str_radix(mode, 8).map_err(|_| GitSubstrateError::InvalidObject {
+                    oid: object.oid.clone(),
+                    message: format!("tree entry has an invalid octal mode: {line}"),
+                })
+            })?;
+        let kind = parts
+            .next()
+            .ok_or_else(|| GitSubstrateError::InvalidObject {
+                oid: object.oid.clone(),
+                message: format!("tree entry is missing a kind: {line}"),
+            })
+            .map(|kind| match kind {
+                "blob" => GitObjectKind::Blob,
+                "tree" => GitObjectKind::Tree,
+                "commit" => GitObjectKind::Commit,
+                "tag" => GitObjectKind::Tag,
+                _ => GitObjectKind::Unknown,
+            })?;
+        let oid = parts
+            .next()
+            .ok_or_else(|| GitSubstrateError::InvalidObject {
+                oid: object.oid.clone(),
+                message: format!("tree entry is missing an oid: {line}"),
+            })?
+            .to_string();
+        entries.push(ParsedTreeRecord {
+            path: path.to_string(),
+            oid,
+            mode,
+            kind,
+        });
+    }
+    Ok(entries)
+}
+
+async fn write_index_snapshot(
+    fs: &dyn VfsFileSystem,
+    root: &str,
+    snapshot: GitIndexSnapshot,
+) -> Result<(), GitSubstrateError> {
+    fs.write_file(
+        &git_control_path(root, "index.json"),
+        serde_json::to_vec(&snapshot)?,
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn clear_checkout_target(
+    fs: &dyn VfsFileSystem,
+    target: &str,
+    preserve_git: bool,
+    repository_id: &str,
+    cancellation: &dyn GitCancellationToken,
+) -> Result<usize, GitSubstrateError> {
+    let target = normalize_path(target);
+    let Some(stats) = fs.stat(&target).await? else {
+        ensure_directory(fs, &target).await?;
+        return Ok(0);
+    };
+    if stats.kind != FileKind::Directory {
+        remove_existing_path(fs, &target).await?;
+        ensure_directory(fs, &target).await?;
+        return Ok(1);
+    }
+    let mut removed = 0;
+    for entry in fs.readdir(&target).await? {
+        if preserve_git && entry.name == ".git" {
+            continue;
+        }
+        if cancellation.is_cancelled() {
+            return Err(GitSubstrateError::Cancelled {
+                repository_id: repository_id.to_string(),
+            });
+        }
+        removed += remove_path_recursive(fs, &join_virtual(&target, &entry.name)).await?;
+    }
+    Ok(removed)
+}
+
+async fn clear_checkout_pathspec(
+    fs: &dyn VfsFileSystem,
+    target_root: &str,
+    preserve_git: bool,
+    pathspec: &[String],
+    repository_id: &str,
+    cancellation: &dyn GitCancellationToken,
+) -> Result<usize, GitSubstrateError> {
+    let target_root = normalize_path(target_root);
+    let Some(stats) = fs.stat(&target_root).await? else {
+        return Ok(0);
+    };
+    if stats.kind != FileKind::Directory {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in fs.readdir(&target_root).await? {
+        if preserve_git && entry.name == ".git" {
+            continue;
+        }
+        if cancellation.is_cancelled() {
+            return Err(GitSubstrateError::Cancelled {
+                repository_id: repository_id.to_string(),
+            });
+        }
+        let child_path = join_virtual(&target_root, &entry.name);
+        let relative = entry.name;
+        removed += Box::pin(clear_checkout_pathspec_recursive(
+            fs,
+            &child_path,
+            &relative,
+            pathspec,
+            repository_id,
+            cancellation,
+        ))
+        .await?;
+    }
+    Ok(removed)
+}
+
+async fn clear_checkout_pathspec_recursive(
+    fs: &dyn VfsFileSystem,
+    path: &str,
+    relative: &str,
+    pathspec: &[String],
+    repository_id: &str,
+    cancellation: &dyn GitCancellationToken,
+) -> Result<usize, GitSubstrateError> {
+    if cancellation.is_cancelled() {
+        return Err(GitSubstrateError::Cancelled {
+            repository_id: repository_id.to_string(),
+        });
+    }
+    let Some(stats) = fs.lstat(path).await? else {
+        return Ok(0);
+    };
+    if pathspec_matches(relative, pathspec) {
+        return remove_path_recursive(fs, path).await;
+    }
+    if stats.kind == FileKind::Directory {
+        let mut removed = 0;
+        for entry in fs.readdir(path).await? {
+            let child_path = join_virtual(path, &entry.name);
+            let child_relative = format!("{relative}/{}", entry.name);
+            removed += Box::pin(clear_checkout_pathspec_recursive(
+                fs,
+                &child_path,
+                &child_relative,
+                pathspec,
+                repository_id,
+                cancellation,
+            ))
+            .await?;
+        }
+        if fs.readdir(path).await?.is_empty() {
+            fs.rmdir(path).await?;
+            removed += 1;
+        }
+        return Ok(removed);
+    }
+    Ok(0)
+}
+
+async fn remove_path_recursive(
+    fs: &dyn VfsFileSystem,
+    path: &str,
+) -> Result<usize, GitSubstrateError> {
+    let Some(stats) = fs.lstat(path).await? else {
+        return Ok(0);
+    };
+    match stats.kind {
+        FileKind::File | FileKind::Symlink => {
+            fs.unlink(path).await?;
+            Ok(1)
+        }
+        FileKind::Directory => {
+            let mut removed = 0;
+            for entry in fs.readdir(path).await? {
+                removed +=
+                    Box::pin(remove_path_recursive(fs, &join_virtual(path, &entry.name))).await?;
+            }
+            fs.rmdir(path).await?;
+            Ok(removed + 1)
+        }
+    }
+}
+
+async fn remove_existing_path(fs: &dyn VfsFileSystem, path: &str) -> Result<(), GitSubstrateError> {
+    if fs.lstat(path).await?.is_some() {
+        let _ = remove_path_recursive(fs, path).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_directory(fs: &dyn VfsFileSystem, path: &str) -> Result<(), GitSubstrateError> {
+    let path = normalize_path(path);
+    match fs.stat(&path).await? {
+        Some(stats) if stats.kind == FileKind::Directory => Ok(()),
+        Some(_) => {
+            remove_existing_path(fs, &path).await?;
+            fs.mkdir(
+                &path,
+                MkdirOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(())
+        }
+        None => {
+            fs.mkdir(
+                &path,
+                MkdirOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+fn mode_matches(expected_mode: u32, actual_kind: FileKind, actual_mode: u32) -> bool {
+    match actual_kind {
+        FileKind::Symlink => is_symlink_mode(expected_mode),
+        FileKind::Directory => is_directory_mode(expected_mode),
+        FileKind::File => {
+            !is_symlink_mode(expected_mode)
+                && !is_directory_mode(expected_mode)
+                && ((expected_mode & 0o111) != 0) == ((actual_mode & 0o111) != 0)
+        }
+    }
+}
+
+fn is_symlink_mode(mode: u32) -> bool {
+    (mode & 0o170000) == 0o120000
+}
+
+fn is_directory_mode(mode: u32) -> bool {
+    (mode & 0o170000) == 0o040000
+}
+
+fn git_control_path(root: &str, name: &str) -> String {
+    if name.starts_with(".git/") {
+        join_virtual(root, name)
+    } else {
+        join_virtual(root, &format!(".git/{}", name.trim_start_matches('/')))
+    }
+}
+
+fn normalize_ref_name(name: &str) -> String {
+    if name == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        name.trim_start_matches(".git/")
+            .trim_start_matches('/')
+            .to_string()
+    }
+}
+
+fn decode_reference_target(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    text.strip_prefix("ref: ")
+        .map(str::to_string)
+        .unwrap_or(text)
 }
 
 fn ancestor_paths(start_path: &str, root: &str) -> Vec<String> {
@@ -540,5 +2007,20 @@ fn normalize_path(path: &str) -> String {
         "/".to_string()
     } else {
         format!("/{}", parts.join("/"))
+    }
+}
+
+fn parent_path(path: &str) -> Option<String> {
+    let path = normalize_path(path);
+    if path == "/" {
+        None
+    } else {
+        path.rsplit_once('/').map(|(parent, _)| {
+            if parent.is_empty() {
+                "/".to_string()
+            } else {
+                parent.to_string()
+            }
+        })
     }
 }

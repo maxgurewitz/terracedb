@@ -6,6 +6,8 @@ use terracedb_vfs::VfsError;
 pub enum GitSubstrateError {
     #[error("git repository was not found at or above {path}")]
     RepositoryNotFound { path: String },
+    #[error("git repository {repository_id} is read-only")]
+    RepositoryReadOnly { repository_id: String },
     #[error(
         "git repository image descriptor mismatch for {field}: expected {expected}, found {found}"
     )]
@@ -16,8 +18,16 @@ pub enum GitSubstrateError {
     },
     #[error("git reference was not found: {reference}")]
     ReferenceNotFound { reference: String },
+    #[error("git reference {reference} expected {expected:?}, found {found:?}")]
+    ReferenceConflict {
+        reference: String,
+        expected: Option<String>,
+        found: Option<String>,
+    },
     #[error("git object was not found: {oid}")]
     ObjectNotFound { oid: String },
+    #[error("git object {oid} could not be decoded: {message}")]
+    InvalidObject { oid: String, message: String },
     #[error("git repository {repository_id} was cancelled")]
     Cancelled { repository_id: String },
     #[error("git host bridge {operation} failed: {message}")]

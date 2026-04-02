@@ -33,6 +33,9 @@ impl GitWorktreeMaterializer for DeterministicGitWorktreeMaterializer {
         Ok(GitCheckoutReport {
             target_ref: request.target_ref,
             materialized_path: request.materialize_path,
+            written_paths: 0,
+            deleted_paths: 0,
+            head_oid: None,
         })
     }
 }
