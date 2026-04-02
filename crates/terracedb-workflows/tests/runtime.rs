@@ -576,6 +576,7 @@ async fn open_sandbox_contract_handler(
             package_compat: PackageCompatibilityMode::TerraceOnly,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: Default::default(),
+            execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })

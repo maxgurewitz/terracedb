@@ -838,7 +838,7 @@ fn execution_metadata(
         ("operation".to_string(), serde_json::to_value(operation)?),
         (
             "execution_domain".to_string(),
-            serde_json::to_value(&binding.domain)?,
+            serde_json::to_value(binding.domain)?,
         ),
         (
             "execution_domain_path".to_string(),

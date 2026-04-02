@@ -28,8 +28,8 @@ use terracedb::{
 };
 
 pub mod failpoints;
-pub mod transition_engine;
 mod run_model;
+pub mod transition_engine;
 
 pub use run_model::{
     InMemoryWorkflowRunStore, WorkflowHistoryRecord, WorkflowReductionPlan, WorkflowRunBuilder,

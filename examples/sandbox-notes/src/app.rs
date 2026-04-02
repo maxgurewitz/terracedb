@@ -349,11 +349,11 @@ impl CapabilityRegistry for PreparedNotesPolicyRegistry {
                 )?);
                 Ok(result)
             }
-            PolicyOutcomeKind::MissingBinding | PolicyOutcomeKind::Denied => {
-                Err(SandboxError::CapabilityDenied {
-                    specifier: request.specifier,
-                })
-            }
+            PolicyOutcomeKind::MissingBinding
+            | PolicyOutcomeKind::Denied
+            | PolicyOutcomeKind::NotVisible => Err(SandboxError::CapabilityDenied {
+                specifier: request.specifier,
+            }),
             PolicyOutcomeKind::RateLimited | PolicyOutcomeKind::BudgetExhausted => {
                 Err(SandboxError::Service {
                     service: "sandbox-notes",
