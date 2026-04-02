@@ -370,6 +370,8 @@ pub struct GitExportReport {
 pub struct GitPushRequest {
     pub remote: String,
     pub branch_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
     pub metadata: BTreeMap<String, JsonValue>,
 }
 

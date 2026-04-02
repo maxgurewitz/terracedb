@@ -21,6 +21,7 @@ use terracedb_capabilities::{
     ExecutionOperation, ExecutionPolicy, ManifestBinding, ResourceKind, ResourcePolicy,
     ResourceSelector, ShellCommandDescriptor, capability_module_specifier,
 };
+use terracedb_git::HostGitBridge;
 use terracedb_sandbox::{
     BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
     DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicPackageInstaller,
@@ -1251,7 +1252,9 @@ async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
         .into_owned();
     let remote_url = remote.to_string_lossy().into_owned();
 
-    let services = SandboxServices::deterministic_with_host_git();
+    let services = SandboxServices::deterministic().with_git_host_bridge(Arc::new(
+        HostGitBridge::new("host-git", "https://sandbox-bridge.invalid"),
+    ));
     let (source_vfs, sandbox) = sandbox_store_with_services(118, 2084, services.clone());
     let base_volume_id = VolumeId::new(0x8224);
     let session_volume_id = VolumeId::new(0x8225);
@@ -1387,10 +1390,10 @@ async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
         })
         .await
         .expect("create pull request after reopen");
-    assert!(report.url.contains("example.invalid"));
+    assert!(report.url.contains("sandbox-bridge.invalid"));
     assert_eq!(
         report.metadata.get("eject_mode"),
-        Some(&json!("apply_delta"))
+        Some(&json!("materialize_snapshot"))
     );
     assert_eq!(
         report.metadata.get("provenance_validated"),

@@ -11,7 +11,8 @@ use terracedb::Clock;
 use terracedb_capabilities::{ExecutionOperation, ExecutionPolicy};
 use terracedb_git::{
     DeterministicGitHostBridge, GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest,
-    HostGitBridge, NeverCancel,
+    GitPullRequestRequest as GitBridgePullRequestRequest, GitPushRequest, HostGitBridge,
+    NeverCancel,
 };
 use terracedb_vfs::{
     CompletedToolRun, CompletedToolRunOutcome, CreateOptions, DirEntry, MkdirOptions,
@@ -1195,7 +1196,12 @@ impl SandboxSession {
                 prepare_git_hoist_via_bridge(self.services.git_bridge.clone(), &request).await?
             }
             crate::HoistMode::GitHead | crate::HoistMode::GitWorkingTree { .. } => {
-                prepare_hoist(&request)?
+                return Err(SandboxError::Service {
+                    service: "git",
+                    message:
+                        "git hoist requires a git host bridge that supports host repository import"
+                            .to_string(),
+                });
             }
         };
         let _guard = self.operation_lock.lock().await;
@@ -1258,9 +1264,7 @@ impl SandboxSession {
         &self,
         request: PullRequestRequest,
     ) -> Result<PullRequestReport, SandboxError> {
-        let has_git_provenance = self.info().await.provenance.git.is_some();
-        let mut git_metadata = BTreeMap::new();
-        if has_git_provenance {
+        if self.info().await.provenance.git.is_some() {
             let workspace_path = default_export_workspace_path(
                 &self.info().await.session_volume_id.to_string(),
                 &request.head_branch,
@@ -1272,65 +1276,106 @@ impl SandboxSession {
                     target_path: workspace_path.to_string_lossy().into_owned(),
                 })
                 .await?;
-            let export_mode = if load_hoist_manifest(self.volume.as_ref()).await?.is_some() {
-                EjectMode::ApplyDelta
-            } else {
-                EjectMode::MaterializeSnapshot
-            };
-            let export_mode_label = match export_mode {
-                EjectMode::MaterializeSnapshot => "materialize_snapshot",
-                EjectMode::ApplyDelta => "apply_delta",
-            };
             let eject_report = self
                 .eject_to_disk(EjectRequest {
                     target_path: workspace.workspace_path.clone(),
-                    mode: export_mode.clone(),
+                    mode: EjectMode::MaterializeSnapshot,
                     conflict_policy: ConflictPolicy::Fail,
                 })
                 .await?;
-            git_metadata.extend(workspace.metadata.clone());
+            let mut git_metadata = workspace.metadata.clone();
             git_metadata.insert(
                 "workspace_path".to_string(),
                 JsonValue::from(workspace.workspace_path.clone()),
             );
-            git_metadata.insert("eject_mode".to_string(), JsonValue::from(export_mode_label));
+            git_metadata.insert(
+                "eject_mode".to_string(),
+                JsonValue::from("materialize_snapshot"),
+            );
             git_metadata.insert(
                 "provenance_validated".to_string(),
                 JsonValue::from(eject_report.provenance_validated),
             );
-            if workspace.metadata.contains_key("repo_root") {
-                let finalize = self
+            let finalize = self
+                .services
+                .git_bridge
+                .finalize_export(
+                    finalize_export_request(
+                        workspace.workspace_path.clone(),
+                        request.title.clone(),
+                        request.body.clone(),
+                        request.head_branch.clone(),
+                        git_metadata.clone(),
+                    ),
+                    Arc::new(NeverCancel),
+                )
+                .await
+                .map_err(git_substrate_error_to_sandbox)?;
+            git_metadata = finalize_export_report_metadata(finalize);
+
+            let has_remote = git_metadata
+                .get("push_remote")
+                .and_then(JsonValue::as_str)
+                .is_some()
+                || git_metadata
+                    .get("remote_url")
+                    .and_then(JsonValue::as_str)
+                    .is_some();
+            if has_remote {
+                let push = self
                     .services
                     .git_bridge
-                    .finalize_export(
-                        finalize_export_request(
-                            workspace.workspace_path.clone(),
-                            request.title.clone(),
-                            request.body.clone(),
-                            request.head_branch.clone(),
-                            git_metadata.clone(),
-                        ),
+                    .push(
+                        GitPushRequest {
+                            remote: "origin".to_string(),
+                            branch_name: request.head_branch.clone(),
+                            head_oid: git_metadata
+                                .get("head_commit")
+                                .and_then(JsonValue::as_str)
+                                .map(ToString::to_string),
+                            metadata: git_metadata.clone(),
+                        },
                         Arc::new(NeverCancel),
                     )
                     .await
                     .map_err(git_substrate_error_to_sandbox)?;
-                git_metadata = finalize_export_report_metadata(finalize);
+                git_metadata = push.metadata;
+                git_metadata.insert("pushed".to_string(), JsonValue::from(true));
+                git_metadata.insert(
+                    "push_remote_name".to_string(),
+                    JsonValue::from(push.remote.clone()),
+                );
+                if let Some(oid) = push.pushed_oid {
+                    git_metadata.insert("pushed_oid".to_string(), JsonValue::from(oid));
+                }
+            } else {
+                git_metadata.insert("pushed".to_string(), JsonValue::from(false));
             }
-            let mut report = self
+
+            let report = self
                 .services
-                .pull_requests
-                .create_pull_request(self, request)
-                .await?;
-            report.metadata.extend(git_metadata);
-            return Ok(report);
+                .git_bridge
+                .create_pull_request(
+                    GitBridgePullRequestRequest {
+                        title: request.title,
+                        body: request.body,
+                        head_branch: request.head_branch,
+                        base_branch: request.base_branch,
+                        metadata: git_metadata,
+                    },
+                    Arc::new(NeverCancel),
+                )
+                .await
+                .map_err(git_substrate_error_to_sandbox)?;
+            return Ok(git_bridge_pull_request_to_sandbox(
+                self.services.git_bridge.name(),
+                report,
+            ));
         }
-        let mut report = self
-            .services
+        self.services
             .pull_requests
             .create_pull_request(self, request)
-            .await?;
-        report.metadata.extend(git_metadata);
-        Ok(report)
+            .await
     }
 
     pub async fn close(&self, options: CloseSessionOptions) -> Result<(), SandboxError> {
@@ -1742,6 +1787,25 @@ fn git_import_entry_to_tree_entry(
         }
     };
     Ok(TreeEntry { path, data })
+}
+
+fn git_bridge_pull_request_to_sandbox(
+    provider: &str,
+    report: terracedb_git::GitPullRequestReport,
+) -> PullRequestReport {
+    let id = report
+        .url
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("pull-request")
+        .to_string();
+    PullRequestReport {
+        provider: provider.to_string(),
+        id,
+        url: report.url,
+        metadata: report.metadata,
+    }
 }
 
 fn normalize_bridge_import_path(path: &str) -> Result<String, SandboxError> {

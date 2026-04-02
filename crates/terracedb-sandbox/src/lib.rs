@@ -42,9 +42,9 @@ pub use git::{
 pub use harness::SandboxHarness;
 pub use loader::{
     HOST_CAPABILITY_PREFIX, LoadedSandboxModule, SANDBOX_BASH_LIBRARY_SPECIFIER,
-    SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry,
-    SandboxModuleKind, SandboxModuleLoadTrace, SandboxModuleLoader, SandboxModuleSpecifier,
-    TERRACE_WORKSPACE_PREFIX,
+    SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_GIT_LIBRARY_SPECIFIER,
+    SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry, SandboxModuleKind,
+    SandboxModuleLoadTrace, SandboxModuleLoader, SandboxModuleSpecifier, TERRACE_WORKSPACE_PREFIX,
 };
 pub use packages::{
     DeterministicPackageClass, DeterministicPackageDefinition, DeterministicPackageInstaller,
