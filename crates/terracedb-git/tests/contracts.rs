@@ -1,8 +1,11 @@
 use std::{
     collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -12,11 +15,12 @@ use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, Stub
 use terracedb_git::worktree::GitWorktreeMaterializer;
 use terracedb_git::{
     DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutReport, GitCheckoutRequest,
-    GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitForkPolicy, GitHeadState,
-    GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase, GitOpenRequest, GitRefUpdate,
-    GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryPolicy,
-    GitRepositoryProvenance, GitRepositoryStore, GitStatusKind, GitStatusOptions,
-    GitSubstrateError, NeverCancel, VfsGitRepositoryImage,
+    GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitFinalizeExportRequest, GitForkPolicy,
+    GitHeadState, GitHostBridge, GitImportMode, GitImportRequest, GitIndexEntry, GitIndexSnapshot,
+    GitObject, GitObjectDatabase, GitOpenRequest, GitRefUpdate, GitReference, GitRepositoryHandle,
+    GitRepositoryImage, GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
+    GitStatusKind, GitStatusOptions, GitSubstrateError, GitWorkspaceRequest, HostGitBridge,
+    NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, SnapshotOptions, Volume, VolumeConfig,
@@ -170,6 +174,152 @@ fn tree_oid_for_commit(oid: &str) -> String {
 
 fn source_bytes_for_commit(oid: &str) -> Vec<u8> {
     format!("pub const SEED: &str = \"{oid}\";\n").into_bytes()
+}
+
+static HOST_TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+static GIT_ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+struct GitEnvRestore {
+    author_date: Option<String>,
+    committer_date: Option<String>,
+}
+
+impl GitEnvRestore {
+    fn set(author_date: &str, committer_date: &str) -> Self {
+        let restore = Self {
+            author_date: env::var("GIT_AUTHOR_DATE").ok(),
+            committer_date: env::var("GIT_COMMITTER_DATE").ok(),
+        };
+        unsafe {
+            env::set_var("GIT_AUTHOR_DATE", author_date);
+            env::set_var("GIT_COMMITTER_DATE", committer_date);
+        }
+        restore
+    }
+}
+
+impl Drop for GitEnvRestore {
+    fn drop(&mut self) {
+        if let Some(value) = self.author_date.as_deref() {
+            unsafe {
+                env::set_var("GIT_AUTHOR_DATE", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("GIT_AUTHOR_DATE");
+            }
+        }
+        if let Some(value) = self.committer_date.as_deref() {
+            unsafe {
+                env::set_var("GIT_COMMITTER_DATE", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("GIT_COMMITTER_DATE");
+            }
+        }
+    }
+}
+
+fn unique_test_dir(name: &str) -> PathBuf {
+    let id = HOST_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("terracedb-git-{name}-{}-{id}", std::process::id()));
+    let _ = fs::remove_dir_all(&path);
+    path
+}
+
+fn cleanup(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
+
+fn git_env_lock() -> &'static std::sync::Mutex<()> {
+    GIT_ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn sanitized_git_command() -> Command {
+    let mut command = Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = sanitized_git_command()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git -C {} {} failed: {}",
+        dir.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = sanitized_git_command()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git -C {} {} failed: {}",
+        dir.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn write_host_file(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent");
+    }
+    fs::write(path, contents).expect("write host file");
+}
+
+fn init_git_repo(repo: &Path, remote: Option<&Path>) {
+    fs::create_dir_all(repo).expect("create repo dir");
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.name", "Sandbox Tester"]);
+    git(repo, &["config", "user.email", "sandbox@example.invalid"]);
+    write_host_file(&repo.join("tracked.txt"), "tracked\n");
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "initial"]);
+    if let Some(remote) = remote {
+        fs::create_dir_all(remote).expect("create remote parent");
+        let output = sanitized_git_command()
+            .arg("init")
+            .arg("--bare")
+            .arg(remote)
+            .output()
+            .expect("init bare remote");
+        assert!(
+            output.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git(
+            repo,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git(repo, &["push", "-u", "origin", "main"]);
+    }
 }
 
 fn open_request(
@@ -1227,4 +1377,132 @@ async fn non_head_symbolic_refs_resolve_through_ref_reads_and_checkout() {
         .await
         .expect("checkout symbolic branch");
     assert_eq!(checkout.head_oid.as_deref(), Some(base_oid.as_str()));
+}
+
+#[tokio::test]
+async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports() {
+    let repo = unique_test_dir("host-bridge-repo");
+    let remote = unique_test_dir("host-bridge-remote");
+    let workspace = unique_test_dir("host-bridge-workspace");
+    init_git_repo(&repo, Some(&remote));
+
+    let bridge = HostGitBridge::default();
+    let imported = bridge
+        .import_repository(
+            GitImportRequest {
+                source_path: repo.to_string_lossy().into_owned(),
+                target_root: "/repo".to_string(),
+                mode: GitImportMode::Head,
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("import host repo");
+    assert_eq!(imported.target_root, "/repo");
+    assert_eq!(
+        imported
+            .entries
+            .iter()
+            .find(|entry| entry.path == "tracked.txt")
+            .and_then(|entry| entry.data.as_ref())
+            .cloned(),
+        Some(b"tracked\n".to_vec())
+    );
+
+    let base_ref = git_out(&repo, &["rev-parse", "HEAD"]);
+    let prepared = bridge
+        .prepare_workspace(
+            GitWorkspaceRequest {
+                repo_root: repo.to_string_lossy().into_owned(),
+                branch_name: "sandbox/feature".to_string(),
+                base_ref: base_ref.clone(),
+                target_path: workspace.to_string_lossy().into_owned(),
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("prepare host workspace");
+    assert_eq!(prepared.workspace_path, workspace.to_string_lossy());
+
+    write_host_file(&workspace.join("tracked.txt"), "updated through bridge\n");
+    let _guard = git_env_lock().lock().expect("lock git env");
+    let _git_env = GitEnvRestore::set("2024-01-02T03:04:05Z", "2024-01-02T03:04:05Z");
+    let finalized = bridge
+        .finalize_export(
+            GitFinalizeExportRequest {
+                workspace_path: workspace.to_string_lossy().into_owned(),
+                head_branch: "sandbox/feature".to_string(),
+                title: "Bridge export".to_string(),
+                body: "Created by host bridge".to_string(),
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("finalize export");
+    assert_eq!(finalized.metadata.get("committed"), Some(&json!(true)));
+    assert_eq!(finalized.metadata.get("pushed"), Some(&json!(true)));
+    assert_eq!(
+        git_out(&workspace, &["log", "-1", "--format=%aI"]),
+        "2024-01-02T03:04:05+00:00"
+    );
+    assert_eq!(
+        git_out(&workspace, &["log", "-1", "--format=%cI"]),
+        "2024-01-02T03:04:05+00:00"
+    );
+
+    let finalized_noop = bridge
+        .finalize_export(
+            GitFinalizeExportRequest {
+                workspace_path: workspace.to_string_lossy().into_owned(),
+                head_branch: "sandbox/feature".to_string(),
+                title: "Bridge export".to_string(),
+                body: "Created by host bridge".to_string(),
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("finalize no-op export");
+    assert_eq!(
+        finalized_noop.metadata.get("committed"),
+        Some(&json!(false))
+    );
+    assert_eq!(finalized_noop.metadata.get("pushed"), Some(&json!(false)));
+
+    let remote_head = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["rev-parse", "refs/heads/sandbox/feature"])
+        .output()
+        .expect("read remote branch");
+    assert!(
+        remote_head.status.success(),
+        "remote branch missing: {}",
+        String::from_utf8_lossy(&remote_head.stderr)
+    );
+
+    let pr_error = bridge
+        .create_pull_request(
+            terracedb_git::GitPullRequestRequest {
+                title: "Bridge export".to_string(),
+                body: "Created by host bridge".to_string(),
+                head_branch: "sandbox/feature".to_string(),
+                base_branch: "main".to_string(),
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect_err("default host bridge should fail closed without a provider adapter");
+    assert!(matches!(
+        pr_error,
+        GitSubstrateError::PullRequestProvider { .. }
+    ));
+
+    cleanup(&repo);
+    cleanup(&remote);
+    cleanup(&workspace);
 }

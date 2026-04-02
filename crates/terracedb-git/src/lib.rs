@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod bridge;
 pub mod error;
+pub mod host;
 pub mod index;
 pub mod object;
 pub mod refs;
@@ -9,8 +10,13 @@ pub mod types;
 pub mod worktree;
 
 pub use adapters::{SandboxGitBinding, SandboxGitRequest};
-pub use bridge::{DeterministicGitHostBridge, GitHostBridge, GitImportReport, GitImportRequest};
+pub use bridge::{
+    DeterministicGitHostBridge, GitFinalizeExportReport, GitFinalizeExportRequest, GitHostBridge,
+    GitImportEntry, GitImportEntryKind, GitImportMode, GitImportReport, GitImportRequest,
+    GitWorkspaceReport, GitWorkspaceRequest,
+};
 pub use error::GitSubstrateError;
+pub use host::HostGitBridge;
 pub use index::GitIndexStore;
 pub use object::{GitObjectDatabase, GitObjectKind};
 pub use refs::GitRefDatabase;

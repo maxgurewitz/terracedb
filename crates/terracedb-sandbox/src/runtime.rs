@@ -7,11 +7,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, FixedJsClock, JsCompatibilityProfile,
-    JsExecutionKind, JsExecutionRequest, JsForkPolicy, JsHostServiceCallRecord,
-    JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsRuntime, JsRuntimeHost,
-    JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsSubstrateError, NeverCancel,
+    JsExecutionKind, JsExecutionRequest, JsForkPolicy, JsHostServiceAdapter, JsHostServiceRequest,
+    JsHostServiceResponse, JsHostServices, JsRuntime, JsRuntimeHost, JsRuntimeOpenRequest,
+    JsRuntimePolicy, JsRuntimeProvenance, JsSubstrateError, NeverCancel, RoutedJsHostServices,
+    VfsJsHostServiceAdapter,
 };
-use terracedb_vfs::{CreateOptions, JsonValue, Stats};
+use terracedb_vfs::{CreateOptions, JsonValue};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -268,7 +269,16 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
         let loader = session
             .module_loader_with_state(session_info.clone(), state.clone())
             .await;
-        let host_services = Arc::new(SandboxJsHostServices::new(session.clone()));
+        let capability_services =
+            Arc::new(SandboxCapabilityHostServiceAdapter::new(session.clone()));
+        let host_services: Arc<dyn JsHostServices> = Arc::new(
+            RoutedJsHostServices::new()
+                .with_adapter(Arc::new(VfsJsHostServiceAdapter::new(
+                    session.volume().fs(),
+                    [SANDBOX_FS_LIBRARY_SPECIFIER, "node:fs", "node:fs/promises"],
+                )))
+                .with_adapter(capability_services.clone()),
+        );
         let (entrypoint, js_request, inline_eval_cache) =
             prepare_js_execution_request(&request, &session_info, &state, &loader).await?;
         let runtime = open_js_runtime(
@@ -276,7 +286,7 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
             &session_info,
             session,
             loader.clone(),
-            host_services.clone(),
+            host_services,
         )
         .await?;
         let report = runtime
@@ -311,7 +321,7 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
             cache_hits: trace.cache_hits,
             cache_misses: trace.cache_misses,
             cache_entries: trace.cache_entries,
-            capability_calls: host_services.capability_calls().await,
+            capability_calls: capability_services.capability_calls().await,
             metadata: BTreeMap::from([
                 (
                     "session_revision".to_string(),
@@ -344,17 +354,15 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
 }
 
 #[derive(Clone)]
-struct SandboxJsHostServices {
+struct SandboxCapabilityHostServiceAdapter {
     session: SandboxSession,
-    calls: Arc<Mutex<Vec<JsHostServiceCallRecord>>>,
     capability_calls: Arc<Mutex<Vec<CapabilityCallResult>>>,
 }
 
-impl SandboxJsHostServices {
+impl SandboxCapabilityHostServiceAdapter {
     fn new(session: SandboxSession) -> Self {
         Self {
             session,
-            calls: Arc::new(Mutex::new(Vec::new())),
             capability_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -367,24 +375,13 @@ impl SandboxJsHostServices {
         &self,
         request: JsHostServiceRequest,
     ) -> Result<JsHostServiceResponse, JsSubstrateError> {
-        let response = if request.service.starts_with(HOST_CAPABILITY_PREFIX) {
-            self.call_capability(request.clone()).await?
-        } else if is_filesystem_service(&request.service) {
-            self.call_filesystem(request.clone()).await?
-        } else {
+        if !request.service.starts_with(HOST_CAPABILITY_PREFIX) {
             return Err(JsSubstrateError::HostServiceUnavailable {
                 service: request.service,
                 operation: request.operation,
             });
-        };
-        self.calls.lock().await.push(JsHostServiceCallRecord {
-            service: request.service,
-            operation: request.operation,
-            arguments: request.arguments,
-            result: response.result.clone(),
-            metadata: response.metadata.clone(),
-        });
-        Ok(response)
+        }
+        self.call_capability(request).await
     }
 
     async fn call_capability(
@@ -422,206 +419,19 @@ impl SandboxJsHostServices {
             metadata: result.metadata,
         })
     }
-
-    async fn call_filesystem(
-        &self,
-        request: JsHostServiceRequest,
-    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
-        let filesystem = self.session.filesystem();
-        let args = host_service_arguments(&request.arguments);
-        match request.operation.as_str() {
-            "readTextFile" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                let bytes = filesystem
-                    .read_file(&path)
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?
-                    .ok_or_else(|| {
-                        host_service_error(
-                            &request,
-                            SandboxError::Service {
-                                service: "filesystem",
-                                message: format!("path not found: {path}"),
-                            },
-                        )
-                    })?;
-                let contents = String::from_utf8(bytes).map_err(|error| {
-                    host_service_error(
-                        &request,
-                        SandboxError::Service {
-                            service: "filesystem",
-                            message: format!("path {path} is not valid UTF-8: {error}"),
-                        },
-                    )
-                })?;
-                Ok(json_response(JsonValue::String(contents)))
-            }
-            "writeTextFile" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                let contents = required_string_arg(&request, &args, 1, "contents")?;
-                filesystem
-                    .write_file(
-                        &path,
-                        contents.into_bytes(),
-                        CreateOptions {
-                            create_parents: true,
-                            overwrite: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(empty_response())
-            }
-            "readJsonFile" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                let bytes = filesystem
-                    .read_file(&path)
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?
-                    .ok_or_else(|| {
-                        host_service_error(
-                            &request,
-                            SandboxError::Service {
-                                service: "filesystem",
-                                message: format!("path not found: {path}"),
-                            },
-                        )
-                    })?;
-                let contents = String::from_utf8(bytes).map_err(|error| {
-                    host_service_error(
-                        &request,
-                        SandboxError::Service {
-                            service: "filesystem",
-                            message: format!("path {path} is not valid UTF-8: {error}"),
-                        },
-                    )
-                })?;
-                let value = serde_json::from_str(&contents).map_err(|error| {
-                    host_service_error(
-                        &request,
-                        SandboxError::Service {
-                            service: "filesystem",
-                            message: format!("json parse failed: {error}"),
-                        },
-                    )
-                })?;
-                Ok(json_response(value))
-            }
-            "writeJsonFile" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                let value = args.get(1).cloned().unwrap_or(JsonValue::Null);
-                let encoded = serde_json::to_vec_pretty(&value).map_err(|error| {
-                    host_service_error(&request, SandboxError::SerdeJson(error))
-                })?;
-                filesystem
-                    .write_file(
-                        &path,
-                        encoded,
-                        CreateOptions {
-                            create_parents: true,
-                            overwrite: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(empty_response())
-            }
-            "mkdir" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                filesystem
-                    .mkdir(
-                        &path,
-                        terracedb_vfs::MkdirOptions {
-                            recursive: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(empty_response())
-            }
-            "readdir" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                let entries = filesystem
-                    .readdir(&path)
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                let json = entries
-                    .into_iter()
-                    .map(|entry| {
-                        serde_json::json!({
-                            "name": entry.name,
-                            "inode": entry.inode.to_string(),
-                            "kind": format!("{:?}", entry.kind).to_lowercase(),
-                        })
-                    })
-                    .collect();
-                Ok(json_response(JsonValue::Array(json)))
-            }
-            "stat" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                let stats = filesystem
-                    .stat(&path)
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(json_response(
-                    stats.map(stats_to_json).unwrap_or(JsonValue::Null),
-                ))
-            }
-            "unlink" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                filesystem
-                    .unlink(&path)
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(empty_response())
-            }
-            "rmdir" => {
-                let path = required_string_arg(&request, &args, 0, "path")?;
-                filesystem
-                    .rmdir(&path)
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(empty_response())
-            }
-            "rename" => {
-                let from = required_string_arg(&request, &args, 0, "from")?;
-                let to = required_string_arg(&request, &args, 1, "to")?;
-                filesystem
-                    .rename(&from, &to)
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(empty_response())
-            }
-            "fsync" => {
-                let path = optional_string_arg(&args, 0);
-                filesystem
-                    .fsync(path.as_deref())
-                    .await
-                    .map_err(|error| host_service_error(&request, error))?;
-                Ok(empty_response())
-            }
-            _ => Err(JsSubstrateError::HostServiceUnavailable {
-                service: request.service,
-                operation: request.operation,
-            }),
-        }
-    }
 }
 
 #[async_trait(?Send)]
-impl JsHostServices for SandboxJsHostServices {
+impl JsHostServiceAdapter for SandboxCapabilityHostServiceAdapter {
+    fn handles_service(&self, service: &str) -> bool {
+        service.starts_with(HOST_CAPABILITY_PREFIX)
+    }
+
     async fn call(
         &self,
         request: JsHostServiceRequest,
     ) -> Result<JsHostServiceResponse, JsSubstrateError> {
         self.call_async(request).await
-    }
-
-    async fn calls(&self) -> Vec<JsHostServiceCallRecord> {
-        self.calls.lock().await.clone()
     }
 }
 
@@ -630,7 +440,7 @@ async fn open_js_runtime(
     session_info: &SandboxSessionInfo,
     session: &SandboxSession,
     loader: SandboxModuleLoader,
-    host_services: Arc<SandboxJsHostServices>,
+    host_services: Arc<dyn JsHostServices>,
 ) -> Result<Arc<dyn JsRuntime>, SandboxError> {
     let runtime_host = BoaJsRuntimeHost::new(Arc::new(loader), host_services)
         .with_clock(Arc::new(FixedJsClock::new(session_info.updated_at.get())))
@@ -899,81 +709,6 @@ fn host_service_arguments(arguments: &JsonValue) -> Vec<JsonValue> {
         JsonValue::Null => Vec::new(),
         JsonValue::Array(values) => values.clone(),
         other => vec![other.clone()],
-    }
-}
-
-fn required_string_arg(
-    request: &JsHostServiceRequest,
-    args: &[JsonValue],
-    index: usize,
-    name: &str,
-) -> Result<String, JsSubstrateError> {
-    let value = args
-        .get(index)
-        .ok_or_else(|| JsSubstrateError::EvaluationFailed {
-            entrypoint: format!("{}::{}", request.service, request.operation),
-            message: format!("missing required argument: {name}"),
-        })?;
-    value
-        .as_str()
-        .map(ToString::to_string)
-        .ok_or_else(|| JsSubstrateError::EvaluationFailed {
-            entrypoint: format!("{}::{}", request.service, request.operation),
-            message: format!("argument {name} must be a string"),
-        })
-}
-
-fn optional_string_arg(args: &[JsonValue], index: usize) -> Option<String> {
-    args.get(index)
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-}
-
-fn empty_response() -> JsHostServiceResponse {
-    JsHostServiceResponse {
-        result: None,
-        metadata: BTreeMap::new(),
-    }
-}
-
-fn json_response(result: JsonValue) -> JsHostServiceResponse {
-    JsHostServiceResponse {
-        result: Some(result),
-        metadata: BTreeMap::new(),
-    }
-}
-
-fn is_filesystem_service(service: &str) -> bool {
-    matches!(
-        service,
-        SANDBOX_FS_LIBRARY_SPECIFIER | "node:fs" | "node:fs/promises"
-    )
-}
-
-fn stats_to_json(stats: Stats) -> JsonValue {
-    serde_json::json!({
-        "inode": stats.inode.to_string(),
-        "kind": format!("{:?}", stats.kind).to_lowercase(),
-        "mode": stats.mode,
-        "nlink": stats.nlink,
-        "uid": stats.uid,
-        "gid": stats.gid,
-        "size": stats.size,
-        "created_at": stats.created_at.get(),
-        "modified_at": stats.modified_at.get(),
-        "changed_at": stats.changed_at.get(),
-        "accessed_at": stats.accessed_at.get(),
-        "rdev": stats.rdev,
-    })
-}
-
-fn host_service_error(request: &JsHostServiceRequest, error: SandboxError) -> JsSubstrateError {
-    match error {
-        SandboxError::Vfs(error) => JsSubstrateError::Vfs(error),
-        other => JsSubstrateError::EvaluationFailed {
-            entrypoint: format!("{}::{}", request.service, request.operation),
-            message: other.to_string(),
-        },
     }
 }
 

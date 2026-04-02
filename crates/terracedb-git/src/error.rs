@@ -30,6 +30,16 @@ pub enum GitSubstrateError {
     InvalidObject { oid: String, message: String },
     #[error("git repository {repository_id} was cancelled")]
     Cancelled { repository_id: String },
+    #[error("git export conflict at {path}: {message}")]
+    ExportConflict { path: String, message: String },
+    #[error("git remote push failed for {remote}/{branch}: {message}")]
+    RemotePushFailed {
+        remote: String,
+        branch: String,
+        message: String,
+    },
+    #[error("git pull-request provider {provider} failed: {message}")]
+    PullRequestProvider { provider: String, message: String },
     #[error("git host bridge {operation} failed: {message}")]
     Bridge {
         operation: &'static str,
