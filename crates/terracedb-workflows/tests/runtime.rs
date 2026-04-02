@@ -42,7 +42,8 @@ use terracedb_workflows::{
     WorkflowSourceResumePoint, WorkflowStateMutation, WorkflowTables, WorkflowTimerCommand,
     contracts::{
         self, WorkflowHistoryEvent, WorkflowLifecycleRecord, WorkflowLifecycleState,
-        WorkflowPayload, WorkflowRunId, WorkflowStateRecord, WorkflowVisibilityRecord,
+        WorkflowPayload, WorkflowRunId, WorkflowStateRecord, WorkflowVisibilityApi,
+        WorkflowVisibilityRecord,
     },
     default_run_id,
     failpoints::names as workflow_failpoint_names,
@@ -5638,6 +5639,199 @@ async fn contract_runtime_supports_visibility_updates_and_continue_as_new() {
             .await
             .expect("read recovered handoff outbox")
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn visibility_api_describes_prior_runs_and_exposes_forensics_hooks() {
+    let clock = Arc::new(StubClock::new(Timestamp::new(170)));
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let path = "/workflow-visibility-api-continue-as-new";
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock.clone(),
+        WorkflowDefinition::new(
+            "contract-billing",
+            std::iter::empty::<Table>(),
+            ContractWorkflowHandler::new(native_contract_bundle(), ContinueAsNewContractHandler)
+                .expect("continue-as-new contract handler"),
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+    let handle = runtime.start().await.expect("start workflow runtime");
+
+    runtime
+        .admit_callback("acct-7", "cb-continue", b"handoff".to_vec())
+        .await
+        .expect("admit callback");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("seeded-next")),
+    )
+    .await
+    .expect("timed out waiting for continued run state")
+    .expect("wait for continued run state");
+
+    let prior_run_id = default_run_id("contract-billing", "acct-7", 1);
+    let next_run_id = WorkflowRunId::new("run:contract-billing:acct-7:next").expect("next run id");
+
+    let list = runtime
+        .list(contracts::WorkflowVisibilityListRequest {
+            workflow_name: Some("contract-billing".to_string()),
+            lifecycle: None,
+            deployment_id: None,
+            target: None,
+            page_size: 10,
+            cursor: None,
+        })
+        .await
+        .expect("list visibility");
+    assert_eq!(list.entries.len(), 2);
+
+    let prior = runtime
+        .describe(contracts::WorkflowDescribeRequest {
+            run_id: prior_run_id.clone(),
+        })
+        .await
+        .expect("describe prior run");
+    assert_eq!(prior.state.run_id, prior_run_id);
+    assert_eq!(
+        prior.state.state,
+        Some(WorkflowPayload::bytes("handoff-complete"))
+    );
+    assert_eq!(prior.state.lifecycle, WorkflowLifecycleState::Completed);
+    let prior_task_id = prior
+        .state
+        .current_task_id
+        .clone()
+        .expect("prior run should retain current task id");
+    assert_eq!(
+        prior
+            .visibility
+            .record
+            .summary
+            .get("correlation-id")
+            .map(String::as_str),
+        Some(prior_task_id.as_str())
+    );
+    assert_eq!(
+        prior
+            .visibility
+            .record
+            .summary
+            .get("trigger-kind")
+            .map(String::as_str),
+        Some("callback")
+    );
+    assert_eq!(
+        prior
+            .visibility
+            .record
+            .summary
+            .get("phase")
+            .map(String::as_str),
+        Some("handoff")
+    );
+
+    let active = runtime
+        .describe(contracts::WorkflowDescribeRequest {
+            run_id: next_run_id.clone(),
+        })
+        .await
+        .expect("describe next run");
+    assert_eq!(active.state.run_id, next_run_id);
+    assert_eq!(
+        active.state.state,
+        Some(WorkflowPayload::bytes("seeded-next"))
+    );
+    assert_eq!(active.state.lifecycle, WorkflowLifecycleState::Scheduled);
+
+    let history_page = runtime
+        .history(contracts::WorkflowHistoryPageRequest {
+            run_id: prior_run_id.clone(),
+            after_sequence: Some(4),
+            limit: 3,
+        })
+        .await
+        .expect("page prior run history");
+    assert_eq!(history_page.entries.len(), 3);
+    assert_eq!(history_page.next_after_sequence, Some(7));
+
+    let forensics = runtime
+        .load_run_forensics(&prior_run_id)
+        .await
+        .expect("load prior run forensics");
+    assert_eq!(forensics.describe, prior);
+    assert!(forensics.pending_inbox.is_empty());
+    assert!(forensics.pending_timers.is_empty());
+    assert_eq!(forensics.admitted_journal.len(), 1);
+    assert!(matches!(
+        forensics.admitted_journal[0].trigger.trigger,
+        contracts::WorkflowTrigger::Callback { .. }
+    ));
+    assert!(!runtime.load_live_scheduler_status("acct-7").in_flight);
+
+    tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("timed out shutting down runtime")
+        .expect("shutdown runtime");
+
+    drop(runtime);
+
+    let reopened_db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("reopen db");
+    let reopened_runtime = WorkflowRuntime::open(
+        reopened_db,
+        clock.clone(),
+        WorkflowDefinition::new(
+            "contract-billing",
+            std::iter::empty::<Table>(),
+            ContractWorkflowHandler::new(native_contract_bundle(), ContinueAsNewContractHandler)
+                .expect("reopen continue-as-new contract handler"),
+        ),
+    )
+    .await
+    .expect("reopen workflow runtime");
+
+    let reopened_prior = reopened_runtime
+        .describe(contracts::WorkflowDescribeRequest {
+            run_id: prior_run_id.clone(),
+        })
+        .await
+        .expect("describe prior run after reopen");
+    assert_eq!(reopened_prior, prior);
+
+    let reopened_history_page = reopened_runtime
+        .history(contracts::WorkflowHistoryPageRequest {
+            run_id: prior_run_id.clone(),
+            after_sequence: Some(4),
+            limit: 3,
+        })
+        .await
+        .expect("page prior run history after reopen");
+    assert_eq!(reopened_history_page, history_page);
+
+    let reopened_forensics = reopened_runtime
+        .load_run_forensics(&prior_run_id)
+        .await
+        .expect("load prior run forensics after reopen");
+    assert_eq!(reopened_forensics, forensics);
+    assert!(
+        !reopened_runtime
+            .load_live_scheduler_status("acct-7")
+            .in_flight
     );
 }
 
