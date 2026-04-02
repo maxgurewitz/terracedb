@@ -1,0 +1,1 @@
+{"kind":"rejected","query_id":"query:orders:inspect-1","error":{"code":"query-denied","message":"inspection denied"},"answered_at_millis":15}
