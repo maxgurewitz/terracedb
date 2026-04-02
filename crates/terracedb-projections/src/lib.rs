@@ -9,6 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt};
+use serde_json::Value as JsonValue;
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{Instrument, instrument::WithSubscriber};
@@ -19,6 +20,7 @@ use terracedb::{
     SequenceNumber, Snapshot, SnapshotTooOld, SpanRelation, StorageError, SubscriptionClosed,
     Table, TableConfig, TableFormat, Value, WriteBatch, set_span_attribute, telemetry_attrs,
 };
+use terracedb_capabilities::{PolicyContext, VisibilityIndexSpec, VisibilityMembershipTransition};
 
 pub mod failpoints;
 
@@ -28,6 +30,7 @@ const PROJECTION_CURSOR_STATE_FORMAT_VERSION: u8 = 2;
 const PROJECTION_CURSOR_KEY_SEPARATOR: u8 = 0;
 const FULL_SCAN_START: &[u8] = b"";
 const FULL_SCAN_END: &[u8] = &[0xff];
+pub const VISIBILITY_INDEX_LOOKUP_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 
 fn collect_operation_contexts(entries: &[ChangeEntry]) -> Vec<OperationContext> {
     let mut seen = BTreeSet::new();
@@ -845,6 +848,667 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisibilityGrant {
+    pub lookup_key: String,
+    pub row_id: String,
+    pub read_mirror: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisibilityProjectionTransition {
+    pub membership: VisibilityMembershipTransition,
+    pub previous_read_mirror: Option<Value>,
+    pub next_read_mirror: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisibilitySourceProvenance {
+    AppendOnly,
+    AuthoritativeCurrentState,
+    RequiresHistory,
+}
+
+impl VisibilitySourceProvenance {
+    fn supports_rebuild_from_current_state(self) -> bool {
+        matches!(self, Self::AppendOnly | Self::AuthoritativeCurrentState)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibilityScanPlan {
+    pub index_name: String,
+    pub index_table: String,
+    pub read_mirror_table: Option<String>,
+    pub lookup_key: String,
+    pub start: Vec<u8>,
+    pub end: Vec<u8>,
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum VisibilityIndexKeyError {
+    #[error("visibility index key is missing the lookup-key length prefix")]
+    MissingLengthPrefix,
+    #[error("visibility index key is truncated before the lookup key completes")]
+    TruncatedLookupKey,
+    #[error("visibility index key is missing the row id payload")]
+    MissingRowId,
+    #[error(transparent)]
+    InvalidUtf8(#[from] std::str::Utf8Error),
+}
+
+#[derive(Debug, Error)]
+pub enum VisibilityProjectionBuildError {
+    #[error(
+        "visibility index {index_name} expects output table {expected}, but projection was configured with {actual}"
+    )]
+    IndexTableMismatch {
+        index_name: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "visibility index {index_name} requires membership source {table_name}, but no companion source was configured"
+    )]
+    MissingMembershipSource {
+        index_name: String,
+        table_name: String,
+    },
+    #[error(
+        "visibility index {index_name} declares membership source {expected}, but projection was configured with {actual}"
+    )]
+    MembershipSourceMismatch {
+        index_name: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "visibility index {index_name} does not declare a membership source, but projection was configured with {table_name}"
+    )]
+    UnexpectedMembershipSource {
+        index_name: String,
+        table_name: String,
+    },
+    #[error(
+        "visibility index {index_name} requires read mirror table {table_name}, but no read mirror output was configured"
+    )]
+    MissingReadMirrorTable {
+        index_name: String,
+        table_name: String,
+    },
+    #[error(
+        "visibility index {index_name} declares read mirror table {expected}, but projection was configured with {actual}"
+    )]
+    ReadMirrorTableMismatch {
+        index_name: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "visibility index {index_name} does not declare a read mirror table, but projection was configured with {table_name}"
+    )]
+    UnexpectedReadMirrorTable {
+        index_name: String,
+        table_name: String,
+    },
+}
+
+pub fn visibility_index_entry_key(lookup_key: &str, row_id: &str) -> Vec<u8> {
+    let mut key = visibility_index_lookup_prefix(lookup_key);
+    key.extend_from_slice(row_id.as_bytes());
+    key
+}
+
+pub fn visibility_index_lookup_prefix(lookup_key: &str) -> Vec<u8> {
+    let lookup_bytes = lookup_key.as_bytes();
+    let lookup_len =
+        u32::try_from(lookup_bytes.len()).expect("visibility lookup keys must fit in u32");
+    let mut key = Vec::with_capacity(VISIBILITY_INDEX_LOOKUP_LENGTH_BYTES + lookup_bytes.len());
+    key.extend_from_slice(&lookup_len.to_be_bytes());
+    key.extend_from_slice(lookup_bytes);
+    key
+}
+
+pub fn visibility_index_lookup_range(lookup_key: &str) -> (Vec<u8>, Vec<u8>) {
+    let start = visibility_index_lookup_prefix(lookup_key);
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+pub fn decode_visibility_index_entry_key(
+    key: &[u8],
+) -> Result<(String, String), VisibilityIndexKeyError> {
+    let prefix = key
+        .get(..VISIBILITY_INDEX_LOOKUP_LENGTH_BYTES)
+        .ok_or(VisibilityIndexKeyError::MissingLengthPrefix)?;
+    let lookup_len = u32::from_be_bytes(prefix.try_into().expect("length prefix has fixed width"));
+    let lookup_len = usize::try_from(lookup_len).expect("u32 lookup length always fits in usize");
+    let lookup_end = VISIBILITY_INDEX_LOOKUP_LENGTH_BYTES + lookup_len;
+    let lookup_key_bytes = key
+        .get(VISIBILITY_INDEX_LOOKUP_LENGTH_BYTES..lookup_end)
+        .ok_or(VisibilityIndexKeyError::TruncatedLookupKey)?;
+    let row_id_bytes = key
+        .get(lookup_end..)
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or(VisibilityIndexKeyError::MissingRowId)?;
+    let lookup_key = std::str::from_utf8(lookup_key_bytes)?.to_string();
+    let row_id = std::str::from_utf8(row_id_bytes)?.to_string();
+    Ok((lookup_key, row_id))
+}
+
+pub fn visibility_scan_plans(
+    spec: &VisibilityIndexSpec,
+    context: &PolicyContext,
+) -> Vec<VisibilityScanPlan> {
+    spec.lookup_keys(context)
+        .into_iter()
+        .map(|lookup_key| {
+            let (start, end) = visibility_index_lookup_range(&lookup_key);
+            VisibilityScanPlan {
+                index_name: spec.index_name.clone(),
+                index_table: spec.index_table.clone(),
+                read_mirror_table: spec.read_mirror_table.clone(),
+                lookup_key,
+                start,
+                end,
+                metadata: spec.metadata.clone(),
+            }
+        })
+        .collect()
+}
+
+type VisibilityFoldFn<State> =
+    dyn Fn(&mut State, Vec<u8>, Value) -> Result<(), ProjectionHandlerError> + Send + Sync;
+type VisibilityExpandFn<SourceState, MembershipState> = dyn Fn(&SourceState, &MembershipState) -> Result<Vec<VisibilityGrant>, ProjectionHandlerError>
+    + Send
+    + Sync;
+
+struct VisibilityMembershipSource<MembershipState> {
+    table: Table,
+    provenance: VisibilitySourceProvenance,
+    fold: Arc<VisibilityFoldFn<MembershipState>>,
+}
+
+pub struct VisibilityIndexProjection<SourceState, MembershipState> {
+    spec: VisibilityIndexSpec,
+    source: Table,
+    source_provenance: VisibilitySourceProvenance,
+    index_table: Table,
+    read_mirror_table: Option<Table>,
+    membership_source: Option<VisibilityMembershipSource<MembershipState>>,
+    fold_source: Arc<VisibilityFoldFn<SourceState>>,
+    expand: Arc<VisibilityExpandFn<SourceState, MembershipState>>,
+    _state: PhantomData<fn() -> (SourceState, MembershipState)>,
+}
+
+impl<SourceState, MembershipState> VisibilityIndexProjection<SourceState, MembershipState>
+where
+    SourceState: Default + Send + Sync + 'static,
+    MembershipState: Default + Send + Sync + 'static,
+{
+    pub fn new<FoldSource, Expand>(
+        spec: VisibilityIndexSpec,
+        source: Table,
+        source_provenance: VisibilitySourceProvenance,
+        index_table: Table,
+        fold_source: FoldSource,
+        expand: Expand,
+    ) -> Result<Self, VisibilityProjectionBuildError>
+    where
+        FoldSource: Fn(&mut SourceState, Vec<u8>, Value) -> Result<(), ProjectionHandlerError>
+            + Send
+            + Sync
+            + 'static,
+        Expand: Fn(
+                &SourceState,
+                &MembershipState,
+            ) -> Result<Vec<VisibilityGrant>, ProjectionHandlerError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        validate_index_table(&spec, &index_table)?;
+        Ok(Self {
+            spec,
+            source,
+            source_provenance,
+            index_table,
+            read_mirror_table: None,
+            membership_source: None,
+            fold_source: Arc::new(fold_source),
+            expand: Arc::new(expand),
+            _state: PhantomData,
+        })
+    }
+
+    pub fn with_membership_source<FoldMembership>(
+        mut self,
+        table: Table,
+        provenance: VisibilitySourceProvenance,
+        fold_membership: FoldMembership,
+    ) -> Result<Self, VisibilityProjectionBuildError>
+    where
+        FoldMembership: Fn(&mut MembershipState, Vec<u8>, Value) -> Result<(), ProjectionHandlerError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        validate_membership_source(&self.spec, &table)?;
+        self.membership_source = Some(VisibilityMembershipSource {
+            table,
+            provenance,
+            fold: Arc::new(fold_membership),
+        });
+        Ok(self)
+    }
+
+    pub fn with_read_mirror_table(
+        mut self,
+        table: Table,
+    ) -> Result<Self, VisibilityProjectionBuildError> {
+        validate_read_mirror_table(&self.spec, &table)?;
+        self.read_mirror_table = Some(table);
+        Ok(self)
+    }
+
+    pub fn recommended_recompute_strategy(&self) -> RecomputeStrategy {
+        if !self.source_provenance.supports_rebuild_from_current_state() {
+            return RecomputeStrategy::FailClosed;
+        }
+
+        let Some(membership_source) = self.membership_source.as_ref() else {
+            let declared = self
+                .spec
+                .authoritative_sources
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            return if declared == BTreeSet::from([self.source.name().to_string()]) {
+                RecomputeStrategy::RebuildFromCurrentState
+            } else {
+                RecomputeStrategy::FailClosed
+            };
+        };
+
+        if !membership_source
+            .provenance
+            .supports_rebuild_from_current_state()
+        {
+            return RecomputeStrategy::FailClosed;
+        }
+
+        let declared = self
+            .spec
+            .authoritative_sources
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let configured = BTreeSet::from([
+            self.source.name().to_string(),
+            membership_source.table.name().to_string(),
+        ]);
+        if declared == configured {
+            RecomputeStrategy::RebuildFromCurrentState
+        } else {
+            RecomputeStrategy::FailClosed
+        }
+    }
+
+    pub fn into_projection(
+        self,
+        name: impl Into<String>,
+    ) -> Result<MultiSourceProjection<Self>, VisibilityProjectionBuildError> {
+        validate_membership_configuration(&self.spec, self.membership_source.as_ref())?;
+        validate_read_mirror_configuration(&self.spec, self.read_mirror_table.as_ref())?;
+        let recompute = self.recommended_recompute_strategy();
+
+        let mut sources = vec![self.source.clone()];
+        if let Some(membership_source) = self.membership_source.as_ref() {
+            sources.push(membership_source.table.clone());
+        }
+
+        let mut outputs = vec![self.index_table.clone()];
+        if let Some(read_mirror_table) = self.read_mirror_table.as_ref() {
+            outputs.push(read_mirror_table.clone());
+        }
+
+        Ok(MultiSourceProjection::new(name, sources, self)
+            .with_outputs(outputs)
+            .with_recompute_strategy(recompute))
+    }
+}
+
+#[async_trait]
+impl<SourceState, MembershipState> MultiSourceProjectionHandler
+    for VisibilityIndexProjection<SourceState, MembershipState>
+where
+    SourceState: Default + Send + Sync + 'static,
+    MembershipState: Default + Send + Sync + 'static,
+{
+    async fn apply(
+        &self,
+        _run: &ProjectionSequenceRun,
+        ctx: &ProjectionContext,
+        tx: &mut ProjectionTransaction,
+    ) -> Result<(), ProjectionHandlerError> {
+        let mut source_state = SourceState::default();
+        fold_visibility_source(ctx, &self.source, &self.fold_source, &mut source_state).await?;
+
+        let mut membership_state = MembershipState::default();
+        if let Some(membership_source) = self.membership_source.as_ref() {
+            fold_visibility_source(
+                ctx,
+                &membership_source.table,
+                &membership_source.fold,
+                &mut membership_state,
+            )
+            .await?;
+        }
+
+        let next =
+            canonicalize_visibility_grants((self.expand)(&source_state, &membership_state)?)?;
+        if self.read_mirror_table.is_none() && next.iter().any(|grant| grant.read_mirror.is_some())
+        {
+            return Err(ProjectionHandlerError::new(std::io::Error::other(
+                "visibility projection emitted read mirrors without configuring a read mirror table",
+            )));
+        }
+
+        let current =
+            load_current_visibility_grants(&self.index_table, self.read_mirror_table.as_ref())
+                .await?;
+        let transitions = visibility_projection_transitions(&self.spec, current, next)?;
+
+        for transition in transitions {
+            let key = visibility_index_entry_key(
+                &transition.membership.lookup_key,
+                &transition.membership.row_id,
+            );
+            if transition.membership.to_visible {
+                tx.put(
+                    &self.index_table,
+                    key.clone(),
+                    visibility_index_marker_value(),
+                );
+            } else {
+                tx.delete(&self.index_table, key.clone());
+            }
+
+            if let Some(read_mirror_table) = self.read_mirror_table.as_ref() {
+                if let Some(value) = transition.next_read_mirror {
+                    tx.put(read_mirror_table, key, value);
+                } else {
+                    tx.delete(read_mirror_table, key);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub fn visibility_projection_transitions(
+    spec: &VisibilityIndexSpec,
+    current: impl IntoIterator<Item = VisibilityGrant>,
+    next: impl IntoIterator<Item = VisibilityGrant>,
+) -> Result<Vec<VisibilityProjectionTransition>, ProjectionHandlerError> {
+    let current = canonicalize_visibility_grants(current.into_iter().collect())?;
+    let next = canonicalize_visibility_grants(next.into_iter().collect())?;
+    let mut current_by_key = current
+        .into_iter()
+        .map(|grant| ((grant.lookup_key.clone(), grant.row_id.clone()), grant))
+        .collect::<BTreeMap<_, _>>();
+    let mut next_by_key = next
+        .into_iter()
+        .map(|grant| ((grant.lookup_key.clone(), grant.row_id.clone()), grant))
+        .collect::<BTreeMap<_, _>>();
+    let mut keys = current_by_key.keys().cloned().collect::<BTreeSet<_>>();
+    keys.extend(next_by_key.keys().cloned());
+
+    let mut transitions = Vec::new();
+    for (lookup_key, row_id) in keys {
+        let previous = current_by_key.remove(&(lookup_key.clone(), row_id.clone()));
+        let next = next_by_key.remove(&(lookup_key.clone(), row_id.clone()));
+        let from_visible = previous.is_some();
+        let to_visible = next.is_some();
+        let previous_read_mirror = previous.and_then(|grant| grant.read_mirror);
+        let next_read_mirror = next.and_then(|grant| grant.read_mirror);
+        if from_visible == to_visible && previous_read_mirror == next_read_mirror {
+            continue;
+        }
+        transitions.push(VisibilityProjectionTransition {
+            membership: VisibilityMembershipTransition {
+                index_name: spec.index_name.clone(),
+                lookup_key,
+                row_id,
+                from_visible,
+                to_visible,
+                metadata: spec.metadata.clone(),
+            },
+            previous_read_mirror,
+            next_read_mirror,
+        });
+    }
+
+    Ok(transitions)
+}
+
+fn visibility_index_marker_value() -> Value {
+    Value::bytes(Vec::<u8>::new())
+}
+
+fn canonicalize_visibility_grants(
+    grants: Vec<VisibilityGrant>,
+) -> Result<Vec<VisibilityGrant>, ProjectionHandlerError> {
+    let mut by_key = BTreeMap::new();
+    for grant in grants {
+        if grant.lookup_key.is_empty() {
+            return Err(ProjectionHandlerError::new(std::io::Error::other(
+                "visibility projection emitted an empty lookup key",
+            )));
+        }
+        if grant.row_id.is_empty() {
+            return Err(ProjectionHandlerError::new(std::io::Error::other(
+                "visibility projection emitted an empty row id",
+            )));
+        }
+
+        let key = (grant.lookup_key, grant.row_id);
+        match by_key.get(&key) {
+            Some(existing) if existing != &grant.read_mirror => {
+                return Err(ProjectionHandlerError::new(std::io::Error::other(format!(
+                    "visibility projection emitted conflicting read mirrors for {}/{}",
+                    key.0, key.1
+                ))));
+            }
+            Some(_) => {}
+            None => {
+                by_key.insert(key, grant.read_mirror);
+            }
+        }
+    }
+
+    Ok(by_key
+        .into_iter()
+        .map(|((lookup_key, row_id), read_mirror)| VisibilityGrant {
+            lookup_key,
+            row_id,
+            read_mirror,
+        })
+        .collect())
+}
+
+async fn fold_visibility_source<State>(
+    ctx: &ProjectionContext,
+    table: &Table,
+    fold: &Arc<VisibilityFoldFn<State>>,
+    state: &mut State,
+) -> Result<(), ProjectionHandlerError> {
+    let mut rows = ctx
+        .scan(
+            table,
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((key, value)) = rows.next().await {
+        fold(state, key, value)?;
+    }
+    Ok(())
+}
+
+async fn load_current_visibility_grants(
+    index_table: &Table,
+    read_mirror_table: Option<&Table>,
+) -> Result<Vec<VisibilityGrant>, ProjectionHandlerError> {
+    let mut grants = BTreeMap::<(String, String), VisibilityGrant>::new();
+    let mut index_rows = index_table
+        .scan(
+            FULL_SCAN_START.to_vec(),
+            FULL_SCAN_END.to_vec(),
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((key, _value)) = index_rows.next().await {
+        let (lookup_key, row_id) =
+            decode_visibility_index_entry_key(&key).map_err(ProjectionHandlerError::new)?;
+        grants.insert(
+            (lookup_key.clone(), row_id.clone()),
+            VisibilityGrant {
+                lookup_key,
+                row_id,
+                read_mirror: None,
+            },
+        );
+    }
+
+    if let Some(read_mirror_table) = read_mirror_table {
+        let mut read_mirror_rows = read_mirror_table
+            .scan(
+                FULL_SCAN_START.to_vec(),
+                FULL_SCAN_END.to_vec(),
+                ScanOptions::default(),
+            )
+            .await?;
+        while let Some((key, value)) = read_mirror_rows.next().await {
+            let (lookup_key, row_id) =
+                decode_visibility_index_entry_key(&key).map_err(ProjectionHandlerError::new)?;
+            grants
+                .entry((lookup_key.clone(), row_id.clone()))
+                .or_insert_with(|| VisibilityGrant {
+                    lookup_key: lookup_key.clone(),
+                    row_id: row_id.clone(),
+                    read_mirror: None,
+                })
+                .read_mirror = Some(value);
+        }
+    }
+
+    Ok(grants.into_values().collect())
+}
+
+fn validate_index_table(
+    spec: &VisibilityIndexSpec,
+    index_table: &Table,
+) -> Result<(), VisibilityProjectionBuildError> {
+    if spec.index_table == index_table.name() {
+        Ok(())
+    } else {
+        Err(VisibilityProjectionBuildError::IndexTableMismatch {
+            index_name: spec.index_name.clone(),
+            expected: spec.index_table.clone(),
+            actual: index_table.name().to_string(),
+        })
+    }
+}
+
+fn validate_membership_source(
+    spec: &VisibilityIndexSpec,
+    membership_table: &Table,
+) -> Result<(), VisibilityProjectionBuildError> {
+    match spec.membership_source.as_deref() {
+        Some(expected) if expected == membership_table.name() => Ok(()),
+        Some(expected) => Err(VisibilityProjectionBuildError::MembershipSourceMismatch {
+            index_name: spec.index_name.clone(),
+            expected: expected.to_string(),
+            actual: membership_table.name().to_string(),
+        }),
+        None => Err(VisibilityProjectionBuildError::UnexpectedMembershipSource {
+            index_name: spec.index_name.clone(),
+            table_name: membership_table.name().to_string(),
+        }),
+    }
+}
+
+fn validate_read_mirror_table(
+    spec: &VisibilityIndexSpec,
+    read_mirror_table: &Table,
+) -> Result<(), VisibilityProjectionBuildError> {
+    match spec.read_mirror_table.as_deref() {
+        Some(expected) if expected == read_mirror_table.name() => Ok(()),
+        Some(expected) => Err(VisibilityProjectionBuildError::ReadMirrorTableMismatch {
+            index_name: spec.index_name.clone(),
+            expected: expected.to_string(),
+            actual: read_mirror_table.name().to_string(),
+        }),
+        None => Err(VisibilityProjectionBuildError::UnexpectedReadMirrorTable {
+            index_name: spec.index_name.clone(),
+            table_name: read_mirror_table.name().to_string(),
+        }),
+    }
+}
+
+fn validate_membership_configuration<MembershipState>(
+    spec: &VisibilityIndexSpec,
+    membership_source: Option<&VisibilityMembershipSource<MembershipState>>,
+) -> Result<(), VisibilityProjectionBuildError> {
+    match (spec.membership_source.as_deref(), membership_source) {
+        (Some(table_name), None) => Err(VisibilityProjectionBuildError::MissingMembershipSource {
+            index_name: spec.index_name.clone(),
+            table_name: table_name.to_string(),
+        }),
+        (Some(expected), Some(source)) if expected != source.table.name() => {
+            Err(VisibilityProjectionBuildError::MembershipSourceMismatch {
+                index_name: spec.index_name.clone(),
+                expected: expected.to_string(),
+                actual: source.table.name().to_string(),
+            })
+        }
+        (None, Some(source)) => Err(VisibilityProjectionBuildError::UnexpectedMembershipSource {
+            index_name: spec.index_name.clone(),
+            table_name: source.table.name().to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn validate_read_mirror_configuration(
+    spec: &VisibilityIndexSpec,
+    read_mirror_table: Option<&Table>,
+) -> Result<(), VisibilityProjectionBuildError> {
+    match (spec.read_mirror_table.as_deref(), read_mirror_table) {
+        (Some(table_name), None) => Err(VisibilityProjectionBuildError::MissingReadMirrorTable {
+            index_name: spec.index_name.clone(),
+            table_name: table_name.to_string(),
+        }),
+        (Some(expected), Some(table)) if expected != table.name() => {
+            Err(VisibilityProjectionBuildError::ReadMirrorTableMismatch {
+                index_name: spec.index_name.clone(),
+                expected: expected.to_string(),
+                actual: table.name().to_string(),
+            })
+        }
+        (None, Some(table)) => Err(VisibilityProjectionBuildError::UnexpectedReadMirrorTable {
+            index_name: spec.index_name.clone(),
+            table_name: table.name().to_string(),
+        }),
+        _ => Ok(()),
     }
 }
 

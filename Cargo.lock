@@ -2689,7 +2689,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "serde_json",
  "terracedb",
+ "terracedb-capabilities",
  "terracedb-fuzz",
  "terracedb-otel",
  "terracedb-simulation",
