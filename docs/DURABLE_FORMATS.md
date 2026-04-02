@@ -58,6 +58,8 @@ The T109 durable workflow record set includes:
 - `history`
 - `lifecycle`
 - `visibility`
+- admitted `inbox` trigger payloads
+- admitted `trigger-journal` entries
 
 Checkpoint capture/restore for workflow runtimes now requires the corresponding table artifacts:
 
@@ -74,6 +76,8 @@ Checkpoint capture/restore for workflow runtimes now requires the corresponding 
 - `outbox`
 
 `trigger-journal` remains conditionally present when the captured checkpoint includes journaled trigger rows. All of these artifacts must fail closed on unsupported versions or malformed bytes.
+
+Accepted workflow updates/control requests now reuse the same persisted admitted-trigger encoding as events, timers, and callbacks. Any change to the serialized `StoredWorkflowTrigger` shape, including the `update` variant carried by inbox rows and trigger-journal entries, requires a matching fixture update in the same change.
 
 ## Shard-Aware Durable State
 
@@ -157,6 +161,8 @@ The checked fixtures live in `tests/fixtures/durable-formats/`:
 - `workflow-history-event-v1.bin`
 - `workflow-lifecycle-record-v1.bin`
 - `workflow-visibility-record-v1.bin`
+- `workflow-inbox-trigger-update-v1.bin`
+- `workflow-trigger-journal-entry-update-v1.bin`
 - `workflow-runs-artifact-v1.bin`
 - `workflow-state-artifact-v1.bin`
 - `workflow-history-artifact-v1.bin`

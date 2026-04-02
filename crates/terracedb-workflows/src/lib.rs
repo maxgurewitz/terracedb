@@ -74,6 +74,7 @@ fn workflow_trigger_kind(trigger: &WorkflowTrigger) -> &'static str {
         WorkflowTrigger::Event(_) => "event",
         WorkflowTrigger::Timer { .. } => "timer",
         WorkflowTrigger::Callback { .. } => "callback",
+        WorkflowTrigger::Update { .. } => "update",
     }
 }
 
@@ -1192,6 +1193,13 @@ pub enum WorkflowTrigger {
     Callback {
         callback_id: String,
         response: Vec<u8>,
+    },
+    Update {
+        update_id: contracts::WorkflowUpdateId,
+        lane: contracts::WorkflowUpdateLane,
+        name: String,
+        payload: Option<contracts::WorkflowPayload>,
+        requested_at_millis: u64,
     },
 }
 
@@ -2387,6 +2395,334 @@ where
         .await
     }
 
+    pub async fn query(
+        &self,
+        request: contracts::WorkflowQueryRequest,
+    ) -> Result<contracts::WorkflowQueryResponse, contracts::WorkflowTaskError> {
+        let answered_at_millis = self.inner.clock.now().get();
+
+        let response = match request.target {
+            contracts::WorkflowQueryTarget::State => {
+                let run_record = match self
+                    .load_run_record(&request.run_id)
+                    .await
+                    .map_err(|error| task_error_from_workflow_error("query-error", error))?
+                {
+                    Some(run_record) => run_record,
+                    None => {
+                        return Ok(contracts::WorkflowQueryResponse::Rejected {
+                            query_id: request.query_id.clone(),
+                            error: contracts::WorkflowTaskError::new(
+                                "missing-run",
+                                format!("unknown workflow run {}", request.run_id),
+                            ),
+                            answered_at_millis,
+                        });
+                    }
+                };
+
+                let state = self
+                    .load_state_record(&run_record.instance_id)
+                    .await
+                    .map_err(|error| task_error_from_workflow_error("query-error", error))?;
+                match state {
+                    Some(state) if state.run_id == request.run_id => {
+                        contracts::WorkflowQueryResponse::Accepted {
+                            query_id: request.query_id.clone(),
+                            payload: Some(json_workflow_payload(&state).map_err(|error| {
+                                task_error_from_workflow_error("query-error", error)
+                            })?),
+                            answered_at_millis,
+                        }
+                    }
+                    _ => contracts::WorkflowQueryResponse::Rejected {
+                        query_id: request.query_id.clone(),
+                        error: contracts::WorkflowTaskError::new(
+                            "missing-state",
+                            format!(
+                                "workflow run {} no longer has an active state record",
+                                request.run_id
+                            ),
+                        ),
+                        answered_at_millis,
+                    },
+                }
+            }
+            contracts::WorkflowQueryTarget::Visibility => {
+                match self
+                    .load_visibility_record(&request.run_id)
+                    .await
+                    .map_err(|error| task_error_from_workflow_error("query-error", error))?
+                {
+                    Some(record) => contracts::WorkflowQueryResponse::Accepted {
+                        query_id: request.query_id.clone(),
+                        payload: Some(
+                            json_workflow_payload(&contracts::WorkflowVisibilityEntry {
+                                record,
+                                execution: None,
+                            })
+                            .map_err(|error| {
+                                task_error_from_workflow_error("query-error", error)
+                            })?,
+                        ),
+                        answered_at_millis,
+                    },
+                    None => contracts::WorkflowQueryResponse::Rejected {
+                        query_id: request.query_id.clone(),
+                        error: contracts::WorkflowTaskError::new(
+                            "missing-visibility",
+                            format!("workflow run {} has no visibility record", request.run_id),
+                        ),
+                        answered_at_millis,
+                    },
+                }
+            }
+            contracts::WorkflowQueryTarget::Execution => {
+                contracts::WorkflowQueryResponse::Rejected {
+                    query_id: request.query_id.clone(),
+                    error: contracts::WorkflowTaskError::new(
+                        "missing-execution",
+                        format!(
+                            "workflow run {} does not expose execution metadata yet",
+                            request.run_id
+                        ),
+                    ),
+                    answered_at_millis,
+                }
+            }
+        };
+
+        Ok(response)
+    }
+
+    pub async fn admit_update(
+        &self,
+        request: contracts::WorkflowUpdateRequest,
+    ) -> Result<contracts::WorkflowUpdateAdmission, contracts::WorkflowTaskError> {
+        let operation_context =
+            Some(OperationContext::current()).filter(|context| !context.is_empty());
+
+        loop {
+            let mut tx = Transaction::begin(&self.inner.db).await;
+
+            let Some(run_record) = load_workflow_run_record_in_transaction(
+                &mut tx,
+                self.inner.tables.run_table(),
+                &request.run_id,
+            )
+            .await
+            .map_err(|error| task_error_from_workflow_error("update-error", error))?
+            else {
+                return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                    update_id: request.update_id.clone(),
+                    error: contracts::WorkflowTaskError::new(
+                        "missing-run",
+                        format!("unknown workflow run {}", request.run_id),
+                    ),
+                });
+            };
+
+            if run_record.workflow_name != self.inner.name {
+                return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                    update_id: request.update_id.clone(),
+                    error: contracts::WorkflowTaskError::invalid_contract(format!(
+                        "workflow run {} belongs to {}, not {}",
+                        request.run_id, run_record.workflow_name, self.inner.name
+                    )),
+                });
+            }
+
+            let snapshot_sequence = tx.snapshot_sequence();
+            if let Some(task_id) = find_existing_update_task_id_at_sequence(
+                self.inner.tables.history_table(),
+                &request.run_id,
+                &request.update_id,
+                snapshot_sequence,
+            )
+            .await
+            .map_err(|error| task_error_from_workflow_error("update-error", error))?
+            {
+                return Ok(contracts::WorkflowUpdateAdmission::Duplicate {
+                    update_id: request.update_id.clone(),
+                    original_task_id: task_id,
+                });
+            }
+
+            if let Some(task_id) = find_pending_update_task_id_at_sequence(
+                self.inner.tables.inbox_table(),
+                &run_record.instance_id,
+                &request.update_id,
+                snapshot_sequence,
+            )
+            .await
+            .map_err(|error| task_error_from_workflow_error("update-error", error))?
+            {
+                return Ok(contracts::WorkflowUpdateAdmission::Duplicate {
+                    update_id: request.update_id.clone(),
+                    original_task_id: task_id,
+                });
+            }
+
+            if self
+                .inner
+                .in_flight_instances
+                .lock()
+                .expect("in-flight lock poisoned")
+                .contains(&run_record.instance_id)
+            {
+                return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                    update_id: request.update_id.clone(),
+                    error: contracts::WorkflowTaskError::new(
+                        "workflow-busy",
+                        format!(
+                            "workflow instance {} is already executing work",
+                            run_record.instance_id
+                        ),
+                    ),
+                });
+            }
+
+            let Some(current_state_record) =
+                load_workflow_state_record_for_instance_in_transaction(
+                    &mut tx,
+                    self.inner.tables.state_table(),
+                    &run_record.instance_id,
+                )
+                .await
+                .map_err(|error| task_error_from_workflow_error("update-error", error))?
+            else {
+                return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                    update_id: request.update_id.clone(),
+                    error: contracts::WorkflowTaskError::new(
+                        "inactive-run",
+                        format!(
+                            "workflow run {} is no longer the active state for instance {}",
+                            request.run_id, run_record.instance_id
+                        ),
+                    ),
+                });
+            };
+
+            if current_state_record.run_id != request.run_id {
+                return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                    update_id: request.update_id.clone(),
+                    error: contracts::WorkflowTaskError::new(
+                        "inactive-run",
+                        format!(
+                            "workflow run {} is no longer the active state for instance {}",
+                            request.run_id, run_record.instance_id
+                        ),
+                    ),
+                });
+            }
+
+            validate_active_run_metadata(
+                &mut tx,
+                &self.inner.name,
+                &run_record.instance_id,
+                &self.inner.tables,
+                &current_state_record,
+            )
+            .await
+            .map_err(|error| task_error_from_workflow_error("update-error", error))?;
+
+            if instance_has_pending_inbox_at_sequence(
+                self.inner.tables.inbox_table(),
+                &run_record.instance_id,
+                snapshot_sequence,
+            )
+            .await
+            .map_err(|error| task_error_from_workflow_error("update-error", error))?
+            {
+                return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                    update_id: request.update_id.clone(),
+                    error: contracts::WorkflowTaskError::new(
+                        "workflow-busy",
+                        format!(
+                            "workflow instance {} has pending admitted work",
+                            run_record.instance_id
+                        ),
+                    ),
+                });
+            }
+
+            let trigger_seq = stage_trigger_sequence(
+                &mut tx,
+                self.inner.tables.trigger_order_table(),
+                &run_record.instance_id,
+            )
+            .await
+            .map_err(|error| task_error_from_workflow_error("update-error", error))?;
+            let admitted_at_millis = self.inner.clock.now().get();
+
+            let trigger = WorkflowTrigger::Update {
+                update_id: request.update_id.clone(),
+                lane: request.lane,
+                name: request.name.clone(),
+                payload: request.payload.clone(),
+                requested_at_millis: request.requested_at_millis,
+            };
+            let task = WorkflowRuntimeTask {
+                workflow_name: self.inner.name.clone(),
+                instance_id: run_record.instance_id.clone(),
+                trigger_seq,
+                admitted_at_millis,
+            };
+            let runtime_plan = match self
+                .inner
+                .handler
+                .plan_runtime_task(&task, Some(&current_state_record), &trigger)
+                .await
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                        update_id: request.update_id.clone(),
+                        error: task_error_from_handler_error("update-denied", error),
+                    });
+                }
+            };
+            if !runtime_plan.proposal.directives.is_empty() {
+                return Ok(contracts::WorkflowUpdateAdmission::Rejected {
+                    update_id: request.update_id.clone(),
+                    error: contracts::WorkflowTaskError::new(
+                        "update-denied",
+                        "workflow executor directives are not yet supported by this runtime loop",
+                    ),
+                });
+            }
+            let task_id = runtime_plan.input.task_id.clone();
+
+            stage_stored_trigger_admission(
+                &mut tx,
+                self.inner.tables.inbox_table(),
+                self.inner.tables.trigger_journal_table(),
+                StoredAdmittedWorkflowTrigger {
+                    workflow_instance: run_record.instance_id.clone(),
+                    trigger_seq,
+                    trigger: StoredWorkflowTrigger::from_runtime_trigger(&trigger),
+                    operation_context: operation_context.clone(),
+                    admitted_at_millis,
+                },
+            )
+            .await
+            .map_err(|error| task_error_from_workflow_error("update-error", error))?;
+
+            match tx.commit().await {
+                Ok(_) => {
+                    return Ok(contracts::WorkflowUpdateAdmission::Accepted {
+                        update_id: request.update_id.clone(),
+                        task_id,
+                    });
+                }
+                Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
+                Err(error) => {
+                    return Err(task_error_from_workflow_error("update-error", error.into()));
+                }
+            }
+        }
+    }
+
     pub async fn start(&self) -> Result<WorkflowHandle, WorkflowError> {
         {
             let mut running = self.inner.running.lock().expect("running lock poisoned");
@@ -2495,6 +2831,26 @@ where
         request: contracts::WorkflowHistoryPageRequest,
     ) -> Result<contracts::WorkflowHistoryPageResponse, contracts::WorkflowTaskError> {
         self.load_run_history_page(request).await
+    }
+}
+
+#[async_trait]
+impl<H> contracts::WorkflowInteractionApi for WorkflowRuntime<H>
+where
+    H: WorkflowRuntimeHandler + 'static,
+{
+    async fn query(
+        &self,
+        request: contracts::WorkflowQueryRequest,
+    ) -> Result<contracts::WorkflowQueryResponse, contracts::WorkflowTaskError> {
+        WorkflowRuntime::query(self, request).await
+    }
+
+    async fn admit_update(
+        &self,
+        request: contracts::WorkflowUpdateRequest,
+    ) -> Result<contracts::WorkflowUpdateAdmission, contracts::WorkflowTaskError> {
+        WorkflowRuntime::admit_update(self, request).await
     }
 }
 
@@ -2943,6 +3299,9 @@ where
             WorkflowTrigger::Event(_) => Err(WorkflowHandlerError::new(std::io::Error::other(
                 "recurring workflows do not consume source events",
             ))),
+            WorkflowTrigger::Update { .. } => Err(WorkflowHandlerError::new(
+                std::io::Error::other("recurring workflows do not accept updates"),
+            )),
         }
     }
 }
@@ -4071,6 +4430,23 @@ where
         WorkflowTrigger::Callback { callback_id, .. } => {
             set_span_attribute(&span, telemetry_attrs::CALLBACK_ID, callback_id.clone());
         }
+        WorkflowTrigger::Update {
+            update_id,
+            lane,
+            name,
+            ..
+        } => {
+            set_span_attribute(&span, "terracedb.workflow.update_id", update_id.to_string());
+            set_span_attribute(
+                &span,
+                "terracedb.workflow.update_lane",
+                match lane {
+                    contracts::WorkflowUpdateLane::Update => "update",
+                    contracts::WorkflowUpdateLane::Control => "control",
+                },
+            );
+            set_span_attribute(&span, "terracedb.workflow.update_name", name.clone());
+        }
     }
     attach_operation_context(&span, operation_context.as_ref());
 
@@ -4186,36 +4562,12 @@ where
         return Err(WorkflowError::EmptyInstanceId);
     }
 
-    let current = tx
-        .read(
-            runtime.tables.trigger_order_table(),
-            instance_key(instance_id),
-        )
-        .await?;
-    let trigger_sequence = decode_trigger_order(current.as_ref())? + 1;
+    let trigger_sequence =
+        stage_trigger_sequence(tx, runtime.tables.trigger_order_table(), instance_id).await?;
     let admitted_at_millis = runtime.clock.now().get();
-
-    tx.write(
-        runtime.tables.trigger_order_table(),
-        instance_key(instance_id),
-        Value::bytes(encode_trigger_order(trigger_sequence)),
-    );
-    tx.write(
-        runtime.tables.inbox_table(),
-        inbox_key(instance_id, trigger_sequence),
-        Value::bytes(encode_payload(
-            &StoredAdmittedWorkflowTrigger {
-                workflow_instance: instance_id.to_string(),
-                trigger_seq: trigger_sequence,
-                trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
-                operation_context: operation_context.clone(),
-                admitted_at_millis,
-            },
-            "workflow inbox trigger",
-        )?),
-    );
-    stage_trigger_journal_admission(
+    stage_stored_trigger_admission(
         tx,
+        runtime.tables.inbox_table(),
         runtime.tables.trigger_journal_table(),
         StoredAdmittedWorkflowTrigger {
             workflow_instance: instance_id.to_string(),
@@ -4227,6 +4579,37 @@ where
     )
     .await?;
 
+    Ok(trigger_sequence)
+}
+
+async fn stage_stored_trigger_admission(
+    tx: &mut Transaction,
+    inbox_table: &Table,
+    trigger_journal_table: &Table,
+    admitted: StoredAdmittedWorkflowTrigger,
+) -> Result<(), WorkflowError> {
+    tx.write(
+        inbox_table,
+        inbox_key(&admitted.workflow_instance, admitted.trigger_seq),
+        Value::bytes(encode_payload(&admitted, "workflow inbox trigger")?),
+    );
+    stage_trigger_journal_admission(tx, trigger_journal_table, admitted).await
+}
+
+async fn stage_trigger_sequence(
+    tx: &mut Transaction,
+    trigger_order_table: &Table,
+    instance_id: &str,
+) -> Result<u64, WorkflowError> {
+    let current = tx
+        .read(trigger_order_table, instance_key(instance_id))
+        .await?;
+    let trigger_sequence = decode_trigger_order(current.as_ref())? + 1;
+    tx.write(
+        trigger_order_table,
+        instance_key(instance_id),
+        Value::bytes(encode_trigger_order(trigger_sequence)),
+    );
     Ok(trigger_sequence)
 }
 
@@ -5422,6 +5805,138 @@ async fn load_pending_timers_for_instance_at_snapshot(
     Ok(timers)
 }
 
+async fn load_workflow_run_record_in_transaction(
+    tx: &mut Transaction,
+    run_table: &Table,
+    run_id: &contracts::WorkflowRunId,
+) -> Result<Option<WorkflowRunRecord>, WorkflowError> {
+    decode_workflow_run_record_opt(tx.read(run_table, workflow_run_key(run_id)).await?.as_ref())
+}
+
+async fn load_workflow_state_record_for_instance_in_transaction(
+    tx: &mut Transaction,
+    state_table: &Table,
+    instance_id: &str,
+) -> Result<Option<contracts::WorkflowStateRecord>, WorkflowError> {
+    decode_workflow_state_record_opt(
+        tx.read(state_table, instance_key(instance_id))
+            .await?
+            .as_ref(),
+    )
+}
+
+async fn instance_has_pending_inbox_at_sequence(
+    inbox_table: &Table,
+    instance_id: &str,
+    snapshot_sequence: SequenceNumber,
+) -> Result<bool, WorkflowError> {
+    let mut rows = inbox_table
+        .scan_at(
+            inbox_start_key(instance_id),
+            inbox_end_key(instance_id),
+            snapshot_sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    Ok(rows.next().await.is_some())
+}
+
+async fn find_existing_update_task_id_at_sequence(
+    history_table: &Table,
+    run_id: &contracts::WorkflowRunId,
+    update_id: &contracts::WorkflowUpdateId,
+    snapshot_sequence: SequenceNumber,
+) -> Result<Option<contracts::WorkflowTaskId>, WorkflowError> {
+    let mut rows = history_table
+        .scan_at(
+            workflow_history_start_key(run_id),
+            workflow_history_end_key(run_id),
+            snapshot_sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((_, value)) = rows.next().await {
+        let event = decode_workflow_history_event_value(&value)?;
+        if let contracts::WorkflowHistoryEvent::TaskAdmitted {
+            task_id,
+            trigger:
+                contracts::WorkflowTrigger::Update {
+                    update_id: existing_update_id,
+                    ..
+                },
+            ..
+        } = event
+            && &existing_update_id == update_id
+        {
+            return Ok(Some(task_id));
+        }
+    }
+    Ok(None)
+}
+
+async fn find_pending_update_task_id_at_sequence(
+    inbox_table: &Table,
+    instance_id: &str,
+    update_id: &contracts::WorkflowUpdateId,
+    snapshot_sequence: SequenceNumber,
+) -> Result<Option<contracts::WorkflowTaskId>, WorkflowError> {
+    let mut rows = inbox_table
+        .scan_at(
+            inbox_start_key(instance_id),
+            inbox_end_key(instance_id),
+            snapshot_sequence,
+            ScanOptions::default(),
+        )
+        .await?;
+    while let Some((_, value)) = rows.next().await {
+        let bytes = expect_bytes_value(&value, "workflow inbox trigger")?;
+        let admitted =
+            decode_payload::<StoredAdmittedWorkflowTrigger>(bytes, "workflow inbox trigger")?;
+        if let StoredWorkflowTrigger::Update {
+            update_id: existing_update_id,
+            ..
+        } = admitted.trigger
+            && &existing_update_id == update_id
+        {
+            return Ok(Some(default_task_id(
+                &admitted.workflow_instance,
+                admitted.trigger_seq,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn json_workflow_payload<T>(value: &T) -> Result<contracts::WorkflowPayload, WorkflowError>
+where
+    T: Serialize,
+{
+    serde_json::to_vec(value)
+        .map(|bytes| contracts::WorkflowPayload::with_encoding("application/json", bytes))
+        .map_err(|error| {
+            StorageError::corruption(format!("workflow query serialization failed: {error}")).into()
+        })
+}
+
+fn task_error_from_workflow_error(
+    code: &str,
+    error: WorkflowError,
+) -> contracts::WorkflowTaskError {
+    contracts::WorkflowTaskError::new(code, error.to_string())
+}
+
+fn task_error_from_handler_error(
+    code: &str,
+    error: WorkflowHandlerError,
+) -> contracts::WorkflowTaskError {
+    if let Some(task_error) = StdError::source(&error)
+        .and_then(|source| source.downcast_ref::<contracts::WorkflowTaskError>())
+    {
+        return task_error.clone();
+    }
+    contracts::WorkflowTaskError::new(code, error.to_string())
+}
+
 async fn validate_active_run_metadata(
     tx: &mut Transaction,
     workflow_name: &str,
@@ -6003,6 +6518,19 @@ fn runtime_trigger_to_transition_trigger(
         } => Ok(contracts::WorkflowTrigger::Callback {
             callback_id: callback_id.clone(),
             response: response.clone(),
+        }),
+        WorkflowTrigger::Update {
+            update_id,
+            lane,
+            name,
+            payload,
+            requested_at_millis,
+        } => Ok(contracts::WorkflowTrigger::Update {
+            update_id: update_id.clone(),
+            lane: *lane,
+            name: name.clone(),
+            payload: payload.clone(),
+            requested_at_millis: *requested_at_millis,
         }),
     }
 }
@@ -6625,6 +7153,19 @@ fn runtime_trigger_to_contract_trigger(
             callback_id: callback_id.clone(),
             response: response.clone(),
         }),
+        WorkflowTrigger::Update {
+            update_id,
+            lane,
+            name,
+            payload,
+            requested_at_millis,
+        } => Ok(contracts::WorkflowTrigger::Update {
+            update_id: update_id.clone(),
+            lane: *lane,
+            name: name.clone(),
+            payload: payload.clone(),
+            requested_at_millis: *requested_at_millis,
+        }),
     }
 }
 
@@ -6633,6 +7174,7 @@ fn workflow_contract_trigger_kind(trigger: &contracts::WorkflowTrigger) -> &'sta
         contracts::WorkflowTrigger::Event { .. } => "event",
         contracts::WorkflowTrigger::Timer { .. } => "timer",
         contracts::WorkflowTrigger::Callback { .. } => "callback",
+        contracts::WorkflowTrigger::Update { .. } => "update",
     }
 }
 
@@ -6881,6 +7423,13 @@ enum StoredWorkflowTrigger {
         callback_id: String,
         response: Vec<u8>,
     },
+    Update {
+        update_id: contracts::WorkflowUpdateId,
+        lane: contracts::WorkflowUpdateLane,
+        name: String,
+        payload: Option<contracts::WorkflowPayload>,
+        requested_at_millis: u64,
+    },
 }
 
 impl StoredWorkflowTrigger {
@@ -6905,6 +7454,19 @@ impl StoredWorkflowTrigger {
                 callback_id: callback_id.clone(),
                 response: response.clone(),
             },
+            WorkflowTrigger::Update {
+                update_id,
+                lane,
+                name,
+                payload,
+                requested_at_millis,
+            } => Self::Update {
+                update_id: update_id.clone(),
+                lane: *lane,
+                name: name.clone(),
+                payload: payload.clone(),
+                requested_at_millis: *requested_at_millis,
+            },
         }
     }
 
@@ -6926,6 +7488,19 @@ impl StoredWorkflowTrigger {
             } => Ok(WorkflowTrigger::Callback {
                 callback_id,
                 response,
+            }),
+            Self::Update {
+                update_id,
+                lane,
+                name,
+                payload,
+                requested_at_millis,
+            } => Ok(WorkflowTrigger::Update {
+                update_id,
+                lane,
+                name,
+                payload,
+                requested_at_millis,
             }),
         }
     }
@@ -7071,6 +7646,20 @@ mod durable_format_tests {
             },
             committed_at_millis: 11,
         };
+        let admitted_update = StoredAdmittedWorkflowTrigger {
+            workflow_instance: "order-1".to_string(),
+            trigger_seq: 4,
+            trigger: StoredWorkflowTrigger::Update {
+                update_id: contracts::WorkflowUpdateId::new("update:orders:pause-1")
+                    .expect("update id"),
+                lane: contracts::WorkflowUpdateLane::Control,
+                name: "pause".to_string(),
+                payload: Some(contracts::WorkflowPayload::bytes("operator-request")),
+                requested_at_millis: 16,
+            },
+            operation_context: None,
+            admitted_at_millis: 16,
+        };
 
         let run_bytes = encode_workflow_run_record(&run).expect("encode run record fixture");
         assert_durable_format_fixture("workflow-run-record-v1.bin", &run_bytes);
@@ -7148,6 +7737,18 @@ mod durable_format_tests {
                 &visibility_rows,
             )
             .expect("encode visibility artifact fixture"),
+        );
+
+        let inbox_trigger_bytes = encode_payload(&admitted_update, "workflow inbox trigger")
+            .expect("encode inbox fixture");
+        assert_durable_format_fixture("workflow-inbox-trigger-update-v1.bin", &inbox_trigger_bytes);
+
+        let trigger_journal_bytes =
+            encode_payload(&admitted_update, "workflow trigger journal entry")
+                .expect("encode trigger journal fixture");
+        assert_durable_format_fixture(
+            "workflow-trigger-journal-entry-update-v1.bin",
+            &trigger_journal_bytes,
         );
     }
 }

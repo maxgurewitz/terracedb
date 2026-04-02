@@ -192,6 +192,10 @@ impl WorkflowHandler for RecordingHandler {
             terracedb_workflows::WorkflowTrigger::Event(entry) => entry.key.clone(),
             terracedb_workflows::WorkflowTrigger::Timer { payload, .. } => payload.clone(),
             terracedb_workflows::WorkflowTrigger::Callback { response, .. } => response.clone(),
+            terracedb_workflows::WorkflowTrigger::Update { payload, .. } => payload
+                .as_ref()
+                .map(|payload| payload.bytes.clone())
+                .unwrap_or_default(),
         };
 
         Ok(WorkflowOutput {
@@ -281,6 +285,9 @@ impl WorkflowHandler for TimerHandler {
                 outbox_entries: Vec::new(),
                 timers: Vec::new(),
             }),
+            terracedb_workflows::WorkflowTrigger::Update { .. } => Err(WorkflowHandlerError::new(
+                std::io::Error::other("timer workflow does not process updates"),
+            )),
             terracedb_workflows::WorkflowTrigger::Event(_) => {
                 panic!("timer workflow does not process source events")
             }
@@ -349,6 +356,9 @@ impl WorkflowHandler for CheckpointCaptureHandler {
                 }],
                 timers: Vec::new(),
             }),
+            terracedb_workflows::WorkflowTrigger::Update { .. } => Err(WorkflowHandlerError::new(
+                std::io::Error::other("checkpoint workflow does not process updates"),
+            )),
         }
     }
 }
@@ -442,6 +452,9 @@ impl WorkflowHandler for BlockingResumeHandler {
             terracedb_workflows::WorkflowTrigger::Timer { .. } => {
                 panic!("blocking resume test only uses callbacks and source events")
             }
+            terracedb_workflows::WorkflowTrigger::Update { .. } => {
+                panic!("blocking resume test only uses callbacks and source events")
+            }
         }
 
         Ok(WorkflowOutput {
@@ -449,6 +462,81 @@ impl WorkflowHandler for BlockingResumeHandler {
             outbox_entries: Vec::new(),
             timers: Vec::new(),
         })
+    }
+}
+
+struct UpdateGateHandler;
+
+#[async_trait]
+impl WorkflowHandler for UpdateGateHandler {
+    async fn route_event(
+        &self,
+        _entry: &terracedb::ChangeEntry,
+    ) -> Result<String, WorkflowHandlerError> {
+        Err(WorkflowHandlerError::new(std::io::Error::other(
+            "update workflow does not route source events",
+        )))
+    }
+
+    async fn handle(
+        &self,
+        _instance_id: &str,
+        state: Option<Value>,
+        trigger: &terracedb_workflows::WorkflowTrigger,
+        _ctx: &WorkflowContext,
+    ) -> Result<WorkflowOutput, WorkflowHandlerError> {
+        match trigger {
+            terracedb_workflows::WorkflowTrigger::Callback { response, .. } => Ok(WorkflowOutput {
+                state: WorkflowStateMutation::Put(Value::bytes(response.clone())),
+                outbox_entries: Vec::new(),
+                timers: Vec::new(),
+            }),
+            terracedb_workflows::WorkflowTrigger::Update {
+                lane,
+                name,
+                payload,
+                ..
+            } => {
+                let current = state
+                    .as_ref()
+                    .and_then(|value| match value {
+                        Value::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+                        Value::Record(_) => None,
+                    })
+                    .unwrap_or_else(|| "unset".to_string());
+                let next = payload
+                    .as_ref()
+                    .map(|payload| String::from_utf8_lossy(&payload.bytes).into_owned())
+                    .unwrap_or_else(|| "empty".to_string());
+                match (lane, name.as_str()) {
+                    (contracts::WorkflowUpdateLane::Update, "set-state") => Ok(WorkflowOutput {
+                        state: WorkflowStateMutation::Put(Value::bytes(format!(
+                            "{current}->{next}"
+                        ))),
+                        outbox_entries: Vec::new(),
+                        timers: Vec::new(),
+                    }),
+                    (contracts::WorkflowUpdateLane::Control, "pause") => Err(
+                        WorkflowHandlerError::new(contracts::WorkflowTaskError::new(
+                            "update-denied",
+                            "control lane denied",
+                        )),
+                    ),
+                    _ => Err(WorkflowHandlerError::new(
+                        contracts::WorkflowTaskError::new(
+                            "update-denied",
+                            format!("unsupported update {name}"),
+                        ),
+                    )),
+                }
+            }
+            terracedb_workflows::WorkflowTrigger::Event(_) => Err(WorkflowHandlerError::new(
+                std::io::Error::other("update workflow does not process source events"),
+            )),
+            terracedb_workflows::WorkflowTrigger::Timer { .. } => Err(WorkflowHandlerError::new(
+                std::io::Error::other("update workflow does not process timers"),
+            )),
+        }
     }
 }
 
@@ -485,6 +573,10 @@ impl ContractParityLogic {
             contracts::WorkflowTrigger::Event { event } => event.key.clone(),
             contracts::WorkflowTrigger::Timer { payload, .. } => payload.clone(),
             contracts::WorkflowTrigger::Callback { response, .. } => response.clone(),
+            contracts::WorkflowTrigger::Update { payload, .. } => payload
+                .as_ref()
+                .map(|payload| payload.bytes.clone())
+                .unwrap_or_default(),
         };
         contracts::WorkflowTransitionOutput {
             state: contracts::WorkflowStateMutation::Put {
@@ -766,6 +858,8 @@ function payloadFromTrigger(trigger) {
       return trigger.payload;
     case "callback":
       return trigger.response;
+    case "update":
+      return trigger.payload ? trigger.payload.bytes : [];
     default:
       throw { code: "invalid-contract", message: `unknown trigger kind ${trigger.kind}` };
   }
@@ -839,6 +933,10 @@ impl ScriptedContractLogic {
             contracts::WorkflowTrigger::Event { event } => event.key.clone(),
             contracts::WorkflowTrigger::Timer { payload, .. } => payload.clone(),
             contracts::WorkflowTrigger::Callback { response, .. } => response.clone(),
+            contracts::WorkflowTrigger::Update { payload, .. } => payload
+                .as_ref()
+                .map(|payload| payload.bytes.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -3126,6 +3224,35 @@ async fn open_historical_checkpoint_runtime(
         .with_timer_poll_interval(Duration::from_millis(1)),
     )
     .await
+}
+
+async fn open_update_runtime(
+    path: &str,
+) -> Result<
+    (
+        WorkflowRuntime<UpdateGateHandler>,
+        WorkflowHandle,
+        Arc<StubClock>,
+    ),
+    WorkflowError,
+> {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(100)));
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open update db");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock.clone(),
+        WorkflowDefinition::new("updates", std::iter::empty::<Table>(), UpdateGateHandler),
+    )
+    .await?;
+    let handle = runtime.start().await?;
+    Ok((runtime, handle, clock))
 }
 
 async fn wait_for_recurring_state<H, P>(
@@ -5783,7 +5910,6 @@ async fn visibility_api_describes_prior_runs_and_exposes_forensics_hooks() {
         .await
         .expect("timed out shutting down runtime")
         .expect("shutdown runtime");
-
     drop(runtime);
 
     let reopened_db = Db::open(
@@ -5833,6 +5959,498 @@ async fn visibility_api_describes_prior_runs_and_exposes_forensics_hooks() {
             .load_live_scheduler_status("acct-7")
             .in_flight
     );
+}
+
+#[tokio::test]
+async fn workflow_queries_inspect_state_and_visibility_without_appending_history() {
+    let (runtime, handle, _) = open_update_runtime("/workflow-query-lane")
+        .await
+        .expect("open update runtime");
+    runtime
+        .admit_callback("acct-7", "seed", b"seeded".to_vec())
+        .await
+        .expect("seed workflow state");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("seeded")),
+    )
+    .await
+    .expect("timed out waiting for seeded state")
+    .expect("wait for seeded state");
+
+    let state = runtime
+        .load_state_record("acct-7")
+        .await
+        .expect("load current state")
+        .expect("state should exist");
+    let visibility = runtime
+        .load_visibility_record(&state.run_id)
+        .await
+        .expect("load visibility")
+        .expect("visibility should exist");
+    let history_before = runtime
+        .load_run_history(&state.run_id)
+        .await
+        .expect("load history before queries");
+
+    let state_response = runtime
+        .query(contracts::WorkflowQueryRequest {
+            query_id: contracts::WorkflowQueryId::new("query:updates:state").expect("query id"),
+            run_id: state.run_id.clone(),
+            target: contracts::WorkflowQueryTarget::State,
+            name: "inspect".to_string(),
+            payload: None,
+            requested_at_millis: 101,
+        })
+        .await
+        .expect("state query");
+    match state_response {
+        contracts::WorkflowQueryResponse::Accepted { payload, .. } => {
+            let payload = payload.expect("state query payload");
+            let queried: WorkflowStateRecord =
+                serde_json::from_slice(&payload.bytes).expect("decode state query payload");
+            assert_eq!(queried, state);
+        }
+        other => panic!("expected accepted state query, got {other:?}"),
+    }
+
+    let visibility_response = runtime
+        .query(contracts::WorkflowQueryRequest {
+            query_id: contracts::WorkflowQueryId::new("query:updates:visibility")
+                .expect("query id"),
+            run_id: state.run_id.clone(),
+            target: contracts::WorkflowQueryTarget::Visibility,
+            name: "inspect".to_string(),
+            payload: None,
+            requested_at_millis: 102,
+        })
+        .await
+        .expect("visibility query");
+    match visibility_response {
+        contracts::WorkflowQueryResponse::Accepted { payload, .. } => {
+            let payload = payload.expect("visibility query payload");
+            let queried: contracts::WorkflowVisibilityEntry =
+                serde_json::from_slice(&payload.bytes).expect("decode visibility query payload");
+            assert_eq!(queried.record, visibility);
+            assert_eq!(queried.execution, None);
+        }
+        other => panic!("expected accepted visibility query, got {other:?}"),
+    }
+
+    let execution_response = runtime
+        .query(contracts::WorkflowQueryRequest {
+            query_id: contracts::WorkflowQueryId::new("query:updates:execution").expect("query id"),
+            run_id: state.run_id.clone(),
+            target: contracts::WorkflowQueryTarget::Execution,
+            name: "inspect".to_string(),
+            payload: None,
+            requested_at_millis: 103,
+        })
+        .await
+        .expect("execution query");
+    match execution_response {
+        contracts::WorkflowQueryResponse::Rejected { error, .. } => {
+            assert_eq!(error.code, "missing-execution");
+        }
+        other => panic!("expected rejected execution query, got {other:?}"),
+    }
+
+    let history_after = runtime
+        .load_run_history(&state.run_id)
+        .await
+        .expect("load history after queries");
+    assert_eq!(history_after, history_before);
+
+    handle.shutdown().await.expect("shutdown query runtime");
+}
+
+#[tokio::test]
+async fn accepted_workflow_updates_commit_once_and_duplicate_after_restart() {
+    let path = "/workflow-update-duplicate";
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(100)));
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open update db");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock.clone(),
+        WorkflowDefinition::new("updates", std::iter::empty::<Table>(), UpdateGateHandler),
+    )
+    .await
+    .expect("open update runtime");
+    let handle = runtime.start().await.expect("start update runtime");
+    runtime
+        .admit_callback("acct-7", "seed", b"seeded".to_vec())
+        .await
+        .expect("seed workflow state");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("seeded")),
+    )
+    .await
+    .expect("timed out waiting for seeded state")
+    .expect("wait for seeded state");
+
+    let state = runtime
+        .load_state_record("acct-7")
+        .await
+        .expect("load update state")
+        .expect("update state should exist");
+    let request = contracts::WorkflowUpdateRequest {
+        update_id: contracts::WorkflowUpdateId::new("update:updates:acct-7:set-state")
+            .expect("update id"),
+        run_id: state.run_id.clone(),
+        lane: contracts::WorkflowUpdateLane::Update,
+        name: "set-state".to_string(),
+        payload: Some(WorkflowPayload::bytes("approved")),
+        requested_at_millis: 105,
+    };
+
+    let accepted = runtime
+        .admit_update(request.clone())
+        .await
+        .expect("accept update");
+    let accepted_task_id = match accepted {
+        contracts::WorkflowUpdateAdmission::Accepted { task_id, .. } => task_id,
+        other => panic!("expected accepted update, got {other:?}"),
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("seeded->approved")),
+    )
+    .await
+    .expect("timed out waiting for updated state")
+    .expect("wait for updated state");
+
+    handle.shutdown().await.expect("shutdown update runtime");
+    drop(runtime);
+
+    let reopened_db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("reopen update db");
+    let reopened_runtime = WorkflowRuntime::open(
+        reopened_db,
+        clock,
+        WorkflowDefinition::new("updates", std::iter::empty::<Table>(), UpdateGateHandler),
+    )
+    .await
+    .expect("reopen update runtime");
+
+    let duplicate = reopened_runtime
+        .admit_update(request)
+        .await
+        .expect("duplicate update");
+    match duplicate {
+        contracts::WorkflowUpdateAdmission::Duplicate {
+            original_task_id, ..
+        } => assert_eq!(original_task_id, accepted_task_id),
+        other => panic!("expected duplicate update, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn accepted_workflow_updates_persist_pending_admission_across_restart() {
+    let path = "/workflow-update-pending-restart";
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::new(Timestamp::new(100)));
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("open pending update db");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock.clone(),
+        WorkflowDefinition::new("updates", std::iter::empty::<Table>(), UpdateGateHandler),
+    )
+    .await
+    .expect("open pending update runtime");
+    let handle = runtime.start().await.expect("start pending update runtime");
+    runtime
+        .admit_callback("acct-7", "seed", b"seeded".to_vec())
+        .await
+        .expect("seed pending update state");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("seeded")),
+    )
+    .await
+    .expect("timed out waiting for seeded pending-update state")
+    .expect("wait for seeded pending-update state");
+
+    let state = runtime
+        .load_state_record("acct-7")
+        .await
+        .expect("load pending update state")
+        .expect("pending update state should exist");
+    let request = contracts::WorkflowUpdateRequest {
+        update_id: contracts::WorkflowUpdateId::new("update:updates:acct-7:restart-safe")
+            .expect("update id"),
+        run_id: state.run_id.clone(),
+        lane: contracts::WorkflowUpdateLane::Update,
+        name: "set-state".to_string(),
+        payload: Some(WorkflowPayload::bytes("approved")),
+        requested_at_millis: 105,
+    };
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown pending update runtime");
+    drop(runtime);
+
+    let reopened_db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system.clone(), object_store.clone(), clock.clone()),
+    )
+    .await
+    .expect("reopen pending update db");
+    let reopened_runtime = WorkflowRuntime::open(
+        reopened_db,
+        clock.clone(),
+        WorkflowDefinition::new("updates", std::iter::empty::<Table>(), UpdateGateHandler),
+    )
+    .await
+    .expect("reopen pending update runtime");
+
+    let accepted = reopened_runtime
+        .admit_update(request)
+        .await
+        .expect("accept pending update while runtime stopped");
+    let accepted_task_id = match accepted {
+        contracts::WorkflowUpdateAdmission::Accepted { task_id, .. } => task_id,
+        other => panic!("expected accepted pending update, got {other:?}"),
+    };
+    let duplicate = reopened_runtime
+        .admit_update(contracts::WorkflowUpdateRequest {
+            update_id: contracts::WorkflowUpdateId::new("update:updates:acct-7:restart-safe")
+                .expect("update id"),
+            run_id: state.run_id.clone(),
+            lane: contracts::WorkflowUpdateLane::Update,
+            name: "set-state".to_string(),
+            payload: Some(WorkflowPayload::bytes("approved")),
+            requested_at_millis: 105,
+        })
+        .await
+        .expect("retry pending update while runtime stopped");
+    match duplicate {
+        contracts::WorkflowUpdateAdmission::Duplicate {
+            original_task_id, ..
+        } => assert_eq!(original_task_id, accepted_task_id),
+        other => panic!("expected duplicate pending update, got {other:?}"),
+    }
+    assert_eq!(
+        reopened_runtime
+            .load_state("acct-7")
+            .await
+            .expect("load state before restart"),
+        Some(Value::bytes("seeded")),
+    );
+    assert_eq!(
+        reopened_runtime
+            .telemetry_snapshot()
+            .await
+            .expect("capture pending update telemetry")
+            .inbox_depth,
+        1,
+    );
+    drop(reopened_runtime);
+
+    let resumed_db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("reopen resumed update db");
+    let resumed_runtime = WorkflowRuntime::open(
+        resumed_db,
+        clock,
+        WorkflowDefinition::new("updates", std::iter::empty::<Table>(), UpdateGateHandler),
+    )
+    .await
+    .expect("open resumed update runtime");
+    let resumed_handle = resumed_runtime
+        .start()
+        .await
+        .expect("start resumed update runtime");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        resumed_runtime.wait_for_state("acct-7", Value::bytes("seeded->approved")),
+    )
+    .await
+    .expect("timed out waiting for resumed update state")
+    .expect("wait for resumed update state");
+
+    resumed_handle
+        .shutdown()
+        .await
+        .expect("shutdown resumed update runtime");
+}
+
+#[tokio::test]
+async fn rejected_workflow_updates_leave_no_durable_history() {
+    let (runtime, handle, _) = open_update_runtime("/workflow-update-rejected")
+        .await
+        .expect("open update runtime");
+    runtime
+        .admit_callback("acct-7", "seed", b"seeded".to_vec())
+        .await
+        .expect("seed workflow state");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("seeded")),
+    )
+    .await
+    .expect("timed out waiting for seeded state")
+    .expect("wait for seeded state");
+
+    let state = runtime
+        .load_state_record("acct-7")
+        .await
+        .expect("load rejected-update state")
+        .expect("state should exist");
+    let history_before = runtime
+        .load_run_history(&state.run_id)
+        .await
+        .expect("load history before rejected update");
+
+    let rejected = runtime
+        .admit_update(contracts::WorkflowUpdateRequest {
+            update_id: contracts::WorkflowUpdateId::new("update:updates:acct-7:pause")
+                .expect("update id"),
+            run_id: state.run_id.clone(),
+            lane: contracts::WorkflowUpdateLane::Control,
+            name: "pause".to_string(),
+            payload: None,
+            requested_at_millis: 106,
+        })
+        .await
+        .expect("reject update");
+    match rejected {
+        contracts::WorkflowUpdateAdmission::Rejected { error, .. } => {
+            assert_eq!(error.code, "update-denied");
+        }
+        other => panic!("expected rejected update, got {other:?}"),
+    }
+
+    let history_after = runtime
+        .load_run_history(&state.run_id)
+        .await
+        .expect("load history after rejected update");
+    assert_eq!(history_after, history_before);
+    assert!(history_after.iter().all(|record| {
+        !matches!(
+            &record.event,
+            WorkflowHistoryEvent::TaskAdmitted {
+                trigger:
+                    contracts::WorkflowTrigger::Update {
+                        update_id,
+                        ..
+                    },
+                ..
+            } if update_id.as_str() == "update:updates:acct-7:pause"
+        )
+    }));
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown rejected-update runtime");
+}
+
+#[tokio::test]
+async fn sandbox_contract_runtime_accepts_update_triggers_via_handle_task_v1() {
+    let path = "/workflow-contract-update";
+    let clock = Arc::new(StubClock::new(Timestamp::new(200)));
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(path, TieredDurabilityMode::GroupCommit),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open contract update db");
+    let bundle = contract_bundle("/workspace/billing.js");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock.clone(),
+        WorkflowDefinition::new(
+            "contract-billing",
+            std::iter::empty::<Table>(),
+            open_sandbox_contract_handler(
+                200,
+                777,
+                VolumeId::new(0x9500),
+                VolumeId::new(0x9501),
+                "/workspace/billing.js",
+                CONTRACT_PARITY_SANDBOX_MODULE,
+                bundle,
+            )
+            .await,
+        ),
+    )
+    .await
+    .expect("open contract update runtime");
+    let handle = runtime
+        .start()
+        .await
+        .expect("start contract update runtime");
+
+    runtime
+        .admit_callback("acct-7", "seed", b"seeded".to_vec())
+        .await
+        .expect("seed contract state");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("contract:contract-billing:1")),
+    )
+    .await
+    .expect("timed out waiting for seeded contract state")
+    .expect("wait for seeded contract state");
+
+    let state = runtime
+        .load_state_record("acct-7")
+        .await
+        .expect("load contract state")
+        .expect("contract state should exist");
+    let update = runtime
+        .admit_update(contracts::WorkflowUpdateRequest {
+            update_id: contracts::WorkflowUpdateId::new("update:contract-billing:acct-7:set")
+                .expect("update id"),
+            run_id: state.run_id.clone(),
+            lane: contracts::WorkflowUpdateLane::Update,
+            name: "set-state".to_string(),
+            payload: Some(WorkflowPayload::bytes("patched")),
+            requested_at_millis: 205,
+        })
+        .await
+        .expect("accept sandbox update");
+    assert!(matches!(
+        update,
+        contracts::WorkflowUpdateAdmission::Accepted { .. }
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_for_state("acct-7", Value::bytes("contract:contract-billing:2")),
+    )
+    .await
+    .expect("timed out waiting for sandbox update state")
+    .expect("wait for sandbox update state");
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown contract update runtime");
 }
 
 #[tokio::test]
