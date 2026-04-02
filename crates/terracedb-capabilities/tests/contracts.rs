@@ -12,12 +12,13 @@ use terracedb_capabilities::{
     DraftAuthorizationDecision, DraftAuthorizationFlowError, DraftAuthorizationHistoryKind,
     DraftAuthorizationOutcomeKind, DraftAuthorizationRequestKind, ExecutionDomain,
     ExecutionDomainAssignment, ExecutionOperation, ExecutionPolicy, FilteredScanResumeToken,
-    ForegroundSessionStatusProjector, ManifestBinding, ManifestBindingOverride, PolicyContext,
-    PolicyError, PolicyOutcomeKind, PolicyResolutionRequest, PolicySubject, PresetBinding,
-    RateLimitOutcome, ResolvedSessionPolicy, ResourceKind, ResourcePolicy, ResourceSelector,
-    ResourceTarget, RowDenialContract, RowQueryShape, RowScopeBinding, RowScopeFamily,
-    RowScopePolicy, RowVisibilityOutcomeKind, SessionLifecycleState, SessionMode,
-    SessionPresetRequest, SessionStatusSource, SessionStatusUpdate, ShellCommandDescriptor,
+    ForegroundSessionStatusProjector, ManifestBinding, ManifestBindingOverride,
+    PolicyAuditMetadata, PolicyContext, PolicyDecisionRecord, PolicyError, PolicyOutcomeKind,
+    PolicyOutcomeRecord, PolicyResolutionRequest, PolicySubject, PresetBinding, RateLimitOutcome,
+    ResolvedSessionPolicy, ResourceKind, ResourcePolicy, ResourceSelector, ResourceTarget,
+    RowDenialContract, RowQueryShape, RowScopeBinding, RowScopeFamily, RowScopePolicy,
+    RowVisibilityOutcomeKind, SessionLifecycleState, SessionMode, SessionPresetRequest,
+    SessionStatusSource, SessionStatusUpdate, ShellCommandDescriptor,
     StaticExecutionPolicyResolver, SubjectResolutionRequest, SubjectSelector, VisibilityIndexSpec,
     VisibilityIndexSubjectKey, VisibilityMembershipTransition, capability_module_specifier,
 };
@@ -30,8 +31,13 @@ use terracedb_migrate::{
     MigrationHistoryEntry, MigrationPlan, MigrationState, MigrationStep, MigrationStepKind,
 };
 use terracedb_procedures::{
-    DeterministicProcedurePublicationStore, ProcedureInvocationContext, ProcedureInvocationRequest,
-    ProcedurePublicationStore, ProcedureReview, ProcedureVersionRef, ReviewedProcedurePublication,
+    DeterministicProcedurePublicationStore, FrozenProcedureArtifact, PendingProcedureInvocation,
+    PendingProcedurePublication, PreparedProcedureInvocation, ProcedureAuditEventKind,
+    ProcedureAuditRecord, ProcedureBindingResolution, ProcedureDeployment, ProcedureDraft,
+    ProcedureDraftSource, ProcedureImmutableArtifact, ProcedureInvocationContext,
+    ProcedureInvocationReceipt, ProcedureInvocationRecord, ProcedureInvocationRequest,
+    ProcedureInvocationState, ProcedurePublicationReceipt, ProcedurePublicationStore,
+    ProcedureReview, ProcedureVersionRef, ReviewedProcedureDraft, ReviewedProcedurePublication,
 };
 
 fn sample_budget() -> BudgetPolicy {
@@ -548,7 +554,13 @@ fn frozen_contracts_compile_together() {
             procedure_id: "sync-ticket".to_string(),
             version: 1,
         },
+        artifact: ProcedureImmutableArtifact::SandboxSnapshot {
+            snapshot_id: "snapshot-1".to_string(),
+        },
+        code_hash: "sha256:abc123".to_string(),
         entrypoint: "terrace:/workspace/procedures/sync-ticket.ts".to_string(),
+        input_schema: serde_json::json!({ "type": "object" }),
+        output_schema: serde_json::json!({ "type": "object" }),
         published_at: Timestamp::new(20),
         manifest: manifest.clone(),
         execution_policy: execution_policy.clone(),
@@ -746,7 +758,13 @@ fn serde_round_trips_grant_manifest_publication_and_execution_policy() {
             procedure_id: "sync-ticket".to_string(),
             version: 2,
         },
+        artifact: ProcedureImmutableArtifact::SandboxSnapshot {
+            snapshot_id: "snapshot-2".to_string(),
+        },
+        code_hash: "sha256:def456".to_string(),
         entrypoint: "terrace:/workspace/procedures/sync-ticket.ts".to_string(),
+        input_schema: serde_json::json!({ "type": "object" }),
+        output_schema: serde_json::json!({ "type": "object" }),
         published_at: Timestamp::new(30),
         manifest: manifest.clone(),
         execution_policy: execution_policy.clone(),
@@ -776,6 +794,268 @@ fn serde_round_trips_grant_manifest_publication_and_execution_policy() {
     assert_eq!(round_trip_manifest, manifest);
     assert_eq!(round_trip_execution, execution_policy);
     assert_eq!(round_trip_publication, publication);
+}
+
+#[test]
+fn serde_round_trips_reviewed_procedure_contracts() {
+    fn assert_round_trip<T>(value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let decoded: T =
+            serde_json::from_slice(&serde_json::to_vec(value).expect("encode procedure contract"))
+                .expect("decode procedure contract");
+        assert_eq!(&decoded, value);
+    }
+
+    let caller = PolicySubject {
+        subject_id: "user:alice".to_string(),
+        tenant_id: Some("tenant-a".to_string()),
+        groups: vec!["support".to_string()],
+        attributes: BTreeMap::from([("region".to_string(), "us-west".to_string())]),
+    };
+    let manifest = CapabilityManifest {
+        subject: Some(caller.clone()),
+        preset_name: Some("draft-support".to_string()),
+        profile_name: None,
+        bindings: vec![ManifestBinding {
+            binding_name: "tickets".to_string(),
+            capability_family: "db.query.v1".to_string(),
+            module_specifier: capability_module_specifier("tickets"),
+            shell_command: Some(ShellCommandDescriptor::for_binding("tickets")),
+            resource_policy: sample_template().default_resource_policy,
+            budget_policy: sample_budget(),
+            source_template_id: "db.query.v1".to_string(),
+            source_grant_id: Some("grant-1".to_string()),
+            allow_interactive_widening: false,
+            metadata: BTreeMap::new(),
+        }],
+        metadata: BTreeMap::from([("surface".to_string(), serde_json::json!("reviewed"))]),
+    };
+    let execution_policy = sample_execution_policy();
+    let publication_ref = ProcedureVersionRef {
+        procedure_id: "sync-ticket".to_string(),
+        version: 7,
+    };
+    let review = ProcedureReview {
+        reviewed_by: "reviewer".to_string(),
+        source_revision: "abc123".to_string(),
+        note: Some("ship it".to_string()),
+        approved_at: Timestamp::new(88),
+    };
+    let draft = ProcedureDraft {
+        publication: publication_ref.clone(),
+        source: ProcedureDraftSource::DraftSandboxSession {
+            session_id: "draft-session".to_string(),
+        },
+        entrypoint: "run".to_string(),
+        requested_manifest: manifest.clone(),
+        execution_policy: execution_policy.clone(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["ticketId"],
+            "properties": { "ticketId": { "type": "string" } }
+        }),
+        output_schema: serde_json::json!({
+            "type": "object",
+            "required": ["status"],
+            "properties": { "status": { "type": "string" } }
+        }),
+        metadata: BTreeMap::from([("draft".to_string(), serde_json::json!(true))]),
+    };
+    let reviewed_draft = ReviewedProcedureDraft {
+        draft: draft.clone(),
+        review: review.clone(),
+        published_at: Timestamp::new(90),
+        metadata: BTreeMap::from([("ready".to_string(), serde_json::json!(true))]),
+    };
+    let artifact = FrozenProcedureArtifact {
+        artifact: ProcedureImmutableArtifact::SandboxSnapshot {
+            snapshot_id: "snapshot-7".to_string(),
+        },
+        code_hash: "sha256:7777".to_string(),
+        metadata: BTreeMap::from([("immutable".to_string(), serde_json::json!(true))]),
+    };
+    let publication = ReviewedProcedurePublication {
+        publication: publication_ref.clone(),
+        artifact: artifact.artifact.clone(),
+        code_hash: artifact.code_hash.clone(),
+        entrypoint: draft.entrypoint.clone(),
+        input_schema: draft.input_schema.clone(),
+        output_schema: draft.output_schema.clone(),
+        published_at: reviewed_draft.published_at,
+        manifest: manifest.clone(),
+        execution_policy: execution_policy.clone(),
+        review: review.clone(),
+        metadata: BTreeMap::from([("published".to_string(), serde_json::json!(true))]),
+    };
+    let publication_receipt = ProcedurePublicationReceipt {
+        publication: publication_ref.clone(),
+        published_at: publication.published_at,
+        code_hash: publication.code_hash.clone(),
+        execution_policy: execution_policy.clone(),
+    };
+    let deployment = ProcedureDeployment {
+        deployment_id: "prod".to_string(),
+        invocation_binding: ManifestBinding {
+            binding_name: "procedures".to_string(),
+            capability_family: "procedure.invoke.v1".to_string(),
+            module_specifier: capability_module_specifier("procedures"),
+            shell_command: None,
+            resource_policy: ResourcePolicy {
+                allow: vec![ResourceSelector {
+                    kind: ResourceKind::Procedure,
+                    pattern: "sync-*".to_string(),
+                }],
+                deny: vec![],
+                tenant_scopes: vec!["tenant-a".to_string()],
+                row_scope_binding: None,
+                visibility_index: None,
+                metadata: BTreeMap::new(),
+            },
+            budget_policy: sample_budget(),
+            source_template_id: "procedure.invoke.v1".to_string(),
+            source_grant_id: None,
+            allow_interactive_widening: false,
+            metadata: BTreeMap::new(),
+        },
+        execution_policy: execution_policy.clone(),
+        binding_overrides: vec![ManifestBindingOverride {
+            binding_name: "tickets".to_string(),
+            drop_binding: false,
+            resource_policy: None,
+            budget_policy: Some(BudgetPolicy {
+                max_calls: Some(2),
+                max_scanned_rows: Some(10),
+                max_returned_rows: Some(5),
+                max_bytes: Some(1024),
+                max_millis: Some(50),
+                rate_limit_bucket: Some("reviewed-procedure".to_string()),
+                labels: BTreeMap::new(),
+            }),
+            expose_in_just_bash: None,
+            metadata: BTreeMap::new(),
+        }],
+        metadata: BTreeMap::from([("env".to_string(), serde_json::json!("prod"))]),
+    };
+    let request = ProcedureInvocationRequest {
+        publication: publication_ref.clone(),
+        arguments: serde_json::json!({ "ticketId": "t-1" }),
+        context: ProcedureInvocationContext {
+            caller: Some(caller.clone()),
+            session_mode: SessionMode::ReviewedProcedure,
+            session_id: Some("proc-session".to_string()),
+            dry_run: false,
+            metadata: BTreeMap::from([("trace".to_string(), serde_json::json!("abc"))]),
+        },
+    };
+    let policy_outcome = PolicyDecisionRecord {
+        outcome: PolicyOutcomeRecord {
+            binding_name: "procedures".to_string(),
+            outcome: PolicyOutcomeKind::Allowed,
+            message: None,
+            observed_at: Timestamp::new(91),
+            row_visibility: None,
+            metadata: BTreeMap::new(),
+        },
+        audit: PolicyAuditMetadata {
+            session_id: "proc-session".to_string(),
+            session_mode: SessionMode::ReviewedProcedure,
+            subject: caller.clone(),
+            binding_name: "procedures".to_string(),
+            capability_family: Some("procedure.invoke.v1".to_string()),
+            target_resources: vec![ResourceTarget {
+                kind: ResourceKind::Procedure,
+                identifier: "sync-ticket".to_string(),
+            }],
+            execution_domain: ExecutionDomain::DedicatedSandbox,
+            placement_tags: vec!["reviewed".to_string()],
+            preset_name: None,
+            profile_name: None,
+            expanded_manifest: Some(manifest.clone()),
+            rate_limit: None,
+            budget_hook: None,
+            metadata: BTreeMap::new(),
+        },
+    };
+    let binding_resolution = ProcedureBindingResolution {
+        binding_name: "tickets".to_string(),
+        effective_row_scope: None,
+    };
+    let prepared = PreparedProcedureInvocation {
+        invocation_id: "sync-ticket@7:invoke-1".to_string(),
+        publication: publication.clone(),
+        request: request.clone(),
+        deployment: deployment.clone(),
+        effective_manifest: manifest.clone(),
+        execution_policy: execution_policy.clone(),
+        execution_domain: ExecutionDomain::DedicatedSandbox,
+        binding_resolutions: vec![binding_resolution.clone()],
+        policy_outcome: policy_outcome.clone(),
+        metadata: BTreeMap::from([("prepared".to_string(), serde_json::json!(true))]),
+    };
+    let receipt = ProcedureInvocationReceipt {
+        invocation_id: prepared.invocation_id.clone(),
+        publication: publication_ref.clone(),
+        accepted_at: Timestamp::new(91),
+        completed_at: Timestamp::new(92),
+        execution_policy: execution_policy.clone(),
+        execution_domain: ExecutionDomain::DedicatedSandbox,
+        effective_manifest: manifest.clone(),
+        binding_resolutions: vec![binding_resolution.clone()],
+        output: serde_json::json!({ "status": "queued" }),
+        metadata: BTreeMap::new(),
+    };
+    let record = ProcedureInvocationRecord {
+        invocation_id: prepared.invocation_id.clone(),
+        publication: publication_ref.clone(),
+        state: ProcedureInvocationState::Succeeded,
+        requested_at: Timestamp::new(91),
+        completed_at: Timestamp::new(92),
+        caller: Some(caller.clone()),
+        execution_policy: execution_policy.clone(),
+        execution_domain: ExecutionDomain::DedicatedSandbox,
+        effective_manifest: manifest.clone(),
+        binding_resolutions: vec![binding_resolution.clone()],
+        policy_outcome: policy_outcome.clone(),
+        arguments: request.arguments.clone(),
+        output: Some(receipt.output.clone()),
+        failure: None,
+        metadata: BTreeMap::new(),
+    };
+    let audit = ProcedureAuditRecord {
+        audit_id: "sync-ticket@7:audit-1".to_string(),
+        procedure_id: "sync-ticket".to_string(),
+        version: 7,
+        invocation_id: Some(prepared.invocation_id.clone()),
+        event: ProcedureAuditEventKind::InvocationSucceeded,
+        recorded_at: Timestamp::new(92),
+        execution_operation: ExecutionOperation::ProcedureInvocation,
+        metadata: BTreeMap::new(),
+    };
+    let pending_publication = PendingProcedurePublication {
+        publication: publication.clone(),
+        recorded_at: Timestamp::new(90),
+    };
+    let pending_invocation = PendingProcedureInvocation {
+        invocation: prepared.clone(),
+        recorded_at: Timestamp::new(91),
+    };
+
+    assert_round_trip(&draft);
+    assert_round_trip(&reviewed_draft);
+    assert_round_trip(&artifact);
+    assert_round_trip(&publication);
+    assert_round_trip(&publication_receipt);
+    assert_round_trip(&deployment);
+    assert_round_trip(&request);
+    assert_round_trip(&binding_resolution);
+    assert_round_trip(&prepared);
+    assert_round_trip(&receipt);
+    assert_round_trip(&record);
+    assert_round_trip(&audit);
+    assert_round_trip(&pending_publication);
+    assert_round_trip(&pending_invocation);
 }
 
 #[test]
