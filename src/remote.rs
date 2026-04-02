@@ -246,12 +246,19 @@ impl ObjectKeyLayout {
         self.key("backup/commitlog/")
     }
 
-    pub fn backup_commit_log_segment(&self, segment_id: SegmentId) -> String {
-        self.key(&format!("backup/commitlog/SEG-{:06}", segment_id.get()))
-    }
+    pub fn backup_commit_log_segment_in_shard(
+        &self,
+        shard: PhysicalShardId,
+        segment_id: SegmentId,
+    ) -> String {
+        if shard == PhysicalShardId::UNSHARDED {
+            return self.key(&format!("backup/commitlog/SEG-{:06}", segment_id.get()));
+        }
 
-    pub fn backup_sstable(&self, table_id: TableId, shard: u32, local_id: &str) -> String {
-        self.backup_sstable_in_shard(table_id, PhysicalShardId::new(shard), local_id)
+        self.key(&format!(
+            "backup/commitlog/{shard}/SEG-{:06}",
+            segment_id.get()
+        ))
     }
 
     pub fn backup_sstable_in_shard(
@@ -2149,11 +2156,18 @@ mod tests {
             "tenant-a/db-01/backup/manifest/latest"
         );
         assert_eq!(
-            layout.backup_commit_log_segment(SegmentId::new(11)),
+            layout.backup_commit_log_segment_in_shard(
+                PhysicalShardId::UNSHARDED,
+                SegmentId::new(11),
+            ),
             "tenant-a/db-01/backup/commitlog/SEG-000011"
         );
         assert_eq!(
-            layout.backup_sstable(TableId::new(9), 0, "SST-000123"),
+            layout.backup_sstable_in_shard(
+                TableId::new(9),
+                PhysicalShardId::UNSHARDED,
+                "SST-000123",
+            ),
             "tenant-a/db-01/backup/sst/table-000009/0000/SST-000123.sst"
         );
         assert_eq!(layout.backup_sstable_prefix(), "tenant-a/db-01/backup/sst");
@@ -2203,8 +2217,15 @@ mod tests {
 
             let normalized_keys = [
                 normalized.backup_manifest(ManifestId::new(manifest_generation)),
-                normalized.backup_commit_log_segment(SegmentId::new(segment_id)),
-                normalized.backup_sstable(TableId::new(table_id), shard as u32, &local_id),
+                normalized.backup_commit_log_segment_in_shard(
+                    PhysicalShardId::UNSHARDED,
+                    SegmentId::new(segment_id),
+                ),
+                normalized.backup_sstable_in_shard(
+                    TableId::new(table_id),
+                    PhysicalShardId::new(shard as u32),
+                    &local_id,
+                ),
                 normalized.cold_sstable(
                     TableId::new(table_id),
                     shard as u32,
@@ -2215,8 +2236,15 @@ mod tests {
             ];
             let slashed_keys = [
                 slashed.backup_manifest(ManifestId::new(manifest_generation)),
-                slashed.backup_commit_log_segment(SegmentId::new(segment_id)),
-                slashed.backup_sstable(TableId::new(table_id), shard as u32, &local_id),
+                slashed.backup_commit_log_segment_in_shard(
+                    PhysicalShardId::UNSHARDED,
+                    SegmentId::new(segment_id),
+                ),
+                slashed.backup_sstable_in_shard(
+                    TableId::new(table_id),
+                    PhysicalShardId::new(shard as u32),
+                    &local_id,
+                ),
                 slashed.cold_sstable(
                     TableId::new(table_id),
                     shard as u32,

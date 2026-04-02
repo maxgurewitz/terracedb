@@ -14,6 +14,7 @@ impl Db {
         live.sort_by(|left, right| {
             (
                 left.meta.table_id.get(),
+                left.meta.physical_shard().get(),
                 left.meta.level,
                 left.meta.min_key.as_slice(),
                 left.meta.max_key.as_slice(),
@@ -21,6 +22,7 @@ impl Db {
             )
                 .cmp(&(
                     right.meta.table_id.get(),
+                    right.meta.physical_shard().get(),
                     right.meta.level,
                     right.meta.min_key.as_slice(),
                     right.meta.max_key.as_slice(),
@@ -45,11 +47,29 @@ impl Db {
         table: &StoredTable,
         live: &[ResidentRowSstable],
     ) -> TableCompactionState {
-        match table.config.compaction_strategy {
-            CompactionStrategy::Leveled => Self::leveled_compaction_state(table, live),
-            CompactionStrategy::Tiered => Self::tiered_compaction_state(table, live),
-            CompactionStrategy::Fifo => Self::fifo_compaction_state(table, live),
+        let mut combined = TableCompactionState::default();
+        let mut best_job_debt = 0_u64;
+
+        for shard_state in Self::table_compaction_states_by_shard(table, live) {
+            combined.compaction_debt = combined
+                .compaction_debt
+                .saturating_add(shard_state.compaction_debt);
+            if let Some(job) = shard_state.next_job {
+                let replace = combined.next_job.is_none()
+                    || shard_state.compaction_debt > best_job_debt
+                    || (shard_state.compaction_debt == best_job_debt
+                        && combined
+                            .next_job
+                            .as_ref()
+                            .is_some_and(|current| job.id < current.id));
+                if replace {
+                    best_job_debt = shard_state.compaction_debt;
+                    combined.next_job = Some(job);
+                }
+            }
         }
+
+        combined
     }
 
     pub(super) fn table_live_sstables(
@@ -59,6 +79,37 @@ impl Db {
         live.iter()
             .filter(|sstable| sstable.meta.table_id == table_id)
             .cloned()
+            .collect()
+    }
+
+    pub(super) fn table_live_sstables_by_shard(
+        table_id: TableId,
+        live: &[ResidentRowSstable],
+    ) -> BTreeMap<crate::PhysicalShardId, Vec<ResidentRowSstable>> {
+        let mut grouped = BTreeMap::new();
+        for sstable in live
+            .iter()
+            .filter(|sstable| sstable.meta.table_id == table_id)
+        {
+            grouped
+                .entry(sstable.meta.physical_shard())
+                .or_insert_with(Vec::new)
+                .push(sstable.clone());
+        }
+        grouped
+    }
+
+    pub(super) fn table_compaction_states_by_shard(
+        table: &StoredTable,
+        live: &[ResidentRowSstable],
+    ) -> Vec<TableCompactionState> {
+        Self::table_live_sstables_by_shard(table.id, live)
+            .into_values()
+            .map(|shard_live| match table.config.compaction_strategy {
+                CompactionStrategy::Leveled => Self::leveled_compaction_state(table, &shard_live),
+                CompactionStrategy::Tiered => Self::tiered_compaction_state(table, &shard_live),
+                CompactionStrategy::Fifo => Self::fifo_compaction_state(table, &shard_live),
+            })
             .collect()
     }
 
@@ -366,7 +417,11 @@ impl Db {
         let live = self.sstables_read().live.clone();
         let mut jobs = tables
             .values()
-            .filter_map(|table| Self::table_compaction_state(table, &live).next_job)
+            .flat_map(|table| {
+                Self::table_compaction_states_by_shard(table, &live)
+                    .into_iter()
+                    .filter_map(|state| state.next_job)
+            })
             .collect::<Vec<_>>();
         jobs.sort_by(|left, right| {
             (
@@ -1058,6 +1113,70 @@ impl Db {
         (row.key.len() + row.value.as_ref().map(value_size_bytes).unwrap_or_default() + 32) as u64
     }
 
+    pub(super) fn shard_ownership_for_compaction_inputs(
+        table: &StoredTable,
+        inputs: &[ResidentRowSstable],
+    ) -> Result<crate::ShardSstableOwnership, StorageError> {
+        let first = inputs.first().ok_or_else(|| {
+            StorageError::unsupported(format!(
+                "cannot derive shard ownership for empty compaction input on table {}",
+                table.config.name
+            ))
+        })?;
+        let first_ownership = if table.config.sharding.is_sharded() {
+            first.meta.shard_ownership.clone().ok_or_else(|| {
+                StorageError::corruption(format!(
+                    "compaction input {} for sharded table {} is missing shard ownership",
+                    first.meta.storage_descriptor(),
+                    table.config.name
+                ))
+            })?
+        } else {
+            first.meta.shard_ownership()
+        };
+        let mut partitions = Vec::new();
+        for input in inputs {
+            let ownership = if table.config.sharding.is_sharded() {
+                input.meta.shard_ownership.clone().ok_or_else(|| {
+                    StorageError::corruption(format!(
+                        "compaction input {} for sharded table {} is missing shard ownership",
+                        input.meta.storage_descriptor(),
+                        table.config.name
+                    ))
+                })?
+            } else {
+                input.meta.shard_ownership()
+            };
+            if ownership.physical_shard != first_ownership.physical_shard {
+                return Err(StorageError::corruption(format!(
+                    "compaction output for table {} mixes physical shards {} and {}",
+                    table.config.name, first_ownership.physical_shard, ownership.physical_shard
+                )));
+            }
+            if ownership.shard_map_revision != first_ownership.shard_map_revision {
+                return Err(StorageError::corruption(format!(
+                    "compaction output for table {} mixes shard-map revisions {} and {}",
+                    table.config.name,
+                    first_ownership.shard_map_revision.get(),
+                    ownership.shard_map_revision.get()
+                )));
+            }
+            for range in &ownership.virtual_partitions.ranges {
+                for partition in range.start.get()..=range.end_inclusive.get() {
+                    partitions.push(crate::VirtualPartitionId::new(partition));
+                }
+            }
+        }
+
+        Ok(crate::ShardSstableOwnership::new(
+            table.id,
+            first_ownership.physical_shard,
+            first_ownership.shard_map_revision,
+            crate::VirtualPartitionCoverage::from_partitions(partitions)
+                .map_err(|error| StorageError::corruption(error.to_string()))?,
+        ))
+    }
+
     pub(super) fn retain_rows_within_horizon(
         rows: Vec<CompactionRow>,
         horizon: Option<SequenceNumber>,
@@ -1334,28 +1453,39 @@ impl Db {
                 "SST-{:06}",
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
-            let path = Self::local_sstable_path(local_root, table.id, &local_id);
+            let output_rows = rows[start..end].to_vec();
+            let shard_ownership = Self::shard_ownership_for_compaction_inputs(table, inputs)?;
+            let path = Self::local_sstable_path_in_shard(
+                local_root,
+                table.id,
+                shard_ownership.physical_shard,
+                &local_id,
+            );
             let output = match table.config.format {
                 TableFormat::Row => {
-                    self.write_row_sstable(
-                        &path,
-                        table.id,
+                    self.write_row_sstable(super::sstable_io::RowSstableWriteRequest {
+                        target: super::sstable_io::SstableWriteTarget::LocalPath(path),
+                        table_id: table.id,
                         level,
                         local_id,
-                        rows[start..end].to_vec(),
-                        table.config.bloom_filter_bits_per_key,
-                    )
+                        rows: output_rows,
+                        shard_ownership: Some(shard_ownership.clone()),
+                        bloom_filter_bits_per_key: table.config.bloom_filter_bits_per_key,
+                    })
                     .await?
                 }
                 TableFormat::Columnar => {
                     self.write_columnar_table_output(
-                        &path,
-                        level,
-                        local_id,
-                        table,
-                        rows[start..end].to_vec(),
-                        Some(applied_generation),
-                        inputs,
+                        super::sstable_io::ColumnarTableOutputRequest {
+                            target: super::sstable_io::SstableWriteTarget::LocalPath(path),
+                            level,
+                            local_id,
+                            stored: table,
+                            rows: output_rows,
+                            shard_ownership: Some(shard_ownership),
+                            applied_generation: Some(applied_generation),
+                            inputs,
+                        },
                     )
                     .await?
                 }

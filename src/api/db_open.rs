@@ -82,20 +82,22 @@ impl Db {
             let mut commit_runtime =
                 Self::open_commit_runtime(&config.storage, &dependencies).await?;
             if let CommitLogBackend::Memory(log) = &mut commit_runtime.backend {
-                log.durable_commit_log_segments =
-                    loaded_manifest.durable_commit_log_segments.clone();
-                log.next_segment_id = loaded_manifest
-                    .durable_commit_log_segments
-                    .iter()
-                    .map(|segment| segment.footer.segment_id.get())
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1)
-                    .max(1);
+                for segment in &loaded_manifest.durable_commit_log_segments {
+                    let shard = Self::parse_remote_commit_log_segment_location(&segment.object_key)
+                        .map(|(shard, _)| shard)
+                        .unwrap_or(crate::PhysicalShardId::UNSHARDED);
+                    let lane = log.lane_mut(shard);
+                    lane.durable_commit_log_segments.push(segment.clone());
+                    lane.next_segment_id = lane
+                        .next_segment_id
+                        .max(segment.footer.segment_id.get().saturating_add(1))
+                        .max(1);
+                }
             }
             let recovered_commit_log = commit_runtime
                 .recover_after(
                     loaded_manifest.last_flushed_sequence,
+                    &tables,
                     dependencies.clock.now(),
                 )
                 .await?;
@@ -710,14 +712,14 @@ impl Db {
         let backend = match storage {
             StorageConfig::Tiered(config) => {
                 let dir = Self::local_commit_log_dir(&config.ssd.path);
-                CommitLogBackend::Local(Box::new(
-                    SegmentManager::open(
+                CommitLogBackend::Local(
+                    ShardLocalSegmentManagers::open(
                         dependencies.file_system.clone(),
                         dir,
                         SegmentOptions::default(),
                     )
                     .await?,
-                ))
+                )
             }
             StorageConfig::S3Primary(_) => CommitLogBackend::Memory(MemoryCommitLog::new()),
         };
@@ -941,6 +943,20 @@ impl Db {
         Self::join_fs_path(root, LOCAL_COMMIT_LOG_RELATIVE_DIR)
     }
 
+    pub(super) fn local_commit_log_dir_in_shard(
+        root: &str,
+        shard: crate::PhysicalShardId,
+    ) -> String {
+        if shard == crate::PhysicalShardId::UNSHARDED {
+            return Self::local_commit_log_dir(root);
+        }
+
+        Self::join_fs_path(
+            root,
+            &format!("{LOCAL_COMMIT_LOG_RELATIVE_DIR}/{}", shard.as_dir_name()),
+        )
+    }
+
     pub(super) fn manifest_filename(generation: ManifestId) -> String {
         format!("MANIFEST-{:06}", generation.get())
     }
@@ -952,15 +968,6 @@ impl Db {
                 "{LOCAL_MANIFEST_DIR_RELATIVE_PATH}/{}",
                 Self::manifest_filename(generation)
             ),
-        )
-    }
-
-    pub(super) fn local_sstable_path(root: &str, table_id: TableId, local_id: &str) -> String {
-        Self::local_sstable_path_in_shard(
-            root,
-            table_id,
-            crate::PhysicalShardId::UNSHARDED,
-            local_id,
         )
     }
 
@@ -999,6 +1006,16 @@ impl Db {
         local_id.strip_prefix("SST-")?.parse::<u64>().ok()
     }
 
+    pub(super) fn parse_sstable_shard(
+        table_id: TableId,
+        location: &str,
+    ) -> Option<crate::PhysicalShardId> {
+        let needle = format!("table-{:06}/", table_id.get());
+        let relative = location.split(&needle).nth(1)?;
+        let shard = relative.split('/').next()?;
+        shard.parse::<u32>().ok().map(crate::PhysicalShardId::new)
+    }
+
     pub(super) fn parse_segment_id(path: &str) -> Option<SegmentId> {
         let path_buf = PathBuf::from(path);
         let file_name = path_buf.file_name()?.to_str()?;
@@ -1009,14 +1026,13 @@ impl Db {
         suffix.parse::<u64>().ok().map(SegmentId::new)
     }
 
-    pub(super) fn local_commit_log_segment_path(root: &str, segment_id: SegmentId) -> String {
-        Self::join_fs_path(
-            root,
-            &format!(
-                "{LOCAL_COMMIT_LOG_RELATIVE_DIR}/SEG-{:06}",
-                segment_id.get()
-            ),
-        )
+    pub(super) fn local_commit_log_segment_path_in_shard(
+        root: &str,
+        shard: crate::PhysicalShardId,
+        segment_id: SegmentId,
+    ) -> String {
+        let dir = Self::local_commit_log_dir_in_shard(root, shard);
+        Self::join_fs_path(&dir, &format!("SEG-{:06}", segment_id.get()))
     }
 
     pub(super) fn backup_restore_marker_path(root: &str) -> String {
@@ -1547,24 +1563,12 @@ impl Db {
         Self::remote_object_layout(config).control_manifest_latest()
     }
 
-    pub(super) fn remote_commit_log_segment_key(
+    pub(super) fn remote_commit_log_segment_key_in_shard(
         config: &S3PrimaryStorageConfig,
+        shard: crate::PhysicalShardId,
         segment_id: crate::SegmentId,
     ) -> String {
-        Self::remote_object_layout(config).backup_commit_log_segment(segment_id)
-    }
-
-    pub(super) fn remote_sstable_key(
-        config: &S3PrimaryStorageConfig,
-        table_id: TableId,
-        local_id: &str,
-    ) -> String {
-        Self::remote_sstable_key_in_shard(
-            config,
-            table_id,
-            crate::PhysicalShardId::UNSHARDED,
-            local_id,
-        )
+        Self::remote_object_layout(config).backup_commit_log_segment_in_shard(shard, segment_id)
     }
 
     pub(super) fn remote_sstable_key_in_shard(
@@ -1574,6 +1578,21 @@ impl Db {
         local_id: &str,
     ) -> String {
         Self::remote_object_layout(config).backup_sstable_in_shard(table_id, shard, local_id)
+    }
+
+    pub(super) fn parse_remote_commit_log_segment_location(
+        key: &str,
+    ) -> Option<(crate::PhysicalShardId, SegmentId)> {
+        let segment_id = Self::parse_segment_id(key)?;
+        let prefix = "/backup/commitlog/";
+        let relative = key.split(prefix).nth(1)?;
+        if relative.starts_with("SEG-") {
+            return Some((crate::PhysicalShardId::UNSHARDED, segment_id));
+        }
+
+        let shard = relative.split('/').next()?;
+        let shard = shard.parse::<u32>().ok().map(crate::PhysicalShardId::new)?;
+        Some((shard, segment_id))
     }
 
     pub(super) async fn load_remote_manifest(
@@ -1924,8 +1943,26 @@ impl Db {
                         sstable.local_id
                     )))
                 })?;
+                let shard = sstable
+                    .shard_ownership
+                    .as_ref()
+                    .map(|ownership| ownership.physical_shard)
+                    .or_else(|| Self::parse_sstable_shard(sstable.table_id, remote_key))
+                    .or_else(|| {
+                        (!sstable.file_path.is_empty())
+                            .then(|| {
+                                Self::parse_sstable_shard(sstable.table_id, &sstable.file_path)
+                            })
+                            .flatten()
+                    })
+                    .unwrap_or(crate::PhysicalShardId::UNSHARDED);
                 let local_path = if sstable.file_path.is_empty() {
-                    Self::local_sstable_path(root, sstable.table_id, &sstable.local_id)
+                    Self::local_sstable_path_in_shard(
+                        root,
+                        sstable.table_id,
+                        shard,
+                        &sstable.local_id,
+                    )
                 } else {
                     sstable.file_path.clone()
                 };
@@ -1965,14 +2002,16 @@ impl Db {
         remote_commit_log_keys.sort();
         remote_commit_log_keys.dedup();
         for object_key in remote_commit_log_keys {
-            let Some(segment_id) = Self::parse_segment_id(&object_key) else {
+            let Some((shard, segment_id)) =
+                Self::parse_remote_commit_log_segment_location(&object_key)
+            else {
                 continue;
             };
             let bytes =
                 read_source(dependencies, &StorageSource::remote_object(object_key)).await?;
             write_local_file_atomic(
                 dependencies,
-                &Self::local_commit_log_segment_path(root, segment_id),
+                &Self::local_commit_log_segment_path_in_shard(root, shard, segment_id),
                 &bytes,
             )
             .await?;

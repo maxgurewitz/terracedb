@@ -1348,7 +1348,7 @@ impl Db {
                     flush_result?;
                 }
                 StorageConfig::S3Primary(config) => {
-                    let (immutables, buffered_records, mut durable_segments, next_segment_id) = {
+                    let (immutables, buffered_lanes) = {
                         let _commit_guard = self.inner.commit_lock.lock().await;
                         self.resolve_failed_provisional_tail_locked()
                             .await
@@ -1358,12 +1358,21 @@ impl Db {
                         commit_runtime.sync().await.map_err(FlushError::Storage)?;
                         let immutables = self.memtables_write().mark_queued_immutables_flushing();
                         match &mut commit_runtime.backend {
-                            CommitLogBackend::Memory(log) => (
-                                immutables,
-                                log.records.clone(),
-                                log.durable_commit_log_segments.clone(),
-                                log.next_segment_id,
-                            ),
+                            CommitLogBackend::Memory(log) => {
+                                let lanes = log
+                                    .lanes
+                                    .iter()
+                                    .map(|(&shard, lane)| {
+                                        (
+                                            shard,
+                                            lane.records.clone(),
+                                            lane.durable_commit_log_segments.clone(),
+                                            lane.next_segment_id,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                (immutables, lanes)
+                            }
                             CommitLogBackend::Local(_) => {
                                 return Err(FlushError::Storage(StorageError::unsupported(
                                     "s3-primary flush requires the memory commit-log backend",
@@ -1372,7 +1381,11 @@ impl Db {
                         }
                     };
 
-                    if immutables.is_empty() && buffered_records.is_empty() {
+                    if immutables.is_empty()
+                        && buffered_lanes
+                            .iter()
+                            .all(|(_, records, _, _)| records.is_empty())
+                    {
                         let status = build_status();
                         crate::set_span_attribute(
                             &span_for_attrs,
@@ -1386,25 +1399,45 @@ impl Db {
                             .await
                             .map_err(FlushError::Storage)?;
 
-                        if !buffered_records.is_empty() {
+                        let mut durable_segments_by_shard = buffered_lanes
+                            .iter()
+                            .map(|(shard, _, durable_segments, _)| {
+                                (*shard, durable_segments.clone())
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        for (shard, buffered_records, _durable_segments, next_segment_id) in
+                            &buffered_lanes
+                        {
+                            if buffered_records.is_empty() {
+                                continue;
+                            }
                             let (segment_bytes, footer) = encode_segment_bytes(
-                                crate::SegmentId::new(next_segment_id),
-                                &buffered_records,
+                                crate::SegmentId::new(*next_segment_id),
+                                buffered_records,
                                 SegmentOptions::default().records_per_block,
                             )
                             .map_err(FlushError::Storage)?;
-                            let object_key =
-                                Self::remote_commit_log_segment_key(config, footer.segment_id);
+                            let object_key = Self::remote_commit_log_segment_key_in_shard(
+                                config,
+                                *shard,
+                                footer.segment_id,
+                            );
                             self.inner
                                 .dependencies
                                 .object_store
                                 .put(&object_key, &segment_bytes)
                                 .await
                                 .map_err(FlushError::Storage)?;
-                            durable_segments
+                            let shard_segments =
+                                durable_segments_by_shard.entry(*shard).or_default();
+                            shard_segments
                                 .push(DurableRemoteCommitLogSegment { object_key, footer });
-                            durable_segments.sort_by_key(|segment| segment.footer.segment_id.get());
+                            shard_segments.sort_by_key(|segment| segment.footer.segment_id.get());
                         }
+                        let durable_segments = durable_segments_by_shard
+                            .values()
+                            .flat_map(|segments| segments.iter().cloned())
+                            .collect::<Vec<_>>();
 
                         let mut sstable_state = self.sstables_read().clone();
                         let mut new_live = sstable_state.live.clone();
@@ -1419,10 +1452,11 @@ impl Db {
                         }
                         Self::sort_live_sstables(&mut new_live);
 
-                        let flushed_through = buffered_records
-                            .last()
-                            .map(CommitRecord::sequence)
-                            .into_iter()
+                        let flushed_through = buffered_lanes
+                            .iter()
+                            .filter_map(|(_, buffered_records, _, _)| {
+                                buffered_records.last().map(CommitRecord::sequence)
+                            })
                             .chain(immutables.iter().map(|immutable| immutable.max_sequence))
                             .max()
                             .unwrap_or(sstable_state.last_flushed_sequence)
@@ -1442,11 +1476,25 @@ impl Db {
                             let mut commit_runtime = self.inner.commit_runtime.lock().await;
                             match &mut commit_runtime.backend {
                                 CommitLogBackend::Memory(log) => {
-                                    Arc::make_mut(&mut log.records)
-                                        .retain(|record| record.sequence() > flushed_through);
-                                    log.durable_commit_log_segments = durable_segments.clone();
-                                    if !buffered_records.is_empty() {
-                                        log.next_segment_id = next_segment_id.saturating_add(1);
+                                    for (
+                                        shard,
+                                        buffered_records,
+                                        _durable_segments,
+                                        next_segment_id,
+                                    ) in &buffered_lanes
+                                    {
+                                        let lane = log.lane_mut(*shard);
+                                        Arc::make_mut(&mut lane.records)
+                                            .retain(|record| record.sequence() > flushed_through);
+                                        lane.durable_commit_log_segments =
+                                            durable_segments_by_shard
+                                                .get(shard)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                        if !buffered_records.is_empty() {
+                                            lane.next_segment_id =
+                                                next_segment_id.saturating_add(1);
+                                        }
                                     }
                                 }
                                 CommitLogBackend::Local(_) => {
@@ -1607,15 +1655,15 @@ impl Db {
             change_feed_floor_sequence,
             change_feed_pins_commit_log_gc,
         ) = if let Some(table_id) = table.resolve_id() {
-            let table_watermark = self.table_change_feed_watermark(table_id);
+            let shard_watermarks = self.table_change_feed_flushed_shard_watermarks(table_id);
             let runtime = self.inner.commit_runtime.lock().await;
             let logical_floor = self.cdc_retention_floor_sequence(table_id, current_sequence);
             let floor = self.change_feed_floor_from_state(
                 table_id,
                 current_sequence,
                 runtime.oldest_sequence_for_table(table_id),
-                runtime.oldest_segment_id(),
-                table_watermark,
+                &runtime.shard_retention_states_for_table(table_id),
+                &shard_watermarks,
             );
             let pins =
                 logical_floor
@@ -2481,6 +2529,9 @@ impl Db {
                     key: operation.key.clone(),
                     value: operation.value.clone(),
                     operation_context: operation_context.clone(),
+                    physical_shard: Some(operation.physical_shard),
+                    virtual_partition: Some(operation.virtual_partition),
+                    shard_map_revision: Some(operation.shard_map_revision),
                 })
             })
             .collect::<Result<Vec<_>, CommitError>>()?;
@@ -2927,7 +2978,7 @@ impl Db {
             if cursor.sequence() > upper_bound || matches!(opts.limit, Some(0)) {
                 return Ok(Box::pin(stream::empty()) as ChangeStream);
             }
-            let table_watermark = self.table_change_feed_watermark(table_id);
+            let shard_watermarks = self.table_change_feed_flushed_shard_watermarks(table_id);
 
             let table_handle = Table {
                 db: self.clone(),
@@ -2940,8 +2991,8 @@ impl Db {
                     table_id,
                     upper_bound,
                     runtime.oldest_sequence_for_table(table_id),
-                    runtime.oldest_segment_id(),
-                    table_watermark,
+                    &runtime.shard_retention_states_for_table(table_id),
+                    &shard_watermarks,
                 );
                 if let Some(oldest_available) = floor
                     && cursor.sequence() < oldest_available
@@ -3093,6 +3144,12 @@ impl Db {
                     let stored = self.resolve_stored_table(table).ok_or_else(|| {
                         CommitError::Storage(Self::missing_table_error(table.name()))
                     })?;
+                    let route = stored.config.sharding.route_key(key).map_err(|error| {
+                        CommitError::Storage(StorageError::unsupported(format!(
+                            "invalid sharding config for table {}: {error}",
+                            table.name()
+                        )))
+                    })?;
                     let value = Self::normalize_value_for_table(&stored, value)
                         .map_err(CommitError::Storage)?;
                     Ok(ResolvedBatchOperation {
@@ -3101,11 +3158,20 @@ impl Db {
                         key: key.clone(),
                         kind: ChangeKind::Put,
                         value: Some(value),
+                        physical_shard: route.physical_shard,
+                        virtual_partition: route.virtual_partition,
+                        shard_map_revision: route.shard_map_revision,
                     })
                 }
                 BatchOperation::Merge { table, key, value } => {
                     let stored = self.resolve_stored_table(table).ok_or_else(|| {
                         CommitError::Storage(Self::missing_table_error(table.name()))
+                    })?;
+                    let route = stored.config.sharding.route_key(key).map_err(|error| {
+                        CommitError::Storage(StorageError::unsupported(format!(
+                            "invalid sharding config for table {}: {error}",
+                            table.name()
+                        )))
                     })?;
                     if stored.config.merge_operator.is_none() {
                         return Err(CommitError::Storage(StorageError::unsupported(format!(
@@ -3121,11 +3187,20 @@ impl Db {
                         key: key.clone(),
                         kind: ChangeKind::Merge,
                         value: Some(value),
+                        physical_shard: route.physical_shard,
+                        virtual_partition: route.virtual_partition,
+                        shard_map_revision: route.shard_map_revision,
                     })
                 }
                 BatchOperation::Delete { table, key } => {
                     let stored = self.resolve_stored_table(table).ok_or_else(|| {
                         CommitError::Storage(Self::missing_table_error(table.name()))
+                    })?;
+                    let route = stored.config.sharding.route_key(key).map_err(|error| {
+                        CommitError::Storage(StorageError::unsupported(format!(
+                            "invalid sharding config for table {}: {error}",
+                            table.name()
+                        )))
                     })?;
                     Ok(ResolvedBatchOperation {
                         table_id: stored.id,
@@ -3133,6 +3208,9 @@ impl Db {
                         key: key.clone(),
                         kind: ChangeKind::Delete,
                         value: None,
+                        physical_shard: route.physical_shard,
+                        virtual_partition: route.virtual_partition,
+                        shard_map_revision: route.shard_map_revision,
                     })
                 }
             })
@@ -3453,13 +3531,20 @@ impl Db {
         key: &[u8],
         collapse: MergeCollapse,
     ) {
-        self.memtables_write().force_collapse(
-            table_id,
-            key.to_vec(),
-            collapse.sequence,
-            collapse.value,
-            self.inner.dependencies.clock.now(),
-        );
+        let route = Self::stored_table_by_id(&self.tables_read(), table_id)
+            .and_then(|table| table.config.sharding.route_key(key).ok());
+        let Some(route) = route else {
+            return;
+        };
+        self.memtables_write()
+            .force_collapse(super::memtable::CollapsedWrite {
+                table_id,
+                route,
+                key: key.to_vec(),
+                sequence: collapse.sequence,
+                value: collapse.value,
+                now: self.inner.dependencies.clock.now(),
+            });
     }
 
     pub(super) fn scan_visible_row_with_state(
@@ -4705,31 +4790,17 @@ impl Db {
             .min()
     }
 
-    pub(super) fn table_change_feed_watermark(&self, table_id: TableId) -> Option<SequenceNumber> {
-        let mut watermark = None;
-
-        if let Some(sequence) = self
-            .memtables_read()
-            .table_watermarks()
-            .get(&table_id)
-            .copied()
-        {
-            watermark = Some(sequence);
-        }
-        if let Some(sequence) = self
-            .sstables_read()
-            .table_watermarks()
-            .get(&table_id)
-            .copied()
-        {
-            watermark = Some(
-                watermark
-                    .map(|current| current.max(sequence))
-                    .unwrap_or(sequence),
-            );
-        }
-
-        watermark
+    pub(super) fn table_change_feed_flushed_shard_watermarks(
+        &self,
+        table_id: TableId,
+    ) -> BTreeMap<crate::PhysicalShardId, SequenceNumber> {
+        self.sstables_read()
+            .table_shard_watermarks()
+            .into_iter()
+            .filter_map(|((candidate_table_id, physical_shard), sequence)| {
+                (candidate_table_id == table_id).then_some((physical_shard, sequence))
+            })
+            .collect()
     }
 
     pub(super) fn change_feed_floor_from_state(
@@ -4737,16 +4808,38 @@ impl Db {
         table_id: TableId,
         upper_bound: SequenceNumber,
         physical_oldest: Option<SequenceNumber>,
-        oldest_segment_id: Option<SegmentId>,
-        table_watermark: Option<SequenceNumber>,
+        shard_retention: &BTreeMap<crate::PhysicalShardId, ChangeFeedShardRetentionState>,
+        shard_watermarks: &BTreeMap<crate::PhysicalShardId, SequenceNumber>,
     ) -> Option<SequenceNumber> {
         let mut floor = self
             .cdc_retention_floor_sequence(table_id, upper_bound)
             .filter(|logical| physical_oldest.is_some_and(|oldest| oldest < *logical));
 
-        if oldest_segment_id.is_some_and(|segment_id| segment_id.get() > 1)
-            && let Some(physical_floor) = physical_oldest.or(table_watermark)
-        {
+        let mut physical_floor = None;
+        let mut shards = shard_watermarks.keys().copied().collect::<BTreeSet<_>>();
+        shards.extend(shard_retention.keys().copied());
+        for shard in shards {
+            let shard_floor = match (
+                shard_retention.get(&shard).copied(),
+                shard_watermarks.get(&shard).copied(),
+            ) {
+                (Some(state), Some(_))
+                    if state.oldest_segment_id.get() > 1 && state.oldest_sequence.get() > 1 =>
+                {
+                    Some(state.oldest_sequence)
+                }
+                (None, Some(watermark)) => Some(watermark),
+                _ => None,
+            };
+            if let Some(shard_floor) = shard_floor {
+                physical_floor = Some(
+                    physical_floor
+                        .map(|current: SequenceNumber| current.max(shard_floor))
+                        .unwrap_or(shard_floor),
+                );
+            }
+        }
+        if let Some(physical_floor) = physical_floor {
             floor = Some(
                 floor
                     .map(|current| current.max(physical_floor))

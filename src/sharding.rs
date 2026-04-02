@@ -524,6 +524,46 @@ impl VirtualPartitionCoverage {
         }
     }
 
+    pub fn from_partitions(
+        partitions: impl IntoIterator<Item = VirtualPartitionId>,
+    ) -> Result<Self, ShardingError> {
+        let mut partitions = partitions
+            .into_iter()
+            .map(VirtualPartitionId::get)
+            .collect::<Vec<_>>();
+        if partitions.is_empty() {
+            return Err(ShardingError::ZeroVirtualPartitions);
+        }
+
+        partitions.sort_unstable();
+        partitions.dedup();
+
+        let mut ranges = Vec::new();
+        let mut start = partitions[0];
+        let mut end = partitions[0];
+
+        for partition in partitions.into_iter().skip(1) {
+            if partition == end.saturating_add(1) {
+                end = partition;
+                continue;
+            }
+
+            ranges.push(VirtualPartitionRange::new(
+                VirtualPartitionId::new(start),
+                VirtualPartitionId::new(end),
+            ));
+            start = partition;
+            end = partition;
+        }
+
+        ranges.push(VirtualPartitionRange::new(
+            VirtualPartitionId::new(start),
+            VirtualPartitionId::new(end),
+        ));
+
+        Ok(Self { ranges })
+    }
+
     pub fn full_table(config: &ShardingConfig) -> Self {
         let last = config.virtual_partition_count().saturating_sub(1);
         Self {

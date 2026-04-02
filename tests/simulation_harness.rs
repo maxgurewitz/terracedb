@@ -9,22 +9,23 @@ use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use rstest::rstest;
 use terracedb::{
-    CacheSpan, Clock, ColocatedDatabasePlacement, ColocatedDeployment, ColocatedSubsystemPlacement,
-    CommitOptions, CompactionStrategy, ContentionClass, DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db,
-    DbComponents, DbConfig, DbProgressSnapshot, DbProgressSubscription, DbSettings,
-    DomainBackgroundBudget, DomainBudgetCharge, DomainBudgetOracle, DomainCpuBudget,
-    DomainIoBudget, DomainMemoryBudget, DurabilityClass, ExecutionDomainBacklogSnapshot,
-    ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath, ExecutionDomainPlacement,
-    ExecutionDomainSpec, ExecutionLane, ExecutionLaneBinding, ExecutionLanePlacementConfig,
-    ExecutionResourceUsage, FieldDefinition, FieldId, FieldType, FieldValue, FileSystem,
-    FileSystemFailure, FileSystemOperation, InMemoryDomainBudgetOracle, LogCursor, ManifestId,
-    ObjectKeyLayout, ObjectStore, ObjectStoreOperation, OpenError, PendingWork, PendingWorkType,
-    RemoteCache, RemoteCacheFetchKind, RemoteRecoveryHint, ResourceManager, RoundRobinScheduler,
-    S3Location, S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
-    SchemaDefinition, SegmentId, SequenceNumber, SsdConfig, StorageConfig, StorageErrorKind,
-    StorageSource, StubRng, TableConfig, TableFormat, TableStats, ThrottleDecision,
-    TieredDurabilityMode, TieredStorageConfig, Transaction, UnifiedStorage, Value,
-    WorkPlacementRequest,
+    CacheSpan, ChangeFeedError, Clock, ColocatedDatabasePlacement, ColocatedDeployment,
+    ColocatedSubsystemPlacement, CommitOptions, CompactionStrategy, ContentionClass,
+    DEFAULT_WRITE_STALL_L0_SSTABLE_COUNT, Db, DbComponents, DbConfig, DbProgressSnapshot,
+    DbProgressSubscription, DbSettings, DomainBackgroundBudget, DomainBudgetCharge,
+    DomainBudgetOracle, DomainCpuBudget, DomainIoBudget, DomainMemoryBudget, DurabilityClass,
+    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainOwner,
+    ExecutionDomainPath, ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionLane,
+    ExecutionLaneBinding, ExecutionLanePlacementConfig, ExecutionResourceUsage, FieldDefinition,
+    FieldId, FieldType, FieldValue, FileSystem, FileSystemFailure, FileSystemOperation,
+    InMemoryDomainBudgetOracle, LogCursor, ManifestId, ObjectKeyLayout, ObjectStore,
+    ObjectStoreOperation, OpenError, PendingWork, PendingWorkType, PhysicalShardId, RemoteCache,
+    RemoteCacheFetchKind, RemoteRecoveryHint, ResourceManager, RoundRobinScheduler, S3Location,
+    S3PrimaryStorageConfig, ScanOptions, ScheduleAction, ScheduleDecision, Scheduler,
+    SchemaDefinition, SegmentId, SequenceNumber, ShardHashAlgorithm, ShardMapRevision,
+    ShardingConfig, SsdConfig, StorageConfig, StorageErrorKind, StorageSource, StubRng,
+    TableConfig, TableFormat, TableStats, ThrottleDecision, TieredDurabilityMode,
+    TieredStorageConfig, Transaction, UnifiedStorage, Value, WorkPlacementRequest,
 };
 use terracedb_fuzz::{
     DbScenarioHarness, GeneratedScenarioHarness, SeedCampaign, assert_seed_replays,
@@ -49,11 +50,51 @@ fn bytes(payload: &str) -> Value {
     Value::Bytes(payload.as_bytes().to_vec())
 }
 
+fn sharded_row_spec(name: &str) -> SimulationTableSpec {
+    let mut spec = SimulationTableSpec::row(name);
+    spec.sharding = ShardingConfig::hash(
+        4,
+        ShardHashAlgorithm::Crc32,
+        ShardMapRevision::new(7),
+        vec![
+            PhysicalShardId::new(0),
+            PhysicalShardId::new(0),
+            PhysicalShardId::new(1),
+            PhysicalShardId::new(1),
+        ],
+    )
+    .expect("valid sharding config");
+    spec
+}
+
+fn find_key_for_shard(config: &ShardingConfig, target: PhysicalShardId, prefix: &str) -> Vec<u8> {
+    for suffix in 0_u64..10_000 {
+        let key = format!("{prefix}-{suffix}").into_bytes();
+        let route = config.route_key(&key).expect("route test key");
+        if route.physical_shard == target {
+            return key;
+        }
+    }
+    panic!("failed to find key for physical shard {target}");
+}
+
 fn assert_change_feed_storage_kind(
     error: terracedb::StorageError,
     expected_kind: StorageErrorKind,
 ) {
     assert_eq!(error.kind(), expected_kind);
+}
+
+fn assert_change_feed_snapshot_too_old(
+    error: ChangeFeedError,
+    requested: SequenceNumber,
+    oldest_available: SequenceNumber,
+) {
+    let snapshot_too_old = error
+        .snapshot_too_old()
+        .expect("expected SnapshotTooOld change-feed error");
+    assert_eq!(snapshot_too_old.requested, requested);
+    assert_eq!(snapshot_too_old.oldest_available, oldest_available);
 }
 
 #[derive(Clone)]
@@ -2797,6 +2838,67 @@ fn db_change_feed_simulation_resumes_from_cursor_after_restart() -> turmoil::Res
 }
 
 #[test]
+fn sharded_change_feed_simulation_surfaces_snapshot_too_old_after_shard_local_gc() -> turmoil::Result
+{
+    let events_spec = sharded_row_spec("events");
+
+    SeededSimulationRunner::new(0xcdc6).run_with(move |context| {
+        let events_spec = events_spec.clone();
+
+        async move {
+            let config = simulation_tiered_config(
+                "/terracedb/sim/cdc-sharded-gap-floor",
+                TieredDurabilityMode::GroupCommit,
+            );
+            let db = context.open_db(config.clone()).await?;
+            let events = db.create_table(events_spec.table_config()).await?;
+            let shard_zero_key =
+                find_key_for_shard(&events_spec.sharding, PhysicalShardId::new(0), "user");
+            let shard_one_key =
+                find_key_for_shard(&events_spec.sharding, PhysicalShardId::new(1), "user");
+
+            let first = events.write(shard_one_key.clone(), bytes("v1")).await?;
+            let second = events.write(shard_zero_key.clone(), bytes("v2")).await?;
+            let third = events.write(shard_one_key, bytes("v3")).await?;
+
+            let visible = collect_change_feed(
+                db.scan_since(&events, LogCursor::beginning(), ScanOptions::default())
+                    .await?,
+            )
+            .await;
+            assert_eq!(collected_sequences(&visible), vec![first, second, third]);
+
+            db.flush().await?;
+
+            let beginning = LogCursor::beginning();
+            assert_change_feed_snapshot_too_old(
+                db.scan_durable_since(&events, beginning, ScanOptions::default())
+                    .await
+                    .err()
+                    .expect("shard-local durable history should advance the floor after flush"),
+                beginning.sequence(),
+                second,
+            );
+
+            let reopened = context.restart_db(config, CutPoint::AfterStep).await?;
+            let reopened_events = reopened.table("events");
+            let reopened_beginning = LogCursor::beginning();
+            assert_change_feed_snapshot_too_old(
+                reopened
+                    .scan_since(&reopened_events, reopened_beginning, ScanOptions::default())
+                    .await
+                    .err()
+                    .expect("reopened shard-local visible history should preserve the floor"),
+                reopened_beginning.sequence(),
+                second,
+            );
+
+            Ok(())
+        }
+    })
+}
+
+#[test]
 fn db_change_feed_simulation_surfaces_snapshot_too_old_for_lagging_tables_after_restart()
 -> turmoil::Result {
     let mut slow_spec = SimulationTableSpec::row("slow");
@@ -2941,7 +3043,10 @@ fn s3_primary_change_feed_simulation_surfaces_structured_remote_scan_failures() 
             .object_store()
             .inject_failure(ObjectStoreFaultSpec::Timeout {
                 operation: ObjectStoreOperation::Get,
-                target_prefix: layout.backup_commit_log_segment(SegmentId::new(1)),
+                target_prefix: layout.backup_commit_log_segment_in_shard(
+                    PhysicalShardId::UNSHARDED,
+                    SegmentId::new(1),
+                ),
             })
             .await?;
 
@@ -2961,7 +3066,10 @@ fn s3_primary_change_feed_simulation_surfaces_structured_remote_scan_failures() 
             .object_store()
             .inject_failure(ObjectStoreFaultSpec::Timeout {
                 operation: ObjectStoreOperation::Get,
-                target_prefix: layout.backup_commit_log_segment(SegmentId::new(1)),
+                target_prefix: layout.backup_commit_log_segment_in_shard(
+                    PhysicalShardId::UNSHARDED,
+                    SegmentId::new(1),
+                ),
             })
             .await?;
 

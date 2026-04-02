@@ -23,8 +23,8 @@ use terracedb::{
     DeterministicRng, FileHandle, FileSystem, FileSystemFailure, FileSystemOperation, FlushError,
     Key, KvStream, LogCursor, MergeOperator, MergeOperatorRef, ObjectStore, ObjectStoreOperation,
     OpenError, OpenOptions, ReadError, Rng, S3Location, ScanOptions, SequenceNumber,
-    SimulatedFileSystem, SsdConfig, StorageConfig, StorageError, StorageErrorKind, Table,
-    TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp,
+    ShardingConfig, SimulatedFileSystem, SsdConfig, StorageConfig, StorageError, StorageErrorKind,
+    Table, TableConfig, TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp,
     TtlCompactionFilter, Value, WriteError, test_support::FailpointRegistry,
 };
 
@@ -1282,6 +1282,8 @@ pub struct SimulationTableSpec {
     pub max_merge_operand_chain_length: Option<u32>,
     pub history_retention_sequences: Option<u64>,
     pub compaction_strategy: CompactionStrategy,
+    #[serde(default)]
+    pub sharding: ShardingConfig,
 }
 
 impl SimulationTableSpec {
@@ -1294,6 +1296,7 @@ impl SimulationTableSpec {
             max_merge_operand_chain_length: None,
             history_retention_sequences: None,
             compaction_strategy: CompactionStrategy::Leveled,
+            sharding: ShardingConfig::default(),
         }
     }
 
@@ -1327,7 +1330,7 @@ impl SimulationTableSpec {
             history_retention_sequences: self.history_retention_sequences,
             compaction_strategy: self.compaction_strategy,
             schema: None,
-            sharding: Default::default(),
+            sharding: self.sharding.clone(),
             metadata: Default::default(),
         }
     }

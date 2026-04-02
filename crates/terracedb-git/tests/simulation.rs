@@ -11,13 +11,13 @@ use async_trait::async_trait;
 use serde_json::json;
 use terracedb::Clock;
 use terracedb_fuzz::{GeneratedScenarioHarness, assert_seed_replays, assert_seed_variation};
-use terracedb_git::{
-    DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutRequest,
-    GitDiscoverRequest, GitForkPolicy, GitObjectDatabase, GitOpenRequest, GitRepositoryImage,
-    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore, GitSubstrateError,
-    NeverCancel, VfsGitRepositoryImage,
-};
 use terracedb_git::worktree::GitWorktreeMaterializer;
+use terracedb_git::{
+    DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutRequest, GitDiscoverRequest,
+    GitForkPolicy, GitObjectDatabase, GitOpenRequest, GitRepositoryImage, GitRepositoryPolicy,
+    GitRepositoryProvenance, GitRepositoryStore, GitSubstrateError, NeverCancel,
+    VfsGitRepositoryImage,
+};
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, SnapshotOptions, Volume, VolumeConfig,
@@ -354,7 +354,9 @@ impl GitWorktreeMaterializer for SimulatedDelayMaterializer {
     }
 }
 
-fn run_checkout_cancellation_simulation(seed: u64) -> turmoil::Result<GitCheckoutCancellationCapture> {
+fn run_checkout_cancellation_simulation(
+    seed: u64,
+) -> turmoil::Result<GitCheckoutCancellationCapture> {
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(40))
         .run_with(move |context| async move {
@@ -382,12 +384,12 @@ fn run_checkout_cancellation_simulation(seed: u64) -> turmoil::Result<GitCheckou
                     .expect("git image"),
             );
             let delay_millis = (seed % 5) + 2;
-            let repo_store = DeterministicGitRepositoryStore::default().with_materializer(Arc::new(
-                SimulatedDelayMaterializer {
+            let repo_store = DeterministicGitRepositoryStore::default().with_materializer(
+                Arc::new(SimulatedDelayMaterializer {
                     clock: context.clock(),
                     delay: Duration::from_millis(delay_millis),
-                },
-            ));
+                }),
+            );
             let repo = repo_store
                 .open(
                     repo_image.clone(),
@@ -424,10 +426,12 @@ fn run_checkout_cancellation_simulation(seed: u64) -> turmoil::Result<GitCheckou
                 .expect("join checkout task")
                 .expect_err("checkout should be cancelled");
             match error {
-                GitSubstrateError::Cancelled { repository_id } => Ok(GitCheckoutCancellationCapture {
-                    delay_millis,
-                    cancelled_repository_id: repository_id,
-                }),
+                GitSubstrateError::Cancelled { repository_id } => {
+                    Ok(GitCheckoutCancellationCapture {
+                        delay_millis,
+                        cancelled_repository_id: repository_id,
+                    })
+                }
                 other => panic!("expected cancelled error, got {other:?}"),
             }
         })

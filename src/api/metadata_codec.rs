@@ -363,7 +363,7 @@ impl Db {
     pub(super) fn encode_manifest_sstable_flatbuffer<'fbb>(
         fbb: &mut flatbuffers::FlatBufferBuilder<'fbb>,
         sstable: &PersistedManifestSstable,
-    ) -> flatbuffers::WIPOffset<metadata_fb::ManifestSstable<'fbb>> {
+    ) -> Result<flatbuffers::WIPOffset<metadata_fb::ManifestSstable<'fbb>>, StorageError> {
         let local_id = fbb.create_string(&sstable.local_id);
         let file_path =
             (!sstable.file_path.is_empty()).then(|| fbb.create_string(&sstable.file_path));
@@ -373,7 +373,17 @@ impl Db {
             .map(|key| fbb.create_string(key));
         let min_key = fbb.create_vector(&sstable.min_key);
         let max_key = fbb.create_vector(&sstable.max_key);
-        metadata_fb::create_manifest_sstable(
+        let shard_ownership_json = match &sstable.shard_ownership {
+            Some(shard_ownership) => Some(fbb.create_vector(
+                &serde_json::to_vec(shard_ownership).map_err(|error| {
+                    StorageError::corruption(format!(
+                        "encode manifest shard ownership failed: {error}"
+                    ))
+                })?,
+            )),
+            None => None,
+        };
+        Ok(metadata_fb::create_manifest_sstable(
             fbb,
             metadata_fb::ManifestSstableCreateArgs {
                 table_id: sstable.table_id.get(),
@@ -390,14 +400,15 @@ impl Db {
                 max_sequence: sstable.max_sequence.get(),
                 has_schema_version: sstable.schema_version.is_some(),
                 schema_version: sstable.schema_version.unwrap_or_default(),
+                shard_ownership_json,
             },
-        )
+        ))
     }
 
     pub(super) fn decode_manifest_sstable_flatbuffer(
         sstable: metadata_fb::ManifestSstable<'_>,
-    ) -> PersistedManifestSstable {
-        PersistedManifestSstable {
+    ) -> Result<PersistedManifestSstable, StorageError> {
+        Ok(PersistedManifestSstable {
             table_id: TableId::new(sstable.table_id()),
             level: sstable.level(),
             local_id: sstable.local_id().to_string(),
@@ -413,7 +424,15 @@ impl Db {
             schema_version: sstable
                 .has_schema_version()
                 .then_some(sstable.schema_version()),
-        }
+            shard_ownership: match sstable.shard_ownership_json() {
+                Some(bytes) => Some(serde_json::from_slice(bytes.bytes()).map_err(|error| {
+                    StorageError::corruption(format!(
+                        "decode manifest shard ownership failed: {error}"
+                    ))
+                })?),
+                None => None,
+            },
+        })
     }
 
     pub(super) fn encode_catalog(
@@ -481,7 +500,7 @@ impl Db {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
         let mut sstable_offsets = Vec::with_capacity(body.sstables.len());
         for sstable in &body.sstables {
-            sstable_offsets.push(Self::encode_manifest_sstable_flatbuffer(&mut fbb, sstable));
+            sstable_offsets.push(Self::encode_manifest_sstable_flatbuffer(&mut fbb, sstable)?);
         }
         let sstables = fbb.create_vector(&sstable_offsets);
         let root = metadata_fb::create_manifest_body(
@@ -528,7 +547,7 @@ impl Db {
 
         let mut sstables = Vec::with_capacity(body.sstables().len());
         for sstable in body.sstables() {
-            sstables.push(Self::decode_manifest_sstable_flatbuffer(sstable));
+            sstables.push(Self::decode_manifest_sstable_flatbuffer(sstable)?);
         }
         Ok(PersistedManifestFile {
             body: PersistedManifestBody {
@@ -568,7 +587,7 @@ impl Db {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
         let mut sstable_offsets = Vec::with_capacity(body.sstables.len());
         for sstable in &body.sstables {
-            sstable_offsets.push(Self::encode_manifest_sstable_flatbuffer(&mut fbb, sstable));
+            sstable_offsets.push(Self::encode_manifest_sstable_flatbuffer(&mut fbb, sstable)?);
         }
         let mut segment_offsets = Vec::with_capacity(body.commit_log_segments.len());
         for segment in &body.commit_log_segments {
@@ -630,7 +649,7 @@ impl Db {
 
         let mut sstables = Vec::with_capacity(body.sstables().len());
         for sstable in body.sstables() {
-            sstables.push(Self::decode_manifest_sstable_flatbuffer(sstable));
+            sstables.push(Self::decode_manifest_sstable_flatbuffer(sstable)?);
         }
 
         let mut commit_log_segments = Vec::with_capacity(body.commit_log_segments().len());

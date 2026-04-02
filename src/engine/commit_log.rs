@@ -14,6 +14,7 @@ use crate::{
     error::{ChangeFeedError, CommitError, FlushError, StorageError},
     ids::{CommitId, FieldId, LogCursor, SegmentId, SequenceNumber, TableId},
     io::{FileHandle, FileSystem, OpenOptions},
+    sharding::{PhysicalShardId, ShardMapRevision, VirtualPartitionId},
     telemetry::OperationContext,
 };
 
@@ -21,7 +22,8 @@ const RECORD_MAGIC: [u8; 4] = *b"TDBR";
 const FOOTER_MAGIC: [u8; 8] = *b"TDBFTR1\0";
 const RECORD_HEADER_LEN: usize = 12;
 const FOOTER_TRAILER_LEN: usize = 16;
-const FORMAT_VERSION: u8 = 2;
+const RECORD_FORMAT_VERSION: u8 = 3;
+const FOOTER_FORMAT_VERSION: u8 = 2;
 const DEFAULT_SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_RECORDS_PER_BLOCK: u64 = 64;
 const FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -84,7 +86,7 @@ impl CommitRecord {
             .map_err(|_| StorageError::unsupported("commit record has more than 65535 entries"))?;
 
         let mut bytes = Vec::new();
-        push_u8(&mut bytes, FORMAT_VERSION);
+        push_u8(&mut bytes, RECORD_FORMAT_VERSION);
         bytes.extend_from_slice(&self.id.encode());
         push_u16(&mut bytes, entry_count);
         for entry in &self.entries {
@@ -96,7 +98,7 @@ impl CommitRecord {
     fn decode_payload(bytes: &[u8]) -> Result<Self, StorageError> {
         let mut cursor = ByteCursor::new(bytes);
         let version = cursor.read_u8()?;
-        if !matches!(version, 1 | FORMAT_VERSION) {
+        if version != RECORD_FORMAT_VERSION {
             return Err(StorageError::corruption(format!(
                 "unsupported commit record format version {version}"
             )));
@@ -109,7 +111,7 @@ impl CommitRecord {
 
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            entries.push(CommitEntry::decode(&mut cursor, version >= 2)?);
+            entries.push(CommitEntry::decode(&mut cursor)?);
         }
 
         if cursor.remaining() != 0 {
@@ -130,6 +132,9 @@ pub struct CommitEntry {
     pub key: Vec<u8>,
     pub value: Option<Value>,
     pub operation_context: Option<OperationContext>,
+    pub physical_shard: Option<PhysicalShardId>,
+    pub virtual_partition: Option<VirtualPartitionId>,
+    pub shard_map_revision: Option<ShardMapRevision>,
 }
 
 impl CommitEntry {
@@ -164,13 +169,23 @@ impl CommitEntry {
             _ => push_u8(bytes, 0),
         }
 
+        let physical_shard = self.physical_shard.ok_or_else(|| {
+            StorageError::corruption("commit entry is missing physical shard metadata")
+        })?;
+        let virtual_partition = self.virtual_partition.ok_or_else(|| {
+            StorageError::corruption("commit entry is missing virtual partition metadata")
+        })?;
+        let shard_map_revision = self.shard_map_revision.ok_or_else(|| {
+            StorageError::corruption("commit entry is missing shard-map revision metadata")
+        })?;
+        push_u32(bytes, physical_shard.get());
+        push_u32(bytes, virtual_partition.get());
+        push_u64(bytes, shard_map_revision.get());
+
         Ok(())
     }
 
-    fn decode(
-        cursor: &mut ByteCursor<'_>,
-        with_operation_context: bool,
-    ) -> Result<Self, StorageError> {
+    fn decode(cursor: &mut ByteCursor<'_>) -> Result<Self, StorageError> {
         let op_index = cursor.read_u16()?;
         let table_id = TableId::new(cursor.read_u32()?);
         let kind = decode_change_kind(cursor.read_u8()?)?;
@@ -182,22 +197,21 @@ impl CommitEntry {
             let value_bytes = cursor.read_exact(value_len as usize)?;
             Some(decode_value(value_bytes)?)
         };
-        let operation_context = if with_operation_context {
-            match cursor.read_u8()? {
-                0 => None,
-                1 => Some(OperationContext {
-                    traceparent: decode_optional_text(cursor)?,
-                    tracestate: decode_optional_text(cursor)?,
-                }),
-                flag => {
-                    return Err(StorageError::corruption(format!(
-                        "unsupported commit entry operation-context flag {flag}"
-                    )));
-                }
+        let operation_context = match cursor.read_u8()? {
+            0 => None,
+            1 => Some(OperationContext {
+                traceparent: decode_optional_text(cursor)?,
+                tracestate: decode_optional_text(cursor)?,
+            }),
+            flag => {
+                return Err(StorageError::corruption(format!(
+                    "unsupported commit entry operation-context flag {flag}"
+                )));
             }
-        } else {
-            None
         };
+        let physical_shard = Some(PhysicalShardId::new(cursor.read_u32()?));
+        let virtual_partition = Some(VirtualPartitionId::new(cursor.read_u32()?));
+        let shard_map_revision = Some(ShardMapRevision::new(cursor.read_u64()?));
 
         Ok(Self {
             op_index,
@@ -206,6 +220,9 @@ impl CommitEntry {
             key: key.to_vec(),
             value,
             operation_context,
+            physical_shard,
+            virtual_partition,
+            shard_map_revision,
         })
     }
 }
@@ -272,7 +289,7 @@ impl SegmentFooter {
             .map_err(|_| StorageError::unsupported("segment footer has too many blocks"))?;
 
         let mut bytes = Vec::new();
-        push_u8(&mut bytes, FORMAT_VERSION);
+        push_u8(&mut bytes, FOOTER_FORMAT_VERSION);
         push_u64(&mut bytes, self.segment_id.get());
         push_u64(&mut bytes, self.min_sequence.get());
         push_u64(&mut bytes, self.max_sequence.get());
@@ -297,7 +314,7 @@ impl SegmentFooter {
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let mut cursor = ByteCursor::new(bytes);
         let version = cursor.read_u8()?;
-        if version != FORMAT_VERSION {
+        if version != FOOTER_FORMAT_VERSION {
             return Err(StorageError::corruption(format!(
                 "unsupported segment footer format version {version}"
             )));
@@ -473,6 +490,12 @@ impl SegmentCatalog {
             .and_then(|spans| spans.first().map(|span| span.min_sequence))
     }
 
+    pub fn oldest_segment_id_for_table(&self, table_id: TableId) -> Option<SegmentId> {
+        self.table_index
+            .get(&table_id)
+            .and_then(|spans| spans.first().map(|span| span.segment_id))
+    }
+
     pub fn segment_ids_for_table_since(
         &self,
         table_id: TableId,
@@ -624,6 +647,16 @@ impl SegmentManager {
             .into_iter()
             .chain(self.active.oldest_sequence_for_table(table_id))
             .min()
+    }
+
+    pub fn oldest_segment_id_for_table(&self, table_id: TableId) -> Option<SegmentId> {
+        self.catalog
+            .oldest_segment_id_for_table(table_id)
+            .or_else(|| {
+                self.active
+                    .oldest_sequence_for_table(table_id)
+                    .map(|_| self.active.id)
+            })
     }
 
     pub fn seek_by_sequence(
@@ -1848,7 +1881,13 @@ async fn list_segment_paths(
     dir: &str,
 ) -> Result<Vec<(SegmentId, String)>, StorageError> {
     let mut paths = fs.list(dir).await?;
-    paths.retain(|path| parse_segment_id(path).is_some());
+    paths.retain(|path| {
+        parse_segment_id(path).is_some()
+            && std::path::Path::new(path)
+                .parent()
+                .and_then(|parent| parent.to_str())
+                == Some(dir)
+    });
     let mut segments = paths
         .into_iter()
         .filter_map(|path| parse_segment_id(&path).map(|segment_id| (segment_id, path)))
@@ -1994,14 +2033,13 @@ mod tests {
         api::FieldValue,
         error::StorageErrorKind,
         ids::SequenceNumber,
+        sharding::{PhysicalShardId, ShardMapRevision, VirtualPartitionId},
         telemetry::OperationContext,
     };
 
     use super::{
-        AppendLocation, BlockIndexEntry, CommitEntry, CommitRecord, RECORD_HEADER_LEN,
-        RECORD_MAGIC, SegmentFooter, SegmentManager, SegmentOptions, TableSegmentMeta, checksum32,
-        encode_change_kind, encode_value, parse_segment_footer, push_len, push_u8, push_u16,
-        push_u32, segment_path,
+        AppendLocation, BlockIndexEntry, CommitEntry, CommitRecord, SegmentFooter, SegmentManager,
+        SegmentOptions, TableSegmentMeta, checksum32, parse_segment_footer, segment_path,
     };
     use crate::api::{ChangeKind, Value};
     use crate::ids::{CommitId, FieldId, SegmentId, TableId};
@@ -2075,6 +2113,9 @@ mod tests {
                         key,
                         value,
                         operation_context: None,
+                        physical_shard: Some(PhysicalShardId::UNSHARDED),
+                        virtual_partition: Some(VirtualPartitionId::new(0)),
+                        shard_map_revision: Some(ShardMapRevision::default()),
                     })
                     .collect(),
             })
@@ -2095,6 +2136,9 @@ mod tests {
                     key: format!("user:{sequence}").into_bytes(),
                     value: Some(Value::Record(record_value)),
                     operation_context: None,
+                    physical_shard: Some(PhysicalShardId::UNSHARDED),
+                    virtual_partition: Some(VirtualPartitionId::new(0)),
+                    shard_map_revision: Some(ShardMapRevision::default()),
                 },
                 CommitEntry {
                     op_index: 1,
@@ -2103,6 +2147,9 @@ mod tests {
                     key: format!("audit:{sequence}").into_bytes(),
                     value: None,
                     operation_context: None,
+                    physical_shard: Some(PhysicalShardId::UNSHARDED),
+                    virtual_partition: Some(VirtualPartitionId::new(0)),
+                    shard_map_revision: Some(ShardMapRevision::default()),
                 },
                 CommitEntry {
                     op_index: 2,
@@ -2111,6 +2158,9 @@ mod tests {
                     key: format!("merge:{sequence}").into_bytes(),
                     value: Some(Value::Bytes(vec![sequence as u8, sequence as u8 + 1])),
                     operation_context: None,
+                    physical_shard: Some(PhysicalShardId::UNSHARDED),
+                    virtual_partition: Some(VirtualPartitionId::new(0)),
+                    shard_map_revision: Some(ShardMapRevision::default()),
                 },
             ],
         }
@@ -2175,50 +2225,6 @@ mod tests {
         }
     }
 
-    fn encode_v1_frame(record: &CommitRecord) -> Vec<u8> {
-        let mut payload = Vec::new();
-        push_u8(&mut payload, 1);
-        payload.extend_from_slice(&record.id.encode());
-        push_u16(
-            &mut payload,
-            u16::try_from(record.entries.len()).expect("entry count fits in u16"),
-        );
-        for entry in &record.entries {
-            assert!(
-                entry.operation_context.is_none(),
-                "legacy commit record fixtures do not include operation context"
-            );
-            push_u16(&mut payload, entry.op_index);
-            push_u32(&mut payload, entry.table_id.get());
-            push_u8(&mut payload, encode_change_kind(entry.kind));
-            push_len(&mut payload, entry.key.len()).expect("key length fits in u32");
-            payload.extend_from_slice(&entry.key);
-
-            match &entry.value {
-                Some(value) => {
-                    let mut encoded_value = Vec::new();
-                    encode_value(&mut encoded_value, value).expect("encode legacy value");
-                    push_u32(
-                        &mut payload,
-                        u32::try_from(encoded_value.len()).expect("value length fits in u32"),
-                    );
-                    payload.extend_from_slice(&encoded_value);
-                }
-                None => push_u32(&mut payload, u32::MAX),
-            }
-        }
-
-        let mut frame = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
-        frame.extend_from_slice(&RECORD_MAGIC);
-        frame.extend_from_slice(
-            &u32::try_from(payload.len())
-                .expect("legacy payload length fits in u32")
-                .to_be_bytes(),
-        );
-        frame.extend_from_slice(&checksum32(&payload).to_be_bytes());
-        frame.extend_from_slice(&payload);
-        frame
-    }
     async fn read_segment_bytes(fs: &dyn FileSystem, path: &str) -> Vec<u8> {
         let handle = fs
             .open(
@@ -2269,27 +2275,15 @@ mod tests {
 
     #[test]
     fn durable_format_fixtures_match_golden_files() {
-        let legacy_record = sample_record(5);
-        let legacy_frame = encode_v1_frame(&legacy_record);
-        let legacy_hex = crate::test_support::durable_format_hex(&legacy_frame);
-        assert_eq!(
-            CommitRecord::decode_frame(&legacy_frame).expect("decode v1 frame"),
-            legacy_record
-        );
-        crate::test_support::assert_durable_format_fixture(
-            "commit-record-v1.hex",
-            legacy_hex.as_bytes(),
-        );
-
         let current_record = sample_record_with_operation_context(7);
-        let current_frame = current_record.encode_frame().expect("encode v2 frame");
+        let current_frame = current_record.encode_frame().expect("encode v3 frame");
         let current_hex = crate::test_support::durable_format_hex(&current_frame);
         assert_eq!(
-            CommitRecord::decode_frame(&current_frame).expect("decode v2 frame"),
+            CommitRecord::decode_frame(&current_frame).expect("decode v3 frame"),
             current_record
         );
         crate::test_support::assert_durable_format_fixture(
-            "commit-record-v2.hex",
+            "commit-record-v3.hex",
             current_hex.as_bytes(),
         );
 

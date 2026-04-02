@@ -12,6 +12,55 @@ enum ColumnarOutputLayout {
     Wide,
 }
 
+#[derive(Debug)]
+pub(super) enum SstableWriteTarget {
+    LocalPath(String),
+    RemoteObject(String),
+}
+
+pub(super) struct RowSstableWriteRequest {
+    pub(super) target: SstableWriteTarget,
+    pub(super) table_id: TableId,
+    pub(super) level: u32,
+    pub(super) local_id: String,
+    pub(super) rows: Vec<SstableRow>,
+    pub(super) shard_ownership: Option<crate::ShardSstableOwnership>,
+    pub(super) bloom_filter_bits_per_key: Option<u32>,
+}
+
+pub(super) struct ColumnarTableOutputRequest<'a> {
+    pub(super) target: SstableWriteTarget,
+    pub(super) level: u32,
+    pub(super) local_id: String,
+    pub(super) stored: &'a StoredTable,
+    pub(super) rows: Vec<SstableRow>,
+    pub(super) shard_ownership: Option<crate::ShardSstableOwnership>,
+    pub(super) applied_generation: Option<ManifestId>,
+    pub(super) inputs: &'a [ResidentRowSstable],
+}
+
+pub(super) struct ColumnarSstableWriteRequest<'a> {
+    target: SstableWriteTarget,
+    level: u32,
+    local_id: String,
+    stored: &'a StoredTable,
+    rows: Vec<SstableRow>,
+    shard_ownership: Option<crate::ShardSstableOwnership>,
+    applied_generation: Option<ManifestId>,
+}
+
+pub(super) struct EncodedColumnarSstable<'a> {
+    table_id: TableId,
+    level: u32,
+    local_id: String,
+    schema: &'a SchemaDefinition,
+    rows: Vec<SstableRow>,
+    shard_ownership: Option<crate::ShardSstableOwnership>,
+    bloom_filter_bits_per_key: Option<u32>,
+    applied_generation: Option<ManifestId>,
+    optional_sidecars: Vec<PersistedOptionalSidecarDescriptor>,
+}
+
 impl ColumnarReadContext {
     pub(super) async fn trim_raw_byte_cache_to_budget(&self) -> Result<(), StorageError> {
         let Some(cache) = &self.remote_cache else {
@@ -1046,6 +1095,7 @@ impl Db {
             min_sequence: SequenceNumber::new(0),
             max_sequence: SequenceNumber::new(0),
             schema_version: Some(0),
+            shard_ownership: None,
         };
         let columnar_read_context = Self::ephemeral_columnar_read_context(dependencies);
         let footer = columnar_read_context
@@ -1077,6 +1127,15 @@ impl Db {
         {
             return Err(StorageError::corruption(format!(
                 "manifest metadata does not match SSTable {location}",
+            )));
+        }
+        if let (Some(manifest_ownership), Some(footer_ownership)) = (
+            meta.shard_ownership.as_ref(),
+            footer.shard_ownership.as_ref(),
+        ) && manifest_ownership != footer_ownership
+        {
+            return Err(StorageError::corruption(format!(
+                "manifest shard ownership does not match SSTable {location}",
             )));
         }
 
@@ -1264,8 +1323,15 @@ impl Db {
             manifest_generation,
         )?;
 
+        let mut resident_meta = meta.clone();
+        resident_meta.shard_ownership = footer
+            .footer
+            .shard_ownership
+            .clone()
+            .or_else(|| meta.shard_ownership.clone());
+
         Ok(ResidentRowSstable {
-            meta: meta.clone(),
+            meta: resident_meta,
             rows: Vec::new(),
             user_key_bloom_filter: footer.footer.user_key_bloom_filter.clone(),
             columnar: Some(ResidentColumnarSstable { source }),
@@ -1319,6 +1385,15 @@ impl Db {
                 "manifest metadata does not match SSTable {location}",
             )));
         }
+        if let (Some(manifest_ownership), Some(body_ownership)) = (
+            meta.shard_ownership.as_ref(),
+            file.body.shard_ownership.as_ref(),
+        ) && manifest_ownership != body_ownership
+        {
+            return Err(StorageError::corruption(format!(
+                "manifest shard ownership does not match SSTable {location}",
+            )));
+        }
 
         let computed = Self::summarize_sstable_rows(
             meta.table_id,
@@ -1336,8 +1411,15 @@ impl Db {
             )));
         }
 
+        let mut resident_meta = meta.clone();
+        resident_meta.shard_ownership = file
+            .body
+            .shard_ownership
+            .clone()
+            .or_else(|| meta.shard_ownership.clone());
+
         Ok(ResidentRowSstable {
-            meta: meta.clone(),
+            meta: resident_meta,
             rows: file.body.rows,
             user_key_bloom_filter: file.body.user_key_bloom_filter,
             columnar: None,
@@ -1540,8 +1622,14 @@ impl Db {
             )));
         }
 
+        let mut resident_meta = meta.clone();
+        resident_meta.shard_ownership = footer
+            .shard_ownership
+            .clone()
+            .or_else(|| meta.shard_ownership.clone());
+
         Ok(ResidentRowSstable {
-            meta: meta.clone(),
+            meta: resident_meta,
             rows,
             user_key_bloom_filter: footer.user_key_bloom_filter,
             columnar: Some(ResidentColumnarSstable {
@@ -2584,6 +2672,7 @@ impl Db {
             min_sequence,
             max_sequence,
             schema_version: None,
+            shard_ownership: None,
         })
     }
 
@@ -2596,10 +2685,11 @@ impl Db {
         let mut outputs = Vec::new();
         let tables = self.tables_read().clone();
 
-        for (&table_id, table_memtable) in &immutable.memtable.tables {
+        for (table_key, table_memtable) in &immutable.memtable.tables {
             if table_memtable.is_empty() {
                 continue;
             }
+            let table_id = table_key.table_id;
 
             let stored = tables
                 .values()
@@ -2611,6 +2701,9 @@ impl Db {
                         table_id.get()
                     )))
                 })?;
+            let shard_ownership = table_memtable
+                .shard_ownership(table_id, &stored.config.sharding)
+                .map_err(FlushError::Storage)?;
 
             let rows = table_memtable
                 .entries
@@ -2626,29 +2719,36 @@ impl Db {
                 "SST-{:06}",
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
-            let path = Self::local_sstable_path(local_root, table_id, &local_id);
+            let path = Self::local_sstable_path_in_shard(
+                local_root,
+                table_id,
+                shard_ownership.physical_shard,
+                &local_id,
+            );
             let output = match stored.config.format {
                 TableFormat::Row => {
-                    self.write_row_sstable(
-                        &path,
+                    self.write_row_sstable(RowSstableWriteRequest {
+                        target: SstableWriteTarget::LocalPath(path),
                         table_id,
-                        0,
+                        level: 0,
                         local_id,
                         rows,
-                        stored.config.bloom_filter_bits_per_key,
-                    )
+                        shard_ownership: Some(shard_ownership.clone()),
+                        bloom_filter_bits_per_key: stored.config.bloom_filter_bits_per_key,
+                    })
                     .await
                 }
                 TableFormat::Columnar => {
-                    self.write_columnar_table_output(
-                        &path,
-                        0,
+                    self.write_columnar_table_output(ColumnarTableOutputRequest {
+                        target: SstableWriteTarget::LocalPath(path),
+                        level: 0,
                         local_id,
-                        &stored,
+                        stored: &stored,
                         rows,
-                        Some(applied_generation),
-                        &[],
-                    )
+                        shard_ownership: Some(shard_ownership.clone()),
+                        applied_generation: Some(applied_generation),
+                        inputs: &[],
+                    })
                     .await
                 }
             }
@@ -2668,10 +2768,11 @@ impl Db {
         let mut outputs = Vec::new();
         let tables = self.tables_read().clone();
 
-        for (&table_id, table_memtable) in &immutable.memtable.tables {
+        for (table_key, table_memtable) in &immutable.memtable.tables {
             if table_memtable.is_empty() {
                 continue;
             }
+            let table_id = table_key.table_id;
 
             let stored = tables
                 .values()
@@ -2683,6 +2784,9 @@ impl Db {
                         table_id.get()
                     )))
                 })?;
+            let shard_ownership = table_memtable
+                .shard_ownership(table_id, &stored.config.sharding)
+                .map_err(FlushError::Storage)?;
 
             let rows = table_memtable
                 .entries
@@ -2698,29 +2802,36 @@ impl Db {
                 "SST-{:06}",
                 self.inner.next_sstable_id.fetch_add(1, Ordering::SeqCst)
             );
-            let object_key = Self::remote_sstable_key(config, table_id, &local_id);
+            let object_key = Self::remote_sstable_key_in_shard(
+                config,
+                table_id,
+                shard_ownership.physical_shard,
+                &local_id,
+            );
             let output = match stored.config.format {
                 TableFormat::Row => {
-                    self.write_row_sstable_remote(
-                        &object_key,
+                    self.write_row_sstable(RowSstableWriteRequest {
+                        target: SstableWriteTarget::RemoteObject(object_key),
                         table_id,
-                        0,
+                        level: 0,
                         local_id,
                         rows,
-                        stored.config.bloom_filter_bits_per_key,
-                    )
+                        shard_ownership: Some(shard_ownership.clone()),
+                        bloom_filter_bits_per_key: stored.config.bloom_filter_bits_per_key,
+                    })
                     .await
                 }
                 TableFormat::Columnar => {
-                    self.write_columnar_table_output_remote(
-                        &object_key,
-                        0,
+                    self.write_columnar_table_output(ColumnarTableOutputRequest {
+                        target: SstableWriteTarget::RemoteObject(object_key),
+                        level: 0,
                         local_id,
-                        &stored,
+                        stored: &stored,
                         rows,
-                        Some(applied_generation),
-                        &[],
-                    )
+                        shard_ownership: Some(shard_ownership.clone()),
+                        applied_generation: Some(applied_generation),
+                        inputs: &[],
+                    })
                     .await
                 }
             }
@@ -2736,9 +2847,11 @@ impl Db {
         level: u32,
         local_id: String,
         rows: Vec<SstableRow>,
+        shard_ownership: Option<crate::ShardSstableOwnership>,
         bloom_filter_bits_per_key: Option<u32>,
     ) -> Result<(ResidentRowSstable, Vec<u8>), StorageError> {
         let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
+        meta.shard_ownership = shard_ownership.clone();
         let user_key_bloom_filter = UserKeyBloomFilter::build(&rows, bloom_filter_bits_per_key);
         let rows_bytes = serde_json::to_vec(&rows).map_err(|error| {
             StorageError::corruption(format!("encode SSTable rows failed: {error}"))
@@ -2757,6 +2870,7 @@ impl Db {
             rows: rows.clone(),
             data_checksum,
             user_key_bloom_filter: user_key_bloom_filter.clone(),
+            shard_ownership,
         };
         let encoded_body = serde_json::to_vec(&body).map_err(|error| {
             StorageError::corruption(format!("encode SSTable body failed: {error}"))
@@ -3670,84 +3784,62 @@ impl Db {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_columnar_table_output(
         &self,
-        path: &str,
-        level: u32,
-        local_id: String,
-        stored: &StoredTable,
-        rows: Vec<SstableRow>,
-        applied_generation: Option<ManifestId>,
-        inputs: &[ResidentRowSstable],
+        request: ColumnarTableOutputRequest<'_>,
     ) -> Result<ResidentRowSstable, StorageError> {
+        let ColumnarTableOutputRequest {
+            target,
+            level,
+            local_id,
+            stored,
+            rows,
+            shard_ownership,
+            applied_generation,
+            inputs,
+        } = request;
         match self.choose_columnar_output_layout(stored, level, &local_id, &rows, inputs)? {
             ColumnarOutputLayout::Compact => {
-                self.write_row_sstable(
-                    path,
-                    stored.id,
+                self.write_row_sstable(RowSstableWriteRequest {
+                    target,
+                    table_id: stored.id,
                     level,
                     local_id,
                     rows,
-                    stored.config.bloom_filter_bits_per_key,
-                )
+                    shard_ownership,
+                    bloom_filter_bits_per_key: stored.config.bloom_filter_bits_per_key,
+                })
                 .await
             }
             ColumnarOutputLayout::Wide => {
-                self.write_columnar_sstable(path, level, local_id, stored, rows, applied_generation)
-                    .await
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn write_columnar_table_output_remote(
-        &self,
-        object_key: &str,
-        level: u32,
-        local_id: String,
-        stored: &StoredTable,
-        rows: Vec<SstableRow>,
-        applied_generation: Option<ManifestId>,
-        inputs: &[ResidentRowSstable],
-    ) -> Result<ResidentRowSstable, StorageError> {
-        match self.choose_columnar_output_layout(stored, level, &local_id, &rows, inputs)? {
-            ColumnarOutputLayout::Compact => {
-                self.write_row_sstable_remote(
-                    object_key,
-                    stored.id,
-                    level,
-                    local_id,
-                    rows,
-                    stored.config.bloom_filter_bits_per_key,
-                )
-                .await
-            }
-            ColumnarOutputLayout::Wide => {
-                self.write_columnar_sstable_remote(
-                    object_key,
+                self.write_columnar_sstable(ColumnarSstableWriteRequest {
+                    target,
                     level,
                     local_id,
                     stored,
                     rows,
+                    shard_ownership,
                     applied_generation,
-                )
+                })
                 .await
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_columnar_sstable(
-        table_id: TableId,
-        level: u32,
-        local_id: String,
-        schema: &SchemaDefinition,
-        rows: Vec<SstableRow>,
-        bloom_filter_bits_per_key: Option<u32>,
-        applied_generation: Option<ManifestId>,
-        optional_sidecars: Vec<PersistedOptionalSidecarDescriptor>,
+        request: EncodedColumnarSstable<'_>,
     ) -> Result<(ResidentRowSstable, Vec<u8>), StorageError> {
+        let EncodedColumnarSstable {
+            table_id,
+            level,
+            local_id,
+            schema,
+            rows,
+            shard_ownership,
+            bloom_filter_bits_per_key,
+            applied_generation,
+            optional_sidecars,
+        } = request;
         schema.validate()?;
 
         let mut meta = Self::summarize_sstable_rows(table_id, level, &local_id, &rows)?;
@@ -3858,6 +3950,7 @@ impl Db {
             digests: Vec::new(),
             optional_sidecars,
             user_key_bloom_filter: user_key_bloom_filter.clone(),
+            shard_ownership: shard_ownership.clone(),
         };
         let mut footer = footer;
         footer.digests = vec![Self::compact_crc32_digest(
@@ -3888,39 +3981,61 @@ impl Db {
 
     pub(super) async fn write_row_sstable(
         &self,
-        path: &str,
-        table_id: TableId,
-        level: u32,
-        local_id: String,
-        rows: Vec<SstableRow>,
-        bloom_filter_bits_per_key: Option<u32>,
+        request: RowSstableWriteRequest,
     ) -> Result<ResidentRowSstable, StorageError> {
-        let (mut resident, bytes) =
-            Self::encode_row_sstable(table_id, level, local_id, rows, bloom_filter_bits_per_key)?;
+        let RowSstableWriteRequest {
+            target,
+            table_id,
+            level,
+            local_id,
+            rows,
+            shard_ownership,
+            bloom_filter_bits_per_key,
+        } = request;
+        let (mut resident, bytes) = Self::encode_row_sstable(
+            table_id,
+            level,
+            local_id,
+            rows,
+            shard_ownership,
+            bloom_filter_bits_per_key,
+        )?;
 
-        let handle = self
-            .inner
-            .dependencies
-            .file_system
-            .open(
-                path,
-                OpenOptions {
-                    create: true,
-                    read: true,
-                    write: true,
-                    truncate: true,
-                    append: false,
-                },
-            )
-            .await?;
-        self.inner
-            .dependencies
-            .file_system
-            .write_at(&handle, 0, &bytes)
-            .await?;
-        self.inner.dependencies.file_system.sync(&handle).await?;
+        match target {
+            SstableWriteTarget::LocalPath(path) => {
+                let handle = self
+                    .inner
+                    .dependencies
+                    .file_system
+                    .open(
+                        &path,
+                        OpenOptions {
+                            create: true,
+                            read: true,
+                            write: true,
+                            truncate: true,
+                            append: false,
+                        },
+                    )
+                    .await?;
+                self.inner
+                    .dependencies
+                    .file_system
+                    .write_at(&handle, 0, &bytes)
+                    .await?;
+                self.inner.dependencies.file_system.sync(&handle).await?;
 
-        resident.meta.file_path = path.to_string();
+                resident.meta.file_path = path;
+            }
+            SstableWriteTarget::RemoteObject(object_key) => {
+                self.inner
+                    .dependencies
+                    .object_store
+                    .put(&object_key, &bytes)
+                    .await?;
+                resident.meta.remote_key = Some(object_key);
+            }
+        }
         Ok(resident)
     }
 
@@ -3958,13 +4073,17 @@ impl Db {
 
     pub(super) async fn write_columnar_sstable(
         &self,
-        path: &str,
-        level: u32,
-        local_id: String,
-        stored: &StoredTable,
-        rows: Vec<SstableRow>,
-        applied_generation: Option<ManifestId>,
+        request: ColumnarSstableWriteRequest<'_>,
     ) -> Result<ResidentRowSstable, StorageError> {
+        let ColumnarSstableWriteRequest {
+            target,
+            level,
+            local_id,
+            stored,
+            rows,
+            shard_ownership,
+            applied_generation,
+        } = request;
         let schema = stored.config.schema.as_ref().ok_or_else(|| {
             StorageError::corruption(format!(
                 "columnar table {} is missing a schema",
@@ -3973,92 +4092,45 @@ impl Db {
         })?;
         let sidecars =
             self.build_optional_sidecars(&local_id, stored, &rows, applied_generation)?;
-        let (mut resident, bytes) = Self::encode_columnar_sstable(
-            stored.id,
+        let (mut resident, bytes) = Self::encode_columnar_sstable(EncodedColumnarSstable {
+            table_id: stored.id,
             level,
             local_id,
             schema,
             rows,
-            stored.config.bloom_filter_bits_per_key,
+            shard_ownership,
+            bloom_filter_bits_per_key: stored.config.bloom_filter_bits_per_key,
             applied_generation,
-            sidecars
+            optional_sidecars: sidecars
                 .iter()
                 .map(EncodedOptionalSidecar::descriptor)
                 .collect(),
-        )?;
-        self.publish_optional_sidecars_local(path, &sidecars).await;
-        write_local_file_atomic(&self.inner.dependencies, path, &bytes).await?;
-
-        resident.meta.file_path = path.to_string();
-        resident.columnar = Some(ResidentColumnarSstable {
-            source: StorageSource::local_file(path.to_string()),
-        });
-        Ok(resident)
-    }
-
-    pub(super) async fn write_row_sstable_remote(
-        &self,
-        object_key: &str,
-        table_id: TableId,
-        level: u32,
-        local_id: String,
-        rows: Vec<SstableRow>,
-        bloom_filter_bits_per_key: Option<u32>,
-    ) -> Result<ResidentRowSstable, StorageError> {
-        let (mut resident, bytes) =
-            Self::encode_row_sstable(table_id, level, local_id, rows, bloom_filter_bits_per_key)?;
-        self.inner
-            .dependencies
-            .object_store
-            .put(object_key, &bytes)
-            .await?;
-        resident.meta.remote_key = Some(object_key.to_string());
-        Ok(resident)
-    }
-
-    pub(super) async fn write_columnar_sstable_remote(
-        &self,
-        object_key: &str,
-        level: u32,
-        local_id: String,
-        stored: &StoredTable,
-        rows: Vec<SstableRow>,
-        applied_generation: Option<ManifestId>,
-    ) -> Result<ResidentRowSstable, StorageError> {
-        let schema = stored.config.schema.as_ref().ok_or_else(|| {
-            StorageError::corruption(format!(
-                "columnar table {} is missing a schema",
-                stored.config.name
-            ))
         })?;
-        let sidecars =
-            self.build_optional_sidecars(&local_id, stored, &rows, applied_generation)?;
-        let (mut resident, bytes) = Self::encode_columnar_sstable(
-            stored.id,
-            level,
-            local_id,
-            schema,
-            rows,
-            stored.config.bloom_filter_bits_per_key,
-            applied_generation,
-            sidecars
-                .iter()
-                .map(EncodedOptionalSidecar::descriptor)
-                .collect(),
-        )?;
-        self.publish_optional_sidecars_remote(object_key, &sidecars)
-            .await;
-        Self::write_source_atomic(
-            &self.inner.dependencies,
-            &self.inner.dependencies.rng,
-            &StorageSource::remote_object(object_key.to_string()),
-            &bytes,
-        )
-        .await?;
-        resident.meta.remote_key = Some(object_key.to_string());
-        resident.columnar = Some(ResidentColumnarSstable {
-            source: StorageSource::remote_object(object_key.to_string()),
-        });
+        match target {
+            SstableWriteTarget::LocalPath(path) => {
+                self.publish_optional_sidecars_local(&path, &sidecars).await;
+                write_local_file_atomic(&self.inner.dependencies, &path, &bytes).await?;
+
+                resident.meta.file_path = path.clone();
+                resident.columnar = Some(ResidentColumnarSstable {
+                    source: StorageSource::local_file(path),
+                });
+            }
+            SstableWriteTarget::RemoteObject(object_key) => {
+                let source = StorageSource::remote_object(object_key.clone());
+                self.publish_optional_sidecars_remote(source.target(), &sidecars)
+                    .await;
+                Self::write_source_atomic(
+                    &self.inner.dependencies,
+                    &self.inner.dependencies.rng,
+                    &source,
+                    &bytes,
+                )
+                .await?;
+                resident.meta.remote_key = Some(object_key);
+                resident.columnar = Some(ResidentColumnarSstable { source });
+            }
+        }
         Ok(resident)
     }
 
@@ -4280,16 +4352,19 @@ impl Db {
         };
 
         let mut snapshots = Vec::new();
-        for descriptor in manager.enumerate_segments() {
+        for (shard, descriptor) in manager.enumerate_segments() {
             if descriptor.record_count == 0 {
                 continue;
             }
 
-            let bytes = manager.read_segment_bytes(descriptor.segment_id).await?;
+            let bytes = manager
+                .read_segment_bytes(shard, descriptor.segment_id)
+                .await?;
             let footer = segment_footer_from_bytes(descriptor.segment_id, &bytes)?;
             snapshots.push((
                 DurableRemoteCommitLogSegment {
-                    object_key: layout.backup_commit_log_segment(descriptor.segment_id),
+                    object_key: layout
+                        .backup_commit_log_segment_in_shard(shard, descriptor.segment_id),
                     footer,
                 },
                 bytes,
@@ -4339,7 +4414,11 @@ impl Db {
         for sstable in live {
             let mut meta = sstable.meta.clone();
             if !meta.file_path.is_empty() {
-                let backup_key = layout.backup_sstable(meta.table_id, 0, &meta.local_id);
+                let backup_key = layout.backup_sstable_in_shard(
+                    meta.table_id,
+                    meta.physical_shard(),
+                    &meta.local_id,
+                );
                 let bytes = read_path(&self.inner.dependencies, &meta.file_path).await?;
                 meta.file_path.clear();
                 meta.remote_key = Some(backup_key.clone());
