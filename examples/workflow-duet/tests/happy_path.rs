@@ -69,6 +69,13 @@ async fn paired_native_and_sandbox_workflows_cross_approve_through_the_public_ap
     assert_eq!(sandbox.target, SANDBOX_BUNDLE_ID);
     assert_eq!(native.lifecycle, "completed");
     assert_eq!(sandbox.lifecycle, "completed");
+    assert_eq!(
+        sandbox
+            .visibility_summary
+            .get("workflow_slug")
+            .map(String::as_str),
+        Some("workflowDuetSandbox")
+    );
     assert!(
         native
             .latest_savepoint_id

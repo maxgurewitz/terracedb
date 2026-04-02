@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -10,8 +10,8 @@ use terracedb::{
     TransactionCommitError, Value, decode_outbox_entry,
 };
 use terracedb_sandbox::{
-    ConflictPolicy, DefaultSandboxStore, PackageCompatibilityMode, SandboxConfig, SandboxError,
-    SandboxServices, SandboxSession, SandboxStore,
+    ConflictPolicy, DefaultSandboxStore, PackageCompatibilityMode, PackageInstallRequest,
+    SandboxConfig, SandboxError, SandboxServices, SandboxSession, SandboxStore, TypeCheckRequest,
 };
 use terracedb_vfs::{
     CreateOptions, InMemoryVfsStore, VfsError, VolumeConfig, VolumeId, VolumeStore,
@@ -28,9 +28,9 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use crate::model::{
     APPROVAL_TIMEOUT_MILLIS, APPROVE_CALLBACK_ID, NATIVE_WORKFLOW_NAME, RETRY_DELAY_MILLIS,
-    ReviewOutboxMessage, ReviewStage, ReviewState, SANDBOX_MODULE_PATH, SANDBOX_WORKFLOW_NAME,
-    START_CALLBACK_ID, decode_review_state, native_registration, review_transition_output,
-    sandbox_bundle,
+    ReviewOutboxMessage, ReviewStage, ReviewState, SANDBOX_PACKAGE_JSON_PATH,
+    SANDBOX_SOURCE_MODULE_PATH, SANDBOX_TSCONFIG_PATH, SANDBOX_WORKFLOW_NAME, START_CALLBACK_ID,
+    decode_review_state, native_registration, review_transition_output, sandbox_bundle,
 };
 
 const BASE_VOLUME_ID: VolumeId = VolumeId::new(0x7700);
@@ -116,6 +116,7 @@ pub struct WorkflowDuetInspection {
     pub waiting_for_callback: Option<String>,
     pub deadline_millis: Option<u64>,
     pub latest_savepoint_id: Option<String>,
+    pub visibility_summary: BTreeMap<String, String>,
     pub visible_statuses: Vec<String>,
 }
 
@@ -420,6 +421,7 @@ impl WorkflowDuetApp {
             waiting_for_callback: state.waiting_for_callback,
             deadline_millis: state.deadline_millis,
             latest_savepoint_id: savepoint.map(|record| record.savepoint_id.to_string()),
+            visibility_summary: visibility_record.summary,
             visible_statuses: visible_statuses(&visible_history),
         }))
     }
@@ -707,27 +709,29 @@ async fn open_sandbox_session(
     vfs: Arc<InMemoryVfsStore>,
     clock: Arc<dyn Clock>,
 ) -> Result<SandboxSession, WorkflowDuetError> {
-    seed_sandbox_module(vfs.as_ref()).await?;
+    seed_sandbox_project(vfs.as_ref()).await?;
     let sandbox = DefaultSandboxStore::new(vfs, clock, SandboxServices::deterministic());
-    sandbox
+    let session = sandbox
         .open_session(SandboxConfig {
             session_volume_id: SESSION_VOLUME_ID,
             session_chunk_size: Some(4096),
             base_volume_id: BASE_VOLUME_ID,
             durable_base: false,
             workspace_root: "/workspace".to_string(),
-            package_compat: PackageCompatibilityMode::TerraceOnly,
+            package_compat: PackageCompatibilityMode::NpmPureJs,
             conflict_policy: ConflictPolicy::Fail,
             capabilities: Default::default(),
             execution_policy: None,
             hoisted_source: None,
             git_provenance: None,
         })
-        .await
-        .map_err(Into::into)
+        .await?;
+    install_sandbox_packages(&session).await?;
+    emit_sandbox_workflow(&session).await?;
+    Ok(session)
 }
 
-async fn seed_sandbox_module(vfs: &InMemoryVfsStore) -> Result<(), WorkflowDuetError> {
+async fn seed_sandbox_project(vfs: &InMemoryVfsStore) -> Result<(), WorkflowDuetError> {
     let base = vfs
         .open_volume(
             VolumeConfig::new(BASE_VOLUME_ID)
@@ -735,17 +739,60 @@ async fn seed_sandbox_module(vfs: &InMemoryVfsStore) -> Result<(), WorkflowDuetE
                 .with_create_if_missing(true),
         )
         .await?;
-    base.fs()
-        .write_file(
-            SANDBOX_MODULE_PATH,
-            include_str!("../sandbox/review_workflow.js")
-                .as_bytes()
-                .to_vec(),
-            CreateOptions {
-                create_parents: true,
-                ..Default::default()
-            },
-        )
+    for (path, contents) in [
+        (
+            SANDBOX_PACKAGE_JSON_PATH,
+            include_str!("../sandbox/package.json"),
+        ),
+        (
+            SANDBOX_TSCONFIG_PATH,
+            include_str!("../sandbox/tsconfig.json"),
+        ),
+        (
+            SANDBOX_SOURCE_MODULE_PATH,
+            include_str!("../sandbox/review_workflow.ts"),
+        ),
+    ] {
+        base.fs()
+            .write_file(
+                path,
+                contents.as_bytes().to_vec(),
+                CreateOptions {
+                    create_parents: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn install_sandbox_packages(session: &SandboxSession) -> Result<(), WorkflowDuetError> {
+    let package_json =
+        serde_json::from_str::<serde_json::Value>(include_str!("../sandbox/package.json"))?;
+    let dependencies = package_json
+        .get("dependencies")
+        .and_then(|deps| deps.as_object())
+        .map(|deps| deps.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if dependencies.is_empty() {
+        return Ok(());
+    }
+    session
+        .install_packages(PackageInstallRequest {
+            packages: dependencies,
+            materialize_compatibility_view: true,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn emit_sandbox_workflow(session: &SandboxSession) -> Result<(), WorkflowDuetError> {
+    session
+        .emit_typescript(TypeCheckRequest {
+            roots: vec![SANDBOX_SOURCE_MODULE_PATH.to_string()],
+            ..Default::default()
+        })
         .await?;
     Ok(())
 }

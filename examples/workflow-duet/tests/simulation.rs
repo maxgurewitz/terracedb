@@ -185,6 +185,14 @@ fn workflow_duet_replays_under_seeded_simulation() -> turmoil::Result {
     assert_eq!(first.paired_sandbox.lifecycle, "completed");
     assert_eq!(first.native_timeout.lifecycle, "failed");
     assert_eq!(first.sandbox_timeout.lifecycle, "failed");
+    assert_eq!(
+        first
+            .paired_sandbox
+            .visibility_summary
+            .get("workflow_slug")
+            .map(String::as_str),
+        Some("workflowDuetSandbox")
+    );
     assert!(
         first
             .paired_native

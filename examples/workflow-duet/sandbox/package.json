@@ -1,0 +1,8 @@
+{
+  "name": "workflow-duet-sandbox",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "lodash": "*"
+  }
+}
