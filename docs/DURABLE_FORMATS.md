@@ -13,6 +13,7 @@ T23a currently covers:
 - remote manifest files
 - remote-cache metadata files
 - backup-GC birth metadata files
+- workflow public-contract JSON fixtures in `crates/terracedb-workflows-core`
 - workflow runtime records and checkpoint artifacts in `crates/terracedb-workflows`
 
 Hot row/columnar SSTable block layout evolution stays with the SSTable tasks and is intentionally out of scope here, but the manifest metadata and durable storage layout that make SSTables reopenable are part of this contract.
@@ -110,6 +111,45 @@ The checked fixtures live in `tests/fixtures/durable-formats/`:
 - `remote-manifest-v1.bin`
 - `remote-cache-entry-v1.bin`
 - `backup-gc-birth-v1.bin`
+- `workflow-native-registration-metadata-v1.bin`
+- `workflow-execution-descriptor-v1.bin`
+- `workflow-execution-descriptor-bundle-v1.bin`
+- `workflow-deployment-record-v1.bin`
+- `workflow-rollout-policy-immediate-v1.bin`
+- `workflow-rollout-policy-manual-v1.bin`
+- `workflow-deployment-preview-request-v1.bin`
+- `workflow-deployment-resolution-request-v1.bin`
+- `workflow-deployment-activation-request-v1.bin`
+- `workflow-deployment-deactivation-request-v1.bin`
+- `workflow-deployment-rollback-request-v1.bin`
+- `workflow-deployment-activation-v1.bin`
+- `workflow-deployment-activation-cleared-v1.bin`
+- `workflow-visibility-entry-v1.bin`
+- `workflow-visibility-list-request-v1.bin`
+- `workflow-visibility-list-response-v1.bin`
+- `workflow-describe-request-v1.bin`
+- `workflow-describe-response-v1.bin`
+- `workflow-history-page-request-v1.bin`
+- `workflow-history-page-response-v1.bin`
+- `workflow-query-request-v1.bin`
+- `workflow-query-target-visibility-v1.bin`
+- `workflow-query-target-execution-v1.bin`
+- `workflow-query-response-v1.bin`
+- `workflow-query-response-rejected-v1.bin`
+- `workflow-update-request-v1.bin`
+- `workflow-update-lane-update-v1.bin`
+- `workflow-update-admission-v1.bin`
+- `workflow-update-admission-rejected-v1.bin`
+- `workflow-update-admission-duplicate-v1.bin`
+- `workflow-compatibility-manifest-v1.bin`
+- `workflow-compatibility-check-v1.bin`
+- `workflow-compatibility-decision-v1.bin`
+- `workflow-compatibility-decision-compatible-v1.bin`
+- `workflow-compatibility-decision-requires-restart-as-new-v1.bin`
+- `workflow-compatibility-decision-rejected-v1.bin`
+- `workflow-upgrade-request-v1.bin`
+- `workflow-upgrade-plan-v1.bin`
+- `workflow-upgrade-plan-restart-as-new-v1.bin`
 - `workflow-run-record-v1.bin`
 - `workflow-state-record-v1.bin`
 - `workflow-history-event-v1.bin`

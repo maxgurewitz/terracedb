@@ -1,0 +1,1 @@
+{"kind":"bundle","bundle":{"bundle_id":"bundle:orders:v2","workflow_name":"orders","kind":{"kind":"sandbox","abi":"workflow-task/v1","module":"orders.js","entrypoint":"default"},"created_at_millis":10,"labels":{"channel":"bundle"}}}
