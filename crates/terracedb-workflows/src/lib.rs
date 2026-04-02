@@ -28,8 +28,8 @@ use terracedb::{
 };
 
 pub mod failpoints;
-pub mod transition_engine;
 mod run_model;
+pub mod transition_engine;
 
 pub use run_model::{
     InMemoryWorkflowRunStore, WorkflowHistoryRecord, WorkflowReductionPlan, WorkflowRunBuilder,
@@ -1306,7 +1306,7 @@ pub struct WorkflowRuntimeTask {
     pub workflow_name: String,
     pub instance_id: String,
     pub trigger_seq: u64,
-    pub admitted_at_millis: Option<u64>,
+    pub admitted_at_millis: u64,
 }
 
 #[async_trait]
@@ -1462,17 +1462,15 @@ where
                     )));
                 }
             };
-            let stored: StoredAdmittedWorkflowTrigger =
-                decode_payload(bytes, "workflow inbox trigger")
-                    .map_err(WorkflowHandlerError::new)?;
-            if stored.admitted_at_millis.is_none() {
-                return Err(WorkflowHandlerError::new(std::io::Error::other(format!(
-                    "workflow bundle {} requires {} inbox rows; pending admission {:?} predates that format",
-                    self.bundle.bundle_id,
-                    WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1,
-                    String::from_utf8_lossy(&key)
-                ))));
-            }
+            let _stored: StoredAdmittedWorkflowTrigger =
+                decode_payload(bytes, "workflow inbox trigger").map_err(|error| {
+                    WorkflowHandlerError::new(std::io::Error::other(format!(
+                        "workflow bundle {} rejects unsupported pending inbox row {:?}: {}",
+                        self.bundle.bundle_id,
+                        String::from_utf8_lossy(&key),
+                        error
+                    )))
+                })?;
         }
         Ok(())
     }
@@ -3827,7 +3825,7 @@ async fn process_workflow_trigger<H>(
     instance_id: &str,
     trigger: WorkflowTrigger,
     trigger_seq: u64,
-    admitted_at_millis: Option<u64>,
+    admitted_at_millis: u64,
     operation_context: Option<OperationContext>,
     inbox_key: Key,
 ) -> Result<(), WorkflowError>
@@ -3992,7 +3990,7 @@ where
                 trigger_seq: trigger_sequence,
                 trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
                 operation_context: operation_context.clone(),
-                admitted_at_millis: Some(admitted_at_millis),
+                admitted_at_millis,
             },
             "workflow inbox trigger",
         )?),
@@ -4005,7 +4003,7 @@ where
             trigger_seq: trigger_sequence,
             trigger: StoredWorkflowTrigger::from_runtime_trigger(trigger),
             operation_context,
-            admitted_at_millis: Some(admitted_at_millis),
+            admitted_at_millis,
         },
     )
     .await?;
@@ -5152,7 +5150,7 @@ fn build_transition_input(
     workflow_name: &str,
     instance_id: &str,
     trigger_seq: u64,
-    admitted_at_millis: Option<u64>,
+    admitted_at_millis: u64,
     current_state: Option<&contracts::WorkflowStateRecord>,
     trigger: &WorkflowTrigger,
 ) -> Result<contracts::WorkflowTransitionInput, WorkflowError> {
@@ -5173,11 +5171,7 @@ fn build_transition_input(
             .unwrap_or(contracts::WorkflowLifecycleState::Scheduled),
         history_len: current_state.map(|state| state.history_len).unwrap_or(0),
         attempt: 1,
-        admitted_at_millis: admitted_at_millis.ok_or_else(|| {
-            WorkflowError::Storage(StorageError::corruption(
-                "pending workflow admission is missing admitted_at_millis; drain legacy inbox rows before enabling explicit workflow run persistence",
-            ))
-        })?,
+        admitted_at_millis,
         state: current_state.and_then(|state| state.state.clone()),
         trigger: runtime_trigger_to_transition_trigger(trigger)?,
     })
@@ -5669,7 +5663,6 @@ fn encode_workflow_source_progress(
         ))
     })?;
     let mut bytes = Vec::with_capacity(1 + json.len());
-    // Version 1 was the legacy bare-cursor encoding from DurableCursorStore.
     bytes.push(WORKFLOW_SOURCE_PROGRESS_FORMAT_VERSION);
     bytes.extend_from_slice(&json);
     Ok(bytes)
@@ -5680,12 +5673,6 @@ fn decode_workflow_source_progress(bytes: &[u8]) -> Result<WorkflowSourceProgres
         return serde_json::from_slice(&bytes[1..]).map_err(|error| {
             StorageError::corruption(format!("workflow source progress decoding failed: {error}"))
         });
-    }
-
-    if bytes.len() == 1 + LogCursor::ENCODED_LEN && bytes.first().copied() == Some(1) {
-        let cursor = LogCursor::decode(&bytes[1..])
-            .map_err(|error| StorageError::corruption(error.to_string()))?;
-        return Ok(WorkflowSourceProgress::from_cursor(cursor));
     }
 
     Err(StorageError::corruption(
@@ -5838,11 +5825,7 @@ fn build_contract_transition_input(
         lifecycle: contracts::WorkflowLifecycleState::Running,
         history_len: task.trigger_seq.saturating_sub(1),
         attempt: 1,
-        admitted_at_millis: task.admitted_at_millis.ok_or_else(|| {
-            contracts::WorkflowTaskError::invalid_contract(
-                "pending workflow admission is missing admitted_at_millis; drain legacy inbox rows before enabling the contract runtime adapter",
-            )
-        })?,
+        admitted_at_millis: task.admitted_at_millis,
         state: state.map(runtime_value_to_contract_payload).transpose()?,
         trigger: runtime_trigger_to_contract_trigger(trigger)?,
     })
@@ -6103,7 +6086,7 @@ struct AdmittedWorkflowTrigger {
     trigger_seq: u64,
     trigger: WorkflowTrigger,
     operation_context: Option<OperationContext>,
-    admitted_at_millis: Option<u64>,
+    admitted_at_millis: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6112,8 +6095,7 @@ struct StoredAdmittedWorkflowTrigger {
     trigger_seq: u64,
     trigger: StoredWorkflowTrigger,
     operation_context: Option<OperationContext>,
-    #[serde(default)]
-    admitted_at_millis: Option<u64>,
+    admitted_at_millis: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

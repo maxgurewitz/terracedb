@@ -94,9 +94,10 @@ struct RawCountsProjection {
 
 #[async_trait]
 impl ProjectionHandler for RawCountsProjection {
-    async fn apply(
+    async fn apply_with_context(
         &self,
         run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError> {
         tx.put(
@@ -114,9 +115,10 @@ struct MirrorCountsProjection {
 
 #[async_trait]
 impl ProjectionHandler for MirrorCountsProjection {
-    async fn apply(
+    async fn apply_with_context(
         &self,
         run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError> {
         for entry in run.entries() {

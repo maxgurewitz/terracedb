@@ -14199,6 +14199,10 @@ async fn s3_primary_control_plane_catalog_progress_survives_user_data_remote_lan
             .kind(),
         StorageErrorKind::NotFound
     );
+    object_store.inject_failure(
+        ObjectStoreFailure::timeout(ObjectStoreOperation::Get, layout.backup_catalog())
+            .persistent(),
+    );
 
     let reopened = Db::open(config, dependencies)
         .await
@@ -14217,7 +14221,7 @@ async fn s3_primary_control_plane_catalog_progress_survives_user_data_remote_lan
 }
 
 #[tokio::test]
-async fn s3_primary_control_plane_manifest_mismatch_fails_closed_before_user_recovery() {
+async fn s3_primary_control_plane_ignores_legacy_backup_manifest_pointer() {
     let file_system = Arc::new(crate::StubFileSystem::default());
     let object_store = Arc::new(StubObjectStore::default());
     let dependencies = dependencies(file_system, object_store.clone());
@@ -14246,25 +14250,23 @@ async fn s3_primary_control_plane_manifest_mismatch_fails_closed_before_user_rec
             format!("{}\n", layout.backup_manifest(ManifestId::new(99))).as_bytes(),
         )
         .await
-        .expect("write conflicting legacy manifest pointer");
+        .expect("write stale legacy manifest pointer");
     object_store.inject_failure(
-        ObjectStoreFailure::timeout(ObjectStoreOperation::Get, layout.backup_commit_log_prefix())
+        ObjectStoreFailure::timeout(ObjectStoreOperation::Get, layout.backup_manifest_latest())
             .persistent(),
     );
 
-    let error = Db::open(config, dependencies)
+    let reopened = Db::open(config, dependencies)
         .await
-        .expect_err("control-plane mismatch should fail closed");
-    let OpenError::Storage(error) = error else {
-        panic!("expected storage error");
-    };
-    assert_eq!(error.kind(), StorageErrorKind::Corruption);
-    assert!(
-        error
-            .message()
-            .contains("control-plane remote manifest latest pointer")
+        .expect("reopen should ignore legacy backup manifest pointer");
+    let reopened_events = reopened.table("events");
+    assert_eq!(
+        reopened_events
+            .read(b"user:1".to_vec())
+            .await
+            .expect("read durable value after reopen"),
+        Some(bytes("v1"))
     );
-    assert!(error.message().contains("durability lane mismatch"));
 }
 
 #[tokio::test]

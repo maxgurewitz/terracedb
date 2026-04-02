@@ -23,8 +23,8 @@ use terracedb::{
 };
 use terracedb_otel::{TelemetryMode, TerracedbTelemetry};
 use terracedb_projections::{
-    ProjectionHandle, ProjectionHandler, ProjectionHandlerError, ProjectionRuntime,
-    ProjectionSequenceRun, ProjectionTransaction, SingleSourceProjection,
+    ProjectionContext, ProjectionHandle, ProjectionHandler, ProjectionHandlerError,
+    ProjectionRuntime, ProjectionSequenceRun, ProjectionTransaction, SingleSourceProjection,
 };
 use terracedb_workflows::{
     WorkflowContext, WorkflowDefinition, WorkflowHandler, WorkflowHandlerError, WorkflowOutput,
@@ -72,9 +72,10 @@ struct MirrorProjection {
 
 #[async_trait]
 impl ProjectionHandler for MirrorProjection {
-    async fn apply(
+    async fn apply_with_context(
         &self,
         run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError> {
         for entry in run.entries() {

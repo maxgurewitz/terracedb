@@ -2673,21 +2673,67 @@ fn workflow_source_progress_round_trips_and_preserves_ordering_semantics() {
         assert_eq!(decoded, progress);
     }
 
-    let legacy_cursor = LogCursor::new(SequenceNumber::new(11), 4);
-    let legacy_bytes = {
-        let mut bytes = Vec::with_capacity(1 + LogCursor::ENCODED_LEN);
-        bytes.push(1);
-        bytes.extend_from_slice(&legacy_cursor.encode());
-        bytes
-    };
-    assert_eq!(
-        WorkflowSourceProgress::decode(&legacy_bytes).expect("decode legacy cursor progress"),
-        WorkflowSourceProgress::from_cursor(legacy_cursor),
-    );
-
     let mut ordered = vec![later, durable_fence, earlier];
     ordered.sort();
     assert_eq!(ordered, vec![earlier, durable_fence, later]);
+}
+
+#[tokio::test]
+async fn workflow_source_progress_legacy_cursor_encoding_fails_closed() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let clock = Arc::new(StubClock::default());
+    let db = Db::open(
+        tiered_test_config_with_durability(
+            "/workflow-source-progress-legacy",
+            TieredDurabilityMode::GroupCommit,
+        ),
+        test_dependencies_with_clock(file_system, object_store, clock.clone()),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("workflow_source"))
+        .await
+        .expect("create workflow source");
+    let runtime = WorkflowRuntime::open(
+        db,
+        clock,
+        WorkflowDefinition::new(
+            "orders",
+            [WorkflowSource::new(source.clone())],
+            RecordingHandler {
+                stats: ExecutionStats::default(),
+            },
+        ),
+    )
+    .await
+    .expect("open workflow runtime");
+
+    let mut legacy_progress = vec![1];
+    legacy_progress.extend_from_slice(&LogCursor::new(SequenceNumber::new(7), 0).encode());
+    runtime
+        .tables()
+        .source_progress_table()
+        .write(
+            source.name().as_bytes().to_vec(),
+            Value::bytes(legacy_progress),
+        )
+        .await
+        .expect("persist legacy source progress");
+
+    match runtime.load_source_progress(&source).await {
+        Err(WorkflowError::Storage(storage)) => {
+            assert_eq!(storage.kind(), StorageErrorKind::Corruption);
+            assert!(
+                storage
+                    .to_string()
+                    .contains("workflow source progress encoding is invalid")
+            );
+        }
+        Err(other) => panic!("expected source progress corruption, got {other:?}"),
+        Ok(progress) => panic!("expected legacy source progress to fail closed, got {progress:?}"),
+    }
 }
 
 #[test]
@@ -5024,7 +5070,11 @@ async fn contract_runtime_rejects_legacy_pending_inbox_rows_without_admitted_at(
 
     match error {
         WorkflowError::Handler { source, .. } => {
-            assert!(source.to_string().contains("predates that format"));
+            assert!(
+                source
+                    .to_string()
+                    .contains("rejects unsupported pending inbox row")
+            );
         }
         other => panic!("expected handler validation error, got {other:?}"),
     }

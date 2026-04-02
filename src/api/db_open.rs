@@ -343,13 +343,6 @@ impl Db {
         )
     }
 
-    fn control_plane_mismatch(label: &str, primary: &str, legacy: &str) -> StorageError {
-        Self::control_plane_error(
-            label,
-            format!("durability lane mismatch between {primary} and legacy {legacy}"),
-        )
-    }
-
     pub(super) fn validate_storage_config(storage: &StorageConfig) -> Result<(), OpenError> {
         match storage {
             StorageConfig::Tiered(TieredStorageConfig {
@@ -700,7 +693,6 @@ impl Db {
             }
             StorageConfig::S3Primary(config) => CatalogLocation::ObjectStore {
                 key: Self::join_object_key(&config.s3.prefix, OBJECT_CATALOG_RELATIVE_KEY),
-                legacy_key: Some(Self::remote_object_layout(config).backup_catalog()),
             },
         }
     }
@@ -790,26 +782,8 @@ impl Db {
                     Err(error) => return Err(OpenError::Storage(error)),
                 }
             }
-            CatalogLocation::ObjectStore { key, legacy_key } => {
-                let primary = read_optional_remote_object(dependencies, key).await?;
-                let legacy = match legacy_key {
-                    Some(legacy_key) => {
-                        read_optional_remote_object(dependencies, legacy_key).await?
-                    }
-                    None => None,
-                };
-                if let (Some(primary), Some(legacy)) = (&primary, &legacy)
-                    && primary != legacy
-                {
-                    return Err(OpenError::Storage(Self::control_plane_mismatch(
-                        "catalog",
-                        key,
-                        legacy_key
-                            .as_deref()
-                            .expect("legacy key should exist when comparing copies"),
-                    )));
-                }
-                primary.or(legacy)
+            CatalogLocation::ObjectStore { key } => {
+                read_optional_remote_object(dependencies, key).await?
             }
         };
 
@@ -1614,7 +1588,7 @@ impl Db {
         columnar_read_context: &ColumnarReadContext,
     ) -> Result<LoadedManifest, OpenError> {
         let Some((key, file)) =
-            Self::load_remote_manifest_file_from_layout(layout, dependencies).await?
+            Self::load_control_manifest_file_from_layout(layout, dependencies).await?
         else {
             return Ok(LoadedManifest::default());
         };
@@ -1625,14 +1599,12 @@ impl Db {
             })
     }
 
-    pub(super) async fn load_remote_manifest_file_from_layout(
+    pub(super) async fn load_control_manifest_file_from_layout(
         layout: &ObjectKeyLayout,
         dependencies: &DbDependencies,
     ) -> Result<Option<(String, PersistedRemoteManifestFile)>, OpenError> {
         let latest_key = layout.control_manifest_latest();
         let manifest_prefix = layout.control_manifest_prefix();
-        let legacy_latest_key = layout.backup_manifest_latest();
-        let legacy_manifest_prefix = layout.backup_manifest_prefix();
         let mut candidates = Vec::new();
         let mut last_error = None;
 
@@ -1651,32 +1623,6 @@ impl Db {
             },
             None => None,
         };
-        let legacy_pointer =
-            match read_optional_remote_object(dependencies, &legacy_latest_key).await? {
-                Some(pointer) => match String::from_utf8(pointer) {
-                    Ok(pointer) => {
-                        let pointer = pointer.trim();
-                        (!pointer.is_empty()).then(|| pointer.to_string())
-                    }
-                    Err(error) => {
-                        last_error = Some(Self::control_plane_error(
-                            "legacy remote manifest latest pointer",
-                            format!("decode pointer failed: {error}"),
-                        ));
-                        None
-                    }
-                },
-                None => None,
-            };
-        if let (Some(primary_pointer), Some(legacy_pointer)) = (&primary_pointer, &legacy_pointer)
-            && primary_pointer != legacy_pointer
-        {
-            return Err(OpenError::Storage(Self::control_plane_mismatch(
-                "remote manifest latest pointer",
-                &latest_key,
-                &legacy_latest_key,
-            )));
-        }
 
         let _ = dependencies
             .__failpoint_registry()
@@ -1684,7 +1630,7 @@ impl Db {
                 crate::failpoints::names::DB_REMOTE_MANIFEST_RECOVERY_AFTER_POINTER_READ,
                 BTreeMap::from([(
                     "candidate_count".to_string(),
-                    usize::from(primary_pointer.is_some() || legacy_pointer.is_some()).to_string(),
+                    usize::from(primary_pointer.is_some()).to_string(),
                 )]),
             )
             .await
@@ -1692,21 +1638,7 @@ impl Db {
 
         let mut listed = dependencies.object_store.list(&manifest_prefix).await?;
         listed.retain(|key| key != &latest_key && Self::parse_manifest_generation(key).is_some());
-        let control_plane_lane_present = primary_pointer.is_some() || !listed.is_empty();
-        if !control_plane_lane_present {
-            listed = dependencies
-                .object_store
-                .list(&legacy_manifest_prefix)
-                .await?;
-            listed.retain(|key| {
-                key != &legacy_latest_key && Self::parse_manifest_generation(key).is_some()
-            });
-        }
-        if control_plane_lane_present {
-            if let Some(pointer) = primary_pointer.as_ref() {
-                candidates.push(pointer.clone());
-            }
-        } else if let Some(pointer) = legacy_pointer.as_ref() {
+        if let Some(pointer) = primary_pointer.as_ref() {
             candidates.push(pointer.clone());
         }
         listed.sort_by_key(|key| {
@@ -1735,6 +1667,72 @@ impl Db {
             Err(OpenError::Storage(last_error.unwrap_or_else(|| {
                 Self::control_plane_error(
                     "remote manifest",
+                    "recovery found no valid manifest generation",
+                )
+            })))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) async fn load_backup_manifest_file_from_layout(
+        layout: &ObjectKeyLayout,
+        dependencies: &DbDependencies,
+    ) -> Result<Option<(String, PersistedRemoteManifestFile)>, OpenError> {
+        let latest_key = layout.backup_manifest_latest();
+        let manifest_prefix = layout.backup_manifest_prefix();
+        let mut candidates = Vec::new();
+        let mut last_error = None;
+
+        let pointer = match read_optional_remote_object(dependencies, &latest_key).await? {
+            Some(pointer) => match String::from_utf8(pointer) {
+                Ok(pointer) => {
+                    let pointer = pointer.trim();
+                    (!pointer.is_empty()).then(|| pointer.to_string())
+                }
+                Err(error) => {
+                    last_error = Some(Self::control_plane_error(
+                        "backup remote manifest latest pointer",
+                        format!("decode pointer failed: {error}"),
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+
+        if let Some(pointer) = pointer.as_ref() {
+            candidates.push(pointer.clone());
+        }
+
+        let mut listed = dependencies.object_store.list(&manifest_prefix).await?;
+        listed.retain(|key| key != &latest_key && Self::parse_manifest_generation(key).is_some());
+        listed.sort_by_key(|key| {
+            std::cmp::Reverse(
+                Self::parse_manifest_generation(key)
+                    .map(ManifestId::get)
+                    .unwrap_or_default(),
+            )
+        });
+        for key in listed {
+            if !candidates.iter().any(|candidate| candidate == &key) {
+                candidates.push(key);
+            }
+        }
+
+        let mut saw_manifest = false;
+        for key in candidates {
+            saw_manifest = true;
+            match Self::read_remote_manifest_file_at_key(dependencies, &key).await {
+                Ok(file) => return Ok(Some((key, file))),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if saw_manifest {
+            Err(OpenError::Storage(last_error.unwrap_or_else(|| {
+                Self::control_plane_error(
+                    "backup remote manifest",
                     "recovery found no valid manifest generation",
                 )
             })))
@@ -1912,7 +1910,7 @@ impl Db {
         let remote_catalog =
             read_optional_remote_object(dependencies, &layout.backup_catalog()).await?;
         let remote_manifest =
-            Self::load_remote_manifest_file_from_layout(&layout, dependencies).await?;
+            Self::load_backup_manifest_file_from_layout(&layout, dependencies).await?;
         let mut remote_commit_log_keys = dependencies
             .object_store
             .list(&layout.backup_commit_log_prefix())
