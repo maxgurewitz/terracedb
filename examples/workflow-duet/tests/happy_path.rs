@@ -27,39 +27,19 @@ async fn open_stubbed_app(
 }
 
 #[tokio::test]
-async fn example_can_be_inspected_through_public_workflow_apis()
+async fn paired_native_and_sandbox_workflows_cross_approve_through_the_public_apis()
 -> Result<(), Box<dyn std::error::Error>> {
     let (app, clock) = open_stubbed_app("workflow-duet-public-apis").await?;
     let handles = app.start().await?;
 
-    app.kick_off(WorkflowDuetFlavor::Native, "native-1").await?;
-    app.kick_off(WorkflowDuetFlavor::Sandbox, "sandbox-1")
-        .await?;
+    app.kick_off_pair("paired-review").await?;
 
     clock.advance(Duration::from_millis(12));
-    app.wait_for_stage(
-        WorkflowDuetFlavor::Native,
-        "native-1",
-        ReviewStage::WaitingApproval,
-        Duration::from_millis(200),
-    )
-    .await?;
-    app.wait_for_stage(
-        WorkflowDuetFlavor::Sandbox,
-        "sandbox-1",
-        ReviewStage::WaitingApproval,
-        Duration::from_millis(200),
-    )
-    .await?;
-
-    app.approve(WorkflowDuetFlavor::Native, "native-1").await?;
-    app.approve(WorkflowDuetFlavor::Sandbox, "sandbox-1")
-        .await?;
 
     let native_state = app
         .wait_for_stage(
             WorkflowDuetFlavor::Native,
-            "native-1",
+            "paired-review",
             ReviewStage::Approved,
             Duration::from_millis(200),
         )
@@ -67,7 +47,7 @@ async fn example_can_be_inspected_through_public_workflow_apis()
     let sandbox_state = app
         .wait_for_stage(
             WorkflowDuetFlavor::Sandbox,
-            "sandbox-1",
+            "paired-review",
             ReviewStage::Approved,
             Duration::from_millis(200),
         )
@@ -77,11 +57,11 @@ async fn example_can_be_inspected_through_public_workflow_apis()
     assert_eq!(sandbox_state.attempt, 2);
 
     let native = app
-        .inspect_instance(WorkflowDuetFlavor::Native, "native-1")
+        .inspect_instance(WorkflowDuetFlavor::Native, "paired-review")
         .await?
         .expect("native inspection");
     let sandbox = app
-        .inspect_instance(WorkflowDuetFlavor::Sandbox, "sandbox-1")
+        .inspect_instance(WorkflowDuetFlavor::Sandbox, "paired-review")
         .await?
         .expect("sandbox inspection");
 

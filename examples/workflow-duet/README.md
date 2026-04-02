@@ -4,6 +4,7 @@ This example shows the workflow model we have been moving toward:
 
 - one handwritten native Rust workflow,
 - one sandbox-authored JavaScript workflow,
+- a small durable relay that lets them interact through workflow outbox messages,
 - the same durable runtime underneath both,
 - automatic savepoints inside the runtime,
 - and separate visible workflow history for inspection.
@@ -14,20 +15,21 @@ The native workflow lives in [src/app.rs](/Users/maxwellgurewitz/.codex/worktree
 
 - **Native Rust stays native**: the Rust workflow is registered as a native registration target rather than pretending to be a sandbox bundle.
 - **Sandbox authoring is smaller**: the JavaScript workflow uses `wf.define(...)`, schema-backed state, and helper commands instead of exporting raw `handleTaskV1` boilerplate directly.
+- **Rust and sandbox workflows can talk through durable surfaces**: paired instances emit durable `requested-approval` outbox messages, and the example relay turns those into approval callbacks for the counterpart runtime.
 - **Visible history is not recovery truth**: the inspection helpers read workflow state, visibility, savepoint, and visible-history surfaces separately.
 - **Timers are durable**: retry and timeout behavior is expressed as timer commands, survives restart, and replays under simulation.
 
-## Run It
+## Verify It
 
 ```bash
-cargo run -p terracedb-example-workflow-duet
+cargo test -p terracedb-example-workflow-duet
 ```
 
-The demo starts both runtimes, kicks off one native and one sandbox review, waits for the retry timer to advance them into the approval stage, approves both, and prints a combined inspection report.
+The verified path today is the test suite: it starts both runtimes, kicks off one paired review under both runtimes, lets the relay cross-approve the pair when each side reaches `requested-approval`, and proves the interaction both directly and under seeded simulation replay.
 
 ## Verification
 
 This example is covered by:
 
 - [tests/happy_path.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/tests/happy_path.rs), which checks the public inspection APIs
-- [tests/simulation.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/tests/simulation.rs), which proves deterministic replay across restart in seeded simulation
+- [tests/simulation.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/examples/workflow-duet/tests/simulation.rs), which proves the cross-runtime interaction and replay across restart in seeded simulation

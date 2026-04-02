@@ -1,10 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use terracedb::{
-    Clock, Db, DbBuilder, DbConfig, DbSettings, Rng, S3Location, SequenceNumber, StubClock,
-    StubRng, TieredDurabilityMode, TieredStorageConfig, Timestamp, Value,
+    Clock, Db, DbBuilder, DbConfig, DbDependencies, DbSettings, ReadError, Rng, S3Location,
+    ScanOptions, SequenceNumber, StorageError, StubClock, StubFileSystem, StubObjectStore, StubRng,
+    SubscriptionClosed, Table, TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction,
+    TransactionCommitError, Value, decode_outbox_entry,
 };
 use terracedb_sandbox::{
     ConflictPolicy, DefaultSandboxStore, PackageCompatibilityMode, SandboxConfig, SandboxError,
@@ -21,16 +24,21 @@ use terracedb_workflows_sandbox::{
     SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter,
 };
 use thiserror::Error;
+use tokio::{sync::watch, task::JoinHandle};
 
 use crate::model::{
     APPROVAL_TIMEOUT_MILLIS, APPROVE_CALLBACK_ID, NATIVE_WORKFLOW_NAME, RETRY_DELAY_MILLIS,
-    ReviewStage, ReviewState, SANDBOX_MODULE_PATH, SANDBOX_WORKFLOW_NAME, START_CALLBACK_ID,
-    decode_review_state, native_registration, review_transition_output, sandbox_bundle,
+    ReviewOutboxMessage, ReviewStage, ReviewState, SANDBOX_MODULE_PATH, SANDBOX_WORKFLOW_NAME,
+    START_CALLBACK_ID, decode_review_state, native_registration, review_transition_output,
+    sandbox_bundle,
 };
 
 const BASE_VOLUME_ID: VolumeId = VolumeId::new(0x7700);
 const SESSION_VOLUME_ID: VolumeId = VolumeId::new(0x7701);
 const WORKFLOW_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const RELAY_BATCH_LIMIT: usize = 128;
+const RELAY_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const PAIR_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 type NativeRuntimeHandler =
     ContractWorkflowHandler<NativeWorkflowHandlerAdapter<NativeReviewWorkflow>>;
@@ -45,6 +53,16 @@ pub enum WorkflowDuetError {
     #[error(transparent)]
     Open(#[from] terracedb::OpenError),
     #[error(transparent)]
+    Read(#[from] ReadError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    TransactionCommit(#[from] TransactionCommitError),
+    #[error(transparent)]
+    SubscriptionClosed(#[from] SubscriptionClosed),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
     Workflow(#[from] WorkflowError),
     #[error(transparent)]
     WorkflowTask(#[from] WorkflowTaskError),
@@ -52,6 +70,8 @@ pub enum WorkflowDuetError {
     Sandbox(#[from] SandboxError),
     #[error(transparent)]
     Vfs(#[from] VfsError),
+    #[error("workflow-duet relay task failed: {0}")]
+    RelayTask(String),
     #[error("timed out waiting for {flavor:?}/{instance_id} to reach stage {expected}")]
     WaitTimeout {
         flavor: WorkflowDuetFlavor,
@@ -72,6 +92,13 @@ impl WorkflowDuetFlavor {
         match self {
             Self::Native => NATIVE_WORKFLOW_NAME,
             Self::Sandbox => SANDBOX_WORKFLOW_NAME,
+        }
+    }
+
+    pub fn counterpart(self) -> Self {
+        match self {
+            Self::Native => Self::Sandbox,
+            Self::Sandbox => Self::Native,
         }
     }
 }
@@ -121,7 +148,10 @@ impl WorkflowHandlerContract for NativeReviewWorkflow {
     }
 }
 
+#[derive(Clone)]
 pub struct WorkflowDuetApp {
+    db: Db,
+    clock: Arc<dyn Clock>,
     native: NativeReviewRuntime,
     sandbox: SandboxReviewRuntime,
     _sandbox_vfs: Arc<InMemoryVfsStore>,
@@ -152,8 +182,8 @@ impl WorkflowDuetApp {
         let sandbox_session = open_sandbox_session(sandbox_vfs.clone(), clock.clone()).await?;
         let bundle = sandbox_bundle();
         let sandbox = WorkflowRuntime::open(
-            db,
-            clock,
+            db.clone(),
+            clock.clone(),
             WorkflowDefinition::new(
                 SANDBOX_WORKFLOW_NAME,
                 std::iter::empty::<terracedb::Table>(),
@@ -170,6 +200,8 @@ impl WorkflowDuetApp {
         .await?;
 
         Ok(Self {
+            db,
+            clock,
             native,
             sandbox,
             _sandbox_vfs: sandbox_vfs,
@@ -187,7 +219,12 @@ impl WorkflowDuetApp {
     pub async fn start(&self) -> Result<WorkflowDuetHandles, WorkflowError> {
         let native = self.native.start().await?;
         match self.sandbox.start().await {
-            Ok(sandbox) => Ok(WorkflowDuetHandles { native, sandbox }),
+            Ok(sandbox) => Ok(WorkflowDuetHandles {
+                native,
+                sandbox,
+                native_relay: spawn_relay(self.clone(), WorkflowDuetFlavor::Native),
+                sandbox_relay: spawn_relay(self.clone(), WorkflowDuetFlavor::Sandbox),
+            }),
             Err(error) => {
                 let _ = native.abort().await;
                 Err(error)
@@ -202,6 +239,27 @@ impl WorkflowDuetApp {
     ) -> Result<SequenceNumber, WorkflowError> {
         self.admit_callback(flavor, instance_id, START_CALLBACK_ID, b"begin")
             .await
+    }
+
+    pub async fn kick_off_pair(&self, instance_id: &str) -> Result<(), WorkflowDuetError> {
+        self.kick_off(WorkflowDuetFlavor::Native, instance_id)
+            .await?;
+        self.kick_off(WorkflowDuetFlavor::Sandbox, instance_id)
+            .await?;
+        let native = self.wait_for_stage(
+            WorkflowDuetFlavor::Native,
+            instance_id,
+            ReviewStage::RetryBackoff,
+            PAIR_START_TIMEOUT,
+        );
+        let sandbox = self.wait_for_stage(
+            WorkflowDuetFlavor::Sandbox,
+            instance_id,
+            ReviewStage::RetryBackoff,
+            PAIR_START_TIMEOUT,
+        );
+        let _ = tokio::try_join!(native, sandbox)?;
+        Ok(())
     }
 
     pub async fn approve(
@@ -365,100 +423,257 @@ impl WorkflowDuetApp {
             visible_statuses: visible_statuses(&visible_history),
         }))
     }
+
+    async fn relay_approval_if_pair_waiting(
+        &self,
+        target_flavor: WorkflowDuetFlavor,
+        instance_id: &str,
+    ) -> Result<bool, WorkflowDuetError> {
+        let Some(state) = self.load_review_state(target_flavor, instance_id).await? else {
+            return Ok(false);
+        };
+        if matches!(state.stage, ReviewStage::Approved | ReviewStage::TimedOut) {
+            return Ok(false);
+        }
+        if state.stage == ReviewStage::WaitingApproval {
+            self.approve(target_flavor, instance_id).await?;
+            return Ok(true);
+        }
+
+        let state = self
+            .wait_for_stage(
+                target_flavor,
+                instance_id,
+                ReviewStage::WaitingApproval,
+                demo_window_hint(),
+            )
+            .await?;
+        if state.stage == ReviewStage::WaitingApproval {
+            self.approve(target_flavor, instance_id).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 pub struct WorkflowDuetHandles {
     native: WorkflowHandle,
     sandbox: WorkflowHandle,
+    native_relay: WorkflowDuetRelayHandle,
+    sandbox_relay: WorkflowDuetRelayHandle,
 }
 
 impl WorkflowDuetHandles {
-    pub async fn shutdown(self) -> Result<(), WorkflowError> {
-        let native_result = self.native.shutdown().await;
-        let sandbox_result = self.sandbox.shutdown().await;
-        native_result?;
-        sandbox_result
+    pub async fn shutdown(self) -> Result<(), WorkflowDuetError> {
+        let (native_relay, sandbox_relay) =
+            tokio::join!(self.native_relay.shutdown(), self.sandbox_relay.shutdown());
+        native_relay?;
+        sandbox_relay?;
+        let (native_runtime, sandbox_runtime) =
+            tokio::join!(self.native.shutdown(), self.sandbox.shutdown());
+        native_runtime?;
+        sandbox_runtime?;
+        Ok(())
     }
 
-    pub async fn abort(self) -> Result<(), WorkflowError> {
-        let native_result = self.native.abort().await;
-        let sandbox_result = self.sandbox.abort().await;
-        native_result?;
-        sandbox_result
+    pub async fn abort(self) -> Result<(), WorkflowDuetError> {
+        let (native_relay, sandbox_relay) =
+            tokio::join!(self.native_relay.abort(), self.sandbox_relay.abort());
+        native_relay?;
+        sandbox_relay?;
+        let (native_runtime, sandbox_runtime) =
+            tokio::join!(self.native.abort(), self.sandbox.abort());
+        native_runtime?;
+        sandbox_runtime?;
+        Ok(())
     }
+}
+
+struct WorkflowDuetRelayHandle {
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<Result<(), WorkflowDuetError>>,
+}
+
+impl WorkflowDuetRelayHandle {
+    async fn shutdown(self) -> Result<(), WorkflowDuetError> {
+        self.shutdown.send_replace(true);
+        match self.task.await {
+            Ok(result) => result,
+            Err(error) => Err(WorkflowDuetError::RelayTask(error.to_string())),
+        }
+    }
+
+    async fn abort(self) -> Result<(), WorkflowDuetError> {
+        self.shutdown.send_replace(true);
+        self.task.abort();
+        match self.task.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(WorkflowDuetError::RelayTask(error.to_string())),
+        }
+    }
+}
+
+fn spawn_relay(app: WorkflowDuetApp, source_flavor: WorkflowDuetFlavor) -> WorkflowDuetRelayHandle {
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let outbox_table = source_outbox_table(&app, source_flavor);
+    let db = app.db.clone();
+    let clock = app.clock.clone();
+    let task = tokio::spawn(async move {
+        relay_cross_runtime_outbox(
+            db,
+            clock,
+            outbox_table,
+            app,
+            source_flavor,
+            source_flavor.counterpart(),
+            shutdown_rx,
+        )
+        .await
+    });
+    WorkflowDuetRelayHandle { shutdown, task }
 }
 
 pub async fn run_local_demo(data_root: &str) -> Result<WorkflowDuetDemoReport, WorkflowDuetError> {
     let demo_timeout = Duration::from_secs(10);
     let clock = Arc::new(StubClock::new(Timestamp::new(0)));
     let rng = Arc::new(StubRng::seeded(0x7711));
-    let ssd_path = format!("{data_root}/ssd");
-    let object_store_root = format!("{data_root}/object-store");
-    let db = workflow_duet_db_builder(&ssd_path, "workflow-duet/demo")
-        .local_object_store(object_store_root)
-        .clock(clock.clone())
-        .rng(rng.clone())
-        .open()
-        .await?;
+    let db = Db::open(
+        workflow_duet_db_config(
+            &format!("/{data_root}/ssd"),
+            &format!("workflow-duet/demo/{data_root}"),
+        ),
+        DbDependencies::new(
+            Arc::new(StubFileSystem::default()),
+            Arc::new(StubObjectStore::default()),
+            clock.clone(),
+            rng.clone(),
+        ),
+    )
+    .await?;
+    let instance_id = format!("duet-demo-{}", rng.uuid());
 
     let app = WorkflowDuetApp::open(db, clock.clone(), rng).await?;
     let handles = app.start().await?;
 
-    app.kick_off(WorkflowDuetFlavor::Native, "native-demo")
-        .await?;
-    app.kick_off(WorkflowDuetFlavor::Sandbox, "sandbox-demo")
-        .await?;
+    app.kick_off_pair(&instance_id).await?;
     clock.advance(Duration::from_millis(RETRY_DELAY_MILLIS + 2));
 
-    let native = async {
-        app.wait_for_stage(
-            WorkflowDuetFlavor::Native,
-            "native-demo",
-            ReviewStage::WaitingApproval,
-            demo_timeout,
-        )
-        .await?;
-        app.approve(WorkflowDuetFlavor::Native, "native-demo")
-            .await?;
-        app.wait_for_stage(
-            WorkflowDuetFlavor::Native,
-            "native-demo",
-            ReviewStage::Approved,
-            demo_timeout,
-        )
-        .await
-    };
-    let sandbox = async {
-        app.wait_for_stage(
-            WorkflowDuetFlavor::Sandbox,
-            "sandbox-demo",
-            ReviewStage::WaitingApproval,
-            demo_timeout,
-        )
-        .await?;
-        app.approve(WorkflowDuetFlavor::Sandbox, "sandbox-demo")
-            .await?;
-        app.wait_for_stage(
-            WorkflowDuetFlavor::Sandbox,
-            "sandbox-demo",
-            ReviewStage::Approved,
-            demo_timeout,
-        )
-        .await
-    };
+    let native = app.wait_for_stage(
+        WorkflowDuetFlavor::Native,
+        &instance_id,
+        ReviewStage::Approved,
+        demo_timeout,
+    );
+    let sandbox = app.wait_for_stage(
+        WorkflowDuetFlavor::Sandbox,
+        &instance_id,
+        ReviewStage::Approved,
+        demo_timeout,
+    );
     let _ = tokio::try_join!(native, sandbox)?;
 
     let native = app
-        .inspect_instance(WorkflowDuetFlavor::Native, "native-demo")
+        .inspect_instance(WorkflowDuetFlavor::Native, &instance_id)
         .await?
         .expect("native demo run");
     let sandbox = app
-        .inspect_instance(WorkflowDuetFlavor::Sandbox, "sandbox-demo")
+        .inspect_instance(WorkflowDuetFlavor::Sandbox, &instance_id)
         .await?
         .expect("sandbox demo run");
 
     handles.shutdown().await?;
     Ok(WorkflowDuetDemoReport { native, sandbox })
+}
+
+async fn relay_cross_runtime_outbox(
+    db: Db,
+    clock: Arc<dyn Clock>,
+    outbox_table: Table,
+    app: WorkflowDuetApp,
+    source_flavor: WorkflowDuetFlavor,
+    target_flavor: WorkflowDuetFlavor,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), WorkflowDuetError> {
+    let mut subscription = db.subscribe(&outbox_table);
+    loop {
+        let processed =
+            relay_cross_runtime_batch(&db, &outbox_table, &app, source_flavor, target_flavor)
+                .await?;
+        if processed == 0 {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                changed = subscription.changed() => {
+                    changed?;
+                }
+                _ = clock.sleep(RELAY_IDLE_POLL_INTERVAL) => {}
+            }
+        }
+    }
+}
+
+async fn relay_cross_runtime_batch(
+    db: &Db,
+    outbox_table: &Table,
+    app: &WorkflowDuetApp,
+    source_flavor: WorkflowDuetFlavor,
+    target_flavor: WorkflowDuetFlavor,
+) -> Result<usize, WorkflowDuetError> {
+    let mut rows = outbox_table
+        .scan(
+            Vec::new(),
+            vec![0xff],
+            ScanOptions {
+                limit: Some(RELAY_BATCH_LIMIT),
+                ..ScanOptions::default()
+            },
+        )
+        .await?;
+
+    let mut entries = Vec::new();
+    while let Some((outbox_id, value)) = rows.next().await {
+        let entry = decode_outbox_entry(outbox_id, &value)?;
+        let message: ReviewOutboxMessage = serde_json::from_slice(&entry.payload)?;
+        entries.push((entry.outbox_id, message));
+    }
+
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    for (_, message) in &entries {
+        relay_outbox_message(app, source_flavor, target_flavor, message).await?;
+    }
+
+    let mut tx = Transaction::begin(db).await;
+    for (outbox_id, _) in &entries {
+        tx.delete(outbox_table, outbox_id.clone());
+    }
+    tx.commit().await?;
+    Ok(entries.len())
+}
+
+async fn relay_outbox_message(
+    app: &WorkflowDuetApp,
+    source_flavor: WorkflowDuetFlavor,
+    target_flavor: WorkflowDuetFlavor,
+    message: &ReviewOutboxMessage,
+) -> Result<(), WorkflowDuetError> {
+    if message.workflow != source_flavor.workflow_name() {
+        return Ok(());
+    }
+    if message.action != "requested-approval" {
+        return Ok(());
+    }
+
+    let _ = app
+        .relay_approval_if_pair_waiting(target_flavor, &message.instance_id)
+        .await?;
+    Ok(())
 }
 
 pub fn workflow_duet_db_settings(path: &str, prefix: &str) -> DbSettings {
@@ -541,6 +756,13 @@ fn render_target(target: &contracts::WorkflowExecutionTarget) -> String {
         contracts::WorkflowExecutionTarget::NativeRegistration { registration_id } => {
             registration_id.to_string()
         }
+    }
+}
+
+fn source_outbox_table(app: &WorkflowDuetApp, flavor: WorkflowDuetFlavor) -> Table {
+    match flavor {
+        WorkflowDuetFlavor::Native => app.native.tables().outbox_table().clone(),
+        WorkflowDuetFlavor::Sandbox => app.sandbox.tables().outbox_table().clone(),
     }
 }
 

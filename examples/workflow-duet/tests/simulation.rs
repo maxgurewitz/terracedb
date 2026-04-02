@@ -9,9 +9,9 @@ use terracedb_simulation::{SeededSimulationRunner, TurmoilClock};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SimulationCapture {
-    native_ok: WorkflowDuetInspection,
+    paired_native: WorkflowDuetInspection,
+    paired_sandbox: WorkflowDuetInspection,
     native_timeout: WorkflowDuetInspection,
-    sandbox_ok: WorkflowDuetInspection,
     sandbox_timeout: WorkflowDuetInspection,
 }
 
@@ -44,20 +44,25 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
             .await?;
             let handles = app.start().await?;
 
-            app.kick_off(WorkflowDuetFlavor::Native, "native-ok")
-                .await?;
+            app.kick_off_pair("paired-ok").await?;
             app.kick_off(WorkflowDuetFlavor::Native, "native-timeout")
-                .await?;
-            app.kick_off(WorkflowDuetFlavor::Sandbox, "sandbox-ok")
                 .await?;
             app.kick_off(WorkflowDuetFlavor::Sandbox, "sandbox-timeout")
                 .await?;
 
-            let native_waiting = app
+            let paired_native = app
                 .wait_for_stage(
                     WorkflowDuetFlavor::Native,
-                    "native-ok",
-                    ReviewStage::WaitingApproval,
+                    "paired-ok",
+                    ReviewStage::Approved,
+                    Duration::from_millis(250),
+                )
+                .await?;
+            let paired_sandbox = app
+                .wait_for_stage(
+                    WorkflowDuetFlavor::Sandbox,
+                    "paired-ok",
+                    ReviewStage::Approved,
                     Duration::from_millis(250),
                 )
                 .await?;
@@ -65,14 +70,6 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
                 .wait_for_stage(
                     WorkflowDuetFlavor::Native,
                     "native-timeout",
-                    ReviewStage::WaitingApproval,
-                    Duration::from_millis(250),
-                )
-                .await?;
-            let sandbox_waiting = app
-                .wait_for_stage(
-                    WorkflowDuetFlavor::Sandbox,
-                    "sandbox-ok",
                     ReviewStage::WaitingApproval,
                     Duration::from_millis(250),
                 )
@@ -85,9 +82,9 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
                     Duration::from_millis(250),
                 )
                 .await?;
-            assert_eq!(native_waiting.attempt, 2);
+            assert_eq!(paired_native.attempt, 2);
+            assert_eq!(paired_sandbox.attempt, 2);
             assert_eq!(native_timeout_waiting.attempt, 2);
-            assert_eq!(sandbox_waiting.attempt, 2);
             assert_eq!(timeout_waiting.attempt, 2);
 
             handles.abort().await?;
@@ -115,16 +112,9 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
             let reopened_handles = reopened.start().await?;
 
             reopened
-                .approve(WorkflowDuetFlavor::Native, "native-ok")
-                .await?;
-            reopened
-                .approve(WorkflowDuetFlavor::Sandbox, "sandbox-ok")
-                .await?;
-
-            reopened
                 .wait_for_stage(
                     WorkflowDuetFlavor::Native,
-                    "native-ok",
+                    "paired-ok",
                     ReviewStage::Approved,
                     Duration::from_millis(250),
                 )
@@ -132,7 +122,7 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
             reopened
                 .wait_for_stage(
                     WorkflowDuetFlavor::Sandbox,
-                    "sandbox-ok",
+                    "paired-ok",
                     ReviewStage::Approved,
                     Duration::from_millis(250),
                 )
@@ -155,18 +145,18 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
                 .await?;
 
             let capture = SimulationCapture {
-                native_ok: reopened
-                    .inspect_instance(WorkflowDuetFlavor::Native, "native-ok")
+                paired_native: reopened
+                    .inspect_instance(WorkflowDuetFlavor::Native, "paired-ok")
                     .await?
-                    .expect("native inspection"),
+                    .expect("paired native inspection"),
+                paired_sandbox: reopened
+                    .inspect_instance(WorkflowDuetFlavor::Sandbox, "paired-ok")
+                    .await?
+                    .expect("paired sandbox inspection"),
                 native_timeout: reopened
                     .inspect_instance(WorkflowDuetFlavor::Native, "native-timeout")
                     .await?
                     .expect("native timeout inspection"),
-                sandbox_ok: reopened
-                    .inspect_instance(WorkflowDuetFlavor::Sandbox, "sandbox-ok")
-                    .await?
-                    .expect("sandbox inspection"),
                 sandbox_timeout: reopened
                     .inspect_instance(WorkflowDuetFlavor::Sandbox, "sandbox-timeout")
                     .await?
@@ -183,21 +173,27 @@ fn workflow_duet_replays_under_seeded_simulation() -> turmoil::Result {
     let second = run_seeded_example(0x7711)?;
 
     assert_eq!(first, second);
-    assert_eq!(first.native_ok.status, "approved");
+    assert_eq!(first.paired_native.status, "approved");
+    assert_eq!(first.paired_sandbox.status, "approved");
     assert_eq!(first.native_timeout.status, "timed-out");
-    assert_eq!(first.sandbox_ok.status, "approved");
     assert_eq!(first.sandbox_timeout.status, "timed-out");
-    assert_eq!(first.native_ok.attempt, 2);
+    assert_eq!(first.paired_native.attempt, 2);
+    assert_eq!(first.paired_sandbox.attempt, 2);
     assert_eq!(first.native_timeout.attempt, 2);
-    assert_eq!(first.sandbox_ok.attempt, 2);
     assert_eq!(first.sandbox_timeout.attempt, 2);
-    assert_eq!(first.native_ok.lifecycle, "completed");
+    assert_eq!(first.paired_native.lifecycle, "completed");
+    assert_eq!(first.paired_sandbox.lifecycle, "completed");
     assert_eq!(first.native_timeout.lifecycle, "failed");
-    assert_eq!(first.sandbox_ok.lifecycle, "completed");
     assert_eq!(first.sandbox_timeout.lifecycle, "failed");
     assert!(
         first
-            .native_ok
+            .paired_native
+            .visible_statuses
+            .contains(&"approved".to_string())
+    );
+    assert!(
+        first
+            .paired_sandbox
             .visible_statuses
             .contains(&"approved".to_string())
     );
@@ -206,12 +202,6 @@ fn workflow_duet_replays_under_seeded_simulation() -> turmoil::Result {
             .native_timeout
             .visible_statuses
             .contains(&"timed-out".to_string())
-    );
-    assert!(
-        first
-            .sandbox_ok
-            .visible_statuses
-            .contains(&"approved".to_string())
     );
     assert!(
         first
