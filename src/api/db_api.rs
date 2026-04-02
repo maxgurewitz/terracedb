@@ -3536,16 +3536,15 @@ impl Db {
         let Some(route) = route else {
             return;
         };
-        self.memtables_write().force_collapse(
-            table_id,
-            route.physical_shard,
-            route.virtual_partition,
-            route.shard_map_revision,
-            key.to_vec(),
-            collapse.sequence,
-            collapse.value,
-            self.inner.dependencies.clock.now(),
-        );
+        self.memtables_write()
+            .force_collapse(super::memtable::CollapsedWrite {
+                table_id,
+                route,
+                key: key.to_vec(),
+                sequence: collapse.sequence,
+                value: collapse.value,
+                now: self.inner.dependencies.clock.now(),
+            });
     }
 
     pub(super) fn scan_visible_row_with_state(

@@ -1463,27 +1463,29 @@ impl Db {
             );
             let output = match table.config.format {
                 TableFormat::Row => {
-                    self.write_row_sstable(
-                        &path,
-                        table.id,
+                    self.write_row_sstable(super::sstable_io::RowSstableWriteRequest {
+                        target: super::sstable_io::SstableWriteTarget::LocalPath(path),
+                        table_id: table.id,
                         level,
                         local_id,
-                        output_rows,
-                        Some(shard_ownership.clone()),
-                        table.config.bloom_filter_bits_per_key,
-                    )
+                        rows: output_rows,
+                        shard_ownership: Some(shard_ownership.clone()),
+                        bloom_filter_bits_per_key: table.config.bloom_filter_bits_per_key,
+                    })
                     .await?
                 }
                 TableFormat::Columnar => {
                     self.write_columnar_table_output(
-                        &path,
-                        level,
-                        local_id,
-                        table,
-                        output_rows,
-                        Some(shard_ownership),
-                        Some(applied_generation),
-                        inputs,
+                        super::sstable_io::ColumnarTableOutputRequest {
+                            target: super::sstable_io::SstableWriteTarget::LocalPath(path),
+                            level,
+                            local_id,
+                            stored: table,
+                            rows: output_rows,
+                            shard_ownership: Some(shard_ownership),
+                            applied_generation: Some(applied_generation),
+                            inputs,
+                        },
                     )
                     .await?
                 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{PhysicalShardId, ShardMapRevision, Timestamp, VirtualPartitionId};
+use crate::{KeyShardRoute, PhysicalShardId, ShardMapRevision, Timestamp, VirtualPartitionId};
 
 #[derive(Clone, Debug)]
 pub(super) struct MemtableEntry {
@@ -62,6 +62,16 @@ impl TableMemtableKey {
             physical_shard,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CollapsedWrite {
+    pub(super) table_id: TableId,
+    pub(super) route: KeyShardRoute,
+    pub(super) key: Key,
+    pub(super) sequence: SequenceNumber,
+    pub(super) value: Value,
+    pub(super) now: Timestamp,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -315,18 +325,15 @@ impl Memtable {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn force_collapse(
-        &mut self,
-        table_id: TableId,
-        physical_shard: PhysicalShardId,
-        virtual_partition: VirtualPartitionId,
-        shard_map_revision: ShardMapRevision,
-        key: Key,
-        sequence: SequenceNumber,
-        value: Value,
-        now: Timestamp,
-    ) {
+    pub(super) fn force_collapse(&mut self, collapse: CollapsedWrite) {
+        let CollapsedWrite {
+            table_id,
+            route,
+            key,
+            sequence,
+            value,
+            now,
+        } = collapse;
         self.min_sequence = Some(
             self.min_sequence
                 .map(|current| current.min(sequence))
@@ -334,7 +341,7 @@ impl Memtable {
         );
         self.max_sequence = self.max_sequence.max(sequence);
         self.tables
-            .entry(TableMemtableKey::new(table_id, physical_shard))
+            .entry(TableMemtableKey::new(table_id, route.physical_shard))
             .or_default()
             .insert(
                 MemtableEntry::new(
@@ -342,9 +349,9 @@ impl Memtable {
                     sequence,
                     ChangeKind::Put,
                     Some(value),
-                    physical_shard,
-                    virtual_partition,
-                    shard_map_revision,
+                    route.physical_shard,
+                    route.virtual_partition,
+                    route.shard_map_revision,
                 ),
                 now,
             );
@@ -1328,28 +1335,8 @@ impl MemtableState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn force_collapse(
-        &mut self,
-        table_id: TableId,
-        physical_shard: PhysicalShardId,
-        virtual_partition: VirtualPartitionId,
-        shard_map_revision: ShardMapRevision,
-        key: Key,
-        sequence: SequenceNumber,
-        value: Value,
-        now: Timestamp,
-    ) {
-        self.mutable.force_collapse(
-            table_id,
-            physical_shard,
-            virtual_partition,
-            shard_map_revision,
-            key,
-            sequence,
-            value,
-            now,
-        );
+    pub(super) fn force_collapse(&mut self, collapse: CollapsedWrite) {
+        self.mutable.force_collapse(collapse);
     }
 
     pub(super) fn rotate_mutable(&mut self) -> Option<SequenceNumber> {
