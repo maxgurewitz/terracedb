@@ -6,7 +6,6 @@
 
 pub mod adapters;
 mod boa;
-pub mod compat;
 pub mod entropy;
 pub mod error;
 pub mod host;
