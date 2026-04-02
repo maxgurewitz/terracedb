@@ -1446,6 +1446,183 @@ Rework the premature example-app implementation after the runtime and SDK direct
 
 ---
 
+## Additional Follow-On Tasks
+
+These tasks came out of actually implementing the runtime and duet example above. They are narrower than W01-W06 and mostly reflect places where the current design is right but the current product surface is still more awkward than it should be.
+
+### W07. Let sandbox workflows target TypeScript entrypoints directly instead of manually emitting JavaScript first
+
+**Depends on:** W04
+
+**Description**
+
+The current duet example proved that a sandbox workflow can be authored in TypeScript and use npm packages, but the host still had to install packages and call `emit_typescript(...)` before the workflow runtime could open the emitted JavaScript entrypoint. That is the wrong long-term authoring model. Workflow publication or runtime open should accept TypeScript entrypoints directly and make package installation plus TypeScript emission an internal step.
+
+**Implementation steps**
+
+1. Allow sandbox workflow bundle metadata or publication requests to name a TypeScript source entrypoint directly.
+2. Move package install, typecheck, and emit into the workflow preparation path instead of forcing example or application code to call them manually.
+3. Record the emitted runtime entrypoint and any related preparation metadata as runtime-owned internal state rather than as ad hoc application setup.
+4. Keep the built-in workflow SDK and generated capability imports available to the TypeScript authoring surface without requiring manual mirror setup in each example.
+5. Remove or backtrack example code paths that have to seed a pre-emitted JavaScript file just to run a TypeScript-authored workflow.
+
+**Verification**
+
+- Example-level tests where the sandbox workflow source exists only as `.ts`, with no preseeded `.js` entrypoint.
+- Publish or runtime-open tests proving npm install and TypeScript emit happen automatically and deterministically.
+- Restart tests proving a reopened runtime can reuse the prepared TypeScript artifact without redoing unnecessary work.
+
+### W08. Either support a fuller TypeScript surface or define and enforce a much clearer supported subset
+
+**Depends on:** W04
+
+**Description**
+
+Implementing the TypeScript duet workflow exposed that the current deterministic TypeScript path is still a constrained transpiler rather than a full TypeScript compiler. That is acceptable only if the supported subset is clear, intentionally small, and enforced early. Otherwise AI-authored workflows will keep accidentally writing syntax that looks reasonable but fails later in confusing ways.
+
+**Implementation steps**
+
+1. Decide whether the deterministic TypeScript path should stay a constrained subset for now or move closer to a fuller compiler surface.
+2. If it stays constrained, document the supported subset explicitly and reject unsupported syntax early with direct diagnostics.
+3. If it expands, prioritize the syntax patterns most likely to appear in AI-authored workflow code:
+   - common type aliases,
+   - interfaces,
+   - multiline declarations,
+   - ordinary return type annotations,
+   - and straightforward object typing.
+4. Add conformance fixtures for intentionally supported and intentionally unsupported syntax so regressions are obvious.
+5. Keep the workflow example suite on the supported surface so the public examples do not silently rely on quirks.
+
+**Verification**
+
+- TypeScript conformance tests for supported workflow-source syntax.
+- Clear failing diagnostics for unsupported syntax rather than malformed emitted JavaScript.
+- Example tests proving the public workflow examples stay inside the intended TypeScript surface.
+
+### W09. Make package compatibility mode a first-class workflow publication concept rather than buried host setup
+
+**Depends on:** W04, W07
+
+**Description**
+
+The difference between “Terrace-only imports” and “real npm-backed workflow project” is currently too easy to hide inside host-side sandbox config. That makes workflow validity depend on operational setup instead of on the authored workflow package or publication request. Package compatibility should be a clear authored or published property of the sandbox workflow itself.
+
+**Implementation steps**
+
+1. Add explicit package-compat or package-surface metadata to sandbox workflow publication or bundle configuration.
+2. Validate that metadata before runtime open so a workflow that expects npm packages cannot accidentally run in `TerraceOnly` mode.
+3. Keep import-surface diagnostics aligned with that declared compatibility mode.
+4. Surface the chosen compatibility mode in workflow inspection or bundle metadata so operators can see it easily.
+5. Remove or reduce host-side example code that implicitly decides package mode without the workflow package declaring it.
+
+**Verification**
+
+- Publication tests proving workflows that depend on npm packages fail early when published against a Terrace-only compatibility mode.
+- Loader and typecheck tests proving imports are accepted or rejected consistently with the declared mode.
+- Inspection or metadata tests proving the chosen mode is visible after publication.
+
+### W10. Introduce a higher-level first-class workflow-to-workflow interaction primitive so simple relays do not require custom outbox plumbing
+
+**Depends on:** W03, W04, W05
+
+**Description**
+
+The duet example showed that cross-runtime interaction works well over durable outbox plus callback surfaces, but it also showed that the raw relay loop is more infrastructure-shaped than most users should have to write. The runtime should grow a more direct primitive for common workflow-to-workflow interaction patterns.
+
+**Implementation steps**
+
+1. Decide which interaction should become first-class first:
+   - child workflow spawn,
+   - cross-workflow signal,
+   - message send,
+   - or a small combination of those.
+2. Lower that primitive onto the same durable outbox, inbox, callback, or signal machinery already used by the relay implementation.
+3. Keep the relay-level mechanics internal so public workflow code does not have to scan raw outbox tables for common interactions.
+4. Make the primitive work for both sandbox-authored workflows and native Rust workflows.
+5. Update the duet example to prefer the higher-level primitive once it exists.
+
+**Verification**
+
+- Example tests proving a native Rust workflow and a sandbox TypeScript workflow can interact without custom outbox relay code.
+- Restart and replay tests proving the higher-level primitive preserves deterministic behavior.
+- Internal parity tests proving the new primitive still lowers to the durable messaging machinery correctly.
+
+### W11. Add better runtime and harness readiness helpers for deterministic tests and local examples
+
+**Depends on:** W03
+
+**Description**
+
+The duet example exposed avoidable races around “workflow has been started” versus “workflow has reached its first stable state” before clocks or interactions advance. The current example solved that with `kick_off_pair(...)`, but the underlying need is broader. The runtime and harness should expose better readiness helpers so deterministic tests and demos do not have to reinvent them.
+
+**Implementation steps**
+
+1. Add runtime or harness helpers for common readiness states such as:
+   - workflow runtime loop started,
+   - instance exists,
+   - instance reached first persisted state,
+   - or instance reached a named visible status.
+2. Prefer those helpers in examples and deterministic tests rather than hard-coded sleeps or guesswork.
+3. Ensure readiness helpers work the same way for sandbox and native workflows.
+4. Keep readiness waiting durable-state-based rather than relying on wall-clock timing.
+5. Remove ad hoc example-specific readiness scaffolding where a shared helper is sufficient.
+
+**Verification**
+
+- Example tests rewritten to use readiness helpers rather than incidental timing assumptions.
+- Deterministic simulation tests proving readiness helpers behave consistently across repeated seeds.
+- Crash and restart tests proving readiness checks still work after reopening runtimes.
+
+### W12. Treat package installation and TypeScript emission as reusable cached workflow build artifacts
+
+**Depends on:** W07, W09
+
+**Description**
+
+Preparing a sandbox TypeScript workflow currently wants to reinstall packages and re-emit TypeScript in places where the result should be reusable. That work should become a cached workflow build artifact keyed by the source snapshot, lockfile, declared package compatibility mode, and runtime surface.
+
+**Implementation steps**
+
+1. Define the cache key for prepared sandbox workflow artifacts from:
+   - source snapshot,
+   - package manifests or lockfiles,
+   - package compatibility mode,
+   - and runtime surface.
+2. Cache package-install manifests, compatibility views, and emitted workflow entrypoints under that key.
+3. Reuse prepared artifacts across runtime open, replay, preview, and deterministic tests when the key matches.
+4. Invalidate cached artifacts cleanly when source, lockfile, package mode, or runtime surface changes.
+5. Keep the cache an internal optimization rather than a new author-facing concept.
+
+**Verification**
+
+- Repeated-open tests proving package install and emit work become cache hits when the input key is unchanged.
+- Invalidation tests proving source or lockfile changes produce fresh prepared artifacts.
+- Replay and preview tests proving cached prepared artifacts do not change workflow semantics.
+
+### W13. Keep visible workflow summaries simple and easy to assert against
+
+**Depends on:** W02, W04, W05
+
+**Description**
+
+The duet implementation used workflow visibility as the clearest place to prove that the sandbox workflow had actually executed `lodash.camelCase(...)`. That is a strong signal that the visible-summary surface is valuable both for operators and for tests. We should preserve that property deliberately.
+
+**Implementation steps**
+
+1. Keep workflow visibility summaries small, string-keyed, and easy to inspect from both sandbox and native paths.
+2. Make the public inspection surface return the latest visible summary directly, not just a history list.
+3. Encourage examples and tests to assert important user-visible behavior through visibility summaries when appropriate.
+4. Keep visibility projection separate from recovery truth so it remains easy to read without constraining compaction.
+5. Add guidance for when workflow authors should put something in visibility versus in hidden recovery state.
+
+**Verification**
+
+- Inspection tests proving the latest visibility summary is easy to fetch and compare.
+- Example tests that assert on real user-visible summary data, not just internal state transitions.
+- Rebuild tests proving visibility can change presentation without affecting replay correctness.
+
+---
+
 ## Glossary
 
 - **Workflow**: Durable code that can pause, resume, and survive crashes.
