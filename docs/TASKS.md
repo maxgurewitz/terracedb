@@ -2413,7 +2413,7 @@ Add a small, teachable example project that demonstrates what the sandbox is for
 
 ## Phase 8b — Simulation-native JavaScript runtime and VFS-native git convergence
 
-**Phase rule:** T40j freezes the shared `terracedb-js` / `terracedb-git` substrate boundary, host-service contracts, fork policy, and deterministic seams first so the phase can parallelize aggressively without interface churn. `terracedb-js` is the architectural home of guest-observable JavaScript semantics, `terracedb-git` is the architectural home of repository semantics, and both must consume the same VFS, scheduling, cancellation, time, entropy, capability, and host-bridge model.
+**Phase rule:** T40j freezes the shared `terracedb-js` / `terracedb-git` substrate boundary, host-service contracts, fork policy, and deterministic seams first so the phase can parallelize aggressively without interface churn. `terracedb-js` is the architectural home of guest-observable JavaScript semantics, `terracedb-git` is the architectural home of repository semantics, and both must consume the same VFS, scheduling, cancellation, time, entropy, capability, and host-bridge model. `boa_engine`, `boa_runtime`, and `boa_wintertc` may remain internal implementation details underneath `terracedb-js`, but crates outside `terracedb-js` should consume the migrated runtime surfaces through `terracedb-js` and its host-service boundary rather than depending on or importing Boa directly.
 
 **Simulation rule:** Every implementation task in this phase must extend the deterministic oracle/cut-point/simulation harness in the same change as the production-path change. When a behavior becomes owned by `terracedb-js` or `terracedb-git`, its primary coverage must move from real-runtime, real-filesystem, or threaded-I/O integration tests into simulation-backed tests immediately. Narrow real runtime / host-service / host-filesystem tests may remain only for explicit `JsHostServices` or `GitHostBridge` conformance and end-to-end bridge smoke behavior. T40q is additive cross-cutting hardening, not a substitute for task-local simulation in T40k-T40p.
 
@@ -2520,7 +2520,7 @@ Bring the Boa-based runtime core into the workspace and replace the first layer 
 
 **Description**
 
-Implement the deterministic core of the JavaScript runtime: VFS-native module loading, host-owned scheduling, injected time, and injected entropy. This task is where guest execution stops depending on ambient host cwd, wall-clock timers, and process randomness for its semantically important behavior.
+Implement the deterministic core of the JavaScript runtime: VFS-native module loading, host-owned scheduling, injected time, and injected entropy. This task is where guest execution stops depending on ambient host cwd, wall-clock timers, and process randomness for its semantically important behavior. For the module-loading and execution flows covered here, `terracedb-js` becomes the semantic owner even if it continues to use Boa internally, and downstream crates such as `terracedb-sandbox` should stop importing or depending on Boa directly for those paths.
 
 **Implementation steps**
 
@@ -2535,13 +2535,15 @@ Implement the deterministic core of the JavaScript runtime: VFS-native module lo
    - `Math.random`,
    - future `crypto.getRandomValues` / `crypto.randomUUID` or equivalent compatibility surfaces.
 5. Remove, gate, or explicitly isolate blocking/runtime-owned behaviors such as hidden host sleeps, blocking waits, or other APIs that cannot participate honestly in the simulated path.
-6. Migrate the sandbox's core module-loading and execution flows onto `terracedb-js` rather than the earlier ad hoc runtime wrapper, and replace real-runtime or threaded-I/O tests whose semantics now live inside `terracedb-js`.
+6. Migrate the sandbox's core module-loading and execution flows onto `terracedb-js` rather than the earlier ad hoc runtime wrapper. This migration explicitly includes removing direct `boa_engine`, `boa_runtime`, and `boa_wintertc` coupling from `terracedb-sandbox` for those flows, while still allowing `terracedb-js` to keep Boa as its internal execution backend, and replacing real-runtime or threaded-I/O tests whose semantics now live inside `terracedb-js`.
 
 **Verification**
 
 - Tests covering module resolution and loading over VFS-backed snapshots, overlays, capability modules, and package-backed modules.
 - Deterministic simulation tests for timer ordering, microtask scheduling, time advancement, and seeded entropy behavior across restart and replay.
 - Tests proving `Math.random` or equivalent guest-visible randomness is deterministic under seeded replay and does not call process RNG directly.
+- Compile/package-level checks showing the migrated sandbox runtime path no longer depends on Boa directly, and that direct `boa_engine`, `boa_runtime`, or `boa_wintertc` imports/dependencies outside `terracedb-js` are removed for the module-loading and execution surfaces covered by this task.
+- Coverage or conformance notes showing `terracedb-js` remains free to use Boa internally as its backend while still owning the guest-observable semantics for the migrated path.
 
 ---
 
@@ -2551,7 +2553,7 @@ Implement the deterministic core of the JavaScript runtime: VFS-native module lo
 
 **Description**
 
-Build the host-API layer above the simulation-native runtime core. This task covers console/process/fetch/timer/crypto-style compatibility, the production and fake host-service adapters behind those APIs, and the migration of sandbox TypeScript/package/shell flows so they use `terracedb-js` as the runtime home rather than a parallel integration path.
+Build the host-API layer above the simulation-native runtime core. This task covers console/process/fetch/timer/crypto-style compatibility, the production and fake host-service adapters behind those APIs, and the migration of sandbox TypeScript, package-install, shell, and runtime compatibility flows so they run through `terracedb-js` and its host-service boundary rather than a parallel Boa-based integration path in `terracedb-sandbox`.
 
 **Implementation steps**
 
@@ -2564,7 +2566,7 @@ Build the host-API layer above the simulation-native runtime core. This task cov
 2. Wrap, fork, or replace the useful pieces of `boa_runtime` and `boa_wintertc` so those surfaces consume the frozen `terracedb-js` host-service traits instead of ambient host behavior.
 3. Ensure manifest and deployment policy, rather than ambient process state, determine which compatibility services are visible to one sandbox session.
 4. Add deterministic fake host-service implementations for registry fetches, network-like calls, console sinks, and other side effects so sandbox package/runtime behavior can be replayed without real host access.
-5. Migrate sandbox TypeScript, package-install, shell-bridge, and capability-invocation flows onto the new runtime/host-service model.
+5. Migrate sandbox TypeScript, package-install, shell-bridge, capability-invocation, and other runtime compatibility / host-service flows onto the new `terracedb-js` runtime plus `terracedb-js-host-services` boundary, removing parallel Boa-based paths from `terracedb-sandbox` for the surfaces this task covers.
 6. Replace or demote existing tests that exercise these semantics only through real runtime helpers, real network calls, or threaded I/O; the new primary coverage should be deterministic simulation against `terracedb-js` plus fake host services.
 
 **Verification**
@@ -2572,6 +2574,8 @@ Build the host-API layer above the simulation-native runtime core. This task cov
 - Integration tests for console/process/fetch/package/shell flows through the `terracedb-js` host-service boundary.
 - Deterministic simulation tests for fake-registry, fake-network, and fake-console behavior as observed through guest code.
 - Tests proving capability and host-service visibility follow manifest/policy decisions rather than ambient process state.
+- Compile/package-level checks showing `terracedb-sandbox` no longer depends on Boa directly for the migrated compatibility and host-service runtime path, and that direct `boa_engine`, `boa_runtime`, or `boa_wintertc` imports/dependencies outside `terracedb-js` are removed for the TypeScript/package/shell/runtime surfaces covered by this task.
+- Coverage or conformance notes showing `terracedb-js` may still use Boa internally as its backend while the public ownership boundary for those guest-visible compatibility semantics stays at `terracedb-js` and `terracedb-js-host-services`.
 
 ---
 
