@@ -3,10 +3,10 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use terracedb::{
     AdmissionDiagnostics, ColocatedDatabasePlacement, ColocatedDeployment,
-    ColocatedDeploymentError, CompactionStrategy, DbConfig, DbSettings,
-    ExecutionDomainBacklogSnapshot, ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane,
-    ExecutionResourceUsage, PressureStats, S3Location, TableConfig, TableFormat,
-    TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig,
+    ColocatedDeploymentError, DbConfig, DbSettings, ExecutionDomainBacklogSnapshot,
+    ExecutionDomainBudget, ExecutionDomainPath, ExecutionLane, ExecutionResourceUsage,
+    PressureStats, S3Location, TableConfig, TieredDurabilityMode, TieredLocalRetentionMode,
+    TieredStorageConfig,
 };
 
 pub const PRIMARY_DATABASE_NAME: &str = "primary";
@@ -363,19 +363,7 @@ pub fn domains_db_config(path: &str, prefix: &str) -> DbConfig {
 }
 
 pub fn row_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: Default::default(),
-    }
+    TableConfig::row(name).build()
 }
 
 trait Pipe: Sized {

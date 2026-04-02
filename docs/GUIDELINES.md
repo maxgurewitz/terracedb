@@ -35,6 +35,9 @@ ready, prefer replacing the old path and updating callsites rather than adding
 
 - Favor explicit, intention-revealing APIs over convenience wrappers that hide
   ordering, durability, or visibility semantics.
+- If a helper may replay caller code, make that replay contract explicit in the
+  API shape. Retry loops that may rerun callbacks on OCC conflicts must require
+  an explicit replay-safe opt-in and the callback body must stay transaction-local.
 - Keep "current state" and "historical state" separate in names and types.
   If both matter, expose both explicitly.
 - Use immutable published snapshots or ordered event streams for observability.
@@ -191,6 +194,10 @@ Example apps must follow the same simulation-testability rules as libraries:
   to copy.
 - If a library gains a better readiness, progress, or observability surface,
   migrate the examples to use it.
+- Treat table bootstrap APIs as part of that pattern surface:
+  `Db::ensure_table` means the persisted definition must still match exactly,
+  while `get_or_create_table_by_name` is the explicit escape hatch for tables
+  whose persisted definition is expected to evolve, such as resharded tables.
 
 ## Documentation Maintenance
 

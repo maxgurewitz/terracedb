@@ -14,6 +14,7 @@ members = [
     "crates/terracedb-procedures",
     "crates/terracedb-retention",
     "examples/domains-api",
+    "examples/chat-rooms-api",
     "examples/order-watch",
     "examples/retention-api",
     "examples/sandbox-notes",

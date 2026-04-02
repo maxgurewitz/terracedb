@@ -3,9 +3,9 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use futures::StreamExt;
 use terracedb::{
-    Clock, CommitOptions, CompactionStrategy, Db, DbConfig, DeterministicRng, OutboxEntry, Rng,
-    S3Location, ScanOptions, SsdConfig, StorageConfig, Table, TableConfig, TableFormat,
-    TieredDurabilityMode, TieredStorageConfig, Transaction, Value,
+    Clock, CommitOptions, Db, DbConfig, DeterministicRng, OutboxEntry, Rng, S3Location,
+    ScanOptions, SsdConfig, StorageConfig, Table, TableConfig, TieredDurabilityMode,
+    TieredStorageConfig, Transaction, Value,
 };
 use terracedb_fuzz::{GeneratedScenarioHarness, assert_seed_replays, assert_seed_variation};
 use terracedb_relays::{OutboxRelay, OutboxRelayHandler, RelayEntry};
@@ -35,19 +35,7 @@ fn simulation_config(root_path: &str) -> DbConfig {
 }
 
 fn row_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: Default::default(),
-    }
+    TableConfig::row(name).build()
 }
 
 #[derive(Debug, Error)]

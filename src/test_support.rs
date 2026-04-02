@@ -1,11 +1,9 @@
-use std::{
-    collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration,
-};
+use std::{env, fs, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
 
 use crate::{
-    Clock, CompactionStrategy, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig,
-    StubClock, StubFileSystem, StubObjectStore, StubRng, TableConfig, TableFormat,
-    TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig, Value,
+    Clock, Db, DbConfig, DbDependencies, S3Location, SsdConfig, StorageConfig, StubClock,
+    StubFileSystem, StubObjectStore, StubRng, TableConfig, TieredDurabilityMode,
+    TieredLocalRetentionMode, TieredStorageConfig, Value,
 };
 use tokio::task::JoinHandle;
 
@@ -129,19 +127,7 @@ impl<'a> ClockProgressProbe<'a> {
 }
 
 pub fn row_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: BTreeMap::new(),
-    }
+    TableConfig::row(name).build()
 }
 
 pub fn bytes(value: &str) -> Value {

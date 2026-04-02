@@ -1,10 +1,11 @@
 use super::watermark::{DbProgressSnapshot, DbProgressSubscription};
 use super::*;
 use crate::execution::{
-    DbExecutionProfile, DomainTaggedWork, ExecutionBacklogGuard, ExecutionDomainBudget,
-    ExecutionDomainOwner, ExecutionDomainPath, ExecutionLane, ExecutionResourceUsage,
-    ExecutionUsageLease, ResourceAdmissionDecision, ResourceManager, ResourceManagerSnapshot,
-    ResourceManagerSubscription, WorkRuntimeTag,
+    DbExecutionProfile, DomainTaggedWork, ExecutionBacklogGuard, ExecutionBacklogPublisher,
+    ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath, ExecutionLane,
+    ExecutionResourceUsage, ExecutionUsageLease, ResourceAdmissionDecision, ResourceManager,
+    ResourceManagerSnapshot, ResourceManagerSubscription, ShardExecutionDomainProfile,
+    WorkRuntimeTag,
 };
 use crate::{
     AdmissionObservationReceiver, SchedulerObservabilitySubscription, Timestamp, ZoneMapPredicate,
@@ -575,8 +576,52 @@ impl Db {
         Ok(table)
     }
 
-    /// Creates the table if it does not exist, otherwise returns the existing handle.
+    /// Creates the table if it does not exist, otherwise returns the existing handle only when
+    /// the persisted table definition matches exactly.
+    ///
+    /// Use this for stable table definitions where any persisted drift should fail closed, such
+    /// as library-owned tables or application tables whose compaction, schema, and sharding
+    /// definition are expected to stay fixed across reopen.
     pub async fn ensure_table(&self, config: TableConfig) -> Result<Table, CreateTableError> {
+        let table_name = config.name.clone();
+        let requested_config = config.clone();
+        match self.create_table(config).await {
+            Ok(table) => Ok(table),
+            Err(CreateTableError::AlreadyExists(_)) => {
+                let Some(existing) = self.tables_read().get(&table_name).cloned() else {
+                    return Err(CreateTableError::Storage(StorageError::not_found(format!(
+                        "table does not exist: {table_name}"
+                    ))));
+                };
+                if Self::same_persisted_table_config(&existing.config, &requested_config) {
+                    return Ok(Table {
+                        db: self.clone(),
+                        name: Arc::from(table_name),
+                        id: Some(existing.id),
+                    });
+                }
+                Err(CreateTableError::DefinitionMismatch {
+                    table_name,
+                    details: Self::describe_persisted_table_config_difference(
+                        &existing.config,
+                        &requested_config,
+                    ),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Creates the table if it does not exist, otherwise returns the existing handle by name
+    /// without validating the current persisted definition.
+    ///
+    /// Prefer [`Self::ensure_table`] unless a caller intentionally wants name-only lookup
+    /// semantics for persisted definitions that are expected to evolve after creation, such as
+    /// tables whose shard map may change after resharding.
+    pub async fn get_or_create_table_by_name(
+        &self,
+        config: TableConfig,
+    ) -> Result<Table, CreateTableError> {
         let table_name = config.name.clone();
         match self.create_table(config).await {
             Ok(table) => Ok(table),
@@ -969,7 +1014,52 @@ impl Db {
         )
     }
 
-    fn shard_ready_layout(&self) -> Option<crate::ShardReadyPlacementLayout> {
+    /// Returns a publisher suited for long-lived direct backlog observations.
+    pub fn backlog_publisher(&self) -> ExecutionBacklogPublisher {
+        ExecutionBacklogPublisher::new(self.resource_manager())
+    }
+
+    /// Returns the canonical shard-ready layout when this database is bound to shard-ready paths.
+    pub fn shard_ready_layout(&self) -> Result<crate::ShardReadyPlacementLayout, StorageError> {
+        self.detect_shard_ready_layout().ok_or_else(|| {
+            StorageError::unsupported(format!(
+                "database '{}' is not using the shard-ready colocated layout",
+                self.execution_identity()
+            ))
+        })
+    }
+
+    /// Returns the preferred execution placement for one physical shard.
+    pub fn shard_execution_placement(
+        &self,
+        shard: crate::PhysicalShardId,
+    ) -> Result<crate::ShardExecutionPlacement, StorageError> {
+        Ok(shard.execution_placement(&self.shard_ready_layout()?))
+    }
+
+    /// Registers shard-local execution domains for the given physical shards.
+    pub fn register_shard_execution_domains<I>(
+        &self,
+        shards: I,
+        profile: &ShardExecutionDomainProfile,
+    ) -> Result<(), StorageError>
+    where
+        I: IntoIterator<Item = crate::PhysicalShardId>,
+    {
+        let layout = self.shard_ready_layout()?;
+        let manager = self.resource_manager();
+        for shard in shards {
+            if shard == crate::PhysicalShardId::UNSHARDED {
+                continue;
+            }
+            for spec in profile.specs_for_shard(&layout, shard) {
+                manager.register_domain(spec);
+            }
+        }
+        Ok(())
+    }
+
+    fn detect_shard_ready_layout(&self) -> Option<crate::ShardReadyPlacementLayout> {
         let layout = crate::ShardReadyPlacementLayout::new(self.execution_identity().to_string());
         (self.execution_profile().foreground.domain
             == layout.database_lane_path(ExecutionLane::UserForeground)
@@ -984,7 +1074,7 @@ impl Db {
         &self,
         path: &ExecutionDomainPath,
     ) -> Option<ExecutionDomainPath> {
-        let layout = self.shard_ready_layout()?;
+        let layout = self.detect_shard_ready_layout()?;
         if !path.is_same_or_descendant_of(&layout.future_shard_namespace) {
             return None;
         }
@@ -1041,7 +1131,7 @@ impl Db {
             return base.clone();
         }
 
-        self.shard_ready_layout()
+        self.detect_shard_ready_layout()
             .map(|layout| {
                 crate::ExecutionLaneBinding::new(
                     layout.future_shard_lane_path(physical_shard.to_string(), lane),
@@ -2132,7 +2222,7 @@ impl Db {
         .any(|configured| {
             configured.is_same_or_descendant_of(path) || path.is_same_or_descendant_of(configured)
         }) || self
-            .shard_ready_layout()
+            .detect_shard_ready_layout()
             .is_some_and(|layout| path.is_same_or_descendant_of(&layout.future_shard_namespace))
     }
 
@@ -3631,6 +3721,12 @@ impl Db {
             CreateTableError::InvalidConfig(message) => {
                 crate::PublishShardMapError::Storage(StorageError::unsupported(message))
             }
+            CreateTableError::DefinitionMismatch {
+                table_name,
+                details,
+            } => crate::PublishShardMapError::Storage(StorageError::unsupported(format!(
+                "catalog persist unexpectedly reported a definition mismatch for {table_name}: {details}"
+            ))),
             CreateTableError::AlreadyExists(table_name) => {
                 crate::PublishShardMapError::Storage(StorageError::unsupported(format!(
                     "catalog persist unexpectedly reported duplicate table {table_name}"
@@ -3646,6 +3742,12 @@ impl Db {
         match error {
             CreateTableError::Storage(error) => error,
             CreateTableError::InvalidConfig(message) => StorageError::unsupported(message),
+            CreateTableError::DefinitionMismatch {
+                table_name,
+                details,
+            } => StorageError::unsupported(format!(
+                "catalog persist unexpectedly reported a definition mismatch for {table_name}: {details}"
+            )),
             CreateTableError::Unimplemented(message) => StorageError::unsupported(message),
             CreateTableError::AlreadyExists(table_name) => StorageError::unsupported(format!(
                 "catalog persist unexpectedly reported duplicate table {table_name}"

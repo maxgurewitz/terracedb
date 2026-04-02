@@ -343,6 +343,49 @@ impl ShardingConfig {
     pub fn preserves_physical_assignments(&self, other: &Self) -> Result<bool, ShardingError> {
         Ok(self.shard_assignments()? == other.shard_assignments()?)
     }
+
+    pub fn move_partition(
+        &self,
+        partition: VirtualPartitionId,
+        target_physical_shard: PhysicalShardId,
+    ) -> Result<Self, ShardingError> {
+        self.validate()?;
+        let Self::Hash(current) = self else {
+            return Err(ShardingError::IncompatibleReshardIdentity {
+                source_virtual_partition_count: self.virtual_partition_count(),
+                target_virtual_partition_count: self.virtual_partition_count(),
+                source_hash_algorithm: self.hash_algorithm(),
+                target_hash_algorithm: self.hash_algorithm(),
+            });
+        };
+
+        let slot = partition.get() as usize;
+        let Some(current_shard) = current
+            .physical_shards_by_virtual_partition
+            .get(slot)
+            .copied()
+        else {
+            return Err(ShardingError::PartitionOutOfRange {
+                partition,
+                virtual_partition_count: current.virtual_partition_count,
+            });
+        };
+        if current_shard == target_physical_shard {
+            return Err(ShardingError::PartitionAlreadyAssigned {
+                partition,
+                physical_shard: target_physical_shard,
+            });
+        }
+
+        let mut assignments = current.physical_shards_by_virtual_partition.clone();
+        assignments[slot] = target_physical_shard;
+        Self::hash(
+            current.virtual_partition_count,
+            current.hash_algorithm,
+            ShardMapRevision::new(current.shard_map_revision.get().saturating_add(1)),
+            assignments,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -787,8 +830,25 @@ pub enum ReshardPlanPhase {
 }
 
 impl ReshardPlanPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Copying => "copying",
+            Self::ManifestInstalled => "manifest_installed",
+            Self::RevisionPublished => "revision_published",
+            Self::Completed => "completed",
+            Self::Aborted => "aborted",
+        }
+    }
+
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Aborted)
+    }
+}
+
+impl fmt::Display for ReshardPlanPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -965,6 +1025,11 @@ pub enum ShardingError {
         current_revision: ShardMapRevision,
         published_revision: ShardMapRevision,
     },
+    #[error("virtual partition {partition} is already assigned to physical shard {physical_shard}")]
+    PartitionAlreadyAssigned {
+        partition: VirtualPartitionId,
+        physical_shard: PhysicalShardId,
+    },
     #[error("decode terracedb sharding metadata failed: {message}")]
     InvalidPersistedMetadata { message: String },
 }
@@ -1054,4 +1119,58 @@ pub(crate) fn decode_persisted_table_metadata(
         ))
     })?;
     Ok((metadata, sharding, resharding))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_partition_reassigns_target_and_bumps_revision() {
+        let base = ShardingConfig::hash(
+            4,
+            ShardHashAlgorithm::Crc32,
+            ShardMapRevision::new(7),
+            vec![
+                PhysicalShardId::new(0),
+                PhysicalShardId::new(0),
+                PhysicalShardId::new(1),
+                PhysicalShardId::new(1),
+            ],
+        )
+        .expect("base sharding");
+
+        let moved = base
+            .move_partition(VirtualPartitionId::new(0), PhysicalShardId::new(2))
+            .expect("move partition");
+
+        assert_eq!(moved.current_revision(), ShardMapRevision::new(8));
+        assert_eq!(
+            moved
+                .physical_shard_for_partition(VirtualPartitionId::new(0))
+                .expect("partition assignment"),
+            PhysicalShardId::new(2)
+        );
+        assert_eq!(
+            base.physical_shard_for_partition(VirtualPartitionId::new(0))
+                .expect("original assignment"),
+            PhysicalShardId::new(0)
+        );
+    }
+
+    #[test]
+    fn reshard_plan_phase_strings_are_stable() {
+        assert_eq!(ReshardPlanPhase::Planned.as_str(), "planned");
+        assert_eq!(ReshardPlanPhase::Copying.to_string(), "copying");
+        assert_eq!(
+            ReshardPlanPhase::ManifestInstalled.to_string(),
+            "manifest_installed"
+        );
+        assert_eq!(
+            ReshardPlanPhase::RevisionPublished.to_string(),
+            "revision_published"
+        );
+        assert_eq!(ReshardPlanPhase::Completed.as_str(), "completed");
+        assert_eq!(ReshardPlanPhase::Aborted.as_str(), "aborted");
+    }
 }

@@ -16,16 +16,17 @@ impl Table {
         self.id
     }
 
-    pub fn sharding_state(&self) -> Option<crate::TableShardingState> {
-        let stored = self.db.resolve_stored_table(self)?;
-        Some(
-            crate::TableShardingState::new(stored.id, &stored.config)
-                .expect("stored table sharding configs should already be validated"),
-        )
+    pub fn sharding_state(&self) -> Result<crate::TableShardingState, StorageError> {
+        let stored = self
+            .db
+            .resolve_stored_table(self)
+            .ok_or_else(|| Db::missing_table_error(self.name()))?;
+        crate::TableShardingState::new(stored.id, &stored.config)
+            .map_err(|error| StorageError::corruption(error.to_string()))
     }
 
-    pub fn route_key(&self, key: &[u8]) -> Option<crate::KeyShardRoute> {
-        Some(self.sharding_state()?.route_key(key))
+    pub fn route_key(&self, key: &[u8]) -> Result<crate::KeyShardRoute, StorageError> {
+        Ok(self.sharding_state()?.route_key(key))
     }
 
     pub fn validate_shard_map(

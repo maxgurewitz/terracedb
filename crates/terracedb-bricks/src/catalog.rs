@@ -2160,6 +2160,12 @@ fn map_create_table_error(error: CreateTableError) -> BlobError {
                 "terracedb-bricks bootstrap table {name} already exists with a mismatched configuration"
             )))
         }
+        CreateTableError::DefinitionMismatch {
+            table_name,
+            details,
+        } => BlobError::Storage(StorageError::unsupported(format!(
+            "terracedb-bricks bootstrap table {table_name} does not match the expected persisted definition: {details}"
+        ))),
         CreateTableError::InvalidConfig(message) => BlobError::Storage(StorageError::unsupported(
             format!("invalid terracedb-bricks bootstrap table configuration: {message}"),
         )),

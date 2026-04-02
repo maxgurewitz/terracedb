@@ -14,10 +14,9 @@ use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
 
 use terracedb::{
-    Clock, CommitError, CompactionStrategy, CreateTableError, Db, DbBuilder, DbConfig, DbSettings,
-    OpenError, S3Location, ScanOptions, SequenceNumber, StorageError, Table, TableConfig,
-    TableFormat, TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction,
-    TransactionCommitError,
+    Clock, CommitError, CreateTableError, Db, DbBuilder, DbConfig, DbSettings, OpenError,
+    S3Location, ScanOptions, SequenceNumber, StorageError, Table, TableConfig,
+    TieredDurabilityMode, TieredStorageConfig, Timestamp, Transaction, TransactionCommitError,
 };
 use terracedb_projections::{
     ProjectionContext, ProjectionError, ProjectionHandle, ProjectionHandler,
@@ -582,19 +581,7 @@ pub async fn ensure_todo_tables(db: &Db) -> Result<TodoTables, TodoAppError> {
 }
 
 fn row_table_config(name: &str) -> TableConfig {
-    TableConfig {
-        name: name.to_string(),
-        format: TableFormat::Row,
-        merge_operator: None,
-        max_merge_operand_chain_length: None,
-        compaction_filter: None,
-        bloom_filter_bits_per_key: Some(10),
-        history_retention_sequences: None,
-        compaction_strategy: CompactionStrategy::Leveled,
-        schema: None,
-        sharding: Default::default(),
-        metadata: Default::default(),
-    }
+    TableConfig::row(name).build()
 }
 
 fn todo_table(table: Table) -> TodoRecordTable {

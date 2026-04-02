@@ -74,6 +74,8 @@ pub enum OpenError {
 pub enum CreateTableError {
     #[error("table already exists: {0}")]
     AlreadyExists(String),
+    #[error("table definition mismatch for {table_name}: {details}")]
+    DefinitionMismatch { table_name: String, details: String },
     #[error("invalid table configuration: {0}")]
     InvalidConfig(String),
     #[error(transparent)]

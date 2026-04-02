@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use terracedb::{CompactionStrategy, TableConfig, TableFormat};
+use terracedb::{CompactionStrategy, TableConfig};
 
 pub const VFS_VOLUME_TABLE_NAME: &str = "vfs_volume";
 pub const VFS_ALLOCATOR_TABLE_NAME: &str = "vfs_allocator";
@@ -34,23 +34,14 @@ impl ReservedTableDescriptor {
             json!(self.append_only),
         );
 
-        TableConfig {
-            name: self.name.to_string(),
-            format: TableFormat::Row,
-            merge_operator: None,
-            max_merge_operand_chain_length: None,
-            compaction_filter: None,
-            bloom_filter_bits_per_key: Some(10),
-            history_retention_sequences: None,
-            compaction_strategy: if self.append_only {
+        TableConfig::row(self.name)
+            .compaction_strategy(if self.append_only {
                 CompactionStrategy::Tiered
             } else {
                 CompactionStrategy::Leveled
-            },
-            schema: None,
-            sharding: Default::default(),
-            metadata,
-        }
+            })
+            .metadata(metadata)
+            .build()
     }
 }
 

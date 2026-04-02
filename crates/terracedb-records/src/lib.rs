@@ -26,6 +26,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     error::Error as StdError,
     fmt,
+    future::Future,
     marker::PhantomData,
     mem::size_of,
     pin::Pin,
@@ -34,8 +35,10 @@ use std::{
 use futures::{Stream, StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
 use terracedb::{
-    ChangeEntry, ChangeKind, ColumnarRecord, Db, Key, KvStream, LogCursor, OperationContext,
-    ReadError, ScanExecution, ScanOptions, SchemaDefinition, SequenceNumber, Table, Transaction,
+    ChangeEntry, ChangeKind, ColumnarRecord, CommitError, CreateTableError, Db, Key, KeyShardRoute,
+    KvStream, LogCursor, OperationContext, PublishShardMapError, ReadError, ReshardPlanError,
+    ScanExecution, ScanOptions, SchemaDefinition, SequenceNumber, ShardingConfig, StorageError,
+    Table, TableConfig, TableReshardingState, TableShardingState, Transaction,
     TransactionCommitError, Value, WriteError,
 };
 use thiserror::Error;
@@ -44,6 +47,28 @@ type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
 pub type RecordStream<K, V> = Pin<Box<dyn Stream<Item = (K, V)> + Send + 'static>>;
 pub type ProjectionStream<V> = Pin<Box<dyn Stream<Item = V> + Send + 'static>>;
+pub type RecordTransactionFuture<'tx, T, E> =
+    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'tx>>;
+
+/// Explicit marker for transaction callbacks that are safe to replay on OCC conflicts.
+///
+/// Wrapping a callback in this type is a caller-side promise that the closure performs only
+/// transaction-local staging and replay-safe computation. Any side effects outside the
+/// transaction, such as network calls, notifications, or external ID allocation, must stay
+/// outside the retry loop.
+pub struct ReplaySafeRecordTransactionCallback<T, E, F> {
+    inner: F,
+    marker: PhantomData<fn() -> (T, E)>,
+}
+
+impl<T, E, F> ReplaySafeRecordTransactionCallback<T, E, F> {
+    pub fn new(inner: F) -> Self {
+        Self {
+            inner,
+            marker: PhantomData,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RecordChange<K, V> {
@@ -257,6 +282,80 @@ impl RecordWriteError {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum RecordRoutingError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Codec(#[from] RecordCodecError),
+}
+
+#[derive(Debug, Error)]
+pub enum RecordKeyspaceError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Codec(#[from] RecordCodecError),
+    #[error(
+        "record keyspace member '{table_name}' is not compatible with primary table '{primary_table}'"
+    )]
+    IncompatibleMember {
+        primary_table: String,
+        table_name: String,
+    },
+    #[error("record keyspace routing diverged between '{primary_table}' and '{table_name}'")]
+    MisalignedRouting {
+        primary_table: String,
+        table_name: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum RecordKeyspaceReshardError {
+    #[error(transparent)]
+    Keyspace(#[from] RecordKeyspaceError),
+    #[error(transparent)]
+    Publish(#[from] PublishShardMapError),
+    #[error(transparent)]
+    Plan(#[from] ReshardPlanError),
+    #[error(
+        "record keyspace reshard partially completed after '{table_name}' failed; completed tables: {completed_tables:?}"
+    )]
+    PartialFailure {
+        table_name: String,
+        completed_tables: Vec<String>,
+        #[source]
+        source: ReshardPlanError,
+    },
+}
+
+#[derive(Debug)]
+pub enum RecordTransactionRunError<E> {
+    Callback(E),
+    Commit(TransactionCommitError),
+}
+
+impl<E: fmt::Display> fmt::Display for RecordTransactionRunError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Callback(error) => error.fmt(f),
+            Self::Commit(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E> StdError for RecordTransactionRunError<E>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Callback(error) => Some(error),
+            Self::Commit(error) => Some(error),
+        }
+    }
+}
+
 /// Raw `Vec<u8>` passthrough codec for byte keys or values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BytesCodec;
@@ -463,6 +562,36 @@ impl<K, V, KC, VC> ColumnarTable<K, V, KC, VC> {
     pub fn into_inner(self) -> Table {
         self.table
     }
+
+    pub async fn ensure(
+        db: &Db,
+        config: TableConfig,
+        schema: SchemaDefinition,
+        key_codec: KC,
+        value_codec: VC,
+    ) -> Result<Self, CreateTableError> {
+        Ok(Self::with_codecs(
+            db.ensure_table(config).await?,
+            schema,
+            key_codec,
+            value_codec,
+        ))
+    }
+
+    pub async fn get_or_create_by_name(
+        db: &Db,
+        config: TableConfig,
+        schema: SchemaDefinition,
+        key_codec: KC,
+        value_codec: VC,
+    ) -> Result<Self, CreateTableError> {
+        Ok(Self::with_codecs(
+            db.get_or_create_table_by_name(config).await?,
+            schema,
+            key_codec,
+            value_codec,
+        ))
+    }
 }
 
 impl<K, V, KC, VC> ColumnarTable<K, V, KC, VC>
@@ -474,6 +603,33 @@ where
 {
     fn encode_key(&self, key: &K) -> Result<Key, RecordCodecError> {
         self.key_codec.encode_key(key)
+    }
+
+    pub fn sharding_state(&self) -> Result<TableShardingState, StorageError> {
+        self.table.sharding_state()
+    }
+
+    pub fn route_key(&self, key: &K) -> Result<KeyShardRoute, RecordRoutingError> {
+        let raw_key = self.encode_key(key)?;
+        self.table.route_key(&raw_key).map_err(Into::into)
+    }
+
+    pub fn validate_shard_map(
+        &self,
+        sharding: &ShardingConfig,
+    ) -> Result<TableShardingState, PublishShardMapError> {
+        self.table.validate_shard_map(sharding)
+    }
+
+    pub fn resharding_state(&self) -> Option<TableReshardingState> {
+        self.table.resharding_state()
+    }
+
+    pub async fn reshard_to(
+        &self,
+        sharding: ShardingConfig,
+    ) -> Result<TableReshardingState, ReshardPlanError> {
+        self.table.reshard_to(sharding).await
     }
 
     fn encode_prefix(&self, prefix: &K) -> Result<Key, RecordCodecError> {
@@ -774,6 +930,32 @@ impl<K, V, KC, VC> RecordTable<K, V, KC, VC> {
     pub fn into_inner(self) -> Table {
         self.table
     }
+
+    pub async fn ensure(
+        db: &Db,
+        config: TableConfig,
+        key_codec: KC,
+        value_codec: VC,
+    ) -> Result<Self, CreateTableError> {
+        Ok(Self::with_codecs(
+            db.ensure_table(config).await?,
+            key_codec,
+            value_codec,
+        ))
+    }
+
+    pub async fn get_or_create_by_name(
+        db: &Db,
+        config: TableConfig,
+        key_codec: KC,
+        value_codec: VC,
+    ) -> Result<Self, CreateTableError> {
+        Ok(Self::with_codecs(
+            db.get_or_create_table_by_name(config).await?,
+            key_codec,
+            value_codec,
+        ))
+    }
 }
 
 impl<K, V, KC, VC> RecordTable<K, V, KC, VC>
@@ -785,6 +967,33 @@ where
 {
     pub fn encode_key(&self, key: &K) -> Result<Key, RecordCodecError> {
         self.key_codec.encode_key(key)
+    }
+
+    pub fn sharding_state(&self) -> Result<TableShardingState, StorageError> {
+        self.table.sharding_state()
+    }
+
+    pub fn route_key(&self, key: &K) -> Result<KeyShardRoute, RecordRoutingError> {
+        let raw_key = self.encode_key(key)?;
+        self.table.route_key(&raw_key).map_err(Into::into)
+    }
+
+    pub fn validate_shard_map(
+        &self,
+        sharding: &ShardingConfig,
+    ) -> Result<TableShardingState, PublishShardMapError> {
+        self.table.validate_shard_map(sharding)
+    }
+
+    pub fn resharding_state(&self) -> Option<TableReshardingState> {
+        self.table.resharding_state()
+    }
+
+    pub async fn reshard_to(
+        &self,
+        sharding: ShardingConfig,
+    ) -> Result<TableReshardingState, ReshardPlanError> {
+        self.table.reshard_to(sharding).await
     }
 
     pub fn encode_prefix(&self, prefix: &K) -> Result<Key, RecordCodecError> {
@@ -1016,6 +1225,129 @@ where
     }
 }
 
+/// Shared keyed surface across multiple tables that are expected to remain colocated.
+#[derive(Clone, Debug)]
+pub struct RecordKeyspace<K, KC> {
+    primary: Table,
+    followers: Vec<Table>,
+    key_codec: KC,
+    marker: PhantomData<fn() -> K>,
+}
+
+impl<K, KC> RecordKeyspace<K, KC>
+where
+    KC: KeyCodec<K>,
+{
+    pub fn new(
+        primary: Table,
+        followers: impl IntoIterator<Item = Table>,
+        key_codec: KC,
+    ) -> Result<Self, RecordKeyspaceError> {
+        let primary_state = primary.sharding_state()?;
+        let followers = followers.into_iter().collect::<Vec<_>>();
+        for table in &followers {
+            let state = table.sharding_state()?;
+            if !primary_state
+                .config
+                .compatible_reshard_identity(&state.config)
+            {
+                return Err(RecordKeyspaceError::IncompatibleMember {
+                    primary_table: primary.name().to_string(),
+                    table_name: table.name().to_string(),
+                });
+            }
+        }
+        Ok(Self {
+            primary,
+            followers,
+            key_codec,
+            marker: PhantomData,
+        })
+    }
+
+    pub fn primary_table(&self) -> &Table {
+        &self.primary
+    }
+
+    pub fn key_codec(&self) -> &KC {
+        &self.key_codec
+    }
+
+    pub fn sharding_state(&self) -> Result<TableShardingState, RecordKeyspaceError> {
+        let primary_state = self.primary.sharding_state()?;
+        for table in &self.followers {
+            let state = table.sharding_state()?;
+            if state.config != primary_state.config {
+                return Err(RecordKeyspaceError::MisalignedRouting {
+                    primary_table: self.primary.name().to_string(),
+                    table_name: table.name().to_string(),
+                });
+            }
+        }
+        Ok(primary_state)
+    }
+
+    pub fn route_key(&self, key: &K) -> Result<KeyShardRoute, RecordKeyspaceError> {
+        let raw_key = self.key_codec.encode_key(key)?;
+        let primary_route = self.primary.route_key(&raw_key)?;
+        for table in &self.followers {
+            let route = table.route_key(&raw_key)?;
+            if route != primary_route {
+                return Err(RecordKeyspaceError::MisalignedRouting {
+                    primary_table: self.primary.name().to_string(),
+                    table_name: table.name().to_string(),
+                });
+            }
+        }
+        Ok(primary_route)
+    }
+
+    pub fn validate_shard_map(
+        &self,
+        sharding: &ShardingConfig,
+    ) -> Result<Vec<TableShardingState>, RecordKeyspaceReshardError> {
+        let mut states = Vec::with_capacity(self.followers.len() + 1);
+        states.push(self.primary.validate_shard_map(sharding)?);
+        for table in &self.followers {
+            states.push(table.validate_shard_map(sharding)?);
+        }
+        Ok(states)
+    }
+
+    pub fn resharding_states(&self) -> Vec<TableReshardingState> {
+        std::iter::once(&self.primary)
+            .chain(self.followers.iter())
+            .filter_map(|table| table.resharding_state())
+            .collect()
+    }
+
+    pub async fn reshard_to(
+        &self,
+        sharding: ShardingConfig,
+    ) -> Result<Vec<TableReshardingState>, RecordKeyspaceReshardError> {
+        let _ = self.sharding_state()?;
+
+        let mut completed = Vec::new();
+        let mut completed_names = Vec::new();
+        for table in std::iter::once(&self.primary).chain(self.followers.iter()) {
+            match table.reshard_to(sharding.clone()).await {
+                Ok(state) => {
+                    completed_names.push(table.name().to_string());
+                    completed.push(state);
+                }
+                Err(source) => {
+                    return Err(RecordKeyspaceReshardError::PartialFailure {
+                        table_name: table.name().to_string(),
+                        completed_tables: completed_names,
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(completed)
+    }
+}
+
 /// Transaction-scoped typed helper layered on top of Terracedb's OCC helper.
 #[derive(Debug)]
 pub struct RecordTransaction {
@@ -1033,6 +1365,57 @@ impl RecordTransaction {
 
     pub fn snapshot_sequence(&self) -> SequenceNumber {
         self.inner.snapshot_sequence()
+    }
+
+    pub async fn run<T, E, F>(
+        db: &Db,
+        mut f: F,
+    ) -> Result<(T, SequenceNumber), RecordTransactionRunError<E>>
+    where
+        F: for<'tx> FnMut(&'tx mut RecordTransaction) -> RecordTransactionFuture<'tx, T, E>,
+    {
+        let mut tx = Self::begin(db).await;
+        let value = f(&mut tx)
+            .await
+            .map_err(RecordTransactionRunError::Callback)?;
+        let sequence = tx
+            .commit()
+            .await
+            .map_err(RecordTransactionRunError::Commit)?;
+        Ok((value, sequence))
+    }
+
+    pub fn replay_safe<T, E, F>(callback: F) -> ReplaySafeRecordTransactionCallback<T, E, F>
+    where
+        F: for<'tx> FnMut(&'tx mut RecordTransaction) -> RecordTransactionFuture<'tx, T, E>,
+    {
+        ReplaySafeRecordTransactionCallback::new(callback)
+    }
+
+    /// Runs a replay-safe transaction-local callback until commit succeeds or a non-conflict
+    /// error occurs.
+    ///
+    /// The callback may be re-executed after optimistic concurrency conflicts, so it must not
+    /// perform side effects outside the transaction. Keep notifications, external RPCs, and other
+    /// non-transactional work outside this helper.
+    pub async fn run_conflict_retry_loop<T, E, F>(
+        db: &Db,
+        mut replay_safe: ReplaySafeRecordTransactionCallback<T, E, F>,
+    ) -> Result<(T, SequenceNumber), RecordTransactionRunError<E>>
+    where
+        F: for<'tx> FnMut(&'tx mut RecordTransaction) -> RecordTransactionFuture<'tx, T, E>,
+    {
+        loop {
+            let mut tx = Self::begin(db).await;
+            let value = (replay_safe.inner)(&mut tx)
+                .await
+                .map_err(RecordTransactionRunError::Callback)?;
+            match tx.commit().await {
+                Ok(sequence) => return Ok((value, sequence)),
+                Err(TransactionCommitError::Commit(CommitError::Conflict)) => continue,
+                Err(error) => return Err(RecordTransactionRunError::Commit(error)),
+            }
+        }
     }
 
     pub async fn read<K, V, KC, VC>(
