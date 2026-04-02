@@ -2038,8 +2038,10 @@ mod tests {
     };
 
     use super::{
-        AppendLocation, BlockIndexEntry, CommitEntry, CommitRecord, SegmentFooter, SegmentManager,
-        SegmentOptions, TableSegmentMeta, checksum32, parse_segment_footer, segment_path,
+        AppendLocation, BlockIndexEntry, CommitEntry, CommitRecord, RECORD_HEADER_LEN,
+        RECORD_MAGIC, SegmentFooter, SegmentManager, SegmentOptions, TableSegmentMeta, checksum32,
+        encode_change_kind, encode_value, parse_segment_footer, push_len, push_u8, push_u16,
+        push_u32, segment_path,
     };
     use crate::api::{ChangeKind, Value};
     use crate::ids::{CommitId, FieldId, SegmentId, TableId};
@@ -2225,6 +2227,51 @@ mod tests {
         }
     }
 
+    fn encode_v1_frame(record: &CommitRecord) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u8(&mut payload, 1);
+        payload.extend_from_slice(&record.id.encode());
+        push_u16(
+            &mut payload,
+            u16::try_from(record.entries.len()).expect("entry count fits in u16"),
+        );
+        for entry in &record.entries {
+            assert!(
+                entry.operation_context.is_none(),
+                "legacy frame fixture excludes operation context"
+            );
+            push_u16(&mut payload, entry.op_index);
+            push_u32(&mut payload, entry.table_id.get());
+            push_u8(&mut payload, encode_change_kind(entry.kind));
+            push_len(&mut payload, entry.key.len()).expect("key length fits in u32");
+            payload.extend_from_slice(&entry.key);
+
+            match &entry.value {
+                Some(value) => {
+                    let mut encoded_value = Vec::new();
+                    encode_value(&mut encoded_value, value).expect("encode legacy value");
+                    push_u32(
+                        &mut payload,
+                        u32::try_from(encoded_value.len()).expect("value length fits in u32"),
+                    );
+                    payload.extend_from_slice(&encoded_value);
+                }
+                None => push_u32(&mut payload, u32::MAX),
+            }
+        }
+
+        let mut frame = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&RECORD_MAGIC);
+        frame.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("legacy payload length fits in u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&checksum32(&payload).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
     async fn read_segment_bytes(fs: &dyn FileSystem, path: &str) -> Vec<u8> {
         let handle = fs
             .open(
@@ -2271,6 +2318,19 @@ mod tests {
         corrupted[last] ^= 0x7f;
         let error = CommitRecord::decode_frame(&corrupted).expect_err("checksum failure");
         assert_eq!(error.kind(), StorageErrorKind::Corruption);
+    }
+
+    #[test]
+    fn commit_record_v1_frames_fail_closed() {
+        let legacy_frame = encode_v1_frame(&sample_record(5));
+        let error =
+            CommitRecord::decode_frame(&legacy_frame).expect_err("v1 frame should be rejected");
+        assert_eq!(error.kind(), StorageErrorKind::Corruption);
+        assert!(
+            error
+                .message()
+                .contains("unsupported commit record format version 1")
+        );
     }
 
     #[test]

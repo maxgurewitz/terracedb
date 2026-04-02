@@ -77,14 +77,8 @@ pub(super) struct StoredTable {
 
 #[derive(Clone, Debug)]
 pub(super) enum CatalogLocation {
-    LocalFile {
-        path: String,
-        temp_path: String,
-    },
-    ObjectStore {
-        key: String,
-        legacy_key: Option<String>,
-    },
+    LocalFile { path: String, temp_path: String },
+    ObjectStore { key: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

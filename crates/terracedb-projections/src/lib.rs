@@ -23,7 +23,6 @@ use terracedb::{
 pub mod failpoints;
 
 pub const PROJECTION_CURSOR_TABLE_NAME: &str = "_projection_cursors";
-const PROJECTION_CURSOR_FORMAT_VERSION: u8 = 1;
 const PROJECTION_CURSOR_STATE_FORMAT_VERSION: u8 = 2;
 const PROJECTION_CURSOR_KEY_SEPARATOR: u8 = 0;
 const FULL_SCAN_START: &[u8] = b"";
@@ -341,28 +340,14 @@ impl ProjectionContextError {
 
 #[async_trait]
 pub trait ProjectionHandler: Send + Sync {
-    /// Compatibility hook for simple projections that only transform the current
-    /// batch. New code should prefer `apply_with_context`.
-    async fn apply(
-        &self,
-        _run: &ProjectionSequenceRun,
-        _tx: &mut ProjectionTransaction,
-    ) -> Result<(), ProjectionHandlerError> {
-        Err(ProjectionHandlerError::new(std::io::Error::other(
-            "projection handler must implement apply or apply_with_context",
-        )))
-    }
-
-    /// Canonical handler entry point for both single-source and multi-source
+    /// Canonical handler entry point for single-source and context-aware
     /// projections.
     async fn apply_with_context(
         &self,
         run: &ProjectionSequenceRun,
-        _ctx: &ProjectionContext,
+        ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
-    ) -> Result<(), ProjectionHandlerError> {
-        self.apply(run, tx).await
-    }
+    ) -> Result<(), ProjectionHandlerError>;
 }
 
 #[async_trait]
@@ -1073,11 +1058,7 @@ impl ProjectionRuntime {
         let mut source_states = Vec::with_capacity(projection.sources.len());
         for (declaration_index, source) in projection.sources.iter().cloned().enumerate() {
             let persisted = self
-                .load_projection_cursor_state_for_start(
-                    &projection.name,
-                    &source,
-                    projection.mode == ProjectionMode::SingleSource,
-                )
+                .load_projection_cursor_state_for_start(&projection.name, &source)
                 .await;
             let persisted = match persisted {
                 Ok(state) => state,
@@ -1185,15 +1166,8 @@ impl ProjectionRuntime {
         &self,
         name: &str,
         source: &Table,
-        legacy_single_source: bool,
     ) -> Result<ProjectionCursorState, ProjectionError> {
-        if legacy_single_source {
-            match load_projection_cursor_state(&self.cursor_table, name, None).await? {
-                state if state != ProjectionCursorState::beginning() => return Ok(state),
-                _ => {}
-            }
-        }
-
+        reject_legacy_single_source_cursor_row(&self.cursor_table, name).await?;
         load_projection_cursor_state(&self.cursor_table, name, Some(source.name())).await
     }
 
@@ -1806,7 +1780,6 @@ async fn drain_next_ready_run(
             &runtime.name,
             &chosen_source,
             new_state,
-            runtime.mode == ProjectionMode::SingleSource,
         );
 
         set_span_attribute(
@@ -1885,7 +1858,6 @@ async fn rebuild_from_current_state(
                 &runtime.name,
                 &source.table,
                 ProjectionCursorState::beginning(),
-                runtime.mode == ProjectionMode::SingleSource,
             );
         }
         if !reset_batch.is_empty() {
@@ -1932,7 +1904,6 @@ async fn rebuild_from_current_state(
                     &runtime.name,
                     &source_table,
                     empty_state,
-                    runtime.mode == ProjectionMode::SingleSource,
                 );
                 let _ = runtime
                     .db
@@ -1994,7 +1965,6 @@ async fn rebuild_from_current_state(
                     &runtime.name,
                     &source_table,
                     new_state,
-                    runtime.mode == ProjectionMode::SingleSource,
                 );
                 let _ = runtime
                     .db
@@ -2130,19 +2100,75 @@ async fn load_projection_cursor_state(
     name: &str,
     source_name: Option<&str>,
 ) -> Result<ProjectionCursorState, ProjectionError> {
-    let key = match source_name {
-        Some(source_name) => projection_source_cursor_key(name, source_name),
-        None => legacy_projection_cursor_key(name),
+    let Some(source_name) = source_name else {
+        return load_single_source_projection_cursor_state(cursor_table, name).await;
     };
 
-    match cursor_table.read(key).await? {
-        Some(Value::Bytes(bytes)) => decode_cursor_state_value(name, source_name, &bytes),
+    match cursor_table
+        .read(projection_source_cursor_key(name, source_name))
+        .await?
+    {
+        Some(Value::Bytes(bytes)) => decode_cursor_state_value(name, Some(source_name), &bytes),
         Some(Value::Record(_)) => Err(ProjectionError::CursorCorruption {
-            name: cursor_label(name, source_name),
+            name: cursor_label(name, Some(source_name)),
             reason: "expected byte cursor payload".to_string(),
         }),
         None => Ok(ProjectionCursorState::beginning()),
     }
+}
+
+async fn load_single_source_projection_cursor_state(
+    cursor_table: &Table,
+    name: &str,
+) -> Result<ProjectionCursorState, ProjectionError> {
+    reject_legacy_single_source_cursor_row(cursor_table, name).await?;
+
+    let mut rows = cursor_table
+        .scan_prefix(
+            projection_source_cursor_key_prefix(name),
+            ScanOptions::default(),
+        )
+        .await?;
+    let Some((_key, value)) = rows.next().await else {
+        return Ok(ProjectionCursorState::beginning());
+    };
+
+    let state = match value {
+        Value::Bytes(bytes) => decode_cursor_state_value(name, None, &bytes)?,
+        Value::Record(_) => {
+            return Err(ProjectionError::CursorCorruption {
+                name: name.to_string(),
+                reason: "expected byte cursor payload".to_string(),
+            });
+        }
+    };
+
+    if rows.next().await.is_some() {
+        return Err(ProjectionError::CursorCorruption {
+            name: name.to_string(),
+            reason: "projection has multiple source-qualified cursor rows; load the frontier or a specific source cursor instead".to_string(),
+        });
+    }
+
+    Ok(state)
+}
+
+async fn reject_legacy_single_source_cursor_row(
+    cursor_table: &Table,
+    name: &str,
+) -> Result<(), ProjectionError> {
+    if cursor_table
+        .read(legacy_projection_cursor_key(name))
+        .await?
+        .is_some()
+    {
+        return Err(ProjectionError::CursorCorruption {
+            name: name.to_string(),
+            reason: "unsupported legacy single-source cursor row".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 async fn scan_whole_sequence_run(
@@ -2206,15 +2232,22 @@ fn projection_cursor_table_config() -> TableConfig {
     }
 }
 
-fn legacy_projection_cursor_key(name: &str) -> Vec<u8> {
-    name.as_bytes().to_vec()
-}
-
 fn projection_source_cursor_key(name: &str, source_name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(name.len() + 1 + source_name.len());
     key.extend_from_slice(name.as_bytes());
     key.push(PROJECTION_CURSOR_KEY_SEPARATOR);
     key.extend_from_slice(source_name.as_bytes());
+    key
+}
+
+fn legacy_projection_cursor_key(name: &str) -> Vec<u8> {
+    name.as_bytes().to_vec()
+}
+
+fn projection_source_cursor_key_prefix(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(name.len() + 1);
+    key.extend_from_slice(name.as_bytes());
+    key.push(PROJECTION_CURSOR_KEY_SEPARATOR);
     key
 }
 
@@ -2224,28 +2257,12 @@ fn stage_projection_cursor_state(
     projection_name: &str,
     source: &Table,
     state: ProjectionCursorState,
-    write_legacy: bool,
 ) {
     batch.put(
         cursor_table,
         projection_source_cursor_key(projection_name, source.name()),
         encode_cursor_state_value(state),
     );
-
-    if write_legacy {
-        batch.put(
-            cursor_table,
-            legacy_projection_cursor_key(projection_name),
-            encode_cursor_value(state.cursor()),
-        );
-    }
-}
-
-fn encode_cursor_value(cursor: LogCursor) -> Value {
-    let mut encoded = Vec::with_capacity(1 + LogCursor::ENCODED_LEN);
-    encoded.push(PROJECTION_CURSOR_FORMAT_VERSION);
-    encoded.extend_from_slice(&cursor.encode());
-    Value::bytes(encoded)
 }
 
 fn encode_cursor_state_value(state: ProjectionCursorState) -> Value {
@@ -2261,63 +2278,35 @@ fn decode_cursor_state_value(
     source_name: Option<&str>,
     bytes: &[u8],
 ) -> Result<ProjectionCursorState, ProjectionError> {
-    match bytes.first().copied() {
-        Some(PROJECTION_CURSOR_FORMAT_VERSION) => {
-            decode_legacy_cursor_value(name, source_name, bytes)
-        }
-        Some(PROJECTION_CURSOR_STATE_FORMAT_VERSION) => {
-            let encoded_len = 1 + LogCursor::ENCODED_LEN + 8;
-            if bytes.len() != encoded_len {
-                return Err(ProjectionError::CursorCorruption {
-                    name: cursor_label(name, source_name),
-                    reason: format!(
-                        "invalid cursor state length: expected {encoded_len} bytes, got {}",
-                        bytes.len()
-                    ),
-                });
-            }
-
-            let cursor =
-                LogCursor::decode(&bytes[1..1 + LogCursor::ENCODED_LEN]).map_err(|error| {
-                    ProjectionError::CursorCorruption {
-                        name: cursor_label(name, source_name),
-                        reason: error.to_string(),
-                    }
-                })?;
-            let mut sequence = [0_u8; 8];
-            sequence.copy_from_slice(&bytes[1 + LogCursor::ENCODED_LEN..]);
-            Ok(ProjectionCursorState {
-                cursor,
-                sequence: SequenceNumber::new(u64::from_be_bytes(sequence)),
-            })
-        }
-        _ => Err(ProjectionError::CursorCorruption {
-            name: cursor_label(name, source_name),
-            reason: "unknown cursor format version".to_string(),
-        }),
-    }
-}
-
-fn decode_legacy_cursor_value(
-    name: &str,
-    source_name: Option<&str>,
-    bytes: &[u8],
-) -> Result<ProjectionCursorState, ProjectionError> {
-    if bytes.first().copied() != Some(PROJECTION_CURSOR_FORMAT_VERSION) {
+    if bytes.first().copied() != Some(PROJECTION_CURSOR_STATE_FORMAT_VERSION) {
         return Err(ProjectionError::CursorCorruption {
             name: cursor_label(name, source_name),
             reason: "unknown cursor format version".to_string(),
         });
     }
 
-    let cursor =
-        LogCursor::decode(&bytes[1..]).map_err(|error| ProjectionError::CursorCorruption {
+    let encoded_len = 1 + LogCursor::ENCODED_LEN + 8;
+    if bytes.len() != encoded_len {
+        return Err(ProjectionError::CursorCorruption {
+            name: cursor_label(name, source_name),
+            reason: format!(
+                "invalid cursor state length: expected {encoded_len} bytes, got {}",
+                bytes.len()
+            ),
+        });
+    }
+
+    let cursor = LogCursor::decode(&bytes[1..1 + LogCursor::ENCODED_LEN]).map_err(|error| {
+        ProjectionError::CursorCorruption {
             name: cursor_label(name, source_name),
             reason: error.to_string(),
-        })?;
+        }
+    })?;
+    let mut sequence = [0_u8; 8];
+    sequence.copy_from_slice(&bytes[1 + LogCursor::ENCODED_LEN..]);
     Ok(ProjectionCursorState {
         cursor,
-        sequence: cursor.sequence(),
+        sequence: SequenceNumber::new(u64::from_be_bytes(sequence)),
     })
 }
 

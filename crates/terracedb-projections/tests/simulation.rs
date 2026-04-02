@@ -50,9 +50,10 @@ struct MirrorProjection {
 
 #[async_trait]
 impl ProjectionHandler for MirrorProjection {
-    async fn apply(
+    async fn apply_with_context(
         &self,
         run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError> {
         for entry in run.entries() {

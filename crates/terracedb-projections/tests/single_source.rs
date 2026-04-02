@@ -27,9 +27,10 @@ struct SequenceRecorder {
 
 #[async_trait]
 impl ProjectionHandler for SequenceRecorder {
-    async fn apply(
+    async fn apply_with_context(
         &self,
         run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError> {
         let keys = run
@@ -56,9 +57,10 @@ struct MirrorProjection {
 
 #[async_trait]
 impl ProjectionHandler for MirrorProjection {
-    async fn apply(
+    async fn apply_with_context(
         &self,
         run: &ProjectionSequenceRun,
+        _ctx: &ProjectionContext,
         tx: &mut ProjectionTransaction,
     ) -> Result<(), ProjectionHandlerError> {
         for entry in run.entries() {
@@ -659,6 +661,56 @@ async fn projection_runtime_surfaces_change_feed_scan_failures_without_panicking
             .await,
         0
     );
+}
+
+#[tokio::test]
+async fn projection_runtime_fails_closed_on_legacy_single_source_cursor_rows() {
+    let file_system = Arc::new(StubFileSystem::default());
+    let object_store = Arc::new(StubObjectStore::default());
+    let db = Db::open(
+        tiered_test_config("/projection-legacy-cursor"),
+        test_dependencies(file_system, object_store),
+    )
+    .await
+    .expect("open db");
+    let source = db
+        .create_table(row_table_config("source"))
+        .await
+        .expect("create source table");
+    let output = db
+        .create_table(row_table_config("output"))
+        .await
+        .expect("create output table");
+    let runtime = ProjectionRuntime::open(db.clone())
+        .await
+        .expect("open projection runtime");
+
+    let mut legacy_cursor = vec![1];
+    legacy_cursor.extend_from_slice(&LogCursor::new(SequenceNumber::new(7), 0).encode());
+    db.table(PROJECTION_CURSOR_TABLE_NAME)
+        .write(b"mirror".to_vec(), Value::bytes(legacy_cursor))
+        .await
+        .expect("write legacy cursor row");
+
+    match runtime
+        .start_single_source(
+            SingleSourceProjection::new(
+                "mirror",
+                source,
+                MirrorProjection {
+                    output: output.clone(),
+                },
+            )
+            .with_outputs([output]),
+        )
+        .await
+    {
+        Err(ProjectionError::CursorCorruption { reason, .. }) => {
+            assert!(reason.contains("legacy single-source cursor row"));
+        }
+        Err(other) => panic!("expected cursor corruption, got {other:?}"),
+        Ok(_) => panic!("expected legacy cursor row to fail closed"),
+    }
 }
 
 #[tokio::test]
