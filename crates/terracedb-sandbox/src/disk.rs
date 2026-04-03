@@ -5,12 +5,16 @@ use std::{
     process::Command,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use serde::{Deserialize, Serialize};
+use terracedb_git::{GitImportSource, GitObjectFormat, GitRepositoryOrigin};
 use terracedb_vfs::{
     CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, VfsError, VfsFileSystem, Volume,
 };
 
-use crate::{ConflictPolicy, GitProvenance, SandboxError};
+use crate::{ConflictPolicy, GitProvenance, SandboxError, types::sanitize_git_import_source};
 
 pub const HOIST_MANIFEST_PATH: &str = "/.terrace/hoist-manifest.json";
 pub const PATCH_BUNDLE_FILE_NAME: &str = ".terrace-sandbox.patch.json";
@@ -124,6 +128,7 @@ pub(crate) enum TreeEntryData {
 pub(crate) struct TreeEntry {
     pub path: String,
     pub data: TreeEntryData,
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,13 +137,15 @@ pub(crate) struct ManifestEntry {
     pub kind: TreeEntryKind,
     pub digest: Option<String>,
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
     pub symlink_target: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HoistManifest {
     pub format_version: u32,
-    pub source_path: String,
+    pub source: GitImportSource,
     pub target_root: String,
     pub mode: HoistMode,
     pub git_provenance: Option<GitProvenance>,
@@ -163,10 +170,22 @@ struct PatchBundle {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PatchOperation {
-    WriteFile { path: String, data: Vec<u8> },
-    CreateDirectory { path: String },
-    CreateSymlink { path: String, target: String },
-    DeletePath { path: String },
+    WriteFile {
+        path: String,
+        data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
+    CreateDirectory {
+        path: String,
+    },
+    CreateSymlink {
+        path: String,
+        target: String,
+    },
+    DeletePath {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +231,7 @@ pub(crate) fn prepare_hoist(request: &HoistRequest) -> Result<PreparedHoist, San
     };
     let manifest = HoistManifest {
         format_version: HOIST_MANIFEST_FORMAT_VERSION,
-        source_path,
+        source: GitImportSource::HostPath { path: source_path },
         target_root,
         mode: request.mode.clone(),
         git_provenance,
@@ -243,7 +262,13 @@ pub(crate) async fn write_hoist_manifest(
     volume: &dyn Volume,
     manifest: &HoistManifest,
 ) -> Result<(), SandboxError> {
-    let payload = serde_json::to_vec_pretty(manifest)?;
+    let mut durable_manifest = manifest.clone();
+    durable_manifest.source = sanitize_git_import_source(&durable_manifest.source);
+    durable_manifest.git_provenance = durable_manifest
+        .git_provenance
+        .as_ref()
+        .map(crate::GitProvenance::sanitized_for_durability);
+    let payload = serde_json::to_vec_pretty(&durable_manifest)?;
     volume
         .fs()
         .write_file(
@@ -551,6 +576,7 @@ fn write_patch_bundle(
                         TreeEntryData::File(bytes) => PatchOperation::WriteFile {
                             path: entry.path.clone(),
                             data: bytes.clone(),
+                            mode: entry.mode,
                         },
                         TreeEntryData::Directory => PatchOperation::CreateDirectory {
                             path: entry.path.clone(),
@@ -661,6 +687,7 @@ async fn collect_vfs_tree_recursive(
                 entries.push(TreeEntry {
                     path: child_relative.clone(),
                     data: TreeEntryData::Directory,
+                    mode: None,
                 });
                 Box::pin(collect_vfs_tree_recursive(
                     fs,
@@ -679,6 +706,7 @@ async fn collect_vfs_tree_recursive(
                 entries.push(TreeEntry {
                     path: child_relative,
                     data: TreeEntryData::File(bytes),
+                    mode: Some(entry.stats.mode),
                 });
             }
             FileKind::Symlink => {
@@ -686,6 +714,7 @@ async fn collect_vfs_tree_recursive(
                 entries.push(TreeEntry {
                     path: child_relative,
                     data: TreeEntryData::Symlink(target),
+                    mode: None,
                 });
             }
         }
@@ -799,7 +828,7 @@ async fn write_vfs_entry(
                 CreateOptions {
                     create_parents: true,
                     overwrite: true,
-                    ..Default::default()
+                    mode: entry.mode.unwrap_or(0o644),
                 },
             )
             .await?;
@@ -845,6 +874,7 @@ fn collect_selected_paths(
                 entries.push(TreeEntry {
                     path: ancestor,
                     data: TreeEntryData::Directory,
+                    mode: None,
                 });
             }
         }
@@ -859,6 +889,7 @@ fn collect_selected_paths(
                     path: path.to_string_lossy().into_owned(),
                     message: error.to_string(),
                 })?),
+                mode: Some(host_file_mode(&metadata)),
             });
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path).map_err(|error| SandboxError::Io {
@@ -868,11 +899,13 @@ fn collect_selected_paths(
             entries.push(TreeEntry {
                 path: relative.clone(),
                 data: TreeEntryData::Symlink(target.to_string_lossy().into_owned()),
+                mode: None,
             });
         } else if metadata.file_type().is_dir() && created_dirs.insert(relative.clone()) {
             entries.push(TreeEntry {
                 path: relative.clone(),
                 data: TreeEntryData::Directory,
+                mode: None,
             });
         }
     }
@@ -922,6 +955,7 @@ fn collect_directory_tree_recursive(
             entries.push(TreeEntry {
                 path: relative.clone(),
                 data: TreeEntryData::Directory,
+                mode: None,
             });
             collect_directory_tree_recursive(root, &child_path, skip_git_metadata, entries)?;
         } else if metadata.file_type().is_symlink() {
@@ -932,6 +966,7 @@ fn collect_directory_tree_recursive(
             entries.push(TreeEntry {
                 path: relative,
                 data: TreeEntryData::Symlink(target.to_string_lossy().into_owned()),
+                mode: None,
             });
         } else if metadata.file_type().is_file() {
             entries.push(TreeEntry {
@@ -942,6 +977,7 @@ fn collect_directory_tree_recursive(
                         message: error.to_string(),
                     }
                 })?),
+                mode: Some(host_file_mode(&metadata)),
             });
         }
     }
@@ -991,6 +1027,9 @@ fn write_host_entry(root: &Path, entry: &TreeEntry) -> Result<(), SandboxError> 
                 path: destination.to_string_lossy().into_owned(),
                 message: error.to_string(),
             })?;
+            if let Some(mode) = entry.mode {
+                apply_host_file_mode(&destination, mode)?;
+            }
         }
         TreeEntryData::Symlink(target) => {
             if destination.exists() || destination.symlink_metadata().is_ok() {
@@ -999,6 +1038,38 @@ fn write_host_entry(root: &Path, entry: &TreeEntry) -> Result<(), SandboxError> 
             create_host_symlink(target, &destination)?;
         }
     }
+    Ok(())
+}
+
+fn host_file_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0o644
+    }
+}
+
+fn apply_host_file_mode(path: &Path, mode: u32) -> Result<(), SandboxError> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| SandboxError::Io {
+                path: path.to_string_lossy().into_owned(),
+                message: error.to_string(),
+            })?
+            .permissions();
+        permissions.set_mode(mode & 0o777);
+        fs::set_permissions(path, permissions).map_err(|error| SandboxError::Io {
+            path: path.to_string_lossy().into_owned(),
+            message: error.to_string(),
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
     Ok(())
 }
 
@@ -1115,6 +1186,7 @@ fn capture_git_provenance(repo_root: &Path) -> Result<GitProvenance, SandboxErro
     let head_commit = git_stdout_optional(repo_root, &["rev-parse", "HEAD"])?;
     let branch = git_stdout_optional(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let remote_url = git_stdout_optional(repo_root, &["remote", "get-url", "origin"])?;
+    let object_format = detect_git_object_format(repo_root)?;
     let dirty = !git_stdout(
         repo_root,
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -1122,12 +1194,38 @@ fn capture_git_provenance(repo_root: &Path) -> Result<GitProvenance, SandboxErro
     .is_empty();
     Ok(GitProvenance {
         repo_root: canonicalize_for_storage(repo_root)?,
+        origin: GitRepositoryOrigin::HostImport,
         head_commit,
         branch,
         remote_url,
+        remote_bridge_metadata: BTreeMap::new(),
+        object_format: Some(object_format),
         pathspec: vec![".".to_string()],
         dirty,
     })
+}
+
+fn detect_git_object_format(repo_root: &Path) -> Result<GitObjectFormat, SandboxError> {
+    if let Some(value) = git_stdout_optional(repo_root, &["rev-parse", "--show-object-format"])? {
+        return parse_git_object_format(&value);
+    }
+    if let Some(value) =
+        git_stdout_optional(repo_root, &["config", "--get", "extensions.objectformat"])?
+    {
+        return parse_git_object_format(&value);
+    }
+    Ok(GitObjectFormat::Sha1)
+}
+
+fn parse_git_object_format(value: &str) -> Result<GitObjectFormat, SandboxError> {
+    match value.trim() {
+        "sha1" => Ok(GitObjectFormat::Sha1),
+        "sha256" => Ok(GitObjectFormat::Sha256),
+        other => Err(SandboxError::Service {
+            service: "git",
+            message: format!("unsupported git object format: {other}"),
+        }),
+    }
 }
 
 fn git_working_tree_paths(
@@ -1349,6 +1447,7 @@ impl ManifestEntry {
                 kind: TreeEntryKind::File,
                 digest: Some(bytes_digest(bytes)),
                 size: Some(bytes.len() as u64),
+                mode: entry.mode,
                 symlink_target: None,
             },
             TreeEntryData::Directory => Self {
@@ -1356,6 +1455,7 @@ impl ManifestEntry {
                 kind: TreeEntryKind::Directory,
                 digest: None,
                 size: None,
+                mode: None,
                 symlink_target: None,
             },
             TreeEntryData::Symlink(target) => Self {
@@ -1363,6 +1463,7 @@ impl ManifestEntry {
                 kind: TreeEntryKind::Symlink,
                 digest: None,
                 size: None,
+                mode: None,
                 symlink_target: Some(target.clone()),
             },
         }
@@ -1374,6 +1475,10 @@ impl ManifestEntry {
             (TreeEntryKind::File, TreeEntryData::File(bytes)) => {
                 self.size == Some(bytes.len() as u64)
                     && self.digest.as_deref() == Some(&bytes_digest(bytes))
+                    && self
+                        .mode
+                        .map(|mode| entry.mode == Some(mode))
+                        .unwrap_or(true)
             }
             (TreeEntryKind::Symlink, TreeEntryData::Symlink(target)) => {
                 self.symlink_target.as_deref() == Some(target)

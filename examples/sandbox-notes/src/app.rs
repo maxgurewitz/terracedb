@@ -24,15 +24,17 @@ use terracedb_capabilities::{
     ResourcePolicy, ResourceSelector, SessionMode, SessionPresetRequest,
     StaticExecutionPolicyResolver, SubjectSelector,
 };
+use terracedb_git::HostGitBridge;
+use terracedb_git_github::GitHubRemoteProvider;
 use terracedb_sandbox::{
     BashReport, BashRequest, CapabilityManifest as SandboxCapabilityManifest, CapabilityMethod0,
     CapabilityMethod1, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
     DeterministicPackageInstaller, DeterministicRuntimeBackend, DeterministicTypeScriptService,
-    EjectMode, EjectRequest, GitWorkspaceRequest, HoistMode, HoistRequest,
-    PackageCompatibilityMode, PackageInstallRequest, PullRequestRequest, ReadonlyViewHandle,
-    ReadonlyViewRequest, SandboxCapability, SandboxCapabilityModule, SandboxError,
-    SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter, SandboxHarness,
-    SandboxServices, SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
+    EjectMode, EjectRequest, HoistMode, HoistRequest, PackageCompatibilityMode,
+    PackageInstallRequest, PullRequestRequest, ReadonlyViewHandle, ReadonlyViewRequest,
+    SandboxCapability, SandboxCapabilityModule, SandboxError, SandboxExecutionDomainRoute,
+    SandboxExecutionPlacement, SandboxExecutionRouter, SandboxHarness, SandboxServices,
+    SandboxSession, TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport,
     TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId, VolumeStore};
@@ -109,6 +111,7 @@ impl ExampleHostApp {
 
     pub fn host_git_services(&self) -> SandboxServices {
         SandboxServices::deterministic_with_host_git_and_capabilities(self.notes_registry())
+            .with_git_host_bridge(configured_host_git_bridge())
     }
 
     pub fn deterministic_services_for_prepared_session(
@@ -131,6 +134,7 @@ impl ExampleHostApp {
             SandboxServices::deterministic_with_host_git_and_capabilities(
                 self.prepared_notes_registry(session_id, prepared)?,
             )
+            .with_git_host_bridge(configured_host_git_bridge())
             .with_execution_router(notes_execution_router()),
         )
     }
@@ -207,6 +211,14 @@ impl ExampleHostApp {
             prepared,
         )?))
     }
+}
+
+fn configured_host_git_bridge() -> Arc<HostGitBridge> {
+    Arc::new(
+        HostGitBridge::new("host-git").with_remote_provider(Arc::new(
+            GitHubRemoteProvider::new().with_supported_host("127.0.0.1"),
+        )),
+    )
 }
 
 #[derive(Clone)]
@@ -713,20 +725,6 @@ pub async fn open_generated_view(
             label: Some("generated".to_string()),
         })
         .await
-}
-
-pub async fn prepare_example_git_workspace(
-    session: &SandboxSession,
-    target_path: &Path,
-) -> Result<String, SandboxError> {
-    Ok(session
-        .prepare_git_workspace(GitWorkspaceRequest {
-            branch_name: "sandbox/example-notes".to_string(),
-            base_branch: Some("main".to_string()),
-            target_path: target_path.to_string_lossy().into_owned(),
-        })
-        .await?
-        .workspace_path)
 }
 
 pub async fn create_example_pull_request(session: &SandboxSession) -> Result<String, SandboxError> {

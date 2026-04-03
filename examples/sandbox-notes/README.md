@@ -8,7 +8,7 @@ This example is a small host application plus a companion sandboxed project tree
 - execute guest code that reads and updates host-side state
 - run TypeScript and bash tooling over the sandbox tree
 - expose generated files through the read-only editor-view protocol
-- export the sandboxed result back to disk or a git worktree
+- export the sandboxed result back to disk or push a repo-backed branch through the git bridge
 
 The host-side Rust code lives in [`src/lib.rs`](/Users/maxwellgurewitz/dev/terracedb/examples/sandbox-notes/src/lib.rs) and [`src/app.rs`](/Users/maxwellgurewitz/dev/terracedb/examples/sandbox-notes/src/app.rs). The hoisted project tree lives under [`project-template/`](/Users/maxwellgurewitz/dev/terracedb/examples/sandbox-notes/project-template).
 
@@ -46,7 +46,7 @@ The companion tree is intentionally small:
 What is simulated versus real:
 
 - The default runnable demo uses deterministic in-memory runtime, package, readonly-view, and PR providers so the flow is teachable and repeatable.
-- The example tests also cover real host-disk hoist/eject and real git worktree export using `HostGitWorkspaceManager`.
+- The example tests also cover real host-disk hoist/eject and repo-backed branch push/PR flow through `HostGitBridge`.
 - The simulation suite seeds the same project directly into the VFS store so capability and session semantics replay under the seeded harness even when disk-backed hoist is not involved.
 
 Why the editor view is read-only:
@@ -63,7 +63,7 @@ How capabilities are injected:
 How export and PR creation work:
 
 - Directory export uses `eject_to_disk` with `MaterializeSnapshot`.
-- Git-backed export uses `create_pull_request`, which prepares an isolated worktree, applies the sandbox delta, commits it, and pushes the branch when the hoisted repo has a configured `origin`.
+- Git-backed export uses `create_pull_request`, which opens the imported VFS-native repo image through `terracedb-git`, commits in-process, and lets the configured git bridge handle the actual push/PR boundary crossing when the hoisted repo has a configured `origin`.
 
 ## Verification
 

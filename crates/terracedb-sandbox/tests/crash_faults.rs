@@ -1,4 +1,7 @@
+mod support;
+
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -8,14 +11,16 @@ use std::{
     },
 };
 
+use support::fake_github::{FakeGithubServer, configured_remote_github_bridge};
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
+use terracedb_git::GitObjectFormat;
 use terracedb_sandbox::{
     ConflictPolicy, DefaultSandboxStore, DeterministicPackageInstaller,
     DeterministicPullRequestProviderClient, DeterministicReadonlyViewProvider,
     DeterministicRuntimeBackend, DeterministicTypeScriptService, GitProvenance, HoistMode,
-    HoistRequest, HostGitWorkspaceManager, PackageCompatibilityMode, PullRequestRequest,
-    ReadonlyViewCut, ReadonlyViewRequest, ReopenSessionOptions, SandboxConfig, SandboxError,
-    SandboxServices, SandboxStore, TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH,
+    HoistRequest, PackageCompatibilityMode, PullRequestRequest, ReadonlyViewCut,
+    ReadonlyViewRequest, ReopenSessionOptions, SandboxConfig, SandboxError, SandboxServices,
+    SandboxStore, TERRACE_SESSION_METADATA_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH,
     TERRACE_TYPESCRIPT_STATE_PATH, TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR, TypeCheckRequest,
     TypeScriptService, TypeScriptTranspileRequest,
 };
@@ -46,14 +51,15 @@ fn deterministic_services() -> SandboxServices {
     SandboxServices::deterministic()
 }
 
-fn host_git_services() -> SandboxServices {
+fn remote_github_services(host: &str) -> SandboxServices {
     SandboxServices::new(
         Arc::new(DeterministicRuntimeBackend::default()),
         Arc::new(DeterministicPackageInstaller::default()),
-        Arc::new(HostGitWorkspaceManager::default()),
+        Arc::new(terracedb_sandbox::DeterministicGitRepositoryStore::default()),
         Arc::new(DeterministicPullRequestProviderClient::default()),
         Arc::new(DeterministicReadonlyViewProvider::default()),
     )
+    .with_git_host_bridge(configured_remote_github_bridge(host))
 }
 
 async fn create_empty_base(
@@ -208,11 +214,8 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn init_git_repo(repo: &Path, remote: Option<&Path>, seed: u64) {
+fn init_git_repo(repo: &Path, remote_url: Option<&str>, seed: u64) {
     cleanup(repo);
-    if let Some(remote) = remote {
-        cleanup(remote);
-    }
     fs::create_dir_all(repo).expect("create repo dir");
     git(repo, &["init", "-b", "main"]);
     git(repo, &["config", "user.name", "Sandbox Tester"]);
@@ -220,23 +223,8 @@ fn init_git_repo(repo: &Path, remote: Option<&Path>, seed: u64) {
     write_host_file(&repo.join("tracked.txt"), &format!("tracked-{seed:x}\n"));
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "initial"]);
-    if let Some(remote) = remote {
-        let output = sanitized_git_command()
-            .arg("init")
-            .arg("--bare")
-            .arg(remote)
-            .output()
-            .expect("init bare remote");
-        assert!(
-            output.status.success(),
-            "git init --bare failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        git(
-            repo,
-            &["remote", "add", "origin", &remote.to_string_lossy()],
-        );
-        git(repo, &["push", "-u", "origin", "main"]);
+    if let Some(remote_url) = remote_url {
+        git(repo, &["remote", "add", "origin", remote_url]);
     }
 }
 
@@ -589,11 +577,11 @@ async fn hoist_manifest_and_apply_delta_only_survive_durable_recovery_after_flus
 #[tokio::test]
 async fn pr_export_bookkeeping_tool_runs_only_survive_durable_recovery_after_flush() {
     let seed = 0xb140_u64;
+    let fake = FakeGithubServer::spawn().await;
     let repo = deterministic_temp_dir("crash-pr-repo", seed);
-    let remote = deterministic_temp_dir("crash-pr-remote", seed);
-    init_git_repo(&repo, Some(&remote), seed);
+    init_git_repo(&repo, Some(&fake.remote_url), seed);
 
-    let (source_vfs, sandbox) = sandbox_store(80, 813, host_git_services());
+    let (source_vfs, sandbox) = sandbox_store(80, 813, remote_github_services("127.0.0.1"));
     let base_volume_id = VolumeId::new(0xb140);
     let session_volume_id = VolumeId::new(0xb141);
     create_empty_base(&source_vfs, base_volume_id)
@@ -614,9 +602,12 @@ async fn pr_export_bookkeeping_tool_runs_only_survive_durable_recovery_after_flu
             hoisted_source: None,
             git_provenance: Some(GitProvenance {
                 repo_root: repo.to_string_lossy().into_owned(),
+                origin: terracedb_sandbox::GitRepositoryOrigin::RemoteImport,
                 head_commit: Some("HEAD".to_string()),
                 branch: Some("main".to_string()),
-                remote_url: Some(remote.to_string_lossy().into_owned()),
+                remote_url: Some(fake.remote_url.clone()),
+                remote_bridge_metadata: BTreeMap::new(),
+                object_format: Some(GitObjectFormat::Sha1),
                 pathspec: vec![".".to_string()],
                 dirty: false,
             }),
@@ -656,11 +647,21 @@ async fn pr_export_bookkeeping_tool_runs_only_survive_durable_recovery_after_flu
         })
         .await
         .expect("create pull request");
+    assert_eq!(
+        fake.branch_file_text(&format!("sandbox/crash-{seed:x}"), "tracked.txt")
+            .await,
+        Some(format!("pr-{seed:x}\n"))
+    );
 
-    let before_flush =
-        reopen_durable_cut(&source_vfs, session_volume_id, 81, 814, host_git_services())
-            .await
-            .expect("reopen durable cut before pr flush");
+    let before_flush = reopen_durable_cut(
+        &source_vfs,
+        session_volume_id,
+        81,
+        814,
+        remote_github_services("127.0.0.1"),
+    )
+    .await
+    .expect("reopen durable cut before pr flush");
     let before_tools = chronological_tool_names(&before_flush)
         .await
         .expect("read durable tool names before flush");
@@ -673,17 +674,19 @@ async fn pr_export_bookkeeping_tool_runs_only_survive_durable_recovery_after_flu
         .flush()
         .await
         .expect("flush session with pr bookkeeping");
-    let after_flush =
-        reopen_durable_cut(&source_vfs, session_volume_id, 82, 815, host_git_services())
-            .await
-            .expect("reopen durable cut after pr flush");
+    let after_flush = reopen_durable_cut(
+        &source_vfs,
+        session_volume_id,
+        82,
+        815,
+        remote_github_services("127.0.0.1"),
+    )
+    .await
+    .expect("reopen durable cut after pr flush");
     let after_tools = chronological_tool_names(&after_flush)
         .await
         .expect("read durable tool names after flush");
-    assert!(after_tools.contains(&"sandbox.git.prepare_workspace".to_string()));
-    assert!(after_tools.contains(&"sandbox.disk.eject".to_string()));
     assert!(after_tools.contains(&"sandbox.pr.create".to_string()));
 
     cleanup(&repo);
-    cleanup(&remote);
 }

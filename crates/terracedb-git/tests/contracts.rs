@@ -1,13 +1,16 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -15,16 +18,17 @@ use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, Stub
 use terracedb_git::worktree::GitWorktreeMaterializer;
 use terracedb_git::{
     DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutReport, GitCheckoutRequest,
-    GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitFinalizeExportRequest, GitForkPolicy,
-    GitHeadState, GitHostBridge, GitImportMode, GitImportRequest, GitIndexEntry, GitIndexSnapshot,
-    GitObject, GitObjectDatabase, GitOpenRequest, GitRefUpdate, GitReference, GitRepositoryHandle,
-    GitRepositoryImage, GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
-    GitStatusKind, GitStatusOptions, GitSubstrateError, GitWorkspaceRequest, HostGitBridge,
-    NeverCancel, VfsGitRepositoryImage,
+    GitCommitRequest, GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitForkPolicy,
+    GitHeadState, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportMode,
+    GitImportRequest, GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase,
+    GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRefUpdate,
+    GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryOrigin,
+    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore, GitStatusKind,
+    GitStatusOptions, GitSubstrateError, HostGitBridge, NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
-    CloneVolumeSource, CreateOptions, InMemoryVfsStore, SnapshotOptions, Volume, VolumeConfig,
-    VolumeId, VolumeStore,
+    CloneVolumeSource, CreateOptions, InMemoryVfsStore, MkdirOptions, SnapshotOptions, Volume,
+    VolumeConfig, VolumeId, VolumeStore,
 };
 use tokio::sync::{Mutex, Notify};
 
@@ -164,6 +168,114 @@ async fn seed_repository(volume: Arc<dyn Volume>, root: &str, oid: &str, payload
         .expect("write git index");
 }
 
+async fn seed_executable_repository(volume: Arc<dyn Volume>, root: &str, oid: &str) {
+    let blob_oid = format!("{oid}-blob-exec");
+    let tree_oid = format!("{oid}-tree-exec");
+    let payload = b"#!/bin/sh\necho terrace\n".to_vec();
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/HEAD"),
+            b"ref: refs/heads/main\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write git head");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/refs/heads/main"),
+            format!("{oid}\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write main ref");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/objects/{oid}"),
+            [
+                b"commit\n".as_slice(),
+                format!("tree {tree_oid}\n").as_bytes(),
+            ]
+            .concat(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write commit object");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/objects/{blob_oid}"),
+            [b"blob\n".as_slice(), payload.as_slice()].concat(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write executable blob");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/objects/{tree_oid}"),
+            format!("tree\n100755 blob {blob_oid}\tscript.sh\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write executable tree");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/script.sh"),
+            payload,
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write worktree script");
+    volume
+        .fs()
+        .write_file(
+            &format!("{root}/.git/index.json"),
+            serde_json::to_vec(&GitIndexSnapshot {
+                entries: vec![GitIndexEntry {
+                    path: "script.sh".to_string(),
+                    oid: Some(blob_oid),
+                    mode: 0o100755,
+                }],
+                metadata: BTreeMap::new(),
+            })
+            .expect("encode executable index"),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write executable index");
+}
+
 fn blob_oid_for_commit(oid: &str) -> String {
     format!("{oid}-blob")
 }
@@ -177,49 +289,6 @@ fn source_bytes_for_commit(oid: &str) -> Vec<u8> {
 }
 
 static HOST_TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-static GIT_ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-
-struct GitEnvRestore {
-    author_date: Option<String>,
-    committer_date: Option<String>,
-}
-
-impl GitEnvRestore {
-    fn set(author_date: &str, committer_date: &str) -> Self {
-        let restore = Self {
-            author_date: env::var("GIT_AUTHOR_DATE").ok(),
-            committer_date: env::var("GIT_COMMITTER_DATE").ok(),
-        };
-        unsafe {
-            env::set_var("GIT_AUTHOR_DATE", author_date);
-            env::set_var("GIT_COMMITTER_DATE", committer_date);
-        }
-        restore
-    }
-}
-
-impl Drop for GitEnvRestore {
-    fn drop(&mut self) {
-        if let Some(value) = self.author_date.as_deref() {
-            unsafe {
-                env::set_var("GIT_AUTHOR_DATE", value);
-            }
-        } else {
-            unsafe {
-                env::remove_var("GIT_AUTHOR_DATE");
-            }
-        }
-        if let Some(value) = self.committer_date.as_deref() {
-            unsafe {
-                env::set_var("GIT_COMMITTER_DATE", value);
-            }
-        } else {
-            unsafe {
-                env::remove_var("GIT_COMMITTER_DATE");
-            }
-        }
-    }
-}
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let id = HOST_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -231,10 +300,6 @@ fn unique_test_dir(name: &str) -> PathBuf {
 
 fn cleanup(path: &Path) {
     let _ = fs::remove_dir_all(path);
-}
-
-fn git_env_lock() -> &'static std::sync::Mutex<()> {
-    GIT_ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 fn sanitized_git_command() -> Command {
@@ -267,23 +332,6 @@ fn git(dir: &Path, args: &[&str]) {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn git_out(dir: &Path, args: &[&str]) -> String {
-    let output = sanitized_git_command()
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git -C {} {} failed: {}",
-        dir.display(),
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn write_host_file(path: &Path, contents: &str) {
@@ -322,6 +370,109 @@ fn init_git_repo(repo: &Path, remote: Option<&Path>) {
     }
 }
 
+fn init_empty_git_repo(repo: &Path, object_format: GitObjectFormat) {
+    fs::create_dir_all(repo).expect("create repo dir");
+    let object_format = match object_format {
+        GitObjectFormat::Sha1 => "sha1",
+        GitObjectFormat::Sha256 => "sha256",
+    };
+    git(
+        repo,
+        &["init", "--object-format", object_format, "-b", "main"],
+    );
+    git(repo, &["config", "user.name", "Sandbox Tester"]);
+    git(repo, &["config", "user.email", "sandbox@example.invalid"]);
+}
+
+fn host_git_supports_sha256() -> bool {
+    let probe = unique_test_dir("sha256-probe");
+    let supported = sanitized_git_command()
+        .arg("init")
+        .arg("--object-format=sha256")
+        .arg("-b")
+        .arg("main")
+        .arg(&probe)
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success());
+    cleanup(&probe);
+    supported
+}
+
+async fn open_empty_volume(seed: u64) -> Arc<dyn Volume> {
+    let dependencies = DbDependencies::new(
+        Arc::new(StubFileSystem::default()),
+        Arc::new(StubObjectStore::default()),
+        Arc::new(StubClock::default()),
+        Arc::new(StubRng::seeded(seed)),
+    );
+    let store = Arc::new(InMemoryVfsStore::with_dependencies(dependencies));
+    store
+        .open_volume(
+            VolumeConfig::new(VolumeId::new(0xa100 + seed as u128))
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open empty volume")
+}
+
+async fn apply_import_entries(volume: Arc<dyn Volume>, root: &str, entries: &[GitImportEntry]) {
+    let fs = volume.fs();
+    for entry in entries {
+        let destination = format!("{root}/{}", entry.path);
+        match entry.kind {
+            GitImportEntryKind::Directory => {
+                fs.mkdir(
+                    &destination,
+                    MkdirOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create imported directory");
+            }
+            GitImportEntryKind::File => {
+                fs.write_file(
+                    &destination,
+                    entry.data.clone().expect("imported file payload"),
+                    CreateOptions {
+                        create_parents: true,
+                        overwrite: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write imported file");
+            }
+            GitImportEntryKind::Symlink => {
+                if let Some(parent) = Path::new(&destination).parent() {
+                    let parent = parent.to_string_lossy();
+                    fs.mkdir(
+                        &parent,
+                        MkdirOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create imported symlink parent");
+                }
+                fs.symlink(
+                    entry
+                        .symlink_target
+                        .as_deref()
+                        .expect("imported symlink target"),
+                    &destination,
+                )
+                .await
+                .expect("write imported symlink");
+            }
+        }
+    }
+}
+
 fn open_request(
     repository_id: &str,
     image: &dyn GitRepositoryImage,
@@ -335,7 +486,9 @@ fn open_request(
         provenance: GitRepositoryProvenance {
             backend: "deterministic-git".to_string(),
             repo_root: descriptor.root_path.clone(),
-            imported_from_host: false,
+            origin: GitRepositoryOrigin::Native,
+            remote_url: None,
+            object_format: GitObjectFormat::Sha256,
             volume_id: descriptor.volume_id,
             snapshot_sequence: descriptor.snapshot_sequence,
             durable_snapshot: descriptor.durable_snapshot,
@@ -1380,17 +1533,84 @@ async fn non_head_symbolic_refs_resolve_through_ref_reads_and_checkout() {
 }
 
 #[tokio::test]
-async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports() {
+async fn noop_commit_on_empty_repository_does_not_write_empty_refs() {
+    let volume = open_empty_volume(0x610f).await;
+    volume
+        .fs()
+        .write_file(
+            "/repo/.git/HEAD",
+            b"ref: refs/heads/main\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write empty repo head");
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("snapshot empty repo"),
+    );
+    let repo_store = DeterministicGitRepositoryStore::default();
+    let repo = repo_store
+        .open(
+            image.clone(),
+            open_request("repo-empty-noop", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open empty repo");
+
+    let report = repo
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/sandbox/empty".to_string(),
+                base_ref: None,
+                title: "Empty noop".to_string(),
+                body: String::new(),
+                require_changes: false,
+                update_head: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("noop commit on empty repo");
+    assert!(!report.committed);
+    assert!(report.commit_oid.is_empty());
+    assert!(report.tree_oid.is_empty());
+    assert_eq!(
+        repo.head()
+            .await
+            .expect("head after empty noop")
+            .symbolic_ref,
+        Some("refs/heads/main".to_string())
+    );
+    assert_eq!(repo.head().await.expect("head after empty noop").oid, None);
+    assert_eq!(
+        volume
+            .fs()
+            .read_file("/repo/.git/refs/heads/sandbox/empty")
+            .await
+            .expect("read empty repo branch"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn host_git_bridge_imports_vfs_repository_images_and_pushes_commits() {
     let repo = unique_test_dir("host-bridge-repo");
     let remote = unique_test_dir("host-bridge-remote");
-    let workspace = unique_test_dir("host-bridge-workspace");
     init_git_repo(&repo, Some(&remote));
 
     let bridge = HostGitBridge::default();
     let imported = bridge
         .import_repository(
             GitImportRequest {
-                source_path: repo.to_string_lossy().into_owned(),
+                source: terracedb_git::GitImportSource::HostPath {
+                    path: repo.to_string_lossy().into_owned(),
+                },
                 target_root: "/repo".to_string(),
                 mode: GitImportMode::Head,
                 metadata: BTreeMap::new(),
@@ -1400,6 +1620,20 @@ async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports()
         .await
         .expect("import host repo");
     assert_eq!(imported.target_root, "/repo");
+    assert!(
+        imported
+            .entries
+            .iter()
+            .any(|entry| entry.path == ".git/HEAD"),
+        "host import should include a VFS-native .git image"
+    );
+    assert!(
+        imported
+            .entries
+            .iter()
+            .any(|entry| entry.path == ".git/refs/heads/main"),
+        "host import should include refs inside the imported repo image"
+    );
     assert_eq!(
         imported
             .entries
@@ -1409,68 +1643,130 @@ async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports()
             .cloned(),
         Some(b"tracked\n".to_vec())
     );
+    let volume = open_empty_volume(0x6110).await;
+    apply_import_entries(volume.clone(), "/repo", &imported.entries).await;
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume.clone(), "/repo", SnapshotOptions::default())
+            .await
+            .expect("snapshot imported repo image"),
+    );
+    let repo_store = DeterministicGitRepositoryStore::default();
+    let mut request = open_request("repo-imported-host", image.as_ref(), BTreeMap::new());
+    request.policy.allow_host_bridge = true;
+    request.provenance.repo_root = imported.repository_root.clone();
+    request.provenance.origin = GitRepositoryOrigin::HostImport;
+    request.provenance.object_format = imported.object_format;
+    let opened = repo_store
+        .open(image, request, Arc::new(NeverCancel))
+        .await
+        .expect("open imported host repo");
+    let no_change_error = opened
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/sandbox/noop-strict".to_string(),
+                base_ref: Some("refs/heads/main".to_string()),
+                title: "Bridge export".to_string(),
+                body: "Created by host bridge".to_string(),
+                require_changes: true,
+                update_head: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect_err("strict no-op commits should fail before mutating refs");
+    assert!(matches!(
+        no_change_error,
+        GitSubstrateError::NoChanges { ref target_ref }
+        if target_ref == "refs/heads/sandbox/noop-strict"
+    ));
+    assert_eq!(
+        opened
+            .head()
+            .await
+            .expect("head after rejected no-op")
+            .symbolic_ref,
+        Some("refs/heads/main".to_string())
+    );
+    assert!(
+        !opened
+            .list_refs()
+            .await
+            .expect("list refs after rejected no-op")
+            .iter()
+            .any(|reference| reference.name == "refs/heads/sandbox/noop-strict")
+    );
+    let noop_commit = opened
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/sandbox/noop".to_string(),
+                base_ref: Some("refs/heads/main".to_string()),
+                title: "Bridge export".to_string(),
+                body: "Created by host bridge".to_string(),
+                require_changes: false,
+                update_head: false,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("commit imported repo without changes");
+    assert!(!noop_commit.committed);
+    assert_eq!(
+        noop_commit.commit_oid,
+        imported.head_commit.expect("imported head commit")
+    );
 
-    let base_ref = git_out(&repo, &["rev-parse", "HEAD"]);
-    let prepared = bridge
-        .prepare_workspace(
-            GitWorkspaceRequest {
-                repo_root: repo.to_string_lossy().into_owned(),
+    volume
+        .fs()
+        .write_file(
+            "/repo/tracked.txt",
+            b"updated through bridge\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update imported worktree");
+    let commit = opened
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/sandbox/feature".to_string(),
+                base_ref: Some("refs/heads/main".to_string()),
+                title: "Bridge export".to_string(),
+                body: "Created by host bridge".to_string(),
+                require_changes: false,
+                update_head: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("commit VFS-backed branch");
+    assert!(commit.committed);
+    assert_eq!(
+        opened.head().await.expect("head after commit").oid,
+        Some(commit.commit_oid.clone())
+    );
+
+    let pushed = bridge
+        .push(
+            opened.clone(),
+            GitPushRequest {
+                remote: "origin".to_string(),
                 branch_name: "sandbox/feature".to_string(),
-                base_ref: base_ref.clone(),
-                target_path: workspace.to_string_lossy().into_owned(),
-                metadata: BTreeMap::new(),
+                head_oid: Some(commit.commit_oid.clone()),
+                metadata: BTreeMap::from([
+                    (
+                        "remote_url".to_string(),
+                        json!(remote.to_string_lossy().into_owned()),
+                    ),
+                    ("base_branch".to_string(), json!("main")),
+                ]),
             },
             Arc::new(NeverCancel),
         )
         .await
-        .expect("prepare host workspace");
-    assert_eq!(prepared.workspace_path, workspace.to_string_lossy());
-
-    write_host_file(&workspace.join("tracked.txt"), "updated through bridge\n");
-    let _guard = git_env_lock().lock().expect("lock git env");
-    let _git_env = GitEnvRestore::set("2024-01-02T03:04:05Z", "2024-01-02T03:04:05Z");
-    let finalized = bridge
-        .finalize_export(
-            GitFinalizeExportRequest {
-                workspace_path: workspace.to_string_lossy().into_owned(),
-                head_branch: "sandbox/feature".to_string(),
-                title: "Bridge export".to_string(),
-                body: "Created by host bridge".to_string(),
-                metadata: BTreeMap::new(),
-            },
-            Arc::new(NeverCancel),
-        )
-        .await
-        .expect("finalize export");
-    assert_eq!(finalized.metadata.get("committed"), Some(&json!(true)));
-    assert_eq!(finalized.metadata.get("pushed"), Some(&json!(true)));
-    assert_eq!(
-        git_out(&workspace, &["log", "-1", "--format=%aI"]),
-        "2024-01-02T03:04:05+00:00"
-    );
-    assert_eq!(
-        git_out(&workspace, &["log", "-1", "--format=%cI"]),
-        "2024-01-02T03:04:05+00:00"
-    );
-
-    let finalized_noop = bridge
-        .finalize_export(
-            GitFinalizeExportRequest {
-                workspace_path: workspace.to_string_lossy().into_owned(),
-                head_branch: "sandbox/feature".to_string(),
-                title: "Bridge export".to_string(),
-                body: "Created by host bridge".to_string(),
-                metadata: BTreeMap::new(),
-            },
-            Arc::new(NeverCancel),
-        )
-        .await
-        .expect("finalize no-op export");
-    assert_eq!(
-        finalized_noop.metadata.get("committed"),
-        Some(&json!(false))
-    );
-    assert_eq!(finalized_noop.metadata.get("pushed"), Some(&json!(false)));
+        .expect("push VFS-backed branch");
 
     let remote_head = sanitized_git_command()
         .arg("--git-dir")
@@ -1483,10 +1779,169 @@ async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports()
         "remote branch missing: {}",
         String::from_utf8_lossy(&remote_head.stderr)
     );
+    assert_eq!(
+        pushed.pushed_oid,
+        Some(
+            String::from_utf8_lossy(&remote_head.stdout)
+                .trim()
+                .to_string()
+        )
+    );
+    let remote_contents = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["show", "refs/heads/sandbox/feature:tracked.txt"])
+        .output()
+        .expect("inspect remote tracked.txt");
+    assert!(
+        remote_contents.status.success(),
+        "remote tracked.txt missing: {}",
+        String::from_utf8_lossy(&remote_contents.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&remote_contents.stdout),
+        "updated through bridge\n"
+    );
+
+    volume
+        .fs()
+        .write_file(
+            "/repo/tracked.txt",
+            b"updated through branch refresh\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update imported worktree for existing branch push");
+    let refreshed_commit = opened
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/sandbox/feature".to_string(),
+                base_ref: Some("refs/heads/sandbox/feature".to_string()),
+                title: "Bridge export refresh".to_string(),
+                body: "Updates an existing PR branch".to_string(),
+                require_changes: false,
+                update_head: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("commit VFS-backed refresh for existing branch");
+    bridge
+        .push(
+            opened.clone(),
+            GitPushRequest {
+                remote: "origin".to_string(),
+                branch_name: "sandbox/feature".to_string(),
+                head_oid: Some(refreshed_commit.commit_oid),
+                metadata: BTreeMap::from([
+                    (
+                        "remote_url".to_string(),
+                        json!(remote.to_string_lossy().into_owned()),
+                    ),
+                    ("base_branch".to_string(), json!("main")),
+                ]),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("push updated PR branch");
+
+    let refreshed_contents = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["show", "refs/heads/sandbox/feature:tracked.txt"])
+        .output()
+        .expect("inspect refreshed tracked.txt");
+    assert!(
+        refreshed_contents.status.success(),
+        "refreshed tracked.txt missing: {}",
+        String::from_utf8_lossy(&refreshed_contents.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&refreshed_contents.stdout),
+        "updated through branch refresh\n"
+    );
+
+    volume
+        .fs()
+        .write_file(
+            "/repo/tracked.txt",
+            b"updated through non-head push\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update imported worktree for non-head push");
+    let non_head_commit = opened
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/sandbox/non-head".to_string(),
+                base_ref: Some("refs/heads/main".to_string()),
+                title: "Bridge export without moving HEAD".to_string(),
+                body: "Pushes the requested ref".to_string(),
+                require_changes: false,
+                update_head: false,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("commit VFS-backed branch without updating HEAD");
+    assert_eq!(
+        opened
+            .head()
+            .await
+            .expect("head after non-head commit")
+            .symbolic_ref,
+        Some("refs/heads/sandbox/feature".to_string())
+    );
+
+    let non_head_push = bridge
+        .push(
+            opened.clone(),
+            GitPushRequest {
+                remote: "origin".to_string(),
+                branch_name: "sandbox/non-head".to_string(),
+                head_oid: Some(non_head_commit.commit_oid.clone()),
+                metadata: BTreeMap::from([
+                    (
+                        "remote_url".to_string(),
+                        json!(remote.to_string_lossy().into_owned()),
+                    ),
+                    ("base_branch".to_string(), json!("main")),
+                ]),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("push requested commit without moving HEAD");
+    assert!(non_head_push.pushed_oid.is_some());
+
+    let non_head_contents = sanitized_git_command()
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["show", "refs/heads/sandbox/non-head:tracked.txt"])
+        .output()
+        .expect("inspect non-head pushed tracked.txt");
+    assert!(
+        non_head_contents.status.success(),
+        "non-head pushed tracked.txt missing: {}",
+        String::from_utf8_lossy(&non_head_contents.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&non_head_contents.stdout),
+        "updated through non-head push\n"
+    );
 
     let pr_error = bridge
         .create_pull_request(
-            terracedb_git::GitPullRequestRequest {
+            GitPullRequestRequest {
                 title: "Bridge export".to_string(),
                 body: "Created by host bridge".to_string(),
                 head_branch: "sandbox/feature".to_string(),
@@ -1504,5 +1959,142 @@ async fn host_git_bridge_imports_head_prepares_workspace_and_finalizes_exports()
 
     cleanup(&repo);
     cleanup(&remote);
-    cleanup(&workspace);
+}
+
+#[tokio::test]
+async fn host_git_bridge_preserves_empty_sha256_repo_format_for_first_commit() {
+    if !host_git_supports_sha256() {
+        return;
+    }
+
+    let repo = unique_test_dir("host-import-empty-sha256");
+    init_empty_git_repo(&repo, GitObjectFormat::Sha256);
+
+    let bridge = HostGitBridge::default();
+    let imported = bridge
+        .import_repository(
+            GitImportRequest {
+                source: terracedb_git::GitImportSource::HostPath {
+                    path: repo.to_string_lossy().into_owned(),
+                },
+                target_root: "/repo".to_string(),
+                mode: GitImportMode::Head,
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("import empty sha256 host repo");
+    assert_eq!(imported.object_format, GitObjectFormat::Sha256);
+    assert_eq!(imported.head_commit, None);
+
+    let volume = open_empty_volume(0x6112).await;
+    apply_import_entries(volume.clone(), "/repo", &imported.entries).await;
+    volume
+        .fs()
+        .write_file(
+            "/repo/src/lib.rs",
+            b"pub const FORMAT: &str = \"sha256\";\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed imported sha256 worktree");
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume, "/repo", SnapshotOptions::default())
+            .await
+            .expect("snapshot imported sha256 repo image"),
+    );
+    let repo_store = DeterministicGitRepositoryStore::default();
+    let mut request = open_request(
+        "repo-imported-empty-sha256",
+        image.as_ref(),
+        BTreeMap::new(),
+    );
+    request.policy.allow_host_bridge = true;
+    request.provenance.repo_root = imported.repository_root;
+    request.provenance.origin = GitRepositoryOrigin::HostImport;
+    request.provenance.object_format = imported.object_format;
+    let opened = repo_store
+        .open(image, request, Arc::new(NeverCancel))
+        .await
+        .expect("open imported empty sha256 repo");
+
+    let report = opened
+        .commit(
+            GitCommitRequest {
+                target_ref: "refs/heads/main".to_string(),
+                base_ref: None,
+                title: "Initial sha256 commit".to_string(),
+                body: "Created from imported empty sha256 repo".to_string(),
+                require_changes: true,
+                update_head: true,
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("commit imported empty sha256 repo");
+    assert!(report.committed);
+    assert_eq!(report.parent_oid, None);
+    assert_eq!(report.commit_oid.len(), 64);
+    assert_eq!(report.tree_oid.len(), 64);
+    assert!(
+        report
+            .commit_oid
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    assert!(report.tree_oid.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    cleanup(&repo);
+}
+
+#[tokio::test]
+async fn host_git_export_preserves_executable_modes() {
+    let volume = open_empty_volume(0x6111).await;
+    seed_executable_repository(volume.clone(), "/repo", "feedbeef").await;
+    let export_root = unique_test_dir("host-export-executable");
+    let image = Arc::new(
+        VfsGitRepositoryImage::from_volume(volume, "/repo", SnapshotOptions::default())
+            .await
+            .expect("snapshot executable repo"),
+    );
+    let repo_store = DeterministicGitRepositoryStore::default();
+    let repo = repo_store
+        .open(
+            image.clone(),
+            open_request("repo-export-executable", image.as_ref(), BTreeMap::new()),
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("open executable repo");
+
+    HostGitBridge::default()
+        .export_repository(
+            repo,
+            terracedb_git::GitExportRequest {
+                target_path: export_root.to_string_lossy().into_owned(),
+                branch_name: Some("main".to_string()),
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("export executable repo");
+
+    #[cfg(unix)]
+    assert_ne!(
+        fs::metadata(export_root.join("script.sh"))
+            .expect("exported script metadata")
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "exported script should retain executable permission bits"
+    );
+
+    cleanup(&export_root);
 }

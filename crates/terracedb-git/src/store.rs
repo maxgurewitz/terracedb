@@ -4,22 +4,31 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
+use sha1::Sha1;
+use sha2::{Digest as _, Sha256};
 use terracedb_vfs::{
     CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, SnapshotOptions, Stats,
     VfsFileSystem, Volume, VolumeSnapshot,
 };
 
 use crate::{
-    GitCheckoutReport, GitCheckoutRequest, GitDiffEntry, GitDiffKind, GitDiffReport,
-    GitDiffRequest, GitDiscoverReport, GitDiscoverRequest, GitHeadState, GitIndexEntry,
-    GitIndexSnapshot, GitIndexStore, GitObject, GitObjectDatabase, GitObjectKind, GitRefDatabase,
-    GitRefUpdate, GitRefUpdateReport, GitReference, GitRepositoryHandle,
-    GitRepositoryImageDescriptor, GitStatusEntry, GitStatusKind, GitStatusOptions, GitStatusReport,
-    GitSubstrateError, worktree::GitWorktreeMaterializer,
+    GitCheckoutReport, GitCheckoutRequest, GitCommitReport, GitCommitRequest, GitDiffEntry,
+    GitDiffKind, GitDiffReport, GitDiffRequest, GitDiscoverReport, GitDiscoverRequest,
+    GitHeadState, GitIndexEntry, GitIndexSnapshot, GitIndexStore, GitObject, GitObjectDatabase,
+    GitObjectFormat, GitObjectKind, GitRefDatabase, GitRefUpdate, GitRefUpdateReport, GitReference,
+    GitRepositoryHandle, GitRepositoryImageDescriptor, GitStatusEntry, GitStatusKind,
+    GitStatusOptions, GitStatusReport, GitSubstrateError, worktree::GitWorktreeMaterializer,
 };
 
 pub trait GitCancellationToken: Send + Sync {
     fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitObjectIdAlgorithm {
+    Sha1,
+    Sha256,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -62,6 +71,10 @@ pub trait GitExecutionHooks: Send + Sync {
     }
 
     async fn on_checkout(&self, _report: &GitCheckoutReport) -> Result<(), GitSubstrateError> {
+        Ok(())
+    }
+
+    async fn on_commit(&self, _report: &GitCommitReport) -> Result<(), GitSubstrateError> {
         Ok(())
     }
 
@@ -180,6 +193,12 @@ pub trait GitRepository:
         request: GitCheckoutRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitCheckoutReport, GitSubstrateError>;
+
+    async fn commit(
+        &self,
+        request: GitCommitRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitCommitReport, GitSubstrateError>;
 
     async fn update_ref(
         &self,
@@ -472,6 +491,132 @@ impl GitRepository for DeterministicGitRepository {
         Ok(report)
     }
 
+    async fn commit(
+        &self,
+        request: GitCommitRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitCommitReport, GitSubstrateError> {
+        if cancellation.is_cancelled() {
+            return Err(GitSubstrateError::Cancelled {
+                repository_id: self.handle.repository_id.clone(),
+            });
+        }
+        let volume = self.writable_volume()?;
+        let fs = volume.fs();
+        let reference_name = normalize_ref_name(&request.target_ref);
+        let base_ref = request.base_ref.as_deref().map(normalize_ref_name);
+        let reference_path = git_control_path(&self.handle.root_path, &reference_name);
+        let previous_target = fs
+            .read_file(&reference_path)
+            .await?
+            .map(|bytes| decode_reference_target(&bytes));
+        let parent_oid = if let Some(base_ref) = base_ref.as_deref() {
+            Some(self.resolve_target_ref(base_ref).await?.oid)
+        } else if let Some(previous_target) = previous_target.as_deref() {
+            Some(previous_target.to_string())
+        } else {
+            self.head().await?.oid
+        };
+        let object_id_algorithm =
+            repository_object_id_algorithm(self.handle.provenance.object_format);
+        let worktree = collect_worktree_entries(fs.clone(), &self.handle.root_path).await?;
+        let parent_tree_oid = if let Some(parent_oid) = parent_oid.as_deref() {
+            self.commit_tree_oid(parent_oid).await?
+        } else {
+            None
+        };
+        let committed = match parent_oid.as_deref() {
+            Some(parent_oid) => {
+                !self
+                    .worktree_matches_target_oid(&worktree, parent_oid)
+                    .await?
+            }
+            None => !worktree.is_empty(),
+        };
+        if request.require_changes && !committed {
+            return Err(GitSubstrateError::NoChanges {
+                target_ref: reference_name,
+            });
+        }
+        if !committed && parent_oid.is_none() {
+            let report = GitCommitReport {
+                target_ref: reference_name,
+                previous_target,
+                commit_oid: String::new(),
+                tree_oid: String::new(),
+                parent_oid: None,
+                committed: false,
+            };
+            self.hooks.on_commit(&report).await?;
+            return Ok(report);
+        }
+        let tree_oid = if committed {
+            self.write_worktree_tree(
+                fs.as_ref(),
+                &worktree,
+                cancellation.as_ref(),
+                object_id_algorithm,
+            )
+            .await?
+        } else {
+            parent_tree_oid.clone().unwrap_or_default()
+        };
+        let commit_oid = if committed {
+            self.write_commit_object(
+                fs.as_ref(),
+                &tree_oid,
+                parent_oid.as_deref(),
+                &request.title,
+                &request.body,
+                object_id_algorithm,
+            )
+            .await?
+        } else {
+            parent_oid.clone().unwrap_or_default()
+        };
+        ensure_parent_directory(fs.as_ref(), &reference_path).await?;
+        fs.write_file(
+            &reference_path,
+            format!("{commit_oid}\n").into_bytes(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        if request.update_head {
+            self.write_checkout_head(
+                fs.as_ref(),
+                &reference_name,
+                &ResolvedTarget {
+                    oid: commit_oid.clone(),
+                    symbolic_ref: Some(reference_name.clone()),
+                },
+            )
+            .await?;
+        }
+        let existing_index = GitIndexStore::index(self).await?;
+        write_index_snapshot(
+            fs.as_ref(),
+            &self.handle.root_path,
+            worktree_index_snapshot(existing_index.metadata, &worktree, object_id_algorithm),
+        )
+        .await?;
+        self.refresh_snapshot().await?;
+
+        let report = GitCommitReport {
+            target_ref: reference_name,
+            previous_target,
+            commit_oid,
+            tree_oid,
+            parent_oid,
+            committed,
+        };
+        self.hooks.on_commit(&report).await?;
+        Ok(report)
+    }
+
     async fn update_ref(
         &self,
         request: GitRefUpdate,
@@ -503,6 +648,7 @@ impl GitRepository for DeterministicGitRepository {
         } else {
             format!("{}\n", request.target)
         };
+        ensure_parent_directory(fs.as_ref(), &reference_path).await?;
         fs.write_file(
             &reference_path,
             payload.into_bytes(),
@@ -928,6 +1074,129 @@ impl DeterministicGitRepository {
             }),
         }
     }
+
+    async fn worktree_matches_target_oid(
+        &self,
+        worktree: &BTreeMap<String, WorktreeEntry>,
+        target_oid: &str,
+    ) -> Result<bool, GitSubstrateError> {
+        let target_entries = self.tree_entries_for_target_oid(target_oid).await?;
+        if worktree.len() != target_entries.len() {
+            return Ok(false);
+        }
+        for (path, worktree_entry) in worktree {
+            let Some(target_entry) = target_entries.get(path) else {
+                return Ok(false);
+            };
+            if worktree_mode(worktree_entry) != target_entry.mode {
+                return Ok(false);
+            }
+            if self.read_blob_payload(&target_entry.oid).await? != worktree_entry.payload_bytes() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn commit_tree_oid(&self, oid: &str) -> Result<Option<String>, GitSubstrateError> {
+        let Some(object) = self.read_object(oid).await? else {
+            return Ok(None);
+        };
+        match object.kind {
+            GitObjectKind::Commit => Ok(Some(parse_commit_tree_oid(&object)?)),
+            GitObjectKind::Tree => Ok(Some(oid.to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    async fn write_worktree_tree(
+        &self,
+        fs: &dyn VfsFileSystem,
+        worktree: &BTreeMap<String, WorktreeEntry>,
+        cancellation: &dyn GitCancellationToken,
+        object_id_algorithm: GitObjectIdAlgorithm,
+    ) -> Result<String, GitSubstrateError> {
+        let mut directories = BTreeMap::<String, Vec<TreeRecord>>::new();
+        for (path, entry) in worktree {
+            if cancellation.is_cancelled() {
+                return Err(GitSubstrateError::Cancelled {
+                    repository_id: self.handle.repository_id.clone(),
+                });
+            }
+            let blob_oid = write_git_object(
+                fs,
+                &self.handle.root_path,
+                GitObjectKind::Blob,
+                &entry.payload_bytes(),
+                object_id_algorithm,
+            )
+            .await?;
+            let mode = worktree_mode(entry);
+            let mut current_dir = String::new();
+            let components = path_components_owned(path);
+            for component in &components[..components.len().saturating_sub(1)] {
+                directories
+                    .entry(current_dir.clone())
+                    .or_default()
+                    .push(TreeRecord::directory(component.clone()));
+                current_dir = if current_dir.is_empty() {
+                    component.clone()
+                } else {
+                    format!("{current_dir}/{component}")
+                };
+            }
+            let file_name =
+                components
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| GitSubstrateError::Bridge {
+                        operation: "commit",
+                        message: format!("worktree path is missing a terminal component: {path}"),
+                    })?;
+            directories
+                .entry(current_dir)
+                .or_default()
+                .push(TreeRecord::file(file_name, blob_oid, mode));
+        }
+        write_directory_tree_objects(
+            fs,
+            &self.handle.root_path,
+            "",
+            &mut directories,
+            object_id_algorithm,
+        )
+        .await
+    }
+
+    async fn write_commit_object(
+        &self,
+        fs: &dyn VfsFileSystem,
+        tree_oid: &str,
+        parent_oid: Option<&str>,
+        title: &str,
+        body: &str,
+        object_id_algorithm: GitObjectIdAlgorithm,
+    ) -> Result<String, GitSubstrateError> {
+        let mut payload = format!("tree {tree_oid}\n");
+        if let Some(parent_oid) = parent_oid {
+            payload.push_str(&format!("parent {parent_oid}\n"));
+        }
+        payload.push('\n');
+        payload.push_str(title.trim());
+        if !body.trim().is_empty() {
+            payload.push_str("\n\n");
+            payload.push_str(body.trim());
+        }
+        payload.push('\n');
+        write_git_object(
+            fs,
+            &self.handle.root_path,
+            GitObjectKind::Commit,
+            payload.as_bytes(),
+            object_id_algorithm,
+        )
+        .await
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1124,6 +1393,34 @@ struct ResolvedTarget {
     symbolic_ref: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeRecord {
+    name: String,
+    oid: Option<String>,
+    mode: u32,
+    kind: GitObjectKind,
+}
+
+impl TreeRecord {
+    fn file(name: String, oid: String, mode: u32) -> Self {
+        Self {
+            name,
+            oid: Some(oid),
+            mode,
+            kind: GitObjectKind::Blob,
+        }
+    }
+
+    fn directory(name: String) -> Self {
+        Self {
+            name,
+            oid: None,
+            mode: 0o040000,
+            kind: GitObjectKind::Tree,
+        }
+    }
+}
+
 fn build_tracked_entries(
     index: &GitIndexSnapshot,
     head_tree: &BTreeMap<String, TreeEntry>,
@@ -1181,6 +1478,27 @@ fn checkout_index_snapshot(
         entries,
         metadata: existing.metadata.clone(),
     }
+}
+
+fn worktree_index_snapshot(
+    metadata: BTreeMap<String, JsonValue>,
+    worktree: &BTreeMap<String, WorktreeEntry>,
+    object_id_algorithm: GitObjectIdAlgorithm,
+) -> GitIndexSnapshot {
+    let mut entries = worktree
+        .iter()
+        .map(|(path, entry)| GitIndexEntry {
+            path: path.clone(),
+            oid: Some(git_object_oid(
+                GitObjectKind::Blob,
+                &entry.payload_bytes(),
+                object_id_algorithm,
+            )),
+            mode: worktree_mode(entry),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    GitIndexSnapshot { entries, metadata }
 }
 
 fn scan_entry_from_staged_kind(
@@ -1295,6 +1613,13 @@ fn content_fingerprint(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn repository_object_id_algorithm(object_format: GitObjectFormat) -> GitObjectIdAlgorithm {
+    match object_format {
+        GitObjectFormat::Sha1 => GitObjectIdAlgorithm::Sha1,
+        GitObjectFormat::Sha256 => GitObjectIdAlgorithm::Sha256,
+    }
 }
 
 fn status_entry_matches_pathspec(entry: &ScanEntry, pathspec: &[String]) -> bool {
@@ -1601,6 +1926,72 @@ fn parse_object_kind(kind: &[u8]) -> GitObjectKind {
     }
 }
 
+async fn write_git_object(
+    fs: &dyn VfsFileSystem,
+    root: &str,
+    kind: GitObjectKind,
+    payload: &[u8],
+    object_id_algorithm: GitObjectIdAlgorithm,
+) -> Result<String, GitSubstrateError> {
+    let oid = git_object_oid(kind, payload, object_id_algorithm);
+    fs.write_file(
+        &git_control_path(root, &format!("objects/{oid}")),
+        [object_kind_name(kind).as_bytes(), b"\n", payload].concat(),
+        CreateOptions {
+            create_parents: true,
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(oid)
+}
+
+fn git_object_oid(
+    kind: GitObjectKind,
+    payload: &[u8],
+    object_id_algorithm: GitObjectIdAlgorithm,
+) -> String {
+    match object_id_algorithm {
+        GitObjectIdAlgorithm::Sha1 => {
+            let mut hasher = Sha1::new();
+            hasher.update(git_object_header(kind, payload.len()).as_bytes());
+            hasher.update(payload);
+            let digest = hasher.finalize();
+            let mut hex = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        }
+        GitObjectIdAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            hasher.update(git_object_header(kind, payload.len()).as_bytes());
+            hasher.update(payload);
+            let digest = hasher.finalize();
+            let mut hex = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        }
+    }
+}
+
+fn git_object_header(kind: GitObjectKind, payload_len: usize) -> String {
+    format!("{} {}\0", object_kind_name(kind), payload_len)
+}
+
+fn object_kind_name(kind: GitObjectKind) -> &'static str {
+    match kind {
+        GitObjectKind::Blob => "blob",
+        GitObjectKind::Commit => "commit",
+        GitObjectKind::Tree => "tree",
+        GitObjectKind::Tag => "tag",
+        GitObjectKind::Unknown => "unknown",
+    }
+}
+
 fn parse_commit_tree_oid(object: &GitObject) -> Result<String, GitSubstrateError> {
     let text = String::from_utf8_lossy(&object.data);
     text.lines()
@@ -1668,6 +2059,95 @@ fn parse_tree_entries(object: &GitObject) -> Result<Vec<ParsedTreeRecord>, GitSu
         });
     }
     Ok(entries)
+}
+
+async fn write_directory_tree_objects(
+    fs: &dyn VfsFileSystem,
+    root: &str,
+    directory: &str,
+    directories: &mut BTreeMap<String, Vec<TreeRecord>>,
+    object_id_algorithm: GitObjectIdAlgorithm,
+) -> Result<String, GitSubstrateError> {
+    let child_directories = directories
+        .keys()
+        .filter(|candidate| {
+            if directory.is_empty() {
+                !candidate.is_empty() && !candidate.contains('/')
+            } else {
+                candidate
+                    .strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                    && candidate[directory.len() + 1..].find('/').is_none()
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut entries = directories.remove(directory).unwrap_or_default();
+    for child in child_directories {
+        let name = child
+            .rsplit('/')
+            .next()
+            .expect("child directory name should exist")
+            .to_string();
+        let oid = Box::pin(write_directory_tree_objects(
+            fs,
+            root,
+            &child,
+            directories,
+            object_id_algorithm,
+        ))
+        .await?;
+        entries.retain(|entry| !(entry.kind == GitObjectKind::Tree && entry.name == name));
+        entries.push(TreeRecord {
+            name,
+            oid: Some(oid),
+            mode: 0o040000,
+            kind: GitObjectKind::Tree,
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    entries.dedup_by(|left, right| left.kind == right.kind && left.name == right.name);
+    let payload = entries
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "{:06o} {} {}\t{}\n",
+                entry.mode,
+                object_kind_name(entry.kind),
+                entry.oid.unwrap_or_default(),
+                entry.name
+            )
+        })
+        .collect::<String>();
+    write_git_object(
+        fs,
+        root,
+        GitObjectKind::Tree,
+        payload.as_bytes(),
+        object_id_algorithm,
+    )
+    .await
+}
+
+fn worktree_mode(entry: &WorktreeEntry) -> u32 {
+    match entry.kind {
+        FileKind::Symlink => 0o120000,
+        FileKind::Directory => 0o040000,
+        FileKind::File => {
+            if (entry.stats.mode & 0o111) != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        }
+    }
+}
+
+fn path_components_owned(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn write_index_snapshot(
@@ -1907,6 +2387,25 @@ fn decode_reference_target(bytes: &[u8]) -> String {
     text.strip_prefix("ref: ")
         .map(str::to_string)
         .unwrap_or(text)
+}
+
+async fn ensure_parent_directory(
+    fs: &dyn VfsFileSystem,
+    path: &str,
+) -> Result<(), GitSubstrateError> {
+    if let Some((parent, _)) = path.rsplit_once('/')
+        && !parent.is_empty()
+    {
+        fs.mkdir(
+            parent,
+            MkdirOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn ancestor_paths(start_path: &str, root: &str) -> Vec<String> {

@@ -11,9 +11,8 @@ pub mod worktree;
 
 pub use adapters::{SandboxGitBinding, SandboxGitRequest};
 pub use bridge::{
-    DeterministicGitHostBridge, GitFinalizeExportReport, GitFinalizeExportRequest, GitHostBridge,
-    GitImportEntry, GitImportEntryKind, GitImportMode, GitImportReport, GitImportRequest,
-    GitWorkspaceReport, GitWorkspaceRequest,
+    DeterministicGitHostBridge, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportMode,
+    GitImportReport, GitImportRequest, GitImportSource, GitRemoteProvider,
 };
 pub use error::GitSubstrateError;
 pub use host::HostGitBridge;
@@ -26,14 +25,15 @@ pub use store::{
     VfsGitRepositoryImage,
 };
 pub use types::{
-    GitAmbientDefault, GitCheckoutReport, GitCheckoutRequest, GitDiffEntry, GitDiffKind,
-    GitDiffReport, GitDiffRequest, GitDiscoverReport, GitDiscoverRequest, GitExportReport,
-    GitExportRequest, GitForkPolicy, GitForkSurface, GitForkSurfacePolicy, GitHeadState,
-    GitIndexEntry, GitIndexSnapshot, GitObject, GitOpenRequest, GitOwnershipMode,
-    GitPullRequestReport, GitPullRequestRequest, GitPushReport, GitPushRequest, GitRefUpdate,
-    GitRefUpdateReport, GitReference, GitRepositoryHandle, GitRepositoryImageDescriptor,
-    GitRepositoryPolicy, GitRepositoryProvenance, GitStatusEntry, GitStatusKind, GitStatusOptions,
-    GitStatusReport, GitTraceEvent, GitTracePhase,
+    GitAmbientDefault, GitCheckoutReport, GitCheckoutRequest, GitCommitReport, GitCommitRequest,
+    GitDiffEntry, GitDiffKind, GitDiffReport, GitDiffRequest, GitDiscoverReport,
+    GitDiscoverRequest, GitExportReport, GitExportRequest, GitForkPolicy, GitForkSurface,
+    GitForkSurfacePolicy, GitHeadState, GitIndexEntry, GitIndexSnapshot, GitObject,
+    GitObjectFormat, GitOpenRequest, GitOwnershipMode, GitPullRequestReport, GitPullRequestRequest,
+    GitPushReport, GitPushRequest, GitRefUpdate, GitRefUpdateReport, GitReference,
+    GitRepositoryHandle, GitRepositoryImageDescriptor, GitRepositoryOrigin, GitRepositoryPolicy,
+    GitRepositoryProvenance, GitStatusEntry, GitStatusKind, GitStatusOptions, GitStatusReport,
+    GitTraceEvent, GitTracePhase,
 };
 
 pub use serde_json::Value as JsonValue;

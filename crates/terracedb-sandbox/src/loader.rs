@@ -10,15 +10,16 @@ use terracedb_vfs::JsonValue;
 use tokio::sync::Mutex;
 
 use crate::{
-    CapabilityRegistry, PackageCompatibilityMode, SandboxCapabilityModule, SandboxError,
-    SandboxFilesystemShim, SandboxRuntimeStateHandle, SandboxSessionInfo,
-    packages::read_package_install_manifest,
+    CapabilityRegistry, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER, PackageCompatibilityMode,
+    SandboxCapabilityModule, SandboxError, SandboxFilesystemShim, SandboxRuntimeStateHandle,
+    SandboxSessionInfo, packages::read_package_install_manifest,
 };
 
 pub const TERRACE_WORKSPACE_PREFIX: &str = "terrace:/workspace";
 pub const HOST_CAPABILITY_PREFIX: &str = "terrace:host/";
 pub const SANDBOX_FS_LIBRARY_SPECIFIER: &str = "@terracedb/sandbox/fs";
 pub const SANDBOX_BASH_LIBRARY_SPECIFIER: &str = "@terracedb/sandbox/bash";
+pub const SANDBOX_GIT_LIBRARY_SPECIFIER: &str = "@terracedb/sandbox/git";
 pub const SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER: &str = "@terracedb/sandbox/typescript";
 
 pub(crate) const FS_HOST_EXPORTS: &[&str] = &[
@@ -33,6 +34,27 @@ pub(crate) const FS_HOST_EXPORTS: &[&str] = &[
     "rmdir",
     "rename",
     "fsync",
+];
+
+pub(crate) const GIT_REMOTE_IMPORT_HOST_EXPORT: &str = "importRepository";
+pub(crate) const GIT_REPO_HOST_EXPORTS: &[&str] = &[
+    "head",
+    "listRefs",
+    "status",
+    "diff",
+    "checkout",
+    "updateRef",
+    "createPullRequest",
+];
+pub(crate) const GIT_HOST_EXPORTS: &[&str] = &[
+    GIT_REMOTE_IMPORT_HOST_EXPORT,
+    "head",
+    "listRefs",
+    "status",
+    "diff",
+    "checkout",
+    "updateRef",
+    "createPullRequest",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +114,7 @@ impl SandboxModuleSpecifier {
             specifier,
             SANDBOX_FS_LIBRARY_SPECIFIER
                 | SANDBOX_BASH_LIBRARY_SPECIFIER
+                | SANDBOX_GIT_LIBRARY_SPECIFIER
                 | SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER
         ) {
             return Ok(Self::BuiltinLibrary {
@@ -301,6 +324,7 @@ impl SandboxModuleLoader {
             SANDBOX_BASH_LIBRARY_SPECIFIER => {
                 "export const unavailable = true;\nexport const service = 'bash';\n".to_string()
             }
+            SANDBOX_GIT_LIBRARY_SPECIFIER => git_preview_source(),
             SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER => {
                 "export const unavailable = true;\nexport const service = 'typescript';\n"
                     .to_string()
@@ -557,6 +581,23 @@ impl SandboxModuleLoader {
                         .collect(),
                 ))
             }
+            SandboxModuleKind::BuiltinLibrary
+                if loaded.specifier == SANDBOX_GIT_LIBRARY_SPECIFIER =>
+            {
+                let mut operations = GIT_REPO_HOST_EXPORTS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>();
+                if self
+                    .session_info
+                    .provenance
+                    .capabilities
+                    .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+                {
+                    operations.insert(0, GIT_REMOTE_IMPORT_HOST_EXPORT.to_string());
+                }
+                Ok(host_service_metadata(&loaded.specifier, operations))
+            }
             SandboxModuleKind::Npm => Ok(BTreeMap::from([(
                 "package".to_string(),
                 JsonValue::Bool(true),
@@ -732,6 +773,14 @@ fn fs_preview_source() -> String {
         .join("\n")
 }
 
+fn git_preview_source() -> String {
+    GIT_HOST_EXPORTS
+        .iter()
+        .map(|name| format!("export async function {name}(...args) {{ /* synthetic */ }}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn capability_preview_source(module: &SandboxCapabilityModule) -> String {
     module
         .methods
@@ -754,7 +803,10 @@ fn js_module_kind_for_specifier(specifier: &str) -> Result<JsModuleKind, Sandbox
         SandboxModuleSpecifier::Npm { .. } => JsModuleKind::Package,
         SandboxModuleSpecifier::NodeBuiltin { .. } => JsModuleKind::HostCapability,
         SandboxModuleSpecifier::BuiltinLibrary { specifier }
-            if specifier == SANDBOX_FS_LIBRARY_SPECIFIER =>
+            if matches!(
+                specifier.as_str(),
+                SANDBOX_FS_LIBRARY_SPECIFIER | SANDBOX_GIT_LIBRARY_SPECIFIER
+            ) =>
         {
             JsModuleKind::HostCapability
         }
@@ -768,7 +820,12 @@ fn js_module_kind_for_loaded(loaded: &LoadedSandboxModule) -> JsModuleKind {
         SandboxModuleKind::HostCapability => JsModuleKind::HostCapability,
         SandboxModuleKind::Npm => JsModuleKind::Package,
         SandboxModuleKind::NodeBuiltin => JsModuleKind::HostCapability,
-        SandboxModuleKind::BuiltinLibrary if loaded.specifier == SANDBOX_FS_LIBRARY_SPECIFIER => {
+        SandboxModuleKind::BuiltinLibrary
+            if matches!(
+                loaded.specifier.as_str(),
+                SANDBOX_FS_LIBRARY_SPECIFIER | SANDBOX_GIT_LIBRARY_SPECIFIER
+            ) =>
+        {
             JsModuleKind::HostCapability
         }
         SandboxModuleKind::BuiltinLibrary => JsModuleKind::Workspace,

@@ -5,6 +5,7 @@ members = [
     "crates/terracedb-bricks",
     "crates/terracedb-debezium",
     "crates/terracedb-git",
+    "crates/terracedb-git-github",
     "crates/terracedb-fuzz",
     "crates/terracedb-kafka",
     "crates/terracedb-js",

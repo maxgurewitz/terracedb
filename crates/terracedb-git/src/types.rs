@@ -132,11 +132,48 @@ pub struct GitRepositoryImageDescriptor {
     pub durable_snapshot: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl GitObjectFormat {
+    pub fn from_oid(oid: &str) -> Option<Self> {
+        if oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Some(Self::Sha1)
+        } else if oid.len() == 64 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Some(Self::Sha256)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRepositoryOrigin {
+    #[default]
+    Native,
+    HostImport,
+    RemoteImport,
+}
+
+impl GitRepositoryOrigin {
+    pub fn uses_external_bridge(self) -> bool {
+        !matches!(self, Self::Native)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRepositoryProvenance {
     pub backend: String,
     pub repo_root: String,
-    pub imported_from_host: bool,
+    pub origin: GitRepositoryOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    pub object_format: GitObjectFormat,
     pub volume_id: Option<VolumeId>,
     pub snapshot_sequence: Option<u64>,
     pub durable_snapshot: bool,
@@ -352,6 +389,32 @@ pub struct GitRefUpdateReport {
     pub previous_target: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitRequest {
+    pub target_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub require_changes: bool,
+    #[serde(default)]
+    pub update_head: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitReport {
+    pub target_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_target: Option<String>,
+    pub commit_oid: String,
+    pub tree_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_oid: Option<String>,
+    #[serde(default)]
+    pub committed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitExportRequest {
     pub target_path: String,
@@ -370,6 +433,8 @@ pub struct GitExportReport {
 pub struct GitPushRequest {
     pub remote: String,
     pub branch_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
@@ -431,8 +496,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        GitDiscoverRequest, GitForkPolicy, GitOpenRequest, GitRepositoryImageDescriptor,
-        GitRepositoryPolicy, GitRepositoryProvenance, GitTraceEvent, GitTracePhase,
+        GitDiscoverRequest, GitForkPolicy, GitObjectFormat, GitOpenRequest,
+        GitRepositoryImageDescriptor, GitRepositoryOrigin, GitRepositoryPolicy,
+        GitRepositoryProvenance, GitTraceEvent, GitTracePhase,
     };
 
     #[test]
@@ -449,7 +515,9 @@ mod tests {
             provenance: GitRepositoryProvenance {
                 backend: "deterministic-git".to_string(),
                 repo_root: "/repo".to_string(),
-                imported_from_host: false,
+                origin: GitRepositoryOrigin::Native,
+                remote_url: Some("https://github.com/example/repo".to_string()),
+                object_format: GitObjectFormat::Sha256,
                 volume_id: Some(terracedb_vfs::VolumeId::new(0x8000)),
                 snapshot_sequence: Some(9),
                 durable_snapshot: false,

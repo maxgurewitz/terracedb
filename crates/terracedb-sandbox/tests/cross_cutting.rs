@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -12,22 +14,24 @@ use std::{
 
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
+use support::fake_github::{FakeGithubServer, configured_remote_github_bridge};
 use terracedb::{
     DbDependencies, LogCursor, Rng, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp,
 };
+use terracedb_git::HostGitBridge;
 use terracedb_sandbox::{
     BashReport, BashRequest, BashService, BashSessionState, CapabilityRegistry, ConflictPolicy,
     DefaultSandboxStore, DeterministicBashService, DeterministicCapabilityModule,
-    DeterministicCapabilityRegistry, DeterministicGitWorkspaceManager,
+    DeterministicCapabilityRegistry, DeterministicGitRepositoryStore,
     DeterministicPackageInstaller, DeterministicPullRequestProviderClient,
     DeterministicReadonlyViewProvider, DeterministicRuntimeBackend, DeterministicTypeScriptService,
-    GitProvenance, HoistMode, HoistRequest, HostGitWorkspaceManager, PackageCompatibilityMode,
-    PackageInstallRequest, PullRequestRequest, ReadonlyViewCut, ReadonlyViewProtocolRequest,
-    ReadonlyViewProtocolResponse, ReadonlyViewProtocolTransport, ReadonlyViewRequest,
-    ReopenSessionOptions, SandboxCapability, SandboxConfig, SandboxServices, SandboxSession,
-    SandboxStore, StaticReadonlyViewRegistry, TERRACE_BASH_SESSION_STATE_PATH,
-    TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_TYPESCRIPT_MIRROR_PATH, TypeCheckRequest,
-    TypeScriptMirrorState, TypeScriptService, read_package_install_manifest,
+    GitProvenance, HoistMode, HoistRequest, PackageCompatibilityMode, PackageInstallRequest,
+    PullRequestRequest, ReadonlyViewCut, ReadonlyViewProtocolRequest, ReadonlyViewProtocolResponse,
+    ReadonlyViewProtocolTransport, ReadonlyViewRequest, ReopenSessionOptions, SandboxCapability,
+    SandboxConfig, SandboxServices, SandboxSession, SandboxStore, StaticReadonlyViewRegistry,
+    TERRACE_BASH_SESSION_STATE_PATH, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    TERRACE_TYPESCRIPT_MIRROR_PATH, TypeCheckRequest, TypeScriptMirrorState, TypeScriptService,
+    read_package_install_manifest,
 };
 use terracedb_simulation::SeededSimulationRunner;
 use terracedb_vfs::{
@@ -732,11 +736,14 @@ fn run_cross_cutting_simulation(seed: u64) -> turmoil::Result<CrossCuttingSimula
                                 move |provenance| {
                                     provenance.git = Some(GitProvenance {
                                         repo_root: "/repo".to_string(),
+                                        origin: terracedb_sandbox::GitRepositoryOrigin::RemoteImport,
                                         head_commit: Some(format!("{seed:x}")),
                                         branch: Some(branch),
                                         remote_url: Some(
                                             "git@example.invalid:terrace/sandbox.git".to_string(),
                                         ),
+                                        remote_bridge_metadata: BTreeMap::new(),
+                                        object_format: None,
                                         pathspec: vec![".".to_string()],
                                         dirty: false,
                                     });
@@ -911,28 +918,8 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn git_out(dir: &Path, args: &[&str]) -> String {
-    let output = sanitized_git_command()
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("run git command");
-    assert!(
-        output.status.success(),
-        "git -C {} {} failed: {}",
-        dir.display(),
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn init_git_repo(repo: &Path, remote: Option<&Path>, seed: u64) {
+fn init_git_repo(repo: &Path, remote_url: Option<&str>, seed: u64) {
     cleanup(repo);
-    if let Some(remote) = remote {
-        cleanup(remote);
-    }
     fs::create_dir_all(repo).expect("create repo dir");
     git(repo, &["init", "-b", "main"]);
     git(repo, &["config", "user.name", "Sandbox Tester"]);
@@ -940,34 +927,32 @@ fn init_git_repo(repo: &Path, remote: Option<&Path>, seed: u64) {
     write_host_file(&repo.join("tracked.txt"), &format!("tracked-{seed:x}\n"));
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "initial"]);
-    if let Some(remote) = remote {
-        let output = sanitized_git_command()
-            .arg("init")
-            .arg("--bare")
-            .arg(remote)
-            .output()
-            .expect("init bare remote");
-        assert!(
-            output.status.success(),
-            "git init --bare failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        git(
-            repo,
-            &["remote", "add", "origin", &remote.to_string_lossy()],
-        );
-        git(repo, &["push", "-u", "origin", "main"]);
+    if let Some(remote_url) = remote_url {
+        git(repo, &["remote", "add", "origin", remote_url]);
     }
 }
 
 fn host_git_services() -> SandboxServices {
+    let bridge = Arc::new(HostGitBridge::new("host-git"));
     SandboxServices::new(
         Arc::new(DeterministicRuntimeBackend::default()),
         Arc::new(DeterministicPackageInstaller::default()),
-        Arc::new(HostGitWorkspaceManager::default()),
+        Arc::new(DeterministicGitRepositoryStore::default()),
         Arc::new(DeterministicPullRequestProviderClient::default()),
         Arc::new(DeterministicReadonlyViewProvider::default()),
     )
+    .with_git_host_bridge(bridge)
+}
+
+fn remote_github_services(host: &str) -> SandboxServices {
+    SandboxServices::new(
+        Arc::new(DeterministicRuntimeBackend::default()),
+        Arc::new(DeterministicPackageInstaller::default()),
+        Arc::new(DeterministicGitRepositoryStore::default()),
+        Arc::new(DeterministicPullRequestProviderClient::default()),
+        Arc::new(DeterministicReadonlyViewProvider::default()),
+    )
+    .with_git_host_bridge(configured_remote_github_bridge(host))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -975,7 +960,7 @@ struct HostDiskWorkflowCapture {
     view_bytes: Vec<u8>,
     target_tracked: String,
     target_new: String,
-    exported_workspace_tracked: String,
+    remote_tracked: String,
     pushed: bool,
     active_view_handles: Vec<String>,
     tool_names: Vec<String>,
@@ -997,15 +982,15 @@ async fn create_empty_base(
 }
 
 async fn run_host_disk_workflow(seed: u64) -> HostDiskWorkflowCapture {
+    let fake = FakeGithubServer::spawn().await;
     let repo = deterministic_temp_dir("host-workflow-repo", seed);
-    let remote = deterministic_temp_dir("host-workflow-remote", seed);
     let target = deterministic_temp_dir("host-workflow-target", seed);
-    init_git_repo(&repo, Some(&remote), seed);
+    init_git_repo(&repo, Some(&fake.remote_url), seed);
     cleanup(&target);
     fs::create_dir_all(&target).expect("create target dir");
     write_host_file(&target.join("tracked.txt"), &format!("tracked-{seed:x}\n"));
 
-    let (vfs, sandbox) = sandbox_store(200 + seed, seed, host_git_services());
+    let (vfs, sandbox) = sandbox_store(200 + seed, seed, remote_github_services("127.0.0.1"));
     let base_volume_id = VolumeId::new(0x9800 + seed as u128);
     let session_volume_id = VolumeId::new(0x9900 + seed as u128);
     create_empty_base(&vfs, base_volume_id)
@@ -1098,17 +1083,14 @@ async fn run_host_disk_workflow(seed: u64) -> HostDiskWorkflowCapture {
         .await
         .expect("create pull request with host git");
 
-    let workspace = PathBuf::from(
-        pr.metadata
-            .get("workspace_path")
-            .and_then(|value| value.as_str())
-            .expect("workspace path"),
-    );
     let capture = HostDiskWorkflowCapture {
         view_bytes: bytes.expect("visible bytes"),
         target_tracked: read_host_file(&target.join("tracked.txt")),
         target_new: read_host_file(&target.join("new.txt")),
-        exported_workspace_tracked: read_host_file(&workspace.join("tracked.txt")),
+        remote_tracked: fake
+            .branch_file_text(&format!("sandbox/workflow-{seed:x}"), "tracked.txt")
+            .await
+            .expect("pushed tracked.txt"),
         pushed: pr
             .metadata
             .get("pushed")
@@ -1129,9 +1111,7 @@ async fn run_host_disk_workflow(seed: u64) -> HostDiskWorkflowCapture {
     };
 
     cleanup(&repo);
-    cleanup(&remote);
     cleanup(&target);
-    cleanup(&workspace);
     capture
 }
 
@@ -1143,10 +1123,7 @@ async fn seeded_host_disk_workflow_replays_hoist_eject_pr_and_view_contracts() {
         assert_eq!(first, second, "seed {seed:#x} should replay identically");
         assert_eq!(first.target_tracked, format!("workflow-{seed:x}\n"));
         assert_eq!(first.target_new, format!("new-{seed:x}\n"));
-        assert_eq!(
-            first.exported_workspace_tracked,
-            format!("workflow-{seed:x}\n")
-        );
+        assert_eq!(first.remote_tracked, format!("workflow-{seed:x}\n"));
         assert!(first.pushed, "seed {seed:#x} should push the PR export");
         assert_eq!(
             first.view_bytes,
@@ -1157,99 +1134,69 @@ async fn seeded_host_disk_workflow_replays_hoist_eject_pr_and_view_contracts() {
 }
 
 #[tokio::test]
-async fn deterministic_git_stub_matches_host_workspace_contract_on_shared_metadata() {
+async fn repo_backed_session_git_surface_reads_imported_repo_without_host_workspaces() {
     let seed = 0x5301_u64;
     let repo = deterministic_temp_dir("git-conformance-repo", seed);
-    let remote = deterministic_temp_dir("git-conformance-remote", seed);
-    let workspace = deterministic_temp_dir("git-conformance-workspace", seed);
-    init_git_repo(&repo, Some(&remote), seed);
-    cleanup(&workspace);
+    init_git_repo(&repo, None, seed);
 
-    let head_commit = git_out(&repo, &["rev-parse", "HEAD"]);
-    let remote_url = remote.to_string_lossy().into_owned();
-
-    let deterministic_services = SandboxServices::new(
-        Arc::new(DeterministicRuntimeBackend::default()),
-        Arc::new(DeterministicPackageInstaller::default()),
-        Arc::new(DeterministicGitWorkspaceManager::default()),
-        Arc::new(DeterministicPullRequestProviderClient::default()),
-        Arc::new(DeterministicReadonlyViewProvider::default()),
-    );
-    let host_services = host_git_services();
-    let (det_vfs, det_sandbox) = sandbox_store(300, seed, deterministic_services);
-    let (host_vfs, host_sandbox) = sandbox_store(301, seed + 1, host_services);
+    let (vfs, sandbox) = sandbox_store(300, seed, host_git_services());
     let base_volume_id = VolumeId::new(0xa100);
-    let det_session_volume_id = VolumeId::new(0xa101);
-    let host_session_volume_id = VolumeId::new(0xa102);
-    create_empty_base(&det_vfs, base_volume_id)
+    let session_volume_id = VolumeId::new(0xa101);
+    create_empty_base(&vfs, base_volume_id)
         .await
-        .expect("create deterministic base");
-    create_empty_base(&host_vfs, base_volume_id)
+        .expect("create base");
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
         .await
-        .expect("create host base");
+        .expect("open git session");
+    session
+        .hoist_from_disk(HoistRequest {
+            source_path: repo.to_string_lossy().into_owned(),
+            target_root: "/workspace".to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        })
+        .await
+        .expect("hoist repo");
 
-    let config = |session_volume_id| SandboxConfig {
-        session_volume_id,
-        session_chunk_size: Some(4096),
-        base_volume_id,
-        durable_base: false,
-        workspace_root: "/workspace".to_string(),
-        package_compat: PackageCompatibilityMode::NpmPureJs,
-        conflict_policy: ConflictPolicy::Fail,
-        capabilities: Default::default(),
-        execution_policy: None,
-        hoisted_source: None,
-        git_provenance: Some(GitProvenance {
-            repo_root: repo.to_string_lossy().into_owned(),
-            head_commit: Some(head_commit.clone()),
-            branch: Some("main".to_string()),
-            remote_url: Some(remote_url.clone()),
-            pathspec: vec![".".to_string()],
-            dirty: false,
-        }),
-    };
-
-    let deterministic = det_sandbox
-        .open_session(config(det_session_volume_id))
+    let head = session.git_head().await.expect("read repo head");
+    assert_eq!(head.symbolic_ref.as_deref(), Some("refs/heads/main"));
+    let status = session
+        .git_status(terracedb_sandbox::GitStatusOptions::default())
         .await
-        .expect("open deterministic git session");
-    let host = host_sandbox
-        .open_session(config(host_session_volume_id))
-        .await
-        .expect("open host git session");
-    let request = terracedb_sandbox::GitWorkspaceRequest {
-        branch_name: "sandbox/conformance".to_string(),
-        base_branch: Some("main".to_string()),
-        target_path: workspace.to_string_lossy().into_owned(),
-    };
-
-    let expected = deterministic
-        .prepare_git_workspace(request.clone())
-        .await
-        .expect("prepare deterministic workspace");
-    let actual = host
-        .prepare_git_workspace(request)
-        .await
-        .expect("prepare host workspace");
-
-    assert_eq!(expected.branch_name, actual.branch_name);
-    assert_eq!(expected.workspace_path, actual.workspace_path);
-    for key in ["base_ref", "head_commit", "remote_url", "repo_root"] {
-        assert_eq!(
-            expected.metadata.get(key),
-            actual.metadata.get(key),
-            "shared git metadata key `{key}` should match"
-        );
-    }
+        .expect("read repo status");
+    assert!(!status.dirty);
+    assert!(status.entries.is_empty());
+    let refs = session.git_list_refs().await.expect("list refs");
     assert_eq!(
-        git_out(
-            Path::new(&actual.workspace_path),
-            &["rev-parse", "--abbrev-ref", "HEAD"]
-        ),
-        "sandbox/conformance"
+        refs.iter()
+            .find(|reference| reference.name == "refs/heads/main")
+            .map(|reference| reference.target.clone()),
+        head.oid.clone()
+    );
+    session
+        .git_update_ref(terracedb_sandbox::GitRefUpdate {
+            name: "refs/heads/sandbox/conformance".to_string(),
+            target: head.oid.clone().expect("head oid"),
+            previous_target: None,
+            symbolic: false,
+        })
+        .await
+        .expect("create branch ref");
+    session
+        .git_checkout(terracedb_sandbox::GitCheckoutRequest {
+            target_ref: "refs/heads/sandbox/conformance".to_string(),
+            materialize_path: "/workspace".to_string(),
+            pathspec: Vec::new(),
+            update_head: true,
+        })
+        .await
+        .expect("checkout branch");
+    let branch_head = session.git_head().await.expect("read branch head");
+    assert_eq!(
+        branch_head.symbolic_ref.as_deref(),
+        Some("refs/heads/sandbox/conformance")
     );
 
     cleanup(&repo);
-    cleanup(&remote);
-    cleanup(&workspace);
 }

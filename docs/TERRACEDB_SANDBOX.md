@@ -701,16 +701,14 @@ Do not make PR creation operate by mutating the original checkout in place.
 Preferred flow:
 
 1. Hoist repo into sandbox and record provenance.
-2. Run agent work in the overlay.
+2. Import that repo as a VFS-native repository image and run agent work in the overlay.
 3. When creating a PR:
-   - create an ephemeral git worktree or temp clone at the recorded base commit,
-   - eject the sandbox delta into that worktree,
-   - create a branch,
-   - commit changes,
-   - push,
+   - open the VFS-native repo through `terracedb-git`,
+   - create/update the target branch and commit changes in-process,
+   - push through the configured git bridge,
    - open a PR through a provider adapter.
 
-This is safer than writing back into the user's active checkout and lets you keep a clean audit trail.
+This keeps git semantics inside the sandbox/VFS boundary while still avoiding writes into the user's active checkout and preserving a clean audit trail.
 
 ### Git-Aware API
 
@@ -730,12 +728,28 @@ pub struct PullRequestRequest {
 Back it with traits like:
 
 ```rust
-pub trait GitWorkspaceManager {
-    async fn prepare_export_worktree(
+pub trait GitRepositoryStore {
+    async fn open(
         &self,
-        provenance: &GitProvenance,
-        branch_name: &str,
-    ) -> Result<PreparedWorktree, SandboxError>;
+        image: Arc<dyn GitRepositoryImage>,
+        request: GitOpenRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<Arc<dyn GitRepository>, GitSubstrateError>;
+}
+
+pub trait GitHostBridge {
+    async fn push(
+        &self,
+        repository: Arc<dyn GitRepository>,
+        request: GitPushRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitPushReport, GitSubstrateError>;
+
+    async fn create_pull_request(
+        &self,
+        request: GitPullRequestRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitPullRequestReport, GitSubstrateError>;
 }
 
 pub trait PullRequestProviderClient {
@@ -751,13 +765,11 @@ pub trait PullRequestProviderClient {
 Recommended sequence:
 
 1. Validate the session has git provenance.
-2. Create an ephemeral worktree at the recorded base commit or branch tip.
-3. Eject the sandbox delta into the worktree.
-4. Run optional validation commands.
-5. `git checkout -b <branch>`
-6. `git add`
-7. `git commit`
-8. `git push`
+2. Open the imported VFS-native repo image through `terracedb-git`.
+3. Run optional validation commands over the sandbox/VFS worktree.
+4. Update or create the target branch ref inside the VFS-native repo.
+5. Commit the current worktree through `terracedb-git`.
+6. Push through the configured git bridge.
 9. Create PR via provider client.
 
 Return:

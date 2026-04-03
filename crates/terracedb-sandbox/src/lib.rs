@@ -23,11 +23,12 @@ pub use capabilities::{
     CapabilityCallRequest, CapabilityCallResult, CapabilityManifest, CapabilityMethod0,
     CapabilityMethod1, CapabilityRegistry, DeterministicCapabilityMethodBehavior,
     DeterministicCapabilityModule, DeterministicCapabilityRegistry,
-    ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
-    ManifestBoundCapabilityRegistry, ManifestBoundCapabilityResult, SandboxCapability,
-    SandboxCapabilityMethod, SandboxCapabilityModule, SandboxShellCommand,
-    SandboxShellCommandTarget, StaticCapabilityRegistry, TypedCapabilityModule,
-    TypedCapabilityModuleBuilder, TypedCapabilityRegistry,
+    GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER, ManifestBoundCapabilityDispatcher,
+    ManifestBoundCapabilityInvocation, ManifestBoundCapabilityRegistry,
+    ManifestBoundCapabilityResult, SandboxCapability, SandboxCapabilityMethod,
+    SandboxCapabilityModule, SandboxShellCommand, SandboxShellCommandTarget,
+    StaticCapabilityRegistry, TypedCapabilityModule, TypedCapabilityModuleBuilder,
+    TypedCapabilityRegistry,
 };
 pub use disk::{
     ConflictEntry, ConflictReport, EjectMode, EjectReport, EjectRequest, HoistMode, HoistReport,
@@ -35,16 +36,12 @@ pub use disk::{
 };
 pub use error::SandboxError;
 pub use fs::{SandboxFilesystemShim, VfsSandboxFilesystemShim};
-pub use git::{
-    DeterministicGitWorkspaceManager, GitWorkspaceManager, GitWorkspaceReport, GitWorkspaceRequest,
-    HostGitWorkspaceManager,
-};
 pub use harness::SandboxHarness;
 pub use loader::{
     HOST_CAPABILITY_PREFIX, LoadedSandboxModule, SANDBOX_BASH_LIBRARY_SPECIFIER,
-    SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry,
-    SandboxModuleKind, SandboxModuleLoadTrace, SandboxModuleLoader, SandboxModuleSpecifier,
-    TERRACE_WORKSPACE_PREFIX,
+    SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_GIT_LIBRARY_SPECIFIER,
+    SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry, SandboxModuleKind,
+    SandboxModuleLoadTrace, SandboxModuleLoader, SandboxModuleSpecifier, TERRACE_WORKSPACE_PREFIX,
 };
 pub use packages::{
     DeterministicPackageClass, DeterministicPackageDefinition, DeterministicPackageInstaller,
@@ -67,14 +64,14 @@ pub use session::{
     SandboxSession, SandboxStore,
 };
 pub use types::{
-    BaseSnapshotIdentity, ConflictPolicy, DEFAULT_WORKSPACE_ROOT, GitProvenance, HoistedSource,
-    PackageCompatibilityMode, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION,
-    SANDBOX_SESSION_FORMAT_VERSION, SandboxConfig, SandboxExecutionBinding, SandboxServiceBindings,
-    SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
-    TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
-    TERRACE_NPM_DIR, TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_NPM_SESSION_CACHE_DIR,
-    TERRACE_RUNTIME_CACHE_DIR, TERRACE_RUNTIME_MODULE_CACHE_PATH, TERRACE_SESSION_INFO_KV_KEY,
-    TERRACE_SESSION_METADATA_PATH,
+    BaseSnapshotIdentity, ConflictPolicy, DEFAULT_WORKSPACE_ROOT, GitProvenance,
+    GitRemoteImportReport, GitRemoteImportRequest, HoistedSource, PackageCompatibilityMode,
+    SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION, SANDBOX_SESSION_FORMAT_VERSION, SandboxConfig,
+    SandboxExecutionBinding, SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance,
+    SandboxSessionState, TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR,
+    TERRACE_NPM_COMPATIBILITY_ROOT, TERRACE_NPM_DIR, TERRACE_NPM_INSTALL_MANIFEST_PATH,
+    TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
 };
 pub use typescript::{
     DeterministicTypeScriptService, TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,
@@ -91,4 +88,13 @@ pub use view::{
     ReadonlyViewRequest, ReadonlyViewService, ReadonlyViewSessionRegistry,
     ReadonlyViewSessionSummary, ReadonlyViewStat, RemoteReadonlyViewBridge,
     StaticReadonlyViewRegistry,
+};
+
+pub use terracedb_git::{
+    DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
+    GitCheckoutRequest, GitCommitReport, GitDiffReport, GitDiffRequest, GitHeadState,
+    GitHostBridge, GitImportSource, GitObjectFormat,
+    GitPullRequestReport as SandboxGitPullRequestReport, GitPushReport, GitRefUpdate,
+    GitRefUpdateReport, GitReference, GitRepositoryOrigin, GitRepositoryStore, GitStatusOptions,
+    GitStatusReport, HostGitBridge,
 };

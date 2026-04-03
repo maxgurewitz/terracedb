@@ -4,7 +4,9 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use terracedb_git::{GitCheckoutRequest, GitDiffRequest, GitRefUpdate, GitStatusOptions};
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, FixedJsClock, JsCompatibilityProfile,
     JsExecutionKind, JsExecutionRequest, JsForkPolicy, JsHostServiceAdapter, JsHostServiceRequest,
@@ -16,10 +18,15 @@ use terracedb_vfs::{CreateOptions, JsonValue};
 use tokio::sync::Mutex;
 
 use crate::{
-    CapabilityCallRequest, CapabilityCallResult, HOST_CAPABILITY_PREFIX, LoadedSandboxModule,
-    PackageCompatibilityMode, SandboxError, SandboxModuleCacheEntry, SandboxModuleKind,
-    SandboxModuleLoadTrace, SandboxSession, SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
-    loader::{FS_HOST_EXPORTS, SANDBOX_FS_LIBRARY_SPECIFIER, SandboxModuleLoader},
+    CapabilityCallRequest, CapabilityCallResult, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER,
+    HOST_CAPABILITY_PREFIX, LoadedSandboxModule, PackageCompatibilityMode, SandboxError,
+    SandboxModuleCacheEntry, SandboxModuleKind, SandboxModuleLoadTrace, SandboxSession,
+    SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    loader::{
+        FS_HOST_EXPORTS, GIT_REMOTE_IMPORT_HOST_EXPORT, GIT_REPO_HOST_EXPORTS,
+        SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_GIT_LIBRARY_SPECIFIER, SandboxModuleLoader,
+    },
+    types::{has_sensitive_remote_bridge_metadata, sensitive_remote_bridge_metadata_keys},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -277,6 +284,7 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
                     session.volume().fs(),
                     [SANDBOX_FS_LIBRARY_SPECIFIER, "node:fs", "node:fs/promises"],
                 )))
+                .with_adapter(Arc::new(SandboxGitHostServiceAdapter::new(session.clone())))
                 .with_adapter(capability_services.clone()),
         );
         let (entrypoint, js_request, inline_eval_cache) =
@@ -435,6 +443,280 @@ impl JsHostServiceAdapter for SandboxCapabilityHostServiceAdapter {
     }
 }
 
+#[derive(Clone)]
+struct SandboxGitHostServiceAdapter {
+    session: SandboxSession,
+}
+
+impl SandboxGitHostServiceAdapter {
+    fn new(session: SandboxSession) -> Self {
+        Self { session }
+    }
+
+    async fn call_async(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        if request.service != SANDBOX_GIT_LIBRARY_SPECIFIER {
+            return Err(JsSubstrateError::HostServiceUnavailable {
+                service: request.service,
+                operation: request.operation,
+            });
+        }
+        match request.operation.as_str() {
+            "importRepository" => {
+                let args = host_service_argument::<GitHostImportRepositoryRequest>(&request)?;
+                if !self
+                    .session
+                    .info()
+                    .await
+                    .provenance
+                    .capabilities
+                    .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+                {
+                    return Err(JsSubstrateError::HostServiceDenied {
+                        service: request.service.clone(),
+                        operation: request.operation.clone(),
+                        message:
+                            "remote repository import requires the git-remote-import capability"
+                                .to_string(),
+                    });
+                }
+                if has_sensitive_remote_bridge_metadata(&args.metadata) {
+                    return Err(JsSubstrateError::HostServiceDenied {
+                        service: request.service.clone(),
+                        operation: request.operation.clone(),
+                        message: format!(
+                            "remote bridge credentials must be configured by the host app, not sandbox code (blocked keys: {})",
+                            sensitive_remote_bridge_metadata_keys(&args.metadata).join(", ")
+                        ),
+                    });
+                }
+                let report = self
+                    .session
+                    .import_remote_repository(crate::GitRemoteImportRequest {
+                        remote_url: args.remote_url,
+                        reference: args.reference,
+                        metadata: args.metadata,
+                        target_root: args.target_root,
+                        delete_missing: args.delete_missing,
+                    })
+                    .await
+                    .map_err(|error| sandbox_error_to_js_host_service(&request, error))?;
+                Ok(JsHostServiceResponse {
+                    result: Some(serde_json::to_value(report)?),
+                    metadata: BTreeMap::new(),
+                })
+            }
+            "head" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_head()
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "listRefs" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_list_refs()
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "status" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_status(
+                            host_service_optional_argument::<GitHostStatusRequest>(&request)?
+                                .into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "diff" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_diff(
+                            host_service_optional_argument::<GitHostDiffRequest>(&request)?.into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "checkout" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_checkout(
+                            host_service_argument::<GitHostCheckoutRequest>(&request)?.into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "updateRef" => Ok(JsHostServiceResponse {
+                result: Some(serde_json::to_value(
+                    self.session
+                        .git_update_ref(
+                            host_service_argument::<GitHostUpdateRefRequest>(&request)?.into(),
+                        )
+                        .await
+                        .map_err(|error| sandbox_error_to_js_host_service(&request, error))?,
+                )?),
+                metadata: BTreeMap::new(),
+            }),
+            "createPullRequest" => {
+                let args = host_service_argument::<GitHostCreatePullRequestRequest>(&request)?;
+                let report = self
+                    .session
+                    .create_pull_request(crate::PullRequestRequest {
+                        title: args.title,
+                        body: args.body,
+                        head_branch: args.head_branch,
+                        base_branch: args.base_branch,
+                    })
+                    .await
+                    .map_err(|error| sandbox_error_to_js_host_service(&request, error))?;
+                Ok(JsHostServiceResponse {
+                    result: Some(serde_json::to_value(report)?),
+                    metadata: BTreeMap::new(),
+                })
+            }
+            _ => Err(JsSubstrateError::HostServiceUnavailable {
+                service: request.service,
+                operation: request.operation,
+            }),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl JsHostServiceAdapter for SandboxGitHostServiceAdapter {
+    fn handles_service(&self, service: &str) -> bool {
+        service == SANDBOX_GIT_LIBRARY_SPECIFIER
+    }
+
+    async fn call(
+        &self,
+        request: JsHostServiceRequest,
+    ) -> Result<JsHostServiceResponse, JsSubstrateError> {
+        self.call_async(request).await
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostImportRepositoryRequest {
+    remote_url: String,
+    reference: Option<String>,
+    #[serde(default)]
+    metadata: BTreeMap<String, JsonValue>,
+    target_root: String,
+    #[serde(default)]
+    delete_missing: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostCreatePullRequestRequest {
+    title: String,
+    body: String,
+    head_branch: String,
+    base_branch: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct GitHostStatusRequest {
+    pathspec: Vec<String>,
+    include_untracked: Option<bool>,
+    include_ignored: Option<bool>,
+}
+
+impl From<GitHostStatusRequest> for GitStatusOptions {
+    fn from(value: GitHostStatusRequest) -> Self {
+        let defaults = GitStatusOptions::default();
+        Self {
+            pathspec: value.pathspec,
+            include_untracked: value
+                .include_untracked
+                .unwrap_or(defaults.include_untracked),
+            include_ignored: value.include_ignored.unwrap_or(defaults.include_ignored),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct GitHostDiffRequest {
+    pathspec: Vec<String>,
+    include_untracked: Option<bool>,
+    include_ignored: Option<bool>,
+}
+
+impl From<GitHostDiffRequest> for GitDiffRequest {
+    fn from(value: GitHostDiffRequest) -> Self {
+        let defaults = GitDiffRequest::default();
+        Self {
+            pathspec: value.pathspec,
+            include_untracked: value
+                .include_untracked
+                .unwrap_or(defaults.include_untracked),
+            include_ignored: value.include_ignored.unwrap_or(defaults.include_ignored),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostCheckoutRequest {
+    target_ref: String,
+    materialize_path: String,
+    #[serde(default)]
+    pathspec: Vec<String>,
+    #[serde(default)]
+    update_head: bool,
+}
+
+impl From<GitHostCheckoutRequest> for GitCheckoutRequest {
+    fn from(value: GitHostCheckoutRequest) -> Self {
+        Self {
+            target_ref: value.target_ref,
+            materialize_path: value.materialize_path,
+            pathspec: value.pathspec,
+            update_head: value.update_head,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostUpdateRefRequest {
+    name: String,
+    target: String,
+    #[serde(default)]
+    previous_target: Option<String>,
+    #[serde(default)]
+    symbolic: bool,
+}
+
+impl From<GitHostUpdateRefRequest> for GitRefUpdate {
+    fn from(value: GitHostUpdateRefRequest) -> Self {
+        Self {
+            name: value.name,
+            target: value.target,
+            previous_target: value.previous_target,
+            symbolic: value.symbolic,
+        }
+    }
+}
+
 async fn open_js_runtime(
     handle: &SandboxRuntimeHandle,
     session_info: &SandboxSessionInfo,
@@ -548,6 +830,29 @@ fn runtime_policy_for_session(
                 visible_host_services.insert(format!("{service}::{operation}"));
             }
         }
+    }
+
+    if session_info.provenance.git.is_some()
+        || session_info
+            .provenance
+            .capabilities
+            .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+    {
+        for operation in GIT_REPO_HOST_EXPORTS {
+            visible_host_services.insert(format!("{SANDBOX_GIT_LIBRARY_SPECIFIER}::{operation}"));
+        }
+    }
+    if session
+        .git_host_bridge()
+        .supports_remote_repository_bridge()
+        && session_info
+            .provenance
+            .capabilities
+            .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+    {
+        visible_host_services.insert(format!(
+            "{SANDBOX_GIT_LIBRARY_SPECIFIER}::{GIT_REMOTE_IMPORT_HOST_EXPORT}"
+        ));
     }
 
     let capabilities = session.capability_registry();
@@ -712,6 +1017,37 @@ fn host_service_arguments(arguments: &JsonValue) -> Vec<JsonValue> {
     }
 }
 
+fn host_service_argument<T>(request: &JsHostServiceRequest) -> Result<T, JsSubstrateError>
+where
+    T: DeserializeOwned,
+{
+    let value = match &request.arguments {
+        JsonValue::Array(values) => values.first().cloned().unwrap_or(JsonValue::Null),
+        other => other.clone(),
+    };
+    serde_json::from_value(value).map_err(|error| JsSubstrateError::EvaluationFailed {
+        entrypoint: format!("{}::{}", request.service, request.operation),
+        message: format!("invalid host service arguments: {error}"),
+    })
+}
+
+fn host_service_optional_argument<T>(request: &JsHostServiceRequest) -> Result<T, JsSubstrateError>
+where
+    T: DeserializeOwned + Default,
+{
+    let value = match &request.arguments {
+        JsonValue::Array(values) => values.first().cloned().unwrap_or(JsonValue::Null),
+        other => other.clone(),
+    };
+    if value.is_null() {
+        return Ok(T::default());
+    }
+    serde_json::from_value(value).map_err(|error| JsSubstrateError::EvaluationFailed {
+        entrypoint: format!("{}::{}", request.service, request.operation),
+        message: format!("invalid host service arguments: {error}"),
+    })
+}
+
 fn js_substrate_error_to_sandbox(
     error: JsSubstrateError,
     fallback_entrypoint: &str,
@@ -762,5 +1098,23 @@ fn js_substrate_error_to_sandbox(
         },
         JsSubstrateError::SerdeJson(error) => SandboxError::SerdeJson(error),
         JsSubstrateError::Vfs(error) => SandboxError::Vfs(error),
+    }
+}
+
+fn sandbox_error_to_js_host_service(
+    request: &JsHostServiceRequest,
+    error: SandboxError,
+) -> JsSubstrateError {
+    match error {
+        SandboxError::MissingGitProvenance | SandboxError::MissingGitObjectFormat => {
+            JsSubstrateError::HostServiceUnavailable {
+                service: request.service.clone(),
+                operation: request.operation.clone(),
+            }
+        }
+        other => JsSubstrateError::EvaluationFailed {
+            entrypoint: format!("{}::{}", request.service, request.operation),
+            message: other.to_string(),
+        },
     }
 }

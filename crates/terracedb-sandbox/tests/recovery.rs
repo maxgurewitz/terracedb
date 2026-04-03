@@ -10,6 +10,13 @@ use std::{
 };
 
 use async_trait::async_trait;
+use axum::{
+    Json, Router,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    routing::{get, patch, post},
+};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use terracedb::{
     DbDependencies, DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainPath,
@@ -21,14 +28,17 @@ use terracedb_capabilities::{
     ExecutionOperation, ExecutionPolicy, ManifestBinding, ResourceKind, ResourcePolicy,
     ResourceSelector, ShellCommandDescriptor, capability_module_specifier,
 };
+use terracedb_git::HostGitBridge;
+use terracedb_git_github::GitHubRemoteProvider;
 use terracedb_sandbox::{
     BashRequest, BashService, CapabilityRegistry, DefaultSandboxStore, DeterministicBashService,
     DeterministicCapabilityModule, DeterministicCapabilityRegistry, DeterministicPackageInstaller,
-    DeterministicRuntimeBackend, DeterministicTypeScriptService, GitProvenance, HoistMode,
-    HoistRequest, ManifestBoundCapabilityDispatcher, ManifestBoundCapabilityInvocation,
-    ManifestBoundCapabilityRegistry, ManifestBoundCapabilityResult, PackageCompatibilityMode,
-    PackageInstallRequest, PullRequestRequest, ReopenSessionOptions, SandboxCapability,
-    SandboxConfig, SandboxExecutionDomainRoute, SandboxExecutionKind, SandboxExecutionPlacement,
+    DeterministicRuntimeBackend, DeterministicTypeScriptService, GitProvenance,
+    GitRemoteImportRequest, HoistMode, HoistRequest, ManifestBoundCapabilityDispatcher,
+    ManifestBoundCapabilityInvocation, ManifestBoundCapabilityRegistry,
+    ManifestBoundCapabilityResult, PackageCompatibilityMode, PackageInstallRequest,
+    PullRequestRequest, ReopenSessionOptions, SandboxCapability, SandboxConfig,
+    SandboxExecutionDomainRoute, SandboxExecutionKind, SandboxExecutionPlacement,
     SandboxExecutionRequest, SandboxExecutionRouter, SandboxRuntimeBackend,
     SandboxRuntimeStateHandle, SandboxServices, SandboxStore, TERRACE_BASH_SESSION_STATE_PATH,
     TERRACE_NPM_INSTALL_MANIFEST_PATH, TERRACE_RUNTIME_MODULE_CACHE_PATH,
@@ -38,6 +48,7 @@ use terracedb_sandbox::{
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore,
 };
+use tokio::{net::TcpListener, sync::Mutex as AsyncMutex};
 
 static HOST_GIT_TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -142,7 +153,7 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn init_git_repo(repo: &Path, remote: Option<&Path>) {
+fn init_git_repo(repo: &Path, remote_url: Option<&str>) {
     fs::create_dir_all(repo).expect("create repo dir");
     git(repo, &["init", "-b", "main"]);
     git(repo, &["config", "user.name", "Sandbox Tester"]);
@@ -150,25 +161,416 @@ fn init_git_repo(repo: &Path, remote: Option<&Path>) {
     write_host_file(&repo.join("tracked.txt"), "tracked\n");
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "initial"]);
-    if let Some(remote) = remote {
-        fs::create_dir_all(remote).expect("create remote parent");
-        let output = sanitized_git_command()
-            .arg("init")
-            .arg("--bare")
-            .arg(remote)
-            .output()
-            .expect("init bare remote");
-        assert!(
-            output.status.success(),
-            "git init --bare failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        git(
-            repo,
-            &["remote", "add", "origin", &remote.to_string_lossy()],
-        );
-        git(repo, &["push", "-u", "origin", "main"]);
+    if let Some(remote_url) = remote_url {
+        git(repo, &["remote", "add", "origin", remote_url]);
     }
+}
+
+#[derive(Clone)]
+struct FakeGithubServer {
+    remote_url: String,
+    state: Arc<AsyncMutex<FakeGithubState>>,
+}
+
+impl FakeGithubServer {
+    async fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake github server");
+        let address = listener.local_addr().expect("fake github address");
+        let base_url = format!("http://{}", address);
+        let remote_url = format!("{}/octo/demo.git", base_url);
+        let state = Arc::new(AsyncMutex::new(FakeGithubState::seeded(base_url.clone())));
+        let app = Router::new()
+            .route("/api/v3/repos/{owner}/{repo}", get(fake_github_repository))
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/ref/heads/{*branch}",
+                get(fake_github_get_ref),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/commits/{sha}",
+                get(fake_github_get_commit),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/trees/{sha}",
+                get(fake_github_get_tree),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/blobs/{sha}",
+                get(fake_github_get_blob),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/blobs",
+                post(fake_github_create_blob),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/trees",
+                post(fake_github_create_tree),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/commits",
+                post(fake_github_create_commit),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/refs",
+                post(fake_github_create_ref),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/git/refs/heads/{*branch}",
+                patch(fake_github_update_ref),
+            )
+            .route(
+                "/api/v3/repos/{owner}/{repo}/pulls",
+                post(fake_github_create_pull),
+            )
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake github api");
+        });
+        Self { remote_url, state }
+    }
+
+    async fn branch_file_text(&self, branch: &str, path: &str) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .branch_file_bytes(branch, path)
+            .map(|bytes| String::from_utf8(bytes).expect("fake github blob is utf-8"))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FakeGithubCommit {
+    message: String,
+    tree: String,
+    parents: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FakeGithubTreeEntry {
+    path: String,
+    mode: String,
+    #[serde(rename = "type")]
+    kind: String,
+    sha: String,
+}
+
+#[derive(Clone, Debug)]
+struct FakeGithubState {
+    base_url: String,
+    next_sha: u64,
+    default_branch: String,
+    refs: BTreeMap<String, String>,
+    blobs: BTreeMap<String, Vec<u8>>,
+    trees: BTreeMap<String, Vec<FakeGithubTreeEntry>>,
+    commits: BTreeMap<String, FakeGithubCommit>,
+}
+
+impl FakeGithubState {
+    fn seeded(base_url: String) -> Self {
+        let mut state = Self {
+            base_url,
+            next_sha: 1,
+            default_branch: "main".to_string(),
+            refs: BTreeMap::new(),
+            blobs: BTreeMap::new(),
+            trees: BTreeMap::new(),
+            commits: BTreeMap::new(),
+        };
+        let blob_sha = state.alloc_sha();
+        state
+            .blobs
+            .insert(blob_sha.clone(), b"remote base\n".to_vec());
+        let tree_sha = state.alloc_sha();
+        state.trees.insert(
+            tree_sha.clone(),
+            vec![FakeGithubTreeEntry {
+                path: "README.md".to_string(),
+                mode: "100644".to_string(),
+                kind: "blob".to_string(),
+                sha: blob_sha,
+            }],
+        );
+        let commit_sha = state.alloc_sha();
+        state.commits.insert(
+            commit_sha.clone(),
+            FakeGithubCommit {
+                message: "Remote base".to_string(),
+                tree: tree_sha,
+                parents: Vec::new(),
+            },
+        );
+        state.refs.insert("main".to_string(), commit_sha);
+        state
+    }
+
+    fn alloc_sha(&mut self) -> String {
+        let next = self.next_sha;
+        self.next_sha = self.next_sha.saturating_add(1);
+        format!("{next:040x}")
+    }
+
+    fn branch_file_bytes(&self, branch: &str, path: &str) -> Option<Vec<u8>> {
+        let commit_sha = self.refs.get(branch)?;
+        let commit = self.commits.get(commit_sha)?;
+        self.tree_file_bytes(&commit.tree, path)
+    }
+
+    fn tree_file_bytes(&self, tree_sha: &str, path: &str) -> Option<Vec<u8>> {
+        let entries = self.trees.get(tree_sha)?;
+        if let Some((head, tail)) = path.split_once('/') {
+            let subtree = entries
+                .iter()
+                .find(|entry| entry.kind == "tree" && entry.path == head)?;
+            return self.tree_file_bytes(&subtree.sha, tail);
+        }
+        let blob = entries
+            .iter()
+            .find(|entry| entry.kind == "blob" && entry.path == path)?;
+        self.blobs.get(&blob.sha).cloned()
+    }
+}
+
+#[derive(Serialize)]
+struct FakeGithubRepositoryResponse {
+    default_branch: String,
+}
+
+#[derive(Serialize)]
+struct FakeGithubRefObject {
+    sha: String,
+}
+
+#[derive(Serialize)]
+struct FakeGithubRefResponse {
+    object: FakeGithubRefObject,
+}
+
+#[derive(Serialize)]
+struct FakeGithubCommitResponse {
+    message: String,
+    tree: FakeGithubRefObject,
+    parents: Vec<FakeGithubRefObject>,
+}
+
+#[derive(Serialize)]
+struct FakeGithubTreeResponse {
+    truncated: bool,
+    tree: Vec<FakeGithubTreeEntry>,
+}
+
+#[derive(Serialize)]
+struct FakeGithubBlobResponse {
+    content: String,
+    encoding: String,
+}
+
+#[derive(Serialize)]
+struct FakeGithubShaResponse {
+    sha: String,
+}
+
+#[derive(Serialize)]
+struct FakeGithubPullResponse {
+    html_url: String,
+}
+
+#[derive(Deserialize)]
+struct FakeGithubCreateBlobRequest {
+    content: String,
+    encoding: String,
+}
+
+#[derive(Deserialize)]
+struct FakeGithubCreateTreeRequest {
+    tree: Vec<FakeGithubTreeEntry>,
+}
+
+#[derive(Deserialize)]
+struct FakeGithubCreateCommitRequest {
+    message: String,
+    tree: String,
+    parents: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct FakeGithubCreateRefRequest {
+    r#ref: String,
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct FakeGithubUpdateRefRequest {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct FakeGithubCreatePullRequest {
+    title: String,
+    head: String,
+    base: String,
+    body: String,
+}
+
+async fn fake_github_repository(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo)): AxumPath<(String, String)>,
+) -> Json<FakeGithubRepositoryResponse> {
+    let state = state.lock().await;
+    Json(FakeGithubRepositoryResponse {
+        default_branch: state.default_branch.clone(),
+    })
+}
+
+async fn fake_github_get_ref(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo, branch)): AxumPath<(String, String, String)>,
+) -> Result<Json<FakeGithubRefResponse>, StatusCode> {
+    let state = state.lock().await;
+    let Some(sha) = state.refs.get(branch.trim_start_matches('/')).cloned() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(FakeGithubRefResponse {
+        object: FakeGithubRefObject { sha },
+    }))
+}
+
+async fn fake_github_get_commit(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo, sha)): AxumPath<(String, String, String)>,
+) -> Result<Json<FakeGithubCommitResponse>, StatusCode> {
+    let state = state.lock().await;
+    let Some(commit) = state.commits.get(&sha).cloned() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(FakeGithubCommitResponse {
+        message: commit.message,
+        tree: FakeGithubRefObject { sha: commit.tree },
+        parents: commit
+            .parents
+            .into_iter()
+            .map(|sha| FakeGithubRefObject { sha })
+            .collect(),
+    }))
+}
+
+async fn fake_github_get_tree(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo, sha)): AxumPath<(String, String, String)>,
+) -> Result<Json<FakeGithubTreeResponse>, StatusCode> {
+    let state = state.lock().await;
+    let Some(tree) = state.trees.get(&sha).cloned() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(FakeGithubTreeResponse {
+        truncated: false,
+        tree,
+    }))
+}
+
+async fn fake_github_get_blob(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo, sha)): AxumPath<(String, String, String)>,
+) -> Result<Json<FakeGithubBlobResponse>, StatusCode> {
+    let state = state.lock().await;
+    let Some(blob) = state.blobs.get(&sha).cloned() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(FakeGithubBlobResponse {
+        content: {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            STANDARD.encode(blob)
+        },
+        encoding: "base64".to_string(),
+    }))
+}
+
+async fn fake_github_create_blob(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo)): AxumPath<(String, String)>,
+    Json(request): Json<FakeGithubCreateBlobRequest>,
+) -> Result<Json<FakeGithubShaResponse>, StatusCode> {
+    let bytes = match request.encoding.as_str() {
+        "base64" => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            STANDARD
+                .decode(request.content.as_bytes())
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let mut state = state.lock().await;
+    let sha = state.alloc_sha();
+    state.blobs.insert(sha.clone(), bytes);
+    Ok(Json(FakeGithubShaResponse { sha }))
+}
+
+async fn fake_github_create_tree(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo)): AxumPath<(String, String)>,
+    Json(request): Json<FakeGithubCreateTreeRequest>,
+) -> Json<FakeGithubShaResponse> {
+    let mut state = state.lock().await;
+    let sha = state.alloc_sha();
+    state.trees.insert(sha.clone(), request.tree);
+    Json(FakeGithubShaResponse { sha })
+}
+
+async fn fake_github_create_commit(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo)): AxumPath<(String, String)>,
+    Json(request): Json<FakeGithubCreateCommitRequest>,
+) -> Json<FakeGithubShaResponse> {
+    let mut state = state.lock().await;
+    let sha = state.alloc_sha();
+    state.commits.insert(
+        sha.clone(),
+        FakeGithubCommit {
+            message: request.message,
+            tree: request.tree,
+            parents: request.parents,
+        },
+    );
+    Json(FakeGithubShaResponse { sha })
+}
+
+async fn fake_github_create_ref(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo)): AxumPath<(String, String)>,
+    Json(request): Json<FakeGithubCreateRefRequest>,
+) -> Json<FakeGithubShaResponse> {
+    let mut state = state.lock().await;
+    state.refs.insert(
+        request.r#ref.trim_start_matches("refs/heads/").to_string(),
+        request.sha.clone(),
+    );
+    Json(FakeGithubShaResponse { sha: request.sha })
+}
+
+async fn fake_github_update_ref(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((_owner, _repo, branch)): AxumPath<(String, String, String)>,
+    Json(request): Json<FakeGithubUpdateRefRequest>,
+) -> StatusCode {
+    let mut state = state.lock().await;
+    state
+        .refs
+        .insert(branch.trim_start_matches('/').to_string(), request.sha);
+    StatusCode::OK
+}
+
+async fn fake_github_create_pull(
+    State(state): State<Arc<AsyncMutex<FakeGithubState>>>,
+    AxumPath((owner, repo)): AxumPath<(String, String)>,
+    Json(request): Json<FakeGithubCreatePullRequest>,
+) -> Json<FakeGithubPullResponse> {
+    let state = state.lock().await;
+    let _ = (request.title, request.head, request.base, request.body);
+    Json(FakeGithubPullResponse {
+        html_url: format!("{}/{owner}/{repo}/pull/1", state.base_url),
+    })
 }
 
 async fn seed_base(store: &InMemoryVfsStore, volume_id: VolumeId) {
@@ -343,9 +745,12 @@ async fn reopen_prefers_file_metadata_and_repairs_missing_kv_mirror() {
     updated.revision += 10;
     updated.provenance.git = Some(GitProvenance {
         repo_root: "/repo".to_string(),
+        origin: terracedb_sandbox::GitRepositoryOrigin::Native,
         head_commit: Some("cafebabe".to_string()),
         branch: Some("file-first".to_string()),
         remote_url: None,
+        remote_bridge_metadata: BTreeMap::new(),
+        object_format: None,
         pathspec: vec![".".to_string()],
         dirty: false,
     });
@@ -408,9 +813,12 @@ async fn durable_recovery_only_sees_flushed_provenance_updates() {
         .update_provenance(|provenance| {
             provenance.git = Some(GitProvenance {
                 repo_root: "/repo".to_string(),
+                origin: terracedb_sandbox::GitRepositoryOrigin::Native,
                 head_commit: Some("1".to_string()),
                 branch: Some("pending".to_string()),
                 remote_url: None,
+                remote_bridge_metadata: BTreeMap::new(),
+                object_format: None,
                 pathspec: vec![".".to_string()],
                 dirty: false,
             });
@@ -1241,17 +1649,21 @@ fn recovery_execution_policy() -> ExecutionPolicy {
 #[tokio::test]
 async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
     let repo = unique_host_git_test_dir("host-git-repo");
-    let remote = unique_host_git_test_dir("host-git-remote");
-    init_git_repo(&repo, Some(&remote));
+    let fake = FakeGithubServer::spawn().await;
+    init_git_repo(&repo, Some(&fake.remote_url));
     let head_commit = git_out(&repo, &["rev-parse", "HEAD"]);
     let source_path = repo.to_string_lossy().into_owned();
     let repo_root = fs::canonicalize(&repo)
         .expect("canonicalize host git repo")
         .to_string_lossy()
         .into_owned();
-    let remote_url = remote.to_string_lossy().into_owned();
+    let remote_url = fake.remote_url.clone();
 
-    let services = SandboxServices::deterministic_with_host_git();
+    let services = SandboxServices::deterministic().with_git_host_bridge(Arc::new(
+        HostGitBridge::new("host-git").with_remote_provider(Arc::new(
+            GitHubRemoteProvider::new().with_supported_host("127.0.0.1"),
+        )),
+    ));
     let (source_vfs, sandbox) = sandbox_store_with_services(118, 2084, services.clone());
     let base_volume_id = VolumeId::new(0x8224);
     let session_volume_id = VolumeId::new(0x8225);
@@ -1311,7 +1723,7 @@ async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
     assert_eq!(
         reopened_info.provenance.hoisted_source,
         Some(terracedb_sandbox::HoistedSource {
-            source_path: repo_root.clone(),
+            source_path: source_path.clone(),
             mode: HoistMode::GitHead,
         })
     );
@@ -1340,13 +1752,15 @@ async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
         .expect("persisted hoist manifest");
     let manifest: serde_json::Value =
         serde_json::from_slice(&manifest_bytes).expect("decode hoist manifest");
-    assert_eq!(manifest["source_path"], json!(repo_root.clone()));
+    assert_eq!(manifest["source"]["kind"], json!("host_path"));
+    assert_eq!(manifest["source"]["path"], json!(source_path.clone()));
     assert_eq!(manifest["target_root"], json!("/workspace"));
     assert_eq!(manifest["mode"], json!("git_head"));
     assert_eq!(
         manifest["git_provenance"]["repo_root"],
         json!(repo_root.clone())
     );
+    assert_eq!(manifest["git_provenance"]["origin"], json!("host_import"));
     assert_eq!(
         manifest["git_provenance"]["head_commit"],
         json!(head_commit.clone())
@@ -1387,44 +1801,211 @@ async fn reopen_restores_host_bridge_git_manifest_and_allows_export() {
         })
         .await
         .expect("create pull request after reopen");
-    assert!(report.url.contains("example.invalid"));
-    assert_eq!(
-        report.metadata.get("eject_mode"),
-        Some(&json!("apply_delta"))
-    );
-    assert_eq!(
-        report.metadata.get("provenance_validated"),
-        Some(&json!(true))
-    );
+    assert!(report.url.contains("/pull/1"));
     assert_eq!(report.metadata.get("committed"), Some(&json!(true)));
     assert_eq!(report.metadata.get("pushed"), Some(&json!(true)));
-
-    let workspace = PathBuf::from(
-        report
-            .metadata
-            .get("workspace_path")
-            .and_then(serde_json::Value::as_str)
-            .expect("workspace path"),
-    );
-    assert_eq!(
-        git_out(&workspace, &["show", "HEAD:tracked.txt"]),
-        "reopened bridge change"
-    );
-    let pushed_head = sanitized_git_command()
-        .arg("--git-dir")
-        .arg(&remote)
-        .args(["rev-parse", "refs/heads/sandbox/recovered-host-git"])
-        .output()
-        .expect("inspect recovered remote branch");
+    assert!(report.metadata.get("workspace_path").is_none());
     assert!(
-        pushed_head.status.success(),
-        "recovered remote branch missing: {}",
-        String::from_utf8_lossy(&pushed_head.stderr)
+        fake.branch_file_text("sandbox/recovered-host-git", "tracked.txt")
+            .await
+            .as_deref()
+            == Some("reopened bridge change\n"),
+        "recovered tracked.txt missing from provider-backed remote"
     );
 
     cleanup(&repo);
-    cleanup(&remote);
-    cleanup(&workspace);
+}
+
+#[tokio::test]
+async fn reopen_restores_remote_import_git_manifest_and_allows_repo_backed_prs() {
+    let fake = FakeGithubServer::spawn().await;
+    let credentialized_remote_url =
+        fake.remote_url
+            .replacen("http://", "http://oauth:test-token@", 1);
+    let services = SandboxServices::deterministic().with_git_host_bridge(Arc::new(
+        HostGitBridge::new("host-git").with_remote_provider(Arc::new(GitHubRemoteProvider::new())),
+    ));
+    let (source_vfs, sandbox) = sandbox_store_with_services(120, 2086, services.clone());
+    let base_volume_id = VolumeId::new(0x8226);
+    let session_volume_id = VolumeId::new(0x8227);
+    create_empty_base(&source_vfs, base_volume_id).await;
+
+    let session = sandbox
+        .open_session(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096))
+        .await
+        .expect("open remote import recovery session");
+    session
+        .set_remote_bridge_session_metadata(
+            credentialized_remote_url.clone(),
+            BTreeMap::from([("auth_token".to_string(), json!("test-token"))]),
+        )
+        .await;
+    let import = session
+        .import_remote_repository(GitRemoteImportRequest {
+            remote_url: credentialized_remote_url.clone(),
+            reference: None,
+            metadata: BTreeMap::from([
+                ("provider".to_string(), json!("github")),
+                ("credential_id".to_string(), json!("test-credential")),
+            ]),
+            target_root: "/workspace".to_string(),
+            delete_missing: true,
+        })
+        .await
+        .expect("import remote repository");
+    assert_eq!(
+        import.git_provenance.origin,
+        terracedb_sandbox::GitRepositoryOrigin::RemoteImport
+    );
+    assert_eq!(import.git_provenance.branch.as_deref(), Some("main"));
+    assert_eq!(
+        import.git_provenance.remote_url.as_deref(),
+        Some(fake.remote_url.as_str())
+    );
+    assert_eq!(import.remote_url, fake.remote_url);
+    assert_eq!(
+        import.git_provenance.remote_bridge_metadata.get("provider"),
+        Some(&json!("github"))
+    );
+    assert_eq!(
+        import
+            .git_provenance
+            .remote_bridge_metadata
+            .get("credential_id"),
+        Some(&json!("test-credential"))
+    );
+    assert!(
+        import
+            .git_provenance
+            .remote_bridge_metadata
+            .get("auth_token")
+            .is_none()
+    );
+    session
+        .flush()
+        .await
+        .expect("flush remote import for recovery");
+
+    let flushed = source_vfs
+        .export_volume(CloneVolumeSource::new(session_volume_id).durable(true))
+        .await
+        .expect("export durable cut for remote import recovery");
+    let (recovery_vfs, recovery_sandbox) = sandbox_store_with_services(121, 2087, services);
+    recovery_vfs
+        .import_volume(
+            flushed,
+            VolumeConfig::new(session_volume_id)
+                .with_chunk_size(4096)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("import durable cut for remote import recovery");
+    let reopened = recovery_sandbox
+        .reopen_session(ReopenSessionOptions {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+        })
+        .await
+        .expect("reopen remote import recovery session");
+
+    let reopened_info = reopened.info().await;
+    assert_eq!(reopened_info.provenance.hoisted_source, None);
+    let reopened_git = reopened_info
+        .provenance
+        .git
+        .expect("reopened remote import git provenance");
+    assert_eq!(
+        reopened_git.origin,
+        terracedb_sandbox::GitRepositoryOrigin::RemoteImport
+    );
+    assert_eq!(reopened_git.branch.as_deref(), Some("main"));
+    assert_eq!(
+        reopened_git.remote_url.as_deref(),
+        Some(fake.remote_url.as_str())
+    );
+    assert_eq!(
+        reopened_git.remote_bridge_metadata.get("provider"),
+        Some(&json!("github"))
+    );
+    assert_eq!(
+        reopened_git.remote_bridge_metadata.get("credential_id"),
+        Some(&json!("test-credential"))
+    );
+    assert!(
+        reopened_git
+            .remote_bridge_metadata
+            .get("auth_token")
+            .is_none()
+    );
+
+    let manifest_bytes = reopened
+        .filesystem()
+        .read_file(terracedb_sandbox::disk::HOIST_MANIFEST_PATH)
+        .await
+        .expect("read persisted remote import manifest")
+        .expect("persisted remote import manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("decode remote import manifest");
+    assert_eq!(manifest["source"]["kind"], json!("remote_repository"));
+    assert_eq!(
+        manifest["source"]["remote_url"],
+        json!(fake.remote_url.clone())
+    );
+    assert_eq!(manifest["target_root"], json!("/workspace"));
+    assert_eq!(manifest["git_provenance"]["origin"], json!("remote_import"));
+    assert_eq!(
+        manifest["git_provenance"]["remote_url"],
+        json!(fake.remote_url.clone())
+    );
+    assert_eq!(
+        manifest["git_provenance"]["remote_bridge_metadata"]["provider"],
+        json!("github")
+    );
+    assert_eq!(
+        manifest["git_provenance"]["remote_bridge_metadata"]["credential_id"],
+        json!("test-credential")
+    );
+    assert!(manifest["git_provenance"]["remote_bridge_metadata"]["auth_token"].is_null());
+
+    reopened
+        .set_remote_bridge_session_metadata(
+            credentialized_remote_url,
+            BTreeMap::from([("auth_token".to_string(), json!("test-token"))]),
+        )
+        .await;
+
+    reopened
+        .filesystem()
+        .write_file(
+            "/workspace/tracked.txt",
+            b"reopened remote import\n".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write reopened remote import change");
+
+    let report = reopened
+        .create_pull_request(PullRequestRequest {
+            title: "Recovered remote import PR".to_string(),
+            body: "Created after reopen".to_string(),
+            head_branch: "sandbox/recovered-remote-import".to_string(),
+            base_branch: "main".to_string(),
+        })
+        .await
+        .expect("create pull request after remote import reopen");
+    assert!(report.url.contains("/pull/1"));
+    assert_eq!(report.metadata.get("committed"), Some(&json!(true)));
+    assert_eq!(report.metadata.get("pushed"), Some(&json!(true)));
+    assert!(report.metadata.get("workspace_path").is_none());
+    assert_eq!(
+        fake.branch_file_text("sandbox/recovered-remote-import", "tracked.txt")
+            .await,
+        Some("reopened remote import\n".to_string())
+    );
 }
 
 fn recovery_router() -> SandboxExecutionRouter {
