@@ -12,7 +12,7 @@ use terracedb_capabilities::{ExecutionOperation, ExecutionPolicy};
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
     GitCheckoutRequest, GitCommitRequest, GitDiffReport, GitDiffRequest, GitHeadState,
-    GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest, GitImportSource,
+    GitHostBridge, GitImportEntryKind, GitImportLayout, GitImportMode, GitImportRequest, GitImportSource,
     GitObjectFormat, GitOpenRequest, GitPullRequestRequest as GitBridgePullRequestRequest,
     GitPushRequest, GitRefUpdate, GitRefUpdateReport, GitReference, GitRepository,
     GitRepositoryImage, GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
@@ -1015,6 +1015,112 @@ impl SandboxSession {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) async fn import_git_tree_into_root(
+        &self,
+        request: HoistRequest,
+        pathspec: Vec<String>,
+    ) -> Result<HoistReport, SandboxError> {
+        let report = match &request.mode {
+            crate::HoistMode::GitHead
+                if self.services.git_bridge.supports_host_filesystem_bridge() =>
+            {
+                self.services
+                    .git_bridge
+                    .import_repository(
+                        GitImportRequest {
+                            source: GitImportSource::HostPath {
+                                path: request.source_path.clone(),
+                            },
+                            target_root: request.target_root.clone(),
+                            mode: GitImportMode::Head,
+                            layout: GitImportLayout::TreeOnly,
+                            pathspec,
+                            metadata: BTreeMap::new(),
+                        },
+                        Arc::new(NeverCancel),
+                    )
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?
+            }
+            crate::HoistMode::GitWorkingTree {
+                include_untracked,
+                include_ignored,
+            } if self.services.git_bridge.supports_host_filesystem_bridge() => {
+                self.services
+                    .git_bridge
+                    .import_repository(
+                        GitImportRequest {
+                            source: GitImportSource::HostPath {
+                                path: request.source_path.clone(),
+                            },
+                            target_root: request.target_root.clone(),
+                            mode: GitImportMode::WorkingTree {
+                                include_untracked: *include_untracked,
+                                include_ignored: *include_ignored,
+                            },
+                            layout: GitImportLayout::TreeOnly,
+                            pathspec,
+                            metadata: BTreeMap::new(),
+                        },
+                        Arc::new(NeverCancel),
+                    )
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?
+            }
+            crate::HoistMode::DirectorySnapshot => {
+                return Err(SandboxError::Service {
+                    service: "git",
+                    message: "git bridge cannot import directory snapshots".to_string(),
+                });
+            }
+            crate::HoistMode::GitHead | crate::HoistMode::GitWorkingTree { .. } => {
+                return Err(SandboxError::Service {
+                    service: "git",
+                    message:
+                        "git support tree import requires a git host bridge that supports host repository import"
+                            .to_string(),
+                });
+            }
+        };
+
+        let entries = report
+            .entries
+            .iter()
+            .map(git_import_entry_to_tree_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let deleted_paths = replace_vfs_tree(
+            self.volume.fs().as_ref(),
+            &report.target_root,
+            &entries,
+            request.delete_missing,
+        )
+        .await?;
+
+        let source_path = match &report.source {
+            GitImportSource::HostPath { path } => path.clone(),
+            GitImportSource::RemoteRepository { remote_url, .. } => remote_url.clone(),
+        };
+
+        Ok(HoistReport {
+            source_path,
+            target_root: report.target_root,
+            hoisted_paths: entries.len(),
+            deleted_paths,
+            git_provenance: Some(crate::GitProvenance {
+                repo_root: report.repository_root,
+                origin: report.origin,
+                head_commit: report.head_commit,
+                branch: report.branch,
+                remote_url: report.remote_url.as_deref().map(sanitize_remote_url),
+                remote_bridge_metadata: durable_remote_bridge_metadata(&report.metadata),
+                object_format: Some(report.object_format),
+                pathspec: report.pathspec,
+                dirty: report.dirty,
+            }),
+        })
     }
 
     pub async fn import_remote_repository(
@@ -2210,6 +2316,8 @@ async fn prepare_git_hoist_via_bridge(
                         });
                     }
                 },
+                layout: GitImportLayout::RepositoryImage,
+                pathspec: Vec::new(),
                 metadata: BTreeMap::new(),
             },
             Arc::new(NeverCancel),
@@ -2258,6 +2366,8 @@ async fn prepare_remote_git_import_via_bridge(
                 },
                 target_root: request.target_root.clone(),
                 mode: GitImportMode::Head,
+                layout: GitImportLayout::RepositoryImage,
+                pathspec: Vec::new(),
                 metadata: request.metadata.clone(),
             },
             Arc::new(NeverCancel),

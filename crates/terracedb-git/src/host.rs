@@ -17,7 +17,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     GitCancellationToken, GitExportReport, GitExportRequest, GitHeadState, GitHostBridge,
-    GitImportEntry, GitImportEntryKind, GitImportMode, GitImportReport, GitImportRequest,
+    GitImportEntry, GitImportEntryKind, GitImportLayout, GitImportMode, GitImportReport, GitImportRequest,
     GitImportSource, GitIndexEntry, GitIndexSnapshot, GitObjectFormat, GitObjectKind,
     GitPullRequestReport, GitPullRequestRequest, GitPushReport, GitPushRequest, GitRemoteProvider,
     GitRepository, GitRepositoryOrigin, GitSubstrateError,
@@ -228,9 +228,10 @@ fn import_host_repository(
         OptionalGitLookup::OriginRemote,
     )?;
     let object_format = git_object_format(&repo_root)?;
+    let layout = request.layout.clone();
     let worktree_entries = match &request.mode {
         GitImportMode::Head => {
-            let export_root = export_git_head(&repo_root)?;
+            let export_root = export_git_head(&repo_root, &request.pathspec)?;
             let entries = collect_directory_tree(&export_root, false)?;
             let _ = fs::remove_dir_all(&export_root);
             entries
@@ -239,32 +240,46 @@ fn import_host_repository(
             include_untracked,
             include_ignored,
         } => {
-            let included =
-                git_working_tree_paths(&repo_root, *include_untracked, *include_ignored)?;
+            let included = git_working_tree_paths(
+                &repo_root,
+                *include_untracked,
+                *include_ignored,
+                &request.pathspec,
+            )?;
             collect_selected_paths(&repo_root, &included)?
         }
     };
-    let refs = git_references(&repo_root)?;
-    let index = git_index_snapshot(&repo_root)?;
-    let objects = git_object_closure(&repo_root, &refs, head_commit.as_deref(), &index)?;
-    let entries = import_repository_image_entries(
-        &branch,
-        head_commit.as_deref(),
-        refs,
-        index,
-        objects,
-        worktree_entries,
-    )?;
+    let entries = match &layout {
+        GitImportLayout::RepositoryImage => {
+            let refs = git_references(&repo_root)?;
+            let index = git_index_snapshot(&repo_root)?;
+            let objects = git_object_closure(&repo_root, &refs, head_commit.as_deref(), &index)?;
+            import_repository_image_entries(
+                &branch,
+                head_commit.as_deref(),
+                refs,
+                index,
+                objects,
+                worktree_entries,
+            )?
+        }
+        GitImportLayout::TreeOnly => worktree_entries,
+    };
     Ok(GitImportReport {
         source: request.source,
         target_root: request.target_root,
         repository_root: canonicalize_for_storage(&repo_root)?,
         origin: GitRepositoryOrigin::HostImport,
         object_format,
+        layout,
         head_commit,
         branch,
         remote_url,
-        pathspec: vec![".".to_string()],
+        pathspec: if request.pathspec.is_empty() {
+            vec![".".to_string()]
+        } else {
+            request.pathspec.clone()
+        },
         dirty: !git_stdout(
             &repo_root,
             &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -516,14 +531,29 @@ fn collect_directory_tree_recursive(
     Ok(())
 }
 
-fn export_git_head(repo_root: &Path) -> Result<PathBuf, GitSubstrateError> {
+fn export_git_head(repo_root: &Path, pathspec: &[String]) -> Result<PathBuf, GitSubstrateError> {
     let export_root = temp_export_path("git-head");
     fs::create_dir_all(&export_root).map_err(|error| GitSubstrateError::Bridge {
         operation: "import_repository",
         message: format!("{}: {}", export_root.display(), error),
     })?;
     let prefix = format!("{}/", export_root.to_string_lossy());
-    run_git(repo_root, &["checkout-index", "--all", "--prefix", &prefix])?;
+    if pathspec.is_empty() {
+        run_git(repo_root, &["checkout-index", "--all", "--prefix", &prefix])?;
+    } else {
+        let files = git_ls_files_with_pathspec(repo_root, &["ls-files", "-z", "--cached"], pathspec)?;
+        if files.is_empty() {
+            return Ok(export_root);
+        }
+        let mut args = vec![
+            "checkout-index".to_string(),
+            "--prefix".to_string(),
+            prefix,
+            "--".to_string(),
+        ];
+        args.extend(files);
+        run_git_dynamic(repo_root, &args)?;
+    }
     Ok(export_root)
 }
 
@@ -531,16 +561,18 @@ fn git_working_tree_paths(
     repo_root: &Path,
     include_untracked: bool,
     include_ignored: bool,
+    pathspec: &[String],
 ) -> Result<BTreeSet<String>, GitSubstrateError> {
-    let mut paths = git_ls_files(repo_root, &["ls-files", "-z"])?;
+    let mut paths = git_ls_files_with_pathspec(repo_root, &["ls-files", "-z"], pathspec)?;
     if include_untracked {
-        paths.extend(git_ls_files(
+        paths.extend(git_ls_files_with_pathspec(
             repo_root,
             &["ls-files", "-z", "--others", "--exclude-standard"],
+            pathspec,
         )?);
     }
     if include_ignored {
-        paths.extend(git_ls_files(
+        paths.extend(git_ls_files_with_pathspec(
             repo_root,
             &[
                 "ls-files",
@@ -549,6 +581,7 @@ fn git_working_tree_paths(
                 "--ignored",
                 "--exclude-standard",
             ],
+            pathspec,
         )?);
     }
     Ok(paths)
@@ -563,6 +596,25 @@ fn git_repo_root(path: &Path) -> Result<PathBuf, GitSubstrateError> {
 
 fn git_ls_files(repo_root: &Path, args: &[&str]) -> Result<BTreeSet<String>, GitSubstrateError> {
     let output = git_command(repo_root, args)?;
+    let mut paths = BTreeSet::new();
+    for entry in output.split('\0').filter(|entry| !entry.is_empty()) {
+        paths.insert(normalize_relative_path(Path::new(entry))?);
+    }
+    Ok(paths)
+}
+
+fn git_ls_files_with_pathspec(
+    repo_root: &Path,
+    args: &[&str],
+    pathspec: &[String],
+) -> Result<BTreeSet<String>, GitSubstrateError> {
+    if pathspec.is_empty() {
+        return git_ls_files(repo_root, args);
+    }
+    let mut dynamic_args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    dynamic_args.push("--".to_string());
+    dynamic_args.extend(pathspec.iter().cloned());
+    let output = git_command_dynamic(repo_root, &dynamic_args)?;
     let mut paths = BTreeSet::new();
     for entry in output.split('\0').filter(|entry| !entry.is_empty()) {
         paths.insert(normalize_relative_path(Path::new(entry))?);
@@ -1310,6 +1362,28 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Result<(), GitSubstrateError> {
     })
 }
 
+fn run_git_dynamic(repo_root: &Path, args: &[String]) -> Result<(), GitSubstrateError> {
+    let output = sanitized_git_command(repo_root)
+        .args(args)
+        .output()
+        .map_err(|error| GitSubstrateError::Bridge {
+            operation: "host_git",
+            message: format!("{}: {}", repo_root.display(), error),
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(GitSubstrateError::Bridge {
+        operation: "host_git",
+        message: format!(
+            "git -C {} {} failed: {}",
+            repo_root.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    })
+}
+
 fn git_stdout(repo_root: &Path, args: &[&str]) -> Result<String, GitSubstrateError> {
     Ok(git_command(repo_root, args)?.trim().to_string())
 }
@@ -1361,6 +1435,31 @@ fn optional_lookup_is_missing(lookup: OptionalGitLookup, stderr: &str) -> bool {
 }
 
 fn git_command(repo_root: &Path, args: &[&str]) -> Result<String, GitSubstrateError> {
+    let output = sanitized_git_command(repo_root)
+        .args(args)
+        .output()
+        .map_err(|error| GitSubstrateError::Bridge {
+            operation: "host_git",
+            message: format!("{}: {}", repo_root.display(), error),
+        })?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout).map_err(|error| GitSubstrateError::Bridge {
+            operation: "host_git",
+            message: error.to_string(),
+        });
+    }
+    Err(GitSubstrateError::Bridge {
+        operation: "host_git",
+        message: format!(
+            "git -C {} {} failed: {}",
+            repo_root.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    })
+}
+
+fn git_command_dynamic(repo_root: &Path, args: &[String]) -> Result<String, GitSubstrateError> {
     let output = sanitized_git_command(repo_root)
         .args(args)
         .output()

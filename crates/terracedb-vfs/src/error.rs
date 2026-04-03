@@ -44,6 +44,8 @@ pub enum VfsError {
     ToolRunAlreadyCompleted { tool_run_id: ToolRunId },
     #[error("unsupported operation in the in-memory stub: {operation}")]
     UnsupportedOperation { operation: &'static str },
+    #[error("volume artifact error: {reason}")]
+    VolumeArtifact { reason: String },
     #[error("expected a snapshot produced by the same store implementation")]
     IncompatibleSnapshotImplementation,
     #[error(transparent)]

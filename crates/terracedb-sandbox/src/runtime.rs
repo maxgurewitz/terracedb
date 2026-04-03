@@ -58,7 +58,8 @@ use url::Url;
 
 use crate::{
     CapabilityCallRequest, CapabilityCallResult, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER,
-    HOST_CAPABILITY_PREFIX, LoadedSandboxModule, PackageCompatibilityMode, SandboxError,
+    HOST_CAPABILITY_PREFIX, HoistMode, HoistRequest, LoadedSandboxModule,
+    PackageCompatibilityMode, SandboxError,
     SandboxModuleCacheEntry, SandboxModuleKind, SandboxModuleLoadTrace, SandboxSession,
     SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
     loader::{
@@ -72,12 +73,11 @@ thread_local! {
     static ACTIVE_NODE_HOST_STACK: RefCell<Vec<Rc<NodeRuntimeHost>>> = const { RefCell::new(Vec::new()) };
 }
 
-const NODE_COMPAT_TARGET_VERSION: &str = "v24.12.0";
+const NODE_COMPAT_TARGET_VERSION: &str = "v24.14.1";
 const NODE_COMPAT_BOOTSTRAP_SOURCE: &str = include_str!("node_compat_bootstrap.js");
-const NODE_PATH_MODULE_SOURCE: &str = include_str!("node_path_module.js");
-const NODE_OS_MODULE_SOURCE: &str = include_str!("node_os_module.js");
-const NODE_INTERNAL_BOOTSTRAP_REALM_SOURCE: &str =
-    include_str!("node_internal_bootstrap_realm.js");
+const NODE_UPSTREAM_VFS_ROOT: &str = "/.terrace/runtime-support/node-src";
+const NODE_UPSTREAM_BOOTSTRAP_REALM_PATH: &str =
+    "/.terrace/runtime-support/node-src/lib/internal/bootstrap/realm.js";
 const NODE_RUNTIME_RESOLVE_BUDGET: u64 = 16_384;
 const NODE_RUNTIME_LOAD_BUDGET: u64 = 8_192;
 const NODE_RUNTIME_FS_BUDGET: u64 = 131_072;
@@ -1279,6 +1279,7 @@ async fn execute_node_command(
     env: BTreeMap<String, String>,
     metadata: &BTreeMap<String, JsonValue>,
 ) -> Result<SandboxExecutionResult, SandboxError> {
+    ensure_node_upstream_support_tree(session).await?;
     let normalized_entrypoint = resolve_node_path(&cwd, &entrypoint);
     let entropy = DeterministicJsEntropySource::new(js_entropy_seed(&session_info));
     let debug_options = metadata
@@ -1314,6 +1315,53 @@ async fn execute_node_command(
     Ok(result)
 }
 
+fn repo_root_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn node_support_source_host_path(name: &str) -> PathBuf {
+    repo_root_path().join("third_party").join(name)
+}
+
+async fn ensure_node_upstream_support_tree(session: &SandboxSession) -> Result<(), SandboxError> {
+    if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
+        eprintln!("[terrace-node][stage] ensure-node-support-tree:start");
+    }
+    if session
+        .volume()
+        .fs()
+        .stat(NODE_UPSTREAM_BOOTSTRAP_REALM_PATH)
+        .await?
+        .is_some()
+    {
+        if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
+            eprintln!("[terrace-node][stage] ensure-node-support-tree:already-present");
+        }
+        return Ok(());
+    }
+
+    let source_path = node_support_source_host_path("node-src");
+    if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
+        eprintln!(
+            "[terrace-node][stage] ensure-node-support-tree:import-start source={} target={}",
+            source_path.display(),
+            NODE_UPSTREAM_VFS_ROOT
+        );
+    }
+    session
+        .import_git_tree_into_root(HoistRequest {
+            source_path: source_path.display().to_string(),
+            target_root: NODE_UPSTREAM_VFS_ROOT.to_string(),
+            mode: HoistMode::GitHead,
+            delete_missing: true,
+        }, vec!["lib".to_string(), "deps".to_string(), "test".to_string()])
+        .await?;
+    if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
+        eprintln!("[terrace-node][stage] ensure-node-support-tree:import-done");
+    }
+    Ok(())
+}
+
 fn execute_node_command_inner(
     node_host: Rc<NodeRuntimeHost>,
     entrypoint: String,
@@ -1335,13 +1383,17 @@ fn execute_node_command_inner(
                 entrypoint: normalized_entrypoint.clone(),
                 message: error.to_string(),
             })?;
+        node_debug_event(node_host, "stage", "context-built".to_string())?;
         install_node_host_bindings(&mut context)?;
+        node_debug_event(node_host, "stage", "host-bindings-installed".to_string())?;
+        node_debug_event(node_host, "stage", "bootstrap-eval-start".to_string())?;
         context
             .eval(
                 Source::from_bytes(NODE_COMPAT_BOOTSTRAP_SOURCE.as_bytes())
                     .with_path(&PathBuf::from("/__terrace__/node/bootstrap.js")),
             )
             .map_err(|error| node_execution_error(&normalized_entrypoint, node_host, error))?;
+        node_debug_event(node_host, "stage", "bootstrap-eval-done".to_string())?;
         let debug_config = JsValue::from_json(
             &serde_json::to_value(&node_host.debug_options).map_err(sandbox_execution_error)?,
             &mut context,
@@ -1362,6 +1414,7 @@ fn execute_node_command_inner(
             &mut context,
         )
         .map_err(|error| node_execution_error(&entrypoint, node_host, error))?;
+        node_debug_event(node_host, "stage", "runner-lookup-start".to_string())?;
         let runner = context
             .global_object()
             .get(js_string!("__terraceRunNodeCommand"), &mut context)
@@ -1372,9 +1425,11 @@ fn execute_node_command_inner(
                 entrypoint: entrypoint.clone(),
                 message: "__terraceRunNodeCommand is not callable".to_string(),
             })?;
+        node_debug_event(node_host, "stage", "runner-call-start".to_string())?;
         let runner_result = runner
             .call(&JsValue::undefined(), &[request], &mut context)
             .map_err(|error| node_execution_error(&entrypoint, node_host, error))?;
+        node_debug_event(node_host, "stage", "runner-call-done".to_string())?;
         if let Some(object) = runner_result.as_object() {
             if let Ok(promise) = JsPromise::from_object(object.clone()) {
                 match promise.await_blocking(&mut context) {
@@ -1687,6 +1742,9 @@ fn node_debug_event(
 ) -> Result<(), SandboxError> {
     let detail = detail.into();
     trace!(target: "terracedb.sandbox.node_runtime", bucket, detail = %detail);
+    if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
+        eprintln!("[terrace-node][{bucket}] {detail}");
+    }
     let mut state = host.debug_trace.borrow_mut();
     match bucket {
         "resolve" => {
@@ -2368,6 +2426,7 @@ fn node_get_process_info(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, context| {
+        node_debug_event(host, "process", "get_process_info".to_string())?;
         JsValue::from_json(&host.process.borrow().to_process_info_json(), context)
             .map_err(sandbox_execution_error)
     })
@@ -2375,6 +2434,7 @@ fn node_get_process_info(
 
 fn node_get_cwd(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
     node_with_host(|host| {
+        node_debug_event(host, "process", "get_cwd".to_string())?;
         Ok(JsValue::from(JsString::from(
             host.process.borrow().cwd.clone(),
         )))
@@ -2385,6 +2445,7 @@ fn node_get_cwd(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> J
 fn node_chdir(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let path = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
+        node_debug_event(host, "process", format!("chdir path={path}"))?;
         host.process.borrow_mut().cwd = resolve_node_path(&host.process.borrow().cwd, &path);
         Ok(JsValue::undefined())
     })
@@ -2446,13 +2507,39 @@ fn node_read_builtin_source(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let name = node_arg_string(args, 0, context)?;
-    let source = match name.as_str() {
-        "path" => NODE_PATH_MODULE_SOURCE,
-        "os" => NODE_OS_MODULE_SOURCE,
-        "internal/bootstrap/realm" => NODE_INTERNAL_BOOTSTRAP_REALM_SOURCE,
-        _ => "",
-    };
-    Ok(JsValue::from(JsString::from(source)))
+    node_with_host(|host| {
+        node_debug_event(host, "builtin", format!("read_source start specifier={name}"))?;
+        let Some(path) = node_upstream_builtin_vfs_path(&name) else {
+            node_debug_event(host, "builtin", format!("read_source empty specifier={name}"))?;
+            return Ok(JsValue::from(JsString::from(String::new())));
+        };
+        let bytes = node_read_file(host, &path)?.ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!("upstream Node builtin source `{name}` is missing from sandbox VFS"),
+        })?;
+        let source = String::from_utf8(bytes).map_err(|error| SandboxError::Service {
+            service: "node_runtime",
+            message: format!("builtin `{name}` is not valid UTF-8: {error}"),
+        })?;
+        node_debug_event(
+            host,
+            "builtin",
+            format!("read_source done specifier={name} bytes={}", source.len()),
+        )?;
+        Ok(JsValue::from(JsString::from(source)))
+    })
+    .map_err(js_error)
+}
+
+fn node_upstream_builtin_vfs_path(specifier: &str) -> Option<String> {
+    if specifier.is_empty() {
+        return None;
+    }
+    let mut relative = PathBuf::from("lib");
+    relative.push(specifier);
+    relative.set_extension("js");
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    Some(format!("{NODE_UPSTREAM_VFS_ROOT}/{relative}"))
 }
 
 fn node_resolve_module(

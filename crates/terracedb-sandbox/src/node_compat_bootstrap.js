@@ -1027,116 +1027,29 @@ function __terraceNodeCorePrimordials() {
   };
 }
 
-function __terraceBuiltinSupportModuleSource(specifier) {
-  switch (specifier) {
-    case "internal/constants":
-      return `
-'use strict';
-module.exports = {
-  CHAR_UPPERCASE_A: 65,
-  CHAR_LOWERCASE_A: 97,
-  CHAR_UPPERCASE_Z: 90,
-  CHAR_LOWERCASE_Z: 122,
-  CHAR_DOT: 46,
-  CHAR_FORWARD_SLASH: 47,
-  CHAR_BACKWARD_SLASH: 92,
-  CHAR_COLON: 58,
-  CHAR_QUESTION_MARK: 63,
-};
-`;
-    case "internal/validators":
-      return `
-'use strict';
-module.exports = {
-  validateObject(value, name) {
-    if (value == null || typeof value !== "object") {
-      throw __terraceNodeTypeError(
-        "ERR_INVALID_ARG_TYPE",
-        \`The "\${name}" argument must be of type object. Received \${value === null ? "null" : typeof value}\`,
-      );
-    }
-  },
-  validateString(value, name) {
-    if (typeof value !== "string") {
-      throw __terraceNodeTypeError(
-        "ERR_INVALID_ARG_TYPE",
-        \`The "\${name}" argument must be of type string. Received \${value === null ? "null" : typeof value}\`,
-      );
-    }
-  },
-};
-`;
-    case "internal/util":
-      return `
-'use strict';
-module.exports = {
-  isWindows: globalThis.process?.platform === "win32",
-  getLazy(loader) {
-    let loaded = false;
-    let value;
-    return () => {
-      if (!loaded) {
-        value = loader();
-        loaded = true;
-      }
-      return value;
-    };
-  },
-  setOwnProperty(target, property, value) {
-    Object.defineProperty(target, property, {
-      __proto__: null,
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value,
-    });
-    return value;
-  },
-};
-`;
-    case "internal/fs/glob":
-      return `
-'use strict';
-module.exports = {
-  matchGlobPattern(path, pattern, windows) {
-    return __terracePathMatchesGlobPattern(path, pattern, windows);
-  },
-};
-`;
-    case "internal/errors":
-      return `
-'use strict';
-function ErrorPrepareStackTrace(error) {
-  if (error && typeof error.stack === "string") {
-    return error.stack;
-  }
-  const name = error?.name ?? "Error";
-  const message = error?.message ?? "";
-  return \`\${name}: \${message}\`;
-}
-function prepareStackTraceCallback(error, trace) {
-  return ErrorPrepareStackTrace(error, trace);
-}
-module.exports = {
-  prepareStackTraceCallback,
-  ErrorPrepareStackTrace,
-  fatalExceptionStackEnhancers: {
-    beforeInspector(error) {
-      return error;
-    },
-    afterInspector(error) {
-      return error;
-    },
-  },
-};
-`;
-    default:
-      return "";
-  }
+function __terraceNodeCoreBuiltinSource(specifier) {
+  return __terraceReadBuiltinSource(specifier);
 }
 
-function __terraceNodeCoreBuiltinSource(specifier) {
-  return __terraceBuiltinSupportModuleSource(specifier) || __terraceReadBuiltinSource(specifier);
+function __terraceNodeCoreBuiltinIds(additionalBuiltinSources = undefined) {
+  const ids = new Set(
+    __terraceKnownNodeBuiltins
+      .filter((id) => !String(id).startsWith("node:"))
+      .concat([
+        "internal/bootstrap/realm",
+        "internal/constants",
+        "internal/errors",
+        "internal/fs/glob",
+        "internal/util",
+        "internal/validators",
+      ]),
+  );
+  if (additionalBuiltinSources && typeof additionalBuiltinSources === "object") {
+    for (const id of Object.keys(additionalBuiltinSources)) {
+      ids.add(String(id));
+    }
+  }
+  return [...ids];
 }
 
 function __terraceCompileNodeCoreBuiltin(specifier, source) {
@@ -1173,6 +1086,59 @@ function __terraceCreateBootstrapRealmGetInternalBinding(builtinIds, builtinSour
     switch (String(specifier)) {
       case "builtins":
         return builtinsBinding;
+      case "constants":
+        return {
+          os: __terraceOsConstants,
+        };
+      case "options":
+        return {
+          getCLIOptionsValues() {
+            return {
+              "--experimental-quic": false,
+              "--preserve-symlinks": false,
+              "--preserve-symlinks-main": false,
+              "--pending-deprecation": false,
+              "--no-deprecation": false,
+              "--require-module": false,
+            };
+          },
+          getCLIOptionsInfo() {
+            return {};
+          },
+          getOptionsAsFlags() {
+            return [];
+          },
+          getEmbedderOptions() {
+            return { noGlobalSearchPaths: true };
+          },
+          getEnvOptionsInputType() {
+            return {};
+          },
+          getNamespaceOptionsInputType() {
+            return {};
+          },
+        };
+      case "types":
+        return {
+          isArrayBufferView(value) {
+            return ArrayBuffer.isView(value);
+          },
+          isAsyncFunction(value) {
+            return typeof value === "function" && value.constructor?.name === "AsyncFunction";
+          },
+          isNativeError(value) {
+            return value instanceof Error;
+          },
+          isPromise(value) {
+            return !!value && typeof value.then === "function";
+          },
+          isProxy(_value) {
+            return false;
+          },
+          isRegExp(value) {
+            return value instanceof RegExp;
+          },
+        };
       case "module_wrap":
         return {
           ModuleWrap: class ModuleWrap {
@@ -1219,10 +1185,11 @@ function __terraceLoadBootstrapRealm(additionalBuiltinSources = undefined) {
   for (const id of [
     "internal/bootstrap/realm",
     "internal/constants",
-    "internal/validators",
-    "internal/util",
-    "internal/fs/glob",
     "internal/errors",
+    "internal/fs/glob",
+    "internal/util",
+    "internal/validators",
+    "os",
     "path",
   ]) {
     const source = __terraceNodeCoreBuiltinSource(id);
@@ -1254,7 +1221,7 @@ function __terraceLoadBootstrapRealm(additionalBuiltinSources = undefined) {
       __terraceLinkedBinding: String(specifier),
     }),
     __terraceCreateBootstrapRealmGetInternalBinding(
-      [...builtinSources.keys()],
+      __terraceNodeCoreBuiltinIds(additionalBuiltinSources),
       builtinSources,
       bindingState,
     ),
@@ -1266,83 +1233,10 @@ function __terraceLoadBootstrapRealm(additionalBuiltinSources = undefined) {
   return realm;
 }
 
-function __terracePathInternalRequire(specifier) {
-  switch (specifier) {
-    case "internal/constants":
-      return {
-        CHAR_UPPERCASE_A: 65,
-        CHAR_LOWERCASE_A: 97,
-        CHAR_UPPERCASE_Z: 90,
-        CHAR_LOWERCASE_Z: 122,
-        CHAR_DOT: 46,
-        CHAR_FORWARD_SLASH: 47,
-        CHAR_BACKWARD_SLASH: 92,
-        CHAR_COLON: 58,
-        CHAR_QUESTION_MARK: 63,
-      };
-    case "internal/validators":
-      return {
-        validateObject(value, name) {
-          if (value == null || typeof value !== "object") {
-            throw __terraceNodeTypeError(
-              "ERR_INVALID_ARG_TYPE",
-              `The "${name}" argument must be of type object. Received ${value === null ? "null" : typeof value}`,
-            );
-          }
-        },
-        validateString(value, name) {
-          if (typeof value !== "string") {
-            throw __terraceNodeTypeError(
-              "ERR_INVALID_ARG_TYPE",
-              `The "${name}" argument must be of type string. Received ${value === null ? "null" : typeof value}`,
-            );
-          }
-        },
-      };
-    case "internal/util":
-      return {
-        isWindows: globalThis.process?.platform === "win32",
-        getLazy(loader) {
-          let loaded = false;
-          let value;
-          return () => {
-            if (!loaded) {
-              value = loader();
-              loaded = true;
-            }
-            return value;
-          };
-        },
-      };
-    case "internal/fs/glob":
-      return {
-        matchGlobPattern(path, pattern, windows) {
-          return __terracePathMatchesGlobPattern(path, pattern, windows);
-        },
-      };
-    default:
-      throw __terraceUnsupportedNodeBuiltinError({
-        builtin: specifier,
-        operation: "require",
-      });
-  }
-}
-
 function __terracePathModule() {
   if (__terracePathSingleton) return __terracePathSingleton;
   __terracePathSingleton = __terraceLoadBootstrapRealm().require("path");
   return __terracePathSingleton;
-}
-
-function __terraceOsPrimordials() {
-  return {
-    ArrayPrototypePush: (target, ...values) => Array.prototype.push.apply(target, values),
-    Float64Array,
-    ObjectDefineProperties: Object.defineProperties,
-    ObjectFreeze: Object.freeze,
-    StringPrototypeSlice: (target, start, end) => String.prototype.slice.call(target, start, end),
-    SymbolToPrimitive: Symbol.toPrimitive,
-  };
 }
 
 function __terraceIpv4MaskToPrefix(netmask) {
@@ -1397,253 +1291,9 @@ function __terraceOsGetCIDR(address, netmask, family) {
   return prefix == null ? null : `${address}/${prefix}`;
 }
 
-function __terraceCreateSystemErrorClass() {
-  class TerraceSystemError extends Error {
-    constructor(ctx = {}) {
-      const syscall = ctx.syscall || "unknown";
-      const code = ctx.code || "UNKNOWN";
-      const message = ctx.message || "unknown error";
-      super(`A system error occurred: ${syscall} returned ${code} (${message})`);
-      this.name = "SystemError";
-      this.code = "ERR_SYSTEM_ERROR";
-      this.info = { ...ctx };
-      if (ctx.errno != null) this.errno = ctx.errno;
-      if (ctx.path != null) this.path = ctx.path;
-      if (ctx.dest != null) this.dest = ctx.dest;
-      if (ctx.syscall != null) this.syscall = ctx.syscall;
-    }
-  }
-  TerraceSystemError.HideStackFramesError = class HideStackFramesError extends TerraceSystemError {};
-  return TerraceSystemError;
-}
-
-function __terraceOsInternalRequire(specifier) {
-  switch (specifier) {
-    case "internal/errors": {
-      const ERR_SYSTEM_ERROR = __terraceCreateSystemErrorClass();
-      return {
-        codes: { ERR_SYSTEM_ERROR },
-        hideStackFrames(fn) {
-          return fn;
-        },
-      };
-    }
-    case "internal/util":
-      return {
-        isWindows: globalThis.process?.platform === "win32",
-        getLazy(loader) {
-          let loaded = false;
-          let value;
-          return () => {
-            if (!loaded) {
-              value = loader();
-              loaded = true;
-            }
-            return value;
-          };
-        },
-        getCIDR(address, netmask, family) {
-          return __terraceOsGetCIDR(address, netmask, family);
-        },
-      };
-    case "internal/validators":
-      return {
-        validateObject(value, name) {
-          if (value == null || typeof value !== "object") {
-            throw __terraceNodeTypeError(
-              "ERR_INVALID_ARG_TYPE",
-              `The "${name}" argument must be of type object. Received ${value === null ? "null" : typeof value}`,
-            );
-          }
-        },
-        validateString(value, name) {
-          if (typeof value !== "string") {
-            throw __terraceNodeTypeError(
-              "ERR_INVALID_ARG_TYPE",
-              `The "${name}" argument must be of type string. Received ${value === null ? "null" : typeof value}`,
-            );
-          }
-        },
-        validateInt32(value, name, min = -2147483648, max = 2147483647) {
-          if (!Number.isInteger(value)) {
-            throw __terraceNodeTypeError(
-              "ERR_INVALID_ARG_TYPE",
-              `The "${name}" argument must be of type number. Received ${value === null ? "null" : typeof value}`,
-            );
-          }
-          if (value < min || value > max) {
-            throw __terraceNodeRangeError(
-              "ERR_OUT_OF_RANGE",
-              `The value of "${name}" is out of range. It must be >= ${min} and <= ${max}. Received ${String(value)}`,
-            );
-          }
-        },
-      };
-    default:
-      return __terracePathInternalRequire(specifier);
-  }
-}
-
-function __terraceOsInternalBinding(specifier) {
-  switch (specifier) {
-    case "constants":
-      return { os: __terraceOsConstants };
-    case "credentials":
-      return {
-        getTempDir() {
-          return __terraceOsTmpdir(globalThis.process?.platform || "linux");
-        },
-      };
-    case "os":
-      return {
-        getAvailableParallelism() {
-          return 1;
-        },
-        getCPUs() {
-          const rows = [];
-          for (const cpu of __terraceOsCpuRows) {
-            rows.push(
-              cpu.model,
-              cpu.speed,
-              cpu.times.user,
-              cpu.times.nice,
-              cpu.times.sys,
-              cpu.times.idle,
-              cpu.times.irq,
-            );
-          }
-          return rows;
-        },
-        getFreeMem() {
-          return 1024 * 1024 * 1024;
-        },
-        getHomeDirectory(ctx = {}) {
-          const value = __terraceOsHomedir(globalThis.process?.platform || "linux");
-          if (!value) {
-            ctx.code = "ENOENT";
-            ctx.syscall = "uv_os_homedir";
-            ctx.message = "home directory unavailable";
-            return undefined;
-          }
-          return value;
-        },
-        getHostname(ctx = {}) {
-          const value = "terrace-sandbox";
-          if (!value) {
-            ctx.code = "ENOENT";
-            ctx.syscall = "uv_os_gethostname";
-            ctx.message = "hostname unavailable";
-            return undefined;
-          }
-          return value;
-        },
-        getInterfaceAddresses(_ctx = {}) {
-          const rows = [];
-          for (const [name, entries] of Object.entries(__terraceOsLoopbackInterfaces)) {
-            for (const entry of entries) {
-              rows.push(
-                name,
-                entry.address,
-                entry.netmask,
-                entry.family,
-                entry.mac,
-                entry.internal,
-                entry.scopeid ?? -1,
-              );
-            }
-          }
-          return rows;
-        },
-        getLoadAvg(target) {
-          if (target && typeof target.length === "number") {
-            target[0] = 0;
-            target[1] = 0;
-            target[2] = 0;
-          }
-        },
-        getPriority(pid, ctx = {}) {
-          try {
-            return __terraceOsGetPriority(pid);
-          } catch (error) {
-            ctx.code = error.info?.code || "ESRCH";
-            ctx.syscall = error.info?.syscall || "uv_os_getpriority";
-            ctx.message = error.info?.message || error.message;
-            return undefined;
-          }
-        },
-        getOSInformation(_ctx = {}) {
-          const info = __terraceProcessInfo();
-          const platform = info.platform || "linux";
-          return [
-            platform === "win32" ? "Windows_NT" : "Linux",
-            "#1 Terrace",
-            "6.0.0-terrace",
-            __terraceOsMachine(info.arch),
-          ];
-        },
-        getTotalMem() {
-          return 1024 * 1024 * 1024;
-        },
-        getUserInfo(options = null, _ctx = {}) {
-          const platform = globalThis.process?.platform || "linux";
-          const encoding = options && typeof options === "object" ? options.encoding : undefined;
-          const asBuffer = encoding === "buffer";
-          const homedir = __terraceOsHomedir(platform);
-          const username = "sandbox";
-          const shell = platform === "win32" ? "cmd.exe" : "/bin/sh";
-          return {
-            uid: 0,
-            gid: 0,
-            username: asBuffer ? TerraceBuffer.from(username) : username,
-            homedir: asBuffer ? TerraceBuffer.from(homedir) : homedir,
-            shell: asBuffer ? TerraceBuffer.from(shell) : shell,
-          };
-        },
-        getUptime(_ctx = {}) {
-          return 1;
-        },
-        isBigEndian: false,
-        setPriority(pid, priority, ctx = {}) {
-          try {
-            __terraceOsSetPriority(pid, priority);
-            return 0;
-          } catch (error) {
-            ctx.code = error.info?.code || "ESRCH";
-            ctx.syscall = error.info?.syscall || "uv_os_setpriority";
-            ctx.message = error.info?.message || error.message;
-            return -1;
-          }
-        },
-      };
-    default:
-      throw __terraceUnsupportedNodeBuiltinError({
-        builtin: `internalBinding(${specifier})`,
-        operation: "call",
-      });
-  }
-}
-
 function __terraceOsModule() {
   if (__terraceOsSingleton) return __terraceOsSingleton;
-  const source = __terraceReadBuiltinSource("os");
-  const module = { exports: {} };
-  const factory = Function(
-    "primordials",
-    "require",
-    "process",
-    "module",
-    "exports",
-    "internalBinding",
-    `${source}\n;return module.exports;`,
-  );
-  __terraceOsSingleton = factory(
-    __terraceOsPrimordials(),
-    __terraceOsInternalRequire,
-    globalThis.process,
-    module,
-    module.exports,
-    __terraceOsInternalBinding,
-  );
+  __terraceOsSingleton = __terraceLoadBootstrapRealm().require("os");
   return __terraceOsSingleton;
 }
 
@@ -4063,6 +3713,7 @@ function __terraceCreateProcess() {
     title: info.title,
     pid: typeof info.pid === "number" ? info.pid : 1,
     ppid: typeof info.ppid === "number" ? info.ppid : 0,
+    mainModule: null,
     exitCode: 0,
     stdout: {
       isTTY: false,
@@ -9480,12 +9131,10 @@ function __terraceCompileCommonJsModule(module, filename, source) {
     String(source).replace(/\bimport\s*\(/g, "__terraceNodeDynamicImport(__filename, "),
   );
   const dirname = __terraceDirname(normalizedFilename);
-  const localRequire = __terraceCreateRequireFromReferrer(normalizedFilename);
-  localRequire.main = __terraceModuleCache.get(__terraceRequireStack[0]) ?? module;
-  const sourceURL = `\n//# sourceURL=${normalizedFilename.replace(/\\/g, "\\\\")}`;
-  const wrapped = (0, eval)(
-    `(function(exports, require, module, __filename, __dirname) {\n${instrumentedSource}${sourceURL}\n})`,
-  );
+  const localRequire = __terraceGetInternalModulesHelpers().makeRequireFunction(module);
+  const Module = __terraceGetInternalModulesCjsLoader().Module;
+  const sourceURL = `\n//# sourceURL=${normalizedFilename.replace(/\\/g, "\\\\")}\n`;
+  const wrapped = (0, eval)(Module.wrap(`${instrumentedSource}${sourceURL}`));
   module.__terraceEvaluationResult = wrapped(
     module.exports,
     localRequire,
@@ -9496,6 +9145,14 @@ function __terraceCompileCommonJsModule(module, filename, source) {
   module.exports = __terraceAutoinstrumentModuleExports(normalizedFilename, module.exports);
   module.loaded = true;
   return module.exports;
+}
+
+function __terraceGetInternalModulesHelpers() {
+  return __terraceLoadBootstrapRealm().require("internal/modules/helpers");
+}
+
+function __terraceGetInternalModulesCjsLoader() {
+  return __terraceLoadBootstrapRealm().require("internal/modules/cjs/loader");
 }
 
 function __terraceCreateNodeModule(id = "", parent = null) {
@@ -9531,15 +9188,7 @@ __terraceCreateNodeModule.prototype._compile = function _compile(content, filena
 
 function __terraceCreateRequireFromReferrer(referrer) {
   const normalizedReferrer = String(referrer);
-  const localRequire = (specifier) => __terraceRequire(specifier, normalizedReferrer);
-  localRequire.resolve = (specifier, options) =>
-    __terraceRequireResolve(specifier, normalizedReferrer, options);
-  localRequire.resolve.paths = (specifier) =>
-    __terraceRequireResolvePaths(specifier, normalizedReferrer);
-  localRequire.cache = __terraceRequireCache;
-  localRequire.extensions = __terraceCreateModuleBuiltin()._extensions;
-  localRequire.main = __terraceModuleCache.get(__terraceRequireStack[0]) ?? null;
-  return localRequire;
+  return __terraceGetInternalModulesCjsLoader().Module.createRequire(normalizedReferrer);
 }
 
 function __terraceCreateModuleBuiltin() {
@@ -9569,57 +9218,8 @@ function __terraceCreateModuleBuiltin() {
     },
   });
   Module._pathCache = Object.create(null);
-  Module.builtinModules = [
-    ...__terraceKnownNodeBuiltins,
-    ...__terraceKnownNodeBuiltins
-      .filter((entry) => !entry.startsWith("node:"))
-      .map((entry) => `node:${entry}`),
-  ];
-  Module.isBuiltin = (specifier) => {
-    const raw = String(specifier);
-    const normalized = raw.replace(/^node:/, "");
-    if (normalized === "test" && !raw.startsWith("node:")) {
-      return false;
-    }
-    return __terraceKnownNodeBuiltins.includes(normalized);
-  };
   Module.enableCompileCache = () => ({ status: "disabled" });
   Module.syncBuiltinESMExports = () => {};
-  Module._nodeModulePaths = (from) => __terraceModuleNodeModulePaths(from);
-  Module._resolveFilename = (request, parent, _isMain = false, options = undefined) => {
-    const referrer =
-      parent && typeof parent === "object"
-        ? parent.filename ?? parent.id ?? null
-        : null;
-    return __terraceRequireResolve(String(request), referrer, options);
-  };
-  Module.createRequire = (filenameOrUrl) => {
-    const invalidCreateRequireArg = (value) => {
-      const inspected =
-        typeof value === "string"
-          ? `'${value}'`
-          : __terraceInspect(value);
-      const error = new TypeError(
-        `The argument 'filename' must be a file URL object, file URL string, or absolute path string. Received ${inspected}`,
-      );
-      error.code = "ERR_INVALID_ARG_VALUE";
-      return error;
-    };
-    let referrer = null;
-    if (filenameOrUrl && typeof filenameOrUrl === "object" && typeof filenameOrUrl.href === "string") {
-      referrer = __terraceUrlModule().fileURLToPath(filenameOrUrl);
-    } else if (typeof filenameOrUrl === "string" && filenameOrUrl.startsWith("file:")) {
-      referrer = __terraceUrlModule().fileURLToPath(filenameOrUrl);
-    } else if (typeof filenameOrUrl === "string" && filenameOrUrl.startsWith("/")) {
-      referrer = filenameOrUrl;
-    } else {
-      throw invalidCreateRequireArg(filenameOrUrl);
-    }
-    if (typeof referrer !== "string" || !referrer.startsWith("/")) {
-      throw invalidCreateRequireArg(filenameOrUrl);
-    }
-    return __terraceCreateRequireFromReferrer(referrer);
-  };
   __terraceModuleSingleton = Module;
   return __terraceModuleSingleton;
 }
@@ -9654,7 +9254,7 @@ function __terraceBuiltin(specifier, referrer = null) {
   let value;
   switch (normalized) {
     case "module":
-      value = __terraceCreateModuleBuiltin();
+      value = __terraceGetInternalModulesCjsLoader().Module;
       break;
     case "process":
       value = globalThis.process;
@@ -9690,6 +9290,9 @@ function __terraceBuiltin(specifier, referrer = null) {
       value = __terracePunycodeModule();
       break;
     case "util":
+      value = __terraceUtilModule();
+      break;
+    case "sys":
       value = __terraceUtilModule();
       break;
     case "constants":
@@ -9793,6 +9396,9 @@ function __terraceModuleForResolved(resolved) {
   __terraceTraceNode(`module-eval-start ${resolved.id} kind=${resolved.kind}`);
   const parent = __terraceModuleParentOf(__terraceRequireStack[__terraceRequireStack.length - 1] ?? null);
   const module = new __terraceCreateNodeModule(resolved.id, parent);
+  if (!parent && globalThis.process && globalThis.process.mainModule == null) {
+    globalThis.process.mainModule = module;
+  }
   __terraceRequireStack.push(resolved.id);
   try {
     if (resolved.kind === "esm") {
@@ -9867,6 +9473,14 @@ function __terraceNamespaceForResolved(resolved) {
 function __terraceRequire(specifier, referrer) {
   const rawSpecifier = String(specifier);
   const isNodeBuiltinBypass = rawSpecifier.startsWith("node:");
+  if (
+    isNodeBuiltinBypass &&
+    !__terraceGetInternalModulesCjsLoader().Module.isBuiltin(rawSpecifier)
+  ) {
+    const { ERR_UNKNOWN_BUILTIN_MODULE } =
+      __terraceLoadBootstrapRealm().require("internal/errors").codes;
+    throw new ERR_UNKNOWN_BUILTIN_MODULE(rawSpecifier);
+  }
   if (
     !isNodeBuiltinBypass &&
     Object.prototype.hasOwnProperty.call(__terraceRequireCacheBacking, rawSpecifier)

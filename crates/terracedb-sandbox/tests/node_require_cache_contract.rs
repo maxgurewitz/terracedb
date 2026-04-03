@@ -21,10 +21,10 @@ async fn node_require_cache_contract_matches_real_node() {
     // Based on test-require-cache.js and test-require-node-prefix.js.
     let source = r#"
       const fs = require("fs");
+      const os = require("os");
       const path = require("path");
-      const base = path.join(process.cwd(), ".terrace-require-cache-contract");
-      fs.mkdirSync(base, { recursive: true });
-      const relativePath = "./.terrace-require-cache-contract/demo.js";
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "terrace-require-cache-contract-"));
+      const relativePath = path.join(base, "demo.js");
       const absolutePath = path.join(base, "demo.js");
 
       globalThis.__terraceDemoLoads = 0;
@@ -35,14 +35,15 @@ async fn node_require_cache_contract_matches_real_node() {
           module.exports = { loads: globalThis.__terraceDemoLoads };
         `,
       );
+      const cachePath = fs.realpathSync(absolutePath);
 
       const first = require(relativePath);
       const second = require(relativePath);
-      delete require.cache[absolutePath];
+      delete require.cache[cachePath];
       const third = require(relativePath);
 
       const fakeModule = { fake: true };
-      require.cache[absolutePath] = { exports: fakeModule };
+      require.cache[cachePath] = { exports: fakeModule };
       const fourth = require(relativePath);
 
       const fakeFs = { sentinel: "fake-fs" };
@@ -58,8 +59,8 @@ async fn node_require_cache_contract_matches_real_node() {
         fourthIsFake: fourth === fakeModule,
         builtinIsFake: builtin === fakeFs,
         nodeBuiltinIsRealFs: nodeBuiltin === fs,
-        cacheHasAbsolute: Object.prototype.hasOwnProperty.call(require.cache, absolutePath),
-        cacheKeysContainAbsolute: Object.keys(require.cache).includes(absolutePath),
+        cacheHasAbsolute: Object.prototype.hasOwnProperty.call(require.cache, cachePath),
+        cacheKeysContainAbsolute: Object.keys(require.cache).includes(cachePath),
       }));
     "#;
 

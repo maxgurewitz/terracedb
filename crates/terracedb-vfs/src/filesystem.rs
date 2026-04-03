@@ -12,7 +12,7 @@ pub enum FileKind {
     Symlink,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     pub inode: InodeId,
     pub kind: FileKind,

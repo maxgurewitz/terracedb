@@ -5,7 +5,7 @@ use terracedb::LogCursor;
 
 use crate::{
     ActivityOptions, ActivityReceiver, ActivityStream, OverlayVolume, SnapshotOptions, VfsError,
-    Volume, VolumeConfig, VolumeSnapshot, VolumeStore,
+    Volume, VolumeConfig, VolumeExport, VolumeSnapshot, VolumeStore,
 };
 
 #[async_trait]
@@ -24,6 +24,30 @@ pub trait VfsStoreExt: VolumeStore {
 }
 
 impl<T: VolumeStore + ?Sized> VfsStoreExt for T {}
+
+#[async_trait]
+pub trait VfsArtifactStoreExt: VolumeStore {
+    /// Export a volume cut as a single-file durable artifact.
+    async fn export_volume_artifact(
+        &self,
+        source: crate::CloneVolumeSource,
+    ) -> Result<Vec<u8>, VfsError> {
+        let export = self.export_volume(source).await?;
+        export.to_artifact_bytes()
+    }
+
+    /// Import a previously exported durable artifact into a new base volume.
+    async fn import_volume_artifact(
+        &self,
+        bytes: &[u8],
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError> {
+        let export = VolumeExport::from_artifact_bytes(bytes)?;
+        self.import_volume(export, target).await
+    }
+}
+
+impl<T: VolumeStore + ?Sized> VfsArtifactStoreExt for T {}
 
 #[async_trait]
 pub trait VfsVolumeExt: Volume {

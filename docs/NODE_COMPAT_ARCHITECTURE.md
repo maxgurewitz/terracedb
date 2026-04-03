@@ -403,3 +403,10 @@ When deciding whether to keep or delete a compatibility layer, use this question
 - or does it implement public Node behavior that upstream Node JS should own instead
 
 If it is the second kind, it is probably transitional and should be replaced.
+
+## Feedback
+
+- When we have multiple sandboxes with shared dependencies (node, npm, particular node modules), we should find a way to use our vf's overlay / copy on write semantics to enable these dependencies to be deduplicated.
+- We should have a base layer with node / npm.
+- That base layer should be vendored into our crate so that others can re-use it, in the file format that our db expects.
+- We should export public utilities that allow people to define their own base layer to e.g. install their own required dependencies, pre-install their own application repos for efficient sandbox cloning.

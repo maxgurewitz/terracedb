@@ -1,0 +1,6 @@
+[submodule "third_party/node-src"]
+	path = third_party/node-src
+	url = https://github.com/nodejs/node.git
+[submodule "third_party/npm-cli"]
+	path = third_party/npm-cli
+	url = https://github.com/npm/cli.git

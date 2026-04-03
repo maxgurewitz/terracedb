@@ -28,6 +28,14 @@ pub enum GitImportEntryKind {
     Symlink,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitImportLayout {
+    #[default]
+    RepositoryImage,
+    TreeOnly,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum GitImportSource {
@@ -58,6 +66,10 @@ pub struct GitImportRequest {
     pub source: GitImportSource,
     pub target_root: String,
     pub mode: GitImportMode,
+    #[serde(default)]
+    pub layout: GitImportLayout,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pathspec: Vec<String>,
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
@@ -68,6 +80,8 @@ pub struct GitImportReport {
     pub repository_root: String,
     pub origin: GitRepositoryOrigin,
     pub object_format: GitObjectFormat,
+    #[serde(default)]
+    pub layout: GitImportLayout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,13 +222,18 @@ impl GitHostBridge for DeterministicGitHostBridge {
                 GitImportSource::RemoteRepository { .. } => GitRepositoryOrigin::RemoteImport,
             },
             object_format: GitObjectFormat::Sha1,
+            layout: request.layout.clone(),
             head_commit: None,
             branch: None,
             remote_url: match request.source {
                 GitImportSource::RemoteRepository { remote_url, .. } => Some(remote_url),
                 GitImportSource::HostPath { .. } => None,
             },
-            pathspec: vec![".".to_string()],
+            pathspec: if request.pathspec.is_empty() {
+                vec![".".to_string()]
+            } else {
+                request.pathspec.clone()
+            },
             dirty: false,
             entries: Vec::new(),
             metadata: request.metadata,

@@ -31,7 +31,7 @@ pub fn sandbox_store(
     let sandbox = DefaultSandboxStore::new(
         Arc::new(vfs.clone()),
         dependencies.clock,
-        SandboxServices::deterministic(),
+        SandboxServices::deterministic_with_host_git(),
     );
     (vfs, sandbox)
 }

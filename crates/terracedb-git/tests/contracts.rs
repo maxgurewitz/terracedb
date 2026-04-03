@@ -19,7 +19,7 @@ use terracedb_git::worktree::GitWorktreeMaterializer;
 use terracedb_git::{
     DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutReport, GitCheckoutRequest,
     GitCommitRequest, GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitForkPolicy,
-    GitHeadState, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportMode,
+    GitHeadState, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportLayout, GitImportMode,
     GitImportRequest, GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase,
     GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRefUpdate,
     GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryOrigin,
@@ -1613,6 +1613,8 @@ async fn host_git_bridge_imports_vfs_repository_images_and_pushes_commits() {
                 },
                 target_root: "/repo".to_string(),
                 mode: GitImportMode::Head,
+                layout: GitImportLayout::RepositoryImage,
+                pathspec: Vec::new(),
                 metadata: BTreeMap::new(),
             },
             Arc::new(NeverCancel),
@@ -1962,6 +1964,53 @@ async fn host_git_bridge_imports_vfs_repository_images_and_pushes_commits() {
 }
 
 #[tokio::test]
+async fn host_git_bridge_can_import_tree_only_layout_without_git_metadata() {
+    let repo = unique_test_dir("host-bridge-tree-only");
+    init_git_repo(&repo, None);
+
+    let bridge = HostGitBridge::default();
+    let imported = bridge
+        .import_repository(
+            GitImportRequest {
+                source: terracedb_git::GitImportSource::HostPath {
+                    path: repo.to_string_lossy().into_owned(),
+                },
+                target_root: "/repo".to_string(),
+                mode: GitImportMode::Head,
+                layout: GitImportLayout::TreeOnly,
+                pathspec: Vec::new(),
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("import host repo tree only");
+
+    assert_eq!(imported.target_root, "/repo");
+    assert_eq!(imported.layout, GitImportLayout::TreeOnly);
+    assert!(
+        imported.entries.iter().all(|entry| !entry.path.starts_with(".git")),
+        "tree-only imports should not synthesize .git metadata: {:?}",
+        imported
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        imported
+            .entries
+            .iter()
+            .find(|entry| entry.path == "tracked.txt")
+            .and_then(|entry| entry.data.as_ref())
+            .cloned(),
+        Some(b"tracked\n".to_vec())
+    );
+
+    cleanup(&repo);
+}
+
+#[tokio::test]
 async fn host_git_bridge_preserves_empty_sha256_repo_format_for_first_commit() {
     if !host_git_supports_sha256() {
         return;
@@ -1979,6 +2028,8 @@ async fn host_git_bridge_preserves_empty_sha256_repo_format_for_first_commit() {
                 },
                 target_root: "/repo".to_string(),
                 mode: GitImportMode::Head,
+                layout: GitImportLayout::RepositoryImage,
+                pathspec: Vec::new(),
                 metadata: BTreeMap::new(),
             },
             Arc::new(NeverCancel),

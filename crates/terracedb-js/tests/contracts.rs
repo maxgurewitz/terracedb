@@ -5,7 +5,7 @@ use serde_json::json;
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitDiscoverRequest,
-    GitExportRequest, GitForkPolicy, GitHostBridge, GitImportMode, GitImportRequest,
+    GitExportRequest, GitForkPolicy, GitHostBridge, GitImportLayout, GitImportMode, GitImportRequest,
     GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRepositoryImage,
     GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
     NeverCancel as NeverCancelGit, VfsGitRepositoryImage,
@@ -270,6 +270,8 @@ async fn public_substrate_contracts_are_instantiable() {
                 },
                 target_root: "/repo".to_string(),
                 mode: GitImportMode::Head,
+                layout: GitImportLayout::RepositoryImage,
+                pathspec: Vec::new(),
                 metadata: BTreeMap::new(),
             },
             Arc::new(NeverCancelGit),

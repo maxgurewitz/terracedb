@@ -16,7 +16,7 @@ use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use terracedb_git::{
-    GitCancellationToken, GitImportEntry, GitImportEntryKind, GitImportMode, GitImportReport,
+    GitCancellationToken, GitImportEntry, GitImportEntryKind, GitImportLayout, GitImportMode, GitImportReport,
     GitImportRequest, GitImportSource, GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectFormat,
     GitObjectKind, GitPullRequestReport, GitPullRequestRequest, GitPushReport, GitPushRequest,
     GitRemoteProvider, GitRepository, GitRepositoryOrigin, GitSubstrateError,
@@ -266,25 +266,32 @@ async fn import_remote_github_repository(
             github_commit_payload(&commit.tree.sha, &commit.parents, &commit.message).into_bytes(),
         ),
     );
-    let refs = vec![(format!("refs/heads/{branch}"), head.clone())];
-    let index = GitIndexSnapshot {
-        entries: state.index_entries,
-        metadata: BTreeMap::new(),
+    let layout = request.layout.clone();
+    let entries = match &layout {
+        GitImportLayout::RepositoryImage => {
+            let refs = vec![(format!("refs/heads/{branch}"), head.clone())];
+            let index = GitIndexSnapshot {
+                entries: state.index_entries,
+                metadata: BTreeMap::new(),
+            };
+            import_repository_image_entries(
+                &Some(branch.clone()),
+                Some(&head),
+                refs,
+                index,
+                state.objects,
+                state.worktree_entries,
+            )?
+        }
+        GitImportLayout::TreeOnly => state.worktree_entries,
     };
-    let entries = import_repository_image_entries(
-        &Some(branch.clone()),
-        Some(&head),
-        refs,
-        index,
-        state.objects,
-        state.worktree_entries,
-    )?;
     Ok(GitImportReport {
         source: request.source,
         target_root: request.target_root,
         repository_root: locator.remote_url.clone(),
         origin: GitRepositoryOrigin::RemoteImport,
         object_format: GitObjectFormat::Sha1,
+        layout,
         head_commit: Some(head),
         branch: Some(branch),
         remote_url: Some(locator.remote_url),

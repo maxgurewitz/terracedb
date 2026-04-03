@@ -12,7 +12,7 @@ pub enum ToolRunStatus {
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolRun {
     pub id: ToolRunId,
     pub name: String,
