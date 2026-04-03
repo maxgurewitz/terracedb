@@ -41,9 +41,9 @@ pub use harness::SandboxHarness;
 pub use loader::{
     HOST_CAPABILITY_PREFIX, LoadedSandboxModule, SANDBOX_BASH_LIBRARY_SPECIFIER,
     SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER, SANDBOX_FS_LIBRARY_SPECIFIER,
-    SANDBOX_GIT_LIBRARY_SPECIFIER,
-    SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry, SandboxModuleKind,
-    SandboxModuleLoadTrace, SandboxModuleLoader, SandboxModuleSpecifier, TERRACE_WORKSPACE_PREFIX,
+    SANDBOX_GIT_LIBRARY_SPECIFIER, SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER, SandboxModuleCacheEntry,
+    SandboxModuleKind, SandboxModuleLoadTrace, SandboxModuleLoader, SandboxModuleSpecifier,
+    TERRACE_WORKSPACE_PREFIX,
 };
 pub use packages::{
     DeterministicPackageClass, DeterministicPackageDefinition, DeterministicPackageInstaller,
@@ -57,13 +57,21 @@ pub use pr::{
 };
 pub use routing::{SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter};
 pub use runtime::{
-    DeterministicRuntimeBackend, SandboxExecutionKind, SandboxExecutionRequest,
+    DeterministicRuntimeBackend, NodeDebugExecutionOptions, SandboxExecutionKind, SandboxExecutionRequest,
     SandboxExecutionResult, SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle,
     SandboxRuntimeState, SandboxRuntimeStateHandle,
 };
 pub use session::{
     CloseSessionOptions, DefaultSandboxStore, ReopenSessionOptions, SandboxServices,
     SandboxSession, SandboxStore,
+};
+pub use terracedb_git::{
+    DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
+    GitCheckoutRequest, GitCommitReport, GitDiffReport, GitDiffRequest, GitHeadState,
+    GitHostBridge, GitImportSource, GitObjectFormat,
+    GitPullRequestReport as SandboxGitPullRequestReport, GitPushReport, GitRefUpdate,
+    GitRefUpdateReport, GitReference, GitRepositoryOrigin, GitRepositoryStore, GitStatusOptions,
+    GitStatusReport, HostGitBridge,
 };
 pub use types::{
     BaseSnapshotIdentity, ConflictPolicy, DEFAULT_WORKSPACE_ROOT, GitProvenance,
@@ -91,14 +99,6 @@ pub use view::{
     ReadonlyViewRequest, ReadonlyViewService, ReadonlyViewSessionRegistry,
     ReadonlyViewSessionSummary, ReadonlyViewStat, RemoteReadonlyViewBridge,
     StaticReadonlyViewRegistry,
-};
-pub use terracedb_git::{
-    DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
-    GitCheckoutRequest, GitCommitReport, GitDiffReport, GitDiffRequest, GitHeadState,
-    GitHostBridge, GitImportSource, GitObjectFormat,
-    GitPullRequestReport as SandboxGitPullRequestReport, GitPushReport, GitRefUpdate,
-    GitRefUpdateReport, GitReference, GitRepositoryOrigin, GitRepositoryStore, GitStatusOptions,
-    GitStatusReport, HostGitBridge,
 };
 pub use workflow_sdk::{
     SANDBOX_WORKFLOW_LIBRARY_SOURCE, SANDBOX_WORKFLOW_LIBRARY_SPECIFIER,

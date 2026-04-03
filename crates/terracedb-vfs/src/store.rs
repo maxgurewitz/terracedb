@@ -170,6 +170,29 @@ pub struct InMemoryVfsStore {
     inner: Arc<InMemoryStoreInner>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VfsPerformanceSnapshot {
+    pub batch_operations_applied: u64,
+    pub overlay_visible_snapshot_builds: u64,
+    pub path_inserts: u64,
+    pub path_removals: u64,
+}
+
+impl VfsPerformanceSnapshot {
+    pub fn delta_since(&self, earlier: &Self) -> Self {
+        Self {
+            batch_operations_applied: self
+                .batch_operations_applied
+                .saturating_sub(earlier.batch_operations_applied),
+            overlay_visible_snapshot_builds: self
+                .overlay_visible_snapshot_builds
+                .saturating_sub(earlier.overlay_visible_snapshot_builds),
+            path_inserts: self.path_inserts.saturating_sub(earlier.path_inserts),
+            path_removals: self.path_removals.saturating_sub(earlier.path_removals),
+        }
+    }
+}
+
 struct InMemoryStoreInner {
     clock: Arc<dyn Clock>,
     _rng: Arc<dyn Rng>,
@@ -191,6 +214,20 @@ impl InMemoryVfsStore {
 
     pub fn with_dependencies(dependencies: DbDependencies) -> Self {
         Self::new(dependencies.clock, dependencies.rng)
+    }
+
+    pub fn performance_snapshot(
+        &self,
+        volume_id: crate::VolumeId,
+    ) -> Option<VfsPerformanceSnapshot> {
+        let volumes = self
+            .inner
+            .volumes
+            .lock()
+            .expect("in-memory vfs store lock poisoned");
+        volumes
+            .get(&volume_id)
+            .map(StoredVolume::performance_snapshot)
     }
 }
 
@@ -223,6 +260,13 @@ impl StoredVolume {
         match self {
             Self::Regular(volume) => volume.snapshot_state(durable),
             Self::Overlay(overlay) => overlay.snapshot_state(durable),
+        }
+    }
+
+    fn performance_snapshot(&self) -> VfsPerformanceSnapshot {
+        match self {
+            Self::Regular(volume) => volume.performance_snapshot(),
+            Self::Overlay(overlay) => overlay.delta.performance_snapshot(),
         }
     }
 }
@@ -1089,7 +1133,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                     activity_spec(ActivityKind::FileWritten, Some(path.clone()), None, None),
                 )));
             }
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             let resolved_path = if let Some((resolved_path, _)) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
             {
@@ -1130,7 +1174,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
                     .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
@@ -1154,7 +1198,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
                     .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
@@ -1218,7 +1262,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                     ),
                 )));
             }
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             if let Some((resolved_path, inode_id)) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
             {
@@ -1274,7 +1318,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                 return Ok(None);
             }
 
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             let (resolved_from, from_inode_id) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &from, false)?
                     .ok_or_else(|| VfsError::NotFound { path: from.clone() })?;
@@ -1333,9 +1377,10 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                     .kind;
                 if from_kind == FileKind::Directory
                     && target_kind == FileKind::Directory
-                    && merged.paths.keys().any(|candidate| {
-                        candidate != &target_path && is_descendant_path(&target_path, candidate)
-                    })
+                    && merged
+                        .children_by_parent
+                        .get(&target_path)
+                        .is_some_and(|children| !children.is_empty())
                 {
                     return Err(VfsError::DirectoryNotEmpty { path: target_path });
                 }
@@ -1364,10 +1409,10 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                 return Ok(None);
             }
             if !source_was_delta {
-                state.whiteouts.insert(resolved_from.clone());
+                insert_volume_whiteout(state, resolved_from.clone());
             }
             if target_was_base {
-                state.whiteouts.insert(resolved_to.clone());
+                insert_volume_whiteout(state, resolved_to.clone());
             }
 
             let mut metadata = BTreeMap::new();
@@ -1389,7 +1434,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let to = normalize_path(to)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             let (resolved_from, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &from, false)?
                     .ok_or_else(|| VfsError::NotFound { path: from.clone() })?;
@@ -1444,7 +1489,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                     ),
                 )));
             }
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             materialize_overlay_parent_chain(state, base.as_ref(), &merged, &linkpath, false, now)?;
             let resolved_linkpath = resolve_target_path(state, &linkpath)?;
             mutate_symlink_state(state, &target, &resolved_linkpath, now)?;
@@ -1464,7 +1509,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
                     .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
@@ -1481,7 +1526,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
             }
             mutate_unlink_state(state, &resolved_path, now)?;
             if !source_was_delta {
-                state.whiteouts.insert(resolved_path);
+                insert_volume_whiteout(state, resolved_path);
             }
             Ok(Some((
                 (),
@@ -1494,7 +1539,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let path = normalize_path(path)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
-            let merged = overlay_visible_snapshot(state, base.as_ref());
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
             let (resolved_path, _) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
                     .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
@@ -1511,7 +1556,7 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
             }
             mutate_rmdir_state(state, &resolved_path, now)?;
             if !source_was_delta {
-                state.whiteouts.insert(resolved_path);
+                insert_volume_whiteout(state, resolved_path);
             }
             Ok(Some((
                 (),
@@ -1899,6 +1944,14 @@ impl InMemoryVolumeInner {
         self.activity_watch.send_replace(visible_sequence);
         self.durable_activity_watch.send_replace(durable_sequence);
     }
+
+    fn performance_snapshot(&self) -> VfsPerformanceSnapshot {
+        self.state
+            .lock()
+            .expect("volume state lock poisoned")
+            .performance
+            .clone()
+    }
 }
 
 #[derive(Clone)]
@@ -1907,6 +1960,8 @@ struct SnapshotState {
     sequence: SequenceNumber,
     durable: bool,
     paths: BTreeMap<String, InodeId>,
+    children_by_parent: BTreeMap<String, BTreeSet<String>>,
+    paths_by_inode: BTreeMap<InodeId, BTreeSet<String>>,
     inodes: BTreeMap<InodeId, InodeRecord>,
     kv: BTreeMap<String, JsonValue>,
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
@@ -1918,6 +1973,8 @@ struct SnapshotState {
 struct DurableViewState {
     sequence: SequenceNumber,
     paths: BTreeMap<String, InodeId>,
+    children_by_parent: BTreeMap<String, BTreeSet<String>>,
+    paths_by_inode: BTreeMap<InodeId, BTreeSet<String>>,
     inodes: BTreeMap<InodeId, InodeRecord>,
     kv: BTreeMap<String, JsonValue>,
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
@@ -1933,6 +1990,8 @@ impl DurableViewState {
             sequence: self.sequence,
             durable: true,
             paths: self.paths.clone(),
+            children_by_parent: self.children_by_parent.clone(),
+            paths_by_inode: self.paths_by_inode.clone(),
             inodes: self.inodes.clone(),
             kv: self.kv.clone(),
             tool_runs: self.tool_runs.clone(),
@@ -1955,11 +2014,14 @@ struct VolumeState {
     sequence: SequenceNumber,
     allocators: BTreeMap<AllocatorKind, BlockLeaseAllocator>,
     paths: BTreeMap<String, InodeId>,
+    children_by_parent: BTreeMap<String, BTreeSet<String>>,
+    paths_by_inode: BTreeMap<InodeId, BTreeSet<String>>,
     inodes: BTreeMap<InodeId, InodeRecord>,
     kv: BTreeMap<String, JsonValue>,
     tool_runs: BTreeMap<ToolRunId, ToolRun>,
     whiteouts: BTreeSet<String>,
     origins: BTreeMap<InodeId, OriginRecord>,
+    performance: VfsPerformanceSnapshot,
     activities: Vec<ActivityEntry>,
     durable: DurableViewState,
 }
@@ -1978,11 +2040,15 @@ impl VolumeState {
         };
         let mut paths = BTreeMap::new();
         paths.insert("/".to_string(), ROOT_INODE_ID);
+        let children_by_parent = build_children_by_parent(&paths);
+        let paths_by_inode = build_paths_by_inode(&paths);
         let mut inodes = BTreeMap::new();
         inodes.insert(ROOT_INODE_ID, root);
         let durable = DurableViewState {
             sequence: SequenceNumber::new(0),
             paths: paths.clone(),
+            children_by_parent: children_by_parent.clone(),
+            paths_by_inode: paths_by_inode.clone(),
             inodes: inodes.clone(),
             kv: BTreeMap::new(),
             tool_runs: BTreeMap::new(),
@@ -1996,11 +2062,14 @@ impl VolumeState {
             sequence: SequenceNumber::new(0),
             allocators: allocator_map(ROOT_INODE_ID.get() + 1, 1, 1, allocator_block_size),
             paths,
+            children_by_parent,
+            paths_by_inode,
             inodes,
             kv: BTreeMap::new(),
             tool_runs: BTreeMap::new(),
             whiteouts: BTreeSet::new(),
             origins: BTreeMap::new(),
+            performance: VfsPerformanceSnapshot::default(),
             activities: Vec::new(),
             durable,
         }
@@ -2035,6 +2104,8 @@ impl VolumeState {
             DurableViewState {
                 sequence: SequenceNumber::new(0),
                 paths: snapshot.paths.clone(),
+                children_by_parent: snapshot.children_by_parent.clone(),
+                paths_by_inode: snapshot.paths_by_inode.clone(),
                 inodes: inodes.clone(),
                 kv: snapshot.kv.clone(),
                 tool_runs: snapshot.tool_runs.clone(),
@@ -2051,11 +2122,14 @@ impl VolumeState {
             sequence: SequenceNumber::new(0),
             allocators: allocator_map(next_inode, 1, next_tool_run_id, allocator_block_size),
             paths: snapshot.paths.clone(),
+            children_by_parent: snapshot.children_by_parent.clone(),
+            paths_by_inode: snapshot.paths_by_inode.clone(),
             inodes,
             kv: snapshot.kv.clone(),
             tool_runs: snapshot.tool_runs.clone(),
             whiteouts: BTreeSet::new(),
             origins: BTreeMap::new(),
+            performance: VfsPerformanceSnapshot::default(),
             activities: Vec::new(),
             durable,
         }
@@ -2078,11 +2152,15 @@ impl VolumeState {
             });
         let mut paths = BTreeMap::new();
         paths.insert("/".to_string(), ROOT_INODE_ID);
+        let children_by_parent = build_children_by_parent(&paths);
+        let paths_by_inode = build_paths_by_inode(&paths);
         let mut inodes = BTreeMap::new();
         inodes.insert(ROOT_INODE_ID, root);
         let durable = DurableViewState {
             sequence: SequenceNumber::new(0),
             paths: paths.clone(),
+            children_by_parent: children_by_parent.clone(),
+            paths_by_inode: paths_by_inode.clone(),
             inodes: inodes.clone(),
             kv: base.kv.clone(),
             tool_runs: base.tool_runs.clone(),
@@ -2111,11 +2189,14 @@ impl VolumeState {
             sequence: SequenceNumber::new(0),
             allocators: allocator_map(next_inode, 1, next_tool_run_id, allocator_block_size),
             paths,
+            children_by_parent,
+            paths_by_inode,
             inodes,
             kv: base.kv.clone(),
             tool_runs: base.tool_runs.clone(),
             whiteouts: BTreeSet::new(),
             origins: BTreeMap::new(),
+            performance: VfsPerformanceSnapshot::default(),
             activities: Vec::new(),
             durable,
         }
@@ -2127,6 +2208,8 @@ impl VolumeState {
             sequence: self.sequence,
             durable: false,
             paths: self.paths.clone(),
+            children_by_parent: self.children_by_parent.clone(),
+            paths_by_inode: self.paths_by_inode.clone(),
             inodes: self.inodes.clone(),
             kv: self.kv.clone(),
             tool_runs: self.tool_runs.clone(),
@@ -2138,6 +2221,8 @@ impl VolumeState {
     fn promote_durable_cut(&mut self) {
         self.durable.sequence = self.sequence;
         self.durable.paths = self.paths.clone();
+        self.durable.children_by_parent = self.children_by_parent.clone();
+        self.durable.paths_by_inode = self.paths_by_inode.clone();
         self.durable.inodes = self.inodes.clone();
         self.durable.kv = self.kv.clone();
         self.durable.tool_runs = self.tool_runs.clone();
@@ -2396,7 +2481,7 @@ fn mutate_write_file_state(
 
             let inode_id = allocate_inode(state);
             let stats = inode_stats(inode_id, FileKind::File, opts.mode, now, data.len() as u64);
-            state.paths.insert(resolved_path.clone(), inode_id);
+            insert_volume_path(state, resolved_path.clone(), inode_id);
             state.inodes.insert(
                 inode_id,
                 InodeRecord {
@@ -2493,6 +2578,10 @@ fn apply_regular_batch_to_state(
     ops: &[VfsBatchOperation],
     now: Timestamp,
 ) -> Result<(), VfsError> {
+    state.performance.batch_operations_applied = state
+        .performance
+        .batch_operations_applied
+        .saturating_add(ops.len() as u64);
     for op in ops {
         match op {
             VfsBatchOperation::WriteFile { path, data, opts } => {
@@ -2628,6 +2717,10 @@ fn apply_overlay_batch_to_state(
     ops: &[VfsBatchOperation],
     now: Timestamp,
 ) -> Result<(), VfsError> {
+    state.performance.batch_operations_applied = state
+        .performance
+        .batch_operations_applied
+        .saturating_add(ops.len() as u64);
     for op in ops {
         match op {
             VfsBatchOperation::WriteFile { path, data, opts } => {
@@ -2639,7 +2732,7 @@ fn apply_overlay_batch_to_state(
                     };
                     mutate_write_file_state(state, &resolved_path, data, &delta_opts, now)?;
                 } else {
-                    let merged = overlay_visible_snapshot(state, base);
+                    let merged = overlay_visible_snapshot_with_metrics(state, base);
                     let resolved_path = if let Some((resolved_path, _)) =
                         resolve_existing_in_maps_with_mode(
                             &merged.paths,
@@ -2684,7 +2777,7 @@ fn apply_overlay_batch_to_state(
             }
             VfsBatchOperation::Pwrite { path, offset, data } => {
                 let path = normalize_path(path)?;
-                let merged = overlay_visible_snapshot(state, base);
+                let merged = overlay_visible_snapshot_with_metrics(state, base);
                 let (resolved_path, _) =
                     resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
                         .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
@@ -2701,7 +2794,7 @@ fn apply_overlay_batch_to_state(
             }
             VfsBatchOperation::Truncate { path, size } => {
                 let path = normalize_path(path)?;
-                let merged = overlay_visible_snapshot(state, base);
+                let merged = overlay_visible_snapshot_with_metrics(state, base);
                 let (resolved_path, _) =
                     resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
                         .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
@@ -2755,7 +2848,7 @@ fn apply_overlay_batch_to_state(
                     }
                     continue;
                 }
-                let merged = overlay_visible_snapshot(state, base);
+                let merged = overlay_visible_snapshot_with_metrics(state, base);
                 if let Some((resolved_path, inode_id)) =
                     resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
                 {
@@ -2798,7 +2891,7 @@ fn apply_overlay_batch_to_state(
                 if from == to {
                     continue;
                 }
-                let merged = overlay_visible_snapshot(state, base);
+                let merged = overlay_visible_snapshot_with_metrics(state, base);
                 let (resolved_from, from_inode_id) = resolve_existing_in_maps_with_mode(
                     &merged.paths,
                     &merged.inodes,
@@ -2858,9 +2951,10 @@ fn apply_overlay_batch_to_state(
                         .kind;
                     if from_kind == FileKind::Directory
                         && target_kind == FileKind::Directory
-                        && merged.paths.keys().any(|candidate| {
-                            candidate != &target_path && is_descendant_path(&target_path, candidate)
-                        })
+                        && merged
+                            .children_by_parent
+                            .get(&target_path)
+                            .is_some_and(|children| !children.is_empty())
                     {
                         return Err(VfsError::DirectoryNotEmpty { path: target_path });
                     }
@@ -2886,10 +2980,10 @@ fn apply_overlay_batch_to_state(
                 }
                 if mutate_rename_state(state, &resolved_from, &resolved_to, now)? {
                     if !source_was_delta {
-                        state.whiteouts.insert(resolved_from.clone());
+                        insert_volume_whiteout(state, resolved_from.clone());
                     }
                     if target_was_base {
-                        state.whiteouts.insert(resolved_to.clone());
+                        insert_volume_whiteout(state, resolved_to.clone());
                     }
                     let mut metadata = BTreeMap::new();
                     metadata.insert("to".to_string(), json!(to));
@@ -2906,7 +3000,7 @@ fn apply_overlay_batch_to_state(
             VfsBatchOperation::Link { from, to } => {
                 let from = normalize_path(from)?;
                 let to = normalize_path(to)?;
-                let merged = overlay_visible_snapshot(state, base);
+                let merged = overlay_visible_snapshot_with_metrics(state, base);
                 let (resolved_from, _) = resolve_existing_in_maps_with_mode(
                     &merged.paths,
                     &merged.inodes,
@@ -2936,7 +3030,7 @@ fn apply_overlay_batch_to_state(
                 {
                     mutate_symlink_state(state, target, &resolved_linkpath, now)?;
                 } else {
-                    let merged = overlay_visible_snapshot(state, base);
+                    let merged = overlay_visible_snapshot_with_metrics(state, base);
                     materialize_overlay_parent_chain(state, base, &merged, &linkpath, false, now)?;
                     let resolved_linkpath = resolve_target_path(state, &linkpath)?;
                     mutate_symlink_state(state, target, &resolved_linkpath, now)?;
@@ -2952,7 +3046,7 @@ fn apply_overlay_batch_to_state(
             }
             VfsBatchOperation::Unlink { path } => {
                 let path = normalize_path(path)?;
-                let merged = overlay_visible_snapshot(state, base);
+                let merged = overlay_visible_snapshot_with_metrics(state, base);
                 let (resolved_path, resolved_inode) = resolve_existing_in_maps_with_mode(
                     &merged.paths,
                     &merged.inodes,
@@ -2979,7 +3073,7 @@ fn apply_overlay_batch_to_state(
                 }
                 mutate_unlink_state(state, &resolved_path, now)?;
                 if was_base {
-                    state.whiteouts.insert(resolved_path);
+                    insert_volume_whiteout(state, resolved_path);
                 }
                 append_activity(
                     state,
@@ -2992,7 +3086,7 @@ fn apply_overlay_batch_to_state(
             }
             VfsBatchOperation::Rmdir { path } => {
                 let path = normalize_path(path)?;
-                let merged = overlay_visible_snapshot(state, base);
+                let merged = overlay_visible_snapshot_with_metrics(state, base);
                 let (resolved_path, resolved_inode) = resolve_existing_in_maps_with_mode(
                     &merged.paths,
                     &merged.inodes,
@@ -3019,7 +3113,7 @@ fn apply_overlay_batch_to_state(
                 }
                 mutate_rmdir_state(state, &resolved_path, now)?;
                 if was_base {
-                    state.whiteouts.insert(resolved_path);
+                    insert_volume_whiteout(state, resolved_path);
                 }
                 append_activity(
                     state,
@@ -3060,7 +3154,7 @@ fn mutate_mkdir_state(
     let resolved_path = resolve_target_path(state, path)?;
     let inode_id = allocate_inode(state);
     let stats = inode_stats(inode_id, FileKind::Directory, opts.mode, now, 0);
-    state.paths.insert(resolved_path.clone(), inode_id);
+    insert_volume_path(state, resolved_path.clone(), inode_id);
     state.inodes.insert(
         inode_id,
         InodeRecord {
@@ -3120,14 +3214,16 @@ fn mutate_rename_state(
             .kind;
         match (from_kind, target_kind) {
             (FileKind::Directory, FileKind::Directory) => {
-                if state.paths.keys().any(|candidate| {
-                    candidate != &resolved_to && is_descendant_path(&resolved_to, candidate)
-                }) {
+                if state
+                    .children_by_parent
+                    .get(&resolved_to)
+                    .is_some_and(|children| !children.is_empty())
+                {
                     return Err(VfsError::DirectoryNotEmpty {
                         path: resolved_to.clone(),
                     });
                 }
-                state.paths.remove(&resolved_to);
+                remove_volume_path(state, &resolved_to);
                 state.inodes.remove(&target_inode_id);
                 decrement_directory_nlink(state, &resolved_to, now)?;
             }
@@ -3157,10 +3253,10 @@ fn mutate_rename_state(
         .collect::<Vec<_>>();
 
     for (old_path, _, _) in &renames {
-        state.paths.remove(old_path);
+        remove_volume_path(state, old_path);
     }
     for (_, new_path, inode) in renames {
-        state.paths.insert(new_path, inode);
+        insert_volume_path(state, new_path, inode);
     }
     touch_directory_path_at(state, &from_parent, now)?;
     touch_directory_path_at(state, &to_parent, now)?;
@@ -3211,7 +3307,7 @@ fn mutate_link_state(
         })?;
     inode.stats.nlink = inode.stats.nlink.saturating_add(1);
     inode.stats.changed_at = now;
-    state.paths.insert(resolved_to.clone(), inode_id);
+    insert_volume_path(state, resolved_to.clone(), inode_id);
     touch_parent_directory(state, &resolved_to, now)?;
     Ok(())
 }
@@ -3233,7 +3329,7 @@ fn mutate_symlink_state(
     }
     let inode_id = allocate_inode(state);
     let stats = inode_stats(inode_id, FileKind::Symlink, 0o777, now, target.len() as u64);
-    state.paths.insert(resolved_linkpath.clone(), inode_id);
+    insert_volume_path(state, resolved_linkpath.clone(), inode_id);
     state.inodes.insert(
         inode_id,
         InodeRecord {
@@ -3281,14 +3377,16 @@ fn mutate_rmdir_state(state: &mut VolumeState, path: &str, now: Timestamp) -> Re
             path: resolved_path.clone(),
         });
     }
-    if state.paths.keys().any(|candidate| {
-        candidate != &resolved_path && is_descendant_path(&resolved_path, candidate)
-    }) {
+    if state
+        .children_by_parent
+        .get(&resolved_path)
+        .is_some_and(|children| !children.is_empty())
+    {
         return Err(VfsError::DirectoryNotEmpty {
             path: resolved_path.clone(),
         });
     }
-    state.paths.remove(&resolved_path);
+    remove_volume_path(state, &resolved_path);
     state.inodes.remove(&inode_id);
     decrement_directory_nlink(state, &resolved_path, now)?;
     touch_parent_directory(state, &resolved_path, now)?;
@@ -3297,6 +3395,8 @@ fn mutate_rmdir_state(state: &mut VolumeState, path: &str, now: Timestamp) -> Re
 
 fn build_overlay_snapshot(delta: &SnapshotState, base: &SnapshotState) -> SnapshotState {
     let mut paths = BTreeMap::new();
+    let mut children_by_parent = BTreeMap::new();
+    let mut paths_by_inode = BTreeMap::new();
     let mut inodes = BTreeMap::new();
 
     for (path, inode_id) in &base.paths {
@@ -3304,6 +3404,11 @@ fn build_overlay_snapshot(delta: &SnapshotState, base: &SnapshotState) -> Snapsh
             continue;
         }
         paths.insert(path.clone(), *inode_id);
+        index_path_parent_child_insert(&mut children_by_parent, path);
+        paths_by_inode
+            .entry(*inode_id)
+            .or_insert_with(BTreeSet::new)
+            .insert(path.clone());
         if let Some(inode) = base.inodes.get(inode_id) {
             inodes.insert(*inode_id, inode.clone());
         }
@@ -3311,6 +3416,11 @@ fn build_overlay_snapshot(delta: &SnapshotState, base: &SnapshotState) -> Snapsh
 
     for (path, inode_id) in &delta.paths {
         paths.insert(path.clone(), *inode_id);
+        index_path_parent_child_insert(&mut children_by_parent, path);
+        paths_by_inode
+            .entry(*inode_id)
+            .or_insert_with(BTreeSet::new)
+            .insert(path.clone());
     }
     inodes.extend(delta.inodes.clone());
 
@@ -3319,6 +3429,8 @@ fn build_overlay_snapshot(delta: &SnapshotState, base: &SnapshotState) -> Snapsh
         sequence: delta.sequence,
         durable: delta.durable,
         paths,
+        children_by_parent,
+        paths_by_inode,
         inodes,
         kv: delta.kv.clone(),
         tool_runs: delta.tool_runs.clone(),
@@ -3331,12 +3443,25 @@ fn overlay_visible_snapshot(state: &VolumeState, base: &SnapshotState) -> Snapsh
     build_overlay_snapshot(&state.visible_snapshot(), base)
 }
 
+fn overlay_visible_snapshot_with_metrics(
+    state: &mut VolumeState,
+    base: &SnapshotState,
+) -> SnapshotState {
+    state.performance.overlay_visible_snapshot_builds = state
+        .performance
+        .overlay_visible_snapshot_builds
+        .saturating_add(1);
+    overlay_visible_snapshot(state, base)
+}
+
 fn try_fast_overlay_new_target_path(
     state: &VolumeState,
     base: &SnapshotState,
     path: &str,
 ) -> Result<Option<String>, VfsError> {
-    if !state.whiteouts.is_empty() {
+    if overlay_path_whiteouted(&state.whiteouts, path)
+        || path_has_descendants(&state.whiteouts, path)
+    {
         return Ok(None);
     }
     let Some(parent) = parent_path(path) else {
@@ -3367,9 +3492,14 @@ fn try_fast_overlay_new_target_path(
 }
 
 fn overlay_path_whiteouted(whiteouts: &BTreeSet<String>, path: &str) -> bool {
-    whiteouts
-        .iter()
-        .any(|whiteout| path == whiteout || is_descendant_path(whiteout, path))
+    let mut current = Some(path.to_string());
+    while let Some(candidate) = current {
+        if whiteouts.contains(&candidate) {
+            return true;
+        }
+        current = parent_path(&candidate);
+    }
+    false
 }
 
 fn overlay_origin_record(state: &VolumeState, base_inode: InodeId) -> Option<OriginRecord> {
@@ -3383,19 +3513,34 @@ fn overlay_origin_record(state: &VolumeState, base_inode: InodeId) -> Option<Ori
 
 fn visible_directory_nlink(merged: &SnapshotState, path: &str) -> Result<u32, VfsError> {
     let mut nlink = 2_u32;
-    for entry in read_snapshot_dir_entries(merged, path)? {
-        if entry.kind == FileKind::Directory {
+    let normalized = normalize_path(path)?;
+    for child_path in merged
+        .children_by_parent
+        .get(&normalized)
+        .into_iter()
+        .flatten()
+    {
+        let Some(inode_id) = merged.paths.get(child_path) else {
+            continue;
+        };
+        let Some(inode) = merged.inodes.get(inode_id) else {
+            continue;
+        };
+        if inode.stats.kind == FileKind::Directory {
             nlink = nlink.saturating_add(1);
         }
     }
     Ok(nlink)
 }
 
-fn count_inode_paths(paths: &BTreeMap<String, InodeId>, inode_id: InodeId) -> u32 {
-    paths
-        .values()
-        .filter(|candidate| **candidate == inode_id)
-        .count() as u32
+fn count_inode_paths(
+    paths_by_inode: &BTreeMap<InodeId, BTreeSet<String>>,
+    inode_id: InodeId,
+) -> u32 {
+    paths_by_inode
+        .get(&inode_id)
+        .map(|paths| paths.len() as u32)
+        .unwrap_or(0)
 }
 
 fn materialize_overlay_parent_chain(
@@ -3456,7 +3601,7 @@ fn materialize_overlay_parent_chain(
 
         let inode_id = allocate_inode(state);
         let stats = inode_stats(inode_id, FileKind::Directory, 0o755, now, 0);
-        state.paths.insert(current.clone(), inode_id);
+        insert_volume_path(state, current.clone(), inode_id);
         state.inodes.insert(
             inode_id,
             InodeRecord {
@@ -3511,7 +3656,7 @@ fn copy_up_overlay_directory_exact(
         inode_id,
     );
     record.stats.nlink = visible_directory_nlink(merged, path)?;
-    state.paths.insert(path.to_string(), inode_id);
+    insert_volume_path(state, path.to_string(), inode_id);
     state.inodes.insert(inode_id, record);
     if inode_id != ROOT_INODE_ID
         && let Some(origin) = overlay_origin_record(state, base_inode_id)
@@ -3572,21 +3717,21 @@ fn copy_up_overlay_inode_aliases(
     };
 
     let aliases = merged
-        .paths
-        .iter()
-        .filter_map(|(alias_path, inode_id)| {
-            (*inode_id == base_inode_id && !state.paths.contains_key(alias_path))
-                .then_some(alias_path.clone())
-        })
+        .paths_by_inode
+        .get(&base_inode_id)
+        .into_iter()
+        .flatten()
+        .filter(|alias_path| !state.paths.contains_key(alias_path.as_str()))
+        .cloned()
         .collect::<Vec<_>>();
 
     for alias in aliases {
         materialize_overlay_parent_chain(state, base, merged, &alias, false, now)?;
-        state.paths.insert(alias, delta_inode);
+        insert_volume_path(state, alias, delta_inode);
     }
 
     if let Some(inode) = state.inodes.get_mut(&delta_inode) {
-        inode.stats.nlink = count_inode_paths(&state.paths, delta_inode).max(1);
+        inode.stats.nlink = count_inode_paths(&state.paths_by_inode, delta_inode).max(1);
     }
     Ok(delta_inode)
 }
@@ -3598,13 +3743,8 @@ fn copy_up_overlay_directory_subtree(
     path: &str,
     now: Timestamp,
 ) -> Result<(), VfsError> {
-    let mut paths = merged
-        .paths
-        .keys()
-        .filter(|candidate| **candidate == path || is_descendant_path(path, candidate))
-        .cloned()
-        .collect::<Vec<_>>();
-    paths.sort_by_key(|candidate| (path_segments(candidate).len(), candidate.clone()));
+    let mut paths = Vec::new();
+    collect_snapshot_subtree_paths(merged, path, &mut paths);
 
     for candidate in paths {
         if state.paths.contains_key(&candidate) {
@@ -3635,6 +3775,15 @@ fn copy_up_overlay_directory_subtree(
     }
 
     Ok(())
+}
+
+fn collect_snapshot_subtree_paths(snapshot: &SnapshotState, path: &str, output: &mut Vec<String>) {
+    output.push(path.to_string());
+    if let Some(children) = snapshot.children_by_parent.get(path) {
+        for child in children {
+            collect_snapshot_subtree_paths(snapshot, child, output);
+        }
+    }
 }
 
 fn ensure_overlay_existing_path(
@@ -3785,6 +3934,104 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+fn build_children_by_parent(
+    paths: &BTreeMap<String, InodeId>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut index = BTreeMap::new();
+    for path in paths.keys() {
+        index_path_parent_child_insert(&mut index, path);
+    }
+    index
+}
+
+fn build_paths_by_inode(paths: &BTreeMap<String, InodeId>) -> BTreeMap<InodeId, BTreeSet<String>> {
+    let mut index = BTreeMap::new();
+    for (path, inode_id) in paths {
+        index
+            .entry(*inode_id)
+            .or_insert_with(BTreeSet::new)
+            .insert(path.clone());
+    }
+    index
+}
+
+fn index_path_parent_child_insert(
+    children_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+    path: &str,
+) {
+    if let Some(parent) = parent_path(path) {
+        children_by_parent
+            .entry(parent)
+            .or_insert_with(BTreeSet::new)
+            .insert(path.to_string());
+    }
+}
+
+fn index_path_parent_child_remove(
+    children_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+    path: &str,
+) {
+    let Some(parent) = parent_path(path) else {
+        return;
+    };
+    if let Some(children) = children_by_parent.get_mut(&parent) {
+        children.remove(path);
+        if children.is_empty() {
+            children_by_parent.remove(&parent);
+        }
+    }
+}
+
+fn insert_volume_path(state: &mut VolumeState, path: String, inode_id: InodeId) -> Option<InodeId> {
+    let previous = state.paths.insert(path.clone(), inode_id);
+    if let Some(previous_inode) = previous {
+        index_path_parent_child_remove(&mut state.children_by_parent, &path);
+        if let Some(paths) = state.paths_by_inode.get_mut(&previous_inode) {
+            paths.remove(&path);
+            if paths.is_empty() {
+                state.paths_by_inode.remove(&previous_inode);
+            }
+        }
+    }
+    index_path_parent_child_insert(&mut state.children_by_parent, &path);
+    state
+        .paths_by_inode
+        .entry(inode_id)
+        .or_insert_with(BTreeSet::new)
+        .insert(path);
+    state.performance.path_inserts = state.performance.path_inserts.saturating_add(1);
+    previous
+}
+
+fn remove_volume_path(state: &mut VolumeState, path: &str) -> Option<InodeId> {
+    let inode_id = state.paths.remove(path)?;
+    index_path_parent_child_remove(&mut state.children_by_parent, path);
+    if let Some(paths) = state.paths_by_inode.get_mut(&inode_id) {
+        paths.remove(path);
+        if paths.is_empty() {
+            state.paths_by_inode.remove(&inode_id);
+        }
+    }
+    state.performance.path_removals = state.performance.path_removals.saturating_add(1);
+    Some(inode_id)
+}
+
+fn insert_volume_whiteout(state: &mut VolumeState, path: String) -> bool {
+    state.whiteouts.insert(path)
+}
+
+fn path_has_descendants(paths: &BTreeSet<String>, path: &str) -> bool {
+    let prefix = if path == "/" {
+        "/".to_string()
+    } else {
+        format!("{path}/")
+    };
+    paths
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|candidate| candidate.starts_with(&prefix))
+}
+
 fn ensure_parent_directory(
     state: &mut VolumeState,
     path: &str,
@@ -3831,7 +4078,7 @@ fn create_missing_directories(
 
         let inode_id = allocate_inode(state);
         let stats = inode_stats(inode_id, FileKind::Directory, 0o755, now, 0);
-        state.paths.insert(current.clone(), inode_id);
+        insert_volume_path(state, current.clone(), inode_id);
         state.inodes.insert(
             inode_id,
             InodeRecord {
@@ -4097,15 +4344,16 @@ fn pread_file_bytes_in_maps(
 }
 
 fn read_dir_entries(state: &VolumeState, path: &str) -> Result<Vec<DirEntry>, VfsError> {
-    read_dir_entries_in_maps(&state.paths, &state.inodes, path)
+    read_dir_entries_in_maps(&state.paths, &state.children_by_parent, &state.inodes, path)
 }
 
 fn read_snapshot_dir_entries(state: &SnapshotState, path: &str) -> Result<Vec<DirEntry>, VfsError> {
-    read_dir_entries_in_maps(&state.paths, &state.inodes, path)
+    read_dir_entries_in_maps(&state.paths, &state.children_by_parent, &state.inodes, path)
 }
 
 fn read_dir_entries_in_maps(
     paths: &BTreeMap<String, InodeId>,
+    children_by_parent: &BTreeMap<String, BTreeSet<String>>,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
 ) -> Result<Vec<DirEntry>, VfsError> {
@@ -4126,38 +4374,43 @@ fn read_dir_entries_in_maps(
     }
 
     let mut entries = Vec::new();
-    for (candidate, inode_id) in paths {
-        if let Some(name) = direct_child_name(&resolved_path, candidate) {
-            let inode = inodes.get(inode_id).ok_or_else(|| VfsError::NotFound {
+    for candidate in children_by_parent.get(&resolved_path).into_iter().flatten() {
+        let inode_id = paths
+            .get(candidate)
+            .copied()
+            .ok_or_else(|| VfsError::NotFound {
                 path: candidate.clone(),
             })?;
-            entries.push(DirEntry {
-                name,
-                inode: *inode_id,
-                kind: inode.stats.kind,
-            });
-        }
+        let inode = inodes.get(&inode_id).ok_or_else(|| VfsError::NotFound {
+            path: candidate.clone(),
+        })?;
+        entries.push(DirEntry {
+            name: basename(candidate).unwrap_or_default().to_string(),
+            inode: inode_id,
+            kind: inode.stats.kind,
+        });
     }
     Ok(entries)
 }
 
 fn read_dir_entries_plus(state: &VolumeState, path: &str) -> Result<Vec<DirEntryPlus>, VfsError> {
-    read_dir_entries_plus_in_maps(&state.paths, &state.inodes, path)
+    read_dir_entries_plus_in_maps(&state.paths, &state.children_by_parent, &state.inodes, path)
 }
 
 fn read_snapshot_dir_entries_plus(
     state: &SnapshotState,
     path: &str,
 ) -> Result<Vec<DirEntryPlus>, VfsError> {
-    read_dir_entries_plus_in_maps(&state.paths, &state.inodes, path)
+    read_dir_entries_plus_in_maps(&state.paths, &state.children_by_parent, &state.inodes, path)
 }
 
 fn read_dir_entries_plus_in_maps(
     paths: &BTreeMap<String, InodeId>,
+    children_by_parent: &BTreeMap<String, BTreeSet<String>>,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     path: &str,
 ) -> Result<Vec<DirEntryPlus>, VfsError> {
-    read_dir_entries_in_maps(paths, inodes, path)?
+    read_dir_entries_in_maps(paths, children_by_parent, inodes, path)?
         .into_iter()
         .map(|entry| {
             let stats = inodes
@@ -4354,7 +4607,7 @@ fn remove_non_directory_path(
     path: &str,
     now: Timestamp,
 ) -> Result<(), VfsError> {
-    let inode_id = state.paths.remove(path).ok_or_else(|| VfsError::NotFound {
+    let inode_id = remove_volume_path(state, path).ok_or_else(|| VfsError::NotFound {
         path: path.to_string(),
     })?;
     let remove_inode = {
@@ -4377,27 +4630,6 @@ fn remove_non_directory_path(
         state.inodes.remove(&inode_id);
     }
     Ok(())
-}
-
-fn direct_child_name(parent: &str, child: &str) -> Option<String> {
-    if parent == child {
-        return None;
-    }
-
-    if parent == "/" {
-        let remainder = child.strip_prefix('/')?;
-        if remainder.is_empty() || remainder.contains('/') {
-            return None;
-        }
-        return Some(remainder.to_string());
-    }
-
-    let prefix = format!("{parent}/");
-    let remainder = child.strip_prefix(&prefix)?;
-    if remainder.is_empty() || remainder.contains('/') {
-        return None;
-    }
-    Some(remainder.to_string())
 }
 
 fn is_descendant_path(parent: &str, candidate: &str) -> bool {

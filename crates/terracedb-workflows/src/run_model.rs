@@ -5,13 +5,12 @@ use serde::{Deserialize, Serialize};
 use terracedb_workflows_core::{
     AppendOnlyWorkflowHistoryOrderer, PassthroughWorkflowVisibilityProjector,
     WorkflowDescribeRequest, WorkflowDescribeResponse, WorkflowExecutionTarget,
-    WorkflowHistoryEvent, WorkflowHistoryOrderer, WorkflowLifecycleRecord,
-    WorkflowLifecycleState, WorkflowRegistrationId, WorkflowRunId, WorkflowStateRecord,
-    WorkflowTaskError, WorkflowTaskId, WorkflowTransitionInput, WorkflowTransitionOutput,
-    WorkflowVisibilityApi, WorkflowVisibilityEntry, WorkflowVisibilityListRequest,
-    WorkflowVisibilityListResponse, WorkflowVisibilityProjector, WorkflowVisibilityRecord,
-    WorkflowVisibleHistoryEntry, WorkflowVisibleHistoryPageRequest,
-    WorkflowVisibleHistoryPageResponse,
+    WorkflowHistoryEvent, WorkflowHistoryOrderer, WorkflowLifecycleRecord, WorkflowLifecycleState,
+    WorkflowRegistrationId, WorkflowRunId, WorkflowStateRecord, WorkflowTaskError, WorkflowTaskId,
+    WorkflowTransitionInput, WorkflowTransitionOutput, WorkflowVisibilityApi,
+    WorkflowVisibilityEntry, WorkflowVisibilityListRequest, WorkflowVisibilityListResponse,
+    WorkflowVisibilityProjector, WorkflowVisibilityRecord, WorkflowVisibleHistoryEntry,
+    WorkflowVisibleHistoryPageRequest, WorkflowVisibleHistoryPageResponse,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -848,10 +847,9 @@ fn workflow_visible_history_entry(
 mod tests {
     use super::*;
     use terracedb_workflows_core::{
-        WorkflowChangeKind, WorkflowContinueAsNew, WorkflowExecutionTarget, WorkflowPayload,
-        WorkflowRegistrationId, WorkflowSourceEvent, WorkflowStateMutation,
-        WorkflowTransitionOutput, WorkflowTrigger,
-        WorkflowDescribeRequest,
+        WorkflowChangeKind, WorkflowContinueAsNew, WorkflowDescribeRequest,
+        WorkflowExecutionTarget, WorkflowPayload, WorkflowRegistrationId, WorkflowSourceEvent,
+        WorkflowStateMutation, WorkflowTransitionOutput, WorkflowTrigger,
     };
 
     fn sample_trigger() -> WorkflowTrigger {

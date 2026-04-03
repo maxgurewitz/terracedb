@@ -342,6 +342,85 @@ async fn overlay_write_file_create_parents_materializes_missing_delta_parents() 
 }
 
 #[tokio::test]
+async fn overlay_create_parents_still_fast_paths_with_unrelated_whiteouts() {
+    let store = test_store(181, 21);
+    let base = store
+        .open_volume(
+            VolumeConfig::new(VolumeId::new(0x4202))
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open base volume");
+    base.fs()
+        .mkdir(
+            "/workspace/docs",
+            MkdirOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("mkdir base docs");
+    base.fs()
+        .write_file(
+            "/workspace/docs/guide.txt",
+            b"guide".to_vec(),
+            CreateOptions::default(),
+        )
+        .await
+        .expect("write base guide");
+
+    let overlay = store
+        .create_overlay(
+            base.snapshot(SnapshotOptions::default())
+                .await
+                .expect("base snapshot"),
+            VolumeConfig::new(VolumeId::new(0x4203))
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("create overlay");
+
+    overlay
+        .fs()
+        .unlink("/workspace/docs/guide.txt")
+        .await
+        .expect("whiteout unrelated base file");
+
+    overlay
+        .fs()
+        .write_file(
+            "/workspace/project/local-dep/package.json",
+            br#"{"name":"local-dep"}"#.to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write nested package.json with unrelated whiteout present");
+
+    assert_eq!(
+        overlay
+            .fs()
+            .read_file("/workspace/project/local-dep/package.json")
+            .await
+            .expect("read nested package.json"),
+        Some(br#"{"name":"local-dep"}"#.to_vec())
+    );
+    assert!(
+        overlay
+            .fs()
+            .read_file("/workspace/docs/guide.txt")
+            .await
+            .expect("read whiteouted base guide")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn overlay_apply_batch_creates_fresh_tree_in_one_operation_window() {
     let store = test_store(19, 30);
     let base = store
@@ -439,6 +518,86 @@ async fn overlay_apply_batch_creates_fresh_tree_in_one_operation_window() {
             .await
             .expect("readlink dependency"),
         "./local-dep/index.js".to_string()
+    );
+}
+
+#[tokio::test]
+async fn overlay_bulk_batch_stays_within_visible_snapshot_budget() {
+    let store = test_store(20, 40);
+    let base = store
+        .open_volume(
+            VolumeConfig::new(VolumeId::new(0x4302))
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open base volume");
+    base.fs()
+        .mkdir(
+            "/workspace",
+            MkdirOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("mkdir base workspace");
+
+    let overlay_id = VolumeId::new(0x4303);
+    let overlay = store
+        .create_overlay(
+            base.snapshot(SnapshotOptions::default())
+                .await
+                .expect("base snapshot"),
+            VolumeConfig::new(overlay_id)
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("create overlay");
+
+    let before = store
+        .performance_snapshot(overlay_id)
+        .expect("overlay performance snapshot before batch");
+
+    let mut ops = Vec::new();
+    ops.push(VfsBatchOperation::Mkdir {
+        path: "/workspace/npm-tree".to_string(),
+        opts: MkdirOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    });
+    for index in 0..1024 {
+        ops.push(VfsBatchOperation::WriteFile {
+            path: format!("/workspace/npm-tree/pkg-{index}.json"),
+            data: format!("{{\"name\":\"pkg-{index}\"}}").into_bytes(),
+            opts: CreateOptions {
+                create_parents: false,
+                ..Default::default()
+            },
+        });
+    }
+
+    overlay
+        .fs()
+        .apply_batch(&ops)
+        .await
+        .expect("apply large overlay batch");
+
+    let after = store
+        .performance_snapshot(overlay_id)
+        .expect("overlay performance snapshot after batch");
+    let delta = after.delta_since(&before);
+
+    assert_eq!(delta.batch_operations_applied, ops.len() as u64);
+    assert!(
+        delta.overlay_visible_snapshot_builds <= 2,
+        "bulk overlay batch rebuilt merged views too often: {delta:?}"
+    );
+    assert!(
+        delta.path_inserts >= ops.len() as u64,
+        "bulk overlay batch should materialize created paths: {delta:?}"
     );
 }
 

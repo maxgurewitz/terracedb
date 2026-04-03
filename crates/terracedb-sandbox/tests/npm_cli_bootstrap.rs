@@ -4,28 +4,29 @@ mod npm_cli;
 mod tracing_support;
 
 #[tokio::test]
-async fn npm_cli_version_fails_with_a_clear_node_gap() {
+async fn npm_cli_version_reports_version() {
     tracing_support::init_tracing();
     let Some((session, _vfs)) = npm_cli::open_npm_cli_session(400, 91).await else {
         eprintln!("skipping npm cli bootstrap test because npm/cli repo is unavailable");
         return;
     };
 
-    let error = npm_cli::run_npm_command(
+    let result = npm_cli::run_npm_command(
         &session,
         npm_cli::SANDBOX_PROJECT_ROOT,
         &["npm", "--version"],
     )
     .await
-    .expect_err("npm should fail fast with an explicit unsupported-runtime error");
+    .expect("npm --version should execute deterministically");
 
-    match error {
-        terracedb_sandbox::SandboxError::Execution { message, .. } => {
-            assert!(
-                message.contains("ERR_TERRACE_NODE_UNIMPLEMENTED"),
-                "expected a clear unsupported runtime error, got: {message}"
-            );
-        }
-        other => panic!("unexpected error: {other}"),
-    }
+    let report = result.result.expect("node command report");
+    assert_eq!(report["exitCode"].as_i64(), Some(0), "{report:#?}");
+    assert!(
+        report["stdout"]
+            .as_str()
+            .map(str::trim)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false),
+        "expected npm --version to print a version string, got: {report:#?}"
+    );
 }

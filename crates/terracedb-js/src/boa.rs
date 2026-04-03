@@ -15,7 +15,9 @@ use boa_engine::{
     context::{Clock as BoaClock, DefaultHooks, time::JsInstant},
     job::{GenericJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob},
     js_string,
-    module::{ModuleLoader as BoaModuleLoader, Referrer, SyntheticModuleInitializer},
+    module::{
+        ModuleLoader as BoaModuleLoader, ModuleRequest, Referrer, SyntheticModuleInitializer,
+    },
     object::builtins::JsPromise,
     object::{FunctionObjectBuilder, JsData, ObjectInitializer},
     property::{Attribute, PropertyDescriptor},
@@ -673,10 +675,10 @@ impl BoaModuleLoader for BoaModuleLoaderBridge {
     async fn load_imported_module(
         self: Rc<Self>,
         referrer: Referrer,
-        specifier: JsString,
+        request: ModuleRequest,
         context: &RefCell<&mut Context>,
     ) -> JsResult<Module> {
-        let requested = specifier.to_std_string_escaped();
+        let requested = request.specifier().to_std_string_escaped();
         let referrer = referrer
             .path()
             .map(|path| path.to_string_lossy().into_owned());
@@ -713,6 +715,10 @@ impl BoaClock for BoaClockAdapter {
     fn now(&self) -> JsInstant {
         let millis = self.clock.now_millis();
         JsInstant::new(millis / 1000, ((millis % 1000) * 1_000_000) as u32)
+    }
+
+    fn system_time_millis(&self) -> i64 {
+        self.clock.now_millis() as i64
     }
 }
 
@@ -782,7 +788,7 @@ impl BoaJobExecutor {
             let mut timeouts = self.timeout_jobs.borrow_mut();
             for instant in ready_instants {
                 if let Some(mut jobs) = timeouts.remove(&instant) {
-                    jobs.retain(|job| !job.is_cancelled());
+                    jobs.retain(|job| !job.cancelled());
                     ready_jobs.extend(jobs);
                 }
             }

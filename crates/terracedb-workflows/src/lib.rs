@@ -5590,7 +5590,9 @@ where
     .await
     .map_err(map_workflow_runtime_error_to_task_error)?;
     Ok(paginate_visible_history(
-        history.iter().filter_map(workflow_visible_history_page_entry),
+        history
+            .iter()
+            .filter_map(workflow_visible_history_page_entry),
         request.after_sequence,
         request.limit,
     ))

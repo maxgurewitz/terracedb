@@ -3,18 +3,18 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use async_trait::async_trait;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
+use serde_json::to_string as json_quote;
 use terracedb_js::{
     JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule, JsSubstrateError,
 };
-use serde_json::to_string as json_quote;
 use terracedb_vfs::JsonValue;
 use tokio::sync::Mutex;
 
 use crate::{
     CapabilityRegistry, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER, PackageCompatibilityMode,
     SANDBOX_WORKFLOW_LIBRARY_SOURCE, SANDBOX_WORKFLOW_LIBRARY_SPECIFIER, SandboxCapabilityModule,
-    SandboxError, SandboxFilesystemShim, SandboxRuntimeStateHandle,
-    SandboxSessionInfo, packages::read_package_install_manifest,
+    SandboxError, SandboxFilesystemShim, SandboxRuntimeStateHandle, SandboxSessionInfo,
+    packages::read_package_install_manifest,
 };
 
 pub const TERRACE_WORKSPACE_PREFIX: &str = "terrace:/workspace";
@@ -327,12 +327,10 @@ impl SandboxModuleLoader {
         let source = match specifier {
             SANDBOX_WORKFLOW_LIBRARY_SPECIFIER => SANDBOX_WORKFLOW_LIBRARY_SOURCE.to_string(),
             SANDBOX_FS_LIBRARY_SPECIFIER => fs_preview_source(),
-            SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER => {
-                capability_catalog_preview_source(
-                    &self.session_info.provenance.capabilities,
-                    self.capabilities.as_ref(),
-                )
-            }
+            SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER => capability_catalog_preview_source(
+                &self.session_info.provenance.capabilities,
+                self.capabilities.as_ref(),
+            ),
             SANDBOX_BASH_LIBRARY_SPECIFIER => {
                 "export const unavailable = true;\nexport const service = 'bash';\n".to_string()
             }
@@ -809,8 +807,8 @@ fn capability_catalog_preview_source(
         let specifier = json_quote(&capability.specifier)
             .expect("capability specifier should serialize as JSON");
         if let Some(module) = registry.module(&capability.specifier) {
-                let mut method_entries = Vec::new();
-                for method in module.methods {
+            let mut method_entries = Vec::new();
+            for method in module.methods {
                 let method_export = crate::capabilities::capability_catalog_export_name(&format!(
                     "{}_{}",
                     capability.name, method.name

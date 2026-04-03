@@ -27,8 +27,8 @@ pub use sdk::{VfsStoreExt, VfsVolumeExt};
 pub use serde_json::Value as JsonValue;
 pub use store::{
     CloneVolumeSource, DEFAULT_CHUNK_SIZE, InMemoryVfsStore, OverlayBaseDescriptor, OverlayVolume,
-    ROOT_INODE_ID, SnapshotOptions, VFS_FORMAT_VERSION, Volume, VolumeConfig, VolumeExport,
-    VolumeInfo, VolumeSnapshot, VolumeStore,
+    ROOT_INODE_ID, SnapshotOptions, VFS_FORMAT_VERSION, VfsPerformanceSnapshot, Volume,
+    VolumeConfig, VolumeExport, VolumeInfo, VolumeSnapshot, VolumeStore,
 };
 pub use tables::{
     RESERVED_TABLES, ReservedTableDescriptor, VFS_ACTIVITY_TABLE_NAME, VFS_ALLOCATOR_TABLE_NAME,

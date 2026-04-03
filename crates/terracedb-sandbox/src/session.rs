@@ -48,9 +48,10 @@ use crate::{
     PackageInstaller, PullRequestProviderClient, PullRequestReport, PullRequestRequest,
     ReadonlyViewCut, ReadonlyViewHandle, ReadonlyViewLocation, ReadonlyViewProvider,
     ReadonlyViewRequest, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION, SandboxConfig,
-    SandboxError, SandboxExecutionKind, SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim,
-    SandboxModuleLoader, SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle,
-    SandboxRuntimeStateHandle, SandboxServiceBindings, SandboxSessionInfo,
+    SandboxError, SandboxExecutionKind, SandboxExecutionRequest, SandboxExecutionResult,
+    NodeDebugExecutionOptions,
+    SandboxFilesystemShim, SandboxModuleLoader, SandboxRuntimeActor, SandboxRuntimeBackend,
+    SandboxRuntimeHandle, SandboxRuntimeStateHandle, SandboxServiceBindings, SandboxSessionInfo,
     SandboxSessionProvenance, SandboxSessionState, StaticCapabilityRegistry,
     TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
     TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
@@ -626,6 +627,22 @@ impl SandboxSession {
         self.execute_runtime_logged(
             "sandbox.runtime.exec_node_command",
             SandboxExecutionRequest::node_command(entrypoint, argv, cwd, env),
+        )
+        .await
+    }
+
+    pub async fn exec_node_command_with_debug(
+        &self,
+        entrypoint: impl Into<String>,
+        argv: Vec<String>,
+        cwd: impl Into<String>,
+        env: BTreeMap<String, String>,
+        debug: NodeDebugExecutionOptions,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        self.execute_runtime_logged(
+            "sandbox.runtime.exec_node_command",
+            SandboxExecutionRequest::node_command(entrypoint, argv, cwd, env)
+                .with_node_debug(debug),
         )
         .await
     }
@@ -2220,7 +2237,10 @@ async fn prepare_git_hoist_via_bridge(
             pathspec: report.pathspec,
             dirty: report.dirty,
         }),
-        entries: entries.iter().map(ManifestEntry::from_tree_entry).collect(),
+        entries: entries
+            .iter()
+            .map(ManifestEntry::from_tree_entry)
+            .collect::<Result<Vec<_>, _>>()?,
     };
     Ok(PreparedHoist { manifest, entries })
 }
@@ -2265,7 +2285,10 @@ async fn prepare_remote_git_import_via_bridge(
             pathspec: report.pathspec,
             dirty: report.dirty,
         }),
-        entries: entries.iter().map(ManifestEntry::from_tree_entry).collect(),
+        entries: entries
+            .iter()
+            .map(ManifestEntry::from_tree_entry)
+            .collect::<Result<Vec<_>, _>>()?,
     };
     Ok(PreparedHoist { manifest, entries })
 }

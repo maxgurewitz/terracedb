@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     process::Command,
 };
@@ -23,6 +24,7 @@ pub const PATCH_BUNDLE_FILE_NAME: &str = ".terrace-sandbox.patch.json";
 
 const HOIST_MANIFEST_FORMAT_VERSION: u32 = 1;
 const PATCH_BUNDLE_FORMAT_VERSION: u32 = 1;
+const HOIST_FILE_BATCH_SIZE: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +124,7 @@ pub(crate) enum TreeEntryKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TreeEntryData {
     File(Vec<u8>),
+    HostFile(PathBuf),
     Directory,
     Symlink(String),
 }
@@ -244,7 +247,10 @@ pub(crate) fn prepare_hoist(request: &HoistRequest) -> Result<PreparedHoist, San
         target_root,
         mode: request.mode.clone(),
         git_provenance,
-        entries: entries.iter().map(ManifestEntry::from_tree_entry).collect(),
+        entries: entries
+            .iter()
+            .map(ManifestEntry::from_tree_entry)
+            .collect::<Result<Vec<_>, _>>()?,
     };
     info!(
         target: "terracedb.sandbox.hoist",
@@ -252,6 +258,32 @@ pub(crate) fn prepare_hoist(request: &HoistRequest) -> Result<PreparedHoist, San
         "prepared hoist tree"
     );
     Ok(PreparedHoist { manifest, entries })
+}
+
+pub async fn apply_hoist_to_volume(
+    volume: &dyn Volume,
+    request: &HoistRequest,
+) -> Result<HoistReport, SandboxError> {
+    let prepared = prepare_hoist(request)?;
+    let deleted_paths = replace_vfs_tree(
+        volume.fs().as_ref(),
+        &prepared.manifest.target_root,
+        &prepared.entries,
+        request.delete_missing,
+    )
+    .await?;
+    write_hoist_manifest(volume, &prepared.manifest).await?;
+    let source_path = match &prepared.manifest.source {
+        GitImportSource::HostPath { path } => path.clone(),
+        GitImportSource::RemoteRepository { remote_url, .. } => remote_url.clone(),
+    };
+    Ok(HoistReport {
+        source_path,
+        target_root: prepared.manifest.target_root,
+        hoisted_paths: prepared.entries.len(),
+        deleted_paths,
+        git_provenance: prepared.manifest.git_provenance,
+    })
 }
 
 pub(crate) async fn replace_vfs_tree(
@@ -316,31 +348,14 @@ pub(crate) async fn populate_vfs_tree_fresh(
             });
         }
     }
-    for entry in entries {
-        let destination = join_vfs_path(&target_root, &entry.path);
-        match &entry.data {
-            TreeEntryData::Directory => {}
-            TreeEntryData::File(bytes) => ops.push(VfsBatchOperation::WriteFile {
-                path: destination,
-                data: bytes.clone(),
-                opts: CreateOptions {
-                    create_parents: false,
-                    overwrite: true,
-                    ..Default::default()
-                },
-            }),
-            TreeEntryData::Symlink(target) => ops.push(VfsBatchOperation::Symlink {
-                target: target.clone(),
-                linkpath: destination,
-            }),
-        }
-    }
     info!(
         target: "terracedb.sandbox.hoist",
         operations = ops.len(),
         "applying fresh vfs batch"
     );
     fs.apply_batch(&ops).await?;
+
+    apply_non_directory_entry_batches(fs, &target_root, entries, false).await?;
 
     Ok(())
 }
@@ -657,12 +672,21 @@ fn write_patch_bundle(
         conflicts: conflicts.clone(),
         operations: operations
             .iter()
-            .map(|operation| match operation {
-                DeltaOperation::Create(entry) | DeltaOperation::Update { current: entry, .. } => {
-                    match &entry.data {
+            .map(|operation| -> Result<PatchOperation, SandboxError> {
+                Ok(match operation {
+                    DeltaOperation::Create(entry)
+                    | DeltaOperation::Update { current: entry, .. } => match &entry.data {
                         TreeEntryData::File(bytes) => PatchOperation::WriteFile {
                             path: entry.path.clone(),
                             data: bytes.clone(),
+                            mode: entry.mode,
+                        },
+                        TreeEntryData::HostFile(host_path) => PatchOperation::WriteFile {
+                            path: entry.path.clone(),
+                            data: std::fs::read(host_path).map_err(|error| SandboxError::Io {
+                                path: host_path.to_string_lossy().into_owned(),
+                                message: error.to_string(),
+                            })?,
                             mode: entry.mode,
                         },
                         TreeEntryData::Directory => PatchOperation::CreateDirectory {
@@ -672,13 +696,13 @@ fn write_patch_bundle(
                             path: entry.path.clone(),
                             target: target.clone(),
                         },
+                    },
+                    DeltaOperation::Delete { path, .. } => {
+                        PatchOperation::DeletePath { path: path.clone() }
                     }
-                }
-                DeltaOperation::Delete { path, .. } => {
-                    PatchOperation::DeletePath { path: path.clone() }
-                }
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let bundle_path = target_path.join(PATCH_BUNDLE_FILE_NAME);
     fs::write(&bundle_path, serde_json::to_vec_pretty(&bundle)?).map_err(|error| {
@@ -892,19 +916,61 @@ async fn write_entries_to_vfs(
             );
         }
     }
-    for (index, entry) in entries.iter().enumerate() {
-        if !matches!(entry.data, TreeEntryData::Directory) {
-            write_vfs_entry(fs, target_root, entry).await?;
+    apply_non_directory_entry_batches(fs, target_root, entries, true).await?;
+    Ok(())
+}
+
+async fn apply_non_directory_entry_batches(
+    fs: &dyn VfsFileSystem,
+    target_root: &str,
+    entries: &[TreeEntry],
+    create_parents: bool,
+) -> Result<(), SandboxError> {
+    let non_directories = entries
+        .iter()
+        .filter(|entry| !matches!(entry.data, TreeEntryData::Directory))
+        .collect::<Vec<_>>();
+    for (chunk_index, chunk) in non_directories.chunks(HOIST_FILE_BATCH_SIZE).enumerate() {
+        let mut ops = Vec::with_capacity(chunk.len());
+        for entry in chunk {
+            let destination = join_vfs_path(target_root, &entry.path);
+            match &entry.data {
+                TreeEntryData::Directory => {}
+                TreeEntryData::File(bytes) => ops.push(VfsBatchOperation::WriteFile {
+                    path: destination,
+                    data: bytes.clone(),
+                    opts: CreateOptions {
+                        create_parents,
+                        overwrite: true,
+                        mode: entry.mode.unwrap_or(0o644),
+                    },
+                }),
+                TreeEntryData::HostFile(host_path) => ops.push(VfsBatchOperation::WriteFile {
+                    path: destination,
+                    data: std::fs::read(host_path).map_err(|error| SandboxError::Io {
+                        path: host_path.to_string_lossy().into_owned(),
+                        message: error.to_string(),
+                    })?,
+                    opts: CreateOptions {
+                        create_parents,
+                        overwrite: true,
+                        mode: entry.mode.unwrap_or(0o644),
+                    },
+                }),
+                TreeEntryData::Symlink(target) => ops.push(VfsBatchOperation::Symlink {
+                    target: target.clone(),
+                    linkpath: destination,
+                }),
+            }
         }
-        if (index + 1) % 256 == 0 {
-            info!(
-                target: "terracedb.sandbox.hoist",
-                written = index + 1,
-                total = entries.len(),
-                phase = "non_directories",
-                "writing hoisted entries to vfs"
-            );
-        }
+        info!(
+            target: "terracedb.sandbox.hoist",
+            written = ((chunk_index + 1) * HOIST_FILE_BATCH_SIZE).min(non_directories.len()),
+            total = non_directories.len(),
+            phase = "non_directories",
+            "writing hoisted entries to vfs"
+        );
+        fs.apply_batch(&ops).await?;
     }
     Ok(())
 }
@@ -930,6 +996,25 @@ async fn write_vfs_entry(
             fs.write_file(
                 &destination,
                 bytes.clone(),
+                CreateOptions {
+                    create_parents: true,
+                    overwrite: true,
+                    mode: entry.mode.unwrap_or(0o644),
+                },
+            )
+            .await?;
+        }
+        TreeEntryData::HostFile(host_path) => {
+            if matches!(fs.lstat(&destination).await?, Some(stats) if matches!(stats.kind, FileKind::Directory))
+            {
+                remove_vfs_path(fs, &destination).await?;
+            }
+            fs.write_file(
+                &destination,
+                std::fs::read(host_path).map_err(|error| SandboxError::Io {
+                    path: host_path.to_string_lossy().into_owned(),
+                    message: error.to_string(),
+                })?,
                 CreateOptions {
                     create_parents: true,
                     overwrite: true,
@@ -991,10 +1076,7 @@ fn collect_selected_paths(
         if metadata.file_type().is_file() {
             entries.push(TreeEntry {
                 path: relative.clone(),
-                data: TreeEntryData::File(fs::read(&path).map_err(|error| SandboxError::Io {
-                    path: path.to_string_lossy().into_owned(),
-                    message: error.to_string(),
-                })?),
+                data: TreeEntryData::HostFile(path.clone()),
                 mode: Some(host_file_mode(&metadata)),
             });
         } else if metadata.file_type().is_symlink() {
@@ -1093,12 +1175,7 @@ fn collect_directory_tree_recursive(
         } else if metadata.file_type().is_file() {
             entries.push(TreeEntry {
                 path: relative,
-                data: TreeEntryData::File(fs::read(&child_path).map_err(|error| {
-                    SandboxError::Io {
-                        path: child_path.to_string_lossy().into_owned(),
-                        message: error.to_string(),
-                    }
-                })?),
+                data: TreeEntryData::HostFile(child_path.clone()),
                 mode: Some(host_file_mode(&metadata)),
             });
         }
@@ -1147,6 +1224,21 @@ fn write_host_entry(root: &Path, entry: &TreeEntry) -> Result<(), SandboxError> 
             }
             fs::write(&destination, bytes).map_err(|error| SandboxError::Io {
                 path: destination.to_string_lossy().into_owned(),
+                message: error.to_string(),
+            })?;
+            if let Some(mode) = entry.mode {
+                apply_host_file_mode(&destination, mode)?;
+            }
+        }
+        TreeEntryData::HostFile(source_path) => {
+            if destination.is_dir() {
+                fs::remove_dir_all(&destination).map_err(|error| SandboxError::Io {
+                    path: destination.to_string_lossy().into_owned(),
+                    message: error.to_string(),
+                })?;
+            }
+            fs::copy(source_path, &destination).map_err(|error| SandboxError::Io {
+                path: source_path.to_string_lossy().into_owned(),
                 message: error.to_string(),
             })?;
             if let Some(mode) = entry.mode {
@@ -1562,32 +1654,43 @@ fn ancestor_relatives(path: &str) -> Vec<String> {
 }
 
 impl ManifestEntry {
-    pub(crate) fn from_tree_entry(entry: &TreeEntry) -> Self {
+    pub(crate) fn from_tree_entry(entry: &TreeEntry) -> Result<Self, SandboxError> {
         match &entry.data {
-            TreeEntryData::File(bytes) => Self {
+            TreeEntryData::File(bytes) => Ok(Self {
                 path: entry.path.clone(),
                 kind: TreeEntryKind::File,
                 digest: Some(bytes_digest(bytes)),
                 size: Some(bytes.len() as u64),
                 mode: entry.mode,
                 symlink_target: None,
-            },
-            TreeEntryData::Directory => Self {
+            }),
+            TreeEntryData::HostFile(host_path) => {
+                let (digest, size) = digest_host_file(host_path)?;
+                Ok(Self {
+                    path: entry.path.clone(),
+                    kind: TreeEntryKind::File,
+                    digest: Some(digest),
+                    size: Some(size),
+                    mode: entry.mode,
+                    symlink_target: None,
+                })
+            }
+            TreeEntryData::Directory => Ok(Self {
                 path: entry.path.clone(),
                 kind: TreeEntryKind::Directory,
                 digest: None,
                 size: None,
                 mode: None,
                 symlink_target: None,
-            },
-            TreeEntryData::Symlink(target) => Self {
+            }),
+            TreeEntryData::Symlink(target) => Ok(Self {
                 path: entry.path.clone(),
                 kind: TreeEntryKind::Symlink,
                 digest: None,
                 size: None,
                 mode: None,
                 symlink_target: Some(target.clone()),
-            },
+            }),
         }
     }
 
@@ -1597,6 +1700,17 @@ impl ManifestEntry {
             (TreeEntryKind::File, TreeEntryData::File(bytes)) => {
                 self.size == Some(bytes.len() as u64)
                     && self.digest.as_deref() == Some(&bytes_digest(bytes))
+                    && self
+                        .mode
+                        .map(|mode| entry.mode == Some(mode))
+                        .unwrap_or(true)
+            }
+            (TreeEntryKind::File, TreeEntryData::HostFile(host_path)) => {
+                let Ok((digest, size)) = digest_host_file(host_path) else {
+                    return false;
+                };
+                self.size == Some(size)
+                    && self.digest.as_deref() == Some(digest.as_str())
                     && self
                         .mode
                         .map(|mode| entry.mode == Some(mode))
@@ -1613,7 +1727,7 @@ impl ManifestEntry {
 impl TreeEntry {
     fn kind(&self) -> TreeEntryKind {
         match self.data {
-            TreeEntryData::File(_) => TreeEntryKind::File,
+            TreeEntryData::File(_) | TreeEntryData::HostFile(_) => TreeEntryKind::File,
             TreeEntryData::Directory => TreeEntryKind::Directory,
             TreeEntryData::Symlink(_) => TreeEntryKind::Symlink,
         }
@@ -1627,4 +1741,29 @@ fn bytes_digest(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn digest_host_file(path: &Path) -> Result<(String, u64), SandboxError> {
+    let mut file = fs::File::open(path).map_err(|error| SandboxError::Io {
+        path: path.to_string_lossy().into_owned(),
+        message: error.to_string(),
+    })?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut size = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| SandboxError::Io {
+            path: path.to_string_lossy().into_owned(),
+            message: error.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(read as u64);
+        for byte in &buffer[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok((format!("{hash:016x}"), size))
 }

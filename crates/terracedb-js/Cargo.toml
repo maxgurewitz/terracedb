@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
-boa_gc = "0.21.1"
-boa_engine = "0.21.1"
+boa_gc = { git = "https://github.com/boa-dev/boa", rev = "8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4" }
+boa_engine = { git = "https://github.com/boa-dev/boa", rev = "8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4" }
 futures = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
