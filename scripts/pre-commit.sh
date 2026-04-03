@@ -8,10 +8,17 @@ while IFS= read -r git_env_var; do
 done < <(git rev-parse --local-env-vars)
 cd "$repo_root"
 
-if [[ "${CODEX_REVIEW_ENABLED:-1}" == "1" && "${SKIP_CODEX_REVIEW:-0}" != "1" ]]; then
-    echo "Running Codex review..."
-    "$repo_root/scripts/run-codex-review.sh"
-fi
+hook_status=0
+
+run_check() {
+    local description="$1"
+    shift
+
+    echo "$description"
+    if ! "$@"; then
+        hook_status=1
+    fi
+}
 
 if ! command -v cargo-nextest >/dev/null 2>&1; then
     echo "cargo-nextest is required; install it with 'cargo install cargo-nextest --locked'" >&2
@@ -30,17 +37,24 @@ if [[ -z "${nextest_test_threads}" ]]; then
     nextest_test_threads="${nextest_test_threads:-1}"
 fi
 
-echo "Running durable-format fixture checks..."
-"$repo_root/scripts/check-durable-format-fixtures.sh"
+run_check "Running durable-format fixture checks..." \
+    "$repo_root/scripts/check-durable-format-fixtures.sh"
 
-echo "Running cargo nextest run --workspace --test-threads=${nextest_test_threads}..."
-cargo nextest run --workspace --test-threads "${nextest_test_threads}"
+run_check "Running cargo nextest run --workspace --test-threads=${nextest_test_threads}..." \
+    cargo nextest run --workspace --test-threads "${nextest_test_threads}"
 
-echo "Running cargo test --workspace --doc..."
-cargo test --workspace --doc
+run_check "Running cargo test --workspace --doc..." \
+    cargo test --workspace --doc
 
-echo "Running cargo fmt --check..."
-cargo fmt --all -- --check
+run_check "Running cargo fmt --check..." \
+    cargo fmt --all -- --check
 
-echo "Running cargo clippy..."
-cargo clippy --all-targets --all-features -- -D warnings
+run_check "Running cargo clippy..." \
+    cargo clippy --all-targets --all-features -- -D warnings
+
+if [[ "${CODEX_REVIEW_ENABLED:-1}" == "1" && "${SKIP_CODEX_REVIEW:-0}" != "1" ]]; then
+    run_check "Running Codex review..." \
+        "$repo_root/scripts/run-codex-review.sh"
+fi
+
+exit "$hook_status"
