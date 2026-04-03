@@ -345,3 +345,61 @@ Make deterministic primitives explicit for:
 - Keep debug tooling separate from runtime semantics.
 - Treat imported Node tests as the main compatibility contract.
 - Treat npm and tsc as canaries, not the definition of correctness.
+
+## Current Code To Deprecate Or Move
+
+We already have a meaningful amount of Node-compat work in tree.
+
+The right posture is not "throw it all away." It is:
+
+- keep the primitive/runtime substrate
+- keep the tracing and test corpus
+- shrink or delete the handwritten public builtin layer
+
+### Deprecate Or Replace
+
+These are the main areas that do not fit the long-term architecture and should be retired as we move onto upstream Node JS.
+
+- [crates/terracedb-sandbox/src/node_compat_bootstrap.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/node_compat_bootstrap.js)
+  The large `__terraceBuiltin(...)` switch is currently acting like a handwritten public Node stdlib. That was useful for bring-up, but it is the wrong ownership boundary long-term.
+- [crates/terracedb-sandbox/src/node_compat_bootstrap.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/node_compat_bootstrap.js)
+  `__terraceWrapBuiltinValue(...)` and `__terraceCreateBuiltinStubModule(...)` are useful debugging tools, but they should become debug-only helpers, not the way production builtins behave.
+- [crates/terracedb-sandbox/src/loader.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/loader.rs)
+  `load_node_builtin_module(...)` currently special-cases a small preview-style builtin path. That should be replaced by loading upstream Node JS with a thinner builtin/internal bridge.
+- [crates/terracedb-sandbox/src/packages.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/packages.rs)
+  `DeterministicPackageInstaller` and the hard-coded fake registry are explicitly contrary to the real npm plan and should be removed once bootstrap moves to pinned host-built dependency trees.
+- [crates/terracedb-sandbox/src/typescript.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/typescript.rs)
+  `ensure_typescript_compiler(...)` still assumes the fake package installer path. That should be replaced by the same real npm / pinned dependency-tree model as the rest of the Node runtime.
+- [crates/terracedb-sandbox/src/runtime.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/runtime.rs)
+  The current handwritten Rust package-resolution policy is valuable as reference and test scaffolding, but it should not keep growing into our permanent replacement for Node's own loader logic.
+
+### Keep, But Move Down To The Primitive Layer
+
+These pieces still fit the new architecture, but they should become substrate for upstream Node JS rather than the place where public Node behavior is authored.
+
+- [crates/terracedb-sandbox/src/runtime.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/runtime.rs)
+  `NodeRuntimeHost`, VFS-backed reads, command execution, module graph caches, and snapshot-backed reads are all still useful. They should increasingly back `internalBinding(...)` and related internal seams rather than public builtin wrappers.
+- [crates/terracedb-sandbox/src/runtime.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/runtime.rs)
+  The current fs, crypto, dns, tls, zlib, and child-process host behaviors are still useful where they represent real deterministic primitives. The shift is about boundary placement, not throwing away the backend work.
+
+### Already Aligned With The New Direction
+
+These pieces are worth preserving and extending.
+
+- [crates/terracedb-sandbox/src/node_path_module.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/node_path_module.js)
+  This is already much closer to the desired model: upstream-shaped JS with a smaller Terrace-owned seam.
+- [crates/terracedb-sandbox/src/node_os_module.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/node_os_module.js)
+  Same story here: this is closer to "reuse upstream JS" than to "author a bespoke public stdlib."
+- [crates/terracedb-sandbox/src/runtime.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/runtime.rs)
+  The flight recorder, debug traces, and autoinstrumentation are still valuable. They should remain debug infrastructure, not semantic implementation.
+- [crates/terracedb-sandbox/tests](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/tests)
+  The imported Node contract suites, parity tests, and npm canaries are some of the highest-value artifacts from this whole effort and should remain central to the migration.
+
+## Migration Rule Of Thumb
+
+When deciding whether to keep or delete a compatibility layer, use this question:
+
+- does this code implement a deterministic primitive or debugging aid we still need
+- or does it implement public Node behavior that upstream Node JS should own instead
+
+If it is the second kind, it is probably transitional and should be replaced.

@@ -76,6 +76,8 @@ const NODE_COMPAT_TARGET_VERSION: &str = "v24.12.0";
 const NODE_COMPAT_BOOTSTRAP_SOURCE: &str = include_str!("node_compat_bootstrap.js");
 const NODE_PATH_MODULE_SOURCE: &str = include_str!("node_path_module.js");
 const NODE_OS_MODULE_SOURCE: &str = include_str!("node_os_module.js");
+const NODE_INTERNAL_BOOTSTRAP_REALM_SOURCE: &str =
+    include_str!("node_internal_bootstrap_realm.js");
 const NODE_RUNTIME_RESOLVE_BUDGET: u64 = 16_384;
 const NODE_RUNTIME_LOAD_BUDGET: u64 = 8_192;
 const NODE_RUNTIME_FS_BUDGET: u64 = 131_072;
@@ -2447,6 +2449,7 @@ fn node_read_builtin_source(
     let source = match name.as_str() {
         "path" => NODE_PATH_MODULE_SOURCE,
         "os" => NODE_OS_MODULE_SOURCE,
+        "internal/bootstrap/realm" => NODE_INTERNAL_BOOTSTRAP_REALM_SOURCE,
         _ => "",
     };
     Ok(JsValue::from(JsString::from(source)))

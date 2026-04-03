@@ -5,6 +5,7 @@ const __terraceWrappedBuiltinValues = new WeakMap();
 const __terraceBuiltinAccesses = [];
 let __terraceFsSingleton = null;
 let __terracePathSingleton = null;
+let __terraceBootstrapRealmSingleton = null;
 let __terraceOsSingleton = null;
 let __terraceUrlSingleton = null;
 let __terracePunycodeSingleton = null;
@@ -1001,6 +1002,270 @@ function __terracePathPrimordials() {
   };
 }
 
+function __terraceNodeCorePrimordials() {
+  return {
+    ...__terracePathPrimordials(),
+    ArrayFrom: Array.from,
+    ArrayPrototypeFilter: (target, callback, thisArg) =>
+      Array.prototype.filter.call(target, callback, thisArg),
+    ArrayPrototypeMap: (target, callback, thisArg) =>
+      Array.prototype.map.call(target, callback, thisArg),
+    ArrayPrototypePushApply: (target, values) => Array.prototype.push.apply(target, values),
+    Error,
+    ObjectDefineProperty: Object.defineProperty,
+    ObjectKeys: Object.keys,
+    ObjectPrototypeHasOwnProperty: (target, property) =>
+      Object.prototype.hasOwnProperty.call(target, property),
+    ObjectSetPrototypeOf: Object.setPrototypeOf,
+    ReflectGet: (target, property, receiver) => Reflect.get(target, property, receiver),
+    SafeMap: Map,
+    SafeSet: Set,
+    String,
+    StringPrototypeStartsWith: (target, search, position) =>
+      String.prototype.startsWith.call(target, search, position),
+    TypeError,
+  };
+}
+
+function __terraceBuiltinSupportModuleSource(specifier) {
+  switch (specifier) {
+    case "internal/constants":
+      return `
+'use strict';
+module.exports = {
+  CHAR_UPPERCASE_A: 65,
+  CHAR_LOWERCASE_A: 97,
+  CHAR_UPPERCASE_Z: 90,
+  CHAR_LOWERCASE_Z: 122,
+  CHAR_DOT: 46,
+  CHAR_FORWARD_SLASH: 47,
+  CHAR_BACKWARD_SLASH: 92,
+  CHAR_COLON: 58,
+  CHAR_QUESTION_MARK: 63,
+};
+`;
+    case "internal/validators":
+      return `
+'use strict';
+module.exports = {
+  validateObject(value, name) {
+    if (value == null || typeof value !== "object") {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        \`The "\${name}" argument must be of type object. Received \${value === null ? "null" : typeof value}\`,
+      );
+    }
+  },
+  validateString(value, name) {
+    if (typeof value !== "string") {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        \`The "\${name}" argument must be of type string. Received \${value === null ? "null" : typeof value}\`,
+      );
+    }
+  },
+};
+`;
+    case "internal/util":
+      return `
+'use strict';
+module.exports = {
+  isWindows: globalThis.process?.platform === "win32",
+  getLazy(loader) {
+    let loaded = false;
+    let value;
+    return () => {
+      if (!loaded) {
+        value = loader();
+        loaded = true;
+      }
+      return value;
+    };
+  },
+  setOwnProperty(target, property, value) {
+    Object.defineProperty(target, property, {
+      __proto__: null,
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value,
+    });
+    return value;
+  },
+};
+`;
+    case "internal/fs/glob":
+      return `
+'use strict';
+module.exports = {
+  matchGlobPattern(path, pattern, windows) {
+    return __terracePathMatchesGlobPattern(path, pattern, windows);
+  },
+};
+`;
+    case "internal/errors":
+      return `
+'use strict';
+function ErrorPrepareStackTrace(error) {
+  if (error && typeof error.stack === "string") {
+    return error.stack;
+  }
+  const name = error?.name ?? "Error";
+  const message = error?.message ?? "";
+  return \`\${name}: \${message}\`;
+}
+function prepareStackTraceCallback(error, trace) {
+  return ErrorPrepareStackTrace(error, trace);
+}
+module.exports = {
+  prepareStackTraceCallback,
+  ErrorPrepareStackTrace,
+  fatalExceptionStackEnhancers: {
+    beforeInspector(error) {
+      return error;
+    },
+    afterInspector(error) {
+      return error;
+    },
+  },
+};
+`;
+    default:
+      return "";
+  }
+}
+
+function __terraceNodeCoreBuiltinSource(specifier) {
+  return __terraceBuiltinSupportModuleSource(specifier) || __terraceReadBuiltinSource(specifier);
+}
+
+function __terraceCompileNodeCoreBuiltin(specifier, source) {
+  const sourceURL = `\n//# sourceURL=node:${String(specifier).replace(/\\/g, "\\\\")}`;
+  return Function(
+    "exports",
+    "require",
+    "module",
+    "process",
+    "internalBinding",
+    "primordials",
+    `${String(source)}${sourceURL}\n; return module.exports;`,
+  );
+}
+
+function __terraceCreateBootstrapRealmGetInternalBinding(builtinIds, builtinSources, bindingState) {
+  const builtinsBinding = {
+    builtinIds,
+    compileFunction(id) {
+      const normalized = String(id);
+      const source = builtinSources.get(normalized);
+      if (typeof source !== "string" || source.length === 0) {
+        throw new TypeError(`Missing internal module '${normalized}'`);
+      }
+      return __terraceCompileNodeCoreBuiltin(normalized, source);
+    },
+    setInternalLoaders(internalBinding, requireBuiltin) {
+      bindingState.internalBinding = internalBinding;
+      bindingState.requireBuiltin = requireBuiltin;
+    },
+  };
+
+  return function getInternalBinding(specifier) {
+    switch (String(specifier)) {
+      case "builtins":
+        return builtinsBinding;
+      case "module_wrap":
+        return {
+          ModuleWrap: class ModuleWrap {
+            constructor(url, _unused, exportKeys = [], evaluate) {
+              this.url = url;
+              this.exportKeys = exportKeys;
+              this.evaluateCallback = evaluate;
+              this.exports = new Map();
+            }
+
+            instantiate() {}
+
+            evaluate() {
+              if (typeof this.evaluateCallback === "function") {
+                this.evaluateCallback.call(this);
+              }
+            }
+
+            setExport(name, value) {
+              this.exports.set(name, value);
+            }
+          },
+        };
+      case "errors":
+        return {
+          setEnhanceStackForFatalException() {},
+          setPrepareStackTraceCallback() {},
+        };
+      default:
+        throw __terraceUnsupportedNodeBuiltinError({
+          builtin: `getInternalBinding(${specifier})`,
+          operation: "call",
+        });
+    }
+  };
+}
+
+function __terraceLoadBootstrapRealm(additionalBuiltinSources = undefined) {
+  if (additionalBuiltinSources == null && __terraceBootstrapRealmSingleton) {
+    return __terraceBootstrapRealmSingleton;
+  }
+
+  const builtinSources = new Map();
+  for (const id of [
+    "internal/bootstrap/realm",
+    "internal/constants",
+    "internal/validators",
+    "internal/util",
+    "internal/fs/glob",
+    "internal/errors",
+    "path",
+  ]) {
+    const source = __terraceNodeCoreBuiltinSource(id);
+    if (source) {
+      builtinSources.set(id, source);
+    }
+  }
+
+  if (additionalBuiltinSources && typeof additionalBuiltinSources === "object") {
+    for (const [id, source] of Object.entries(additionalBuiltinSources)) {
+      builtinSources.set(String(id), String(source));
+    }
+  }
+
+  const bindingState = {
+    internalBinding: null,
+    requireBuiltin: null,
+  };
+  const factory = Function(
+    "process",
+    "getLinkedBinding",
+    "getInternalBinding",
+    "primordials",
+    `${__terraceNodeCoreBuiltinSource("internal/bootstrap/realm")}\n; return { internalBinding, BuiltinModule, require: requireBuiltin, requireBuiltin };`,
+  );
+  const realm = factory(
+    globalThis.process,
+    (specifier) => ({
+      __terraceLinkedBinding: String(specifier),
+    }),
+    __terraceCreateBootstrapRealmGetInternalBinding(
+      [...builtinSources.keys()],
+      builtinSources,
+      bindingState,
+    ),
+    __terraceNodeCorePrimordials(),
+  );
+  if (additionalBuiltinSources == null) {
+    __terraceBootstrapRealmSingleton = realm;
+  }
+  return realm;
+}
+
 function __terracePathInternalRequire(specifier) {
   switch (specifier) {
     case "internal/constants":
@@ -1065,23 +1330,7 @@ function __terracePathInternalRequire(specifier) {
 
 function __terracePathModule() {
   if (__terracePathSingleton) return __terracePathSingleton;
-  const source = __terraceReadBuiltinSource("path");
-  const module = { exports: {} };
-  const factory = Function(
-    "primordials",
-    "require",
-    "process",
-    "module",
-    "exports",
-    `${source}\n;return module.exports;`,
-  );
-  __terracePathSingleton = factory(
-    __terracePathPrimordials(),
-    __terracePathInternalRequire,
-    globalThis.process,
-    module,
-    module.exports,
-  );
+  __terracePathSingleton = __terraceLoadBootstrapRealm().require("path");
   return __terracePathSingleton;
 }
 

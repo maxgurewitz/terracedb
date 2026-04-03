@@ -1,0 +1,120 @@
+#[path = "support/node_compat.rs"]
+mod node_compat;
+#[path = "support/tracing.rs"]
+mod tracing_support;
+
+#[tokio::test]
+async fn bootstrap_realm_loads_path_and_caches_internal_bindings() {
+    tracing_support::init_tracing();
+
+    let result = node_compat::exec_node_fixture(
+        r#"
+        const realm = __terraceLoadBootstrapRealm();
+        const pathA = realm.require("path");
+        const pathB = realm.require("path");
+        const builtinsA = realm.internalBinding("builtins");
+        const builtinsB = realm.internalBinding("builtins");
+
+        console.log(JSON.stringify({
+          sameBuiltins: builtinsA === builtinsB,
+          samePath: pathA === pathB,
+          normalizeNodePath: realm.BuiltinModule.normalizeRequirableId("node:path"),
+          canRequirePath: realm.BuiltinModule.canBeRequiredByUsers("path"),
+          isBuiltinNodePath: realm.BuiltinModule.isBuiltin("node:path"),
+          joined: pathA.join("/workspace", "app", "index.js"),
+          basename: pathA.basename("/workspace/app/index.js"),
+          moduleLoadList: process.moduleLoadList.filter((entry) =>
+            entry.includes("Internal Binding builtins") ||
+            entry.includes("NativeModule path") ||
+            entry.includes("NativeModule internal/constants")
+          ),
+        }));
+        "#,
+    )
+    .await
+    .expect("bootstrap realm path contract");
+
+    let report = result.result.expect("node command report");
+    let stdout = report["stdout"].as_str().expect("stdout");
+    let payload = stdout
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .expect("structured payload");
+    let payload: serde_json::Value = serde_json::from_str(payload).expect("decode payload");
+
+    assert_eq!(payload["sameBuiltins"].as_bool(), Some(true));
+    assert_eq!(payload["samePath"].as_bool(), Some(true));
+    assert_eq!(payload["normalizeNodePath"].as_str(), Some("path"));
+    assert_eq!(payload["canRequirePath"].as_bool(), Some(true));
+    assert_eq!(payload["isBuiltinNodePath"].as_bool(), Some(true));
+    assert_eq!(payload["joined"].as_str(), Some("/workspace/app/index.js"));
+    assert_eq!(payload["basename"].as_str(), Some("index.js"));
+
+    let load_list = payload["moduleLoadList"]
+        .as_array()
+        .expect("module load list");
+    assert!(
+        load_list
+            .iter()
+            .any(|entry| entry.as_str() == Some("Internal Binding builtins")),
+        "expected builtins binding in moduleLoadList: {load_list:?}"
+    );
+    assert!(
+        load_list
+            .iter()
+            .any(|entry| entry.as_str() == Some("NativeModule path")),
+        "expected path native module in moduleLoadList: {load_list:?}"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_realm_can_compile_additional_builtin_sources() {
+    tracing_support::init_tracing();
+
+    let result = node_compat::exec_node_fixture(
+        r#"
+        const realm = __terraceLoadBootstrapRealm({
+          "internal/test/bootstrap-sentinel": `
+            'use strict';
+            module.exports = {
+              answer: 42,
+              internalBindingType: typeof internalBinding,
+            };
+          `,
+          "hello": `
+            'use strict';
+            const sentinel = require('internal/test/bootstrap-sentinel');
+            module.exports = {
+              answer: sentinel.answer,
+              internalBindingType: sentinel.internalBindingType,
+            };
+          `,
+        });
+
+        const hello = realm.require("hello");
+        console.log(JSON.stringify({
+          answer: hello.answer,
+          internalBindingType: hello.internalBindingType,
+          canRequireHello: realm.BuiltinModule.canBeRequiredByUsers("hello"),
+          normalizeHello: realm.BuiltinModule.normalizeRequirableId("node:hello"),
+          isBuiltinHello: realm.BuiltinModule.isBuiltin("node:hello"),
+        }));
+        "#,
+    )
+    .await
+    .expect("bootstrap realm extension contract");
+
+    let report = result.result.expect("node command report");
+    let stdout = report["stdout"].as_str().expect("stdout");
+    let payload = stdout
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .expect("structured payload");
+    let payload: serde_json::Value = serde_json::from_str(payload).expect("decode payload");
+
+    assert_eq!(payload["answer"].as_i64(), Some(42));
+    assert_eq!(payload["internalBindingType"].as_str(), Some("function"));
+    assert_eq!(payload["canRequireHello"].as_bool(), Some(true));
+    assert_eq!(payload["normalizeHello"].as_str(), Some("hello"));
+    assert_eq!(payload["isBuiltinHello"].as_bool(), Some(true));
+}
