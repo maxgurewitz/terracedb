@@ -25,6 +25,7 @@ use terracedb_capabilities::{
     StaticExecutionPolicyResolver, SubjectSelector,
 };
 use terracedb_git::HostGitBridge;
+use terracedb_git_github::GitHubRemoteProvider;
 use terracedb_sandbox::{
     BashReport, BashRequest, CapabilityManifest as SandboxCapabilityManifest, CapabilityMethod0,
     CapabilityMethod1, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
@@ -213,10 +214,11 @@ impl ExampleHostApp {
 }
 
 fn configured_host_git_bridge() -> Arc<HostGitBridge> {
-    Arc::new(HostGitBridge::new(
-        "host-git",
-        "https://sandbox-notes.invalid",
-    ))
+    Arc::new(
+        HostGitBridge::new("host-git").with_remote_provider(Arc::new(
+            GitHubRemoteProvider::new().with_supported_host("127.0.0.1"),
+        )),
+    )
 }
 
 #[derive(Clone)]

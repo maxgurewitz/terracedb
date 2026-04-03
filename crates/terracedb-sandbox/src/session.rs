@@ -12,11 +12,11 @@ use terracedb_capabilities::{ExecutionOperation, ExecutionPolicy};
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitCheckoutReport,
     GitCheckoutRequest, GitCommitRequest, GitDiffReport, GitDiffRequest, GitHeadState,
-    GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest, GitObjectFormat,
-    GitOpenRequest, GitPullRequestRequest as GitBridgePullRequestRequest, GitPushRequest,
-    GitRefUpdate, GitRefUpdateReport, GitReference, GitRepository, GitRepositoryImage,
-    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore, GitStatusOptions,
-    GitStatusReport, HostGitBridge, NeverCancel, VfsGitRepositoryImage,
+    GitHostBridge, GitImportEntryKind, GitImportMode, GitImportRequest, GitImportSource,
+    GitObjectFormat, GitOpenRequest, GitPullRequestRequest as GitBridgePullRequestRequest,
+    GitPushRequest, GitRefUpdate, GitRefUpdateReport, GitReference, GitRepository,
+    GitRepositoryImage, GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
+    GitStatusOptions, GitStatusReport, HostGitBridge, NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
     CompletedToolRun, CompletedToolRunOutcome, CreateOptions, DirEntry, MkdirOptions,
@@ -35,24 +35,28 @@ use crate::routing::{
     RoutedBashService, RoutedPackageInstaller, RoutedRuntimeBackend, RoutedTypeScriptService,
     SandboxExecutionRouter,
 };
+use crate::types::{
+    durable_remote_bridge_metadata, sanitize_git_import_source, sanitize_remote_url,
+};
 use crate::{
     BaseSnapshotIdentity, BashReport, BashRequest, BashService, CapabilityCallRequest,
     CapabilityCallResult, CapabilityRegistry, ConflictPolicy, DeterministicBashService,
     DeterministicPackageInstaller, DeterministicPullRequestProviderClient,
     DeterministicReadonlyViewProvider, DeterministicRuntimeBackend, DeterministicTypeScriptService,
-    EjectMode, EjectReport, EjectRequest, HoistReport, HoistRequest, HoistedSource,
-    PackageInstallReport, PackageInstallRequest, PackageInstaller, PullRequestProviderClient,
-    PullRequestReport, PullRequestRequest, ReadonlyViewCut, ReadonlyViewHandle,
-    ReadonlyViewLocation, ReadonlyViewProvider, ReadonlyViewRequest,
-    SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION, SandboxConfig, SandboxError,
-    SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim, SandboxModuleLoader,
-    SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeStateHandle,
-    SandboxServiceBindings, SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState,
-    StaticCapabilityRegistry, TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR,
-    TERRACE_NPM_COMPATIBILITY_ROOT, TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR,
-    TERRACE_RUNTIME_CACHE_DIR, TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH,
-    TypeCheckReport, TypeCheckRequest, TypeScriptEmitReport, TypeScriptService,
-    TypeScriptTranspileReport, TypeScriptTranspileRequest, VfsSandboxFilesystemShim,
+    EjectMode, EjectReport, EjectRequest, GitRemoteImportReport, GitRemoteImportRequest,
+    HoistReport, HoistRequest, HoistedSource, PackageInstallReport, PackageInstallRequest,
+    PackageInstaller, PullRequestProviderClient, PullRequestReport, PullRequestRequest,
+    ReadonlyViewCut, ReadonlyViewHandle, ReadonlyViewLocation, ReadonlyViewProvider,
+    ReadonlyViewRequest, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION, SandboxConfig,
+    SandboxError, SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim,
+    SandboxModuleLoader, SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle,
+    SandboxRuntimeStateHandle, SandboxServiceBindings, SandboxSessionInfo,
+    SandboxSessionProvenance, SandboxSessionState, StaticCapabilityRegistry,
+    TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
+    TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
+    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TypeCheckReport, TypeCheckRequest,
+    TypeScriptEmitReport, TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
+    VfsSandboxFilesystemShim,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +426,7 @@ pub struct SandboxSession {
     clock: Arc<dyn Clock>,
     services: SandboxServices,
     info: Arc<Mutex<SandboxSessionInfo>>,
+    remote_bridge_session_metadata: Arc<Mutex<BTreeMap<String, BTreeMap<String, JsonValue>>>>,
     operation_lock: Arc<Mutex<()>>,
     execution_counts: Arc<Mutex<ExecutionCountState>>,
     execution_count_persist_lock: Arc<Mutex<()>>,
@@ -444,6 +449,7 @@ impl SandboxSession {
             runtime_actor: SandboxRuntimeActor::new(services.runtime.clone(), runtime.clone()),
             services,
             info: Arc::new(Mutex::new(info)),
+            remote_bridge_session_metadata: Arc::new(Mutex::new(BTreeMap::new())),
             operation_lock: Arc::new(Mutex::new(())),
             execution_counts: Arc::new(Mutex::new(ExecutionCountState::new(execution_counts))),
             execution_count_persist_lock: Arc::new(Mutex::new(())),
@@ -473,6 +479,25 @@ impl SandboxSession {
 
     pub fn capability_registry(&self) -> Arc<dyn CapabilityRegistry> {
         self.services.capabilities.clone()
+    }
+
+    pub fn git_host_bridge(&self) -> Arc<dyn GitHostBridge> {
+        self.services.git_bridge.clone()
+    }
+
+    /// Attaches app-owned remote bridge metadata to this live session without persisting it.
+    ///
+    /// This is the intended place to register live credentials such as short-lived access tokens
+    /// or provider secrets that should participate in bridge calls but must not become
+    /// guest-visible sandbox provenance.
+    pub async fn set_remote_bridge_session_metadata(
+        &self,
+        remote_url: impl Into<String>,
+        metadata: BTreeMap<String, JsonValue>,
+    ) {
+        let remote_url = remote_url.into();
+        self.remember_remote_bridge_session_metadata(&remote_url, &metadata)
+            .await;
     }
 
     pub(crate) async fn execution_policy(&self) -> Option<ExecutionPolicy> {
@@ -946,6 +971,41 @@ impl SandboxSession {
         }
     }
 
+    pub async fn import_remote_repository(
+        &self,
+        request: GitRemoteImportRequest,
+    ) -> Result<GitRemoteImportReport, SandboxError> {
+        let params = Some(serde_json::to_value(sanitized_remote_import_request(
+            &request,
+        ))?);
+        match self.import_remote_repository_inner(request).await {
+            Ok(report) => {
+                record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.import_repository",
+                    params,
+                    CompletedToolRunOutcome::Success {
+                        result: Some(serde_json::to_value(&report)?),
+                    },
+                )
+                .await?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = record_completed_tool_run(
+                    self.volume.as_ref(),
+                    "sandbox.git.import_repository",
+                    params,
+                    CompletedToolRunOutcome::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn eject_to_disk(&self, request: EjectRequest) -> Result<EjectReport, SandboxError> {
         let params = Some(serde_json::to_value(&request)?);
         match self.eject_to_disk_inner(request).await {
@@ -1387,13 +1447,14 @@ impl SandboxSession {
                     ),
                     repository_image: descriptor.clone(),
                     policy: GitRepositoryPolicy {
-                        allow_host_bridge: true,
+                        allow_host_bridge: provenance.origin.uses_external_bridge(),
                         ..Default::default()
                     },
                     provenance: GitRepositoryProvenance {
                         backend: self.services.git.name().to_string(),
                         repo_root: provenance.repo_root,
-                        imported_from_host: true,
+                        origin: provenance.origin,
+                        remote_url: provenance.remote_url.clone(),
                         object_format,
                         volume_id: descriptor.volume_id,
                         snapshot_sequence: descriptor.snapshot_sequence,
@@ -1462,6 +1523,34 @@ impl SandboxSession {
         Ok(())
     }
 
+    async fn remember_remote_bridge_session_metadata(
+        &self,
+        remote_url: &str,
+        metadata: &BTreeMap<String, JsonValue>,
+    ) {
+        if metadata.is_empty() {
+            return;
+        }
+        self.remote_bridge_session_metadata
+            .lock()
+            .await
+            .entry(sanitize_remote_url(remote_url))
+            .and_modify(|existing| existing.extend(metadata.clone()))
+            .or_insert_with(|| metadata.clone());
+    }
+
+    async fn remote_bridge_session_metadata(
+        &self,
+        remote_url: &str,
+    ) -> BTreeMap<String, JsonValue> {
+        self.remote_bridge_session_metadata
+            .lock()
+            .await
+            .get(&sanitize_remote_url(remote_url))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     async fn hoist_from_disk_inner(
         &self,
         request: HoistRequest,
@@ -1496,9 +1585,13 @@ impl SandboxSession {
         )
         .await?;
         write_hoist_manifest(self.volume.as_ref(), &prepared.manifest).await?;
+        let source_path = match &prepared.manifest.source {
+            GitImportSource::HostPath { path } => path.clone(),
+            GitImportSource::RemoteRepository { remote_url, .. } => remote_url.clone(),
+        };
         let mut updated = self.info.lock().await.clone();
         updated.provenance.hoisted_source = Some(HoistedSource {
-            source_path: prepared.manifest.source_path.clone(),
+            source_path: source_path.clone(),
             mode: prepared.manifest.mode.clone(),
         });
         updated.provenance.git = prepared.manifest.git_provenance.clone();
@@ -1507,11 +1600,63 @@ impl SandboxSession {
         write_session_info_exact(self.volume.as_ref(), &updated).await?;
         *self.info.lock().await = updated;
         Ok(HoistReport {
-            source_path: prepared.manifest.source_path,
+            source_path,
             target_root: prepared.manifest.target_root,
             hoisted_paths: prepared.entries.len(),
             deleted_paths,
             git_provenance: prepared.manifest.git_provenance,
+        })
+    }
+
+    async fn import_remote_repository_inner(
+        &self,
+        request: GitRemoteImportRequest,
+    ) -> Result<GitRemoteImportReport, SandboxError> {
+        if !self.services.git_bridge.supports_remote_repository_bridge() {
+            return Err(SandboxError::Service {
+                service: "git",
+                message:
+                    "git remote import requires a git host bridge that supports remote repositories"
+                        .to_string(),
+            });
+        }
+        self.remember_remote_bridge_session_metadata(&request.remote_url, &request.metadata)
+            .await;
+        let mut bridge_request = request.clone();
+        bridge_request.metadata.extend(
+            self.remote_bridge_session_metadata(&request.remote_url)
+                .await,
+        );
+        let prepared =
+            prepare_remote_git_import_via_bridge(self.services.git_bridge.clone(), &bridge_request)
+                .await?;
+        let _guard = self.operation_lock.lock().await;
+        let deleted_paths = replace_vfs_tree(
+            self.volume.fs().as_ref(),
+            &prepared.manifest.target_root,
+            &prepared.entries,
+            request.delete_missing,
+        )
+        .await?;
+        write_hoist_manifest(self.volume.as_ref(), &prepared.manifest).await?;
+        let git_provenance = prepared
+            .manifest
+            .git_provenance
+            .clone()
+            .ok_or(SandboxError::MissingGitProvenance)?;
+        let mut updated = self.info.lock().await.clone();
+        updated.provenance.hoisted_source = None;
+        updated.provenance.git = Some(git_provenance.clone());
+        updated.revision = updated.revision.saturating_add(1);
+        updated.updated_at = self.clock.now();
+        write_session_info_exact(self.volume.as_ref(), &updated).await?;
+        *self.info.lock().await = updated;
+        Ok(GitRemoteImportReport {
+            remote_url: sanitize_remote_url(&request.remote_url),
+            target_root: prepared.manifest.target_root,
+            imported_paths: prepared.entries.len(),
+            deleted_paths,
+            git_provenance,
         })
     }
 
@@ -1547,96 +1692,101 @@ impl SandboxSession {
         &self,
         request: PullRequestRequest,
     ) -> Result<PullRequestReport, SandboxError> {
-        if let Some(remote_url) = self
-            .info()
-            .await
-            .provenance
-            .git
-            .and_then(|git| git.remote_url)
-            .filter(|url| !url.is_empty())
-        {
-            let repository = self.open_git_repository().await?;
-            let commit = repository
-                .commit(
-                    GitCommitRequest {
-                        target_ref: format!("refs/heads/{}", request.head_branch),
-                        base_ref: Some(format!("refs/heads/{}", request.base_branch)),
-                        title: request.title.clone(),
-                        body: request.body.clone(),
-                        require_changes: true,
-                        update_head: true,
-                    },
-                    Arc::new(NeverCancel),
-                )
-                .await
-                .map_err(git_substrate_error_to_sandbox)?;
-            self.sync_git_provenance(&repository, Some(commit.commit_oid.clone()), Some(false))
-                .await?;
-            let mut git_metadata = BTreeMap::from([
-                (
-                    "session_volume_id".to_string(),
-                    JsonValue::from(self.info().await.session_volume_id.to_string()),
-                ),
-                (
-                    "base_branch".to_string(),
-                    JsonValue::from(request.base_branch.clone()),
-                ),
-                (
-                    "head_commit".to_string(),
-                    JsonValue::from(commit.commit_oid.clone()),
-                ),
-                (
-                    "tree_oid".to_string(),
-                    JsonValue::from(commit.tree_oid.clone()),
-                ),
-                ("committed".to_string(), JsonValue::from(commit.committed)),
-                ("remote_url".to_string(), JsonValue::from(remote_url)),
-            ]);
-            let push = self
-                .services
-                .git_bridge
-                .push(
-                    repository.clone(),
-                    GitPushRequest {
-                        remote: "origin".to_string(),
-                        branch_name: request.head_branch.clone(),
-                        head_oid: Some(commit.commit_oid.clone()),
-                        metadata: git_metadata.clone(),
-                    },
-                    Arc::new(NeverCancel),
-                )
-                .await
-                .map_err(git_substrate_error_to_sandbox)?;
-            git_metadata = push.metadata;
-            git_metadata.insert("pushed".to_string(), JsonValue::from(true));
-            git_metadata.insert(
-                "push_remote_name".to_string(),
-                JsonValue::from(push.remote.clone()),
-            );
-            if let Some(oid) = push.pushed_oid {
-                git_metadata.insert("pushed_oid".to_string(), JsonValue::from(oid));
-            }
+        let info = self.info().await;
+        if let Some(git_provenance) = info.provenance.git.clone() {
+            if let Some(remote_url) = git_provenance
+                .remote_url
+                .clone()
+                .filter(|url| !url.is_empty())
+            {
+                let repository = self.open_git_repository().await?;
+                let commit = repository
+                    .commit(
+                        GitCommitRequest {
+                            target_ref: format!("refs/heads/{}", request.head_branch),
+                            base_ref: Some(format!("refs/heads/{}", request.base_branch)),
+                            title: request.title.clone(),
+                            body: request.body.clone(),
+                            require_changes: true,
+                            update_head: true,
+                        },
+                        Arc::new(NeverCancel),
+                    )
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                self.sync_git_provenance(&repository, Some(commit.commit_oid.clone()), Some(false))
+                    .await?;
+                let ephemeral_remote_metadata =
+                    self.remote_bridge_session_metadata(&remote_url).await;
+                let mut git_metadata = git_provenance.remote_bridge_metadata;
+                git_metadata.extend(ephemeral_remote_metadata.clone());
+                git_metadata.extend(BTreeMap::from([
+                    (
+                        "session_volume_id".to_string(),
+                        JsonValue::from(info.session_volume_id.to_string()),
+                    ),
+                    (
+                        "base_branch".to_string(),
+                        JsonValue::from(request.base_branch.clone()),
+                    ),
+                    (
+                        "head_commit".to_string(),
+                        JsonValue::from(commit.commit_oid.clone()),
+                    ),
+                    (
+                        "tree_oid".to_string(),
+                        JsonValue::from(commit.tree_oid.clone()),
+                    ),
+                    ("committed".to_string(), JsonValue::from(commit.committed)),
+                    ("remote_url".to_string(), JsonValue::from(remote_url)),
+                ]));
+                let push = self
+                    .services
+                    .git_bridge
+                    .push(
+                        repository.clone(),
+                        GitPushRequest {
+                            remote: "origin".to_string(),
+                            branch_name: request.head_branch.clone(),
+                            head_oid: Some(commit.commit_oid.clone()),
+                            metadata: git_metadata.clone(),
+                        },
+                        Arc::new(NeverCancel),
+                    )
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                let mut durable_git_metadata = durable_remote_bridge_metadata(&push.metadata);
+                durable_git_metadata.insert("pushed".to_string(), JsonValue::from(true));
+                durable_git_metadata.insert(
+                    "push_remote_name".to_string(),
+                    JsonValue::from(push.remote.clone()),
+                );
+                if let Some(oid) = push.pushed_oid {
+                    durable_git_metadata.insert("pushed_oid".to_string(), JsonValue::from(oid));
+                }
+                let mut bridge_pr_metadata = durable_git_metadata.clone();
+                bridge_pr_metadata.extend(ephemeral_remote_metadata);
 
-            let report = self
-                .services
-                .git_bridge
-                .create_pull_request(
-                    GitBridgePullRequestRequest {
-                        title: request.title,
-                        body: request.body,
-                        head_branch: request.head_branch,
-                        base_branch: request.base_branch,
-                        metadata: git_metadata,
-                    },
-                    Arc::new(NeverCancel),
-                )
-                .await
-                .map_err(git_substrate_error_to_sandbox)?;
-            return Ok(git_bridge_pull_request_to_sandbox(
-                self.services.git_bridge.name(),
-                report,
-            ));
-        } else if self.info().await.provenance.git.is_some() {
+                let report = self
+                    .services
+                    .git_bridge
+                    .create_pull_request(
+                        GitBridgePullRequestRequest {
+                            title: request.title,
+                            body: request.body,
+                            head_branch: request.head_branch,
+                            base_branch: request.base_branch,
+                            metadata: bridge_pr_metadata,
+                        },
+                        Arc::new(NeverCancel),
+                    )
+                    .await
+                    .map_err(git_substrate_error_to_sandbox)?;
+                return Ok(git_bridge_pull_request_to_sandbox(
+                    self.services.git_bridge.name(),
+                    report,
+                ));
+            }
             return Err(SandboxError::MissingGitRemote);
         }
         self.services
@@ -1987,7 +2137,9 @@ async fn prepare_git_hoist_via_bridge(
     let report = bridge
         .import_repository(
             GitImportRequest {
-                source_path: request.source_path.clone(),
+                source: GitImportSource::HostPath {
+                    path: request.source_path.clone(),
+                },
                 target_root: request.target_root.clone(),
                 mode: match &request.mode {
                     crate::HoistMode::GitHead => GitImportMode::Head,
@@ -2018,14 +2170,61 @@ async fn prepare_git_hoist_via_bridge(
         .collect::<Result<Vec<_>, _>>()?;
     let manifest = HoistManifest {
         format_version: 1,
-        source_path: report.source_path,
+        source: sanitize_git_import_source(&report.source),
         target_root: report.target_root,
         mode: request.mode.clone(),
         git_provenance: Some(crate::GitProvenance {
             repo_root: report.repository_root,
+            origin: report.origin,
             head_commit: report.head_commit,
             branch: report.branch,
-            remote_url: report.remote_url,
+            remote_url: report.remote_url.as_deref().map(sanitize_remote_url),
+            remote_bridge_metadata: durable_remote_bridge_metadata(&report.metadata),
+            object_format: Some(report.object_format),
+            pathspec: report.pathspec,
+            dirty: report.dirty,
+        }),
+        entries: entries.iter().map(ManifestEntry::from_tree_entry).collect(),
+    };
+    Ok(PreparedHoist { manifest, entries })
+}
+
+async fn prepare_remote_git_import_via_bridge(
+    bridge: Arc<dyn GitHostBridge>,
+    request: &GitRemoteImportRequest,
+) -> Result<PreparedHoist, SandboxError> {
+    let report = bridge
+        .import_repository(
+            GitImportRequest {
+                source: GitImportSource::RemoteRepository {
+                    remote_url: request.remote_url.clone(),
+                    reference: request.reference.clone(),
+                },
+                target_root: request.target_root.clone(),
+                mode: GitImportMode::Head,
+                metadata: request.metadata.clone(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .map_err(git_substrate_error_to_sandbox)?;
+    let entries = report
+        .entries
+        .iter()
+        .map(git_import_entry_to_tree_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest = HoistManifest {
+        format_version: 1,
+        source: sanitize_git_import_source(&report.source),
+        target_root: report.target_root,
+        mode: crate::HoistMode::GitHead,
+        git_provenance: Some(crate::GitProvenance {
+            repo_root: report.repository_root,
+            origin: report.origin,
+            head_commit: report.head_commit,
+            branch: report.branch,
+            remote_url: report.remote_url.as_deref().map(sanitize_remote_url),
+            remote_bridge_metadata: durable_remote_bridge_metadata(&report.metadata),
             object_format: Some(report.object_format),
             pathspec: report.pathspec,
             dirty: report.dirty,
@@ -2076,7 +2275,7 @@ fn git_bridge_pull_request_to_sandbox(
         provider: provider.to_string(),
         id,
         url: report.url,
-        metadata: report.metadata,
+        metadata: durable_remote_bridge_metadata(&report.metadata),
     }
 }
 
@@ -2147,7 +2346,13 @@ async fn write_session_info_exact(
     volume: &dyn Volume,
     info: &SandboxSessionInfo,
 ) -> Result<(), SandboxError> {
-    let bytes = serde_json::to_vec_pretty(info)?;
+    let mut durable_info = info.clone();
+    durable_info.provenance.git = durable_info
+        .provenance
+        .git
+        .as_ref()
+        .map(crate::GitProvenance::sanitized_for_durability);
+    let bytes = serde_json::to_vec_pretty(&durable_info)?;
     volume
         .fs()
         .write_file(
@@ -2162,9 +2367,18 @@ async fn write_session_info_exact(
         .await?;
     volume
         .kv()
-        .set_json(TERRACE_SESSION_INFO_KV_KEY, serde_json::to_value(info)?)
+        .set_json(
+            TERRACE_SESSION_INFO_KV_KEY,
+            serde_json::to_value(&durable_info)?,
+        )
         .await?;
     Ok(())
+}
+
+fn sanitized_remote_import_request(request: &GitRemoteImportRequest) -> GitRemoteImportRequest {
+    let mut sanitized = request.clone();
+    sanitized.metadata = durable_remote_bridge_metadata(&sanitized.metadata);
+    sanitized
 }
 
 pub(crate) async fn record_completed_tool_run(

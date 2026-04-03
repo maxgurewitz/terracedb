@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -12,6 +14,7 @@ use std::{
 
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
+use support::fake_github::{FakeGithubServer, configured_remote_github_bridge};
 use terracedb::{
     DbDependencies, LogCursor, Rng, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp,
 };
@@ -733,11 +736,13 @@ fn run_cross_cutting_simulation(seed: u64) -> turmoil::Result<CrossCuttingSimula
                                 move |provenance| {
                                     provenance.git = Some(GitProvenance {
                                         repo_root: "/repo".to_string(),
+                                        origin: terracedb_sandbox::GitRepositoryOrigin::RemoteImport,
                                         head_commit: Some(format!("{seed:x}")),
                                         branch: Some(branch),
                                         remote_url: Some(
                                             "git@example.invalid:terrace/sandbox.git".to_string(),
                                         ),
+                                        remote_bridge_metadata: BTreeMap::new(),
                                         object_format: None,
                                         pathspec: vec![".".to_string()],
                                         dirty: false,
@@ -913,11 +918,8 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn init_git_repo(repo: &Path, remote: Option<&Path>, seed: u64) {
+fn init_git_repo(repo: &Path, remote_url: Option<&str>, seed: u64) {
     cleanup(repo);
-    if let Some(remote) = remote {
-        cleanup(remote);
-    }
     fs::create_dir_all(repo).expect("create repo dir");
     git(repo, &["init", "-b", "main"]);
     git(repo, &["config", "user.name", "Sandbox Tester"]);
@@ -925,31 +927,13 @@ fn init_git_repo(repo: &Path, remote: Option<&Path>, seed: u64) {
     write_host_file(&repo.join("tracked.txt"), &format!("tracked-{seed:x}\n"));
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "initial"]);
-    if let Some(remote) = remote {
-        let output = sanitized_git_command()
-            .arg("init")
-            .arg("--bare")
-            .arg(remote)
-            .output()
-            .expect("init bare remote");
-        assert!(
-            output.status.success(),
-            "git init --bare failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        git(
-            repo,
-            &["remote", "add", "origin", &remote.to_string_lossy()],
-        );
-        git(repo, &["push", "-u", "origin", "main"]);
+    if let Some(remote_url) = remote_url {
+        git(repo, &["remote", "add", "origin", remote_url]);
     }
 }
 
 fn host_git_services() -> SandboxServices {
-    let bridge = Arc::new(HostGitBridge::new(
-        "host-git",
-        "https://sandbox-bridge.invalid",
-    ));
+    let bridge = Arc::new(HostGitBridge::new("host-git"));
     SandboxServices::new(
         Arc::new(DeterministicRuntimeBackend::default()),
         Arc::new(DeterministicPackageInstaller::default()),
@@ -958,6 +942,17 @@ fn host_git_services() -> SandboxServices {
         Arc::new(DeterministicReadonlyViewProvider::default()),
     )
     .with_git_host_bridge(bridge)
+}
+
+fn remote_github_services(host: &str) -> SandboxServices {
+    SandboxServices::new(
+        Arc::new(DeterministicRuntimeBackend::default()),
+        Arc::new(DeterministicPackageInstaller::default()),
+        Arc::new(DeterministicGitRepositoryStore::default()),
+        Arc::new(DeterministicPullRequestProviderClient::default()),
+        Arc::new(DeterministicReadonlyViewProvider::default()),
+    )
+    .with_git_host_bridge(configured_remote_github_bridge(host))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -987,15 +982,15 @@ async fn create_empty_base(
 }
 
 async fn run_host_disk_workflow(seed: u64) -> HostDiskWorkflowCapture {
+    let fake = FakeGithubServer::spawn().await;
     let repo = deterministic_temp_dir("host-workflow-repo", seed);
-    let remote = deterministic_temp_dir("host-workflow-remote", seed);
     let target = deterministic_temp_dir("host-workflow-target", seed);
-    init_git_repo(&repo, Some(&remote), seed);
+    init_git_repo(&repo, Some(&fake.remote_url), seed);
     cleanup(&target);
     fs::create_dir_all(&target).expect("create target dir");
     write_host_file(&target.join("tracked.txt"), &format!("tracked-{seed:x}\n"));
 
-    let (vfs, sandbox) = sandbox_store(200 + seed, seed, host_git_services());
+    let (vfs, sandbox) = sandbox_store(200 + seed, seed, remote_github_services("127.0.0.1"));
     let base_volume_id = VolumeId::new(0x9800 + seed as u128);
     let session_volume_id = VolumeId::new(0x9900 + seed as u128);
     create_empty_base(&vfs, base_volume_id)
@@ -1088,23 +1083,14 @@ async fn run_host_disk_workflow(seed: u64) -> HostDiskWorkflowCapture {
         .await
         .expect("create pull request with host git");
 
-    let remote_branch = format!("refs/heads/sandbox/workflow-{seed:x}");
-    let remote_contents = sanitized_git_command()
-        .arg("--git-dir")
-        .arg(&remote)
-        .args(["show", &format!("{remote_branch}:tracked.txt")])
-        .output()
-        .expect("inspect pushed tracked.txt");
-    assert!(
-        remote_contents.status.success(),
-        "pushed tracked.txt missing: {}",
-        String::from_utf8_lossy(&remote_contents.stderr)
-    );
     let capture = HostDiskWorkflowCapture {
         view_bytes: bytes.expect("visible bytes"),
         target_tracked: read_host_file(&target.join("tracked.txt")),
         target_new: read_host_file(&target.join("new.txt")),
-        remote_tracked: String::from_utf8_lossy(&remote_contents.stdout).to_string(),
+        remote_tracked: fake
+            .branch_file_text(&format!("sandbox/workflow-{seed:x}"), "tracked.txt")
+            .await
+            .expect("pushed tracked.txt"),
         pushed: pr
             .metadata
             .get("pushed")
@@ -1125,7 +1111,6 @@ async fn run_host_disk_workflow(seed: u64) -> HostDiskWorkflowCapture {
     };
 
     cleanup(&repo);
-    cleanup(&remote);
     cleanup(&target);
     capture
 }
@@ -1152,8 +1137,7 @@ async fn seeded_host_disk_workflow_replays_hoist_eject_pr_and_view_contracts() {
 async fn repo_backed_session_git_surface_reads_imported_repo_without_host_workspaces() {
     let seed = 0x5301_u64;
     let repo = deterministic_temp_dir("git-conformance-repo", seed);
-    let remote = deterministic_temp_dir("git-conformance-remote", seed);
-    init_git_repo(&repo, Some(&remote), seed);
+    init_git_repo(&repo, None, seed);
 
     let (vfs, sandbox) = sandbox_store(300, seed, host_git_services());
     let base_volume_id = VolumeId::new(0xa100);
@@ -1215,5 +1199,4 @@ async fn repo_backed_session_git_surface_reads_imported_repo_without_host_worksp
     );
 
     cleanup(&repo);
-    cleanup(&remote);
 }

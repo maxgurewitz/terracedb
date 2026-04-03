@@ -151,11 +151,28 @@ impl GitObjectFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRepositoryOrigin {
+    #[default]
+    Native,
+    HostImport,
+    RemoteImport,
+}
+
+impl GitRepositoryOrigin {
+    pub fn uses_external_bridge(self) -> bool {
+        !matches!(self, Self::Native)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRepositoryProvenance {
     pub backend: String,
     pub repo_root: String,
-    pub imported_from_host: bool,
+    pub origin: GitRepositoryOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
     pub object_format: GitObjectFormat,
     pub volume_id: Option<VolumeId>,
     pub snapshot_sequence: Option<u64>,
@@ -480,8 +497,8 @@ mod tests {
 
     use super::{
         GitDiscoverRequest, GitForkPolicy, GitObjectFormat, GitOpenRequest,
-        GitRepositoryImageDescriptor, GitRepositoryPolicy, GitRepositoryProvenance, GitTraceEvent,
-        GitTracePhase,
+        GitRepositoryImageDescriptor, GitRepositoryOrigin, GitRepositoryPolicy,
+        GitRepositoryProvenance, GitTraceEvent, GitTracePhase,
     };
 
     #[test]
@@ -498,7 +515,8 @@ mod tests {
             provenance: GitRepositoryProvenance {
                 backend: "deterministic-git".to_string(),
                 repo_root: "/repo".to_string(),
-                imported_from_host: false,
+                origin: GitRepositoryOrigin::Native,
+                remote_url: Some("https://github.com/example/repo".to_string()),
                 object_format: GitObjectFormat::Sha256,
                 volume_id: Some(terracedb_vfs::VolumeId::new(0x8000)),
                 snapshot_sequence: Some(9),

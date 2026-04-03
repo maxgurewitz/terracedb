@@ -238,7 +238,8 @@ async fn public_substrate_contracts_are_instantiable() {
                 provenance: GitRepositoryProvenance {
                     backend: "deterministic-git".to_string(),
                     repo_root: repo_descriptor.root_path.clone(),
-                    imported_from_host: false,
+                    origin: terracedb_git::GitRepositoryOrigin::Native,
+                    remote_url: None,
                     object_format: GitObjectFormat::Sha256,
                     volume_id: repo_descriptor.volume_id,
                     snapshot_sequence: repo_descriptor.snapshot_sequence,
@@ -264,7 +265,9 @@ async fn public_substrate_contracts_are_instantiable() {
     let imported = bridge
         .import_repository(
             GitImportRequest {
-                source_path: "/host/repo".to_string(),
+                source: terracedb_git::GitImportSource::HostPath {
+                    path: "/host/repo".to_string(),
+                },
                 target_root: "/repo".to_string(),
                 mode: GitImportMode::Head,
                 metadata: BTreeMap::new(),
@@ -413,7 +416,8 @@ async fn deterministic_smoke_executes_fake_runtime_and_repo_over_vfs() {
                 provenance: GitRepositoryProvenance {
                     backend: "deterministic-git".to_string(),
                     repo_root: repo_descriptor.root_path.clone(),
-                    imported_from_host: false,
+                    origin: terracedb_git::GitRepositoryOrigin::Native,
+                    remote_url: None,
                     object_format: GitObjectFormat::Sha256,
                     volume_id: repo_descriptor.volume_id,
                     snapshot_sequence: repo_descriptor.snapshot_sequence,

@@ -11,6 +11,8 @@ use terracedb_vfs::JsonValue;
 
 use crate::{HOST_CAPABILITY_PREFIX, SandboxError, SandboxSession};
 
+pub const GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER: &str = "terrace:host/git-remote-import";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SandboxCapability {
     pub name: String,
@@ -27,6 +29,19 @@ impl SandboxCapability {
             specifier: format!("{HOST_CAPABILITY_PREFIX}{name}"),
             name,
             description: None,
+            typescript_declarations: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn git_remote_import() -> Self {
+        Self {
+            specifier: GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER.to_string(),
+            name: "git-remote-import".to_string(),
+            description: Some(
+                "Allows sandbox code to import remote repositories through the configured git bridge"
+                    .to_string(),
+            ),
             typescript_declarations: None,
             metadata: BTreeMap::new(),
         }

@@ -12,7 +12,7 @@ pub mod worktree;
 pub use adapters::{SandboxGitBinding, SandboxGitRequest};
 pub use bridge::{
     DeterministicGitHostBridge, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportMode,
-    GitImportReport, GitImportRequest,
+    GitImportReport, GitImportRequest, GitImportSource, GitRemoteProvider,
 };
 pub use error::GitSubstrateError;
 pub use host::HostGitBridge;
@@ -31,7 +31,7 @@ pub use types::{
     GitForkSurfacePolicy, GitHeadState, GitIndexEntry, GitIndexSnapshot, GitObject,
     GitObjectFormat, GitOpenRequest, GitOwnershipMode, GitPullRequestReport, GitPullRequestRequest,
     GitPushReport, GitPushRequest, GitRefUpdate, GitRefUpdateReport, GitReference,
-    GitRepositoryHandle, GitRepositoryImageDescriptor, GitRepositoryPolicy,
+    GitRepositoryHandle, GitRepositoryImageDescriptor, GitRepositoryOrigin, GitRepositoryPolicy,
     GitRepositoryProvenance, GitStatusEntry, GitStatusKind, GitStatusOptions, GitStatusReport,
     GitTraceEvent, GitTracePhase,
 };

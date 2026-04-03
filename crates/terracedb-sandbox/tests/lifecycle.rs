@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use futures::TryStreamExt;
 use terracedb::{
@@ -79,9 +79,11 @@ async fn reopen_preserves_session_metadata_and_provenance() {
             }),
             git_provenance: Some(GitProvenance {
                 repo_root: "/repo".to_string(),
+                origin: terracedb_sandbox::GitRepositoryOrigin::Native,
                 head_commit: Some("abc".to_string()),
                 branch: Some("main".to_string()),
                 remote_url: None,
+                remote_bridge_metadata: BTreeMap::new(),
                 object_format: None,
                 pathspec: vec![".".to_string()],
                 dirty: false,

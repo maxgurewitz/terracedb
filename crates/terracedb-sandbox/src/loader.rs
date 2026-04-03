@@ -10,9 +10,9 @@ use terracedb_vfs::JsonValue;
 use tokio::sync::Mutex;
 
 use crate::{
-    CapabilityRegistry, PackageCompatibilityMode, SandboxCapabilityModule, SandboxError,
-    SandboxFilesystemShim, SandboxRuntimeStateHandle, SandboxSessionInfo,
-    packages::read_package_install_manifest,
+    CapabilityRegistry, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER, PackageCompatibilityMode,
+    SandboxCapabilityModule, SandboxError, SandboxFilesystemShim, SandboxRuntimeStateHandle,
+    SandboxSessionInfo, packages::read_package_install_manifest,
 };
 
 pub const TERRACE_WORKSPACE_PREFIX: &str = "terrace:/workspace";
@@ -36,7 +36,18 @@ pub(crate) const FS_HOST_EXPORTS: &[&str] = &[
     "fsync",
 ];
 
+pub(crate) const GIT_REMOTE_IMPORT_HOST_EXPORT: &str = "importRepository";
+pub(crate) const GIT_REPO_HOST_EXPORTS: &[&str] = &[
+    "head",
+    "listRefs",
+    "status",
+    "diff",
+    "checkout",
+    "updateRef",
+    "createPullRequest",
+];
 pub(crate) const GIT_HOST_EXPORTS: &[&str] = &[
+    GIT_REMOTE_IMPORT_HOST_EXPORT,
     "head",
     "listRefs",
     "status",
@@ -573,13 +584,19 @@ impl SandboxModuleLoader {
             SandboxModuleKind::BuiltinLibrary
                 if loaded.specifier == SANDBOX_GIT_LIBRARY_SPECIFIER =>
             {
-                Ok(host_service_metadata(
-                    &loaded.specifier,
-                    GIT_HOST_EXPORTS
-                        .iter()
-                        .map(|name| (*name).to_string())
-                        .collect(),
-                ))
+                let mut operations = GIT_REPO_HOST_EXPORTS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>();
+                if self
+                    .session_info
+                    .provenance
+                    .capabilities
+                    .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+                {
+                    operations.insert(0, GIT_REMOTE_IMPORT_HOST_EXPORT.to_string());
+                }
+                Ok(host_service_metadata(&loaded.specifier, operations))
             }
             SandboxModuleKind::Npm => Ok(BTreeMap::from([(
                 "package".to_string(),

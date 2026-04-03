@@ -22,9 +22,9 @@ use terracedb_git::{
     GitHeadState, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportMode,
     GitImportRequest, GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase,
     GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRefUpdate,
-    GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryPolicy,
-    GitRepositoryProvenance, GitRepositoryStore, GitStatusKind, GitStatusOptions,
-    GitSubstrateError, HostGitBridge, NeverCancel, VfsGitRepositoryImage,
+    GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryOrigin,
+    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore, GitStatusKind,
+    GitStatusOptions, GitSubstrateError, HostGitBridge, NeverCancel, VfsGitRepositoryImage,
 };
 use terracedb_vfs::{
     CloneVolumeSource, CreateOptions, InMemoryVfsStore, MkdirOptions, SnapshotOptions, Volume,
@@ -486,7 +486,8 @@ fn open_request(
         provenance: GitRepositoryProvenance {
             backend: "deterministic-git".to_string(),
             repo_root: descriptor.root_path.clone(),
-            imported_from_host: false,
+            origin: GitRepositoryOrigin::Native,
+            remote_url: None,
             object_format: GitObjectFormat::Sha256,
             volume_id: descriptor.volume_id,
             snapshot_sequence: descriptor.snapshot_sequence,
@@ -1607,7 +1608,9 @@ async fn host_git_bridge_imports_vfs_repository_images_and_pushes_commits() {
     let imported = bridge
         .import_repository(
             GitImportRequest {
-                source_path: repo.to_string_lossy().into_owned(),
+                source: terracedb_git::GitImportSource::HostPath {
+                    path: repo.to_string_lossy().into_owned(),
+                },
                 target_root: "/repo".to_string(),
                 mode: GitImportMode::Head,
                 metadata: BTreeMap::new(),
@@ -1651,7 +1654,7 @@ async fn host_git_bridge_imports_vfs_repository_images_and_pushes_commits() {
     let mut request = open_request("repo-imported-host", image.as_ref(), BTreeMap::new());
     request.policy.allow_host_bridge = true;
     request.provenance.repo_root = imported.repository_root.clone();
-    request.provenance.imported_from_host = true;
+    request.provenance.origin = GitRepositoryOrigin::HostImport;
     request.provenance.object_format = imported.object_format;
     let opened = repo_store
         .open(image, request, Arc::new(NeverCancel))
@@ -1971,7 +1974,9 @@ async fn host_git_bridge_preserves_empty_sha256_repo_format_for_first_commit() {
     let imported = bridge
         .import_repository(
             GitImportRequest {
-                source_path: repo.to_string_lossy().into_owned(),
+                source: terracedb_git::GitImportSource::HostPath {
+                    path: repo.to_string_lossy().into_owned(),
+                },
                 target_root: "/repo".to_string(),
                 mode: GitImportMode::Head,
                 metadata: BTreeMap::new(),
@@ -2011,7 +2016,7 @@ async fn host_git_bridge_preserves_empty_sha256_repo_format_for_first_commit() {
     );
     request.policy.allow_host_bridge = true;
     request.provenance.repo_root = imported.repository_root;
-    request.provenance.imported_from_host = true;
+    request.provenance.origin = GitRepositoryOrigin::HostImport;
     request.provenance.object_format = imported.object_format;
     let opened = repo_store
         .open(image, request, Arc::new(NeverCancel))

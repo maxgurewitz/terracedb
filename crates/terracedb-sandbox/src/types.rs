@@ -7,7 +7,7 @@ use terracedb::{
     Timestamp,
 };
 use terracedb_capabilities::{BudgetPolicy, ExecutionDomain, ExecutionOperation, ExecutionPolicy};
-use terracedb_git::GitObjectFormat;
+use terracedb_git::{GitImportSource, GitObjectFormat, GitRepositoryOrigin};
 use terracedb_vfs::VolumeId;
 
 use crate::{CapabilityManifest, HoistMode, ReadonlyViewHandle};
@@ -36,9 +36,13 @@ pub struct BaseSnapshotIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitProvenance {
     pub repo_root: String,
+    #[serde(default)]
+    pub origin: GitRepositoryOrigin,
     pub head_commit: Option<String>,
     pub branch: Option<String>,
     pub remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote_bridge_metadata: BTreeMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_format: Option<GitObjectFormat>,
     pub pathspec: Vec<String>,
@@ -49,6 +53,117 @@ pub struct GitProvenance {
 pub struct HoistedSource {
     pub source_path: String,
     pub mode: HoistMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRemoteImportRequest {
+    pub remote_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, JsonValue>,
+    pub target_root: String,
+    #[serde(default)]
+    pub delete_missing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRemoteImportReport {
+    pub remote_url: String,
+    pub target_root: String,
+    pub imported_paths: usize,
+    pub deleted_paths: usize,
+    pub git_provenance: GitProvenance,
+}
+
+impl GitProvenance {
+    pub(crate) fn sanitized_for_durability(&self) -> Self {
+        let mut sanitized = self.clone();
+        sanitized.remote_url = sanitized.remote_url.as_deref().map(sanitize_remote_url);
+        sanitized.remote_bridge_metadata =
+            durable_remote_bridge_metadata(&sanitized.remote_bridge_metadata);
+        sanitized
+    }
+}
+
+pub(crate) fn sanitize_git_import_source(source: &GitImportSource) -> GitImportSource {
+    match source {
+        GitImportSource::HostPath { path } => GitImportSource::HostPath { path: path.clone() },
+        GitImportSource::RemoteRepository {
+            remote_url,
+            reference,
+        } => GitImportSource::RemoteRepository {
+            remote_url: sanitize_remote_url(remote_url),
+            reference: reference.clone(),
+        },
+    }
+}
+
+pub(crate) fn sanitize_remote_url(remote_url: &str) -> String {
+    let Some(authority_start) = remote_url.find("://").map(|index| index + 3) else {
+        return remote_url.to_string();
+    };
+    let authority_end = remote_url[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|index| authority_start + index)
+        .unwrap_or(remote_url.len());
+    let authority = &remote_url[authority_start..authority_end];
+    let Some(userinfo_end) = authority.rfind('@') else {
+        return remote_url.to_string();
+    };
+    format!(
+        "{}{}{}",
+        &remote_url[..authority_start],
+        &authority[userinfo_end + 1..],
+        &remote_url[authority_end..]
+    )
+}
+
+pub(crate) fn durable_remote_bridge_metadata(
+    metadata: &BTreeMap<String, JsonValue>,
+) -> BTreeMap<String, JsonValue> {
+    metadata
+        .iter()
+        .filter(|(key, _)| !is_sensitive_remote_bridge_metadata_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+pub(crate) fn sensitive_remote_bridge_metadata_keys(
+    metadata: &BTreeMap<String, JsonValue>,
+) -> Vec<String> {
+    metadata
+        .keys()
+        .filter(|key| is_sensitive_remote_bridge_metadata_key(key))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn has_sensitive_remote_bridge_metadata(metadata: &BTreeMap<String, JsonValue>) -> bool {
+    metadata
+        .keys()
+        .any(|key| is_sensitive_remote_bridge_metadata_key(key))
+}
+
+fn is_sensitive_remote_bridge_metadata_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "auth_token"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "bearer_token"
+            | "password"
+            | "secret"
+            | "client_secret"
+            | "api_key"
+            | "private_key"
+    ) || normalized.ends_with("_token")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_password")
+        || normalized.ends_with("_api_key")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

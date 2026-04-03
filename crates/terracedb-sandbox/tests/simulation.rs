@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde_json::json;
 use terracedb_simulation::SeededSimulationRunner;
@@ -139,9 +139,11 @@ fn run_sandbox_simulation(seed: u64) -> turmoil::Result<SandboxSimulationCapture
                 .update_provenance(|provenance| {
                     provenance.git = Some(GitProvenance {
                         repo_root: "/repo".to_string(),
+                        origin: terracedb_sandbox::GitRepositoryOrigin::HostImport,
                         head_commit: Some(format!("{seed:040x}")),
                         branch: Some("main".to_string()),
                         remote_url: Some("https://simulation.invalid/repo.git".to_string()),
+                        remote_bridge_metadata: BTreeMap::new(),
                         object_format: Some(GitObjectFormat::Sha1),
                         pathspec: vec![".".to_string()],
                         dirty: false,
@@ -330,11 +332,15 @@ async fn seed_repo_backed_workspace(session: &terracedb_sandbox::SandboxSession,
         terracedb_sandbox::disk::HOIST_MANIFEST_PATH,
         serde_json::to_vec_pretty(&json!({
             "format_version": 1,
-            "source_path": "/repo",
+            "source": {
+                "kind": "host_path",
+                "path": "/repo"
+            },
             "target_root": "/workspace",
             "mode": "git_head",
             "git_provenance": {
                 "repo_root": "/repo",
+                "origin": "remote_import",
                 "head_commit": commit_oid,
                 "branch": "main",
                 "remote_url": "https://simulation.invalid/repo.git",

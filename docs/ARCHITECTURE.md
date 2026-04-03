@@ -5198,9 +5198,15 @@ Even with a VFS-native git core, the application still needs an explicit boundar
 The host bridge is responsible for:
 
 - importing a real host repo into a VFS-native repository image,
+- importing a remote-provider repository into a VFS-native repository image when the source of
+  truth is a hosted remote rather than a local checkout,
 - materializing a VFS-native branch or patch into a real checkout for review,
 - pushing to a remote using real credentials and transport,
 - creating pull requests through provider APIs.
+
+Persisted sandbox/git provenance should also record whether a repository image is native,
+host-imported, or remote-imported so reopen/recovery and capability policy can re-enable only the
+boundary adapters that the repository actually depends on.
 
 This split keeps the core repository logic simulation-friendly while preserving practical interoperability with ordinary developer machines and hosted git providers.
 

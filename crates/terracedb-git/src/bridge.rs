@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     GitCancellationToken, GitObjectFormat, GitPullRequestReport, GitPullRequestRequest,
-    GitPushReport, GitPushRequest, GitRepository, GitSubstrateError,
+    GitPushReport, GitPushRequest, GitRepository, GitRepositoryOrigin, GitSubstrateError,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +29,19 @@ pub enum GitImportEntryKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum GitImportSource {
+    HostPath {
+        path: String,
+    },
+    RemoteRepository {
+        remote_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitImportEntry {
     pub path: String,
     pub kind: GitImportEntryKind,
@@ -42,7 +55,7 @@ pub struct GitImportEntry {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitImportRequest {
-    pub source_path: String,
+    pub source: GitImportSource,
     pub target_root: String,
     pub mode: GitImportMode,
     pub metadata: BTreeMap<String, JsonValue>,
@@ -50,9 +63,10 @@ pub struct GitImportRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitImportReport {
-    pub source_path: String,
+    pub source: GitImportSource,
     pub target_root: String,
     pub repository_root: String,
+    pub origin: GitRepositoryOrigin,
     pub object_format: GitObjectFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_commit: Option<String>,
@@ -73,6 +87,9 @@ pub struct GitImportReport {
 pub trait GitHostBridge: Send + Sync {
     fn name(&self) -> &str;
     fn supports_host_filesystem_bridge(&self) -> bool {
+        false
+    }
+    fn supports_remote_repository_bridge(&self) -> bool {
         false
     }
 
@@ -98,6 +115,40 @@ pub trait GitHostBridge: Send + Sync {
 
     async fn create_pull_request(
         &self,
+        request: GitPullRequestRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitPullRequestReport, GitSubstrateError>;
+}
+
+#[async_trait]
+/// Boundary adapter for provider-owned remote import, transport, and pull-request APIs.
+///
+/// `terracedb-git` owns repository semantics over VFS-native repository images. Implementations of
+/// this trait own only the external boundary crossings needed to source a repository image from a
+/// remote service, publish commits to that service, and create a pull request through the
+/// provider's API.
+pub trait GitRemoteProvider: Send + Sync {
+    fn name(&self) -> &str;
+
+    fn supports_remote(&self, remote_url: &str, metadata: &BTreeMap<String, JsonValue>) -> bool;
+
+    async fn import_repository(
+        &self,
+        request: GitImportRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitImportReport, GitSubstrateError>;
+
+    async fn push(
+        &self,
+        repository: Arc<dyn GitRepository>,
+        remote_url: String,
+        request: GitPushRequest,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitPushReport, GitSubstrateError>;
+
+    async fn create_pull_request(
+        &self,
+        remote_url: String,
         request: GitPullRequestRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPullRequestReport, GitSubstrateError>;
@@ -130,6 +181,10 @@ impl GitHostBridge for DeterministicGitHostBridge {
         self.base_url.as_ref()
     }
 
+    fn supports_remote_repository_bridge(&self) -> bool {
+        true
+    }
+
     async fn import_repository(
         &self,
         request: GitImportRequest,
@@ -142,13 +197,23 @@ impl GitHostBridge for DeterministicGitHostBridge {
             });
         }
         Ok(GitImportReport {
-            repository_root: request.source_path.clone(),
-            source_path: request.source_path,
+            repository_root: match &request.source {
+                GitImportSource::HostPath { path } => path.clone(),
+                GitImportSource::RemoteRepository { remote_url, .. } => remote_url.clone(),
+            },
+            source: request.source.clone(),
             target_root: request.target_root,
+            origin: match request.source {
+                GitImportSource::HostPath { .. } => GitRepositoryOrigin::HostImport,
+                GitImportSource::RemoteRepository { .. } => GitRepositoryOrigin::RemoteImport,
+            },
             object_format: GitObjectFormat::Sha1,
             head_commit: None,
             branch: None,
-            remote_url: None,
+            remote_url: match request.source {
+                GitImportSource::RemoteRepository { remote_url, .. } => Some(remote_url),
+                GitImportSource::HostPath { .. } => None,
+            },
             pathspec: vec![".".to_string()],
             dirty: false,
             entries: Vec::new(),

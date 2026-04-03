@@ -18,13 +18,15 @@ use terracedb_vfs::{CreateOptions, JsonValue};
 use tokio::sync::Mutex;
 
 use crate::{
-    CapabilityCallRequest, CapabilityCallResult, HOST_CAPABILITY_PREFIX, LoadedSandboxModule,
-    PackageCompatibilityMode, SandboxError, SandboxModuleCacheEntry, SandboxModuleKind,
-    SandboxModuleLoadTrace, SandboxSession, SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
+    CapabilityCallRequest, CapabilityCallResult, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER,
+    HOST_CAPABILITY_PREFIX, LoadedSandboxModule, PackageCompatibilityMode, SandboxError,
+    SandboxModuleCacheEntry, SandboxModuleKind, SandboxModuleLoadTrace, SandboxSession,
+    SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
     loader::{
-        FS_HOST_EXPORTS, GIT_HOST_EXPORTS, SANDBOX_FS_LIBRARY_SPECIFIER,
-        SANDBOX_GIT_LIBRARY_SPECIFIER, SandboxModuleLoader,
+        FS_HOST_EXPORTS, GIT_REMOTE_IMPORT_HOST_EXPORT, GIT_REPO_HOST_EXPORTS,
+        SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_GIT_LIBRARY_SPECIFIER, SandboxModuleLoader,
     },
+    types::{has_sensitive_remote_bridge_metadata, sensitive_remote_bridge_metadata_keys},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -462,6 +464,50 @@ impl SandboxGitHostServiceAdapter {
             });
         }
         match request.operation.as_str() {
+            "importRepository" => {
+                let args = host_service_argument::<GitHostImportRepositoryRequest>(&request)?;
+                if !self
+                    .session
+                    .info()
+                    .await
+                    .provenance
+                    .capabilities
+                    .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+                {
+                    return Err(JsSubstrateError::HostServiceDenied {
+                        service: request.service.clone(),
+                        operation: request.operation.clone(),
+                        message:
+                            "remote repository import requires the git-remote-import capability"
+                                .to_string(),
+                    });
+                }
+                if has_sensitive_remote_bridge_metadata(&args.metadata) {
+                    return Err(JsSubstrateError::HostServiceDenied {
+                        service: request.service.clone(),
+                        operation: request.operation.clone(),
+                        message: format!(
+                            "remote bridge credentials must be configured by the host app, not sandbox code (blocked keys: {})",
+                            sensitive_remote_bridge_metadata_keys(&args.metadata).join(", ")
+                        ),
+                    });
+                }
+                let report = self
+                    .session
+                    .import_remote_repository(crate::GitRemoteImportRequest {
+                        remote_url: args.remote_url,
+                        reference: args.reference,
+                        metadata: args.metadata,
+                        target_root: args.target_root,
+                        delete_missing: args.delete_missing,
+                    })
+                    .await
+                    .map_err(|error| sandbox_error_to_js_host_service(&request, error))?;
+                Ok(JsHostServiceResponse {
+                    result: Some(serde_json::to_value(report)?),
+                    metadata: BTreeMap::new(),
+                })
+            }
             "head" => Ok(JsHostServiceResponse {
                 result: Some(serde_json::to_value(
                     self.session
@@ -562,6 +608,18 @@ impl JsHostServiceAdapter for SandboxGitHostServiceAdapter {
     ) -> Result<JsHostServiceResponse, JsSubstrateError> {
         self.call_async(request).await
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHostImportRepositoryRequest {
+    remote_url: String,
+    reference: Option<String>,
+    #[serde(default)]
+    metadata: BTreeMap<String, JsonValue>,
+    target_root: String,
+    #[serde(default)]
+    delete_missing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -774,10 +832,27 @@ fn runtime_policy_for_session(
         }
     }
 
-    if session_info.provenance.git.is_some() {
-        for operation in GIT_HOST_EXPORTS {
+    if session_info.provenance.git.is_some()
+        || session_info
+            .provenance
+            .capabilities
+            .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+    {
+        for operation in GIT_REPO_HOST_EXPORTS {
             visible_host_services.insert(format!("{SANDBOX_GIT_LIBRARY_SPECIFIER}::{operation}"));
         }
+    }
+    if session
+        .git_host_bridge()
+        .supports_remote_repository_bridge()
+        && session_info
+            .provenance
+            .capabilities
+            .contains(GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER)
+    {
+        visible_host_services.insert(format!(
+            "{SANDBOX_GIT_LIBRARY_SPECIFIER}::{GIT_REMOTE_IMPORT_HOST_EXPORT}"
+        ));
     }
 
     let capabilities = session.capability_registry();

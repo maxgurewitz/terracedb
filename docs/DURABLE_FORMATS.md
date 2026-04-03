@@ -96,6 +96,18 @@ The current shard-aware contract adds three reviewed pieces of durable state on 
 
 Changing any of those bytes, fields, or path/key conventions requires the same fixture-and-doc update workflow as the earlier T23a formats.
 
+Sandbox session reopen/recovery also now relies on reviewed git-hoist provenance shape inside
+`/.terrace/session.json` and `/.terrace/hoist-manifest.json`:
+
+- session git provenance records `origin` as `native`, `host_import`, or `remote_import` rather
+  than a legacy boolean host-import marker,
+- session git provenance may persist a `remote_url` when the reopened repository depends on a
+  provider-backed remote,
+- hoist manifests persist structured `source` data (`host_path` or `remote_repository`) instead of
+  only a raw `source_path`, and
+- reopen must continue to fail closed if required git provenance is malformed, missing required
+  origin/source discriminators, or advertises an unsupported session-control `format_version`.
+
 ## Local Workflow
 
 Use these commands for intentional durable-format changes:

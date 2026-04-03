@@ -172,7 +172,8 @@ fn open_request(repository_id: &str, image: &dyn GitRepositoryImage) -> GitOpenR
         provenance: GitRepositoryProvenance {
             backend: "deterministic-git".to_string(),
             repo_root: descriptor.root_path.clone(),
-            imported_from_host: false,
+            origin: terracedb_git::GitRepositoryOrigin::Native,
+            remote_url: None,
             object_format: GitObjectFormat::Sha256,
             volume_id: descriptor.volume_id,
             snapshot_sequence: descriptor.snapshot_sequence,

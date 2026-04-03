@@ -14,13 +14,13 @@ use std::os::unix::fs::PermissionsExt;
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
-use tokio::sync::Mutex;
 
 use crate::{
     GitCancellationToken, GitExportReport, GitExportRequest, GitHeadState, GitHostBridge,
     GitImportEntry, GitImportEntryKind, GitImportMode, GitImportReport, GitImportRequest,
-    GitIndexEntry, GitIndexSnapshot, GitObjectFormat, GitObjectKind, GitPullRequestReport,
-    GitPullRequestRequest, GitPushReport, GitPushRequest, GitRepository, GitSubstrateError,
+    GitImportSource, GitIndexEntry, GitIndexSnapshot, GitObjectFormat, GitObjectKind,
+    GitPullRequestReport, GitPullRequestRequest, GitPushReport, GitPushRequest, GitRemoteProvider,
+    GitRepository, GitRepositoryOrigin, GitSubstrateError,
 };
 
 static IMPORT_EXPORT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -32,26 +32,40 @@ enum OptionalGitLookup {
     OriginRemote,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HostGitBridge {
     name: Arc<str>,
-    base_url: Arc<str>,
-    pr_counter: Arc<Mutex<u64>>,
+    remote_providers: Vec<Arc<dyn GitRemoteProvider>>,
 }
 
 impl HostGitBridge {
-    pub fn new(name: impl Into<Arc<str>>, base_url: impl Into<Arc<str>>) -> Self {
+    pub fn new(name: impl Into<Arc<str>>) -> Self {
         Self {
             name: name.into(),
-            base_url: base_url.into(),
-            pr_counter: Arc::new(Mutex::new(1)),
+            remote_providers: Vec::new(),
         }
+    }
+
+    pub fn with_remote_provider(mut self, provider: Arc<dyn GitRemoteProvider>) -> Self {
+        self.remote_providers.push(provider);
+        self
+    }
+
+    fn resolve_remote_provider(
+        &self,
+        remote_url: &str,
+        metadata: &BTreeMap<String, JsonValue>,
+    ) -> Option<Arc<dyn GitRemoteProvider>> {
+        self.remote_providers
+            .iter()
+            .find(|provider| provider.supports_remote(remote_url, metadata))
+            .cloned()
     }
 }
 
 impl Default for HostGitBridge {
     fn default() -> Self {
-        Self::new("host-git", "https://example.invalid")
+        Self::new("host-git")
     }
 }
 
@@ -65,74 +79,32 @@ impl GitHostBridge for HostGitBridge {
         true
     }
 
+    fn supports_remote_repository_bridge(&self) -> bool {
+        !self.remote_providers.is_empty()
+    }
+
     async fn import_repository(
         &self,
         request: GitImportRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitImportReport, GitSubstrateError> {
         ensure_not_cancelled(cancellation.as_ref(), "import_repository")?;
-        let source_path = canonicalize_for_storage(Path::new(&request.source_path))?;
-        let repo_root = git_repo_root(Path::new(&source_path))?;
-        let head_commit = git_stdout_optional(
-            &repo_root,
-            &["rev-parse", "HEAD"],
-            OptionalGitLookup::HeadCommit,
-        )?;
-        let branch = git_stdout_optional(
-            &repo_root,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            OptionalGitLookup::SymbolicHead,
-        )?;
-        let remote_url = git_stdout_optional(
-            &repo_root,
-            &["remote", "get-url", "origin"],
-            OptionalGitLookup::OriginRemote,
-        )?;
-        let object_format = git_object_format(&repo_root)?;
-        let worktree_entries = match &request.mode {
-            GitImportMode::Head => {
-                let export_root = export_git_head(&repo_root)?;
-                let entries = collect_directory_tree(&export_root, false)?;
-                let _ = fs::remove_dir_all(&export_root);
-                entries
+        match request.source.clone() {
+            GitImportSource::HostPath { path } => {
+                import_host_repository(&path, request, cancellation.as_ref())
             }
-            GitImportMode::WorkingTree {
-                include_untracked,
-                include_ignored,
-            } => {
-                let included =
-                    git_working_tree_paths(&repo_root, *include_untracked, *include_ignored)?;
-                collect_selected_paths(&repo_root, &included)?
+            GitImportSource::RemoteRepository { remote_url, .. } => {
+                self.resolve_remote_provider(&remote_url, &request.metadata)
+                    .ok_or_else(|| GitSubstrateError::Bridge {
+                        operation: "import_repository",
+                        message: format!(
+                            "no configured remote repository provider supports {remote_url}"
+                        ),
+                    })?
+                    .import_repository(request, cancellation)
+                    .await
             }
-        };
-        let refs = git_references(&repo_root)?;
-        let index = git_index_snapshot(&repo_root)?;
-        let objects = git_object_closure(&repo_root, &refs, head_commit.as_deref(), &index)?;
-        let entries = import_repository_image_entries(
-            &branch,
-            head_commit.as_deref(),
-            refs,
-            index,
-            objects,
-            worktree_entries,
-        )?;
-        Ok(GitImportReport {
-            source_path,
-            target_root: request.target_root,
-            repository_root: canonicalize_for_storage(&repo_root)?,
-            object_format,
-            head_commit,
-            branch,
-            remote_url,
-            pathspec: vec![".".to_string()],
-            dirty: !git_stdout(
-                &repo_root,
-                &["status", "--porcelain=v1", "--untracked-files=all"],
-            )?
-            .is_empty(),
-            entries,
-            metadata: request.metadata,
-        })
+        }
     }
 
     async fn export_repository(
@@ -177,67 +149,13 @@ impl GitHostBridge for HostGitBridge {
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPushReport, GitSubstrateError> {
         ensure_not_cancelled(cancellation.as_ref(), "push")?;
-        let remote_url = request
-            .metadata
-            .get("remote_url")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| GitSubstrateError::Bridge {
-                operation: "push",
-                message: "remote_url metadata is required for host push".to_string(),
-            })?;
-        let pushed_head = if let Some(oid) = request.head_oid.as_deref() {
-            oid.to_string()
-        } else {
-            repository
-                .head()
-                .await?
-                .oid
-                .ok_or_else(|| GitSubstrateError::Bridge {
-                    operation: "push",
-                    message: "repository HEAD is not available for push".to_string(),
-                })?
-        };
-        let base_branch = request
-            .metadata
-            .get("base_branch")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("main");
-        let workspace_path = temp_export_path("push");
-        clone_remote_checkout(
-            remote_url,
-            &request.branch_name,
-            base_branch,
-            &workspace_path,
-        )?;
-        materialize_repository_to_host(
-            repository.as_ref(),
-            &pushed_head,
-            &workspace_path,
-            true,
-            cancellation.as_ref(),
-        )
-        .await?;
-        let (title, body) = repository_head_message(repository.as_ref(), &pushed_head).await?;
-        commit_host_checkout(&workspace_path, &title, &body)?;
-        run_git(
-            &workspace_path,
-            &["push", "-u", &request.remote, &request.branch_name],
-        )
-        .map_err(|error| match error {
-            GitSubstrateError::Bridge { message, .. } => GitSubstrateError::RemotePushFailed {
-                remote: request.remote.clone(),
-                branch: request.branch_name.clone(),
-                message,
-            },
-            other => other,
-        })?;
-        let pushed_oid = git_stdout(&workspace_path, &["rev-parse", "HEAD"])?;
-        Ok(GitPushReport {
-            remote: request.remote,
-            branch_name: request.branch_name,
-            pushed_oid: Some(pushed_oid),
-            metadata: request.metadata,
-        })
+        let remote_url = resolve_bridge_remote_url(repository.as_ref(), &request.metadata)?;
+        if let Some(provider) = self.resolve_remote_provider(&remote_url, &request.metadata) {
+            return provider
+                .push(repository, remote_url, request, cancellation)
+                .await;
+        }
+        push_via_host_checkout(repository.as_ref(), request, cancellation.as_ref()).await
     }
 
     async fn create_pull_request(
@@ -246,21 +164,23 @@ impl GitHostBridge for HostGitBridge {
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitPullRequestReport, GitSubstrateError> {
         ensure_not_cancelled(cancellation.as_ref(), "create_pull_request")?;
-        if self.base_url.is_empty() || self.base_url.contains("example.invalid") {
-            return Err(GitSubstrateError::PullRequestProvider {
+        let remote_url = request
+            .metadata
+            .get("remote_url")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| GitSubstrateError::PullRequestProvider {
                 provider: self.name().to_string(),
-                message: "provider adapter is not configured".to_string(),
-            });
-        }
-        let mut counter = self.pr_counter.lock().await;
-        let number = *counter;
-        *counter += 1;
-        Ok(GitPullRequestReport {
-            url: format!("{}/pull/{}", self.base_url, number),
-            head_branch: request.head_branch,
-            base_branch: request.base_branch,
-            metadata: request.metadata,
-        })
+                message: "remote_url metadata is required for provider pull requests".to_string(),
+            })?;
+        let provider = self
+            .resolve_remote_provider(remote_url, &request.metadata)
+            .ok_or_else(|| GitSubstrateError::PullRequestProvider {
+                provider: self.name().to_string(),
+                message: format!("remote provider is not supported for {remote_url}"),
+            })?;
+        provider
+            .create_pull_request(remote_url.to_string(), request, cancellation)
+            .await
     }
 }
 
@@ -283,6 +203,161 @@ fn export_target_ref(head: &GitHeadState, branch_name: Option<&str>) -> String {
         .or_else(|| head.symbolic_ref.clone())
         .or_else(|| head.oid.clone())
         .unwrap_or_else(|| "HEAD".to_string())
+}
+
+fn import_host_repository(
+    source_path: &str,
+    request: GitImportRequest,
+    _cancellation: &dyn GitCancellationToken,
+) -> Result<GitImportReport, GitSubstrateError> {
+    let source_path = canonicalize_for_storage(Path::new(source_path))?;
+    let repo_root = git_repo_root(Path::new(&source_path))?;
+    let head_commit = git_stdout_optional(
+        &repo_root,
+        &["rev-parse", "HEAD"],
+        OptionalGitLookup::HeadCommit,
+    )?;
+    let branch = git_stdout_optional(
+        &repo_root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        OptionalGitLookup::SymbolicHead,
+    )?;
+    let remote_url = git_stdout_optional(
+        &repo_root,
+        &["remote", "get-url", "origin"],
+        OptionalGitLookup::OriginRemote,
+    )?;
+    let object_format = git_object_format(&repo_root)?;
+    let worktree_entries = match &request.mode {
+        GitImportMode::Head => {
+            let export_root = export_git_head(&repo_root)?;
+            let entries = collect_directory_tree(&export_root, false)?;
+            let _ = fs::remove_dir_all(&export_root);
+            entries
+        }
+        GitImportMode::WorkingTree {
+            include_untracked,
+            include_ignored,
+        } => {
+            let included =
+                git_working_tree_paths(&repo_root, *include_untracked, *include_ignored)?;
+            collect_selected_paths(&repo_root, &included)?
+        }
+    };
+    let refs = git_references(&repo_root)?;
+    let index = git_index_snapshot(&repo_root)?;
+    let objects = git_object_closure(&repo_root, &refs, head_commit.as_deref(), &index)?;
+    let entries = import_repository_image_entries(
+        &branch,
+        head_commit.as_deref(),
+        refs,
+        index,
+        objects,
+        worktree_entries,
+    )?;
+    Ok(GitImportReport {
+        source: request.source,
+        target_root: request.target_root,
+        repository_root: canonicalize_for_storage(&repo_root)?,
+        origin: GitRepositoryOrigin::HostImport,
+        object_format,
+        head_commit,
+        branch,
+        remote_url,
+        pathspec: vec![".".to_string()],
+        dirty: !git_stdout(
+            &repo_root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?
+        .is_empty(),
+        entries,
+        metadata: request.metadata,
+    })
+}
+
+async fn push_via_host_checkout(
+    repository: &dyn GitRepository,
+    request: GitPushRequest,
+    cancellation: &dyn GitCancellationToken,
+) -> Result<GitPushReport, GitSubstrateError> {
+    let remote_url = request
+        .metadata
+        .get("remote_url")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| GitSubstrateError::Bridge {
+            operation: "push",
+            message: "remote_url metadata is required for host push".to_string(),
+        })?;
+    let pushed_head = if let Some(oid) = request.head_oid.as_deref() {
+        oid.to_string()
+    } else {
+        repository
+            .head()
+            .await?
+            .oid
+            .ok_or_else(|| GitSubstrateError::Bridge {
+                operation: "push",
+                message: "repository HEAD is not available for push".to_string(),
+            })?
+    };
+    let base_branch = request
+        .metadata
+        .get("base_branch")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("main");
+    let workspace_path = temp_export_path("push");
+    clone_remote_checkout(
+        remote_url,
+        &request.branch_name,
+        base_branch,
+        &workspace_path,
+    )?;
+    materialize_repository_to_host(
+        repository,
+        &pushed_head,
+        &workspace_path,
+        true,
+        cancellation,
+    )
+    .await?;
+    let (title, body) = repository_head_message(repository, &pushed_head).await?;
+    commit_host_checkout(&workspace_path, &title, &body)?;
+    run_git(
+        &workspace_path,
+        &["push", "-u", &request.remote, &request.branch_name],
+    )
+    .map_err(|error| match error {
+        GitSubstrateError::Bridge { message, .. } => GitSubstrateError::RemotePushFailed {
+            remote: request.remote.clone(),
+            branch: request.branch_name.clone(),
+            message,
+        },
+        other => other,
+    })?;
+    let pushed_oid = git_stdout(&workspace_path, &["rev-parse", "HEAD"])?;
+    Ok(GitPushReport {
+        remote: request.remote,
+        branch_name: request.branch_name,
+        pushed_oid: Some(pushed_oid),
+        metadata: request.metadata,
+    })
+}
+
+fn resolve_bridge_remote_url(
+    repository: &dyn GitRepository,
+    metadata: &BTreeMap<String, JsonValue>,
+) -> Result<String, GitSubstrateError> {
+    if let Some(remote_url) = repository.handle().provenance.remote_url {
+        return Ok(remote_url);
+    }
+    metadata
+        .get("remote_url")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| GitSubstrateError::Bridge {
+            operation: "push",
+            message: "repository provenance does not record a remote_url".to_string(),
+        })
 }
 
 fn collect_directory_tree(

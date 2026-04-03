@@ -9,12 +9,12 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use serde::{Deserialize, Serialize};
-use terracedb_git::GitObjectFormat;
+use terracedb_git::{GitImportSource, GitObjectFormat, GitRepositoryOrigin};
 use terracedb_vfs::{
     CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, VfsError, VfsFileSystem, Volume,
 };
 
-use crate::{ConflictPolicy, GitProvenance, SandboxError};
+use crate::{ConflictPolicy, GitProvenance, SandboxError, types::sanitize_git_import_source};
 
 pub const HOIST_MANIFEST_PATH: &str = "/.terrace/hoist-manifest.json";
 pub const PATCH_BUNDLE_FILE_NAME: &str = ".terrace-sandbox.patch.json";
@@ -145,7 +145,7 @@ pub(crate) struct ManifestEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HoistManifest {
     pub format_version: u32,
-    pub source_path: String,
+    pub source: GitImportSource,
     pub target_root: String,
     pub mode: HoistMode,
     pub git_provenance: Option<GitProvenance>,
@@ -231,7 +231,7 @@ pub(crate) fn prepare_hoist(request: &HoistRequest) -> Result<PreparedHoist, San
     };
     let manifest = HoistManifest {
         format_version: HOIST_MANIFEST_FORMAT_VERSION,
-        source_path,
+        source: GitImportSource::HostPath { path: source_path },
         target_root,
         mode: request.mode.clone(),
         git_provenance,
@@ -262,7 +262,13 @@ pub(crate) async fn write_hoist_manifest(
     volume: &dyn Volume,
     manifest: &HoistManifest,
 ) -> Result<(), SandboxError> {
-    let payload = serde_json::to_vec_pretty(manifest)?;
+    let mut durable_manifest = manifest.clone();
+    durable_manifest.source = sanitize_git_import_source(&durable_manifest.source);
+    durable_manifest.git_provenance = durable_manifest
+        .git_provenance
+        .as_ref()
+        .map(crate::GitProvenance::sanitized_for_durability);
+    let payload = serde_json::to_vec_pretty(&durable_manifest)?;
     volume
         .fs()
         .write_file(
@@ -1188,9 +1194,11 @@ fn capture_git_provenance(repo_root: &Path) -> Result<GitProvenance, SandboxErro
     .is_empty();
     Ok(GitProvenance {
         repo_root: canonicalize_for_storage(repo_root)?,
+        origin: GitRepositoryOrigin::HostImport,
         head_commit,
         branch,
         remote_url,
+        remote_bridge_metadata: BTreeMap::new(),
         object_format: Some(object_format),
         pathspec: vec![".".to_string()],
         dirty,

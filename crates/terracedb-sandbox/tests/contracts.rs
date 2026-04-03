@@ -168,9 +168,11 @@ async fn public_sandbox_surface_compiles_and_is_instantiable() {
             }),
             git_provenance: Some(GitProvenance {
                 repo_root: "/repo".to_string(),
+                origin: terracedb_sandbox::GitRepositoryOrigin::HostImport,
                 head_commit: Some("abc123".to_string()),
                 branch: Some("main".to_string()),
                 remote_url: Some("git@example.invalid:terrace/repo.git".to_string()),
+                remote_bridge_metadata: BTreeMap::new(),
                 object_format: Some(GitObjectFormat::Sha1),
                 pathspec: vec![".".to_string()],
                 dirty: false,
@@ -335,9 +337,11 @@ fn metadata_and_view_uri_round_trip() {
         }),
         git: Some(GitProvenance {
             repo_root: "/repo".to_string(),
+            origin: terracedb_sandbox::GitRepositoryOrigin::HostImport,
             head_commit: Some("deadbeef".to_string()),
             branch: Some("feature".to_string()),
             remote_url: Some("git@example.invalid:terrace/repo.git".to_string()),
+            remote_bridge_metadata: BTreeMap::new(),
             object_format: None,
             pathspec: vec!["src".to_string()],
             dirty: true,
