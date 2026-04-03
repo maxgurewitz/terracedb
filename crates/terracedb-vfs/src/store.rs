@@ -16,7 +16,7 @@ use crate::{
     ActivityEntry, ActivityId, ActivityKind, ActivityOptions, ActivityReceiver, ActivityStream,
     AllocatorKind, CreateOptions, DirEntry, DirEntryPlus, FileKind, InodeId, JsonValue,
     MkdirOptions, ReadOnlyToolRunStore, ReadOnlyVfsFileSystem, ReadOnlyVfsKvStore, Stats, ToolRun,
-    ToolRunId, ToolRunStatus, ToolRunStore, VfsError, VfsFileSystem, VfsKvStore,
+    ToolRunId, ToolRunStatus, ToolRunStore, VfsBatchOperation, VfsError, VfsFileSystem, VfsKvStore,
 };
 
 pub const VFS_FORMAT_VERSION: u8 = 1;
@@ -231,6 +231,19 @@ impl StoredVolume {
 struct InMemoryOverlayEntry {
     delta: Arc<InMemoryVolumeInner>,
     base: Arc<SnapshotState>,
+    snapshot_cache: Arc<Mutex<OverlaySnapshotCache>>,
+}
+
+#[derive(Default)]
+struct OverlaySnapshotCache {
+    visible: Option<CachedOverlaySnapshot>,
+    durable: Option<CachedOverlaySnapshot>,
+}
+
+#[derive(Clone)]
+struct CachedOverlaySnapshot {
+    sequence: SequenceNumber,
+    snapshot: SnapshotState,
 }
 
 impl InMemoryOverlayEntry {
@@ -239,8 +252,37 @@ impl InMemoryOverlayEntry {
     }
 
     fn snapshot_state(&self, durable: bool) -> SnapshotState {
-        let delta = self.delta.snapshot_state(durable);
-        build_overlay_snapshot(&delta, self.base.as_ref())
+        let state = self.delta.state.lock().expect("volume state lock poisoned");
+        let sequence = if durable {
+            state.durable.sequence
+        } else {
+            state.sequence
+        };
+        let mut cache = self
+            .snapshot_cache
+            .lock()
+            .expect("overlay snapshot cache lock poisoned");
+        let slot = if durable {
+            &mut cache.durable
+        } else {
+            &mut cache.visible
+        };
+        if let Some(cached) = slot
+            && cached.sequence == sequence
+        {
+            return cached.snapshot.clone();
+        }
+        let delta = if durable {
+            state.durable.snapshot(state.info.clone())
+        } else {
+            state.visible_snapshot()
+        };
+        let snapshot = build_overlay_snapshot(&delta, self.base.as_ref());
+        *slot = Some(CachedOverlaySnapshot {
+            sequence,
+            snapshot: snapshot.clone(),
+        });
+        snapshot
     }
 
     fn base_snapshot(&self) -> Arc<dyn VolumeSnapshot> {
@@ -416,6 +458,7 @@ impl VolumeStore for InMemoryVfsStore {
         let overlay = Arc::new(InMemoryOverlayEntry {
             delta: volume,
             base: base_snapshot.state.clone(),
+            snapshot_cache: Arc::new(Mutex::new(OverlaySnapshotCache::default())),
         });
         volumes.insert(target.volume_id, StoredVolume::Overlay(overlay.clone()));
 
@@ -837,6 +880,13 @@ impl ReadOnlyVfsFileSystem for InMemoryOverlayFileSystem {
 
 #[async_trait]
 impl VfsFileSystem for InMemoryVfsFileSystem {
+    async fn apply_batch(&self, ops: &[VfsBatchOperation]) -> Result<(), VfsError> {
+        self.volume.mutate(|state, now| {
+            apply_regular_batch_to_state(state, ops, now)?;
+            Ok(None)
+        })
+    }
+
     async fn write_file(
         &self,
         path: &str,
@@ -1008,6 +1058,14 @@ impl VfsFileSystem for InMemoryVfsFileSystem {
 
 #[async_trait]
 impl VfsFileSystem for InMemoryOverlayFileSystem {
+    async fn apply_batch(&self, ops: &[VfsBatchOperation]) -> Result<(), VfsError> {
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            apply_overlay_batch_to_state(state, base.as_ref(), ops, now)?;
+            Ok(None)
+        })
+    }
+
     async fn write_file(
         &self,
         path: &str,
@@ -1018,6 +1076,19 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let opts = opts.clone();
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
+            if let Some(resolved_path) =
+                try_fast_overlay_new_target_path(state, base.as_ref(), &path)?
+            {
+                let delta_opts = CreateOptions {
+                    create_parents: false,
+                    ..opts.clone()
+                };
+                mutate_write_file_state(state, &resolved_path, &data, &delta_opts, now)?;
+                return Ok(Some((
+                    (),
+                    activity_spec(ActivityKind::FileWritten, Some(path.clone()), None, None),
+                )));
+            }
             let merged = overlay_visible_snapshot(state, base.as_ref());
             let resolved_path = if let Some((resolved_path, _)) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
@@ -1032,17 +1103,15 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                 )?;
                 resolved_path
             } else {
-                let resolved_path =
-                    resolve_target_path_in_maps(&merged.paths, &merged.inodes, &path)?;
                 materialize_overlay_parent_chain(
                     state,
                     base.as_ref(),
                     &merged,
-                    &resolved_path,
+                    &path,
                     opts.create_parents,
                     now,
                 )?;
-                resolved_path
+                resolve_target_path(state, &path)?
             };
 
             let delta_opts = CreateOptions {
@@ -1118,6 +1187,37 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let opts = opts.clone();
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
+            if opts.recursive
+                && let Some((resolved_path, inode_id)) = resolve_existing_path(state, &path, false)?
+            {
+                let inode = state
+                    .inodes
+                    .get(&inode_id)
+                    .ok_or_else(|| VfsError::NotFound {
+                        path: resolved_path.clone(),
+                    })?;
+                if inode.stats.kind == FileKind::Directory {
+                    return Ok(None);
+                }
+            }
+            if let Some(resolved_path) =
+                try_fast_overlay_new_target_path(state, base.as_ref(), &path)?
+            {
+                let delta_opts = MkdirOptions {
+                    recursive: false,
+                    ..opts.clone()
+                };
+                mutate_mkdir_state(state, &resolved_path, &delta_opts, now)?;
+                return Ok(Some((
+                    (),
+                    activity_spec(
+                        ActivityKind::DirectoryCreated,
+                        Some(path.clone()),
+                        None,
+                        None,
+                    ),
+                )));
+            }
             let merged = overlay_visible_snapshot(state, base.as_ref());
             if let Some((resolved_path, inode_id)) =
                 resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
@@ -1136,15 +1236,15 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
                 });
             }
 
-            let resolved_path = resolve_target_path_in_maps(&merged.paths, &merged.inodes, &path)?;
             materialize_overlay_parent_chain(
                 state,
                 base.as_ref(),
                 &merged,
-                &resolved_path,
+                &path,
                 opts.recursive,
                 now,
             )?;
+            let resolved_path = resolve_target_path(state, &path)?;
             let delta_opts = MkdirOptions {
                 recursive: false,
                 ..opts.clone()
@@ -1330,17 +1430,23 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         let target = target.to_string();
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
+            if let Some(resolved_linkpath) =
+                try_fast_overlay_new_target_path(state, base.as_ref(), &linkpath)?
+            {
+                mutate_symlink_state(state, &target, &resolved_linkpath, now)?;
+                return Ok(Some((
+                    (),
+                    activity_spec(
+                        ActivityKind::SymlinkCreated,
+                        Some(linkpath.clone()),
+                        None,
+                        None,
+                    ),
+                )));
+            }
             let merged = overlay_visible_snapshot(state, base.as_ref());
-            let resolved_linkpath =
-                resolve_target_path_in_maps(&merged.paths, &merged.inodes, &linkpath)?;
-            materialize_overlay_parent_chain(
-                state,
-                base.as_ref(),
-                &merged,
-                &resolved_linkpath,
-                false,
-                now,
-            )?;
+            materialize_overlay_parent_chain(state, base.as_ref(), &merged, &linkpath, false, now)?;
+            let resolved_linkpath = resolve_target_path(state, &linkpath)?;
             mutate_symlink_state(state, &target, &resolved_linkpath, now)?;
             Ok(Some((
                 (),
@@ -2382,6 +2488,553 @@ fn mutate_truncate_state(
     Ok(())
 }
 
+fn apply_regular_batch_to_state(
+    state: &mut VolumeState,
+    ops: &[VfsBatchOperation],
+    now: Timestamp,
+) -> Result<(), VfsError> {
+    for op in ops {
+        match op {
+            VfsBatchOperation::WriteFile { path, data, opts } => {
+                let path = normalize_path(path)?;
+                mutate_write_file_state(state, &path, data, opts, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::FileWritten,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Pwrite { path, offset, data } => {
+                let path = normalize_path(path)?;
+                mutate_pwrite_state(state, &path, *offset, data, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::FilePatched,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Truncate { path, size } => {
+                let path = normalize_path(path)?;
+                mutate_truncate_state(state, &path, *size, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::FileTruncated,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Mkdir { path, opts } => {
+                let path = normalize_path(path)?;
+                if path == "/" {
+                    if !opts.recursive {
+                        return Err(VfsError::AlreadyExists { path });
+                    }
+                    continue;
+                }
+                if mutate_mkdir_state(state, &path, opts, now)? {
+                    append_activity(
+                        state,
+                        now,
+                        ActivityKind::DirectoryCreated,
+                        Some(path),
+                        None,
+                        BTreeMap::new(),
+                    );
+                }
+            }
+            VfsBatchOperation::Rename { from, to } => {
+                let from = normalize_path(from)?;
+                let to = normalize_path(to)?;
+                if mutate_rename_state(state, &from, &to, now)? {
+                    let mut metadata = BTreeMap::new();
+                    metadata.insert("to".to_string(), json!(to));
+                    append_activity(
+                        state,
+                        now,
+                        ActivityKind::PathRenamed,
+                        Some(from),
+                        None,
+                        metadata,
+                    );
+                }
+            }
+            VfsBatchOperation::Link { from, to } => {
+                let from = normalize_path(from)?;
+                let to = normalize_path(to)?;
+                mutate_link_state(state, &from, &to, now)?;
+                let mut metadata = BTreeMap::new();
+                metadata.insert("from".to_string(), json!(from));
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::HardLinkCreated,
+                    Some(to),
+                    None,
+                    metadata,
+                );
+            }
+            VfsBatchOperation::Symlink { target, linkpath } => {
+                let linkpath = normalize_path(linkpath)?;
+                mutate_symlink_state(state, target, &linkpath, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::SymlinkCreated,
+                    Some(linkpath),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Unlink { path } => {
+                let path = normalize_path(path)?;
+                mutate_unlink_state(state, &path, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::PathDeleted,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Rmdir { path } => {
+                let path = normalize_path(path)?;
+                mutate_rmdir_state(state, &path, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::DirectoryRemoved,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_overlay_batch_to_state(
+    state: &mut VolumeState,
+    base: &SnapshotState,
+    ops: &[VfsBatchOperation],
+    now: Timestamp,
+) -> Result<(), VfsError> {
+    for op in ops {
+        match op {
+            VfsBatchOperation::WriteFile { path, data, opts } => {
+                let path = normalize_path(path)?;
+                if let Some(resolved_path) = try_fast_overlay_new_target_path(state, base, &path)? {
+                    let delta_opts = CreateOptions {
+                        create_parents: false,
+                        ..opts.clone()
+                    };
+                    mutate_write_file_state(state, &resolved_path, data, &delta_opts, now)?;
+                } else {
+                    let merged = overlay_visible_snapshot(state, base);
+                    let resolved_path = if let Some((resolved_path, _)) =
+                        resolve_existing_in_maps_with_mode(
+                            &merged.paths,
+                            &merged.inodes,
+                            &path,
+                            true,
+                        )? {
+                        ensure_overlay_existing_path(
+                            state,
+                            base,
+                            &merged,
+                            &resolved_path,
+                            false,
+                            now,
+                        )?;
+                        resolved_path
+                    } else {
+                        materialize_overlay_parent_chain(
+                            state,
+                            base,
+                            &merged,
+                            &path,
+                            opts.create_parents,
+                            now,
+                        )?;
+                        resolve_target_path(state, &path)?
+                    };
+                    let delta_opts = CreateOptions {
+                        create_parents: false,
+                        ..opts.clone()
+                    };
+                    mutate_write_file_state(state, &resolved_path, data, &delta_opts, now)?;
+                }
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::FileWritten,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Pwrite { path, offset, data } => {
+                let path = normalize_path(path)?;
+                let merged = overlay_visible_snapshot(state, base);
+                let (resolved_path, _) =
+                    resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
+                        .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
+                ensure_overlay_existing_path(state, base, &merged, &resolved_path, false, now)?;
+                mutate_pwrite_state(state, &resolved_path, *offset, data, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::FilePatched,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Truncate { path, size } => {
+                let path = normalize_path(path)?;
+                let merged = overlay_visible_snapshot(state, base);
+                let (resolved_path, _) =
+                    resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
+                        .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
+                ensure_overlay_existing_path(state, base, &merged, &resolved_path, false, now)?;
+                mutate_truncate_state(state, &resolved_path, *size, now)?;
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::FileTruncated,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Mkdir { path, opts } => {
+                let path = normalize_path(path)?;
+                if path == "/" {
+                    if !opts.recursive {
+                        return Err(VfsError::AlreadyExists { path });
+                    }
+                    continue;
+                }
+                if opts.recursive
+                    && let Some((resolved_path, inode_id)) =
+                        resolve_existing_path(state, &path, false)?
+                {
+                    let inode = state
+                        .inodes
+                        .get(&inode_id)
+                        .ok_or_else(|| VfsError::NotFound {
+                            path: resolved_path.clone(),
+                        })?;
+                    if inode.stats.kind == FileKind::Directory {
+                        continue;
+                    }
+                }
+                if let Some(resolved_path) = try_fast_overlay_new_target_path(state, base, &path)? {
+                    let delta_opts = MkdirOptions {
+                        recursive: false,
+                        ..opts.clone()
+                    };
+                    if mutate_mkdir_state(state, &resolved_path, &delta_opts, now)? {
+                        append_activity(
+                            state,
+                            now,
+                            ActivityKind::DirectoryCreated,
+                            Some(path),
+                            None,
+                            BTreeMap::new(),
+                        );
+                    }
+                    continue;
+                }
+                let merged = overlay_visible_snapshot(state, base);
+                if let Some((resolved_path, inode_id)) =
+                    resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, false)?
+                {
+                    let inode = merged
+                        .inodes
+                        .get(&inode_id)
+                        .ok_or_else(|| VfsError::NotFound {
+                            path: resolved_path.clone(),
+                        })?;
+                    if inode.stats.kind == FileKind::Directory && opts.recursive {
+                        continue;
+                    }
+                    return Err(VfsError::AlreadyExists {
+                        path: resolved_path,
+                    });
+                }
+                materialize_overlay_parent_chain(state, base, &merged, &path, opts.recursive, now)?;
+                let resolved_path = resolve_target_path(state, &path)?;
+                let delta_opts = MkdirOptions {
+                    recursive: false,
+                    ..opts.clone()
+                };
+                if mutate_mkdir_state(state, &resolved_path, &delta_opts, now)? {
+                    append_activity(
+                        state,
+                        now,
+                        ActivityKind::DirectoryCreated,
+                        Some(path),
+                        None,
+                        BTreeMap::new(),
+                    );
+                }
+            }
+            VfsBatchOperation::Rename { from, to } => {
+                let from = normalize_path(from)?;
+                let to = normalize_path(to)?;
+                if from == "/" || to == "/" {
+                    return Err(VfsError::RootInvariant);
+                }
+                if from == to {
+                    continue;
+                }
+                let merged = overlay_visible_snapshot(state, base);
+                let (resolved_from, from_inode_id) = resolve_existing_in_maps_with_mode(
+                    &merged.paths,
+                    &merged.inodes,
+                    &from,
+                    false,
+                )?
+                .ok_or_else(|| VfsError::NotFound { path: from.clone() })?;
+                let resolved_to = resolve_target_path_in_maps(&merged.paths, &merged.inodes, &to)?;
+                if resolved_from == resolved_to {
+                    continue;
+                }
+                let from_kind = merged
+                    .inodes
+                    .get(&from_inode_id)
+                    .ok_or_else(|| VfsError::NotFound {
+                        path: resolved_from.clone(),
+                    })?
+                    .stats
+                    .kind;
+                let source_was_delta = state.paths.contains_key(&resolved_from);
+                if !source_was_delta {
+                    if from_kind == FileKind::Directory {
+                        copy_up_overlay_directory_subtree(
+                            state,
+                            base,
+                            &merged,
+                            &resolved_from,
+                            now,
+                        )?;
+                    } else {
+                        ensure_overlay_existing_path(
+                            state,
+                            base,
+                            &merged,
+                            &resolved_from,
+                            false,
+                            now,
+                        )?;
+                    }
+                }
+                let target_existing = resolve_existing_in_maps_with_mode(
+                    &merged.paths,
+                    &merged.inodes,
+                    &resolved_to,
+                    false,
+                )?;
+                let mut target_was_base = false;
+                if let Some((target_path, target_inode_id)) = target_existing {
+                    target_was_base = !state.paths.contains_key(&target_path);
+                    let target_kind = merged
+                        .inodes
+                        .get(&target_inode_id)
+                        .ok_or_else(|| VfsError::NotFound {
+                            path: target_path.clone(),
+                        })?
+                        .stats
+                        .kind;
+                    if from_kind == FileKind::Directory
+                        && target_kind == FileKind::Directory
+                        && merged.paths.keys().any(|candidate| {
+                            candidate != &target_path && is_descendant_path(&target_path, candidate)
+                        })
+                    {
+                        return Err(VfsError::DirectoryNotEmpty { path: target_path });
+                    }
+                    if target_was_base {
+                        ensure_overlay_existing_path(
+                            state,
+                            base,
+                            &merged,
+                            &target_path,
+                            false,
+                            now,
+                        )?;
+                    }
+                } else {
+                    materialize_overlay_parent_chain(
+                        state,
+                        base,
+                        &merged,
+                        &resolved_to,
+                        false,
+                        now,
+                    )?;
+                }
+                if mutate_rename_state(state, &resolved_from, &resolved_to, now)? {
+                    if !source_was_delta {
+                        state.whiteouts.insert(resolved_from.clone());
+                    }
+                    if target_was_base {
+                        state.whiteouts.insert(resolved_to.clone());
+                    }
+                    let mut metadata = BTreeMap::new();
+                    metadata.insert("to".to_string(), json!(to));
+                    append_activity(
+                        state,
+                        now,
+                        ActivityKind::PathRenamed,
+                        Some(from),
+                        None,
+                        metadata,
+                    );
+                }
+            }
+            VfsBatchOperation::Link { from, to } => {
+                let from = normalize_path(from)?;
+                let to = normalize_path(to)?;
+                let merged = overlay_visible_snapshot(state, base);
+                let (resolved_from, _) = resolve_existing_in_maps_with_mode(
+                    &merged.paths,
+                    &merged.inodes,
+                    &from,
+                    false,
+                )?
+                .ok_or_else(|| VfsError::NotFound { path: from.clone() })?;
+                ensure_overlay_existing_path(state, base, &merged, &resolved_from, false, now)?;
+                let resolved_to = resolve_target_path_in_maps(&merged.paths, &merged.inodes, &to)?;
+                materialize_overlay_parent_chain(state, base, &merged, &resolved_to, false, now)?;
+                mutate_link_state(state, &resolved_from, &resolved_to, now)?;
+                let mut metadata = BTreeMap::new();
+                metadata.insert("from".to_string(), json!(from));
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::HardLinkCreated,
+                    Some(to),
+                    None,
+                    metadata,
+                );
+            }
+            VfsBatchOperation::Symlink { target, linkpath } => {
+                let linkpath = normalize_path(linkpath)?;
+                if let Some(resolved_linkpath) =
+                    try_fast_overlay_new_target_path(state, base, &linkpath)?
+                {
+                    mutate_symlink_state(state, target, &resolved_linkpath, now)?;
+                } else {
+                    let merged = overlay_visible_snapshot(state, base);
+                    materialize_overlay_parent_chain(state, base, &merged, &linkpath, false, now)?;
+                    let resolved_linkpath = resolve_target_path(state, &linkpath)?;
+                    mutate_symlink_state(state, target, &resolved_linkpath, now)?;
+                }
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::SymlinkCreated,
+                    Some(linkpath),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Unlink { path } => {
+                let path = normalize_path(path)?;
+                let merged = overlay_visible_snapshot(state, base);
+                let (resolved_path, resolved_inode) = resolve_existing_in_maps_with_mode(
+                    &merged.paths,
+                    &merged.inodes,
+                    &path,
+                    false,
+                )?
+                .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
+                let resolved_kind = merged
+                    .inodes
+                    .get(&resolved_inode)
+                    .ok_or_else(|| VfsError::NotFound {
+                        path: resolved_path.clone(),
+                    })?
+                    .stats
+                    .kind;
+                let was_base = !state.paths.contains_key(&resolved_path);
+                if was_base {
+                    ensure_overlay_existing_path(state, base, &merged, &resolved_path, false, now)?;
+                }
+                if resolved_kind == FileKind::Directory {
+                    return Err(VfsError::IsDirectory {
+                        path: resolved_path,
+                    });
+                }
+                mutate_unlink_state(state, &resolved_path, now)?;
+                if was_base {
+                    state.whiteouts.insert(resolved_path);
+                }
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::PathDeleted,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            VfsBatchOperation::Rmdir { path } => {
+                let path = normalize_path(path)?;
+                let merged = overlay_visible_snapshot(state, base);
+                let (resolved_path, resolved_inode) = resolve_existing_in_maps_with_mode(
+                    &merged.paths,
+                    &merged.inodes,
+                    &path,
+                    false,
+                )?
+                .ok_or_else(|| VfsError::NotFound { path: path.clone() })?;
+                let resolved_kind = merged
+                    .inodes
+                    .get(&resolved_inode)
+                    .ok_or_else(|| VfsError::NotFound {
+                        path: resolved_path.clone(),
+                    })?
+                    .stats
+                    .kind;
+                if resolved_kind != FileKind::Directory {
+                    return Err(VfsError::NotDirectory {
+                        path: resolved_path,
+                    });
+                }
+                let was_base = !state.paths.contains_key(&resolved_path);
+                if was_base {
+                    ensure_overlay_existing_path(state, base, &merged, &resolved_path, true, now)?;
+                }
+                mutate_rmdir_state(state, &resolved_path, now)?;
+                if was_base {
+                    state.whiteouts.insert(resolved_path);
+                }
+                append_activity(
+                    state,
+                    now,
+                    ActivityKind::DirectoryRemoved,
+                    Some(path),
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn mutate_mkdir_state(
     state: &mut VolumeState,
     path: &str,
@@ -2676,6 +3329,41 @@ fn build_overlay_snapshot(delta: &SnapshotState, base: &SnapshotState) -> Snapsh
 
 fn overlay_visible_snapshot(state: &VolumeState, base: &SnapshotState) -> SnapshotState {
     build_overlay_snapshot(&state.visible_snapshot(), base)
+}
+
+fn try_fast_overlay_new_target_path(
+    state: &VolumeState,
+    base: &SnapshotState,
+    path: &str,
+) -> Result<Option<String>, VfsError> {
+    if !state.whiteouts.is_empty() {
+        return Ok(None);
+    }
+    let Some(parent) = parent_path(path) else {
+        return Err(VfsError::RootInvariant);
+    };
+    let Some(name) = basename(path) else {
+        return Err(VfsError::RootInvariant);
+    };
+    let Some((resolved_parent, parent_inode)) = resolve_existing_path(state, &parent, true)? else {
+        return Ok(None);
+    };
+    let parent_record = state
+        .inodes
+        .get(&parent_inode)
+        .ok_or_else(|| VfsError::NotDirectory {
+            path: resolved_parent.clone(),
+        })?;
+    if parent_record.stats.kind != FileKind::Directory {
+        return Err(VfsError::NotDirectory {
+            path: resolved_parent,
+        });
+    }
+    let resolved_path = join_path(&resolved_parent, name);
+    if state.paths.contains_key(&resolved_path) || base.paths.contains_key(&resolved_path) {
+        return Ok(None);
+    }
+    Ok(Some(resolved_path))
 }
 
 fn overlay_path_whiteouted(whiteouts: &BTreeSet<String>, path: &str) -> bool {

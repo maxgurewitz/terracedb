@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use terracedb_workflows::{
     WORKFLOW_RUNTIME_SURFACE_LABEL, WORKFLOW_RUNTIME_SURFACE_STATE_OUTBOX_TIMERS_V1,
     contracts::{
-        WorkflowBundleId, WorkflowBundleKind, WorkflowBundleMetadata, WorkflowCommand,
-        WorkflowLifecycleState, WorkflowNativeRegistrationMetadata, WorkflowOutboxCommand,
-        WorkflowPayload, WorkflowRegistrationId, WorkflowTaskError, WorkflowTimerCommand,
-        WorkflowTransitionInput, WorkflowTransitionOutput, WorkflowTrigger,
-        WorkflowVisibilityUpdate,
+        WorkflowBundleId, WorkflowBundleKind, WorkflowBundleMetadata,
+        WorkflowCallbackDeliveryCommand, WorkflowCommand, WorkflowLifecycleState,
+        WorkflowNativeRegistrationMetadata, WorkflowPayload, WorkflowRegistrationId,
+        WorkflowSandboxPackageCompatibility, WorkflowSandboxPreparation, WorkflowSandboxSourceKind,
+        WorkflowTaskError, WorkflowTimerCommand, WorkflowTransitionInput, WorkflowTransitionOutput,
+        WorkflowTrigger, WorkflowVisibilityUpdate,
     },
 };
 use terracedb_workflows_sandbox::WORKFLOW_TASK_V1_ABI;
@@ -17,8 +18,7 @@ pub const NATIVE_WORKFLOW_NAME: &str = "workflow-duet-native";
 pub const SANDBOX_WORKFLOW_NAME: &str = "workflow-duet-sandbox";
 pub const NATIVE_REGISTRATION_ID: &str = "registration:workflow-duet:review:v1";
 pub const SANDBOX_BUNDLE_ID: &str = "bundle:workflow-duet:review-sandbox:v1";
-pub const SANDBOX_MODULE_PATH: &str = "/workspace/review_workflow.js";
-pub const SANDBOX_SOURCE_MODULE_PATH: &str = "/workspace/review_workflow.ts";
+pub const SANDBOX_MODULE_PATH: &str = "/workspace/review_workflow.ts";
 pub const SANDBOX_PACKAGE_JSON_PATH: &str = "/workspace/package.json";
 pub const SANDBOX_TSCONFIG_PATH: &str = "/workspace/tsconfig.json";
 pub const START_CALLBACK_ID: &str = "start";
@@ -52,18 +52,10 @@ pub struct ReviewState {
     pub attempt: u32,
     pub started_at_millis: u64,
     pub last_updated_at_millis: u64,
+    pub approval_received: bool,
     pub waiting_for_callback: Option<String>,
     pub deadline_millis: Option<u64>,
     pub last_trigger: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewOutboxMessage {
-    pub workflow: String,
-    pub instance_id: String,
-    pub action: String,
-    pub attempt: u32,
-    pub trigger: String,
 }
 
 pub fn native_registration() -> WorkflowNativeRegistrationMetadata {
@@ -85,6 +77,12 @@ pub fn sandbox_bundle() -> WorkflowBundleMetadata {
             abi: WORKFLOW_TASK_V1_ABI.to_string(),
             module: SANDBOX_MODULE_PATH.to_string(),
             entrypoint: "default".to_string(),
+            preparation: WorkflowSandboxPreparation {
+                source_kind: Some(WorkflowSandboxSourceKind::TypeScript),
+                package_compat: Some(WorkflowSandboxPackageCompatibility::NpmPureJs),
+                package_manifest_path: Some(SANDBOX_PACKAGE_JSON_PATH.to_string()),
+                tsconfig_path: Some(SANDBOX_TSCONFIG_PATH.to_string()),
+            },
         },
         created_at_millis: 1,
         labels: runtime_labels("sandbox"),
@@ -156,6 +154,7 @@ fn handle_start_transition(
         attempt: 1,
         started_at_millis: input.admitted_at_millis,
         last_updated_at_millis: input.admitted_at_millis,
+        approval_received: false,
         waiting_for_callback: None,
         deadline_millis: None,
         last_trigger: trigger_label.to_string(),
@@ -163,19 +162,13 @@ fn handle_start_transition(
     let retry_at = input.admitted_at_millis.saturating_add(RETRY_DELAY_MILLIS);
     build_transition(
         workflow_name,
-        &input.instance_id,
         next_state,
         Some(WorkflowLifecycleState::Running),
-        vec![
-            outbox_command(
-                workflow_name,
-                &input.instance_id,
-                "requested-check",
-                1,
-                trigger_label,
-            )?,
-            schedule_timer_command(retry_timer_id(&input.instance_id), retry_at, "retry"),
-        ],
+        vec![schedule_timer_command(
+            retry_timer_id(&input.instance_id),
+            retry_at,
+            "retry",
+        )],
     )
 }
 
@@ -194,35 +187,80 @@ fn handle_existing_transition(
                 ..
             },
         ) if *timer_id == retry_timer_id(&input.instance_id) => {
-            let deadline = fire_at_millis.saturating_add(APPROVAL_TIMEOUT_MILLIS);
+            let next_attempt = state.attempt.saturating_add(1);
+            let counterpart = counterpart_workflow_name(workflow_name)?;
+            if state.approval_received {
+                let next_state = ReviewState {
+                    stage: ReviewStage::Approved,
+                    attempt: next_attempt,
+                    started_at_millis: state.started_at_millis,
+                    last_updated_at_millis: input.admitted_at_millis,
+                    approval_received: true,
+                    waiting_for_callback: None,
+                    deadline_millis: None,
+                    last_trigger: trigger_label.to_string(),
+                };
+                build_transition(
+                    workflow_name,
+                    next_state,
+                    Some(WorkflowLifecycleState::Completed),
+                    vec![deliver_callback_command(
+                        counterpart,
+                        &input.instance_id,
+                        APPROVE_CALLBACK_ID,
+                        b"approved".to_vec(),
+                    )],
+                )
+            } else {
+                let deadline = fire_at_millis.saturating_add(APPROVAL_TIMEOUT_MILLIS);
+                let next_state = ReviewState {
+                    stage: ReviewStage::WaitingApproval,
+                    attempt: next_attempt,
+                    started_at_millis: state.started_at_millis,
+                    last_updated_at_millis: input.admitted_at_millis,
+                    approval_received: false,
+                    waiting_for_callback: Some(APPROVE_CALLBACK_ID.to_string()),
+                    deadline_millis: Some(deadline),
+                    last_trigger: trigger_label.to_string(),
+                };
+                build_transition(
+                    workflow_name,
+                    next_state,
+                    Some(WorkflowLifecycleState::Running),
+                    vec![
+                        deliver_callback_command(
+                            counterpart,
+                            &input.instance_id,
+                            APPROVE_CALLBACK_ID,
+                            b"approved".to_vec(),
+                        ),
+                        schedule_timer_command(
+                            approval_timeout_timer_id(&input.instance_id),
+                            deadline,
+                            "approval-timeout",
+                        ),
+                    ],
+                )
+            }
+        }
+        (ReviewStage::RetryBackoff, WorkflowTrigger::Callback { callback_id, .. })
+            if callback_id == APPROVE_CALLBACK_ID =>
+        {
             let next_state = ReviewState {
-                stage: ReviewStage::WaitingApproval,
-                attempt: state.attempt.saturating_add(1),
+                stage: ReviewStage::RetryBackoff,
+                attempt: state.attempt,
                 started_at_millis: state.started_at_millis,
                 last_updated_at_millis: input.admitted_at_millis,
-                waiting_for_callback: Some(APPROVE_CALLBACK_ID.to_string()),
-                deadline_millis: Some(deadline),
+                approval_received: true,
+                waiting_for_callback: None,
+                deadline_millis: None,
                 last_trigger: trigger_label.to_string(),
             };
             build_transition(
                 workflow_name,
-                &input.instance_id,
-                next_state.clone(),
+                next_state,
                 Some(WorkflowLifecycleState::Running),
-                vec![
-                    outbox_command(
-                        workflow_name,
-                        &input.instance_id,
-                        "requested-approval",
-                        next_state.attempt,
-                        trigger_label,
-                    )?,
-                    schedule_timer_command(
-                        approval_timeout_timer_id(&input.instance_id),
-                        deadline,
-                        "approval-timeout",
-                    ),
-                ],
+                Vec::new(),
             )
         }
         (ReviewStage::WaitingApproval, WorkflowTrigger::Callback { callback_id, .. })
@@ -233,25 +271,18 @@ fn handle_existing_transition(
                 attempt: state.attempt,
                 started_at_millis: state.started_at_millis,
                 last_updated_at_millis: input.admitted_at_millis,
+                approval_received: true,
                 waiting_for_callback: None,
                 deadline_millis: None,
                 last_trigger: trigger_label.to_string(),
             };
             build_transition(
                 workflow_name,
-                &input.instance_id,
-                next_state.clone(),
+                next_state,
                 Some(WorkflowLifecycleState::Completed),
-                vec![
-                    cancel_timer_command(approval_timeout_timer_id(&input.instance_id)),
-                    outbox_command(
-                        workflow_name,
-                        &input.instance_id,
-                        "approved",
-                        next_state.attempt,
-                        trigger_label,
-                    )?,
-                ],
+                vec![cancel_timer_command(approval_timeout_timer_id(
+                    &input.instance_id,
+                ))],
             )
         }
         (ReviewStage::WaitingApproval, WorkflowTrigger::Timer { timer_id, .. })
@@ -262,22 +293,16 @@ fn handle_existing_transition(
                 attempt: state.attempt,
                 started_at_millis: state.started_at_millis,
                 last_updated_at_millis: input.admitted_at_millis,
+                approval_received: state.approval_received,
                 waiting_for_callback: None,
                 deadline_millis: None,
                 last_trigger: trigger_label.to_string(),
             };
             build_transition(
                 workflow_name,
-                &input.instance_id,
-                next_state.clone(),
+                next_state,
                 Some(WorkflowLifecycleState::Failed),
-                vec![outbox_command(
-                    workflow_name,
-                    &input.instance_id,
-                    "timed-out",
-                    next_state.attempt,
-                    trigger_label,
-                )?],
+                Vec::new(),
             )
         }
         _ => Ok(WorkflowTransitionOutput {
@@ -292,7 +317,6 @@ fn handle_existing_transition(
 
 fn build_transition(
     workflow_name: &str,
-    instance_id: &str,
     state: ReviewState,
     lifecycle: Option<WorkflowLifecycleState>,
     commands: Vec<WorkflowCommand>,
@@ -304,22 +328,7 @@ fn build_transition(
         lifecycle,
         visibility: Some(visibility_update(workflow_name, &state)),
         continue_as_new: None,
-        commands: {
-            let mut commands = commands;
-            if state.stage == ReviewStage::RetryBackoff {
-                commands.insert(
-                    0,
-                    outbox_command(
-                        workflow_name,
-                        instance_id,
-                        "accepted-start",
-                        state.attempt,
-                        &state.last_trigger,
-                    )?,
-                );
-            }
-            commands
-        },
+        commands,
     })
 }
 
@@ -335,6 +344,10 @@ fn visibility_update(workflow_name: &str, state: &ReviewState) -> WorkflowVisibi
                 .clone()
                 .unwrap_or_else(|| "-".to_string()),
         ),
+        (
+            "approval-received".to_string(),
+            state.approval_received.to_string(),
+        ),
     ]);
     if let Some(deadline) = state.deadline_millis {
         summary.insert("deadline-millis".to_string(), deadline.to_string());
@@ -349,29 +362,30 @@ fn visibility_update(workflow_name: &str, state: &ReviewState) -> WorkflowVisibi
     }
 }
 
-fn outbox_command(
-    workflow_name: &str,
+fn counterpart_workflow_name(workflow_name: &str) -> Result<&'static str, WorkflowTaskError> {
+    match workflow_name {
+        NATIVE_WORKFLOW_NAME => Ok(SANDBOX_WORKFLOW_NAME),
+        SANDBOX_WORKFLOW_NAME => Ok(NATIVE_WORKFLOW_NAME),
+        other => Err(WorkflowTaskError::invalid_contract(format!(
+            "workflow-duet does not know counterpart for workflow {other}"
+        ))),
+    }
+}
+
+fn deliver_callback_command(
+    target_workflow: &str,
     instance_id: &str,
-    action: &str,
-    attempt: u32,
-    trigger: &str,
-) -> Result<WorkflowCommand, WorkflowTaskError> {
-    let key = format!("{instance_id}:{action}:{attempt}");
-    let payload = serde_json::to_vec(&ReviewOutboxMessage {
-        workflow: workflow_name.to_string(),
-        instance_id: instance_id.to_string(),
-        action: action.to_string(),
-        attempt,
-        trigger: trigger.to_string(),
-    })
-    .map_err(|error| WorkflowTaskError::serialization("workflow-duet outbox payload", error))?;
-    Ok(WorkflowCommand::Outbox {
-        entry: WorkflowOutboxCommand {
-            outbox_id: key.as_bytes().to_vec(),
-            idempotency_key: key,
-            payload,
+    callback_id: &str,
+    response: Vec<u8>,
+) -> WorkflowCommand {
+    WorkflowCommand::DeliverCallback {
+        delivery: WorkflowCallbackDeliveryCommand {
+            target_workflow: target_workflow.to_string(),
+            instance_id: instance_id.to_string(),
+            callback_id: callback_id.to_string(),
+            response,
         },
-    })
+    }
 }
 
 fn schedule_timer_command(

@@ -219,6 +219,10 @@ pub enum WorkflowError {
         #[source]
         source: WorkflowHandlerError,
     },
+    #[error(
+        "workflow {current} cannot deliver callback directly to workflow {target}; cross-workflow delivery requires a dispatcher"
+    )]
+    UnsupportedCrossWorkflowCallbackDelivery { current: String, target: String },
     #[error("workflow {name} panicked: {reason}")]
     Panic { name: String, reason: String },
 }
@@ -241,6 +245,7 @@ impl WorkflowError {
             | Self::SubscriptionClosed { .. }
             | Self::CheckpointStore { .. }
             | Self::Handler { .. }
+            | Self::UnsupportedCrossWorkflowCallbackDelivery { .. }
             | Self::Panic { .. } => None,
         }
     }
@@ -5392,6 +5397,7 @@ fn map_workflow_runtime_error_to_task_error(error: WorkflowError) -> contracts::
         | WorkflowError::Panic { .. }
         | WorkflowError::AlreadyRunning { .. }
         | WorkflowError::RestoreWhileRunning { .. }
+        | WorkflowError::UnsupportedCrossWorkflowCallbackDelivery { .. }
         | WorkflowError::SubscriptionClosed { .. } => "runtime-error",
         WorkflowError::EmptyName | WorkflowError::EmptyInstanceId => "invalid-contract",
     };
@@ -6922,6 +6928,25 @@ where
                     .timers
                     .cancel_in_transaction(tx, timer_id.clone())
                     .await?;
+            }
+            WorkflowEffectIntent::DeliverCallback { delivery } => {
+                if delivery.target_workflow != runtime.name {
+                    return Err(WorkflowError::UnsupportedCrossWorkflowCallbackDelivery {
+                        current: runtime.name.clone(),
+                        target: delivery.target_workflow.clone(),
+                    });
+                }
+                stage_trigger_admission(
+                    runtime,
+                    tx,
+                    &delivery.instance_id,
+                    &WorkflowTrigger::Callback {
+                        callback_id: delivery.callback_id.clone(),
+                        response: delivery.response.clone(),
+                    },
+                    operation_context.clone(),
+                )
+                .await?;
             }
         }
     }

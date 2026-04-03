@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use crc32fast::Hasher;
+use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use terracedb_vfs::{CreateOptions, JsonValue, MkdirOptions};
 use tokio::sync::Mutex;
@@ -69,6 +70,7 @@ pub struct DeterministicPackageDefinition {
     pub name: String,
     pub version: String,
     pub entrypoint: String,
+    pub types_entrypoint: Option<String>,
     pub files: BTreeMap<String, String>,
     pub dependencies: Vec<String>,
     pub uses_node_builtins: bool,
@@ -85,6 +87,7 @@ impl DeterministicPackageDefinition {
             name: name.into(),
             version: version.into(),
             entrypoint: "index.js".to_string(),
+            types_entrypoint: None,
             files: BTreeMap::from([("index.js".to_string(), source.into())]),
             dependencies: Vec::new(),
             uses_node_builtins: false,
@@ -110,6 +113,11 @@ impl DeterministicPackageDefinition {
 
     pub fn with_entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
         self.entrypoint = entrypoint.into();
+        self
+    }
+
+    pub fn with_types_entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
+        self.types_entrypoint = Some(entrypoint.into());
         self
     }
 
@@ -147,6 +155,7 @@ struct CachedPackage {
     integrity: String,
     files: BTreeMap<String, Vec<u8>>,
     entrypoint: String,
+    types_entrypoint: Option<String>,
     dependencies: Vec<String>,
     uses_node_builtins: bool,
 }
@@ -384,16 +393,16 @@ impl DeterministicPackageInstaller {
                     reason: "package is not available in the deterministic registry".to_string(),
                 })?;
         match version_request {
-            Some(version) => {
-                versions
-                    .get(version)
-                    .cloned()
-                    .ok_or_else(|| SandboxError::UnsupportedPackage {
-                        package: format!("{package}@{version}"),
-                        reason: "version is not available in the deterministic registry"
-                            .to_string(),
-                    })
-            }
+            Some(version) => versions
+                .iter()
+                .rev()
+                .find_map(|(candidate, definition)| {
+                    matches_version_request(candidate, version).then(|| definition.clone())
+                })
+                .ok_or_else(|| SandboxError::UnsupportedPackage {
+                    package: format!("{package}@{version}"),
+                    reason: "version is not available in the deterministic registry".to_string(),
+                }),
             None => versions
                 .iter()
                 .next_back()
@@ -488,6 +497,7 @@ fn cached_package_for(definition: &DeterministicPackageDefinition) -> CachedPack
         integrity,
         files,
         entrypoint: definition.entrypoint.clone(),
+        types_entrypoint: definition.types_entrypoint.clone(),
         dependencies: definition.dependencies.clone(),
         uses_node_builtins: definition.uses_node_builtins,
     }
@@ -520,13 +530,16 @@ async fn write_package_tree(
             )
             .await?;
     }
-    let package_json = serde_json::json!({
+    let mut package_json = serde_json::json!({
         "name": package.package,
         "version": package.version,
         "type": "module",
         "main": package.entrypoint,
         "exports": format!("./{}", package.entrypoint),
     });
+    if let Some(entrypoint) = package.types_entrypoint.as_ref() {
+        package_json["types"] = JsonValue::String(format!("./{entrypoint}"));
+    }
     filesystem
         .write_file(
             &format!("{root}/package.json"),
@@ -636,8 +649,105 @@ fn cache_key_for(
     format!("{:08x}", hasher.finalize())
 }
 
+fn matches_version_request(candidate: &str, request: &str) -> bool {
+    if request.is_empty() || matches!(request, "*" | "latest") {
+        return true;
+    }
+    if request == candidate {
+        return true;
+    }
+    let Some(candidate_parts) = parse_semver_parts(candidate) else {
+        return false;
+    };
+    if let Some(base) = request.strip_prefix('^').and_then(parse_semver_parts) {
+        if candidate_parts.0 != base.0 {
+            return false;
+        }
+        return candidate_parts >= base;
+    }
+    if let Some(base) = request.strip_prefix('~').and_then(parse_semver_parts) {
+        if candidate_parts.0 != base.0 || candidate_parts.1 != base.1 {
+            return false;
+        }
+        return candidate_parts >= base;
+    }
+    false
+}
+
+fn parse_semver_parts(input: &str) -> Option<(u64, u64, u64)> {
+    let mut segments = input.split('.');
+    let major = segments.next()?.parse().ok()?;
+    let minor = segments.next().unwrap_or("0").parse().ok()?;
+    let patch = segments
+        .next()
+        .unwrap_or("0")
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
+}
+
+static TYPESCRIPT_5_9_3_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/vendor/typescript/5.9.3");
+
+fn collect_vendored_files(directory: &Dir<'_>, prefix: &str, files: &mut BTreeMap<String, String>) {
+    for file in directory.files() {
+        let path = if prefix.is_empty() {
+            file.path()
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string()
+        } else {
+            format!(
+                "{prefix}/{}",
+                file.path().to_string_lossy().trim_start_matches('/')
+            )
+        };
+        let contents = file
+            .contents_utf8()
+            .unwrap_or_else(|| panic!("vendored file {} must be UTF-8", path))
+            .to_string();
+        files.insert(path, contents);
+    }
+    for child in directory.dirs() {
+        let child_prefix = if prefix.is_empty() {
+            child
+                .path()
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string()
+        } else {
+            format!(
+                "{prefix}/{}",
+                child.path().to_string_lossy().trim_start_matches('/')
+            )
+        };
+        collect_vendored_files(child, &child_prefix, files);
+    }
+}
+
+fn vendored_typescript_definition(
+    version: &str,
+    directory: &Dir<'_>,
+) -> DeterministicPackageDefinition {
+    let mut files = BTreeMap::new();
+    collect_vendored_files(directory, "", &mut files);
+    DeterministicPackageDefinition {
+        name: "typescript".to_string(),
+        version: version.to_string(),
+        entrypoint: "index.js".to_string(),
+        types_entrypoint: Some("lib/typescript.d.ts".to_string()),
+        files,
+        dependencies: Vec::new(),
+        uses_node_builtins: false,
+        package_class: DeterministicPackageClass::PureJsEsm,
+    }
+}
+
 fn default_registry() -> BTreeMap<String, BTreeMap<String, DeterministicPackageDefinition>> {
     let definitions = [
+        vendored_typescript_definition("5.9.3", &TYPESCRIPT_5_9_3_DIR),
         DeterministicPackageDefinition::esm(
             "lodash",
             "4.17.21",

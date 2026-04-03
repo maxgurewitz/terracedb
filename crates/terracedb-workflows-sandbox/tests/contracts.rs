@@ -11,9 +11,10 @@ use terracedb_workflows_core::{
     NativeWorkflowHandlerAdapter, NoopWorkflowObservability, StrictWorkflowParityComparator,
     WorkflowBundleId, WorkflowBundleKind, WorkflowBundleMetadata, WorkflowCommand,
     WorkflowDeterministicContext, WorkflowHandlerContract, WorkflowOutboxCommand,
-    WorkflowParityComparator, WorkflowPayload, WorkflowSourceEvent, WorkflowStateMutation,
-    WorkflowTaskError, WorkflowTaskId, WorkflowTransitionInput, WorkflowTransitionOutput,
-    WorkflowTrigger,
+    WorkflowParityComparator, WorkflowPayload, WorkflowSandboxPackageCompatibility,
+    WorkflowSandboxPreparation, WorkflowSandboxSourceKind, WorkflowSourceEvent,
+    WorkflowStateMutation, WorkflowTaskError, WorkflowTaskId, WorkflowTransitionInput,
+    WorkflowTransitionOutput, WorkflowTrigger,
 };
 use terracedb_workflows_sandbox::{
     SandboxModuleWorkflowTaskV1Handler, SandboxWorkflowHandlerAdapter, WORKFLOW_TASK_V1_ABI,
@@ -119,6 +120,38 @@ fn sample_bundle() -> WorkflowBundleMetadata {
             abi: WORKFLOW_TASK_V1_ABI.to_string(),
             module: "/workspace/billing.js".to_string(),
             entrypoint: "default".to_string(),
+            preparation: Default::default(),
+        },
+        created_at_millis: 1,
+        labels: BTreeMap::from([
+            ("track".to_string(), "T108".to_string()),
+            (
+                "terracedb.workflow.runtime-surface".to_string(),
+                "state-outbox-timers/v1".to_string(),
+            ),
+        ]),
+    }
+}
+
+fn sample_typescript_bundle(
+    workflow_name: &str,
+    module: &str,
+    package_manifest_path: Option<&str>,
+    tsconfig_path: Option<&str>,
+) -> WorkflowBundleMetadata {
+    WorkflowBundleMetadata {
+        bundle_id: WorkflowBundleId::new("bundle:ts:v1").expect("bundle id"),
+        workflow_name: workflow_name.to_string(),
+        kind: WorkflowBundleKind::Sandbox {
+            abi: WORKFLOW_TASK_V1_ABI.to_string(),
+            module: module.to_string(),
+            entrypoint: "default".to_string(),
+            preparation: WorkflowSandboxPreparation {
+                source_kind: Some(WorkflowSandboxSourceKind::TypeScript),
+                package_compat: Some(WorkflowSandboxPackageCompatibility::NpmPureJs),
+                package_manifest_path: package_manifest_path.map(ToOwned::to_owned),
+                tsconfig_path: tsconfig_path.map(ToOwned::to_owned),
+            },
         },
         created_at_millis: 1,
         labels: BTreeMap::from([
@@ -655,4 +688,259 @@ async fn sdk_defined_module_can_import_generated_capability_catalog() {
             state: WorkflowPayload::bytes(r#"{"echoed":"echo:terrace:host/tickets"}"#),
         }
     );
+}
+
+#[tokio::test]
+async fn typescript_bundle_prepares_direct_entrypoints_and_executes_installed_packages() {
+    let (vfs, sandbox) = sandbox_store(140, 95);
+    let base_volume_id = VolumeId::new(0x9340);
+    let session_volume_id = VolumeId::new(0x9341);
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/package.json",
+        r#"{
+          "name": "billing-ts",
+          "private": true,
+          "type": "module",
+          "dependencies": {
+            "lodash": "*"
+          },
+          "devDependencies": {
+            "typescript": "5.9.3"
+          }
+        }"#,
+    )
+    .await;
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/tsconfig.json",
+        r#"{
+          "compilerOptions": {
+            "module": "esnext",
+            "target": "es2022"
+          }
+        }"#,
+    )
+    .await;
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/billing.ts",
+        r#"
+        import { camelCase } from "lodash";
+        import { schema, wf } from "@terrace/workflow";
+
+        const BillingState = wf.jsonState(
+          schema.object({
+            workflow_slug: schema.string(),
+          }),
+        );
+
+        export default wf.define({
+          state: BillingState,
+
+          async handle({ workflowName, running }) {
+            return running({
+              putState: {
+                workflow_slug: camelCase(workflowName),
+              },
+            });
+          },
+        });
+        "#,
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::NpmPureJs,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let bundle = sample_typescript_bundle(
+        "billing-workflow",
+        "/workspace/billing.ts",
+        Some("/workspace/package.json"),
+        Some("/workspace/tsconfig.json"),
+    );
+    let handler =
+        SandboxModuleWorkflowTaskV1Handler::new(session, bundle.clone()).expect("module handler");
+    let mut input = sample_input(&bundle);
+    input.state = None;
+    input.history_len = 0;
+
+    let response = handler
+        .handle_task_v1(WorkflowTaskV1Request {
+            abi: WORKFLOW_TASK_V1_ABI.to_string(),
+            input,
+            deterministic: terracedb_workflows_core::WorkflowDeterministicSeed {
+                workflow_name: "billing-workflow".to_string(),
+                instance_id: "acct-7".to_string(),
+                run_id: terracedb_workflows_core::WorkflowRunId::new("run:acct-7").expect("run id"),
+                task_id: WorkflowTaskId::new("task:acct-7:1").expect("task id"),
+                trigger_hash: 11,
+                state_hash: 22,
+            },
+        })
+        .await
+        .expect("handle task");
+
+    assert_eq!(response.abi, WORKFLOW_TASK_V1_ABI);
+    assert_eq!(
+        response.output.state,
+        WorkflowStateMutation::Put {
+            state: WorkflowPayload::bytes(r#"{"workflow_slug":"billingWorkflow"}"#),
+        }
+    );
+}
+
+#[tokio::test]
+async fn typescript_bundle_requires_matching_package_compatibility_mode() {
+    let (vfs, sandbox) = sandbox_store(141, 96);
+    let base_volume_id = VolumeId::new(0x9350);
+    let session_volume_id = VolumeId::new(0x9351);
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/billing.ts",
+        r#"
+        import { wf } from "@terrace/workflow";
+
+        export default wf.define({
+          async handle({ running }) {
+            return running({});
+          },
+        });
+        "#,
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::TerraceOnly,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let bundle = sample_typescript_bundle("billing", "/workspace/billing.ts", None, None);
+    let handler =
+        SandboxModuleWorkflowTaskV1Handler::new(session, bundle.clone()).expect("module handler");
+    let mut input = sample_input(&bundle);
+    input.state = None;
+    input.history_len = 0;
+
+    let error = handler
+        .handle_task_v1(WorkflowTaskV1Request {
+            abi: WORKFLOW_TASK_V1_ABI.to_string(),
+            input,
+            deterministic: terracedb_workflows_core::WorkflowDeterministicSeed {
+                workflow_name: "billing".to_string(),
+                instance_id: "acct-7".to_string(),
+                run_id: terracedb_workflows_core::WorkflowRunId::new("run:acct-7").expect("run id"),
+                task_id: WorkflowTaskId::new("task:acct-7:1").expect("task id"),
+                trigger_hash: 11,
+                state_hash: 22,
+            },
+        })
+        .await
+        .expect_err("package-compat mismatch should fail");
+
+    assert_eq!(error.code, "invalid-contract");
+    assert!(error.message.contains("expects package compatibility"));
+    assert!(error.message.contains("NpmPureJs"));
+}
+
+#[tokio::test]
+async fn typescript_bundle_reports_clear_subset_diagnostics() {
+    let (vfs, sandbox) = sandbox_store(142, 97);
+    let base_volume_id = VolumeId::new(0x9360);
+    let session_volume_id = VolumeId::new(0x9361);
+    seed_module(
+        &vfs,
+        base_volume_id,
+        "/workspace/billing.ts",
+        r#"
+        import { wf } from "@terrace/workflow";
+
+        type BillingState = {
+          status: string;
+        };
+
+        export default wf.define({
+          async handle({ running }) {
+            return running({});
+          },
+        });
+        "#,
+    )
+    .await;
+
+    let session = sandbox
+        .open_session(SandboxConfig {
+            session_volume_id,
+            session_chunk_size: Some(4096),
+            base_volume_id,
+            durable_base: false,
+            workspace_root: "/workspace".to_string(),
+            package_compat: PackageCompatibilityMode::NpmPureJs,
+            conflict_policy: ConflictPolicy::Fail,
+            capabilities: Default::default(),
+            execution_policy: None,
+            hoisted_source: None,
+            git_provenance: None,
+        })
+        .await
+        .expect("open session");
+
+    let bundle = sample_typescript_bundle("billing", "/workspace/billing.ts", None, None);
+    let handler =
+        SandboxModuleWorkflowTaskV1Handler::new(session, bundle.clone()).expect("module handler");
+    let mut input = sample_input(&bundle);
+    input.state = None;
+    input.history_len = 0;
+
+    let error = handler
+        .handle_task_v1(WorkflowTaskV1Request {
+            abi: WORKFLOW_TASK_V1_ABI.to_string(),
+            input,
+            deterministic: terracedb_workflows_core::WorkflowDeterministicSeed {
+                workflow_name: "billing".to_string(),
+                instance_id: "acct-7".to_string(),
+                run_id: terracedb_workflows_core::WorkflowRunId::new("run:acct-7").expect("run id"),
+                task_id: WorkflowTaskId::new("task:acct-7:1").expect("task id"),
+                trigger_hash: 11,
+                state_hash: 22,
+            },
+        })
+        .await
+        .expect_err("multiline type alias should fail deterministic subset validation");
+
+    assert_eq!(error.code, "invalid-contract");
+    assert!(error.message.contains("TS80001"));
+    assert!(error.message.contains(
+        "deterministic TypeScript currently supports only single-line type aliases and interfaces"
+    ));
 }

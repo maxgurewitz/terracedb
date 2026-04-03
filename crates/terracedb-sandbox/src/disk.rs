@@ -11,8 +11,10 @@ use std::os::unix::fs::PermissionsExt;
 use serde::{Deserialize, Serialize};
 use terracedb_git::{GitImportSource, GitObjectFormat, GitRepositoryOrigin};
 use terracedb_vfs::{
-    CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, VfsError, VfsFileSystem, Volume,
+    CreateOptions, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, VfsBatchOperation, VfsError,
+    VfsFileSystem, Volume,
 };
+use tracing::info;
 
 use crate::{ConflictPolicy, GitProvenance, SandboxError, types::sanitize_git_import_source};
 
@@ -202,6 +204,13 @@ enum DeltaOperation {
 }
 
 pub(crate) fn prepare_hoist(request: &HoistRequest) -> Result<PreparedHoist, SandboxError> {
+    info!(
+        target: "terracedb.sandbox.hoist",
+        source_path = %request.source_path,
+        target_root = %request.target_root,
+        mode = ?request.mode,
+        "preparing hoist"
+    );
     let source_path = canonicalize_for_storage(Path::new(&request.source_path))?;
     let target_root = normalize_vfs_path(&request.target_root)?;
     let (entries, git_provenance) = match &request.mode {
@@ -237,6 +246,11 @@ pub(crate) fn prepare_hoist(request: &HoistRequest) -> Result<PreparedHoist, San
         git_provenance,
         entries: entries.iter().map(ManifestEntry::from_tree_entry).collect(),
     };
+    info!(
+        target: "terracedb.sandbox.hoist",
+        entries = entries.len(),
+        "prepared hoist tree"
+    );
     Ok(PreparedHoist { manifest, entries })
 }
 
@@ -246,6 +260,13 @@ pub(crate) async fn replace_vfs_tree(
     entries: &[TreeEntry],
     delete_missing: bool,
 ) -> Result<usize, SandboxError> {
+    info!(
+        target: "terracedb.sandbox.hoist",
+        target_root = %target_root,
+        entries = entries.len(),
+        delete_missing,
+        "replacing vfs tree"
+    );
     let target_root = normalize_vfs_path(target_root)?;
     let deleted_paths = if delete_missing {
         ensure_vfs_directory(fs, &target_root).await?;
@@ -255,7 +276,73 @@ pub(crate) async fn replace_vfs_tree(
         0
     };
     write_entries_to_vfs(fs, &target_root, entries).await?;
+    info!(
+        target: "terracedb.sandbox.hoist",
+        target_root = %target_root,
+        deleted_paths,
+        "replaced vfs tree"
+    );
     Ok(deleted_paths)
+}
+
+pub(crate) async fn populate_vfs_tree_fresh(
+    fs: &dyn VfsFileSystem,
+    target_root: &str,
+    entries: &[TreeEntry],
+) -> Result<(), SandboxError> {
+    let target_root = normalize_vfs_path(target_root)?;
+    info!(
+        target: "terracedb.sandbox.hoist",
+        target_root = %target_root,
+        entries = entries.len(),
+        "populating fresh vfs tree"
+    );
+    let mut ops = Vec::with_capacity(entries.len() + 1);
+    ops.push(VfsBatchOperation::Mkdir {
+        path: target_root.clone(),
+        opts: MkdirOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    });
+    for entry in entries {
+        if matches!(entry.data, TreeEntryData::Directory) {
+            ops.push(VfsBatchOperation::Mkdir {
+                path: join_vfs_path(&target_root, &entry.path),
+                opts: MkdirOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            });
+        }
+    }
+    for entry in entries {
+        let destination = join_vfs_path(&target_root, &entry.path);
+        match &entry.data {
+            TreeEntryData::Directory => {}
+            TreeEntryData::File(bytes) => ops.push(VfsBatchOperation::WriteFile {
+                path: destination,
+                data: bytes.clone(),
+                opts: CreateOptions {
+                    create_parents: false,
+                    overwrite: true,
+                    ..Default::default()
+                },
+            }),
+            TreeEntryData::Symlink(target) => ops.push(VfsBatchOperation::Symlink {
+                target: target.clone(),
+                linkpath: destination,
+            }),
+        }
+    }
+    info!(
+        target: "terracedb.sandbox.hoist",
+        operations = ops.len(),
+        "applying fresh vfs batch"
+    );
+    fs.apply_batch(&ops).await?;
+
+    Ok(())
 }
 
 pub(crate) async fn write_hoist_manifest(
@@ -791,14 +878,32 @@ async fn write_entries_to_vfs(
     target_root: &str,
     entries: &[TreeEntry],
 ) -> Result<(), SandboxError> {
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         if matches!(entry.data, TreeEntryData::Directory) {
             write_vfs_entry(fs, target_root, entry).await?;
         }
+        if (index + 1) % 256 == 0 {
+            info!(
+                target: "terracedb.sandbox.hoist",
+                written = index + 1,
+                total = entries.len(),
+                phase = "directories",
+                "writing hoisted entries to vfs"
+            );
+        }
     }
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         if !matches!(entry.data, TreeEntryData::Directory) {
             write_vfs_entry(fs, target_root, entry).await?;
+        }
+        if (index + 1) % 256 == 0 {
+            info!(
+                target: "terracedb.sandbox.hoist",
+                written = index + 1,
+                total = entries.len(),
+                phase = "non_directories",
+                "writing hoisted entries to vfs"
+            );
         }
     }
     Ok(())
@@ -854,7 +959,8 @@ fn collect_directory_tree(
         });
     }
     let mut entries = Vec::new();
-    collect_directory_tree_recursive(root, root, skip_git_metadata, &mut entries)?;
+    let mut visited = 0usize;
+    collect_directory_tree_recursive(root, root, skip_git_metadata, &mut entries, &mut visited)?;
     Ok(entries)
 }
 
@@ -918,6 +1024,7 @@ fn collect_directory_tree_recursive(
     current: &Path,
     skip_git_metadata: bool,
     entries: &mut Vec<TreeEntry>,
+    visited: &mut usize,
 ) -> Result<(), SandboxError> {
     let mut children = fs::read_dir(current)
         .map_err(|error| SandboxError::Io {
@@ -935,6 +1042,15 @@ fn collect_directory_tree_recursive(
             .cmp(&right.file_name().to_string_lossy())
     });
     for child in children {
+        *visited = visited.saturating_add(1);
+        if *visited % 256 == 0 {
+            info!(
+                target: "terracedb.sandbox.hoist",
+                visited = *visited,
+                current = %current.to_string_lossy(),
+                "walking hoist directory tree"
+            );
+        }
         let file_name = child.file_name();
         if skip_git_metadata && file_name == ".git" {
             continue;
@@ -957,7 +1073,13 @@ fn collect_directory_tree_recursive(
                 data: TreeEntryData::Directory,
                 mode: None,
             });
-            collect_directory_tree_recursive(root, &child_path, skip_git_metadata, entries)?;
+            collect_directory_tree_recursive(
+                root,
+                &child_path,
+                skip_git_metadata,
+                entries,
+                visited,
+            )?;
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(&child_path).map_err(|error| SandboxError::Io {
                 path: child_path.to_string_lossy().into_owned(),

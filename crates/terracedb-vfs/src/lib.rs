@@ -16,7 +16,7 @@ pub use activity::{
 pub use error::VfsError;
 pub use filesystem::{
     CreateOptions, DirEntry, DirEntryPlus, FileKind, MkdirOptions, ReadOnlyVfsFileSystem, Stats,
-    VfsFileSystem,
+    VfsBatchOperation, VfsFileSystem,
 };
 pub use ids::{
     ActivityId, ActivityKey, AllocatorKey, AllocatorKind, ChunkKey, DentryKey, InodeId, InodeKey,

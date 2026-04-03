@@ -95,6 +95,7 @@ async fn typescript_service_writes_mirror_cache_and_emit_outputs() {
                 target: "es2022".to_string(),
                 module_kind: "esm".to_string(),
                 jsx: None,
+                tsconfig_path: None,
             },
         )
         .await
@@ -108,6 +109,7 @@ async fn typescript_service_writes_mirror_cache_and_emit_outputs() {
                 target: "es2022".to_string(),
                 module_kind: "esm".to_string(),
                 jsx: None,
+                tsconfig_path: None,
             },
         )
         .await

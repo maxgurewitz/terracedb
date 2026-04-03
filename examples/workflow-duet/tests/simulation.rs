@@ -1,11 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
-use terracedb::{Db, DbDependencies, DeterministicRng, SimulatedFileSystem, SimulatedObjectStore};
+use futures::StreamExt;
+use terracedb::{
+    Db, DbDependencies, DeterministicRng, ScanOptions, SimulatedFileSystem, SimulatedObjectStore,
+    decode_outbox_entry,
+};
 use terracedb_example_workflow_duet::{
-    ReviewStage, WorkflowDuetApp, WorkflowDuetFlavor, WorkflowDuetInspection,
-    workflow_duet_db_config,
+    APPROVAL_TIMEOUT_MILLIS, RETRY_DELAY_MILLIS, ReviewStage, WorkflowDuetApp, WorkflowDuetFlavor,
+    WorkflowDuetInspection, workflow_duet_db_config,
 };
 use terracedb_simulation::{SeededSimulationRunner, TurmoilClock};
+use terracedb_workflows::decode_callback_delivery_outbox_entry;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SimulationCapture {
@@ -49,6 +54,51 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
                 .await?;
             app.kick_off(WorkflowDuetFlavor::Sandbox, "sandbox-timeout")
                 .await?;
+            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MILLIS + 25)).await;
+            eprintln!(
+                "pre-wait paired snapshots: native={:?} sandbox={:?}",
+                app.inspect_instance(WorkflowDuetFlavor::Native, "paired-ok")
+                    .await?
+                    .map(|inspection| inspection.status),
+                app.inspect_instance(WorkflowDuetFlavor::Sandbox, "paired-ok")
+                    .await?
+                    .map(|inspection| inspection.status),
+            );
+            let native_outbox = app.native_runtime().tables().outbox_table().clone();
+            let sandbox_outbox = app.sandbox_runtime().tables().outbox_table().clone();
+            let mut native_rows = native_outbox
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        limit: Some(32),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let mut sandbox_rows = sandbox_outbox
+                .scan(
+                    Vec::new(),
+                    vec![0xff],
+                    ScanOptions {
+                        limit: Some(32),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let mut native_deliveries = Vec::new();
+            while let Some((outbox_id, value)) = native_rows.next().await {
+                let entry = decode_outbox_entry(outbox_id, &value)?;
+                native_deliveries.push(decode_callback_delivery_outbox_entry(&entry)?);
+            }
+            let mut sandbox_deliveries = Vec::new();
+            while let Some((outbox_id, value)) = sandbox_rows.next().await {
+                let entry = decode_outbox_entry(outbox_id, &value)?;
+                sandbox_deliveries.push(decode_callback_delivery_outbox_entry(&entry)?);
+            }
+            eprintln!(
+                "pre-wait deliveries: native={native_deliveries:?} sandbox={sandbox_deliveries:?}"
+            );
 
             let paired_native = app
                 .wait_for_stage(
@@ -127,6 +177,7 @@ fn run_seeded_example(seed: u64) -> turmoil::Result<SimulationCapture> {
                     Duration::from_millis(250),
                 )
                 .await?;
+            tokio::time::sleep(Duration::from_millis(APPROVAL_TIMEOUT_MILLIS + 25)).await;
             reopened
                 .wait_for_stage(
                     WorkflowDuetFlavor::Sandbox,

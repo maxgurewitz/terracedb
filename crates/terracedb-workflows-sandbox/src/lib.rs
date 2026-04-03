@@ -1,12 +1,17 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
-use terracedb_sandbox::{SandboxError, SandboxSession};
+use std::sync::Arc;
+use terracedb_sandbox::{
+    PackageCompatibilityMode, PackageInstallRequest, SandboxError, SandboxSession, TypeCheckRequest,
+};
 use terracedb_workflows_core::{
     WorkflowBundleKind, WorkflowBundleMetadata, WorkflowDeterministicContext,
     WorkflowDeterministicSeed, WorkflowHandlerContract, WorkflowObservationValue,
+    WorkflowSandboxPackageCompatibility, WorkflowSandboxPreparation, WorkflowSandboxSourceKind,
     WorkflowSourceEvent, WorkflowTaskError, WorkflowTransitionInput, WorkflowTransitionOutput,
 };
+use tokio::sync::Mutex;
 
 pub const WORKFLOW_TASK_V1_ABI: &str = "workflow-task/v1";
 
@@ -41,6 +46,14 @@ pub struct SandboxModuleWorkflowTaskV1Handler {
     bundle_id: String,
     module: String,
     entrypoint: String,
+    preparation: WorkflowSandboxPreparation,
+    prepared_module: Arc<Mutex<Option<PreparedSandboxModule>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedSandboxModule {
+    session_revision: u64,
+    runtime_module: String,
 }
 
 impl SandboxModuleWorkflowTaskV1Handler {
@@ -53,6 +66,7 @@ impl SandboxModuleWorkflowTaskV1Handler {
             abi,
             module,
             entrypoint,
+            preparation,
         } = bundle.kind
         else {
             return Err(WorkflowTaskError::invalid_contract(format!(
@@ -75,7 +89,80 @@ impl SandboxModuleWorkflowTaskV1Handler {
             bundle_id,
             module,
             entrypoint,
+            preparation,
+            prepared_module: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn resolve_runtime_module(&self) -> Result<String, WorkflowTaskError> {
+        let info = self.session.info().await;
+        let package_compat = bundle_package_compat(&self.preparation);
+        let source_kind = self.preparation.source_kind();
+        if info.provenance.package_compat != package_compat {
+            return Err(WorkflowTaskError::invalid_contract(format!(
+                "sandbox bundle {} expects package compatibility {:?}, but session is {:?}",
+                self.bundle_id, package_compat, info.provenance.package_compat
+            )));
+        }
+        let session_revision = info.revision;
+        {
+            let prepared = self.prepared_module.lock().await;
+            if let Some(prepared) = prepared.as_ref()
+                && prepared.session_revision == session_revision
+            {
+                return Ok(prepared.runtime_module.clone());
+            }
+        }
+
+        let runtime_module = match source_kind {
+            WorkflowSandboxSourceKind::JavaScript => self.module.clone(),
+            WorkflowSandboxSourceKind::TypeScript => {
+                if let Some(package_manifest_path) = self.preparation.package_manifest_path.as_ref()
+                {
+                    install_manifest_packages(&self.session, package_manifest_path).await?;
+                }
+                let request = TypeCheckRequest {
+                    roots: vec![self.module.clone()],
+                    tsconfig_path: self.preparation.tsconfig_path.clone(),
+                    ..Default::default()
+                };
+                let report = self
+                    .session
+                    .typecheck(request.clone())
+                    .await
+                    .map_err(sandbox_error_to_task_error)?;
+                if !report.diagnostics.is_empty() {
+                    let details = report
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| match diagnostic.code.as_deref() {
+                            Some(code) => {
+                                format!("{} {}: {}", diagnostic.path, code, diagnostic.message)
+                            }
+                            None => format!("{}: {}", diagnostic.path, diagnostic.message),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(WorkflowTaskError::invalid_contract(format!(
+                        "sandbox bundle {} TypeScript entrypoint failed validation: {}",
+                        self.bundle_id, details
+                    )));
+                }
+                self.session
+                    .emit_typescript(request)
+                    .await
+                    .map_err(sandbox_error_to_task_error)?;
+                emitted_output_path(&self.module)
+            }
+        };
+
+        let prepared_revision = self.session.info().await.revision;
+        let mut prepared = self.prepared_module.lock().await;
+        *prepared = Some(PreparedSandboxModule {
+            session_revision: prepared_revision,
+            runtime_module: runtime_module.clone(),
+        });
+        Ok(runtime_module)
     }
 
     async fn invoke<Request, Response>(
@@ -89,7 +176,7 @@ impl SandboxModuleWorkflowTaskV1Handler {
     {
         let session = self.session.clone();
         let bundle_id = self.bundle_id.clone();
-        let module = self.module.clone();
+        let module = self.resolve_runtime_module().await?;
         let entrypoint = self.entrypoint.clone();
         let method = method.to_string();
         let request = serde_json::to_value(request)
@@ -253,6 +340,80 @@ fn ensure_abi(abi: &str) -> Result<(), WorkflowTaskError> {
         "abi-mismatch",
         format!("expected {WORKFLOW_TASK_V1_ABI}, got {abi}"),
     ))
+}
+
+fn bundle_package_compat(preparation: &WorkflowSandboxPreparation) -> PackageCompatibilityMode {
+    match preparation.package_compat() {
+        WorkflowSandboxPackageCompatibility::TerraceOnly => PackageCompatibilityMode::TerraceOnly,
+        WorkflowSandboxPackageCompatibility::NpmPureJs => PackageCompatibilityMode::NpmPureJs,
+        WorkflowSandboxPackageCompatibility::NpmWithNodeBuiltins => {
+            PackageCompatibilityMode::NpmWithNodeBuiltins
+        }
+    }
+}
+
+async fn install_manifest_packages(
+    session: &SandboxSession,
+    manifest_path: &str,
+) -> Result<(), WorkflowTaskError> {
+    let bytes = session
+        .filesystem()
+        .read_file(manifest_path)
+        .await
+        .map_err(sandbox_error_to_task_error)?
+        .ok_or_else(|| {
+            WorkflowTaskError::invalid_contract(format!(
+                "sandbox workflow package manifest {manifest_path} does not exist"
+            ))
+        })?;
+    let manifest: JsonValue = serde_json::from_slice(&bytes).map_err(|error| {
+        WorkflowTaskError::serialization("sandbox workflow package manifest", error)
+    })?;
+    let mut packages = Vec::new();
+    for section in ["dependencies", "devDependencies"] {
+        if let Some(deps) = manifest.get(section).and_then(|value| value.as_object()) {
+            for (name, version) in deps {
+                match version.as_str().map(str::trim) {
+                    Some(version) if !version.is_empty() => {
+                        packages.push(format!("{name}@{version}"));
+                    }
+                    _ => packages.push(name.clone()),
+                }
+            }
+        }
+    }
+    packages.sort();
+    packages.dedup();
+    if packages.is_empty() {
+        return Ok(());
+    }
+    session
+        .install_packages(PackageInstallRequest {
+            packages,
+            materialize_compatibility_view: true,
+        })
+        .await
+        .map_err(sandbox_error_to_task_error)?;
+    Ok(())
+}
+
+fn emitted_output_path(path: &str) -> String {
+    if path.ends_with(".tsx") {
+        return format!("{}{}", path.trim_end_matches(".tsx"), ".jsx");
+    }
+    if path.ends_with(".mts") {
+        return format!("{}{}", path.trim_end_matches(".mts"), ".mjs");
+    }
+    if path.ends_with(".cts") {
+        return format!("{}{}", path.trim_end_matches(".cts"), ".cjs");
+    }
+    if path.ends_with(".ts") {
+        return format!("{}{}", path.trim_end_matches(".ts"), ".js");
+    }
+    if path.ends_with(".d.ts") {
+        return format!("{}{}", path.trim_end_matches(".d.ts"), ".js");
+    }
+    path.to_string()
 }
 
 #[derive(Debug, Deserialize)]

@@ -903,6 +903,7 @@ async fn reopen_preserves_typescript_and_bash_service_metadata() {
             target: "es2022".to_string(),
             module_kind: "esm".to_string(),
             jsx: None,
+            tsconfig_path: None,
         },
     )
     .await
@@ -969,6 +970,7 @@ async fn reopen_preserves_typescript_and_bash_service_metadata() {
                 target: "es2022".to_string(),
                 module_kind: "esm".to_string(),
                 jsx: None,
+                tsconfig_path: None,
             },
         )
         .await

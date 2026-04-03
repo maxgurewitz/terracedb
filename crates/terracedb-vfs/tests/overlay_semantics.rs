@@ -5,7 +5,7 @@ use serde_json::json;
 use terracedb::{StubClock, StubRng, Timestamp};
 use terracedb_vfs::{
     CompletedToolRun, CompletedToolRunOutcome, CreateOptions, InMemoryVfsStore, MkdirOptions,
-    SnapshotOptions, ToolRunStatus, VolumeConfig, VolumeId, VolumeStore,
+    SnapshotOptions, ToolRunStatus, VfsBatchOperation, VolumeConfig, VolumeId, VolumeStore,
 };
 
 fn test_store(seed: u64, now: u64) -> InMemoryVfsStore {
@@ -271,6 +271,174 @@ async fn overlays_merge_base_entries_support_whiteouts_and_reopen_correctly() {
             "new.txt".to_string(),
             "readme.txt".to_string()
         ]
+    );
+}
+
+#[tokio::test]
+async fn overlay_write_file_create_parents_materializes_missing_delta_parents() {
+    let store = test_store(18, 20);
+    let base = store
+        .open_volume(
+            VolumeConfig::new(VolumeId::new(0x4200))
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open base volume");
+    base.fs()
+        .mkdir(
+            "/workspace",
+            MkdirOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("mkdir base workspace");
+
+    let overlay = store
+        .create_overlay(
+            base.snapshot(SnapshotOptions::default())
+                .await
+                .expect("base snapshot"),
+            VolumeConfig::new(VolumeId::new(0x4201))
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("create overlay");
+
+    overlay
+        .fs()
+        .write_file(
+            "/workspace/project/local-dep/package.json",
+            br#"{"name":"local-dep"}"#.to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write nested package.json through overlay");
+
+    assert_eq!(
+        overlay
+            .fs()
+            .read_file("/workspace/project/local-dep/package.json")
+            .await
+            .expect("read nested package.json"),
+        Some(br#"{"name":"local-dep"}"#.to_vec())
+    );
+    assert_eq!(
+        sorted_names(
+            overlay
+                .fs()
+                .readdir("/workspace/project")
+                .await
+                .expect("readdir project"),
+        ),
+        vec!["local-dep".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn overlay_apply_batch_creates_fresh_tree_in_one_operation_window() {
+    let store = test_store(19, 30);
+    let base = store
+        .open_volume(
+            VolumeConfig::new(VolumeId::new(0x4300))
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("open base volume");
+    base.fs()
+        .mkdir(
+            "/workspace",
+            MkdirOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("mkdir base workspace");
+
+    let overlay = store
+        .create_overlay(
+            base.snapshot(SnapshotOptions::default())
+                .await
+                .expect("base snapshot"),
+            VolumeConfig::new(VolumeId::new(0x4301))
+                .with_chunk_size(8)
+                .with_create_if_missing(true),
+        )
+        .await
+        .expect("create overlay");
+
+    overlay
+        .fs()
+        .apply_batch(&[
+            VfsBatchOperation::Mkdir {
+                path: "/workspace/project".to_string(),
+                opts: MkdirOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            },
+            VfsBatchOperation::Mkdir {
+                path: "/workspace/project/local-dep".to_string(),
+                opts: MkdirOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            },
+            VfsBatchOperation::WriteFile {
+                path: "/workspace/project/package.json".to_string(),
+                data: br#"{"name":"project"}"#.to_vec(),
+                opts: CreateOptions {
+                    create_parents: false,
+                    ..Default::default()
+                },
+            },
+            VfsBatchOperation::WriteFile {
+                path: "/workspace/project/local-dep/index.js".to_string(),
+                data: b"module.exports = 'local-dep';\n".to_vec(),
+                opts: CreateOptions {
+                    create_parents: false,
+                    ..Default::default()
+                },
+            },
+            VfsBatchOperation::Symlink {
+                target: "./local-dep/index.js".to_string(),
+                linkpath: "/workspace/project/dependency.js".to_string(),
+            },
+        ])
+        .await
+        .expect("apply overlay batch");
+
+    assert_eq!(
+        overlay
+            .fs()
+            .read_file("/workspace/project/package.json")
+            .await
+            .expect("read project package"),
+        Some(br#"{"name":"project"}"#.to_vec())
+    );
+    assert_eq!(
+        overlay
+            .fs()
+            .read_file("/workspace/project/local-dep/index.js")
+            .await
+            .expect("read dependency"),
+        Some(b"module.exports = 'local-dep';\n".to_vec())
+    );
+    assert_eq!(
+        overlay
+            .fs()
+            .readlink("/workspace/project/dependency.js")
+            .await
+            .expect("readlink dependency"),
+        "./local-dep/index.js".to_string()
     );
 }
 

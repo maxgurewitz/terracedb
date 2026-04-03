@@ -273,6 +273,9 @@ pub enum WorkflowEffectIntent {
     Outbox {
         entry: contracts::WorkflowOutboxCommand,
     },
+    DeliverCallback {
+        delivery: contracts::WorkflowCallbackDeliveryCommand,
+    },
     ScheduleTimer {
         timer_id: Vec<u8>,
         fire_at_millis: u64,
@@ -915,6 +918,11 @@ fn reduce_effect_intents(commands: &[contracts::WorkflowCommand]) -> Vec<Workflo
             contracts::WorkflowCommand::Outbox { entry } => WorkflowEffectIntent::Outbox {
                 entry: entry.clone(),
             },
+            contracts::WorkflowCommand::DeliverCallback { delivery } => {
+                WorkflowEffectIntent::DeliverCallback {
+                    delivery: delivery.clone(),
+                }
+            }
             contracts::WorkflowCommand::Timer {
                 command:
                     contracts::WorkflowTimerCommand::Schedule {

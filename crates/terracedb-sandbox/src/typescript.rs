@@ -1,33 +1,52 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
-use terracedb_vfs::{CompletedToolRunOutcome, CreateOptions, MkdirOptions};
+use terracedb_vfs::CompletedToolRunOutcome;
 
 use crate::{
-    CapabilityManifest, HOST_CAPABILITY_PREFIX, PackageCompatibilityMode,
+    CapabilityManifest, PackageCompatibilityMode, PackageInstallRequest,
     SANDBOX_BASH_LIBRARY_SPECIFIER, SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER,
     SANDBOX_FS_LIBRARY_SPECIFIER, SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER,
-    SANDBOX_WORKFLOW_LIBRARY_SPECIFIER, SANDBOX_WORKFLOW_LIBRARY_TYPESCRIPT_DECLARATIONS,
-    SandboxError, SandboxSession, packages::read_package_install_manifest,
-    session::record_completed_tool_run,
+    SANDBOX_WORKFLOW_LIBRARY_TYPESCRIPT_DECLARATIONS, SandboxError, SandboxSession,
+    packages::read_package_install_manifest, session::record_completed_tool_run,
 };
 
-pub const TERRACE_TYPESCRIPT_STATE_PATH: &str = "/.terrace/typescript/state.json";
-pub const TERRACE_TYPESCRIPT_MIRROR_PATH: &str = "/.terrace/typescript/mirror.json";
-pub const TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR: &str = "/.terrace/typescript/transpile";
 pub const TERRACE_TYPESCRIPT_DECLARATIONS_PATH: &str = "/.terrace/typescript/generated.d.ts";
+pub const TERRACE_TYPESCRIPT_MIRROR_PATH: &str = "/.terrace/typescript/mirror.json";
+pub const TERRACE_TYPESCRIPT_STATE_PATH: &str = "/.terrace/typescript/state.json";
+pub const TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR: &str = "/.terrace/typescript/transpile";
+
+const DEFAULT_TYPESCRIPT_VERSION: &str = "5.9.3";
+const TYPESCRIPT_RUNNER_SOURCE: &str = include_str!("./typescript_runner.js");
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeCheckRequest {
     pub roots: Vec<String>,
+    #[serde(default)]
+    pub tsconfig_path: Option<String>,
     #[serde(default)]
     pub target: Option<String>,
     #[serde(default)]
     pub module_kind: Option<String>,
     #[serde(default)]
     pub jsx: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeScriptMirrorState {
+    #[serde(default)]
+    pub roots: Vec<String>,
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TypeScriptState {
+    compiler_version: String,
+    #[serde(default)]
+    tsconfig_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,9 +65,11 @@ pub struct TypeCheckReport {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeScriptEmitReport {
+    #[serde(default)]
+    pub diagnostics: Vec<TypeScriptDiagnostic>,
     pub emitted_files: Vec<String>,
     #[serde(default)]
-    pub cache_keys: BTreeMap<String, String>,
+    pub root_outputs: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +81,8 @@ pub struct TypeScriptTranspileRequest {
     pub module_kind: String,
     #[serde(default)]
     pub jsx: Option<String>,
+    #[serde(default)]
+    pub tsconfig_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,52 +95,46 @@ pub struct TypeScriptTranspileReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TypeScriptMirrorEntry {
-    pub path: String,
-    pub size_bytes: u64,
-    pub content_hash: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TypeScriptMirrorState {
-    pub roots: Vec<String>,
-    pub files: Vec<TypeScriptMirrorEntry>,
-    pub updated_revision: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct PersistedTypeScriptState {
-    last_check: Option<TypeCheckReport>,
-    last_emit: Option<TypeScriptEmitReport>,
-    last_transpile: Option<TypeScriptTranspileReport>,
-    updated_revision: u64,
-}
-
-#[derive(Clone, Debug)]
-struct MirrorBuild {
-    mirror: TypeScriptMirrorState,
-    contents: BTreeMap<String, String>,
-    missing_roots: Vec<String>,
-    missing_imports: Vec<(String, String)>,
-}
-
-#[derive(Clone, Debug)]
-struct TypeScriptImportSurface {
-    builtins: BTreeSet<String>,
-    capabilities: CapabilityManifest,
-    packages: BTreeSet<String>,
+#[serde(rename_all = "snake_case")]
+enum TypeScriptRunMode {
+    Check,
+    Emit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct TranspileCacheEntry {
-    cache_key: String,
-    input_path: String,
-    content_hash: String,
-    target: String,
-    module_kind: String,
+struct TypeScriptRunnerRequest {
+    mode: TypeScriptRunMode,
+    roots: Vec<String>,
+    #[serde(default)]
+    tsconfig_path: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    module_kind: Option<String>,
+    #[serde(default)]
     jsx: Option<String>,
-    output_path: String,
-    source_map_path: String,
+    #[serde(default)]
+    force_source_map: bool,
+    cwd: String,
+    typescript_lib_root: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TypeScriptRunnerResponse {
+    #[serde(default)]
+    diagnostics: Vec<TypeScriptDiagnostic>,
+    #[serde(default)]
+    checked_files: Vec<String>,
+    #[serde(default)]
+    emitted_files: Vec<String>,
+    #[serde(default)]
+    root_outputs: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedTypeScriptCompiler {
+    version: String,
+    lib_root: String,
 }
 
 #[async_trait]
@@ -150,153 +167,48 @@ impl DeterministicTypeScriptService {
         Self { name: name.into() }
     }
 
-    async fn transpile_inner(
-        &self,
-        session: &SandboxSession,
-        request: &TypeScriptTranspileRequest,
-    ) -> Result<TypeScriptTranspileReport, SandboxError> {
-        let info = session.info().await;
-        let input_path = resolve_workspace_path(&info.workspace_root, &request.path)?;
-        let source = read_utf8_file(session, &input_path, "typescript").await?;
-        let content_hash = stable_hash_hex(source.as_bytes());
-        let cache_key = stable_hash_hex(
-            serde_json::to_vec(&serde_json::json!({
-                "content_hash": content_hash,
-                "target": request.target,
-                "module_kind": request.module_kind,
-                "jsx": request.jsx,
-                "path": input_path,
-            }))?
-            .as_slice(),
-        );
-        let output_path = format!("{TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR}/{cache_key}.js");
-        let source_map_path = format!("{output_path}.map");
-        let metadata_path = format!("{TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR}/{cache_key}.json");
-        let fs = session.filesystem();
-        fs.mkdir(
-            TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR,
-            MkdirOptions {
-                recursive: true,
-                ..Default::default()
-            },
-        )
-        .await?;
-        let cache_hit = fs.read_file(&metadata_path).await?.is_some()
-            && fs.read_file(&output_path).await?.is_some()
-            && fs.read_file(&source_map_path).await?.is_some();
-
-        if !cache_hit {
-            let output = transpile_source(&source);
-            let source_map = serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 3,
-                "file": output_path,
-                "sources": [input_path],
-                "names": [],
-                "mappings": "",
-            }))?;
-            let metadata = TranspileCacheEntry {
-                cache_key: cache_key.clone(),
-                input_path: input_path.clone(),
-                content_hash,
-                target: request.target.clone(),
-                module_kind: request.module_kind.clone(),
-                jsx: request.jsx.clone(),
-                output_path: output_path.clone(),
-                source_map_path: source_map_path.clone(),
-            };
-            fs.write_file(
-                &output_path,
-                output.into_bytes(),
-                CreateOptions {
-                    create_parents: true,
-                    overwrite: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
-            fs.write_file(
-                &source_map_path,
-                source_map,
-                CreateOptions {
-                    create_parents: true,
-                    overwrite: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
-            fs.write_file(
-                &metadata_path,
-                serde_json::to_vec_pretty(&metadata)?,
-                CreateOptions {
-                    create_parents: true,
-                    overwrite: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
-        }
-
-        let report = TypeScriptTranspileReport {
-            input_path,
-            cache_key,
-            output_path,
-            source_map_path,
-            cache_hit,
-        };
-        persist_typescript_state(session, |state, revision| {
-            state.last_transpile = Some(report.clone());
-            state.updated_revision = revision;
-        })
-        .await?;
-        Ok(report)
-    }
-
     async fn check_inner(
         &self,
         session: &SandboxSession,
         request: &TypeCheckRequest,
     ) -> Result<TypeCheckReport, SandboxError> {
-        let build = build_mirror(session, &request.roots).await?;
-        persist_mirror_state(session, &build.mirror).await?;
-        let mut diagnostics = build
-            .missing_roots
-            .iter()
-            .map(|path| TypeScriptDiagnostic {
-                path: path.clone(),
-                message: format!("file not found: {path}"),
-                code: Some("TS6053".to_string()),
-            })
-            .collect::<Vec<_>>();
-        diagnostics.extend(build.missing_imports.iter().map(|(path, specifier)| {
-            TypeScriptDiagnostic {
-                path: path.clone(),
-                message: format!("cannot resolve import `{specifier}`"),
-                code: Some("TS2307".to_string()),
-            }
-        }));
-        for (path, source) in &build.contents {
-            diagnostics.extend(primitive_assignment_diagnostics(path, source));
-        }
-        diagnostics.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.message.cmp(&right.message))
-        });
-        let report = TypeCheckReport {
-            diagnostics,
-            checked_files: build
-                .mirror
-                .files
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect(),
-        };
-        persist_typescript_state(session, |state, revision| {
-            state.last_check = Some(report.clone());
-            state.updated_revision = revision;
-        })
+        let info = session.info().await;
+        let compiler =
+            prepare_compiler_inputs(session, &request.roots, request.tsconfig_path.as_deref())
+                .await?;
+        let roots = normalized_roots(&info.workspace_root, &request.roots)?;
+        let tsconfig_path = request
+            .tsconfig_path
+            .as_deref()
+            .map(|path| resolve_workspace_path(&info.workspace_root, path))
+            .transpose()?;
+        let response = run_typescript(
+            session,
+            TypeScriptRunnerRequest {
+                mode: TypeScriptRunMode::Check,
+                roots: roots.clone(),
+                tsconfig_path: tsconfig_path.clone(),
+                target: request.target.clone(),
+                module_kind: request.module_kind.clone(),
+                jsx: request.jsx.clone(),
+                force_source_map: false,
+                cwd: info.workspace_root,
+                typescript_lib_root: compiler.lib_root,
+            },
+        )
         .await?;
-        Ok(report)
+        persist_typescript_state(
+            session,
+            &compiler.version,
+            &roots,
+            &response.checked_files,
+            tsconfig_path.as_deref(),
+        )
+        .await?;
+        Ok(TypeCheckReport {
+            diagnostics: response.diagnostics,
+            checked_files: response.checked_files,
+        })
     }
 
     async fn emit_inner(
@@ -304,89 +216,136 @@ impl DeterministicTypeScriptService {
         session: &SandboxSession,
         request: &TypeCheckRequest,
     ) -> Result<TypeScriptEmitReport, SandboxError> {
-        let build = build_mirror(session, &request.roots).await?;
-        persist_mirror_state(session, &build.mirror).await?;
         let info = session.info().await;
-        let mut emitted_files = Vec::new();
-        let mut cache_keys = BTreeMap::new();
-        let fs = session.filesystem();
-
-        for root in &request.roots {
-            let path = resolve_workspace_path(&info.workspace_root, root)?;
-            if !build.contents.contains_key(&path) {
-                continue;
-            }
-            let transpile = self
-                .transpile_inner(
-                    session,
-                    &TypeScriptTranspileRequest {
-                        path: path.clone(),
-                        target: request
-                            .target
-                            .clone()
-                            .unwrap_or_else(default_transpile_target),
-                        module_kind: request
-                            .module_kind
-                            .clone()
-                            .unwrap_or_else(default_transpile_module_kind),
-                        jsx: request.jsx.clone(),
-                    },
-                )
+        let compiler =
+            prepare_compiler_inputs(session, &request.roots, request.tsconfig_path.as_deref())
                 .await?;
-            let emitted_path = emitted_output_path(&path);
-            let emitted_map_path = format!("{emitted_path}.map");
-            let output = fs.read_file(&transpile.output_path).await?.ok_or_else(|| {
-                SandboxError::Service {
-                    service: "typescript",
-                    message: format!(
-                        "transpile cache output {} disappeared before emit",
-                        transpile.output_path
-                    ),
-                }
-            })?;
-            let source_map = fs
-                .read_file(&transpile.source_map_path)
-                .await?
-                .ok_or_else(|| SandboxError::Service {
-                    service: "typescript",
-                    message: format!(
-                        "transpile source map {} disappeared before emit",
-                        transpile.source_map_path
-                    ),
-                })?;
-            fs.write_file(
-                &emitted_path,
-                output,
-                CreateOptions {
-                    create_parents: true,
-                    overwrite: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
-            fs.write_file(
-                &emitted_map_path,
-                source_map,
-                CreateOptions {
-                    create_parents: true,
-                    overwrite: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
-            emitted_files.push(emitted_path.clone());
-            cache_keys.insert(path, transpile.cache_key);
-        }
-
-        let report = TypeScriptEmitReport {
-            emitted_files,
-            cache_keys,
-        };
-        persist_typescript_state(session, |state, revision| {
-            state.last_emit = Some(report.clone());
-            state.updated_revision = revision;
-        })
+        let roots = normalized_roots(&info.workspace_root, &request.roots)?;
+        let tsconfig_path = request
+            .tsconfig_path
+            .as_deref()
+            .map(|path| resolve_workspace_path(&info.workspace_root, path))
+            .transpose()?;
+        let response = run_typescript(
+            session,
+            TypeScriptRunnerRequest {
+                mode: TypeScriptRunMode::Emit,
+                roots: roots.clone(),
+                tsconfig_path: tsconfig_path.clone(),
+                target: request.target.clone(),
+                module_kind: request.module_kind.clone(),
+                jsx: request.jsx.clone(),
+                force_source_map: false,
+                cwd: info.workspace_root,
+                typescript_lib_root: compiler.lib_root,
+            },
+        )
         .await?;
+        persist_typescript_state(
+            session,
+            &compiler.version,
+            &roots,
+            &response.checked_files,
+            tsconfig_path.as_deref(),
+        )
+        .await?;
+        Ok(TypeScriptEmitReport {
+            diagnostics: response.diagnostics,
+            emitted_files: response.emitted_files,
+            root_outputs: response.root_outputs,
+        })
+    }
+
+    async fn transpile_inner(
+        &self,
+        session: &SandboxSession,
+        request: &TypeScriptTranspileRequest,
+    ) -> Result<TypeScriptTranspileReport, SandboxError> {
+        let info = session.info().await;
+        let input_path = resolve_workspace_path(&info.workspace_root, &request.path)?;
+        let compiler = prepare_compiler_inputs(
+            session,
+            std::slice::from_ref(&input_path),
+            request.tsconfig_path.as_deref(),
+        )
+        .await?;
+        let response = run_typescript(
+            session,
+            TypeScriptRunnerRequest {
+                mode: TypeScriptRunMode::Emit,
+                roots: vec![input_path.clone()],
+                tsconfig_path: request
+                    .tsconfig_path
+                    .as_deref()
+                    .map(|path| resolve_workspace_path(&info.workspace_root, path))
+                    .transpose()?,
+                target: Some(request.target.clone()),
+                module_kind: Some(request.module_kind.clone()),
+                jsx: request.jsx.clone(),
+                force_source_map: true,
+                cwd: info.workspace_root.clone(),
+                typescript_lib_root: compiler.lib_root.clone(),
+            },
+        )
+        .await?;
+        let cache_key = stable_hash_hex(
+            serde_json::to_vec(&serde_json::json!({
+                "path": input_path,
+                "compiler": compiler.version,
+                "target": request.target,
+                "module_kind": request.module_kind,
+                "jsx": request.jsx,
+                "tsconfig_path": request.tsconfig_path,
+            }))?
+            .as_slice(),
+        );
+        let metadata_path = format!("{TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR}/{cache_key}.json");
+        if let Some(bytes) = session.filesystem().read_file(&metadata_path).await? {
+            let mut cached = serde_json::from_slice::<TypeScriptTranspileReport>(&bytes)?;
+            cached.cache_hit = true;
+            return Ok(cached);
+        }
+        if !response.diagnostics.is_empty() {
+            return Err(SandboxError::Service {
+                service: "typescript",
+                message: format!(
+                    "TypeScript transpile failed: {}",
+                    summarize_diagnostics(&response.diagnostics)
+                ),
+            });
+        }
+        let output_path = response
+            .root_outputs
+            .get(&input_path)
+            .cloned()
+            .unwrap_or_else(|| emitted_output_path(&input_path));
+        persist_typescript_state(
+            session,
+            &compiler.version,
+            std::slice::from_ref(&input_path),
+            &response.checked_files,
+            request.tsconfig_path.as_deref(),
+        )
+        .await?;
+        let report = TypeScriptTranspileReport {
+            input_path: input_path.clone(),
+            cache_key,
+            output_path: output_path.clone(),
+            source_map_path: format!("{output_path}.map"),
+            cache_hit: false,
+        };
+        session
+            .filesystem()
+            .write_file(
+                &metadata_path,
+                serde_json::to_vec_pretty(&report)?,
+                terracedb_vfs::CreateOptions {
+                    create_parents: true,
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
         Ok(report)
     }
 }
@@ -529,506 +488,324 @@ fn default_transpile_module_kind() -> String {
     "esm".to_string()
 }
 
-async fn build_mirror(
+async fn prepare_compiler_inputs(
     session: &SandboxSession,
     roots: &[String],
-) -> Result<MirrorBuild, SandboxError> {
-    let info = session.info().await;
-    let fs = session.filesystem();
-    let import_surface = build_import_surface(session).await?;
-    let generated_declarations =
-        generated_typescript_declarations(&info.provenance.capabilities).to_string();
-    fs.write_file(
-        TERRACE_TYPESCRIPT_DECLARATIONS_PATH,
-        generated_declarations.as_bytes().to_vec(),
-        CreateOptions {
-            create_parents: true,
-            overwrite: true,
-            ..Default::default()
-        },
-    )
-    .await?;
-    let mut pending = VecDeque::new();
-    let mut root_set = BTreeSet::new();
-    for root in roots {
-        let normalized = resolve_workspace_path(&info.workspace_root, root)?;
-        root_set.insert(normalized.clone());
-        pending.push_back(normalized);
-    }
-    pending.push_back(TERRACE_TYPESCRIPT_DECLARATIONS_PATH.to_string());
-
-    let mut contents = BTreeMap::new();
-    let mut visited = BTreeSet::new();
-    let mut missing_roots = Vec::new();
-    let mut missing_imports = Vec::new();
-
-    while let Some(path) = pending.pop_front() {
-        if !visited.insert(path.clone()) {
-            continue;
-        }
-        let Some(bytes) = fs.read_file(&path).await? else {
-            if root_set.contains(&path) {
-                missing_roots.push(path);
-            }
-            continue;
-        };
-        let source = String::from_utf8(bytes).map_err(|error| SandboxError::Service {
-            service: "typescript",
-            message: format!("{path} is not valid utf-8: {error}"),
-        })?;
-        for specifier in extract_module_specifiers(&source) {
-            if is_relative_specifier(&specifier) {
-                match resolve_import_path(session, &path, &specifier).await? {
-                    Some(resolved) => pending.push_back(resolved),
-                    None => missing_imports.push((path.clone(), specifier)),
-                }
-            } else if !import_surface.allows(&specifier) {
-                missing_imports.push((path.clone(), specifier));
-            }
-        }
-        contents.insert(path, source);
-    }
-
-    let files = contents
-        .iter()
-        .map(|(path, source)| TypeScriptMirrorEntry {
-            path: path.clone(),
-            size_bytes: source.len() as u64,
-            content_hash: stable_hash_hex(source.as_bytes()),
-        })
-        .collect::<Vec<_>>();
-
-    Ok(MirrorBuild {
-        mirror: TypeScriptMirrorState {
-            roots: root_set.into_iter().collect(),
-            files,
-            updated_revision: info.revision,
-        },
-        contents,
-        missing_roots,
-        missing_imports,
-    })
+    tsconfig_path: Option<&str>,
+) -> Result<ResolvedTypeScriptCompiler, SandboxError> {
+    write_generated_typescript_declarations(session).await?;
+    ensure_typescript_compiler(session, roots, tsconfig_path).await
 }
 
-async fn build_import_surface(
+async fn write_generated_typescript_declarations(
     session: &SandboxSession,
-) -> Result<TypeScriptImportSurface, SandboxError> {
-    let info = session.info().await;
-    let filesystem = session.filesystem();
-    let installed_packages = read_package_install_manifest(filesystem.as_ref()).await?;
-    let packages = installed_packages
-        .map(|manifest| {
-            manifest
-                .packages
-                .into_iter()
-                .map(|package| package.package)
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut builtins = BTreeSet::from([
-        SANDBOX_WORKFLOW_LIBRARY_SPECIFIER.to_string(),
-        SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER.to_string(),
-        SANDBOX_FS_LIBRARY_SPECIFIER.to_string(),
-        SANDBOX_BASH_LIBRARY_SPECIFIER.to_string(),
-        SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER.to_string(),
-    ]);
-    if info.provenance.package_compat == PackageCompatibilityMode::NpmWithNodeBuiltins {
-        builtins.insert("node:fs".to_string());
-        builtins.insert("node:fs/promises".to_string());
-    }
-    Ok(TypeScriptImportSurface {
-        builtins,
-        capabilities: info.provenance.capabilities,
-        packages,
-    })
-}
-
-impl TypeScriptImportSurface {
-    fn allows(&self, specifier: &str) -> bool {
-        self.builtins.contains(specifier)
-            || self.capabilities.contains(specifier)
-            || package_name_for_import(specifier)
-                .is_some_and(|package| self.packages.contains(&package))
-    }
-}
-
-fn generated_typescript_declarations(manifest: &CapabilityManifest) -> String {
-    [
-        SANDBOX_WORKFLOW_LIBRARY_TYPESCRIPT_DECLARATIONS.to_string(),
-        manifest.generated_ambient_typescript_declarations(),
-    ]
-    .into_iter()
-    .filter(|section| !section.trim().is_empty())
-    .collect::<Vec<_>>()
-    .join("\n\n")
-}
-
-fn package_name_for_import(specifier: &str) -> Option<String> {
-    if specifier.starts_with(HOST_CAPABILITY_PREFIX) || specifier.starts_with("node:") {
-        return None;
-    }
-    if let Some(package) = specifier.strip_prefix("npm:") {
-        return (!package.is_empty()).then_some(package.to_string());
-    }
-    if !specifier.contains(':') && !specifier.starts_with('.') && !specifier.starts_with('/') {
-        return Some(specifier.to_string());
-    }
-    None
-}
-
-async fn resolve_import_path(
-    session: &SandboxSession,
-    base_path: &str,
-    specifier: &str,
-) -> Result<Option<String>, SandboxError> {
-    let fs = session.filesystem();
-    for candidate in import_candidates(base_path, specifier)? {
-        if fs.read_file(&candidate).await?.is_some() {
-            return Ok(Some(candidate));
-        }
-    }
-    Ok(None)
-}
-
-fn import_candidates(base_path: &str, specifier: &str) -> Result<Vec<String>, SandboxError> {
-    let base_dir = parent_path(base_path);
-    let absolute = resolve_path(&base_dir, specifier)?;
-    let mut candidates = Vec::new();
-
-    if has_extension(specifier) {
-        candidates.push(absolute.clone());
-    } else {
-        for suffix in [
-            ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".js", ".jsx", ".mjs", ".cjs",
-        ] {
-            candidates.push(format!("{absolute}{suffix}"));
-        }
-    }
-
-    for suffix in [
-        "/index.ts",
-        "/index.tsx",
-        "/index.mts",
-        "/index.cts",
-        "/index.d.ts",
-        "/index.js",
-        "/index.jsx",
-        "/index.mjs",
-        "/index.cjs",
-    ] {
-        candidates.push(format!("{absolute}{suffix}"));
-    }
-
-    candidates.sort();
-    candidates.dedup();
-    Ok(candidates)
-}
-
-fn extract_module_specifiers(source: &str) -> Vec<String> {
-    let mut specifiers = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(specifier) = quoted_after(trimmed, "from ") {
-            specifiers.push(specifier);
-            continue;
-        }
-        if let Some(specifier) = quoted_after(trimmed, "import(") {
-            specifiers.push(specifier);
-        }
-    }
-    specifiers
-}
-
-fn quoted_after(line: &str, marker: &str) -> Option<String> {
-    let suffix = line.split_once(marker)?.1;
-    let mut chars = suffix.chars();
-    let quote = chars.next()?;
-    if quote != '\'' && quote != '"' {
-        return None;
-    }
-    let mut value = String::new();
-    let mut escaped = false;
-    for ch in chars {
-        if escaped {
-            value.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == quote {
-            return Some(value);
-        }
-        value.push(ch);
-    }
-    None
-}
-
-fn primitive_assignment_diagnostics(path: &str, source: &str) -> Vec<TypeScriptDiagnostic> {
-    let mut diagnostics = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("const ")
-            && !trimmed.starts_with("let ")
-            && !trimmed.starts_with("var ")
-            && !trimmed.starts_with("export const ")
-            && !trimmed.starts_with("export let ")
-            && !trimmed.starts_with("export var ")
-        {
-            continue;
-        }
-        let Some(colon) = trimmed.find(':') else {
-            continue;
-        };
-        let Some(eq_offset) = trimmed[colon + 1..].find('=') else {
-            continue;
-        };
-        let annotation = trimmed[colon + 1..colon + 1 + eq_offset].trim();
-        let value = trimmed[colon + 1 + eq_offset + 1..]
-            .trim()
-            .trim_end_matches(';')
-            .trim();
-        let Some(expected) = primitive_kind(annotation) else {
-            continue;
-        };
-        let Some(actual) = literal_kind(value) else {
-            continue;
-        };
-        if expected != actual {
-            diagnostics.push(TypeScriptDiagnostic {
-                path: path.to_string(),
-                message: format!("cannot assign {actual} to {expected}"),
-                code: Some("TS2322".to_string()),
-            });
-        }
-    }
-    diagnostics
-}
-
-fn primitive_kind(annotation: &str) -> Option<&'static str> {
-    match annotation.split_whitespace().next()? {
-        "string" => Some("string"),
-        "number" => Some("number"),
-        "boolean" => Some("boolean"),
-        _ => None,
-    }
-}
-
-fn literal_kind(value: &str) -> Option<&'static str> {
-    if value.starts_with('"') || value.starts_with('\'') {
-        return Some("string");
-    }
-    if value == "true" || value == "false" {
-        return Some("boolean");
-    }
-    if value.parse::<f64>().is_ok() {
-        return Some("number");
-    }
-    None
-}
-
-async fn persist_mirror_state(
-    session: &SandboxSession,
-    mirror: &TypeScriptMirrorState,
 ) -> Result<(), SandboxError> {
-    write_json_file(session, TERRACE_TYPESCRIPT_MIRROR_PATH, mirror).await
-}
-
-async fn persist_typescript_state<F>(
-    session: &SandboxSession,
-    mutator: F,
-) -> Result<(), SandboxError>
-where
-    F: FnOnce(&mut PersistedTypeScriptState, u64),
-{
-    let mut state: PersistedTypeScriptState =
-        read_json_file(session, TERRACE_TYPESCRIPT_STATE_PATH).await?;
-    let revision = session.info().await.revision;
-    mutator(&mut state, revision);
-    write_json_file(session, TERRACE_TYPESCRIPT_STATE_PATH, &state).await
-}
-
-async fn read_json_file<T>(session: &SandboxSession, path: &str) -> Result<T, SandboxError>
-where
-    T: for<'de> Deserialize<'de> + Default,
-{
-    match session.filesystem().read_file(path).await? {
-        Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        None => Ok(T::default()),
-    }
-}
-
-async fn write_json_file<T>(
-    session: &SandboxSession,
-    path: &str,
-    value: &T,
-) -> Result<(), SandboxError>
-where
-    T: Serialize + ?Sized,
-{
+    let info = session.info().await;
     session
         .filesystem()
         .write_file(
-            path,
-            serde_json::to_vec_pretty(value)?,
-            CreateOptions {
+            TERRACE_TYPESCRIPT_DECLARATIONS_PATH,
+            generated_typescript_declarations(
+                &info.provenance.capabilities,
+                info.provenance.package_compat,
+            )
+            .into_bytes(),
+            terracedb_vfs::CreateOptions {
                 create_parents: true,
                 overwrite: true,
                 ..Default::default()
             },
         )
-        .await
+        .await?;
+    Ok(())
 }
 
-async fn read_utf8_file(
+async fn persist_typescript_state(
     session: &SandboxSession,
-    path: &str,
-    service: &'static str,
-) -> Result<String, SandboxError> {
-    let bytes =
-        session
-            .filesystem()
-            .read_file(path)
-            .await?
-            .ok_or_else(|| SandboxError::Service {
-                service,
-                message: format!("file not found: {path}"),
-            })?;
-    String::from_utf8(bytes).map_err(|error| SandboxError::Service {
-        service,
-        message: format!("{path} is not valid utf-8: {error}"),
-    })
+    compiler_version: &str,
+    roots: &[String],
+    checked_files: &[String],
+    tsconfig_path: Option<&str>,
+) -> Result<(), SandboxError> {
+    let mirror = TypeScriptMirrorState {
+        roots: roots.to_vec(),
+        files: checked_files
+            .iter()
+            .cloned()
+            .map(|path| (path, String::new()))
+            .collect(),
+    };
+    session
+        .filesystem()
+        .write_file(
+            TERRACE_TYPESCRIPT_MIRROR_PATH,
+            serde_json::to_vec_pretty(&mirror)?,
+            terracedb_vfs::CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let state = TypeScriptState {
+        compiler_version: compiler_version.to_string(),
+        tsconfig_path: tsconfig_path.map(ToString::to_string),
+    };
+    session
+        .filesystem()
+        .write_file(
+            TERRACE_TYPESCRIPT_STATE_PATH,
+            serde_json::to_vec_pretty(&state)?,
+            terracedb_vfs::CreateOptions {
+                create_parents: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(())
 }
 
-fn transpile_source(source: &str) -> String {
-    source
-        .lines()
-        .filter_map(transpile_line)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn transpile_line(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("type ")
-        || trimmed.starts_with("export type ")
-        || trimmed.starts_with("interface ")
-        || trimmed.starts_with("export interface ")
-    {
-        return None;
+async fn ensure_typescript_compiler(
+    session: &SandboxSession,
+    roots: &[String],
+    tsconfig_path: Option<&str>,
+) -> Result<ResolvedTypeScriptCompiler, SandboxError> {
+    if let Some(installed) = installed_typescript_compiler(session).await? {
+        return Ok(installed);
     }
 
-    let mut output = line.replace("import type ", "import ");
-    output = strip_variable_annotation(&output);
-    output = strip_function_signature_annotations(&output);
-    output = strip_keyword_assertions(&output, " as ");
-    output = strip_keyword_assertions(&output, " satisfies ");
-    Some(output)
-}
-
-fn strip_variable_annotation(line: &str) -> String {
-    let trimmed = line.trim_start();
-    let variable_markers = [
-        "const ",
-        "let ",
-        "var ",
-        "export const ",
-        "export let ",
-        "export var ",
-    ];
-    if !variable_markers
-        .iter()
-        .any(|marker| trimmed.starts_with(marker))
-    {
-        return line.to_string();
-    }
-    let Some(eq_index) = line.find('=') else {
-        return line.to_string();
-    };
-    let Some(colon_index) = line[..eq_index].rfind(':') else {
-        return line.to_string();
-    };
-    let mut output = String::new();
-    output.push_str(&line[..colon_index]);
-    output.push(' ');
-    output.push_str(line[eq_index..].trim_start());
-    output
-}
-
-fn strip_function_signature_annotations(line: &str) -> String {
-    let Some(function_index) = line.find("function ") else {
-        return line.to_string();
-    };
-    let Some(open_paren) = line[function_index..].find('(') else {
-        return line.to_string();
-    };
-    let open_paren = function_index + open_paren;
-    let Some(close_paren) = find_matching_paren(line, open_paren) else {
-        return line.to_string();
-    };
-
-    let params = &line[open_paren + 1..close_paren];
-    let stripped_params = params
-        .split(',')
-        .map(|part| {
-            let trimmed = part.trim();
-            match trimmed.split_once(':') {
-                Some((name, _)) => name.trim().to_string(),
-                None => trimmed.to_string(),
-            }
+    let version_request = discover_typescript_version_request(session, roots, tsconfig_path)
+        .await?
+        .unwrap_or_else(|| DEFAULT_TYPESCRIPT_VERSION.to_string());
+    session
+        .install_packages(PackageInstallRequest {
+            packages: vec![format!("typescript@{version_request}")],
+            materialize_compatibility_view: true,
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut output = String::new();
-    output.push_str(&line[..open_paren + 1]);
-    output.push_str(&stripped_params);
-    output.push(')');
-    let suffix = &line[close_paren + 1..];
-    if let Some(colon_index) = suffix.find(':')
-        && let Some(body_index) = suffix[colon_index + 1..].find('{')
-    {
-        output.push_str(&suffix[..colon_index]);
-        output.push(' ');
-        output.push_str(suffix[colon_index + 1 + body_index..].trim_start());
-        return output;
-    }
-    output.push_str(suffix);
-    output
+        .await?;
+    installed_typescript_compiler(session)
+        .await?
+        .ok_or_else(|| SandboxError::Service {
+            service: "typescript",
+            message: "typescript package did not appear after installation".to_string(),
+        })
 }
 
-fn find_matching_paren(line: &str, open_paren: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (index, ch) in line.char_indices().skip(open_paren) {
-        match ch {
-            '(' => depth = depth.saturating_add(1),
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(index);
-                }
+async fn installed_typescript_compiler(
+    session: &SandboxSession,
+) -> Result<Option<ResolvedTypeScriptCompiler>, SandboxError> {
+    let Some(manifest) = read_package_install_manifest(session.filesystem().as_ref()).await? else {
+        return Ok(None);
+    };
+    let Some(entry) = manifest.package("typescript") else {
+        return Ok(None);
+    };
+    let package_root = entry
+        .compatibility_root
+        .clone()
+        .unwrap_or_else(|| entry.session_root.clone());
+    Ok(Some(ResolvedTypeScriptCompiler {
+        version: entry.version.clone(),
+        lib_root: format!("{package_root}/lib"),
+    }))
+}
+
+async fn discover_typescript_version_request(
+    session: &SandboxSession,
+    roots: &[String],
+    tsconfig_path: Option<&str>,
+) -> Result<Option<String>, SandboxError> {
+    let info = session.info().await;
+    let mut candidates = BTreeSet::new();
+    if let Some(path) = tsconfig_path {
+        collect_package_manifest_candidates(
+            &info.workspace_root,
+            &resolve_workspace_path(&info.workspace_root, path)?,
+            &mut candidates,
+        )?;
+    }
+    for root in roots {
+        collect_package_manifest_candidates(
+            &info.workspace_root,
+            &resolve_workspace_path(&info.workspace_root, root)?,
+            &mut candidates,
+        )?;
+    }
+    candidates.insert(format!("{}/package.json", info.workspace_root));
+    for candidate in candidates {
+        let Some(bytes) = session.filesystem().read_file(&candidate).await? else {
+            continue;
+        };
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+        for section in ["devDependencies", "dependencies"] {
+            if let Some(version) = manifest
+                .get(section)
+                .and_then(|value| value.as_object())
+                .and_then(|deps| deps.get("typescript"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Ok(Some(version.to_string()));
             }
-            _ => {}
         }
     }
-    None
+    Ok(None)
 }
 
-fn strip_keyword_assertions(line: &str, marker: &str) -> String {
-    let mut output = String::new();
-    let mut remainder = line;
-    while let Some(index) = remainder.find(marker) {
-        output.push_str(&remainder[..index]);
-        let after_marker = &remainder[index + marker.len()..];
-        let split_index = after_marker
-            .find(|ch: char| [',', ';', ')', '}', '\n'].contains(&ch))
-            .unwrap_or(after_marker.len());
-        remainder = &after_marker[split_index..];
+fn collect_package_manifest_candidates(
+    workspace_root: &str,
+    path: &str,
+    candidates: &mut BTreeSet<String>,
+) -> Result<(), SandboxError> {
+    let mut current = if path.ends_with(".json")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".mts")
+        || path.ends_with(".cts")
+        || path.ends_with(".js")
+        || path.ends_with(".jsx")
+        || path.ends_with(".mjs")
+        || path.ends_with(".cjs")
+    {
+        parent_path(path)
+    } else {
+        path.to_string()
+    };
+    let workspace_root = normalize_internal_path(workspace_root)?;
+    loop {
+        candidates.insert(format!("{current}/package.json"));
+        if current == workspace_root || current == "/" {
+            break;
+        }
+        let parent = parent_path(&current);
+        if parent == current {
+            break;
+        }
+        current = parent;
     }
-    output.push_str(remainder);
-    output
+    Ok(())
+}
+
+fn normalized_roots(workspace_root: &str, roots: &[String]) -> Result<Vec<String>, SandboxError> {
+    roots
+        .iter()
+        .map(|path| resolve_workspace_path(workspace_root, path))
+        .collect()
+}
+
+async fn run_typescript(
+    session: &SandboxSession,
+    request: TypeScriptRunnerRequest,
+) -> Result<TypeScriptRunnerResponse, SandboxError> {
+    let payload = serde_json::to_string(&request)?;
+    let source = format!(
+        "{}\nexport default runTypeScript({payload});\n",
+        TYPESCRIPT_RUNNER_SOURCE
+    );
+    let workspace_root = session.info().await.workspace_root;
+    let session = session.clone();
+    let virtual_specifier = format!("terrace:{workspace_root}/.terrace/typescript/runner-eval.mjs");
+    let result = tokio::task::spawn_blocking(move || -> Result<_, SandboxError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| SandboxError::Service {
+                service: "typescript",
+                message: format!("failed to build local runtime for tsc: {error}"),
+            })?;
+        runtime.block_on(async move {
+            session
+                .eval_untracked(source, Some(virtual_specifier))
+                .await
+        })
+    })
+    .await
+    .map_err(|error| SandboxError::Service {
+        service: "typescript",
+        message: format!("typescript runner task failed: {error}"),
+    })??;
+    serde_json::from_value(result.result.ok_or_else(|| SandboxError::Service {
+        service: "typescript",
+        message: "typescript runner did not produce a JSON result".to_string(),
+    })?)
+    .map_err(Into::into)
+}
+
+fn summarize_diagnostics(diagnostics: &[TypeScriptDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(|diagnostic| match diagnostic.code.as_deref() {
+            Some(code) => format!("{} {}: {}", diagnostic.path, code, diagnostic.message),
+            None => format!("{}: {}", diagnostic.path, diagnostic.message),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn generated_typescript_declarations(
+    manifest: &CapabilityManifest,
+    package_compat: PackageCompatibilityMode,
+) -> String {
+    let mut sections = vec![
+        SANDBOX_WORKFLOW_LIBRARY_TYPESCRIPT_DECLARATIONS.to_string(),
+        sandbox_builtin_typescript_declarations(package_compat),
+        manifest.generated_ambient_typescript_declarations(),
+    ];
+    sections.retain(|section| !section.trim().is_empty());
+    sections.join("\n\n")
+}
+
+fn sandbox_builtin_typescript_declarations(package_compat: PackageCompatibilityMode) -> String {
+    let mut sections = vec![
+        format!(
+            r#"declare module "{SANDBOX_FS_LIBRARY_SPECIFIER}" {{
+  export function readTextFile(path: string): string;
+  export function writeTextFile(path: string, contents: string): void;
+  export function readJsonFile(path: string): unknown;
+  export function writeJsonFile(path: string, value: unknown): void;
+  export function mkdir(path: string): void;
+  export function readdir(path: string): Array<{{ name: string; kind: "file" | "directory" }}>;
+  export function stat(path: string): {{ kind: "file" | "directory" }} | null;
+  export function unlink(path: string): void;
+  export function rmdir(path: string): void;
+  export function rename(from: string, to: string): void;
+  export function fsync(path: string): void;
+}}"#
+        ),
+        format!(
+            r#"declare module "{SANDBOX_BASH_LIBRARY_SPECIFIER}" {{
+  export const unavailable: boolean;
+  export const service: string;
+}}"#
+        ),
+        format!(
+            r#"declare module "{SANDBOX_TYPESCRIPT_LIBRARY_SPECIFIER}" {{
+  export const unavailable: boolean;
+  export const service: string;
+}}"#
+        ),
+        format!(
+            r#"declare module "{SANDBOX_CAPABILITIES_LIBRARY_SPECIFIER}" {{
+  const capabilities: Record<string, unknown>;
+  export default capabilities;
+}}"#
+        ),
+    ];
+    if package_compat == PackageCompatibilityMode::NpmWithNodeBuiltins {
+        sections.push(
+            r#"declare module "node:fs" {
+  export function readTextFile(path: string): string;
+}
+
+declare module "node:fs/promises" {
+  export function readTextFile(path: string): Promise<string>;
+}"#
+            .to_string(),
+        );
+    }
+    sections.join("\n\n")
 }
 
 fn emitted_output_path(path: &str) -> String {
@@ -1110,14 +887,4 @@ fn parent_path(path: &str) -> String {
         Some(0) | None => "/".to_string(),
         Some(index) => path[..index].to_string(),
     }
-}
-
-fn has_extension(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|segment| segment.contains('.'))
-}
-
-fn is_relative_specifier(specifier: &str) -> bool {
-    specifier.starts_with("./") || specifier.starts_with("../")
 }

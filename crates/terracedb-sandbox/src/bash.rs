@@ -131,7 +131,7 @@ impl JustBashFilesystemAdapter {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 pub trait BashService: Send + Sync {
     fn name(&self) -> &str;
     async fn run(
@@ -283,16 +283,31 @@ impl DeterministicBashService {
     }
 
     async fn npm_command(&self, session: &SandboxSession, tokens: &[String]) -> CommandOutcome {
-        if tokens.get(1).map(String::as_str) != Some("install") || tokens.len() < 3 {
+        if tokens.get(1).map(String::as_str) != Some("install") {
             return shell_failure(
                 1,
                 String::new(),
-                "supported syntax is `npm install <package...>`\n".to_string(),
+                "supported syntax is `npm install [package...]`\n".to_string(),
             );
         }
+        let packages = if tokens.len() >= 3 {
+            tokens[2..].to_vec()
+        } else {
+            match self.packages_from_manifest(session).await {
+                Ok(packages) if !packages.is_empty() => packages,
+                Ok(_) => {
+                    return shell_failure(
+                        1,
+                        String::new(),
+                        "package.json did not declare any dependencies to install\n".to_string(),
+                    );
+                }
+                Err(error) => return shell_failure(1, String::new(), format!("{error}\n")),
+            }
+        };
         match session
             .install_packages(PackageInstallRequest {
-                packages: tokens[2..].to_vec(),
+                packages,
                 materialize_compatibility_view: true,
             })
             .await
@@ -335,10 +350,28 @@ impl DeterministicBashService {
         };
         if emit {
             match self.typescript.emit(session, request).await {
-                Ok(report) => CommandOutcome {
+                Ok(report) if report.diagnostics.is_empty() => CommandOutcome {
                     exit_code: 0,
                     stdout: render_lines(&report.emitted_files),
                     stderr: String::new(),
+                },
+                Ok(report) => CommandOutcome {
+                    exit_code: 2,
+                    stdout: render_lines(&report.emitted_files),
+                    stderr: render_lines(
+                        &report
+                            .diagnostics
+                            .into_iter()
+                            .map(|diagnostic| {
+                                format!(
+                                    "{} {} {}",
+                                    diagnostic.path,
+                                    diagnostic.code.unwrap_or_else(|| "TS0000".to_string()),
+                                    diagnostic.message
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
                 },
                 Err(error) => shell_failure(1, String::new(), format!("{error}\n")),
             }
@@ -370,6 +403,34 @@ impl DeterministicBashService {
                 Err(error) => shell_failure(1, String::new(), format!("{error}\n")),
             }
         }
+    }
+
+    async fn packages_from_manifest(
+        &self,
+        session: &SandboxSession,
+    ) -> Result<Vec<String>, SandboxError> {
+        let workspace_root = session.info().await.workspace_root;
+        let manifest_path = format!("{workspace_root}/package.json");
+        let Some(bytes) = session.filesystem().read_file(&manifest_path).await? else {
+            return Ok(Vec::new());
+        };
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let mut packages = Vec::new();
+        for section in ["dependencies", "devDependencies"] {
+            if let Some(deps) = manifest.get(section).and_then(|value| value.as_object()) {
+                for (name, version) in deps {
+                    match version.as_str().map(str::trim) {
+                        Some(version) if !version.is_empty() => {
+                            packages.push(format!("{name}@{version}"));
+                        }
+                        _ => packages.push(name.clone()),
+                    }
+                }
+            }
+        }
+        packages.sort();
+        packages.dedup();
+        Ok(packages)
     }
 }
 
@@ -491,7 +552,7 @@ impl Default for DeterministicBashService {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl BashService for DeterministicBashService {
     fn name(&self) -> &str {
         &self.name

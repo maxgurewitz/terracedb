@@ -138,6 +138,46 @@ impl WorkflowLifecycleState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowSandboxSourceKind {
+    JavaScript,
+    TypeScript,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSandboxPackageCompatibility {
+    TerraceOnly,
+    NpmPureJs,
+    NpmWithNodeBuiltins,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkflowSandboxPreparation {
+    #[serde(default)]
+    pub source_kind: Option<WorkflowSandboxSourceKind>,
+    #[serde(default)]
+    pub package_compat: Option<WorkflowSandboxPackageCompatibility>,
+    #[serde(default)]
+    pub package_manifest_path: Option<String>,
+    #[serde(default)]
+    pub tsconfig_path: Option<String>,
+}
+
+impl WorkflowSandboxPreparation {
+    pub fn source_kind(&self) -> WorkflowSandboxSourceKind {
+        self.source_kind
+            .clone()
+            .unwrap_or(WorkflowSandboxSourceKind::JavaScript)
+    }
+
+    pub fn package_compat(&self) -> WorkflowSandboxPackageCompatibility {
+        self.package_compat
+            .unwrap_or(WorkflowSandboxPackageCompatibility::TerraceOnly)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum WorkflowBundleKind {
     NativeRust {
@@ -147,6 +187,8 @@ pub enum WorkflowBundleKind {
         abi: String,
         module: String,
         entrypoint: String,
+        #[serde(default)]
+        preparation: WorkflowSandboxPreparation,
     },
 }
 
@@ -676,6 +718,14 @@ pub struct WorkflowOutboxCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCallbackDeliveryCommand {
+    pub target_workflow: String,
+    pub instance_id: String,
+    pub callback_id: String,
+    pub response: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum WorkflowTimerCommand {
     Schedule {
@@ -691,8 +741,15 @@ pub enum WorkflowTimerCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum WorkflowCommand {
-    Outbox { entry: WorkflowOutboxCommand },
-    Timer { command: WorkflowTimerCommand },
+    Outbox {
+        entry: WorkflowOutboxCommand,
+    },
+    Timer {
+        command: WorkflowTimerCommand,
+    },
+    DeliverCallback {
+        delivery: WorkflowCallbackDeliveryCommand,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1938,6 +1995,7 @@ mod durable_format_tests {
                         abi: "workflow-task/v1".to_string(),
                         module: "orders.js".to_string(),
                         entrypoint: "default".to_string(),
+                        preparation: Default::default(),
                     },
                     created_at_millis: 10,
                     labels: BTreeMap::from([("channel".to_string(), "bundle".to_string())]),

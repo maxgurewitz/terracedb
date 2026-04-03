@@ -310,6 +310,7 @@ async fn typescript_cache_and_mirror_only_survive_durable_recovery_after_flush()
                 target: "es2022".to_string(),
                 module_kind: "esm".to_string(),
                 jsx: None,
+                tsconfig_path: None,
             },
         )
         .await
@@ -400,6 +401,7 @@ async fn typescript_cache_and_mirror_only_survive_durable_recovery_after_flush()
                 target: "es2022".to_string(),
                 module_kind: "esm".to_string(),
                 jsx: None,
+                tsconfig_path: None,
             },
         )
         .await

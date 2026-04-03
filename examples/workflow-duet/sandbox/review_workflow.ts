@@ -2,7 +2,7 @@ import { camelCase } from "lodash";
 import { schema, text, wf } from "@terrace/workflow";
 
 type ReviewStageName = "retry-backoff" | "waiting-approval" | "approved" | "timed-out";
-type ReviewStateValue = { stage: ReviewStageName; attempt: number; started_at_millis: number; last_updated_at_millis: number; waiting_for_callback: string | null; deadline_millis: number | null; last_trigger: string };
+type ReviewStateValue = { stage: ReviewStageName; attempt: number; started_at_millis: number; last_updated_at_millis: number; approval_received: boolean; waiting_for_callback: string | null; deadline_millis: number | null; last_trigger: string };
 
 const START_CALLBACK_ID: string = "start";
 const APPROVE_CALLBACK_ID: string = "approve";
@@ -15,6 +15,7 @@ const ReviewState = wf.jsonState(
     attempt: schema.number(),
     started_at_millis: schema.number(),
     last_updated_at_millis: schema.number(),
+    approval_received: schema.boolean(),
     waiting_for_callback: schema.nullable(schema.string()),
     deadline_millis: schema.nullable(schema.number()),
     last_trigger: schema.string(),
@@ -48,6 +49,7 @@ function reviewVisibility(workflowName, state, visibility) {
     attempt: String(state.attempt),
     workflow: workflowName,
     workflow_slug: camelCase(workflowName),
+    approval_received: String(state.approval_received),
     "waiting-for": state.waiting_for_callback ?? "-",
   };
   if (state.deadline_millis != null) {
@@ -56,15 +58,13 @@ function reviewVisibility(workflowName, state, visibility) {
   return visibility(summary, `${camelCase(state.stage)} via ${state.last_trigger}`);
 }
 
-function outboxAction(command, workflowName, instanceId, action, attempt, trigger) {
-  const idempotencyKey = `${instanceId}:${action}:${attempt}`;
-  return command.outboxJson(idempotencyKey, {
-    workflow: workflowName,
-    instance_id: instanceId,
-    action,
-    attempt,
-    trigger,
-  });
+function counterpartWorkflow(workflowName: string): string {
+  if (workflowName === "workflow-duet-native") return "workflow-duet-sandbox";
+  if (workflowName === "workflow-duet-sandbox") return "workflow-duet-native";
+  throw {
+    code: "invalid-contract",
+    message: `workflow-duet does not know counterpart for workflow ${workflowName}`,
+  };
 }
 
 export default wf.define({
@@ -97,6 +97,7 @@ export default wf.define({
         attempt: 1,
         started_at_millis: admittedAtMillis,
         last_updated_at_millis: admittedAtMillis,
+        approval_received: false,
         waiting_for_callback: null,
         deadline_millis: null,
         last_trigger: label,
@@ -104,15 +105,7 @@ export default wf.define({
       return running({
         putState: nextState,
         visibility: reviewVisibility(workflowName, nextState, visibility),
-        commands: [
-          outboxAction(command, workflowName, instanceId, "accepted-start", 1, label),
-          outboxAction(command, workflowName, instanceId, "requested-check", 1, label),
-          command.scheduleTimer(
-            retryTimerId(instanceId),
-            admittedAtMillis + RETRY_DELAY_MS,
-            "retry",
-          ),
-        ],
+        commands: [command.scheduleTimer(retryTimerId(instanceId), admittedAtMillis + RETRY_DELAY_MS, "retry")],
       });
     }
 
@@ -122,12 +115,31 @@ export default wf.define({
       text(input.trigger.timer_id) === retryTimerId(instanceId)
     ) {
       const nextAttempt = state.attempt + 1;
+      const counterpart = counterpartWorkflow(workflowName);
+      if (state.approval_received) {
+        const nextState: ReviewStateValue = {
+          stage: "approved",
+          attempt: nextAttempt,
+          started_at_millis: state.started_at_millis,
+          last_updated_at_millis: admittedAtMillis,
+          approval_received: true,
+          waiting_for_callback: null,
+          deadline_millis: null,
+          last_trigger: label,
+        };
+        return completed({
+          putState: nextState,
+          visibility: reviewVisibility(workflowName, nextState, visibility),
+          commands: [command.deliverCallback(counterpart, instanceId, APPROVE_CALLBACK_ID, "approved")],
+        });
+      }
       const deadline = input.trigger.fire_at_millis + APPROVAL_TIMEOUT_MS;
       const nextState: ReviewStateValue = {
         stage: "waiting-approval",
         attempt: nextAttempt,
         started_at_millis: state.started_at_millis,
         last_updated_at_millis: admittedAtMillis,
+        approval_received: false,
         waiting_for_callback: APPROVE_CALLBACK_ID,
         deadline_millis: deadline,
         last_trigger: label,
@@ -136,9 +148,30 @@ export default wf.define({
         putState: nextState,
         visibility: reviewVisibility(workflowName, nextState, visibility),
         commands: [
-          outboxAction(command, workflowName, instanceId, "requested-approval", nextAttempt, label),
+          command.deliverCallback(counterpart, instanceId, APPROVE_CALLBACK_ID, "approved"),
           command.scheduleTimer(approvalTimerId(instanceId), deadline, "approval-timeout"),
         ],
+      });
+    }
+
+    if (
+      state.stage === "retry-backoff" &&
+      input.trigger.kind === "callback" &&
+      input.trigger.callback_id === APPROVE_CALLBACK_ID
+    ) {
+      const nextState: ReviewStateValue = {
+        stage: "retry-backoff",
+        attempt: state.attempt,
+        started_at_millis: state.started_at_millis,
+        last_updated_at_millis: admittedAtMillis,
+        approval_received: true,
+        waiting_for_callback: null,
+        deadline_millis: null,
+        last_trigger: label,
+      };
+      return running({
+        putState: nextState,
+        visibility: reviewVisibility(workflowName, nextState, visibility),
       });
     }
 
@@ -152,6 +185,7 @@ export default wf.define({
         attempt: state.attempt,
         started_at_millis: state.started_at_millis,
         last_updated_at_millis: admittedAtMillis,
+        approval_received: true,
         waiting_for_callback: null,
         deadline_millis: null,
         last_trigger: label,
@@ -159,10 +193,7 @@ export default wf.define({
       return completed({
         putState: nextState,
         visibility: reviewVisibility(workflowName, nextState, visibility),
-        commands: [
-          command.cancelTimer(approvalTimerId(instanceId)),
-          outboxAction(command, workflowName, instanceId, "approved", state.attempt, label),
-        ],
+        commands: [command.cancelTimer(approvalTimerId(instanceId))],
       });
     }
 
@@ -176,6 +207,7 @@ export default wf.define({
         attempt: state.attempt,
         started_at_millis: state.started_at_millis,
         last_updated_at_millis: admittedAtMillis,
+        approval_received: state.approval_received,
         waiting_for_callback: null,
         deadline_millis: null,
         last_trigger: label,
@@ -183,9 +215,6 @@ export default wf.define({
       return failed({
         putState: nextState,
         visibility: reviewVisibility(workflowName, nextState, visibility),
-        commands: [
-          outboxAction(command, workflowName, instanceId, "timed-out", state.attempt, label),
-        ],
       });
     }
 

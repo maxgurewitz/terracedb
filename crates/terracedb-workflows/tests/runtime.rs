@@ -684,6 +684,7 @@ fn contract_bundle(module: &str) -> contracts::WorkflowBundleMetadata {
             abi: terracedb_workflows::sandbox_contracts::WORKFLOW_TASK_V1_ABI.to_string(),
             module: module.to_string(),
             entrypoint: "default".to_string(),
+            preparation: Default::default(),
         },
         created_at_millis: 1,
         labels: BTreeMap::from([(

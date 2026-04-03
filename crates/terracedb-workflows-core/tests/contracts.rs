@@ -35,6 +35,7 @@ fn bundle_metadata_round_trips() {
             abi: "workflow-task/v1".to_string(),
             module: "payments.js".to_string(),
             entrypoint: "default".to_string(),
+            preparation: Default::default(),
         },
         created_at_millis: 42,
         labels: BTreeMap::from([("channel".to_string(), "stable".to_string())]),
@@ -133,7 +134,9 @@ fn history_event_round_trips() {
             visibility: None,
             continue_as_new: Some(WorkflowContinueAsNew {
                 next_run_id: WorkflowRunId::new("run:2").expect("next run"),
-                next_bundle_id: WorkflowBundleId::new("bundle:v2").expect("next bundle"),
+                next_target: WorkflowExecutionTarget::Bundle {
+                    bundle_id: WorkflowBundleId::new("bundle:v2").expect("next bundle"),
+                },
                 state: Some(WorkflowPayload::bytes("carry")),
             }),
             commands: vec![WorkflowCommand::Outbox {
@@ -503,6 +506,7 @@ async fn deployment_manager_resolves_preview_and_production_deterministically() 
             abi: "workflow-task/v1".to_string(),
             module: "orders.preview.js".to_string(),
             entrypoint: "default".to_string(),
+            preparation: Default::default(),
         },
         created_at_millis: 10,
         labels: BTreeMap::from([("channel".to_string(), "preview".to_string())]),

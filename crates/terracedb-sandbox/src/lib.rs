@@ -79,8 +79,8 @@ pub use typescript::{
     DeterministicTypeScriptService, TERRACE_TYPESCRIPT_DECLARATIONS_PATH,
     TERRACE_TYPESCRIPT_MIRROR_PATH, TERRACE_TYPESCRIPT_STATE_PATH,
     TERRACE_TYPESCRIPT_TRANSPILE_CACHE_DIR, TypeCheckReport, TypeCheckRequest,
-    TypeScriptDiagnostic, TypeScriptEmitReport, TypeScriptMirrorEntry, TypeScriptMirrorState,
-    TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
+    TypeScriptDiagnostic, TypeScriptEmitReport, TypeScriptMirrorState, TypeScriptService,
+    TypeScriptTranspileReport, TypeScriptTranspileRequest,
 };
 pub use view::{
     AuthenticatedReadonlyViewRemoteEndpoint, DeterministicReadonlyViewProvider,

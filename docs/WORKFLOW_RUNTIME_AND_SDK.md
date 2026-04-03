@@ -1547,6 +1547,39 @@ The duet example showed that cross-runtime interaction works well over durable o
 - Restart and replay tests proving the higher-level primitive preserves deterministic behavior.
 - Internal parity tests proving the new primitive still lowers to the durable messaging machinery correctly.
 
+### W10a. Extend the example to cover workflow spawn plus "signal-or-start" style interaction
+
+**Depends on:** W10
+
+**Description**
+
+The duet example should not stop at communication between already-running workflows. It should also show the next important orchestration shape:
+
+- start a child workflow when it does not exist yet,
+- otherwise signal or callback an existing workflow,
+- and do that across the same durable interaction machinery as ordinary workflow-to-workflow delivery.
+
+Temporal's `signalWithStart` / `signalOrStart` family is a useful reference point here. Terracedb does not need to copy that API exactly, but the example should exercise the same underlying workflow story so we can judge whether our model is simpler and safer in practice.
+
+**Implementation steps**
+
+1. Add a child-workflow interaction to the example so one workflow can cause another workflow to exist rather than only talking to a peer that is already running.
+2. Add a "signal-or-start" style helper or command in the example-facing API shape:
+   - if the target workflow already exists, deliver the interaction,
+   - otherwise start it and deliver the initial interaction as part of startup.
+3. Keep the durable lowering explicit internally so replay, restart, and idempotency remain testable.
+4. Prefer a design that can later generalize to `spawn`, `signal`, and child-workflow convenience APIs rather than an example-only special case.
+5. Update the example and README so reviewers can see:
+   - communication between existing workflows,
+   - spawning a new child workflow,
+   - and signal-or-start behavior in one coherent flow.
+
+**Verification**
+
+- Example tests proving an interaction succeeds both when the target workflow already exists and when it must be started first.
+- Deterministic simulation tests covering restart before and after the start-or-signal boundary.
+- Review notes describing whether the resulting API feels like a good Terracedb-native replacement for Temporal's `signalWithStart` / `signalOrStart`.
+
 ### W11. Add better runtime and harness readiness helpers for deterministic tests and local examples
 
 **Depends on:** W03

@@ -42,6 +42,46 @@ pub struct DirEntryPlus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VfsBatchOperation {
+    WriteFile {
+        path: String,
+        data: Vec<u8>,
+        opts: CreateOptions,
+    },
+    Pwrite {
+        path: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Truncate {
+        path: String,
+        size: u64,
+    },
+    Mkdir {
+        path: String,
+        opts: MkdirOptions,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Link {
+        from: String,
+        to: String,
+    },
+    Symlink {
+        target: String,
+        linkpath: String,
+    },
+    Unlink {
+        path: String,
+    },
+    Rmdir {
+        path: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateOptions {
     pub create_parents: bool,
     pub overwrite: bool,
@@ -86,6 +126,7 @@ pub trait ReadOnlyVfsFileSystem: Send + Sync {
 
 #[async_trait]
 pub trait VfsFileSystem: ReadOnlyVfsFileSystem {
+    async fn apply_batch(&self, ops: &[VfsBatchOperation]) -> Result<(), VfsError>;
     async fn write_file(
         &self,
         path: &str,

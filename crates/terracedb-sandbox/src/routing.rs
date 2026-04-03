@@ -775,7 +775,7 @@ impl RoutedBashService {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl BashService for RoutedBashService {
     fn name(&self) -> &str {
         self.inner.name()

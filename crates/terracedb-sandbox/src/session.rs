@@ -48,7 +48,7 @@ use crate::{
     PackageInstaller, PullRequestProviderClient, PullRequestReport, PullRequestRequest,
     ReadonlyViewCut, ReadonlyViewHandle, ReadonlyViewLocation, ReadonlyViewProvider,
     ReadonlyViewRequest, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION, SandboxConfig,
-    SandboxError, SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim,
+    SandboxError, SandboxExecutionKind, SandboxExecutionRequest, SandboxExecutionResult, SandboxFilesystemShim,
     SandboxModuleLoader, SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle,
     SandboxRuntimeStateHandle, SandboxServiceBindings, SandboxSessionInfo,
     SandboxSessionProvenance, SandboxSessionState, StaticCapabilityRegistry,
@@ -598,7 +598,7 @@ impl SandboxSession {
         &self,
         specifier: impl Into<String>,
     ) -> Result<SandboxExecutionResult, SandboxError> {
-        self.execute_runtime(
+        self.execute_runtime_logged(
             "sandbox.runtime.exec_module",
             SandboxExecutionRequest::module(specifier.into()),
         )
@@ -609,10 +609,39 @@ impl SandboxSession {
         &self,
         source: impl Into<String>,
     ) -> Result<SandboxExecutionResult, SandboxError> {
-        self.execute_runtime(
+        self.execute_runtime_logged(
             "sandbox.runtime.eval",
             SandboxExecutionRequest::eval(source.into()),
         )
+        .await
+    }
+
+    pub async fn exec_node_command(
+        &self,
+        entrypoint: impl Into<String>,
+        argv: Vec<String>,
+        cwd: impl Into<String>,
+        env: BTreeMap<String, String>,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        self.execute_runtime_logged(
+            "sandbox.runtime.exec_node_command",
+            SandboxExecutionRequest::node_command(entrypoint, argv, cwd, env),
+        )
+        .await
+    }
+
+    pub(crate) async fn eval_untracked(
+        &self,
+        source: impl Into<String>,
+        virtual_specifier: Option<String>,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        self.execute_runtime_untracked(SandboxExecutionRequest {
+            kind: SandboxExecutionKind::Eval {
+                source: source.into(),
+                virtual_specifier,
+            },
+            metadata: BTreeMap::new(),
+        })
         .await
     }
 
@@ -1823,14 +1852,14 @@ impl SandboxSession {
         Ok(())
     }
 
-    async fn execute_runtime(
+    async fn execute_runtime_logged(
         &self,
         operation_name: &str,
         request: SandboxExecutionRequest,
     ) -> Result<SandboxExecutionResult, SandboxError> {
         let counted = self.execution_policy().await.is_some();
         let params = Some(serde_json::to_value(&request)?);
-        match self.runtime_actor.execute(self, request).await {
+        match self.execute_runtime_untracked(request).await {
             Ok(result) => {
                 let outcome = record_completed_tool_run(
                     self.volume.as_ref(),
@@ -1871,6 +1900,13 @@ impl SandboxSession {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) async fn execute_runtime_untracked(
+        &self,
+        request: SandboxExecutionRequest,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        self.runtime_actor.execute(self, request).await
     }
 
     async fn export_root(&self) -> Result<String, SandboxError> {

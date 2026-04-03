@@ -4,5 +4,8 @@
   "type": "module",
   "dependencies": {
     "lodash": "*"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
   }
 }
