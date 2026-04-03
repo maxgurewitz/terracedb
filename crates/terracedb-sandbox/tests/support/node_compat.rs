@@ -88,7 +88,13 @@ pub async fn open_node_session(
 pub async fn exec_node_fixture(
     source: &str,
 ) -> Result<terracedb_sandbox::SandboxExecutionResult, terracedb_sandbox::SandboxError> {
-    let entrypoint = "/workspace/app/index.cjs";
+    exec_node_fixture_at("/workspace/app/index.cjs", source).await
+}
+
+pub async fn exec_node_fixture_at(
+    entrypoint: &str,
+    source: &str,
+) -> Result<terracedb_sandbox::SandboxExecutionResult, terracedb_sandbox::SandboxError> {
     let session = open_node_session(510, 121, entrypoint, source).await;
     session
         .exec_node_command(
@@ -140,8 +146,24 @@ fn unique_temp_node_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("terrace-node-parity-{label}-{nanos}.cjs"))
 }
 
+fn unique_temp_node_path_with_extension(label: &str, extension: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("terrace-node-parity-{label}-{nanos}.{extension}"))
+}
+
 pub fn exec_real_node_file(source: &str) -> std::io::Result<RealNodeExecution> {
-    let path = unique_temp_node_path("file");
+    exec_real_node_file_with_extension("file", "cjs", source)
+}
+
+pub fn exec_real_node_file_with_extension(
+    label: &str,
+    extension: &str,
+    source: &str,
+) -> std::io::Result<RealNodeExecution> {
+    let path = unique_temp_node_path_with_extension(label, extension);
     fs::write(&path, source)?;
     let output = Command::new("node").arg(&path).output()?;
     let _ = fs::remove_file(&path);
@@ -154,6 +176,18 @@ pub fn exec_real_node_file(source: &str) -> std::io::Result<RealNodeExecution> {
 
 pub fn exec_real_node_eval(source: &str) -> std::io::Result<RealNodeExecution> {
     let output = Command::new("node").arg("-e").arg(source).output()?;
+    Ok(RealNodeExecution {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code().unwrap_or_default(),
+    })
+}
+
+pub fn exec_real_node_eval_with_args(
+    args: &[&str],
+    source: &str,
+) -> std::io::Result<RealNodeExecution> {
+    let output = Command::new("node").args(args).arg(source).output()?;
     Ok(RealNodeExecution {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),

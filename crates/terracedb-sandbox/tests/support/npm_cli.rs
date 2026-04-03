@@ -303,6 +303,59 @@ pub fn node_runtime_events(result: &terracedb_sandbox::SandboxExecutionResult) -
         .unwrap_or_default()
 }
 
+pub fn node_runtime_events_with_labels(
+    result: &terracedb_sandbox::SandboxExecutionResult,
+    labels: &[&str],
+) -> Vec<serde_json::Value> {
+    node_runtime_events(result)
+        .into_iter()
+        .filter(|event| {
+            event
+                .get("label")
+                .and_then(|value| value.as_str())
+                .map(|label| labels.iter().any(|candidate| candidate == &label))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+pub fn node_runtime_events_matching(
+    result: &terracedb_sandbox::SandboxExecutionResult,
+    labels: Option<&[&str]>,
+    module_substrings: Option<&[&str]>,
+    limit: Option<usize>,
+) -> Vec<serde_json::Value> {
+    let mut matches = node_runtime_events(result)
+        .into_iter()
+        .filter(|event| {
+            let label_ok = labels.map_or(true, |labels| {
+                event.get("label")
+                    .and_then(|value| value.as_str())
+                    .map(|label| labels.iter().any(|candidate| candidate == &label))
+                    .unwrap_or(false)
+            });
+            let module_ok = module_substrings.map_or(true, |module_substrings| {
+                let module = event
+                    .get("data")
+                    .and_then(|value| value.get("module"))
+                    .and_then(|value| value.as_str());
+                module.map_or(false, |module| {
+                    module_substrings
+                        .iter()
+                        .any(|candidate| module.contains(candidate))
+                })
+            });
+            label_ok && module_ok
+        })
+        .collect::<Vec<_>>();
+    if let Some(limit) = limit {
+        if matches.len() > limit {
+            matches = matches.split_off(matches.len() - limit);
+        }
+    }
+    matches
+}
+
 pub fn node_runtime_last_exception(
     result: &terracedb_sandbox::SandboxExecutionResult,
 ) -> Option<serde_json::Value> {

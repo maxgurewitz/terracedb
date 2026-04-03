@@ -54,6 +54,7 @@ use terracedb_vfs::{
 };
 use tokio::sync::Mutex;
 use tracing::{Level, info_span, trace};
+use url::Url;
 
 use crate::{
     CapabilityCallRequest, CapabilityCallResult, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER,
@@ -173,6 +174,8 @@ struct NodeLoadedModule {
 struct NodeRequireResolveOptions {
     #[serde(default)]
     paths: Option<Vec<String>>,
+    #[serde(default)]
+    extensions: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -189,6 +192,7 @@ struct NodeRuntimeHost {
     process: Rc<RefCell<NodeProcessState>>,
     open_files: Rc<RefCell<NodeOpenFileTable>>,
     loaded_modules: Rc<RefCell<BTreeMap<String, NodeLoadedModule>>>,
+    materialized_modules: Rc<RefCell<BTreeMap<String, Module>>>,
     module_graph: Rc<RefCell<NodeModuleGraph>>,
     read_snapshot_fs: Rc<RefCell<Option<Arc<dyn ReadOnlyVfsFileSystem>>>>,
     debug_trace: Rc<RefCell<NodeRuntimeDebugTrace>>,
@@ -198,7 +202,6 @@ struct NodeRuntimeHost {
 
 struct NodeCommandModuleLoader {
     host: Rc<NodeRuntimeHost>,
-    modules: RefCell<BTreeMap<String, Module>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -297,6 +300,7 @@ impl NodeModuleGraph {
 struct NodeFileOrDirectoryCacheKey {
     base: String,
     mode: NodeResolveMode,
+    extensions: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -304,6 +308,7 @@ struct NodePackageEntryCacheKey {
     package_root: String,
     subpath: Option<String>,
     mode: NodeResolveMode,
+    extensions: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -312,6 +317,7 @@ struct NodeResolveCacheKey {
     referrer: Option<String>,
     mode: NodeResolveMode,
     paths: Vec<String>,
+    extensions: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1294,6 +1300,7 @@ async fn execute_node_command(
         process: Rc::new(RefCell::new(NodeProcessState::new(argv, env, cwd))),
         open_files: Rc::new(RefCell::new(NodeOpenFileTable::default())),
         loaded_modules: Rc::new(RefCell::new(BTreeMap::new())),
+        materialized_modules: Rc::new(RefCell::new(BTreeMap::new())),
         module_graph: Rc::new(RefCell::new(NodeModuleGraph::default())),
         read_snapshot_fs: Rc::new(RefCell::new(None)),
         debug_trace: Rc::new(RefCell::new(NodeRuntimeDebugTrace::default())),
@@ -1500,6 +1507,12 @@ fn install_node_host_bindings(context: &mut Context) -> Result<(), SandboxError>
     register_global_native(context, "__terraceResolveModule", 3, node_resolve_module)?;
     register_global_native(
         context,
+        "__terraceRequireEsmNamespace",
+        1,
+        node_require_esm_namespace,
+    )?;
+    register_global_native(
+        context,
         "__terraceRequireResolveImpl",
         3,
         node_require_resolve,
@@ -1636,7 +1649,12 @@ fn register_global_native(
 fn node_with_host<T>(
     f: impl FnOnce(&NodeRuntimeHost) -> Result<T, SandboxError>,
 ) -> Result<T, SandboxError> {
-    let host = ACTIVE_NODE_HOST_STACK
+    let host = active_node_host()?;
+    f(&host)
+}
+
+fn active_node_host() -> Result<Rc<NodeRuntimeHost>, SandboxError> {
+    ACTIVE_NODE_HOST_STACK
         .try_with(|stack| {
             let stack = stack.borrow();
             stack.last().cloned().ok_or_else(|| SandboxError::Service {
@@ -1649,8 +1667,8 @@ fn node_with_host<T>(
             service: "runtime",
             message: "node host bindings are unavailable outside node command execution"
                 .to_string(),
-        })??;
-    f(&host)
+        })?
+        .map_err(|error| error)
 }
 
 fn node_with_host_js(
@@ -1887,10 +1905,7 @@ fn with_active_node_host<T>(
 
 impl NodeCommandModuleLoader {
     fn new(host: Rc<NodeRuntimeHost>) -> Self {
-        Self {
-            host,
-            modules: RefCell::new(BTreeMap::new()),
-        }
+        Self { host }
     }
 
     fn materialize(
@@ -1898,7 +1913,13 @@ impl NodeCommandModuleLoader {
         resolved: &NodeResolvedModule,
         context: &mut Context,
     ) -> Result<Module, SandboxError> {
-        if let Some(module) = self.modules.borrow().get(&resolved.specifier).cloned() {
+        if let Some(module) = self
+            .host
+            .materialized_modules
+            .borrow()
+            .get(&resolved.specifier)
+            .cloned()
+        {
             return Ok(module);
         }
 
@@ -1925,7 +1946,8 @@ impl NodeCommandModuleLoader {
                 .map_err(sandbox_execution_error)?
             }
         };
-        self.modules
+        self.host
+            .materialized_modules
             .borrow_mut()
             .insert(resolved.specifier.clone(), module.clone());
         Ok(module)
@@ -1948,10 +1970,38 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
             &requested,
             referrer.as_deref(),
             NodeResolveMode::Import,
+            None,
         )
         .map_err(js_error)?;
         let mut context = context.borrow_mut();
         self.materialize(&resolved, &mut context).map_err(js_error)
+    }
+
+    fn init_import_meta(
+        self: Rc<Self>,
+        import_meta: &boa_engine::object::JsObject,
+        module: &Module,
+        context: &mut Context,
+    ) {
+        let Some(path) = module.path() else {
+            return;
+        };
+        let path = path.to_string_lossy().into_owned();
+        if let Ok(url) = node_file_url_from_path(&path) {
+            let _ = import_meta.set(js_string!("url"), JsValue::from(JsString::from(url)), true, context);
+        }
+        let resolver = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_copy_closure_with_captures(
+                node_import_meta_resolve_for_module,
+                JsString::from(path),
+            ),
+        )
+        .name(js_string!("resolve"))
+        .length(1)
+        .constructor(false)
+        .build();
+        let _ = import_meta.set(js_string!("resolve"), resolver, true, context);
     }
 }
 
@@ -2082,6 +2132,101 @@ where
         .map_err(js_error)?
         .unwrap_or(JsonValue::Null);
     serde_json::from_value(value).map_err(|error| js_error(sandbox_execution_error(error)))
+}
+
+fn node_error_with_code(
+    context: &mut Context,
+    kind: JsNativeError,
+    message: impl Into<String>,
+    code: &str,
+) -> boa_engine::JsError {
+    let object = kind.with_message(message.into()).into_opaque(context);
+    let _ = object.set(
+        js_string!("code"),
+        JsValue::from(JsString::from(code)),
+        true,
+        context,
+    );
+    boa_engine::JsError::from_opaque(object.into())
+}
+
+fn node_file_url_from_path(path: &str) -> Result<String, SandboxError> {
+    Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .map_err(|_| SandboxError::Execution {
+            entrypoint: path.to_string(),
+            message: format!("failed to convert path `{path}` to file URL"),
+        })
+}
+
+fn resolve_import_meta_target(
+    host: &NodeRuntimeHost,
+    module_path: &str,
+    specifier: &str,
+) -> Result<String, SandboxError> {
+    if let Some(builtin) = node_builtin_name(specifier) {
+        return Ok(format!("node:{builtin}"));
+    }
+
+    if Url::parse(specifier).is_ok() {
+        return Ok(specifier.to_string());
+    }
+
+    let referrer_path = module_path.to_string();
+
+    if specifier.starts_with('/')
+        || matches!(specifier, "." | "..")
+        || specifier.starts_with("./")
+        || specifier.starts_with("../")
+    {
+        let base = directory_for_path(&referrer_path);
+        let resolved = if specifier.starts_with('/') {
+            normalize_node_path(specifier)
+        } else {
+            resolve_node_path(&base, specifier)
+        };
+        return node_file_url_from_path(&resolved);
+    }
+
+    let resolved =
+        resolve_node_module_path(host, specifier, Some(&referrer_path), NodeResolveMode::Import, None)?;
+    if node_builtin_name(&resolved).is_some() {
+        return Ok(resolved);
+    }
+    node_file_url_from_path(&resolved)
+}
+
+fn node_import_meta_resolve_for_module(
+    _this: &JsValue,
+    args: &[JsValue],
+    module_path: &JsString,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let request = node_arg_string(args, 0, context)?;
+
+    let result = node_with_host(|host| {
+        resolve_import_meta_target(
+            host,
+            &module_path.to_std_string_escaped(),
+            &request,
+        )
+    })
+    .map_err(|error| match error {
+        SandboxError::ModuleNotFound { .. } => node_error_with_code(
+            context,
+            JsNativeError::error(),
+            format!("Cannot find package '{request}' imported from {}", module_path.to_std_string_escaped()),
+            "ERR_MODULE_NOT_FOUND",
+        ),
+        other => node_error_with_code(
+            context,
+            JsNativeError::error(),
+            other.to_string(),
+            "ERR_TERRACE_NODE_IMPORT_META_RESOLVE",
+        ),
+    })?;
+
+    Ok(JsValue::from(JsString::from(result)))
 }
 
 fn node_bytes_from_js(value: &JsValue, context: &mut Context) -> JsResult<Vec<u8>> {
@@ -2330,6 +2475,18 @@ fn node_resolve_module(
         Some("import") => NodeResolveMode::Import,
         _ => NodeResolveMode::Require,
     };
+    let options = match args.get(3) {
+        Some(value) if !value.is_null() && !value.is_undefined() => {
+            let value = value
+                .to_json(context)
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?
+                .unwrap_or(JsonValue::Null);
+            serde_json::from_value::<NodeRequireResolveOptions>(value)
+                .map_err(|error| js_error(sandbox_execution_error(error)))?
+        }
+        _ => NodeRequireResolveOptions::default(),
+    };
     node_with_host_js(context, |host, context| {
         node_debug_event(
             host,
@@ -2339,13 +2496,54 @@ fn node_resolve_module(
                 referrer.as_deref().unwrap_or("<root>")
             ),
         )?;
-        let resolved = resolve_node_module(host, &specifier, referrer.as_deref(), mode)?;
+        let resolved = resolve_node_module(
+            host,
+            &specifier,
+            referrer.as_deref(),
+            mode,
+            options.extensions.as_deref(),
+        )?;
         JsValue::from_json(
             &serde_json::to_value(resolved).map_err(sandbox_execution_error)?,
             context,
         )
         .map_err(sandbox_execution_error)
     })
+}
+
+fn node_require_esm_namespace(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let resolved: NodeResolvedModule = node_arg_json(args, 0, context)?;
+    if resolved.kind != NodeResolvedKind::EsModule {
+        return Err(node_error_with_code(
+            context,
+            JsNativeError::typ(),
+            format!(
+                "__terraceRequireEsmNamespace expected an esm module, got {:?}",
+                resolved.kind
+            ),
+            "ERR_INVALID_ARG_VALUE",
+        ));
+    }
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "load", format!("require_esm {}", resolved.id)).map_err(js_error)?;
+    let loader = NodeCommandModuleLoader::new(host.clone());
+    let module = loader
+        .materialize(&resolved, context)
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?;
+    let promise = module.load_link_evaluate(context);
+    match promise.await_blocking(context) {
+        Ok(_) | Err(_) => {}
+    }
+    drain_node_jobs_until_quiescent(context, &host, &resolved.id).map_err(js_error)?;
+    if let PromiseState::Rejected(reason) = promise.state() {
+        return Err(boa_engine::JsError::from_opaque(reason));
+    }
+    Ok(module.namespace(context).into())
 }
 
 fn node_read_module_source(
@@ -2399,6 +2597,7 @@ fn node_require_resolve(
             &specifier,
             referrer.as_deref(),
             options.paths.as_deref(),
+            options.extensions.as_deref(),
         );
         JsValue::from_json(
             &serde_json::to_value(report).map_err(sandbox_execution_error)?,
@@ -2437,8 +2636,9 @@ fn resolve_require_report(
     specifier: &str,
     referrer: Option<&str>,
     paths: Option<&[String]>,
+    extensions: Option<&[String]>,
 ) -> JsonValue {
-    match resolve_require_target(host, specifier, referrer, paths) {
+    match resolve_require_target(host, specifier, referrer, paths, extensions) {
         Ok(resolved) => serde_json::json!({
             "ok": true,
             "resolved": resolved,
@@ -2456,6 +2656,7 @@ fn resolve_require_target(
     specifier: &str,
     referrer: Option<&str>,
     paths: Option<&[String]>,
+    extensions: Option<&[String]>,
 ) -> Result<String, (String, String)> {
     if let Some(builtin) = node_builtin_name(specifier) {
         return Ok(if specifier.starts_with("node:") {
@@ -2465,7 +2666,14 @@ fn resolve_require_target(
         });
     }
 
-    resolve_node_module_path_with_paths(host, specifier, referrer, NodeResolveMode::Require, paths)
+    resolve_node_module_path_with_paths(
+        host,
+        specifier,
+        referrer,
+        NodeResolveMode::Require,
+        paths,
+        extensions,
+    )
         .map_err(|error| {
             let message = match &error {
                 SandboxError::ModuleNotFound { .. } => {
@@ -4367,6 +4575,7 @@ fn execute_node_child_process(
         ))),
         open_files: Rc::new(RefCell::new(NodeOpenFileTable::default())),
         loaded_modules: Rc::new(RefCell::new(BTreeMap::new())),
+        materialized_modules: Rc::new(RefCell::new(BTreeMap::new())),
         module_graph: Rc::new(RefCell::new(NodeModuleGraph::default())),
         read_snapshot_fs: Rc::new(RefCell::new(None)),
         debug_trace: Rc::new(RefCell::new(NodeRuntimeDebugTrace::default())),
@@ -4535,6 +4744,9 @@ fn json_object_string(value: &JsonValue, key: &str) -> String {
 
 fn node_builtin_name(specifier: &str) -> Option<String> {
     let normalized = specifier.strip_prefix("node:").unwrap_or(specifier);
+    if normalized == "test" && !specifier.starts_with("node:") {
+        return None;
+    }
     KNOWN_NODE_BUILTIN_MODULES
         .contains(&normalized)
         .then(|| normalized.to_string())
@@ -4545,6 +4757,7 @@ fn resolve_node_module(
     specifier: &str,
     referrer: Option<&str>,
     mode: NodeResolveMode,
+    extensions: Option<&[String]>,
 ) -> Result<NodeResolvedModule, SandboxError> {
     if let Some(builtin) = node_builtin_name(specifier) {
         return Ok(NodeResolvedModule {
@@ -4554,7 +4767,7 @@ fn resolve_node_module(
         });
     }
 
-    let resolved_path = resolve_node_module_path(host, specifier, referrer, mode)?;
+    let resolved_path = resolve_node_module_path(host, specifier, referrer, mode, extensions)?;
     if let Some(loaded) = host.loaded_modules.borrow().get(&resolved_path).cloned() {
         return Ok(NodeResolvedModule {
             id: loaded.runtime_path.clone(),
@@ -4579,8 +4792,9 @@ fn resolve_node_module_path(
     specifier: &str,
     referrer: Option<&str>,
     mode: NodeResolveMode,
+    extensions: Option<&[String]>,
 ) -> Result<String, SandboxError> {
-    resolve_node_module_path_with_paths(host, specifier, referrer, mode, None)
+    resolve_node_module_path_with_paths(host, specifier, referrer, mode, None, extensions)
 }
 
 fn resolve_node_module_path_with_paths(
@@ -4589,12 +4803,14 @@ fn resolve_node_module_path_with_paths(
     referrer: Option<&str>,
     mode: NodeResolveMode,
     paths: Option<&[String]>,
+    extensions: Option<&[String]>,
 ) -> Result<String, SandboxError> {
     let cache_key = NodeResolveCacheKey {
         specifier: specifier.to_string(),
         referrer: referrer.map(str::to_string),
         mode,
         paths: paths.unwrap_or_default().to_vec(),
+        extensions: normalize_require_extensions(extensions),
     };
     if let Some(cached) = host
         .module_graph
@@ -4609,7 +4825,14 @@ fn resolve_node_module_path_with_paths(
     }
 
     let result =
-        resolve_node_module_path_with_paths_uncached(host, specifier, referrer, mode, paths);
+        resolve_node_module_path_with_paths_uncached(
+            host,
+            specifier,
+            referrer,
+            mode,
+            paths,
+            extensions,
+        );
     match &result {
         Ok(resolved) => {
             host.module_graph
@@ -4634,9 +4857,15 @@ fn resolve_node_module_path_with_paths_uncached(
     referrer: Option<&str>,
     mode: NodeResolveMode,
     paths: Option<&[String]>,
+    extensions: Option<&[String]>,
 ) -> Result<String, SandboxError> {
     if specifier.starts_with('/') {
-        return resolve_as_file_or_directory(host, &normalize_node_path(specifier), mode)?
+        return resolve_as_file_or_directory(
+            host,
+            &normalize_node_path(specifier),
+            mode,
+            extensions,
+        )?
             .ok_or_else(|| SandboxError::ModuleNotFound {
                 specifier: specifier.to_string(),
             });
@@ -4658,6 +4887,7 @@ fn resolve_node_module_path_with_paths_uncached(
                     host,
                     &resolve_node_path(&normalized, specifier),
                     mode,
+                    extensions,
                 )? {
                     return Ok(resolved);
                 }
@@ -4669,18 +4899,23 @@ fn resolve_node_module_path_with_paths_uncached(
         let base = referrer
             .map(directory_for_path)
             .unwrap_or_else(|| host.process.borrow().cwd.clone());
-        return resolve_as_file_or_directory(host, &resolve_node_path(&base, specifier), mode)?
+        return resolve_as_file_or_directory(
+            host,
+            &resolve_node_path(&base, specifier),
+            mode,
+            extensions,
+        )?
             .ok_or_else(|| SandboxError::ModuleNotFound {
                 specifier: specifier.to_string(),
             });
     }
 
     if specifier.starts_with('#') {
-        return resolve_package_import_from_referrer(host, specifier, referrer, mode);
+        return resolve_package_import_from_referrer(host, specifier, referrer, mode, extensions);
     }
 
     if let Some(paths) = paths {
-        return resolve_bare_node_module_with_lookup_paths(host, specifier, mode, paths);
+        return resolve_bare_node_module_with_lookup_paths(host, specifier, mode, paths, extensions);
     }
 
     let base = referrer
@@ -4690,7 +4925,13 @@ fn resolve_node_module_path_with_paths_uncached(
     for directory in node_module_lookup_paths_from(host, &base) {
         let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
         if let Some(resolved) =
-            resolve_package_entry_from_directory(host, &package_root, subpath.as_deref(), mode)?
+            resolve_package_entry_from_directory(
+                host,
+                &package_root,
+                subpath.as_deref(),
+                mode,
+                extensions,
+            )?
         {
             return Ok(resolved);
         }
@@ -4706,6 +4947,7 @@ fn resolve_bare_node_module_with_lookup_paths(
     specifier: &str,
     mode: NodeResolveMode,
     paths: &[String],
+    extensions: Option<&[String]>,
 ) -> Result<String, SandboxError> {
     let (package_name, subpath) = split_package_request(specifier)?;
     let cwd = host.process.borrow().cwd.clone();
@@ -4718,7 +4960,13 @@ fn resolve_bare_node_module_with_lookup_paths(
         for directory in node_module_lookup_paths_from(host, &normalized) {
             let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
             if let Some(resolved) =
-                resolve_package_entry_from_directory(host, &package_root, subpath.as_deref(), mode)?
+                resolve_package_entry_from_directory(
+                    host,
+                    &package_root,
+                    subpath.as_deref(),
+                    mode,
+                    extensions,
+                )?
             {
                 return Ok(resolved);
             }
@@ -4735,6 +4983,7 @@ fn resolve_package_import_from_referrer(
     specifier: &str,
     referrer: Option<&str>,
     mode: NodeResolveMode,
+    extensions: Option<&[String]>,
 ) -> Result<String, SandboxError> {
     let referrer = referrer.ok_or_else(|| SandboxError::InvalidModuleSpecifier {
         specifier: specifier.to_string(),
@@ -4759,7 +5008,7 @@ fn resolve_package_import_from_referrer(
             specifier: specifier.to_string(),
         }
     })?;
-    resolve_package_target(host, &package_root, &target, mode)?.ok_or_else(|| {
+    resolve_package_target(host, &package_root, &target, mode, extensions)?.ok_or_else(|| {
         SandboxError::ModuleNotFound {
             specifier: specifier.to_string(),
         }
@@ -4802,11 +5051,13 @@ fn resolve_package_entry_from_directory(
     package_root: &str,
     subpath: Option<&str>,
     mode: NodeResolveMode,
+    extensions: Option<&[String]>,
 ) -> Result<Option<String>, SandboxError> {
     let cache_key = NodePackageEntryCacheKey {
         package_root: package_root.to_string(),
         subpath: subpath.map(str::to_string),
         mode,
+        extensions: normalize_require_extensions(extensions),
     };
     if let Some(cached) = host
         .module_graph
@@ -4850,7 +5101,7 @@ fn resolve_package_entry_from_directory(
             if let Some(exports) = package_json.get("exports") {
                 if let Some(target) = select_package_map_target(exports, &export_key, mode) {
                     if let Some(resolved) =
-                        resolve_package_target(host, package_root, &target, mode)?
+                        resolve_package_target(host, package_root, &target, mode, extensions)?
                     {
                         host.module_graph
                             .borrow_mut()
@@ -4865,6 +5116,7 @@ fn resolve_package_entry_from_directory(
             host,
             &normalize_node_path(&format!("{package_root}/{subpath}")),
             mode,
+            extensions,
         )?
     } else {
         let mut resolved = None;
@@ -4874,7 +5126,9 @@ fn resolve_package_entry_from_directory(
                 .get("exports")
                 .and_then(|value| select_package_map_target(value, ".", mode))
             {
-                if let Some(found) = resolve_package_target(host, package_root, &target, mode)? {
+                if let Some(found) =
+                    resolve_package_target(host, package_root, &target, mode, extensions)?
+                {
                     resolved = Some(found);
                 }
             }
@@ -4882,7 +5136,7 @@ fn resolve_package_entry_from_directory(
             if resolved.is_none() {
                 if let Some(target) = package_json.get("main").and_then(|value| value.as_str()) {
                     let candidate = normalize_node_path(&format!("{package_root}/{target}"));
-                    resolved = resolve_as_file_or_directory(host, &candidate, mode)?;
+                    resolved = resolve_as_file_or_directory(host, &candidate, mode, extensions)?;
                 }
             }
         }
@@ -4892,6 +5146,7 @@ fn resolve_package_entry_from_directory(
                 host,
                 &normalize_node_path(&format!("{package_root}/index")),
                 mode,
+                extensions,
             )?;
         }
 
@@ -4909,29 +5164,33 @@ fn resolve_package_target(
     package_root: &str,
     target: &str,
     mode: NodeResolveMode,
+    extensions: Option<&[String]>,
 ) -> Result<Option<String>, SandboxError> {
     if target.starts_with("./") || target.starts_with("../") {
         return resolve_as_file_or_directory(
             host,
             &normalize_node_path(&format!("{package_root}/{target}")),
             mode,
+            extensions,
         );
     }
     if target.starts_with('/') {
-        return resolve_as_file_or_directory(host, &normalize_node_path(target), mode);
+        return resolve_as_file_or_directory(host, &normalize_node_path(target), mode, extensions);
     }
     let package_referrer = format!("{package_root}/package.json");
-    resolve_node_module_path(host, target, Some(&package_referrer), mode).map(Some)
+    resolve_node_module_path(host, target, Some(&package_referrer), mode, extensions).map(Some)
 }
 
 fn resolve_as_file_or_directory(
     host: &NodeRuntimeHost,
     base: &str,
     mode: NodeResolveMode,
+    extensions: Option<&[String]>,
 ) -> Result<Option<String>, SandboxError> {
     let cache_key = NodeFileOrDirectoryCacheKey {
         base: base.to_string(),
         mode,
+        extensions: normalize_require_extensions(extensions),
     };
     if let Some(cached) = host
         .module_graph
@@ -4943,7 +5202,8 @@ fn resolve_as_file_or_directory(
         return Ok(cached);
     }
     node_debug_event(host, "resolve", format!("file_or_directory base={base}"))?;
-    for candidate in candidate_module_paths(base) {
+    let resolved_extensions = normalize_require_extensions(extensions);
+    for candidate in candidate_module_paths(base, &resolved_extensions) {
         let Some(stats) = node_graph_stat(host, &candidate)? else {
             continue;
         };
@@ -4957,7 +5217,7 @@ fn resolve_as_file_or_directory(
             }
             FileKind::Directory => {
                 if let Some(resolved) =
-                    resolve_package_entry_from_directory(host, &candidate, None, mode)?
+                    resolve_package_entry_from_directory(host, &candidate, None, mode, extensions)?
                 {
                     host.module_graph
                         .borrow_mut()
@@ -5199,18 +5459,29 @@ fn nearest_package_type(
     Ok(None)
 }
 
-fn candidate_module_paths(base: &str) -> Vec<String> {
-    let base = normalize_node_path(base);
-    if PathBuf::from(&base).extension().is_some() {
-        return vec![base];
+fn normalize_require_extensions(extensions: Option<&[String]>) -> Vec<String> {
+    let mut resolved = vec![
+        ".js".to_string(),
+        ".json".to_string(),
+        ".node".to_string(),
+    ];
+    if let Some(extensions) = extensions {
+        for extension in extensions {
+            if !resolved.contains(extension) {
+                resolved.push(extension.clone());
+            }
+        }
     }
-    vec![
-        base.clone(),
-        format!("{base}.js"),
-        format!("{base}.cjs"),
-        format!("{base}.mjs"),
-        format!("{base}.json"),
-    ]
+    resolved
+}
+
+fn candidate_module_paths(base: &str, extensions: &[String]) -> Vec<String> {
+    let base = normalize_node_path(base);
+    let mut candidates = vec![base.clone()];
+    for extension in extensions {
+        candidates.push(format!("{base}{extension}"));
+    }
+    candidates
 }
 
 fn ancestor_directories_to_root(start: &str) -> Vec<String> {

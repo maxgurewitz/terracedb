@@ -1,4 +1,5 @@
 const __terraceModuleCache = new Map();
+const __terraceRequireCacheBacking = Object.create(null);
 const __terraceBuiltinCache = new Map();
 const __terraceWrappedBuiltinValues = new WeakMap();
 const __terraceBuiltinAccesses = [];
@@ -6,6 +7,7 @@ let __terraceFsSingleton = null;
 let __terracePathSingleton = null;
 let __terraceOsSingleton = null;
 let __terraceUrlSingleton = null;
+let __terracePunycodeSingleton = null;
 let __terraceCryptoSingleton = null;
 let __terraceWebCryptoSingleton = null;
 let __terraceZlibSingleton = null;
@@ -13,6 +15,10 @@ let __terraceV8Singleton = null;
 let __terraceVmSingleton = null;
 let __terraceWorkerThreadsSingleton = null;
 let __terraceEventsSingleton = null;
+let __terraceDnsSingleton = null;
+let __terraceTlsSingleton = null;
+let __terraceModuleSingleton = null;
+let __terraceReplSingleton = null;
 const __terraceWorkerEnvironmentData = new Map();
 const __terraceMarkedUntransferable = new WeakSet();
 const __terraceMarkedUncloneable = new WeakSet();
@@ -37,6 +43,38 @@ let __terraceNodeCommandDebug = {
   caughtExit: false,
   caughtExitCode: null,
 };
+
+const __terraceRequireCache = new Proxy(__terraceRequireCacheBacking, {
+  deleteProperty(target, property) {
+    if (typeof property === "string") {
+      __terraceModuleCache.delete(property);
+    }
+    return Reflect.deleteProperty(target, property);
+  },
+  defineProperty(target, property, descriptor) {
+    if (typeof property === "string" && "value" in descriptor) {
+      Reflect.deleteProperty(target, property);
+      Reflect.set(target, property, descriptor.value);
+      return true;
+    }
+    return Reflect.defineProperty(target, property, descriptor);
+  },
+  get(target, property, receiver) {
+    return Reflect.get(target, property, receiver);
+  },
+  getOwnPropertyDescriptor(target, property) {
+    return Reflect.getOwnPropertyDescriptor(target, property);
+  },
+  has(target, property) {
+    return Reflect.has(target, property);
+  },
+  ownKeys(target) {
+    return Reflect.ownKeys(target);
+  },
+  set(target, property, value, receiver) {
+    return Reflect.set(target, property, value, receiver);
+  },
+});
 const __terraceKnownNodeBuiltins = [
   "assert",
   "assert/strict",
@@ -306,6 +344,36 @@ function __terraceTraceNode(detail) {
   __terraceDebugTrace("trace", detail);
 }
 
+function __terraceDescribeReceivedValue(value) {
+  if (value === null) return "null";
+  const kind = typeof value;
+  switch (kind) {
+    case "string":
+      return `type string ('${String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')`;
+    case "number":
+      return `type number (${String(value)})`;
+    case "boolean":
+      return `type boolean (${String(value)})`;
+    case "symbol":
+      return `type symbol (${String(value)})`;
+    case "bigint":
+      return `type bigint (${String(value)}n)`;
+    case "undefined":
+      return "undefined";
+    case "function":
+      return `type function (${value.name ? `[Function: ${value.name}]` : "[Function (anonymous)]"})`;
+    default:
+      return `type ${kind}`;
+  }
+}
+
+function __terraceInvalidThisError(typeName) {
+  return __terraceNodeTypeError(
+    "ERR_INVALID_THIS",
+    `Value of "this" must be of type ${typeName}`,
+  );
+}
+
 globalThis.__terraceDebugTrace = __terraceDebugTrace;
 if (typeof globalThis.queueMicrotask !== "function") {
   globalThis.queueMicrotask = (fn) => Promise.resolve().then(fn);
@@ -368,6 +436,8 @@ function __terraceAutoinstrumentModuleSource(id, kind, source) {
   if (kind !== "commonjs" || !__terraceShouldAutoinstrumentModule(id)) {
     return source;
   }
+  const renderEntryTrace = (indent, name, type) =>
+    `${indent}  __terraceDebugTrace("${type}", { module: ${JSON.stringify(id)}, method: ${JSON.stringify(name)} });`;
   const prologue = source.match(/^(\s*(?:(?:"use strict"|'use strict');?\s*)+)/);
   const directivePrefix = prologue ? prologue[0] : "";
   const body = directivePrefix.length > 0 ? source.slice(directivePrefix.length) : source;
@@ -381,9 +451,31 @@ function __terraceAutoinstrumentModuleSource(id, kind, source) {
       if (match) {
         const indent = match[1] ?? "";
         const method = (match[2] ?? "").trim();
-        lines.push(
-          `${indent}  __terraceDebugTrace("method-enter-source", { module: ${JSON.stringify(id)}, method: ${JSON.stringify(method)} });`,
-        );
+        lines.push(renderEntryTrace(indent, method, "method-enter-source"));
+      }
+      const functionMatch = line.match(
+        /^(\s*)function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{$/,
+      );
+      if (functionMatch) {
+        const indent = functionMatch[1] ?? "";
+        const name = functionMatch[2] ?? "<anonymous>";
+        lines.push(renderEntryTrace(indent, name, "function-enter-source"));
+      }
+      const asyncFunctionMatch = line.match(
+        /^(\s*)async\s+function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{$/,
+      );
+      if (asyncFunctionMatch) {
+        const indent = asyncFunctionMatch[1] ?? "";
+        const name = asyncFunctionMatch[2] ?? "<anonymous>";
+        lines.push(renderEntryTrace(indent, name, "function-enter-source"));
+      }
+      const arrowMatch = line.match(
+        /^(\s*)(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{$/,
+      );
+      if (arrowMatch) {
+        const indent = arrowMatch[1] ?? "";
+        const name = arrowMatch[2] ?? "<anonymous>";
+        lines.push(renderEntryTrace(indent, name, "function-enter-source"));
       }
       return lines;
     })
@@ -405,11 +497,19 @@ function __terraceDescribeDebugValue(value) {
   if (value instanceof Promise) return "promise";
   const kind = typeof value;
   if (kind === "object" || kind === "function") {
-    const name =
-      (value.constructor && value.constructor.name) ||
-      (kind === "function" && value.name) ||
-      kind;
-    return name;
+    if (kind === "function" && typeof value.name === "string" && value.name.length > 0) {
+      return value.name;
+    }
+    try {
+      const tag = Object.prototype.toString.call(value);
+      const match = /^\[object ([^\]]+)\]$/.exec(tag);
+      if (match && match[1]) {
+        return match[1];
+      }
+    } catch (_error) {
+      // Ignore debug labeling failures.
+    }
+    return kind;
   }
   return kind;
 }
@@ -3980,8 +4080,209 @@ function __terraceDrainTimers() {
   return drained;
 }
 
+function __terracePunycodeModule() {
+  if (__terracePunycodeSingleton) return __terracePunycodeSingleton;
+
+  const maxInt = 2147483647;
+  const base = 36;
+  const tMin = 1;
+  const tMax = 26;
+  const skew = 38;
+  const damp = 700;
+  const initialBias = 72;
+  const initialN = 128;
+  const delimiter = "-";
+  const regexPunycode = /^xn--/;
+  const regexNonASCII = /[^\0-\x7F]/;
+  const regexSeparators = /[\x2E\u3002\uFF0E\uFF61]/g;
+  const baseMinusTMin = base - tMin;
+  const floor = Math.floor;
+  const stringFromCharCode = String.fromCharCode;
+
+  function punycodeError(type) {
+    const messages = {
+      overflow: "Overflow: input needs wider integers to process",
+      "not-basic": "Illegal input >= 0x80 (not a basic code point)",
+      "invalid-input": "Invalid input",
+    };
+    throw new RangeError(messages[type]);
+  }
+
+  function map(array, callback) {
+    const result = [];
+    let length = array.length;
+    while (length--) result[length] = callback(array[length]);
+    return result;
+  }
+
+  function mapDomain(domain, callback) {
+    const parts = String(domain).split("@");
+    let result = "";
+    if (parts.length > 1) {
+      result = `${parts[0]}@`;
+      domain = parts[1];
+    }
+    domain = String(domain).replace(regexSeparators, "\x2E");
+    return result + map(String(domain).split("."), callback).join(".");
+  }
+
+  function ucs2decode(string) {
+    const output = [];
+    let counter = 0;
+    const length = string.length;
+    while (counter < length) {
+      const value = string.charCodeAt(counter++);
+      if (value >= 0xD800 && value <= 0xDBFF && counter < length) {
+        const extra = string.charCodeAt(counter++);
+        if ((extra & 0xFC00) === 0xDC00) {
+          output.push(((value & 0x3FF) << 10) + (extra & 0x3FF) + 0x10000);
+        } else {
+          output.push(value);
+          counter--;
+        }
+      } else {
+        output.push(value);
+      }
+    }
+    return output;
+  }
+
+  const ucs2encode = (codePoints) => String.fromCodePoint(...codePoints);
+
+  function basicToDigit(codePoint) {
+    if (codePoint >= 0x30 && codePoint < 0x3A) return 26 + (codePoint - 0x30);
+    if (codePoint >= 0x41 && codePoint < 0x5B) return codePoint - 0x41;
+    if (codePoint >= 0x61 && codePoint < 0x7B) return codePoint - 0x61;
+    return base;
+  }
+
+  function digitToBasic(digit, flag) {
+    return digit + 22 + 75 * (digit < 26) - ((flag !== 0) << 5);
+  }
+
+  function adapt(delta, numPoints, firstTime) {
+    let k = 0;
+    delta = firstTime ? floor(delta / damp) : delta >> 1;
+    delta += floor(delta / numPoints);
+    for (; delta > (baseMinusTMin * tMax >> 1); k += base) {
+      delta = floor(delta / baseMinusTMin);
+    }
+    return floor(k + (baseMinusTMin + 1) * delta / (delta + skew));
+  }
+
+  function decode(input) {
+    const output = [];
+    const inputLength = input.length;
+    let i = 0;
+    let n = initialN;
+    let bias = initialBias;
+    let basic = input.lastIndexOf(delimiter);
+    if (basic < 0) basic = 0;
+    for (let j = 0; j < basic; ++j) {
+      if (input.charCodeAt(j) >= 0x80) punycodeError("not-basic");
+      output.push(input.charCodeAt(j));
+    }
+    for (let index = basic > 0 ? basic + 1 : 0; index < inputLength;) {
+      const oldi = i;
+      for (let w = 1, k = base;; k += base) {
+        if (index >= inputLength) punycodeError("invalid-input");
+        const digit = basicToDigit(input.charCodeAt(index++));
+        if (digit >= base) punycodeError("invalid-input");
+        if (digit > floor((maxInt - i) / w)) punycodeError("overflow");
+        i += digit * w;
+        const t = k <= bias ? tMin : (k >= bias + tMax ? tMax : k - bias);
+        if (digit < t) break;
+        const baseMinusT = base - t;
+        if (w > floor(maxInt / baseMinusT)) punycodeError("overflow");
+        w *= baseMinusT;
+      }
+      const out = output.length + 1;
+      bias = adapt(i - oldi, out, oldi === 0);
+      if (floor(i / out) > maxInt - n) punycodeError("overflow");
+      n += floor(i / out);
+      i %= out;
+      output.splice(i++, 0, n);
+    }
+    return String.fromCodePoint(...output);
+  }
+
+  function encode(input) {
+    const output = [];
+    input = ucs2decode(String(input));
+    const inputLength = input.length;
+    let n = initialN;
+    let delta = 0;
+    let bias = initialBias;
+    for (const currentValue of input) {
+      if (currentValue < 0x80) output.push(stringFromCharCode(currentValue));
+    }
+    const basicLength = output.length;
+    let handledCPCount = basicLength;
+    if (basicLength) output.push(delimiter);
+    while (handledCPCount < inputLength) {
+      let m = maxInt;
+      for (const currentValue of input) {
+        if (currentValue >= n && currentValue < m) m = currentValue;
+      }
+      const handledCPCountPlusOne = handledCPCount + 1;
+      if (m - n > floor((maxInt - delta) / handledCPCountPlusOne)) punycodeError("overflow");
+      delta += (m - n) * handledCPCountPlusOne;
+      n = m;
+      for (const currentValue of input) {
+        if (currentValue < n && ++delta > maxInt) punycodeError("overflow");
+        if (currentValue === n) {
+          let q = delta;
+          for (let k = base;; k += base) {
+            const t = k <= bias ? tMin : (k >= bias + tMax ? tMax : k - bias);
+            if (q < t) break;
+            const qMinusT = q - t;
+            const baseMinusT = base - t;
+            output.push(stringFromCharCode(digitToBasic(t + (qMinusT % baseMinusT), 0)));
+            q = floor(qMinusT / baseMinusT);
+          }
+          output.push(stringFromCharCode(digitToBasic(q, 0)));
+          bias = adapt(delta, handledCPCountPlusOne, handledCPCount === basicLength);
+          delta = 0;
+          ++handledCPCount;
+        }
+      }
+      ++delta;
+      ++n;
+    }
+    return output.join("");
+  }
+
+  function toUnicode(input) {
+    return mapDomain(input, (label) => regexPunycode.test(label) ? decode(label.slice(4).toLowerCase()) : label);
+  }
+
+  function toASCII(input) {
+    return mapDomain(input, (label) => regexNonASCII.test(label) ? `xn--${encode(label)}` : label);
+  }
+
+  __terracePunycodeSingleton = {
+    version: "2.1.0",
+    ucs2: {
+      decode: ucs2decode,
+      encode: ucs2encode,
+    },
+    decode,
+    encode,
+    toASCII,
+    toUnicode,
+  };
+  return __terracePunycodeSingleton;
+}
+
 function __terraceUrlModule() {
   if (__terraceUrlSingleton) return __terraceUrlSingleton;
+
+  function invalidUrlError(input) {
+    const error = new TypeError("Invalid URL");
+    error.code = "ERR_INVALID_URL";
+    error.input = String(input);
+    return error;
+  }
 
   function parseAuthority(authority) {
     let auth = "";
@@ -4029,7 +4330,7 @@ function __terraceUrlModule() {
   function parseBasicUrlRecord(raw) {
     const input = String(raw);
     const match = input.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)(\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/);
-    if (!match) throw new Error(`Invalid URL: ${input}`);
+    if (!match) throw invalidUrlError(input);
     const protocol = match[1];
     const authority = match[3] || "";
     const pathname = match[4] || (authority ? "/" : "");
@@ -4053,18 +4354,54 @@ function __terraceUrlModule() {
     };
   }
 
-  const URLImpl = globalThis.URL || class TerraceUrl {
-    constructor(href, base) {
-      const raw = base == null ? String(href) : urlResolve(String(base), String(href));
-      Object.assign(this, parseBasicUrlRecord(raw));
-    }
-    toString() { return this.href; }
-  };
+  const NativeURLImpl = globalThis.URL;
+  const URLImpl = NativeURLImpl
+    ? class TerraceUrl extends NativeURLImpl {
+        constructor(href, base = undefined) {
+          const input = String(href);
+          try {
+            if (base === undefined) {
+              super(input);
+            } else {
+              super(input, String(base));
+            }
+          } catch {
+            throw invalidUrlError(input);
+          }
+        }
+      }
+    : class TerraceUrl {
+        constructor(href, base = undefined) {
+          const input = String(href);
+          try {
+            const raw = base === undefined ? input : urlResolve(String(base), input);
+            Object.assign(this, parseBasicUrlRecord(raw));
+          } catch {
+            throw invalidUrlError(input);
+          }
+        }
+        toString() { return this.href; }
+      };
   const pathModule = __terraceRequire("path");
+  const punycode = __terracePunycodeModule();
   const querystring = __terraceRequire("querystring");
 
-  const URLSearchParamsImpl = globalThis.URLSearchParams || class TerraceUrlSearchParams {
+  const kUrlSearchParamsBrand = Symbol("TerraceURLSearchParams");
+
+  function assertUrlSearchParams(value) {
+    if (!value || value[kUrlSearchParamsBrand] !== true) {
+      throw __terraceInvalidThisError("URLSearchParams");
+    }
+  }
+
+  const URLSearchParamsImpl = class TerraceUrlSearchParams {
     constructor(init = "") {
+      Object.defineProperty(this, kUrlSearchParamsBrand, {
+        value: true,
+        configurable: false,
+        enumerable: false,
+        writable: false,
+      });
       this._pairs = [];
       if (typeof init === "string") {
         const source = init.startsWith("?") ? init.slice(1) : init;
@@ -4086,77 +4423,102 @@ function __terraceUrlModule() {
     }
 
     append(name, value) {
+      assertUrlSearchParams(this);
       this._pairs.push([String(name), String(value)]);
     }
 
     delete(name) {
+      assertUrlSearchParams(this);
       const key = String(name);
       this._pairs = this._pairs.filter(([entry]) => entry !== key);
     }
 
     entries() {
+      assertUrlSearchParams(this);
       return this._pairs[Symbol.iterator]();
     }
 
     forEach(callback, thisArg = undefined) {
+      assertUrlSearchParams(this);
       for (const [key, value] of this._pairs) {
         callback.call(thisArg, value, key, this);
       }
     }
 
     get(name) {
+      assertUrlSearchParams(this);
       const key = String(name);
       const found = this._pairs.find(([entry]) => entry === key);
       return found ? found[1] : null;
     }
 
     getAll(name) {
+      assertUrlSearchParams(this);
       const key = String(name);
       return this._pairs.filter(([entry]) => entry === key).map(([, value]) => value);
     }
 
     has(name) {
+      assertUrlSearchParams(this);
       const key = String(name);
       return this._pairs.some(([entry]) => entry === key);
     }
 
     keys() {
+      assertUrlSearchParams(this);
       return this._pairs.map(([key]) => key)[Symbol.iterator]();
     }
 
     set(name, value) {
+      assertUrlSearchParams(this);
       const key = String(name);
       const normalized = String(value);
+      const next = [];
       let replaced = false;
-      this._pairs = this._pairs.filter(([entry]) => {
-        if (entry !== key) return true;
-        if (!replaced) {
-          replaced = true;
-          return true;
+      for (const [entry, current] of this._pairs) {
+        if (entry !== key) {
+          next.push([entry, current]);
+          continue;
         }
-        return false;
-      }).map(([entry, current]) => (entry === key ? [entry, normalized] : [entry, current]));
-      if (!replaced) this._pairs.push([key, normalized]);
+        if (!replaced) {
+          next.push([entry, normalized]);
+          replaced = true;
+        }
+      }
+      if (!replaced) next.push([key, normalized]);
+      this._pairs = next;
     }
 
     sort() {
+      assertUrlSearchParams(this);
       this._pairs.sort(([left], [right]) => left.localeCompare(right));
     }
 
     toString() {
+      assertUrlSearchParams(this);
       return this._pairs
         .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
         .join("&");
     }
 
     values() {
+      assertUrlSearchParams(this);
       return this._pairs.map(([, value]) => value)[Symbol.iterator]();
+    }
+
+    get size() {
+      assertUrlSearchParams(this);
+      return this._pairs.length;
     }
 
     [Symbol.iterator]() {
       return this.entries();
     }
   };
+  Object.defineProperty(URLSearchParamsImpl.prototype, Symbol.toStringTag, {
+    value: "URLSearchParams",
+    configurable: true,
+  });
 
   class Url {
     constructor() {
@@ -4305,14 +4667,18 @@ function __terraceUrlModule() {
 
   function domainToASCII(value) {
     try {
-      return new URLImpl(`http://${String(value)}`).hostname;
+      return punycode.toASCII(String(value ?? ""));
     } catch {
       return "";
     }
   }
 
   function domainToUnicode(value) {
-    return String(value ?? "");
+    try {
+      return punycode.toUnicode(String(value ?? ""));
+    } catch {
+      return String(value ?? "");
+    }
   }
 
   function isAbsoluteUrl(value) {
@@ -4481,20 +4847,62 @@ function __terraceUrlModule() {
   }
 
   function urlToHttpOptions(value) {
-    const url = normalizeUrlInput(value, "url");
-    const options = {
-      protocol: url.protocol,
-      hostname: url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname,
-      hash: url.hash,
-      search: url.search,
-      pathname: url.pathname,
-      path: `${url.pathname}${url.search || ""}`,
-      href: url.href,
-    };
-    if (url.port) options.port = Number(url.port);
-    if (url.username || url.password) {
-      options.auth = url.password ? `${url.username}:${url.password}` : url.username;
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "url" argument must be of type object. Received ${value === null ? "null" : typeof value}`,
+      );
     }
+    const knownKeys = new Set([
+      "protocol",
+      "username",
+      "password",
+      "host",
+      "hostname",
+      "port",
+      "pathname",
+      "search",
+      "hash",
+      "href",
+      "origin",
+    ]);
+    const extraProps = {};
+    for (const key of Object.keys(value)) {
+      if (knownKeys.has(key)) continue;
+      extraProps[key] = value[key];
+    }
+    const {
+      hostname,
+      pathname,
+      port,
+      username,
+      password,
+      search,
+    } = value;
+    const normalizedHostname = hostname && hostname.startsWith("[")
+      ? hostname.slice(1, -1)
+      : hostname
+        ? domainToASCII(hostname)
+        : hostname;
+    const auth = username || password
+      ? `${decodeURIComponent(username)}:${decodeURIComponent(password)}`
+      : undefined;
+    const encodedHost = port !== ""
+      ? `${normalizedHostname}:${String(port)}`
+      : normalizedHostname;
+    const options = {
+      __proto__: null,
+      ...extraProps,
+      protocol: value.protocol,
+      hostname: normalizedHostname,
+      hash: value.hash,
+      search,
+      pathname,
+      path: `${pathname || ""}${search || ""}`,
+      href: `${value.protocol}//${auth ? `${auth}@` : ""}${encodedHost || ""}${pathname || ""}${search || ""}${value.hash || ""}`,
+    };
+    if (port !== "") options.port = Number(port);
+    if (auth) options.auth = auth;
     return options;
   }
 
@@ -5595,6 +6003,17 @@ function __terraceHttpModule(protocol = "http:") {
   const events = __terraceEventsModule();
   const stream = __terraceStreamModule();
   const net = __terraceNetModule();
+  const headerNamePattern = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+  const headerValuePattern = /[^\t\x20-\x7E\x80-\xFF]/;
+
+  function validateHostProperty(options, name) {
+    const value = options?.[name];
+    if (value === undefined || value === null || typeof value === "string") return;
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "options.${name}" property must be of type string or one of undefined or null. Received ${__terraceDescribeReceivedValue(value)}`,
+    );
+  }
 
   class OutgoingMessage extends stream.Writable {
     constructor() {
@@ -5649,7 +6068,9 @@ function __terraceHttpModule(protocol = "http:") {
   class ClientRequest extends OutgoingMessage {
     constructor(options = {}, callback = null) {
       super();
-      this.agent = options.agent ?? null;
+      this.agent = options.agent === false
+        ? new (options._agentClass || Agent)({ keepAlive: false })
+        : (options.agent ?? options._defaultAgent ?? null);
       this.protocol = options.protocol || protocol;
       this.aborted = false;
       this.destroyed = false;
@@ -5720,9 +6141,14 @@ function __terraceHttpModule(protocol = "http:") {
     }
 
     getName(options = {}) {
-      const host = options.host || options.hostname || "localhost";
-      const port = options.port || this.defaultPort;
-      return `${host}:${port}:`;
+      let name = options.host || "localhost";
+      name += ":";
+      if (options.port) name += options.port;
+      name += ":";
+      if (options.localAddress) name += options.localAddress;
+      if (options.family === 4 || options.family === 6) name += `:${options.family}`;
+      if (options.socketPath) name += `:${options.socketPath}`;
+      return name;
     }
   }
 
@@ -5764,6 +6190,10 @@ function __terraceHttpModule(protocol = "http:") {
     if (args[1] && typeof args[1] === "object") options = { ...options, ...args[1] };
     callback = args.find((value) => typeof value === "function") || null;
     if (!options.protocol) options.protocol = protocol;
+    validateHostProperty(options, "hostname");
+    validateHostProperty(options, "host");
+    options._defaultAgent = options._defaultAgent ?? globalAgent;
+    options._agentClass = options._agentClass ?? Agent;
     return new ClientRequest(options, callback);
   }
 
@@ -5798,8 +6228,25 @@ function __terraceHttpModule(protocol = "http:") {
     maxHeaderSize: 16384,
     request,
     setMaxIdleHTTPParsers() {},
-    validateHeaderName() { return true; },
-    validateHeaderValue() { return true; },
+    validateHeaderName(name) {
+      const normalized = String(name);
+      if (!headerNamePattern.test(normalized)) {
+        const error = new TypeError(`Header name must be a valid HTTP token ["${normalized}"]`);
+        error.code = "ERR_INVALID_HTTP_TOKEN";
+        throw error;
+      }
+      return true;
+    },
+    validateHeaderValue(name, value) {
+      const normalizedName = String(name);
+      const normalizedValue = String(value);
+      if (headerValuePattern.test(normalizedValue)) {
+        const error = new TypeError(`Invalid character in header content ["${normalizedName}"]`);
+        error.code = "ERR_INVALID_CHAR";
+        throw error;
+      }
+      return true;
+    },
   };
 }
 
@@ -5810,6 +6257,40 @@ function __terraceHttpsModule() {
       super({ ...options });
       this.protocol = "https:";
       this.defaultPort = 443;
+    }
+
+    getName(options = {}) {
+      let name = http.Agent.prototype.getName.call(this, options);
+      const append = (value) => {
+        name += ":";
+        if (value !== undefined && value !== null && value !== false) name += value;
+      };
+      append(options.ca);
+      append(options.cert);
+      append(options.clientCertEngine);
+      append(options.ciphers);
+      append(options.key);
+      append(options.pfx);
+      name += ":";
+      if (options.rejectUnauthorized !== undefined) name += options.rejectUnauthorized;
+      name += ":";
+      if (options.servername && options.servername !== options.host) name += options.servername;
+      append(options.minVersion);
+      append(options.maxVersion);
+      append(options.secureProtocol);
+      append(options.crl);
+      name += ":";
+      if (options.honorCipherOrder !== undefined) name += options.honorCipherOrder;
+      append(options.ecdhCurve);
+      append(options.dhparam);
+      name += ":";
+      if (options.secureOptions !== undefined) name += options.secureOptions;
+      append(options.sessionIdContext);
+      name += ":";
+      if (options.sigalgs) name += JSON.stringify(options.sigalgs);
+      append(options.privateKeyIdentifier);
+      append(options.privateKeyEngine);
+      return name;
     }
   }
   const globalAgent = new Agent();
@@ -5825,9 +6306,28 @@ function __terraceHttpsModule() {
     },
     globalAgent,
     request(...args) {
-      const req = http.request(...args);
-      req.protocol = "https:";
-      return req;
+      let options = {};
+      if (typeof args[0] === "string") {
+        try {
+          options = __terraceUrlModule().urlToHttpOptions(new (__terraceUrlModule().URL)(args[0]));
+          args = args.slice(1);
+        } catch {
+          options = { path: String(args[0]) };
+          args = args.slice(1);
+        }
+      } else if (args[0] instanceof (__terraceUrlModule().URL)) {
+        options = __terraceUrlModule().urlToHttpOptions(args[0]);
+        args = args.slice(1);
+      }
+      if (args[0] && typeof args[0] === "object" && typeof args[0] !== "function") {
+        options = { ...options, ...args[0] };
+        args = args.slice(1);
+      }
+      const callback = args.find((value) => typeof value === "function") || null;
+      options.protocol = "https:";
+      options._defaultAgent = globalAgent;
+      options._agentClass = Agent;
+      return http.request(options, callback);
     },
   };
 }
@@ -5909,6 +6409,609 @@ function __terraceHttp2Module() {
     },
     sensitiveHeaders: [],
   };
+}
+
+let __terraceDnsServers = ["127.0.0.1"];
+let __terraceDnsDefaultResultOrder = "verbatim";
+
+function __terraceDnsError(code, message = code) {
+  const error = new Error(message);
+  error.code = code;
+  error.errno = code;
+  error.syscall = "getaddrinfo";
+  return error;
+}
+
+function __terraceDnsUnsupportedCallback(name, callback) {
+  const error = __terraceDnsError("ENOTSUP", `dns.${name} is not implemented in this sandbox`);
+  if (typeof callback === "function") {
+    process.nextTick(() => callback(error));
+    return;
+  }
+  throw error;
+}
+
+function __terraceDnsFamilyForAddress(address) {
+  const family = __terraceNetModule().isIP(address);
+  return family === 0 ? null : family;
+}
+
+function __terraceCreateResolverClass() {
+  return class Resolver {
+    constructor(options = {}) {
+      this.timeout = options.timeout ?? -1;
+      this.tries = options.tries ?? 4;
+      this.maxTimeout = options.maxTimeout ?? 0;
+      this._servers = [...__terraceDnsServers];
+      this._activeQuery = false;
+      this._handle = {
+        getServers: () => [...this._servers],
+      };
+    }
+
+    cancel() {
+      this._activeQuery = false;
+    }
+
+    getServers() {
+      return this._handle.getServers();
+    }
+
+    setServers(servers) {
+      if (!Array.isArray(servers)) {
+        throw __terraceNodeTypeError(
+          "ERR_INVALID_ARG_TYPE",
+          'The "servers" argument must be of type Array. Received ' +
+            `${servers === null ? "null" : typeof servers}`,
+        );
+      }
+      if (this._activeQuery) {
+        throw __terraceDnsError("ERR_DNS_SET_SERVERS_FAILED", "c-ares failed to set servers: query in progress");
+      }
+      this._servers = servers.map((server) => String(server));
+      return undefined;
+    }
+
+    lookup(hostname, options, callback) {
+      return __terraceDnsLookupImpl(hostname, options, callback);
+    }
+
+    lookupService(address, port, callback) {
+      return __terraceDnsLookupServiceImpl(address, port, callback);
+    }
+
+    resolve(hostname, rrtype, callback) {
+      return __terraceDnsResolveImpl("resolve", hostname, rrtype, callback);
+    }
+
+    resolve4(hostname, options, callback) { return __terraceDnsResolveImpl("resolve4", hostname, options, callback); }
+    resolve6(hostname, options, callback) { return __terraceDnsResolveImpl("resolve6", hostname, options, callback); }
+    resolveAny(hostname, callback) { return __terraceDnsResolveImpl("resolveAny", hostname, callback); }
+    resolveCaa(hostname, callback) { return __terraceDnsResolveImpl("resolveCaa", hostname, callback); }
+    resolveCname(hostname, callback) { return __terraceDnsResolveImpl("resolveCname", hostname, callback); }
+    resolveMx(hostname, callback) { return __terraceDnsResolveImpl("resolveMx", hostname, callback); }
+    resolveNaptr(hostname, callback) { return __terraceDnsResolveImpl("resolveNaptr", hostname, callback); }
+    resolveNs(hostname, callback) { return __terraceDnsResolveImpl("resolveNs", hostname, callback); }
+    resolvePtr(hostname, callback) { return __terraceDnsResolveImpl("resolvePtr", hostname, callback); }
+    resolveSoa(hostname, callback) { return __terraceDnsResolveImpl("resolveSoa", hostname, callback); }
+    resolveSrv(hostname, callback) { return __terraceDnsResolveImpl("resolveSrv", hostname, callback); }
+    resolveTlsa(hostname, callback) { return __terraceDnsResolveImpl("resolveTlsa", hostname, callback); }
+    resolveTxt(hostname, callback) { return __terraceDnsResolveImpl("resolveTxt", hostname, callback); }
+    reverse(ip, callback) { return __terraceDnsResolveImpl("reverse", ip, callback); }
+  };
+}
+
+function __terraceDnsNormalizeLookupOptions(options) {
+  if (options == null || typeof options === "function") return {};
+  if (typeof options === "number") return { family: options };
+  if (typeof options === "object") return { ...options };
+  throw __terraceNodeTypeError(
+    "ERR_INVALID_ARG_TYPE",
+    'The "options" argument must be of type object or number. Received ' +
+      `${typeof options}`,
+  );
+}
+
+function __terraceDnsLookupImpl(hostname, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  } else if (callback === undefined && options !== undefined && typeof options !== "object" && typeof options !== "number") {
+    callback = options;
+    options = {};
+  }
+  if (typeof hostname !== "string" && hostname !== false && hostname !== undefined && hostname !== null) {
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "hostname" argument must be of type string. Received ${__terraceDescribeReceivedValue(hostname)}`,
+    );
+  }
+  if (typeof callback !== "function") {
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "callback" argument must be of type function. Received ${__terraceDescribeReceivedValue(callback)}`,
+    );
+  }
+  const normalized = __terraceDnsNormalizeLookupOptions(options);
+  if (normalized.family !== undefined && normalized.family !== 0 && normalized.family !== 4 && normalized.family !== 6) {
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_VALUE",
+      `The property 'options.family' must be one of: 0, 4, 6. Received ${String(normalized.family)}`,
+    );
+  }
+  if (normalized.hints !== undefined && typeof normalized.hints !== "number") {
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "options.hints" property must be of type number. Received ${__terraceDescribeReceivedValue(normalized.hints)}`,
+    );
+  }
+  if (normalized.all !== undefined && typeof normalized.all !== "boolean") {
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "options.all" property must be of type boolean. Received ${__terraceDescribeReceivedValue(normalized.all)}`,
+    );
+  }
+  if (normalized.verbatim !== undefined && typeof normalized.verbatim !== "boolean") {
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "options.verbatim" property must be of type boolean. Received ${__terraceDescribeReceivedValue(normalized.verbatim)}`,
+    );
+  }
+  const family = __terraceDnsFamilyForAddress(hostname);
+  process.nextTick(() => {
+    if (family != null) {
+      if (normalized.all) {
+        callback(null, [{ address: String(hostname), family }]);
+      } else {
+        callback(null, String(hostname), family);
+      }
+      return;
+    }
+    callback(__terraceDnsError("ENOTFOUND", `getaddrinfo ENOTFOUND ${String(hostname)}`));
+  });
+}
+
+function __terraceDnsLookupServiceImpl(address, port, callback) {
+  if (typeof callback !== "function") {
+    throw __terraceNodeTypeError(
+      "ERR_INVALID_ARG_TYPE",
+      'The "callback" argument must be of type function. Received ' +
+        `${callback === null ? "null" : typeof callback}`,
+    );
+  }
+  process.nextTick(() => {
+    callback(__terraceDnsError("ENOTFOUND", "lookupService ENOTFOUND"), undefined, undefined);
+  });
+}
+
+function __terraceDnsResolveImpl(name, ...args) {
+  const callback = args.find((value) => typeof value === "function");
+  return __terraceDnsUnsupportedCallback(name, callback);
+}
+
+function __terraceDnsPromisesModule(resolverClass) {
+  const promises = {};
+  promises.lookup = (hostname, options) =>
+    new Promise((resolve, reject) => {
+      __terraceDnsLookupImpl(hostname, options, (error, address, familyOrRecords) => {
+        if (error) {
+          reject(error);
+        } else if (options && typeof options === "object" && options.all) {
+          resolve(address);
+        } else {
+          resolve({ address, family: familyOrRecords });
+        }
+      });
+    });
+  promises.lookupService = (address, port) =>
+    new Promise((resolve, reject) => {
+      __terraceDnsLookupServiceImpl(address, port, (error, hostname, service) => {
+        if (error) reject(error);
+        else resolve({ hostname, service });
+      });
+    });
+  for (const name of [
+    "resolve",
+    "resolve4",
+    "resolve6",
+    "resolveAny",
+    "resolveCaa",
+    "resolveCname",
+    "resolveMx",
+    "resolveNaptr",
+    "resolveNs",
+    "resolvePtr",
+    "resolveSoa",
+    "resolveSrv",
+    "resolveTlsa",
+    "resolveTxt",
+    "reverse",
+  ]) {
+    promises[name] = (...args) => new Promise((_resolve, reject) => reject(__terraceDnsError("ENOTSUP", `dns.promises.${name} is not implemented in this sandbox`)));
+  }
+  promises.Resolver = class Resolver extends resolverClass {
+    lookup(hostname, options) {
+      return promises.lookup(hostname, options);
+    }
+    lookupService(address, port) {
+      return promises.lookupService(address, port);
+    }
+  };
+  return promises;
+}
+
+function __terraceDnsModule() {
+  if (__terraceDnsSingleton) return __terraceDnsSingleton;
+  const Resolver = __terraceCreateResolverClass();
+  const constants = {
+    ADDRCONFIG: 1024,
+    ADDRGETNETWORKPARAMS: 7,
+    ALL: 16,
+    BADFAMILY: "EBADFAMILY",
+    BADFLAGS: "EBADFLAGS",
+    BADHINTS: "EBADHINTS",
+    BADNAME: "EBADNAME",
+    BADQUERY: "EBADQUERY",
+    BADRESP: "EBADRESP",
+    BADSTR: "EBADSTR",
+    CANCELLED: "ECANCELLED",
+    CONNREFUSED: "ECONNREFUSED",
+    DESTRUCTION: "EDESTRUCTION",
+    EOF: "EOF",
+    FILE: "EFILE",
+    FORMERR: "EFORMERR",
+    LOADIPHLPAPI: "ELOADIPHLPAPI",
+    NODATA: "ENODATA",
+    NOMEM: "ENOMEM",
+    NONAME: "ENONAME",
+    NOTFOUND: "ENOTFOUND",
+    NOTIMP: "ENOTIMP",
+    NOTINITIALIZED: "ENOTINITIALIZED",
+    REFUSED: "EREFUSED",
+    SERVFAIL: "ESERVFAIL",
+    TIMEOUT: "ETIMEOUT",
+    V4MAPPED: 8,
+  };
+  const module = {
+    ...constants,
+    Resolver,
+    getDefaultResultOrder() {
+      return __terraceDnsDefaultResultOrder;
+    },
+    getServers() {
+      return [...__terraceDnsServers];
+    },
+    lookup: __terraceDnsLookupImpl,
+    lookupService: __terraceDnsLookupServiceImpl,
+    promises: __terraceDnsPromisesModule(Resolver),
+    resolve(hostname, rrtype, callback) { return __terraceDnsResolveImpl("resolve", hostname, rrtype, callback); },
+    resolve4(hostname, options, callback) { return __terraceDnsResolveImpl("resolve4", hostname, options, callback); },
+    resolve6(hostname, options, callback) { return __terraceDnsResolveImpl("resolve6", hostname, options, callback); },
+    resolveAny(hostname, callback) { return __terraceDnsResolveImpl("resolveAny", hostname, callback); },
+    resolveCaa(hostname, callback) { return __terraceDnsResolveImpl("resolveCaa", hostname, callback); },
+    resolveCname(hostname, callback) { return __terraceDnsResolveImpl("resolveCname", hostname, callback); },
+    resolveMx(hostname, callback) { return __terraceDnsResolveImpl("resolveMx", hostname, callback); },
+    resolveNaptr(hostname, callback) { return __terraceDnsResolveImpl("resolveNaptr", hostname, callback); },
+    resolveNs(hostname, callback) { return __terraceDnsResolveImpl("resolveNs", hostname, callback); },
+    resolvePtr(hostname, callback) { return __terraceDnsResolveImpl("resolvePtr", hostname, callback); },
+    resolveSoa(hostname, callback) { return __terraceDnsResolveImpl("resolveSoa", hostname, callback); },
+    resolveSrv(hostname, callback) { return __terraceDnsResolveImpl("resolveSrv", hostname, callback); },
+    resolveTlsa(hostname, callback) { return __terraceDnsResolveImpl("resolveTlsa", hostname, callback); },
+    resolveTxt(hostname, callback) { return __terraceDnsResolveImpl("resolveTxt", hostname, callback); },
+    reverse(ip, callback) { return __terraceDnsResolveImpl("reverse", ip, callback); },
+    setDefaultResultOrder(order) {
+      if (order !== "ipv4first" && order !== "ipv6first" && order !== "verbatim") {
+        throw __terraceNodeTypeError(
+          "ERR_INVALID_ARG_VALUE",
+          `The argument 'order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received ${String(order)}`,
+        );
+      }
+      __terraceDnsDefaultResultOrder = order;
+    },
+    setServers(servers) {
+      if (!Array.isArray(servers)) {
+        throw __terraceNodeTypeError(
+          "ERR_INVALID_ARG_TYPE",
+          'The "servers" argument must be of type Array. Received ' +
+            `${servers === null ? "null" : typeof servers}`,
+        );
+      }
+      __terraceDnsServers = servers.map((server) => String(server));
+    },
+  };
+  module.promises = __terraceDnsPromisesModule(Resolver);
+  for (const key of [
+    "ADDRGETNETWORKPARAMS",
+    "BADFAMILY",
+    "BADFLAGS",
+    "BADHINTS",
+    "BADNAME",
+    "BADQUERY",
+    "BADRESP",
+    "BADSTR",
+    "CANCELLED",
+    "CONNREFUSED",
+    "DESTRUCTION",
+    "EOF",
+    "FILE",
+    "FORMERR",
+    "LOADIPHLPAPI",
+    "NODATA",
+    "NOMEM",
+    "NONAME",
+    "NOTFOUND",
+    "NOTIMP",
+    "NOTINITIALIZED",
+    "REFUSED",
+    "SERVFAIL",
+    "TIMEOUT",
+  ]) {
+    module.promises[key] = module[key];
+  }
+  module.promises.getServers = () => module.getServers();
+  module.promises.setServers = (servers) => module.setServers(servers);
+  module.promises.getDefaultResultOrder = () => module.getDefaultResultOrder();
+  module.promises.setDefaultResultOrder = (order) => module.setDefaultResultOrder(order);
+  __terraceDnsSingleton = module;
+  return __terraceDnsSingleton;
+}
+
+function __terraceTlsModule() {
+  if (__terraceTlsSingleton) return __terraceTlsSingleton;
+  const events = __terraceEventsModule();
+  const net = __terraceNetModule();
+  const validTlsVersions = new Set(["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"]);
+
+  function validateTlsCommonOptions(options = {}) {
+    if (options.ciphers !== undefined && typeof options.ciphers !== "string") {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "options.ciphers" property must be of type string. Received ${__terraceDescribeReceivedValue(options.ciphers)}`,
+      );
+    }
+    if (options.passphrase !== undefined && typeof options.passphrase !== "string") {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "options.passphrase" property must be of type string. Received ${__terraceDescribeReceivedValue(options.passphrase)}`,
+      );
+    }
+    if (options.ecdhCurve !== undefined && typeof options.ecdhCurve !== "string") {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "options.ecdhCurve" property must be of type string. Received ${__terraceDescribeReceivedValue(options.ecdhCurve)}`,
+      );
+    }
+    if (options.handshakeTimeout !== undefined && typeof options.handshakeTimeout !== "number") {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "options.handshakeTimeout" property must be of type number. Received ${__terraceDescribeReceivedValue(options.handshakeTimeout)}`,
+      );
+    }
+    if (options.sessionTimeout !== undefined && typeof options.sessionTimeout !== "number") {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "options.sessionTimeout" property must be of type number. Received ${__terraceDescribeReceivedValue(options.sessionTimeout)}`,
+      );
+    }
+    if (
+      options.ticketKeys !== undefined &&
+      !TerraceBuffer.isBuffer(options.ticketKeys) &&
+      !(options.ticketKeys instanceof Uint8Array) &&
+      !ArrayBuffer.isView(options.ticketKeys)
+    ) {
+      throw __terraceNodeTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "options.ticketKeys" property must be an instance of Buffer, TypedArray, or DataView. Received ${__terraceDescribeReceivedValue(options.ticketKeys)}`,
+      );
+    }
+    if (options.minVersion !== undefined && !validTlsVersions.has(options.minVersion)) {
+      const error = new TypeError(`"${String(options.minVersion)}" is not a valid minimum TLS protocol version`);
+      error.code = "ERR_TLS_INVALID_PROTOCOL_VERSION";
+      throw error;
+    }
+    if (options.maxVersion !== undefined && !validTlsVersions.has(options.maxVersion)) {
+      const error = new TypeError(`"${String(options.maxVersion)}" is not a valid maximum TLS protocol version`);
+      error.code = "ERR_TLS_INVALID_PROTOCOL_VERSION";
+      throw error;
+    }
+  }
+
+  function parseAltNames(value) {
+    return String(value || "")
+      .split(/,\s*/)
+      .filter(Boolean);
+  }
+
+  function canonicalizeIp(value) {
+    return String(value || "").replace(/^\[|\]$/g, "");
+  }
+  class SecureContext {
+    constructor(options = {}) {
+      validateTlsCommonOptions(options);
+      this.context = Object.freeze({ ...options });
+    }
+  }
+  class TLSSocket extends net.Socket {
+    constructor(socket = undefined, options = {}) {
+      super(options);
+      this.encrypted = true;
+      this.authorized = false;
+      this.authorizationError = null;
+      this.secureConnecting = false;
+      this.alpnProtocol = false;
+      this.servername = options.servername || undefined;
+      this._secureContext = options.secureContext || new SecureContext(options);
+      if (socket && typeof socket === "object") {
+        this._wrappedSocket = socket;
+      }
+    }
+    disableRenegotiation() {}
+    enableTrace() {}
+    exportKeyingMaterial() { return TerraceBuffer.alloc(0); }
+    getCipher() { return null; }
+    getEphemeralKeyInfo() { return null; }
+    getFinished() { return null; }
+    getPeerCertificate() { return {}; }
+    getProtocol() { return null; }
+    getSession() { return undefined; }
+    getSharedSigalgs() { return []; }
+    getTLSTicket() { return undefined; }
+    getX509Certificate() { return undefined; }
+    isSessionReused() { return false; }
+    renegotiate(options, callback) {
+      if (typeof callback === "function") process.nextTick(callback);
+      return false;
+    }
+    setKeyCert() { return this; }
+    setMaxSendFragment() { return true; }
+    setServername(servername) {
+      if (this._isServer) {
+        throw __terraceNodeTypeError("ERR_TLS_SNI_FROM_SERVER", "Cannot issue SNI from a TLS server-side socket");
+      }
+      this.servername = servername;
+    }
+  }
+  class Server extends events.EventEmitter {
+    constructor(options = {}, secureConnectionListener = null) {
+      super();
+      validateTlsCommonOptions(options);
+      this._tlsOptions = { ...options };
+      if (typeof secureConnectionListener === "function") {
+        this.on("secureConnection", secureConnectionListener);
+      }
+    }
+    addContext() { return this; }
+    close(callback) {
+      process.nextTick(() => {
+        this.emit("close");
+        if (typeof callback === "function") callback();
+      });
+      return this;
+    }
+    listen(...args) {
+      const callback = args.find((value) => typeof value === "function") || null;
+      process.nextTick(() => {
+        this.emit("listening");
+        if (callback) callback();
+      });
+      return this;
+    }
+    setSecureContext(options = {}) {
+      this._tlsOptions = { ...this._tlsOptions, ...options };
+      return this;
+    }
+  }
+  const rootCertificates = Object.freeze([]);
+  const defaultCACertificates = Object.freeze([]);
+  __terraceTlsSingleton = {
+    CLIENT_RENEG_LIMIT: 3,
+    CLIENT_RENEG_WINDOW: 600,
+    DEFAULT_CIPHERS: "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA",
+    DEFAULT_ECDH_CURVE: "auto",
+    DEFAULT_MAX_VERSION: "TLSv1.3",
+    DEFAULT_MIN_VERSION: "TLSv1.2",
+    SecureContext,
+    Server,
+    TLSSocket,
+    checkServerIdentity(hostname, cert) {
+      hostname = String(hostname);
+      const altNames = parseAltNames(cert?.subjectaltname);
+      const ipNames = altNames
+        .filter((entry) => entry.startsWith("IP Address:"))
+        .map((entry) => canonicalizeIp(entry.slice("IP Address:".length)));
+      if (__terraceNetModule().isIP(hostname)) {
+        if (ipNames.includes(canonicalizeIp(hostname))) return undefined;
+        const error = new Error(
+          `Hostname/IP does not match certificate's altnames: IP: ${hostname} is not in the cert's list: ${ipNames.join(", ")}`,
+        );
+        error.code = "ERR_TLS_CERT_ALTNAME_INVALID";
+        return error;
+      }
+      const commonName = cert?.subject?.CN;
+      if (commonName && String(commonName).replace(/[.]$/, "") === hostname.replace(/[.]$/, "")) {
+        return undefined;
+      }
+      if (commonName) {
+        const error = new Error(
+          `Hostname/IP does not match certificate's altnames: Host: ${hostname}. is not cert's CN: ${commonName}`,
+        );
+        error.code = "ERR_TLS_CERT_ALTNAME_INVALID";
+        return error;
+      }
+      return undefined;
+    },
+    connect(...args) {
+      const callback = args.find((value) => typeof value === "function") || null;
+      let options = args.find((value) => value && typeof value === "object") || {};
+      if (typeof args[0] === "number") options = { ...options, port: args[0] };
+      validateTlsCommonOptions(options);
+      if (Object.prototype.hasOwnProperty.call(options, "checkServerIdentity") &&
+          options.checkServerIdentity !== undefined &&
+          typeof options.checkServerIdentity !== "function") {
+        throw __terraceNodeTypeError(
+          "ERR_INVALID_ARG_TYPE",
+          `The "options.checkServerIdentity" property must be of type function. Received ${__terraceDescribeReceivedValue(options.checkServerIdentity)}`,
+        );
+      }
+      const socket = new TLSSocket(undefined, options);
+      process.nextTick(() => {
+        if (callback) callback.call(socket);
+        socket.emit("error", __terraceUnsupportedNetworkError("tls"));
+      });
+      return socket;
+    },
+    convertALPNProtocols(value, out = {}) {
+      if (Array.isArray(value)) {
+        let total = 0;
+        const lengths = value.map((entry) => {
+          const length = TerraceBuffer.byteLength(String(entry));
+          total += 1 + length;
+          return length;
+        });
+        const buffer = TerraceBuffer.alloc(total);
+        let offset = 0;
+        value.forEach((entry, index) => {
+          buffer[offset++] = lengths[index];
+          buffer.write(String(entry), offset);
+          offset += lengths[index];
+        });
+        out.ALPNProtocols = buffer;
+      } else if (value instanceof Uint8Array) {
+        out.ALPNProtocols = TerraceBuffer.from(value);
+      } else if (ArrayBuffer.isView(value)) {
+        out.ALPNProtocols = TerraceBuffer.from(
+          new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
+        );
+      }
+      return undefined;
+    },
+    createSecureContext(options = {}) {
+      return new SecureContext(options);
+    },
+    createServer(options = {}, secureConnectionListener = null) {
+      return new Server(options, secureConnectionListener);
+    },
+    getCACertificates(kind = "default") {
+      return kind === "default" ? defaultCACertificates : rootCertificates;
+    },
+    getCiphers() {
+      return Object.freeze([
+        "tls_aes_256_gcm_sha384",
+        "tls_chacha20_poly1305_sha256",
+        "tls_aes_128_gcm_sha256",
+      ]);
+    },
+    rootCertificates,
+    setDefaultCACertificates(certs) {
+      if (!Array.isArray(certs)) {
+        throw __terraceNodeTypeError(
+          "ERR_INVALID_ARG_TYPE",
+          `The "certs" argument must be of type Array. Received ${__terraceDescribeReceivedValue(certs)}`,
+        );
+      }
+    },
+  };
+  return __terraceTlsSingleton;
 }
 
 const __terraceZlibConstants = Object.freeze(
@@ -8086,6 +9189,66 @@ function __terraceModuleParentOf(referrer) {
   return __terraceModuleCache.get(referrer) ?? null;
 }
 
+function __terraceCurrentRequireExtensions() {
+  const Module = __terraceCreateModuleBuiltin();
+  return Object.keys(Module._extensions);
+}
+
+function __terraceResolveModuleWithNodeOptions(specifier, referrer, mode = "require") {
+  const options = mode === "require"
+    ? { extensions: __terraceCurrentRequireExtensions() }
+    : null;
+  return globalThis.__terraceResolveModule(
+    String(specifier),
+    referrer == null ? null : String(referrer),
+    mode,
+    options,
+  );
+}
+
+function __terraceFindLongestRegisteredExtension(filename) {
+  const Module = __terraceCreateModuleBuiltin();
+  const name = __terraceBasename(filename);
+  let currentExtension;
+  let index;
+  let startIndex = 0;
+  while ((index = name.indexOf(".", startIndex)) !== -1) {
+    startIndex = index + 1;
+    if (index === 0) continue;
+    currentExtension = name.slice(index);
+    if (Object.prototype.hasOwnProperty.call(Module._extensions, currentExtension)) {
+      return currentExtension;
+    }
+  }
+  return ".js";
+}
+
+function __terraceCompileCommonJsModule(module, filename, source) {
+  const normalizedFilename = String(filename);
+  const instrumentedSource = __terraceAutoinstrumentModuleSource(
+    normalizedFilename,
+    "commonjs",
+    String(source).replace(/\bimport\s*\(/g, "__terraceNodeDynamicImport(__filename, "),
+  );
+  const dirname = __terraceDirname(normalizedFilename);
+  const localRequire = __terraceCreateRequireFromReferrer(normalizedFilename);
+  localRequire.main = __terraceModuleCache.get(__terraceRequireStack[0]) ?? module;
+  const sourceURL = `\n//# sourceURL=${normalizedFilename.replace(/\\/g, "\\\\")}`;
+  const wrapped = (0, eval)(
+    `(function(exports, require, module, __filename, __dirname) {\n${instrumentedSource}${sourceURL}\n})`,
+  );
+  module.__terraceEvaluationResult = wrapped(
+    module.exports,
+    localRequire,
+    module,
+    normalizedFilename,
+    dirname,
+  );
+  module.exports = __terraceAutoinstrumentModuleExports(normalizedFilename, module.exports);
+  module.loaded = true;
+  return module.exports;
+}
+
 function __terraceCreateNodeModule(id = "", parent = null) {
   if (!(this instanceof __terraceCreateNodeModule)) {
     return new __terraceCreateNodeModule(id, parent);
@@ -8108,6 +9271,15 @@ __terraceCreateNodeModule.prototype.require = function require(specifier) {
   return __terraceRequire(specifier, this.filename ?? this.id ?? null);
 };
 
+__terraceCreateNodeModule.prototype._compile = function _compile(content, filename) {
+  const normalizedFilename = filename == null ? this.filename ?? this.id ?? "" : String(filename);
+  this.id = normalizedFilename;
+  this.filename = normalizedFilename;
+  this.path = normalizedFilename ? __terraceDirname(normalizedFilename) : ".";
+  this.paths = this.filename ? __terraceModuleNodeModulePaths(this.path) : [];
+  return __terraceCompileCommonJsModule(this, normalizedFilename, content);
+};
+
 function __terraceCreateRequireFromReferrer(referrer) {
   const normalizedReferrer = String(referrer);
   const localRequire = (specifier) => __terraceRequire(specifier, normalizedReferrer);
@@ -8115,12 +9287,17 @@ function __terraceCreateRequireFromReferrer(referrer) {
     __terraceRequireResolve(specifier, normalizedReferrer, options);
   localRequire.resolve.paths = (specifier) =>
     __terraceRequireResolvePaths(specifier, normalizedReferrer);
-  localRequire.cache = Object.fromEntries(__terraceModuleCache.entries());
+  localRequire.cache = __terraceRequireCache;
+  localRequire.extensions = __terraceCreateModuleBuiltin()._extensions;
   localRequire.main = __terraceModuleCache.get(__terraceRequireStack[0]) ?? null;
   return localRequire;
 }
 
 function __terraceCreateModuleBuiltin() {
+  if (__terraceModuleSingleton) {
+    return __terraceModuleSingleton;
+  }
+
   function Module(id = "", parent = null) {
     return new __terraceCreateNodeModule(id, parent);
   }
@@ -8128,8 +9305,21 @@ function __terraceCreateModuleBuiltin() {
   Module.prototype = __terraceCreateNodeModule.prototype;
   Module.prototype.constructor = Module;
   Module.Module = Module;
-  Module._cache = Object.fromEntries(__terraceModuleCache.entries());
-  Module._extensions = Object.create(null);
+  Module._cache = __terraceRequireCache;
+  Module._extensions = Object.assign(Object.create(null), {
+    ".js": (module, filename) => module._compile(__terraceReadModuleSource(filename), filename),
+    ".json": (module, filename) => {
+      module.exports = JSON.parse(__terraceReadModuleSource(filename));
+      module.loaded = true;
+      return module.exports;
+    },
+    ".node": (_module, filename) => {
+      const error = new Error(`ERR_DLOPEN_DISABLED: native addon loading is not supported for ${filename}`);
+      error.code = "ERR_DLOPEN_DISABLED";
+      throw error;
+    },
+  });
+  Module._pathCache = Object.create(null);
   Module.builtinModules = [
     ...__terraceKnownNodeBuiltins,
     ...__terraceKnownNodeBuiltins
@@ -8137,7 +9327,11 @@ function __terraceCreateModuleBuiltin() {
       .map((entry) => `node:${entry}`),
   ];
   Module.isBuiltin = (specifier) => {
-    const normalized = String(specifier).replace(/^node:/, "");
+    const raw = String(specifier);
+    const normalized = raw.replace(/^node:/, "");
+    if (normalized === "test" && !raw.startsWith("node:")) {
+      return false;
+    }
     return __terraceKnownNodeBuiltins.includes(normalized);
   };
   Module.enableCompileCache = () => ({ status: "disabled" });
@@ -8151,22 +9345,55 @@ function __terraceCreateModuleBuiltin() {
     return __terraceRequireResolve(String(request), referrer, options);
   };
   Module.createRequire = (filenameOrUrl) => {
-    let referrer;
+    const invalidCreateRequireArg = (value) => {
+      const inspected =
+        typeof value === "string"
+          ? `'${value}'`
+          : __terraceInspect(value);
+      const error = new TypeError(
+        `The argument 'filename' must be a file URL object, file URL string, or absolute path string. Received ${inspected}`,
+      );
+      error.code = "ERR_INVALID_ARG_VALUE";
+      return error;
+    };
+    let referrer = null;
     if (filenameOrUrl && typeof filenameOrUrl === "object" && typeof filenameOrUrl.href === "string") {
-      referrer = new URL(filenameOrUrl.href).pathname;
+      referrer = __terraceUrlModule().fileURLToPath(filenameOrUrl);
     } else if (typeof filenameOrUrl === "string" && filenameOrUrl.startsWith("file:")) {
-      referrer = new URL(filenameOrUrl).pathname;
-    } else if (typeof filenameOrUrl === "string") {
+      referrer = __terraceUrlModule().fileURLToPath(filenameOrUrl);
+    } else if (typeof filenameOrUrl === "string" && filenameOrUrl.startsWith("/")) {
       referrer = filenameOrUrl;
     } else {
-      throw __terraceNodeTypeError(
-        "ERR_INVALID_ARG_TYPE",
-        'The "filename" argument must be a file URL object, file URL string, or absolute path string.',
-      );
+      throw invalidCreateRequireArg(filenameOrUrl);
+    }
+    if (typeof referrer !== "string" || !referrer.startsWith("/")) {
+      throw invalidCreateRequireArg(filenameOrUrl);
     }
     return __terraceCreateRequireFromReferrer(referrer);
   };
-  return Module;
+  __terraceModuleSingleton = Module;
+  return __terraceModuleSingleton;
+}
+
+function __terraceReplModule() {
+  if (__terraceReplSingleton) {
+    return __terraceReplSingleton;
+  }
+
+  class TerraceReplServer extends __terraceEventsModule().EventEmitter {
+    close() {
+      this.emit("close");
+      return this;
+    }
+  }
+
+  __terraceReplSingleton = {
+    REPLServer: TerraceReplServer,
+    start(_options = undefined) {
+      return new TerraceReplServer();
+    },
+  };
+  return __terraceReplSingleton;
 }
 
 function __terraceBuiltin(specifier, referrer = null) {
@@ -8210,6 +9437,9 @@ function __terraceBuiltin(specifier, referrer = null) {
     case "url":
       value = __terraceUrlModule();
       break;
+    case "punycode":
+      value = __terracePunycodeModule();
+      break;
     case "util":
       value = __terraceUtilModule();
       break;
@@ -8231,11 +9461,17 @@ function __terraceBuiltin(specifier, referrer = null) {
     case "querystring":
       value = __terraceQuerystringModule();
       break;
+    case "dns":
+      value = __terraceDnsModule();
+      break;
     case "string_decoder":
       value = __terraceStringDecoderModule();
       break;
     case "stream":
       value = __terraceStreamModule();
+      break;
+    case "tls":
+      value = __terraceTlsModule();
       break;
     case "net":
       value = __terraceNetModule();
@@ -8254,6 +9490,9 @@ function __terraceBuiltin(specifier, referrer = null) {
       break;
     case "child_process":
       value = __terraceChildProcessModule();
+      break;
+    case "repl":
+      value = __terraceReplModule();
       break;
     default:
       value = __terraceCreateBuiltinStubModule(normalized, referrer);
@@ -8292,6 +9531,10 @@ function __terraceUnsupportedGlobal(name) {
 }
 
 function __terraceModuleForResolved(resolved) {
+  if (Object.prototype.hasOwnProperty.call(__terraceRequireCacheBacking, resolved.id)) {
+    __terraceTraceNode(`module-cache-hit ${resolved.id}`);
+    return __terraceRequireCacheBacking[resolved.id];
+  }
   if (__terraceModuleCache.has(resolved.id)) {
     __terraceTraceNode(`module-cache-hit ${resolved.id}`);
     return __terraceModuleCache.get(resolved.id);
@@ -8301,41 +9544,30 @@ function __terraceModuleForResolved(resolved) {
   __terraceTraceNode(`module-eval-start ${resolved.id} kind=${resolved.kind}`);
   const parent = __terraceModuleParentOf(__terraceRequireStack[__terraceRequireStack.length - 1] ?? null);
   const module = new __terraceCreateNodeModule(resolved.id, parent);
-  __terraceModuleCache.set(resolved.id, module);
-  if (resolved.kind === "esm") {
-    throw new Error(
-      `ERR_REQUIRE_ESM: require() of ES Module ${resolved.id} is not supported; use dynamic import() instead`,
-    );
-  }
-  if (resolved.kind === "json") {
-    module.exports = JSON.parse(__terraceReadModuleSource(resolved.id));
-    module.loaded = true;
-    return module;
-  }
   __terraceRequireStack.push(resolved.id);
   try {
-    const source = __terraceAutoinstrumentModuleSource(
-      resolved.id,
-      resolved.kind,
-      __terraceReadModuleSource(resolved.id)
-        .replace(/\bimport\s*\(/g, "__terraceNodeDynamicImport(__filename, "),
-    );
-    const dirname = __terraceDirname(resolved.id);
-    const localRequire = __terraceCreateRequireFromReferrer(resolved.id);
-    localRequire.main = __terraceModuleCache.get(__terraceRequireStack[0]) ?? module;
-    const sourceURL = `\n//# sourceURL=${resolved.id.replace(/\\/g, "\\\\")}`;
-    const wrapped = (0, eval)(
-      `(function(exports, require, module, __filename, __dirname) {\n${source}${sourceURL}\n})`,
-    );
-    module.__terraceEvaluationResult = wrapped(
-      module.exports,
-      localRequire,
-      module,
-      resolved.id,
-      dirname,
-    );
-    module.exports = __terraceAutoinstrumentModuleExports(resolved.id, module.exports);
-    module.loaded = true;
+    if (resolved.kind === "esm") {
+      module.exports = globalThis.__terraceRequireEsmNamespace(resolved);
+      module.loaded = true;
+      module.__terraceEvaluationResult = module.exports;
+      __terraceTraceNode(
+        `module-eval-ok ${resolved.id} exports=${typeof module.exports} result=${typeof module.__terraceEvaluationResult}`,
+      );
+      return module;
+    }
+    __terraceModuleCache.set(resolved.id, module);
+    __terraceRequireCacheBacking[resolved.id] = module;
+    const Module = __terraceCreateModuleBuiltin();
+    const extension = resolved.kind === "json"
+      ? ".json"
+      : __terraceFindLongestRegisteredExtension(resolved.id);
+    const handler =
+      Module._extensions[extension] ??
+      Module._extensions[".js"];
+    if (typeof handler !== "function") {
+      throw new Error(`ERR_TERRACE_NODE_INVALID_EXTENSION_HANDLER: no handler for ${extension}`);
+    }
+    handler(module, resolved.id);
     __terraceTraceNode(
       `module-eval-ok ${resolved.id} exports=${typeof module.exports} result=${typeof module.__terraceEvaluationResult}`,
     );
@@ -8384,21 +9616,54 @@ function __terraceNamespaceForResolved(resolved) {
 }
 
 function __terraceRequire(specifier, referrer) {
+  const rawSpecifier = String(specifier);
+  const isNodeBuiltinBypass = rawSpecifier.startsWith("node:");
+  if (
+    !isNodeBuiltinBypass &&
+    Object.prototype.hasOwnProperty.call(__terraceRequireCacheBacking, rawSpecifier)
+  ) {
+    const cached = __terraceRequireCacheBacking[rawSpecifier];
+    return cached && typeof cached === "object" && "exports" in cached ? cached.exports : cached;
+  }
   __terraceNodeResolutionCount += 1;
   __terraceAssertNodeBudget(
     "resolution",
     __terraceNodeResolutionCount,
     __terraceNodeResolutionBudget,
     referrer ? String(referrer) : null,
-    String(specifier),
+    rawSpecifier,
   );
-  const resolved = __terraceResolveModule(String(specifier), referrer ? String(referrer) : null);
+  let resolved;
+  try {
+    resolved = __terraceResolveModuleWithNodeOptions(
+      rawSpecifier,
+      referrer ? String(referrer) : null,
+    );
+  } catch (error) {
+    if (error && (error.code === "MODULE_NOT_FOUND" || String(error.message || "").includes("sandbox module not found:"))) {
+      const requireStack = __terraceRequireStack.length
+        ? `\nRequire stack:\n- ${__terraceRequireStack.slice().reverse().join("\n- ")}`
+        : "";
+      throw __terraceCreateModuleNotFoundError(
+        `Cannot find module '${rawSpecifier}'${requireStack}`,
+      );
+    }
+    throw error;
+  }
+  if (
+    !isNodeBuiltinBypass &&
+    Object.prototype.hasOwnProperty.call(__terraceRequireCacheBacking, resolved.id)
+  ) {
+    const cached = __terraceRequireCacheBacking[resolved.id];
+    __terraceTraceNode(`require-cache-hit ${rawSpecifier} -> ${resolved.id}`);
+    return cached && typeof cached === "object" && "exports" in cached ? cached.exports : cached;
+  }
   if (resolved.kind === "builtin") {
-    __terraceTraceNode(`require-builtin ${specifier} -> ${resolved.id}`);
+    __terraceTraceNode(`require-builtin ${rawSpecifier} -> ${resolved.id}`);
     return __terraceBuiltin(resolved.id, referrer ? String(referrer) : null);
   }
   const exports = __terraceModuleForResolved(resolved).exports;
-  __terraceTraceNode(`require-module ${specifier} -> ${resolved.id} exports=${typeof exports}`);
+  __terraceTraceNode(`require-module ${rawSpecifier} -> ${resolved.id} exports=${typeof exports}`);
   return exports;
 }
 
@@ -8411,7 +9676,11 @@ function __terraceNodeDynamicImport(referrer, specifier) {
     String(referrer),
     String(specifier),
   );
-  const resolved = __terraceResolveModule(String(specifier), String(referrer), "import");
+  const resolved = __terraceResolveModuleWithNodeOptions(
+    String(specifier),
+    String(referrer),
+    "import",
+  );
   return import(resolved.specifier);
 }
 
@@ -8427,14 +9696,14 @@ function __terraceRequireResolve(specifier, referrer, options) {
     throw __terraceNodeTypeError("ERR_INVALID_ARG_TYPE", 'The "options" argument must be of type object.');
   }
 
-  let normalizedOptions = null;
+  let normalizedOptions = { extensions: __terraceCurrentRequireExtensions() };
   if (options && Object.prototype.hasOwnProperty.call(options, "paths")) {
     if (!Array.isArray(options.paths)) {
       const error = new TypeError('The "paths" argument must be an array of strings.');
       error.code = "ERR_INVALID_ARG_VALUE";
       throw error;
     }
-    normalizedOptions = { paths: [] };
+    normalizedOptions.paths = [];
     for (const entry of options.paths) {
       if (typeof entry !== "string") {
         throw __terraceNodeTypeError("ERR_INVALID_ARG_TYPE", 'The "paths" argument must be an array of strings.');
@@ -8443,7 +9712,7 @@ function __terraceRequireResolve(specifier, referrer, options) {
     }
   }
 
-  const report = __terraceRequireResolveImpl(
+  const report = globalThis.__terraceRequireResolveImpl(
     request,
     referrer == null ? null : String(referrer),
     normalizedOptions,
@@ -8502,7 +9771,7 @@ function __terraceRunNodeCommand(request) {
   };
   try {
     __terraceTraceNode(`command-start ${request.entrypoint}`);
-    const resolved = __terraceResolveModule(String(request.entrypoint), null);
+    const resolved = __terraceResolveModuleWithNodeOptions(String(request.entrypoint), null);
     if (resolved.kind === "esm") {
       const topLevelResult = import(resolved.specifier).then((namespace) => {
         __terraceTraceNode(`command-finished ${resolved.id}`);

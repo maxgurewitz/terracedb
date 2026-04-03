@@ -96,11 +96,20 @@ async fn npm_cli_registry_fetch_lodash_packument_smoke_test() {
         terracedb_sandbox::NodeDebugExecutionOptions {
             autoinstrument_modules: vec![
                 "/workspace/npm/node_modules/npm-registry-fetch/lib/index.js".to_string(),
+                "/workspace/npm/node_modules/npm-registry-fetch/lib/auth.js".to_string(),
                 "/workspace/npm/node_modules/npm-registry-fetch/lib/check-response.js".to_string(),
                 "/workspace/npm/node_modules/make-fetch-happen/lib/index.js".to_string(),
+                "/workspace/npm/node_modules/make-fetch-happen/lib/options.js".to_string(),
+                "/workspace/npm/node_modules/make-fetch-happen/lib/fetch.js".to_string(),
+                "/workspace/npm/node_modules/make-fetch-happen/lib/remote.js".to_string(),
                 "/workspace/npm/node_modules/minipass-fetch/lib/index.js".to_string(),
+                "/workspace/npm/node_modules/minipass-fetch/lib/headers.js".to_string(),
                 "/workspace/npm/node_modules/minipass-fetch/lib/request.js".to_string(),
                 "/workspace/npm/node_modules/minipass-fetch/lib/response.js".to_string(),
+                "/workspace/npm/node_modules/@npmcli/agent/lib/index.js".to_string(),
+                "/workspace/npm/node_modules/@npmcli/agent/lib/options.js".to_string(),
+                "/workspace/npm/node_modules/@npmcli/agent/lib/proxy.js".to_string(),
+                "/workspace/npm/node_modules/@npmcli/agent/lib/dns.js".to_string(),
                 "/workspace/npm/node_modules/@sigstore/sign/dist/external/fetch.js".to_string(),
             ],
             capture_exceptions: true,
@@ -119,10 +128,42 @@ async fn npm_cli_registry_fetch_lodash_packument_smoke_test() {
         .find(|value| value.get("ok").is_some())
         .expect("structured payload");
     let last_exception = npm_cli::node_runtime_last_exception(&result);
+    let debug_events = npm_cli::node_runtime_events_with_labels(
+        &result,
+        &[
+            "call-throw",
+            "autoinstrument-throw",
+            "exception",
+            "nullish-to-object",
+            "missing-builtin",
+        ],
+    );
+    let recent_fetch_events = npm_cli::node_runtime_events_matching(
+        &result,
+        Some(&[
+            "function-enter-source",
+            "method-enter-source",
+            "call-enter",
+            "call-exit",
+            "call-throw",
+            "autoinstrument-enter",
+            "autoinstrument-exit",
+            "autoinstrument-throw",
+            "nullish-to-object",
+            "exception",
+        ]),
+        Some(&[
+            "npm-registry-fetch/lib",
+            "make-fetch-happen/lib",
+            "minipass-fetch/lib",
+            "@npmcli/agent/lib",
+        ]),
+        Some(80),
+    );
     assert_eq!(
         payload["ok"].as_bool(),
         Some(true),
-        "expected npm-registry-fetch packument to succeed, got payload: {payload:#?}\nstdout:\n{stdout}\nlast exception:\n{last_exception:#?}\nnode trace: {:#?}\nreport: {report:#?}",
+        "expected npm-registry-fetch packument to succeed, got payload: {payload:#?}\nstdout:\n{stdout}\nlast exception:\n{last_exception:#?}\ndebug events:\n{debug_events:#?}\nrecent fetch events:\n{recent_fetch_events:#?}\nnode trace: {:#?}\nreport: {report:#?}",
         npm_cli::node_runtime_trace(&result),
     );
 }
