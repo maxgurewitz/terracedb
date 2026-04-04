@@ -1039,7 +1039,7 @@ Replace JSON for the structured metadata/control-plane formats where schema disc
 **Implementation steps**
 
 1. Define FlatBuffers schemas for the catalog, local manifest, remote manifest, remote-cache metadata, and backup-GC metadata, including explicit versioning rules and file identifiers for each durable artifact.
-2. Keep the checked schema reference, Rust wrapper/bindings, and reviewed fixtures in sync with local tests and pre-commit checks so incompatible schema drift fails before commit.
+2. Keep the checked schemas, generated Rust bindings, and reviewed fixtures in sync with local tests and pre-commit checks so incompatible schema drift fails before commit.
 3. Switch readers and writers fully to canonical FlatBuffers payloads for these metadata formats; do not carry JSON fallback readers in this greenfield phase.
 4. Preserve checksums and fail-closed validation behavior where applicable; do not migrate commit-log frames, row SSTables, or columnar data blocks in this task.
 5. Update open, recovery, cache-rebuild, and backup-GC paths plus their fixtures/tests so the new schemas are exercised end to end.

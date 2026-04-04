@@ -1,0 +1,23 @@
+namespace terracedb.durable.remote_cache;
+
+// Remote cache metadata format.
+// Root: `RemoteCacheEntry`
+// Identifier: `TDRC`
+
+enum CacheSpanKind : ubyte {
+  None = 0,
+  Full = 1,
+  Range = 2,
+}
+
+table RemoteCacheEntry {
+  format_version:uint;
+  object_key:string (required);
+  span_kind:CacheSpanKind;
+  start:ulong;
+  end:ulong;
+  data_len:ulong;
+}
+
+root_type RemoteCacheEntry;
+file_identifier "TDRC";

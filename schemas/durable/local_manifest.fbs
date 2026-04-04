@@ -1,0 +1,35 @@
+namespace terracedb.durable.local_manifest;
+
+// Local manifest durable metadata format.
+// Body identifier: `TDMB`
+// File identifier: `TDMF`
+
+table ManifestSstable {
+  table_id:uint;
+  level:uint;
+  local_id:string (required);
+  file_path:string;
+  remote_key:string;
+  length:ulong;
+  checksum:uint;
+  data_checksum:uint;
+  min_key:[ubyte] (required);
+  max_key:[ubyte] (required);
+  min_sequence:ulong;
+  max_sequence:ulong;
+  has_schema_version:bool;
+  schema_version:uint;
+  shard_ownership_json:[ubyte];
+}
+
+table ManifestBody {
+  format_version:uint;
+  generation:ulong;
+  last_flushed_sequence:ulong;
+  sstables:[ManifestSstable] (required);
+}
+
+table ManifestFile {
+  body_bytes:[ubyte] (required);
+  checksum:uint;
+}

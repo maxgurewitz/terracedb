@@ -37,8 +37,8 @@ use crate::{
     StubObjectStore, StubRng, Table, TableConfig, TableFormat, TableId, TableStats,
     ThrottleDecision, TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig,
     Timestamp, Transaction, TtlCompactionFilter, Value,
+    durable_formats::catalog as catalog_fb,
     engine::commit_log::{BlockIndexEntry, SegmentFooter, TableSegmentMeta},
-    metadata_flatbuffers as metadata_fb,
 };
 
 fn tiered_config_with_durability(path: &str, durability: TieredDurabilityMode) -> DbConfig {
@@ -15552,12 +15552,14 @@ async fn durable_format_decoders_fail_closed_on_corruption_and_unsupported_versi
 
     let mut catalog_fbb = flatbuffers::FlatBufferBuilder::new();
     let empty_entries = catalog_fbb.create_vector::<flatbuffers::WIPOffset<_>>(&[]);
-    let catalog_unsupported_root =
-        metadata_fb::create_catalog(&mut catalog_fbb, CATALOG_FORMAT_VERSION + 1, empty_entries);
-    catalog_fbb.finish(
-        catalog_unsupported_root,
-        Some(metadata_fb::CATALOG_IDENTIFIER),
+    let catalog_unsupported_root = catalog_fb::Catalog::create(
+        &mut catalog_fbb,
+        &catalog_fb::CatalogArgs {
+            format_version: CATALOG_FORMAT_VERSION + 1,
+            tables: Some(empty_entries),
+        },
     );
+    catalog_fbb.finish(catalog_unsupported_root, Some(catalog_fb::FILE_IDENTIFIER));
     let catalog_unsupported = catalog_fbb.finished_data().to_vec();
     let catalog_unsupported = Db::decode_catalog(&catalog_unsupported)
         .expect_err("unsupported catalog version should fail closed");

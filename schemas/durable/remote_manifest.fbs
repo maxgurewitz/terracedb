@@ -1,0 +1,41 @@
+namespace terracedb.durable.remote_manifest;
+
+// Remote manifest durable metadata format.
+// Body identifier: `TDRB`
+// File identifier: `TDRF`
+
+table ManifestSstable {
+  table_id:uint;
+  level:uint;
+  local_id:string (required);
+  file_path:string;
+  remote_key:string;
+  length:ulong;
+  checksum:uint;
+  data_checksum:uint;
+  min_key:[ubyte] (required);
+  max_key:[ubyte] (required);
+  min_sequence:ulong;
+  max_sequence:ulong;
+  has_schema_version:bool;
+  schema_version:uint;
+  shard_ownership_json:[ubyte];
+}
+
+table RemoteCommitLogSegment {
+  object_key:string (required);
+  footer_bytes:[ubyte] (required);
+}
+
+table RemoteManifestBody {
+  format_version:uint;
+  generation:ulong;
+  last_flushed_sequence:ulong;
+  sstables:[ManifestSstable] (required);
+  commit_log_segments:[RemoteCommitLogSegment] (required);
+}
+
+table RemoteManifestFile {
+  body_bytes:[ubyte] (required);
+  checksum:uint;
+}

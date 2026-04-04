@@ -17,10 +17,10 @@ use tokio::{
 
 use crate::{
     config::S3Location,
+    durable_formats::{flatbuffers::root_with_identifier, remote_cache as remote_cache_fb},
     error::{StorageError, StorageErrorKind},
     ids::{ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, FileSystem, ObjectStore, OpenOptions},
-    metadata_flatbuffers as metadata_fb,
     sharding::PhysicalShardId,
 };
 
@@ -513,12 +513,17 @@ fn encode_cache_span_flatbuffer(span: CacheSpan) -> (u8, u64, u64) {
     }
 }
 
-fn decode_cache_span_flatbuffer(kind: u8, start: u64, end: u64) -> Result<CacheSpan, StorageError> {
-    match kind {
+fn decode_cache_span_flatbuffer(
+    kind: remote_cache_fb::CacheSpanKind,
+    start: u64,
+    end: u64,
+) -> Result<CacheSpan, StorageError> {
+    match kind.0 {
         FB_CACHE_SPAN_FULL => Ok(CacheSpan::Full),
         FB_CACHE_SPAN_RANGE => Ok(CacheSpan::Range { start, end }),
         _ => Err(StorageError::corruption(format!(
-            "unknown remote cache span tag {kind}"
+            "unknown remote cache span tag {}",
+            kind.0
         ))),
     }
 }
@@ -527,23 +532,25 @@ fn encode_cache_entry_file_flatbuffer(file: &CacheEntryFile) -> Result<Vec<u8>, 
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
     let object_key = fbb.create_string(&file.record.object_key);
     let (span_kind, start, end) = encode_cache_span_flatbuffer(file.record.span);
-    let root = metadata_fb::create_remote_cache_entry(
+    let root = remote_cache_fb::RemoteCacheEntry::create(
         &mut fbb,
-        file.format_version,
-        object_key,
-        span_kind,
-        start,
-        end,
-        file.record.data_len,
+        &remote_cache_fb::RemoteCacheEntryArgs {
+            format_version: file.format_version,
+            object_key: Some(object_key),
+            span_kind: remote_cache_fb::CacheSpanKind(span_kind),
+            start,
+            end,
+            data_len: file.record.data_len,
+        },
     );
-    fbb.finish(root, Some(metadata_fb::REMOTE_CACHE_IDENTIFIER));
+    fbb.finish(root, Some(remote_cache_fb::FILE_IDENTIFIER));
     Ok(fbb.finished_data().to_vec())
 }
 
 fn decode_cache_entry_file_flatbuffer(bytes: &[u8]) -> Result<CacheEntryFile, StorageError> {
-    let file = metadata_fb::root_with_identifier::<metadata_fb::RemoteCacheEntry<'_>>(
+    let file = root_with_identifier::<remote_cache_fb::RemoteCacheEntry<'_>>(
         bytes,
-        metadata_fb::REMOTE_CACHE_IDENTIFIER,
+        remote_cache_fb::FILE_IDENTIFIER,
         "remote cache metadata",
     )
     .map_err(|error| {

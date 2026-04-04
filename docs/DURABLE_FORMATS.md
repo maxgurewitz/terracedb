@@ -31,7 +31,7 @@ Today that means:
 - unsupported versions must fail closed, and
 - malformed bytes must never be treated as valid durable state.
 
-The checked FlatBuffers schema reference lives at `schemas/durable_metadata.fbs`. Commit-log frames and segment footers remain custom binary formats.
+The checked FlatBuffers schema set lives under `schemas/durable/`, and the generated Rust bindings checked into the repo live under `src/durable_formats/`. Commit-log frames and segment footers remain custom binary formats.
 
 The current per-format policy is:
 
@@ -112,11 +112,12 @@ Sandbox session reopen/recovery also now relies on reviewed git-hoist provenance
 
 Use these commands for intentional durable-format changes:
 
-1. Run `scripts/check-durable-format-fixtures.sh` to verify the current fixtures.
-2. If the byte change is intentional, run `scripts/regenerate-durable-format-fixtures.sh`.
-3. Review the fixture diffs together with the code change before committing.
+1. If the schema changed, run `scripts/regenerate-flatbuffer-bindings.sh`.
+2. Run `scripts/check-durable-format-fixtures.sh` to verify the current fixtures.
+3. If the byte change is intentional, run `scripts/regenerate-durable-format-fixtures.sh`.
+4. Review the schema, generated binding, and fixture diffs together with the code change before committing.
 
-The shared pre-commit hook runs the check script before the broader test/lint pass, so accidental format drift fails locally.
+The shared pre-commit hook checks that the generated FlatBuffers bindings and durable fixtures are current before the broader test/lint pass, so accidental schema or byte drift fails locally.
 
 ## Fixture Inventory
 

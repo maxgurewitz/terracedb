@@ -12,6 +12,7 @@ This repository includes a shared pre-commit script at `scripts/pre-commit.sh`.
 
 The Git hook at `.githooks/pre-commit` calls that script, which runs:
 
+- `scripts/check-flatbuffer-bindings.sh`
 - `scripts/run-codex-review.sh`
 - `scripts/check-durable-format-fixtures.sh`
 - `cargo nextest run --workspace`
@@ -20,6 +21,7 @@ The Git hook at `.githooks/pre-commit` calls that script, which runs:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 
 The Codex review hook expects `jq` to be installed locally.
+The FlatBuffers binding check expects `flatc` to be installed locally.
 
 ## Codex review hook
 
@@ -60,12 +62,20 @@ scripts/codex-review-record-decision.sh \
 
 ## Durable format workflow
 
-Durable-format policy, fixture inventory, and the checked FlatBuffers schema
-reference live in `docs/DURABLE_FORMATS.md` and `schemas/durable_metadata.fbs`.
+Durable-format policy, fixture inventory, the checked FlatBuffers schemas,
+and generated Rust bindings live in `docs/DURABLE_FORMATS.md`,
+`schemas/durable/`, and `src/durable_formats/*_generated.rs`.
 
 When an intentional durable-format change updates canonical bytes, regenerate
 the reviewed fixtures with:
 
 ```bash
 scripts/regenerate-durable-format-fixtures.sh
+```
+
+When an intentional schema change updates the FlatBuffers bindings, regenerate
+them with:
+
+```bash
+scripts/regenerate-flatbuffer-bindings.sh
 ```

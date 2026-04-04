@@ -27,6 +27,10 @@ use crate::{
         S3PrimaryStorageConfig, StorageConfig, TableConfig, TableFormat, TableMetadata,
         TieredDurabilityMode, TieredLocalRetentionMode, TieredStorageConfig,
     },
+    durable_formats::{
+        backup_gc as backup_gc_fb, catalog as catalog_fb, flatbuffers::root_with_identifier,
+        local_manifest as local_manifest_fb, remote_manifest as remote_manifest_fb,
+    },
     engine::commit_log::{
         CommitEntry, CommitRecord, LocalSegmentScanPlan, SegmentFooter, SegmentManager,
         SegmentOptions, SegmentRecordScanner, encode_segment_bytes, segment_footer_from_bytes,
@@ -47,7 +51,6 @@ use crate::{
     },
     ids::{CommitId, FieldId, LogCursor, ManifestId, SegmentId, SequenceNumber, TableId},
     io::{DbDependencies, FileHandle, OpenOptions},
-    metadata_flatbuffers as metadata_fb,
     pressure::{
         AdmissionCorrectnessContext, AdmissionSignals, FlushPressureCandidate, PressureBudget,
         PressureBytes, PressureScope, PressureStats,
