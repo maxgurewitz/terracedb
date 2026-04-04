@@ -984,6 +984,8 @@ Phase 3.a now provides:
 
 #### Phase 3.b: context, realm, and environment ownership
 
+Status: complete in code.
+
 Replace Boa's same-thread context ownership with the Terrace attach/detach model.
 
 Deliverables:
@@ -999,6 +1001,19 @@ Primary input material:
 - `~/dev/boa/core/engine/src/context/*`
 - `~/dev/boa/core/engine/src/realm.rs`
 - `~/dev/boa/core/engine/src/host_defined.rs`
+
+Implemented in:
+
+- [crates/terracedb-js/src/engine/context.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-js/src/engine/context.rs)
+
+Phase 3.b now provides:
+
+- a `JsRuntimeContextBuilder` analogous to Boa's context builder
+- explicit runtime configuration and service injection into detached context state
+- stable realm ids and detached realm snapshots
+- per-realm host-defined state, loaded-module tracking, and registered-class tracking
+- explicit context attach and detach on top of the Phase 3.a heap substrate
+- tests covering environment injection, realm creation and switching, host-defined persistence across detach/thread handoff, realm-scoped state, and realm root release
 
 #### Phase 3.c: compile pipeline and immutable code artifacts
 

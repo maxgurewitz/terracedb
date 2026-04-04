@@ -18,6 +18,11 @@ pub mod types;
 
 pub use adapters::{SandboxJsRuntimeBinding, SandboxJsRuntimeRequest};
 pub use boa::{BoaJsExecutionHooks, BoaJsRuntimeHost, BoaJsScheduler};
+pub use engine::context::{
+    JsAttachedRuntimeContext, JsContextAttachmentSnapshot, JsContextDetachedSnapshot,
+    JsContextError, JsContextServiceConfiguration, JsContextSnapshot, JsRealmId, JsRealmSnapshot,
+    JsRuntimeContext, JsRuntimeContextBuilder,
+};
 pub use engine::heap::{
     JsCollectorSnapshot, JsEphemeronId, JsGcCycleReport, JsHeapAttachmentSnapshot, JsHeapConfig,
     JsHeapError, JsHeapObjectDescriptor, JsHeapObjectId, JsHeapPhase, JsHeapRootId, JsHeapSnapshot,

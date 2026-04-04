@@ -333,7 +333,7 @@ pub struct JsRuntimeHandle {
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsRuntimeConfiguration {
     pub runtime_id: String,
     pub policy: JsRuntimePolicy,
