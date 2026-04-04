@@ -952,6 +952,8 @@ Phase 3 is the engine rewrite proper. It should be executed in the following ord
 
 #### Phase 3.a: heap and GC ownership model
 
+Status: complete in code.
+
 Define the new heap and collector substrate.
 
 Deliverables:
@@ -966,6 +968,19 @@ Primary input material:
 - `~/dev/boa/core/gc/src/*`
 - `~/dev/boa/core/engine/src/object/*`
 - `~/dev/boa/core/engine/src/value/*`
+
+Implemented in:
+
+- [crates/terracedb-js/src/engine/heap.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-js/src/engine/heap.rs)
+
+Phase 3.a now provides:
+
+- a heap substrate with explicit attach and detach
+- collector state owned by the heap instead of thread-local globals
+- stable object, root, weak, and ephemeron ids
+- safepoint-gated collection and detach
+- a collector snapshot and cycle report surface
+- tests that reproduce the equivalent allocation, liveness, deep-chain, weak, and ephemeron behaviors for the new interface
 
 #### Phase 3.b: context, realm, and environment ownership
 

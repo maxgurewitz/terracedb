@@ -6,6 +6,7 @@
 
 pub mod adapters;
 mod boa;
+pub mod engine;
 pub mod entropy;
 pub mod error;
 pub mod host;
@@ -17,6 +18,11 @@ pub mod types;
 
 pub use adapters::{SandboxJsRuntimeBinding, SandboxJsRuntimeRequest};
 pub use boa::{BoaJsExecutionHooks, BoaJsRuntimeHost, BoaJsScheduler};
+pub use engine::heap::{
+    JsCollectorSnapshot, JsEphemeronId, JsGcCycleReport, JsHeapAttachmentSnapshot, JsHeapConfig,
+    JsHeapError, JsHeapObjectDescriptor, JsHeapObjectId, JsHeapPhase, JsHeapRootId, JsHeapSnapshot,
+    JsRuntimeHeap, JsWeakObjectId,
+};
 pub use entropy::{DeterministicJsEntropySource, JsEntropySnapshot, JsEntropySource};
 pub use error::JsSubstrateError;
 pub use host::{
