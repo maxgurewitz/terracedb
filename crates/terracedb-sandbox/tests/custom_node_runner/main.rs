@@ -5,9 +5,7 @@ use std::{thread, time::Duration};
 
 use tokio::{runtime::Builder, time::timeout};
 
-fn stdout_stderr_exit(
-    result: &terracedb_sandbox::SandboxExecutionResult,
-) -> (String, String, i64) {
+fn stdout_stderr_exit(result: &terracedb_sandbox::SandboxExecutionResult) -> (String, String, i64) {
     let report = result
         .result
         .as_ref()
@@ -67,7 +65,9 @@ async fn upstream_commonjs_custom_runner_single_case() {
         match thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => failures.push(error),
-            Err(payload) => failures.push(format!("runner thread panicked: {:?}", payload.type_id())),
+            Err(payload) => {
+                failures.push(format!("runner thread panicked: {:?}", payload.type_id()))
+            }
         }
     }
 

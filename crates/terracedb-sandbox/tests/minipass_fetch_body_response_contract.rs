@@ -172,10 +172,12 @@ fn render_body_response_source(
         }});
         "#,
         body_require = serde_json::to_string(body_require).expect("quoted body require"),
-        response_require = serde_json::to_string(response_require).expect("quoted response require"),
+        response_require =
+            serde_json::to_string(response_require).expect("quoted response require"),
         headers_require = serde_json::to_string(headers_require).expect("quoted headers require"),
         blob_require = serde_json::to_string(blob_require).expect("quoted blob require"),
-        minipass_require = serde_json::to_string(minipass_require).expect("quoted minipass require"),
+        minipass_require =
+            serde_json::to_string(minipass_require).expect("quoted minipass require"),
     )
 }
 
@@ -185,7 +187,9 @@ async fn minipass_fetch_body_and_response_contract_match_real_node() {
         return;
     }
     let Some(npm_root) = npm_cli::npm_cli_root() else {
-        eprintln!("skipping minipass-fetch body/response contract because npm/cli root is unavailable");
+        eprintln!(
+            "skipping minipass-fetch body/response contract because npm/cli root is unavailable"
+        );
         return;
     };
 
@@ -205,7 +209,9 @@ async fn minipass_fetch_body_and_response_contract_match_real_node() {
     );
 
     let Some((session, _vfs)) = npm_cli::open_npm_cli_session(463, 143).await else {
-        eprintln!("skipping minipass-fetch body/response contract because npm/cli session is unavailable");
+        eprintln!(
+            "skipping minipass-fetch body/response contract because npm/cli session is unavailable"
+        );
         return;
     };
     let sandbox = sandbox_stdout_json(

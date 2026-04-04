@@ -146,7 +146,9 @@ async fn npm_registry_fetch_sync_contract_matches_real_node() {
     );
 
     let Some((session, _vfs)) = npm_cli::open_npm_cli_session(465, 145).await else {
-        eprintln!("skipping npm-registry-fetch sync contract because npm/cli session is unavailable");
+        eprintln!(
+            "skipping npm-registry-fetch sync contract because npm/cli session is unavailable"
+        );
         return;
     };
     let sandbox = sandbox_stdout_json(

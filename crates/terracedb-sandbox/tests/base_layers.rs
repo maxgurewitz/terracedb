@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use terracedb_vfs::{CreateOptions, VolumeConfig, VolumeId, VolumeStore, VfsArtifactStoreExt};
+use terracedb_vfs::{CreateOptions, VfsArtifactStoreExt, VolumeConfig, VolumeId, VolumeStore};
 
 use terracedb_sandbox::{
     SandboxBaseLayer, SandboxHarness, SandboxServices, SandboxSnapshotLayer, SandboxSnapshotRecipe,
@@ -65,7 +65,9 @@ async fn bundled_base_layer_materializes_once_and_sessions_reuse_it() {
         .expect("write source project");
 
     let artifact = volumes
-        .export_volume_artifact(terracedb_vfs::CloneVolumeSource::new(source.info().volume_id))
+        .export_volume_artifact(terracedb_vfs::CloneVolumeSource::new(
+            source.info().volume_id,
+        ))
         .await
         .expect("export base layer artifact");
     let base_layer = SandboxBaseLayer::from_bytes("test-base", artifact);
@@ -140,7 +142,9 @@ async fn file_backed_base_layer_streams_artifact_from_disk() {
         .expect("write source project");
 
     let artifact = volumes
-        .export_volume_artifact(terracedb_vfs::CloneVolumeSource::new(source.info().volume_id))
+        .export_volume_artifact(terracedb_vfs::CloneVolumeSource::new(
+            source.info().volume_id,
+        ))
         .await
         .expect("export base layer artifact");
 
@@ -186,20 +190,20 @@ async fn git_backed_base_layer_builds_artifact_via_tree_only_import() {
 
     git(&repo_root, ["init", "-q"]);
 
-    let harness = SandboxHarness::deterministic(
-        10,
-        9,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 9, SandboxServices::deterministic_with_host_git());
     let layer = SandboxSnapshotRecipe::new("git-layer")
         .layer(
-            SandboxSnapshotLayer::git_host_path("node-source", repo_root.to_string_lossy().into_owned())
-                .with_mode(terracedb_git::GitImportMode::WorkingTree {
-                    include_untracked: true,
-                    include_ignored: false,
-                })
-                .with_target_root("/node")
-                .with_pathspec(vec!["lib".to_string(), "test".to_string()]),
+            SandboxSnapshotLayer::git_host_path(
+                "node-source",
+                repo_root.to_string_lossy().into_owned(),
+            )
+            .with_mode(terracedb_git::GitImportMode::WorkingTree {
+                include_untracked: true,
+                include_ignored: false,
+            })
+            .with_target_root("/node")
+            .with_pathspec(vec!["lib".to_string(), "test".to_string()]),
         )
         .build_base_layer(Arc::new(terracedb_sandbox::HostGitBridge::default()))
         .await
@@ -257,20 +261,20 @@ async fn git_backed_base_layer_can_stream_single_file_artifact_to_disk() {
     fs::write(repo_root.join("lib/path.js"), b"exports.path = true;\n").expect("write lib file");
     git(&repo_root, ["init", "-q"]);
 
-    let harness = SandboxHarness::deterministic(
-        10,
-        11,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 11, SandboxServices::deterministic_with_host_git());
     let artifact_path = unique_temp_dir("git-base-layer-file-artifact").with_extension("tdva");
     let recipe = SandboxSnapshotRecipe::new("git-layer-file").layer(
-        SandboxSnapshotLayer::git_host_path("node-source", repo_root.to_string_lossy().into_owned())
-            .with_mode(terracedb_git::GitImportMode::WorkingTree {
-                include_untracked: true,
-                include_ignored: false,
-            })
-            .with_target_root("/node")
-            .with_pathspec(vec!["lib".to_string()]),
+        SandboxSnapshotLayer::git_host_path(
+            "node-source",
+            repo_root.to_string_lossy().into_owned(),
+        )
+        .with_mode(terracedb_git::GitImportMode::WorkingTree {
+            include_untracked: true,
+            include_ignored: false,
+        })
+        .with_target_root("/node")
+        .with_pathspec(vec!["lib".to_string()]),
     );
 
     let layer = recipe
@@ -278,11 +282,14 @@ async fn git_backed_base_layer_can_stream_single_file_artifact_to_disk() {
             Arc::new(terracedb_sandbox::HostGitBridge::default()),
             &artifact_path,
         )
-    .await
-    .expect("write git base layer artifact");
+        .await
+        .expect("write git base layer artifact");
 
     assert!(artifact_path.exists(), "artifact file should exist on disk");
-    assert!(layer.artifact_path().is_some(), "layer should reference artifact path");
+    assert!(
+        layer.artifact_path().is_some(),
+        "layer should reference artifact path"
+    );
 
     let session = harness
         .open_session_from_base_layer(&layer, VolumeId::new(0x6501), VolumeId::new(0x6502))
@@ -317,28 +324,31 @@ async fn snapshot_recipe_can_merge_runtime_and_app_layers() {
     git(&node_repo, ["init", "-q"]);
     git(&app_repo, ["init", "-q"]);
 
-    let harness = SandboxHarness::deterministic(
-        10,
-        13,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 13, SandboxServices::deterministic_with_host_git());
     let layer = SandboxSnapshotRecipe::new("runtime-and-app")
         .layer(
-            SandboxSnapshotLayer::git_host_path("node-source", node_repo.to_string_lossy().into_owned())
-                .with_mode(terracedb_git::GitImportMode::WorkingTree {
-                    include_untracked: true,
-                    include_ignored: false,
-                })
-                .with_target_root("/node")
-                .with_pathspec(vec!["lib".to_string()]),
+            SandboxSnapshotLayer::git_host_path(
+                "node-source",
+                node_repo.to_string_lossy().into_owned(),
+            )
+            .with_mode(terracedb_git::GitImportMode::WorkingTree {
+                include_untracked: true,
+                include_ignored: false,
+            })
+            .with_target_root("/node")
+            .with_pathspec(vec!["lib".to_string()]),
         )
         .layer(
-            SandboxSnapshotLayer::git_host_path("app-source", app_repo.to_string_lossy().into_owned())
-                .with_mode(terracedb_git::GitImportMode::WorkingTree {
-                    include_untracked: true,
-                    include_ignored: false,
-                })
-                .with_target_root("/workspace/app"),
+            SandboxSnapshotLayer::git_host_path(
+                "app-source",
+                app_repo.to_string_lossy().into_owned(),
+            )
+            .with_mode(terracedb_git::GitImportMode::WorkingTree {
+                include_untracked: true,
+                include_ignored: false,
+            })
+            .with_target_root("/workspace/app"),
         )
         .build_base_layer(Arc::new(terracedb_sandbox::HostGitBridge::default()))
         .await
@@ -391,11 +401,8 @@ async fn host_tree_layer_builds_artifact_from_materialized_runtime_tree() {
     fs::write(runtime_root.join(".git/config"), b"[core]\n").expect("write git metadata");
     fs::write(runtime_root.join("docs/readme.md"), b"skip\n").expect("write docs");
 
-    let harness = SandboxHarness::deterministic(
-        10,
-        14,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 14, SandboxServices::deterministic_with_host_git());
     let layer = SandboxSnapshotRecipe::new("host-tree-runtime")
         .layer(
             SandboxSnapshotLayer::host_tree(
@@ -476,11 +483,8 @@ async fn snapshot_recipe_can_merge_git_and_host_tree_layers() {
     fs::write(npm_root.join("package.json"), b"{\"name\":\"npm\"}\n").expect("write package");
     git(&node_repo, ["init", "-q"]);
 
-    let harness = SandboxHarness::deterministic(
-        10,
-        15,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 15, SandboxServices::deterministic_with_host_git());
     let layer = SandboxSnapshotRecipe::new("node-and-npm")
         .layer(
             SandboxSnapshotLayer::git_host_path(
@@ -495,16 +499,13 @@ async fn snapshot_recipe_can_merge_git_and_host_tree_layers() {
             .with_pathspec(vec!["lib".to_string()]),
         )
         .layer(
-            SandboxSnapshotLayer::host_tree(
-                "npm-runtime",
-                npm_root.to_string_lossy().into_owned(),
-            )
-            .with_target_root("/npm")
-            .with_pathspec(vec![
-                "lib".to_string(),
-                "node_modules".to_string(),
-                "package.json".to_string(),
-            ]),
+            SandboxSnapshotLayer::host_tree("npm-runtime", npm_root.to_string_lossy().into_owned())
+                .with_target_root("/npm")
+                .with_pathspec(vec![
+                    "lib".to_string(),
+                    "node_modules".to_string(),
+                    "package.json".to_string(),
+                ]),
         )
         .build_base_layer(Arc::new(terracedb_sandbox::HostGitBridge::default()))
         .await
@@ -561,21 +562,25 @@ async fn node_submodule_can_be_packaged_as_base_layer() {
         .canonicalize()
         .expect("canonicalize node submodule");
 
-    let harness = SandboxHarness::deterministic(
-        10,
-        10,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 10, SandboxServices::deterministic_with_host_git());
     let layer = SandboxSnapshotRecipe::new("node-js-tree")
         .layer(
-            SandboxSnapshotLayer::git_host_path("node-source", repo_root.to_string_lossy().into_owned())
-                .with_mode(terracedb_git::GitImportMode::Head)
-                .with_target_root("/node")
-                .with_pathspec(vec!["lib".to_string(), "deps".to_string(), "test".to_string()]),
+            SandboxSnapshotLayer::git_host_path(
+                "node-source",
+                repo_root.to_string_lossy().into_owned(),
+            )
+            .with_mode(terracedb_git::GitImportMode::Head)
+            .with_target_root("/node")
+            .with_pathspec(vec![
+                "lib".to_string(),
+                "deps".to_string(),
+                "test".to_string(),
+            ]),
         )
         .build_base_layer(Arc::new(terracedb_sandbox::HostGitBridge::default()))
-    .await
-    .expect("build node base layer");
+        .await
+        .expect("build node base layer");
 
     let session = harness
         .open_session_from_base_layer(&layer, VolumeId::new(0x6401), VolumeId::new(0x6402))
@@ -614,11 +619,8 @@ async fn node_submodule_can_be_packaged_as_base_layer() {
 #[tokio::test]
 #[ignore = "large vendored node base artifact canary"]
 async fn vendored_node_base_layer_opens_in_sandbox() {
-    let harness = SandboxHarness::deterministic(
-        10,
-        12,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 12, SandboxServices::deterministic_with_host_git());
     let layer = SandboxBaseLayer::vendored_node_v24_14_1_js_tree();
 
     let session = harness
@@ -658,11 +660,8 @@ async fn vendored_node_base_layer_opens_in_sandbox() {
 #[tokio::test]
 #[ignore = "large vendored combined node+npm base artifact canary"]
 async fn vendored_node_and_npm_base_layer_opens_in_sandbox() {
-    let harness = SandboxHarness::deterministic(
-        10,
-        16,
-        SandboxServices::deterministic_with_host_git(),
-    );
+    let harness =
+        SandboxHarness::deterministic(10, 16, SandboxServices::deterministic_with_host_git());
     let layer = SandboxBaseLayer::vendored_node_v24_14_1_npm_cli_v11_12_1();
 
     let session = harness

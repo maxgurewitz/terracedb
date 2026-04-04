@@ -5,9 +5,9 @@ use serde_json::json;
 use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_git::{
     DeterministicGitHostBridge, DeterministicGitRepositoryStore, GitDiscoverRequest,
-    GitExportRequest, GitForkPolicy, GitHostBridge, GitImportLayout, GitImportMode, GitImportRequest,
-    GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRepositoryImage,
-    GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
+    GitExportRequest, GitForkPolicy, GitHostBridge, GitImportLayout, GitImportMode,
+    GitImportRequest, GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest,
+    GitRepositoryImage, GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore,
     NeverCancel as NeverCancelGit, VfsGitRepositoryImage,
 };
 use terracedb_js::{
@@ -378,6 +378,7 @@ async fn deterministic_smoke_executes_fake_runtime_and_repo_over_vfs() {
                 durable_snapshot: false,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: Default::default(),
             metadata: BTreeMap::new(),
         })
         .await
@@ -630,6 +631,7 @@ async fn boa_runtime_executes_modules_and_capability_imports_over_frozen_interfa
                 durable_snapshot: false,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: Default::default(),
             metadata: BTreeMap::new(),
         })
         .await
@@ -696,6 +698,7 @@ async fn boa_runtime_async_bridge_waits_for_executor_driven_loaders_and_host_ser
                 durable_snapshot: false,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: Default::default(),
             metadata: BTreeMap::new(),
         })
         .await
@@ -765,6 +768,7 @@ async fn boa_runtime_replaces_ambient_rng_and_denies_package_modules_by_default(
                             durable_snapshot: false,
                             fork_policy: JsForkPolicy::simulation_native_baseline(),
                         },
+                        environment: Default::default(),
                         metadata: BTreeMap::new(),
                     })
                     .await
@@ -824,6 +828,7 @@ export default {
                 durable_snapshot: false,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: Default::default(),
             metadata: BTreeMap::new(),
         })
         .await

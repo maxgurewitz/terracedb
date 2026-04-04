@@ -123,7 +123,8 @@ async fn sandbox_npm_config_preserves_logwarnings_shape() {
         "loaded": real_loaded,
     });
     assert_eq!(
-        sandbox_payloads, real_payloads,
+        sandbox_payloads,
+        real_payloads,
         "sandbox npm.config shape should match real node\nsandbox stdout:\n{}\n\nsandbox stderr:\n{}\n\nreal stdout:\n{}\n\nreal stderr:\n{}\n\ntrace:\n{:#?}",
         report["stdout"].as_str().unwrap_or_default(),
         report["stderr"].as_str().unwrap_or_default(),

@@ -35,10 +35,15 @@ pub use scheduler::{
 };
 pub use time::{DeterministicJsClock, FixedJsClock, JsClock, JsClockSnapshot};
 pub use types::{
-    JsAmbientDefault, JsCompatibilityProfile, JsExecutionKind, JsExecutionReport,
-    JsExecutionRequest, JsForkPolicy, JsForkSurface, JsForkSurfacePolicy, JsHostServiceCallRecord,
-    JsHostServiceRequest, JsHostServiceResponse, JsOwnershipMode, JsRuntimeHandle,
-    JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsTraceEvent, JsTracePhase,
+    JsAmbientDefault, JsCallbackId, JsCompatibilityProfile, JsCompletedHostOperation,
+    JsExecutionKind, JsExecutionReport, JsExecutionRequest, JsForkPolicy, JsForkSurface,
+    JsForkSurfacePolicy, JsHostOpId, JsHostServiceCallRecord, JsHostServiceRequest,
+    JsHostServiceResponse, JsModuleGraphNode, JsModuleId, JsOwnershipMode, JsPendingHostOperation,
+    JsPendingTask, JsPendingTimer, JsPromiseId, JsRuntimeAttachmentState, JsRuntimeConfiguration,
+    JsRuntimeEnvironment, JsRuntimeErrorReport, JsRuntimeHandle, JsRuntimeOpenRequest,
+    JsRuntimePolicy, JsRuntimeProvenance, JsRuntimeSuspendedState, JsRuntimeTurn,
+    JsRuntimeTurnCompletion, JsRuntimeTurnKind, JsRuntimeTurnOutcome, JsTaskId, JsTimerId,
+    JsTraceEvent, JsTracePhase,
 };
 
 pub use serde_json::Value as JsonValue;

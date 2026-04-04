@@ -23,8 +23,7 @@ fn normalize_missing_message(payload: &mut Value) {
         if let Some(start) = normalized.find("Cannot find module '") {
             let path_start = start + "Cannot find module '".len();
             if let Some(path_end) = normalized[path_start..].find('\'') {
-                let path =
-                    normalized[path_start..path_start + path_end].to_string();
+                let path = normalized[path_start..path_start + path_end].to_string();
                 let basename = std::path::Path::new(&path)
                     .file_name()
                     .and_then(|name| name.to_str())

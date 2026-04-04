@@ -36,8 +36,7 @@ fn render_options_source(options_require: &str) -> String {
         }};
         console.log(JSON.stringify(snapshot));
         "#,
-        options_require =
-            serde_json::to_string(options_require).expect("quoted options require")
+        options_require = serde_json::to_string(options_require).expect("quoted options require")
     )
 }
 
@@ -51,8 +50,11 @@ async fn npmcli_agent_options_contract_matches_real_node() {
         return;
     };
 
-    let sandbox_source = render_options_source("/workspace/npm/node_modules/@npmcli/agent/lib/options.js");
-    let real_source = render_options_source(&format!("{npm_root}/node_modules/@npmcli/agent/lib/options.js"));
+    let sandbox_source =
+        render_options_source("/workspace/npm/node_modules/@npmcli/agent/lib/options.js");
+    let real_source = render_options_source(&format!(
+        "{npm_root}/node_modules/@npmcli/agent/lib/options.js"
+    ));
 
     let Some((session, _vfs)) = npm_cli::open_npm_cli_session(470, 150).await else {
         eprintln!("skipping @npmcli/agent options contract because npm/cli session is unavailable");

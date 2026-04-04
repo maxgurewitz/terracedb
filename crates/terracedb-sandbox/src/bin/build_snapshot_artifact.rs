@@ -101,16 +101,16 @@ async fn main() -> ExitCode {
     }
 
     let layer = match source_kind {
-        "git-host" => SandboxSnapshotLayer::git_host_path("source", source).with_mode(
-            if working_tree {
+        "git-host" => {
+            SandboxSnapshotLayer::git_host_path("source", source).with_mode(if working_tree {
                 GitImportMode::WorkingTree {
                     include_untracked,
                     include_ignored,
                 }
             } else {
                 GitImportMode::Head
-            },
-        ),
+            })
+        }
         "git-remote" => SandboxSnapshotLayer::git_remote("source", source, reference),
         "host-tree" => {
             let mut layer = SandboxSnapshotLayer::host_tree("source", source);

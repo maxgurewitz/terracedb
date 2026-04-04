@@ -25,19 +25,22 @@ use boa_engine::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    JsForkPolicy, JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule, JsRuntimeHandle,
+    JsForkPolicy, JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule,
     JsRuntimeOpenRequest, JsRuntimePolicy, JsSubstrateError, JsonValue,
     entropy::JsEntropySource,
     host::JsHostServices,
     runtime::{
         JsCancellationToken, JsRuntime, JsRuntimeHost, NoopJsExecutionHooks,
-        ensure_module_kind_allowed,
+        ensure_module_kind_allowed, js_turn_kind_label,
     },
     scheduler::{JsScheduledTask, JsScheduler, JsSchedulerSnapshot, JsTaskQueue},
     time::JsClock,
     types::{
         JsExecutionKind, JsExecutionReport, JsExecutionRequest, JsHostServiceCallRecord,
-        JsHostServiceRequest, JsTraceEvent, JsTracePhase,
+        JsHostServiceRequest, JsModuleGraphNode, JsModuleId, JsRuntimeAttachmentState,
+        JsRuntimeConfiguration, JsRuntimeHandle, JsRuntimeSuspendedState, JsRuntimeTurn,
+        JsRuntimeTurnCompletion, JsRuntimeTurnKind, JsRuntimeTurnOutcome, JsTraceEvent,
+        JsTracePhase,
     },
 };
 
@@ -234,11 +237,14 @@ impl JsRuntimeHost for BoaJsRuntimeHost {
             backend: self.name.to_string(),
             policy: request.policy,
             provenance: request.provenance,
+            environment: request.environment,
             metadata: request.metadata,
         };
+        let configuration = JsRuntimeConfiguration::from_handle(&handle);
         self.hooks.on_runtime_open(&handle)?;
         Ok(Arc::new(BoaJsRuntime {
             handle,
+            configuration,
             scheduler: self.scheduler.clone(),
             clock: self.clock.clone(),
             entropy: self.entropy.clone(),
@@ -246,12 +252,15 @@ impl JsRuntimeHost for BoaJsRuntimeHost {
             host_services: self.host_services.clone(),
             hooks: self.hooks.clone(),
             execution_lock: AsyncMutex::new(()),
+            attachment: AsyncMutex::new(JsRuntimeAttachmentState::default()),
+            suspended: AsyncMutex::new(JsRuntimeSuspendedState::default()),
         }))
     }
 }
 
 struct BoaJsRuntime {
     handle: JsRuntimeHandle,
+    configuration: JsRuntimeConfiguration,
     scheduler: Arc<dyn BoaJsScheduler>,
     clock: Arc<dyn JsClock>,
     entropy: Arc<dyn JsEntropySource>,
@@ -259,6 +268,8 @@ struct BoaJsRuntime {
     host_services: Arc<dyn JsHostServices>,
     hooks: Arc<dyn BoaJsExecutionHooks>,
     execution_lock: AsyncMutex<()>,
+    attachment: AsyncMutex<JsRuntimeAttachmentState>,
+    suspended: AsyncMutex<JsRuntimeSuspendedState>,
 }
 
 enum PreparedBoaExecution {
@@ -278,7 +289,67 @@ impl JsRuntime for BoaJsRuntime {
         self.handle.clone()
     }
 
+    fn configuration(&self) -> JsRuntimeConfiguration {
+        self.configuration.clone()
+    }
+
+    async fn attachment_state(&self) -> Result<JsRuntimeAttachmentState, JsSubstrateError> {
+        Ok(self.attachment.lock().await.clone())
+    }
+
+    async fn suspended_state(&self) -> Result<JsRuntimeSuspendedState, JsSubstrateError> {
+        Ok(self.suspended.lock().await.clone())
+    }
+
+    async fn run_turn(
+        &self,
+        turn: JsRuntimeTurn,
+        cancellation: Arc<dyn JsCancellationToken>,
+    ) -> Result<JsRuntimeTurnOutcome, JsSubstrateError> {
+        self.attach(js_turn_kind_label(&turn.kind)).await;
+        let result = match turn.kind {
+            JsRuntimeTurnKind::Bootstrap => Ok(JsRuntimeTurnOutcome::Completed {
+                completion: JsRuntimeTurnCompletion {
+                    execution: None,
+                    metadata: BTreeMap::from([(
+                        "runtime_id".to_string(),
+                        JsonValue::from(self.handle.runtime_id.clone()),
+                    )]),
+                },
+            }),
+            JsRuntimeTurnKind::EvaluateEntrypoint { request } => {
+                let report = self.run_execution_request(request, cancellation).await?;
+                self.update_suspended_from_report(&report).await;
+                Ok(JsRuntimeTurnOutcome::Completed {
+                    completion: JsRuntimeTurnCompletion {
+                        execution: Some(report),
+                        metadata: BTreeMap::new(),
+                    },
+                })
+            }
+            unsupported => Err(JsSubstrateError::UnsupportedTurn {
+                turn: js_turn_kind_label(&unsupported).to_string(),
+            }),
+        };
+        self.detach().await;
+        result
+    }
+
     async fn execute(
+        &self,
+        request: JsExecutionRequest,
+        cancellation: Arc<dyn JsCancellationToken>,
+    ) -> Result<JsExecutionReport, JsSubstrateError> {
+        self.run_execution_request(request, cancellation).await
+    }
+
+    async fn close(&self) -> Result<(), JsSubstrateError> {
+        self.hooks.on_runtime_close(&self.handle)
+    }
+}
+
+impl BoaJsRuntime {
+    async fn run_execution_request(
         &self,
         request: JsExecutionRequest,
         cancellation: Arc<dyn JsCancellationToken>,
@@ -359,12 +430,43 @@ impl JsRuntime for BoaJsRuntime {
         })
     }
 
-    async fn close(&self) -> Result<(), JsSubstrateError> {
-        self.hooks.on_runtime_close(&self.handle)
+    async fn attach(&self, turn: &str) {
+        let mut attachment = self.attachment.lock().await;
+        attachment.attached = true;
+        attachment.attachment_epoch = attachment.attachment_epoch.saturating_add(1);
+        attachment.worker_hint = Some(format!("{:?}", std::thread::current().id()));
+        attachment.current_turn = Some(turn.to_string());
     }
-}
 
-impl BoaJsRuntime {
+    async fn detach(&self) {
+        let mut attachment = self.attachment.lock().await;
+        attachment.attached = false;
+        attachment.current_turn = None;
+    }
+
+    async fn update_suspended_from_report(&self, report: &JsExecutionReport) {
+        let mut suspended = self.suspended.lock().await;
+        suspended.pending_microtasks = 0;
+        suspended.terminated = false;
+        suspended.module_graph.clear();
+        for (index, specifier) in report.module_graph.iter().enumerate() {
+            let module_id = JsModuleId::new((index + 1) as u64);
+            suspended.module_graph.insert(
+                module_id,
+                JsModuleGraphNode {
+                    module_id,
+                    specifier: specifier.clone(),
+                    dependencies: Vec::new(),
+                    evaluated: true,
+                },
+            );
+        }
+        suspended.metadata.insert(
+            "last_entrypoint".to_string(),
+            JsonValue::from(report.entrypoint.clone()),
+        );
+    }
+
     async fn prepare_request(
         &self,
         request: JsExecutionRequest,
@@ -1351,6 +1453,7 @@ mod tests {
                 durable_snapshot: false,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: Default::default(),
             metadata: Default::default(),
         })
         .await
@@ -1396,6 +1499,7 @@ text;
                 durable_snapshot: false,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: Default::default(),
             metadata: Default::default(),
         })
         .await
@@ -1441,6 +1545,7 @@ state;
                 durable_snapshot: false,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: Default::default(),
             metadata: Default::default(),
         })
         .await

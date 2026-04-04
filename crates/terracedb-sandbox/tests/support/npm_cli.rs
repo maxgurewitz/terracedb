@@ -11,8 +11,7 @@ pub const SANDBOX_PROJECT_ROOT: &str = "/workspace/project";
 
 const CACHED_NPM_BASE_VOLUME_ID: VolumeId = VolumeId::new(0xA7F0_0000_0000_0001);
 const SESSION_VOLUME_BASE: u128 = 0xA8F0_0000_0000_0000;
-static NEXT_SESSION_SUFFIX: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static NEXT_SESSION_SUFFIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn npm_cli_root() -> Option<String> {
     std::env::var("TERRACE_NPM_CLI_ROOT")
@@ -45,8 +44,7 @@ pub async fn open_npm_cli_session(
     now: u64,
     seed: u64,
 ) -> Option<(SandboxSession, InMemoryVfsStore)> {
-    let artifact_path =
-        terracedb_sandbox::NODE_V24_14_1_NPM_CLI_V11_12_1_BASE_LAYER_ARTIFACT_PATH;
+    let artifact_path = terracedb_sandbox::NODE_V24_14_1_NPM_CLI_V11_12_1_BASE_LAYER_ARTIFACT_PATH;
     if !std::path::Path::new(artifact_path).exists() {
         return None;
     }
@@ -169,7 +167,9 @@ pub fn node_runtime_trace(result: &terracedb_sandbox::SandboxExecutionResult) ->
         .unwrap_or_default()
 }
 
-pub fn node_runtime_events(result: &terracedb_sandbox::SandboxExecutionResult) -> Vec<serde_json::Value> {
+pub fn node_runtime_events(
+    result: &terracedb_sandbox::SandboxExecutionResult,
+) -> Vec<serde_json::Value> {
     result
         .metadata
         .get("node_runtime_events")
@@ -204,7 +204,8 @@ pub fn node_runtime_events_matching(
         .into_iter()
         .filter(|event| {
             let label_ok = labels.map_or(true, |labels| {
-                event.get("label")
+                event
+                    .get("label")
                     .and_then(|value| value.as_str())
                     .map(|label| labels.iter().any(|candidate| candidate == &label))
                     .unwrap_or(false)

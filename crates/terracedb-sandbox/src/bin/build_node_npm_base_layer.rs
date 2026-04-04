@@ -1,8 +1,6 @@
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
-use terracedb_sandbox::{
-    HostGitBridge, node_v24_14_1_npm_cli_v11_12_1_recipe,
-};
+use terracedb_sandbox::{HostGitBridge, node_v24_14_1_npm_cli_v11_12_1_recipe};
 
 fn print_usage(program: &str) {
     eprintln!("usage: {program} <npm_runtime_path> <output_path>");

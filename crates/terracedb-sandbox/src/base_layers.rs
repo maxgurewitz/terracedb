@@ -15,14 +15,16 @@ use terracedb_git::{
     GitImportSource, NeverCancel,
 };
 use terracedb_vfs::{
-    DEFAULT_CHUNK_SIZE, Volume, VolumeArtifactBuilder, VolumeConfig, VolumeId, VolumeStore,
-    VfsArtifactStoreExt,
+    DEFAULT_CHUNK_SIZE, VfsArtifactStoreExt, Volume, VolumeArtifactBuilder, VolumeConfig, VolumeId,
+    VolumeStore,
 };
 
 use crate::{SandboxError, git::git_substrate_error_to_sandbox};
 
-pub const NODE_V24_14_1_JS_TREE_BASE_LAYER_ARTIFACT_PATH: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/node-v24.14.1-js-tree.tdva");
+pub const NODE_V24_14_1_JS_TREE_BASE_LAYER_ARTIFACT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/node-v24.14.1-js-tree.tdva"
+);
 pub const NODE_V24_14_1_NPM_CLI_V11_12_1_BASE_LAYER_ARTIFACT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/node-v24.14.1-npm-cli-v11.12.1-runtime.tdva"
@@ -139,9 +141,8 @@ impl SandboxSnapshotRecipe {
     ) -> Result<SandboxBaseLayer, SandboxError> {
         let mut artifact = Vec::new();
         self.write_artifact(git_bridge, &mut artifact).await?;
-        Ok(SandboxBaseLayer::from_bytes(self.name.clone(), artifact).with_chunk_size(
-            self.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE),
-        ))
+        Ok(SandboxBaseLayer::from_bytes(self.name.clone(), artifact)
+            .with_chunk_size(self.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE)))
     }
 
     pub async fn write_artifact<W: Write + Send>(
@@ -177,19 +178,15 @@ impl SandboxSnapshotRecipe {
             path: artifact_path.display().to_string(),
             message: error.to_string(),
         })?;
-        Ok(SandboxBaseLayer::from_artifact_path(
-            self.name.clone(),
-            artifact_path.to_path_buf(),
+        Ok(
+            SandboxBaseLayer::from_artifact_path(self.name.clone(), artifact_path.to_path_buf())
+                .with_chunk_size(self.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE)),
         )
-        .with_chunk_size(self.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE)))
     }
 }
 
 impl SandboxSnapshotLayer {
-    pub fn host_tree(
-        name: impl Into<Cow<'static, str>>,
-        source_path: impl Into<String>,
-    ) -> Self {
+    pub fn host_tree(name: impl Into<Cow<'static, str>>, source_path: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             target_root: "/".to_string(),
@@ -205,9 +202,12 @@ impl SandboxSnapshotLayer {
         name: impl Into<Cow<'static, str>>,
         source_path: impl Into<String>,
     ) -> Self {
-        Self::git_source(name, GitImportSource::HostPath {
-            path: source_path.into(),
-        })
+        Self::git_source(
+            name,
+            GitImportSource::HostPath {
+                path: source_path.into(),
+            },
+        )
     }
 
     pub fn git_remote(
@@ -224,10 +224,7 @@ impl SandboxSnapshotLayer {
         )
     }
 
-    pub fn git_source(
-        name: impl Into<Cow<'static, str>>,
-        source: GitImportSource,
-    ) -> Self {
+    pub fn git_source(name: impl Into<Cow<'static, str>>, source: GitImportSource) -> Self {
         Self {
             name: name.into(),
             target_root: "/".to_string(),
@@ -318,10 +315,7 @@ impl SandboxBaseLayer {
         }
     }
 
-    pub fn from_bytes(
-        name: impl Into<Cow<'static, str>>,
-        artifact: impl Into<Arc<[u8]>>,
-    ) -> Self {
+    pub fn from_bytes(name: impl Into<Cow<'static, str>>, artifact: impl Into<Arc<[u8]>>) -> Self {
         Self {
             name: name.into(),
             source: SandboxBaseLayerSource::Bytes(artifact.into()),
@@ -377,12 +371,16 @@ impl SandboxBaseLayer {
         }
     }
 
-    pub async fn ensure_volume<S>(&self, volumes: &S, volume_id: VolumeId) -> Result<Arc<dyn Volume>, SandboxError>
+    pub async fn ensure_volume<S>(
+        &self,
+        volumes: &S,
+        volume_id: VolumeId,
+    ) -> Result<Arc<dyn Volume>, SandboxError>
     where
         S: VolumeStore + ?Sized,
     {
-        let config =
-            VolumeConfig::new(volume_id).with_chunk_size(self.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE));
+        let config = VolumeConfig::new(volume_id)
+            .with_chunk_size(self.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE));
         match &self.source {
             SandboxBaseLayerSource::Bytes(bytes) => volumes
                 .ensure_imported_volume_artifact(bytes.as_ref(), config)
@@ -409,7 +407,10 @@ struct GitImportArtifactSink {
 }
 
 impl GitImportArtifactSink {
-    fn from_builder(builder: VolumeArtifactBuilder, target_root: &str) -> Result<Self, SandboxError> {
+    fn from_builder(
+        builder: VolumeArtifactBuilder,
+        target_root: &str,
+    ) -> Result<Self, SandboxError> {
         Ok(Self {
             builder,
             target_root: normalize_target_root(target_root)?,
@@ -423,9 +424,13 @@ impl GitImportArtifactSink {
 
 #[async_trait]
 impl GitImportSink for GitImportArtifactSink {
-    async fn add_directory(&mut self, path: &str, mode: Option<u32>) -> Result<(), terracedb_git::GitSubstrateError> {
-        let path = join_target_root(&self.target_root, path)
-            .map_err(sandbox_error_to_git_bridge_error)?;
+    async fn add_directory(
+        &mut self,
+        path: &str,
+        mode: Option<u32>,
+    ) -> Result<(), terracedb_git::GitSubstrateError> {
+        let path =
+            join_target_root(&self.target_root, path).map_err(sandbox_error_to_git_bridge_error)?;
         self.builder
             .add_directory(&path, mode)
             .map_err(vfs_error_to_git_bridge_error)
@@ -437,8 +442,8 @@ impl GitImportSink for GitImportArtifactSink {
         mode: Option<u32>,
         reader: &mut (dyn Read + Send),
     ) -> Result<(), terracedb_git::GitSubstrateError> {
-        let path = join_target_root(&self.target_root, path)
-            .map_err(sandbox_error_to_git_bridge_error)?;
+        let path =
+            join_target_root(&self.target_root, path).map_err(sandbox_error_to_git_bridge_error)?;
         self.builder
             .add_file_from_reader(&path, reader, mode)
             .map_err(vfs_error_to_git_bridge_error)
@@ -450,8 +455,8 @@ impl GitImportSink for GitImportArtifactSink {
         target: &str,
         mode: Option<u32>,
     ) -> Result<(), terracedb_git::GitSubstrateError> {
-        let path = join_target_root(&self.target_root, path)
-            .map_err(sandbox_error_to_git_bridge_error)?;
+        let path =
+            join_target_root(&self.target_root, path).map_err(sandbox_error_to_git_bridge_error)?;
         self.builder
             .add_symlink(&path, target, mode)
             .map_err(vfs_error_to_git_bridge_error)
@@ -514,7 +519,11 @@ pub fn node_v24_14_1_js_tree_recipe() -> SandboxSnapshotRecipe {
             Some(NODE_V24_14_1_COMMIT.to_string()),
         )
         .with_target_root("/node")
-        .with_pathspec(vec!["lib".to_string(), "deps".to_string(), "test".to_string()]),
+        .with_pathspec(vec![
+            "lib".to_string(),
+            "deps".to_string(),
+            "test".to_string(),
+        ]),
     )
 }
 
@@ -547,7 +556,11 @@ pub fn node_v24_14_1_npm_cli_v11_12_1_recipe(
                 Some(NODE_V24_14_1_COMMIT.to_string()),
             )
             .with_target_root("/node")
-            .with_pathspec(vec!["lib".to_string(), "deps".to_string(), "test".to_string()]),
+            .with_pathspec(vec![
+                "lib".to_string(),
+                "deps".to_string(),
+                "test".to_string(),
+            ]),
         )
         .layer(
             SandboxSnapshotLayer::host_tree("npm-runtime", npm_runtime_source)
@@ -792,7 +805,9 @@ fn sandbox_error_to_git_bridge_error(error: SandboxError) -> terracedb_git::GitS
     }
 }
 
-fn vfs_error_to_git_bridge_error(error: terracedb_vfs::VfsError) -> terracedb_git::GitSubstrateError {
+fn vfs_error_to_git_bridge_error(
+    error: terracedb_vfs::VfsError,
+) -> terracedb_git::GitSubstrateError {
     terracedb_git::GitSubstrateError::Bridge {
         operation: "import_repository_streaming",
         message: error.to_string(),

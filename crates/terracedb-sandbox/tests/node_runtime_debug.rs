@@ -46,7 +46,9 @@ async fn node_runtime_debug_structured_events_capture_js_payloads() {
     let events = node_runtime_events(&result);
     let demo = events
         .iter()
-        .find(|event| event["bucket"].as_str() == Some("js") && event["label"].as_str() == Some("demo"))
+        .find(|event| {
+            event["bucket"].as_str() == Some("js") && event["label"].as_str() == Some("demo")
+        })
         .expect("structured js event");
     assert_eq!(demo["data"]["step"].as_str(), Some("start"));
     assert_eq!(demo["data"]["answer"].as_i64(), Some(42));
@@ -201,7 +203,8 @@ async fn node_runtime_debug_autoinstrumentation_traces_method_calls() {
                 return this.value;
               },
             };
-            "#.to_vec(),
+            "#
+            .to_vec(),
             CreateOptions {
                 create_parents: true,
                 overwrite: true,
@@ -276,7 +279,8 @@ async fn node_runtime_debug_autoinstrumentation_preserves_class_constructors() {
                 return this.value.toUpperCase();
               }
             };
-            "#.to_vec(),
+            "#
+            .to_vec(),
             CreateOptions {
                 create_parents: true,
                 overwrite: true,
@@ -341,7 +345,8 @@ async fn node_runtime_debug_autoinstrumentation_traces_private_method_entry() {
                 return 42;
               }
             };
-            "#.to_vec(),
+            "#
+            .to_vec(),
             CreateOptions {
                 create_parents: true,
                 overwrite: true,
@@ -408,7 +413,8 @@ async fn node_runtime_debug_autoinstrumentation_preserves_function_static_method
               return { wrapped: value };
             };
             module.exports = helper;
-            "#.to_vec(),
+            "#
+            .to_vec(),
             CreateOptions {
                 create_parents: true,
                 overwrite: true,

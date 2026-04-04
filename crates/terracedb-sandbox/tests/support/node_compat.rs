@@ -20,7 +20,8 @@ mod tracing_support;
 const CACHED_NODE_BASE_VOLUME_ID: VolumeId = VolumeId::new(0xA9F0_0000_0000_0001);
 const SESSION_VOLUME_BASE: u128 = 0xAAF0_0000_0000_0000;
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
-static SHARED_UPSTREAM_NODE_HARNESS: OnceCell<SandboxHarness<InMemoryVfsStore>> = OnceCell::const_new();
+static SHARED_UPSTREAM_NODE_HARNESS: OnceCell<SandboxHarness<InMemoryVfsStore>> =
+    OnceCell::const_new();
 
 async fn shared_upstream_node_harness() -> &'static SandboxHarness<InMemoryVfsStore> {
     SHARED_UPSTREAM_NODE_HARNESS

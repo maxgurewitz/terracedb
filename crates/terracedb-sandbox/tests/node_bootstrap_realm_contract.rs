@@ -128,7 +128,10 @@ async fn bootstrap_realm_loads_upstream_internal_support_modules() {
 
     assert_eq!(payload["slash"].as_i64(), Some(47));
     assert_eq!(payload["eol"].as_str(), Some("\n"));
-    assert_eq!(payload["validateStringCode"].as_str(), Some("ERR_INVALID_ARG_TYPE"));
+    assert_eq!(
+        payload["validateStringCode"].as_str(),
+        Some("ERR_INVALID_ARG_TYPE")
+    );
     assert_eq!(
         payload["internalAssertCode"].as_str(),
         Some("ERR_INTERNAL_ASSERTION")

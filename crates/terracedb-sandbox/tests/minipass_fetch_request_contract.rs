@@ -200,7 +200,8 @@ fn render_request_source(
         }});
         "#,
         request_require = serde_json::to_string(request_require).expect("quoted request require"),
-        minipass_require = serde_json::to_string(minipass_require).expect("quoted minipass require"),
+        minipass_require =
+            serde_json::to_string(minipass_require).expect("quoted minipass require"),
         http_require = serde_json::to_string(http_require).expect("quoted http require"),
     )
 }
@@ -226,7 +227,9 @@ async fn minipass_fetch_request_contract_matches_real_node() {
     );
 
     let Some((session, _vfs)) = npm_cli::open_npm_cli_session(461, 141).await else {
-        eprintln!("skipping minipass-fetch request contract because npm/cli session is unavailable");
+        eprintln!(
+            "skipping minipass-fetch request contract because npm/cli session is unavailable"
+        );
         return;
     };
     let sandbox = sandbox_stdout_json(

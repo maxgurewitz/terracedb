@@ -158,7 +158,9 @@ async fn minipass_fetch_headers_contract_matches_real_node() {
     let real_source = render_headers_source(&real_require);
 
     let Some((session, _vfs)) = npm_cli::open_npm_cli_session(460, 140).await else {
-        eprintln!("skipping minipass-fetch headers contract because npm/cli session is unavailable");
+        eprintln!(
+            "skipping minipass-fetch headers contract because npm/cli session is unavailable"
+        );
         return;
     };
     let sandbox = sandbox_stdout_json(

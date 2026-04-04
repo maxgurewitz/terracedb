@@ -82,8 +82,9 @@ async fn minipass_fetch_index_contract_matches_real_node_for_pure_paths() {
     };
     let sandbox_source =
         render_fetch_index_source("/workspace/npm/node_modules/minipass-fetch/lib/index.js");
-    let real_source =
-        render_fetch_index_source(&format!("{npm_root}/node_modules/minipass-fetch/lib/index.js"));
+    let real_source = render_fetch_index_source(&format!(
+        "{npm_root}/node_modules/minipass-fetch/lib/index.js"
+    ));
 
     let Some((session, _vfs)) = npm_cli::open_npm_cli_session(464, 144).await else {
         eprintln!("skipping minipass-fetch index contract because npm/cli session is unavailable");

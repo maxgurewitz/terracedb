@@ -30,6 +30,8 @@ pub enum JsSubstrateError {
     EvaluationFailed { entrypoint: String, message: String },
     #[error("invalid js fake-runtime directive in {module}: {message}")]
     InvalidDirective { module: String, message: String },
+    #[error("unsupported js runtime turn: {turn}")]
+    UnsupportedTurn { turn: String },
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]

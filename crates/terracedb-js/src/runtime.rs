@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     JsForkPolicy, JsSubstrateError,
@@ -15,8 +16,10 @@ use crate::{
     time::JsClock,
     types::{
         JsExecutionKind, JsExecutionReport, JsExecutionRequest, JsHostServiceCallRecord,
-        JsHostServiceRequest, JsRuntimeHandle, JsRuntimeOpenRequest, JsRuntimePolicy, JsTraceEvent,
-        JsTracePhase,
+        JsHostServiceRequest, JsRuntimeAttachmentState, JsRuntimeConfiguration,
+        JsRuntimeErrorReport, JsRuntimeHandle, JsRuntimeOpenRequest, JsRuntimePolicy,
+        JsRuntimeSuspendedState, JsRuntimeTurn, JsRuntimeTurnCompletion, JsRuntimeTurnKind,
+        JsRuntimeTurnOutcome, JsTraceEvent, JsTracePhase,
     },
 };
 
@@ -65,11 +68,70 @@ impl JsExecutionHooks for NoopJsExecutionHooks {}
 #[async_trait(?Send)]
 pub trait JsRuntime: Send + Sync {
     fn handle(&self) -> JsRuntimeHandle;
+    fn configuration(&self) -> JsRuntimeConfiguration {
+        JsRuntimeConfiguration::from_handle(&self.handle())
+    }
+    async fn attachment_state(&self) -> Result<JsRuntimeAttachmentState, JsSubstrateError> {
+        Ok(JsRuntimeAttachmentState::default())
+    }
+    async fn suspended_state(&self) -> Result<JsRuntimeSuspendedState, JsSubstrateError> {
+        Ok(JsRuntimeSuspendedState::default())
+    }
+    async fn run_turn(
+        &self,
+        turn: JsRuntimeTurn,
+        cancellation: Arc<dyn JsCancellationToken>,
+    ) -> Result<JsRuntimeTurnOutcome, JsSubstrateError> {
+        match turn.kind {
+            JsRuntimeTurnKind::Bootstrap => Ok(JsRuntimeTurnOutcome::Completed {
+                completion: JsRuntimeTurnCompletion::default(),
+            }),
+            JsRuntimeTurnKind::EvaluateEntrypoint { request } => {
+                let execution = self.execute(request, cancellation).await?;
+                Ok(JsRuntimeTurnOutcome::Completed {
+                    completion: JsRuntimeTurnCompletion {
+                        execution: Some(execution),
+                        metadata: BTreeMap::new(),
+                    },
+                })
+            }
+            unsupported => Err(JsSubstrateError::UnsupportedTurn {
+                turn: js_turn_kind_label(&unsupported).to_string(),
+            }),
+        }
+    }
     async fn execute(
         &self,
         request: JsExecutionRequest,
         cancellation: Arc<dyn JsCancellationToken>,
-    ) -> Result<JsExecutionReport, JsSubstrateError>;
+    ) -> Result<JsExecutionReport, JsSubstrateError> {
+        match self
+            .run_turn(JsRuntimeTurn::evaluate_entrypoint(request), cancellation)
+            .await?
+        {
+            JsRuntimeTurnOutcome::Completed { completion } => {
+                completion
+                    .execution
+                    .ok_or(JsSubstrateError::EvaluationFailed {
+                        entrypoint: self.handle().runtime_id,
+                        message: "runtime turn completed without an execution report".to_string(),
+                    })
+            }
+            JsRuntimeTurnOutcome::Threw { error } => Err(js_runtime_error_to_substrate(
+                self.handle().runtime_id,
+                error,
+            )),
+            JsRuntimeTurnOutcome::Terminated { reason } => {
+                Err(JsSubstrateError::EvaluationFailed {
+                    entrypoint: self.handle().runtime_id,
+                    message: format!("runtime terminated: {reason}"),
+                })
+            }
+            outcome => Err(JsSubstrateError::UnsupportedTurn {
+                turn: format!("evaluate_entrypoint -> {}", js_turn_outcome_label(&outcome)),
+            }),
+        }
+    }
     async fn close(&self) -> Result<(), JsSubstrateError>;
 }
 
@@ -172,29 +234,37 @@ impl JsRuntimeHost for DeterministicJsRuntimeHost {
             backend: self.name.to_string(),
             policy: request.policy,
             provenance: request.provenance,
+            environment: request.environment,
             metadata: request.metadata,
         };
+        let configuration = JsRuntimeConfiguration::from_handle(&handle);
         self.hooks.on_runtime_open(&handle).await?;
         Ok(Arc::new(DeterministicJsRuntime {
             handle,
+            configuration,
             scheduler: self.scheduler.clone(),
             clock: self.clock.clone(),
             entropy: self.entropy.clone(),
             module_loader: self.module_loader.clone(),
             host_services: self.host_services.clone(),
             hooks: self.hooks.clone(),
+            attachment: Arc::new(AsyncMutex::new(JsRuntimeAttachmentState::default())),
+            suspended: Arc::new(AsyncMutex::new(JsRuntimeSuspendedState::default())),
         }))
     }
 }
 
 struct DeterministicJsRuntime {
     handle: JsRuntimeHandle,
+    configuration: JsRuntimeConfiguration,
     scheduler: Arc<dyn JsScheduler>,
     clock: Arc<dyn JsClock>,
     entropy: Arc<dyn JsEntropySource>,
     module_loader: Arc<dyn JsModuleLoader>,
     host_services: Arc<dyn JsHostServices>,
     hooks: Arc<dyn JsExecutionHooks>,
+    attachment: Arc<AsyncMutex<JsRuntimeAttachmentState>>,
+    suspended: Arc<AsyncMutex<JsRuntimeSuspendedState>>,
 }
 
 #[async_trait(?Send)]
@@ -203,7 +273,76 @@ impl JsRuntime for DeterministicJsRuntime {
         self.handle.clone()
     }
 
+    fn configuration(&self) -> JsRuntimeConfiguration {
+        self.configuration.clone()
+    }
+
+    async fn attachment_state(&self) -> Result<JsRuntimeAttachmentState, JsSubstrateError> {
+        Ok(self.attachment.lock().await.clone())
+    }
+
+    async fn suspended_state(&self) -> Result<JsRuntimeSuspendedState, JsSubstrateError> {
+        Ok(self.suspended.lock().await.clone())
+    }
+
+    async fn run_turn(
+        &self,
+        turn: JsRuntimeTurn,
+        cancellation: Arc<dyn JsCancellationToken>,
+    ) -> Result<JsRuntimeTurnOutcome, JsSubstrateError> {
+        self.attach(js_turn_kind_label(&turn.kind)).await;
+        let result = match turn.kind {
+            JsRuntimeTurnKind::Bootstrap => Ok(JsRuntimeTurnOutcome::Completed {
+                completion: JsRuntimeTurnCompletion {
+                    execution: None,
+                    metadata: BTreeMap::from([(
+                        "runtime_id".to_string(),
+                        JsonValue::from(self.handle.runtime_id.clone()),
+                    )]),
+                },
+            }),
+            JsRuntimeTurnKind::EvaluateEntrypoint { request } => {
+                let report = self.execute_request(request, cancellation).await?;
+                self.update_suspended_from_report(&report).await;
+                Ok(JsRuntimeTurnOutcome::Completed {
+                    completion: JsRuntimeTurnCompletion {
+                        execution: Some(report),
+                        metadata: BTreeMap::new(),
+                    },
+                })
+            }
+            unsupported => Err(JsSubstrateError::UnsupportedTurn {
+                turn: js_turn_kind_label(&unsupported).to_string(),
+            }),
+        };
+        self.detach().await;
+        result
+    }
+
     async fn execute(
+        &self,
+        request: JsExecutionRequest,
+        cancellation: Arc<dyn JsCancellationToken>,
+    ) -> Result<JsExecutionReport, JsSubstrateError> {
+        self.execute_request(request, cancellation).await
+    }
+
+    async fn close(&self) -> Result<(), JsSubstrateError> {
+        self.hooks.on_runtime_close(&self.handle).await
+    }
+}
+
+#[derive(Default)]
+struct ExecutionState {
+    module_graph: Vec<String>,
+    seen: BTreeSet<String>,
+    host_calls: Vec<JsHostServiceCallRecord>,
+    trace: Vec<JsTraceEvent>,
+    result: Option<JsonValue>,
+}
+
+impl DeterministicJsRuntime {
+    async fn execute_request(
         &self,
         request: JsExecutionRequest,
         cancellation: Arc<dyn JsCancellationToken>,
@@ -281,21 +420,43 @@ impl JsRuntime for DeterministicJsRuntime {
         })
     }
 
-    async fn close(&self) -> Result<(), JsSubstrateError> {
-        self.hooks.on_runtime_close(&self.handle).await
+    async fn attach(&self, turn: &str) {
+        let mut attachment = self.attachment.lock().await;
+        attachment.attached = true;
+        attachment.attachment_epoch = attachment.attachment_epoch.saturating_add(1);
+        attachment.worker_hint = Some(format!("{:?}", std::thread::current().id()));
+        attachment.current_turn = Some(turn.to_string());
     }
-}
 
-#[derive(Default)]
-struct ExecutionState {
-    module_graph: Vec<String>,
-    seen: BTreeSet<String>,
-    host_calls: Vec<JsHostServiceCallRecord>,
-    trace: Vec<JsTraceEvent>,
-    result: Option<JsonValue>,
-}
+    async fn detach(&self) {
+        let mut attachment = self.attachment.lock().await;
+        attachment.attached = false;
+        attachment.current_turn = None;
+    }
 
-impl DeterministicJsRuntime {
+    async fn update_suspended_from_report(&self, report: &JsExecutionReport) {
+        let mut suspended = self.suspended.lock().await;
+        suspended.pending_microtasks = 0;
+        suspended.terminated = false;
+        suspended.module_graph.clear();
+        for (index, specifier) in report.module_graph.iter().enumerate() {
+            let module_id = crate::JsModuleId::new((index + 1) as u64);
+            suspended.module_graph.insert(
+                module_id,
+                crate::JsModuleGraphNode {
+                    module_id,
+                    specifier: specifier.clone(),
+                    dependencies: Vec::new(),
+                    evaluated: true,
+                },
+            );
+        }
+        suspended.metadata.insert(
+            "last_entrypoint".to_string(),
+            JsonValue::from(report.entrypoint.clone()),
+        );
+    }
+
     async fn walk_module(
         &self,
         module: JsLoadedModule,
@@ -498,6 +659,40 @@ fn module_resolve_event(
                 ),
             ),
         ]),
+    }
+}
+
+pub(crate) fn js_turn_kind_label(kind: &JsRuntimeTurnKind) -> &'static str {
+    match kind {
+        JsRuntimeTurnKind::Bootstrap => "bootstrap",
+        JsRuntimeTurnKind::EvaluateEntrypoint { .. } => "evaluate_entrypoint",
+        JsRuntimeTurnKind::EvaluateModule { .. } => "evaluate_module",
+        JsRuntimeTurnKind::DeliverTimer { .. } => "deliver_timer",
+        JsRuntimeTurnKind::DeliverTask { .. } => "deliver_task",
+        JsRuntimeTurnKind::DeliverHostCompletion { .. } => "deliver_host_completion",
+        JsRuntimeTurnKind::DrainMicrotasks => "drain_microtasks",
+    }
+}
+
+pub(crate) fn js_turn_outcome_label(outcome: &JsRuntimeTurnOutcome) -> &'static str {
+    match outcome {
+        JsRuntimeTurnOutcome::Completed { .. } => "completed",
+        JsRuntimeTurnOutcome::Yielded { .. } => "yielded",
+        JsRuntimeTurnOutcome::PendingHostOp { .. } => "pending_host_op",
+        JsRuntimeTurnOutcome::PendingTimer { .. } => "pending_timer",
+        JsRuntimeTurnOutcome::PendingMicrotasks => "pending_microtasks",
+        JsRuntimeTurnOutcome::Threw { .. } => "threw",
+        JsRuntimeTurnOutcome::Terminated { .. } => "terminated",
+    }
+}
+
+fn js_runtime_error_to_substrate(
+    entrypoint: String,
+    error: JsRuntimeErrorReport,
+) -> JsSubstrateError {
+    JsSubstrateError::EvaluationFailed {
+        entrypoint,
+        message: error.message,
     }
 }
 

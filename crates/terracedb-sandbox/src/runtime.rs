@@ -14,15 +14,17 @@ use std::{
 use async_trait::async_trait;
 use base64::{
     Engine as _,
-    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD},
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+    },
 };
 use boa_ast::scope::Scope;
 use boa_ast::visitor::Visitor;
 use boa_engine::{
-    Context, JsError, JsNativeError, JsResult, JsString, JsSymbol, JsValue, NativeFunction, Script, Source,
+    Context, Finalize, JsData, JsError, JsNativeError, JsResult, JsString, JsSymbol, JsValue,
+    NativeFunction, Script, Source, Trace,
     builtins::promise::{OperationType, Promise, PromiseState},
     context::HostHooks,
-    Finalize, JsData, Trace,
     job::JobCallback,
     job::NativeAsyncJob,
     js_string,
@@ -30,11 +32,10 @@ use boa_engine::{
         Module, ModuleLoader as BoaModuleLoader, ModuleRequest, Referrer,
         SyntheticModuleInitializer,
     },
-    object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
     object::builtins::{
-        JsArray, JsArrayBuffer, JsFunction, JsPromise, JsProxy, JsSharedArrayBuffer,
-        JsUint8Array,
+        JsArray, JsArrayBuffer, JsFunction, JsPromise, JsProxy, JsSharedArrayBuffer, JsUint8Array,
     },
+    object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
     property::{Attribute, PropertyDescriptor, PropertyKey},
 };
 use boa_interner::Interner;
@@ -66,9 +67,11 @@ use terracedb_git::{GitCheckoutRequest, GitDiffRequest, GitRefUpdate, GitStatusO
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, FixedJsClock, JsCompatibilityProfile,
     JsEntropySource, JsExecutionKind, JsExecutionRequest, JsForkPolicy, JsHostServiceAdapter,
-    JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsRuntime, JsRuntimeHost,
-    JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsSubstrateError, NeverCancel,
-    RoutedJsHostServices, VfsJsHostServiceAdapter,
+    JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsRuntime,
+    JsRuntimeAttachmentState, JsRuntimeConfiguration, JsRuntimeEnvironment, JsRuntimeHost,
+    JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsRuntimeSuspendedState,
+    JsRuntimeTurn, JsRuntimeTurnOutcome, JsSubstrateError, NeverCancel, RoutedJsHostServices,
+    VfsJsHostServiceAdapter,
 };
 use terracedb_vfs::{
     CreateOptions, FileKind, JsonValue, MkdirOptions, ReadOnlyVfsFileSystem, Stats, VfsVolumeExt,
@@ -76,7 +79,9 @@ use terracedb_vfs::{
 use tokio::sync::Mutex;
 use tracing::{Level, info_span, trace};
 use url::Url;
-use urlpattern::{UrlPattern as RustUrlPattern, UrlPatternOptions as RustUrlPatternOptions, quirks};
+use urlpattern::{
+    UrlPattern as RustUrlPattern, UrlPatternOptions as RustUrlPatternOptions, quirks,
+};
 
 use crate::{
     CapabilityCallRequest, CapabilityCallResult, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER,
@@ -1011,7 +1016,10 @@ fn node_default_cli_option_values() -> JsonValue {
         ("--check".to_string(), JsonValue::Bool(false)),
         ("--conditions".to_string(), JsonValue::Array(Vec::new())),
         ("--env-file".to_string(), JsonValue::Array(Vec::new())),
-        ("--env-file-if-exists".to_string(), JsonValue::Array(Vec::new())),
+        (
+            "--env-file-if-exists".to_string(),
+            JsonValue::Array(Vec::new()),
+        ),
         ("--eval".to_string(), JsonValue::Array(Vec::new())),
         ("--no-addons".to_string(), JsonValue::Bool(false)),
         ("--no-warnings".to_string(), JsonValue::Bool(false)),
@@ -1019,12 +1027,21 @@ fn node_default_cli_option_values() -> JsonValue {
         ("--print".to_string(), JsonValue::Bool(false)),
         ("--prof-process".to_string(), JsonValue::Bool(false)),
         ("--require".to_string(), JsonValue::Array(Vec::new())),
-        ("--experimental-loader".to_string(), JsonValue::Array(Vec::new())),
+        (
+            "--experimental-loader".to_string(),
+            JsonValue::Array(Vec::new()),
+        ),
         ("--import".to_string(), JsonValue::Array(Vec::new())),
         ("--entry-url".to_string(), JsonValue::Bool(false)),
         ("--enable-source-maps".to_string(), JsonValue::Bool(false)),
-        ("--experimental-require-module".to_string(), JsonValue::Bool(false)),
-        ("--experimental-vm-modules".to_string(), JsonValue::Bool(false)),
+        (
+            "--experimental-require-module".to_string(),
+            JsonValue::Bool(false),
+        ),
+        (
+            "--experimental-vm-modules".to_string(),
+            JsonValue::Bool(false),
+        ),
         ("--strip-types".to_string(), JsonValue::Bool(false)),
         (
             "--experimental-default-type".to_string(),
@@ -1046,32 +1063,56 @@ fn node_default_cli_option_values() -> JsonValue {
             "--no-experimental-websocket".to_string(),
             JsonValue::Bool(false),
         ),
-        ("--experimental-eventsource".to_string(), JsonValue::Bool(false)),
+        (
+            "--experimental-eventsource".to_string(),
+            JsonValue::Bool(false),
+        ),
         (
             "--no-experimental-global-navigator".to_string(),
             JsonValue::Bool(false),
         ),
-        ("--no-experimental-sqlite".to_string(), JsonValue::Bool(false)),
+        (
+            "--no-experimental-sqlite".to_string(),
+            JsonValue::Bool(false),
+        ),
         (
             "--experimental-default-config-file".to_string(),
             JsonValue::Bool(false),
         ),
-        ("--experimental-config-file".to_string(), JsonValue::String(String::new())),
+        (
+            "--experimental-config-file".to_string(),
+            JsonValue::String(String::new()),
+        ),
         (
             "--experimental-network-inspection".to_string(),
             JsonValue::Bool(false),
         ),
         ("--trace-sigint".to_string(), JsonValue::Bool(false)),
-        ("--experimental-test-coverage".to_string(), JsonValue::Bool(false)),
-        ("--experimental-webstorage".to_string(), JsonValue::Bool(false)),
+        (
+            "--experimental-test-coverage".to_string(),
+            JsonValue::Bool(false),
+        ),
+        (
+            "--experimental-webstorage".to_string(),
+            JsonValue::Bool(false),
+        ),
         ("--expose-internals".to_string(), JsonValue::Bool(false)),
         ("--frozen-intrinsics".to_string(), JsonValue::Bool(false)),
         ("--report-on-signal".to_string(), JsonValue::Bool(false)),
-        ("--heapsnapshot-signal".to_string(), JsonValue::String(String::new())),
-        ("--diagnostic-dir".to_string(), JsonValue::String(String::new())),
+        (
+            "--heapsnapshot-signal".to_string(),
+            JsonValue::String(String::new()),
+        ),
+        (
+            "--diagnostic-dir".to_string(),
+            JsonValue::String(String::new()),
+        ),
         ("--experimental-quic".to_string(), JsonValue::Bool(false)),
         ("--preserve-symlinks".to_string(), JsonValue::Bool(false)),
-        ("--preserve-symlinks-main".to_string(), JsonValue::Bool(false)),
+        (
+            "--preserve-symlinks-main".to_string(),
+            JsonValue::Bool(false),
+        ),
         ("--pending-deprecation".to_string(), JsonValue::Bool(false)),
         ("--no-deprecation".to_string(), JsonValue::Bool(false)),
         ("--require-module".to_string(), JsonValue::Bool(false)),
@@ -1246,7 +1287,10 @@ fn node_apply_process_metadata_overrides(
         if let Some(value) = process_config.get("osRelease").and_then(JsonValue::as_str) {
             process.os_release = value.to_string();
         }
-        if let Some(value) = process_config.get("releaseName").and_then(JsonValue::as_str) {
+        if let Some(value) = process_config
+            .get("releaseName")
+            .and_then(JsonValue::as_str)
+        {
             process.release_name = value.to_string();
         }
         if let Some(value) = process_config.get("releaseLts").and_then(JsonValue::as_str) {
@@ -1615,10 +1659,19 @@ pub struct SandboxExecutionResult {
     pub metadata: BTreeMap<String, JsonValue>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SandboxJsRuntimeBoundaryState {
+    pub configuration: JsRuntimeConfiguration,
+    pub attachment: JsRuntimeAttachmentState,
+    pub suspended: JsRuntimeSuspendedState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SandboxRuntimeState {
     pub next_eval_id: u64,
     pub module_cache: BTreeMap<String, SandboxModuleCacheEntry>,
+    #[serde(default)]
+    pub js_boundary: Option<SandboxJsRuntimeBoundaryState>,
 }
 
 #[derive(Clone, Default)]
@@ -1672,6 +1725,10 @@ impl SandboxRuntimeStateHandle {
             state.module_cache.insert(entry.specifier.clone(), entry);
         }
         state.next_eval_id = state.next_eval_id.max(next_eval_id);
+    }
+
+    pub async fn set_js_boundary(&self, boundary: SandboxJsRuntimeBoundaryState) {
+        self.inner.lock().await.js_boundary = Some(boundary);
     }
 }
 
@@ -1844,8 +1901,44 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
             host_services,
         )
         .await?;
-        let report = runtime
-            .execute(js_request, Arc::new(NeverCancel))
+        sync_js_runtime_boundary_state(&state, runtime.as_ref())
+            .await
+            .map_err(|error| js_substrate_error_to_sandbox(error, &entrypoint))?;
+        runtime
+            .run_turn(JsRuntimeTurn::bootstrap(), Arc::new(NeverCancel))
+            .await
+            .map_err(|error| js_substrate_error_to_sandbox(error, &entrypoint))?;
+        sync_js_runtime_boundary_state(&state, runtime.as_ref())
+            .await
+            .map_err(|error| js_substrate_error_to_sandbox(error, &entrypoint))?;
+        let report = match runtime
+            .run_turn(
+                JsRuntimeTurn::evaluate_entrypoint(js_request),
+                Arc::new(NeverCancel),
+            )
+            .await
+            .map_err(|error| js_substrate_error_to_sandbox(error, &entrypoint))?
+        {
+            JsRuntimeTurnOutcome::Completed { completion } => {
+                completion
+                    .execution
+                    .ok_or_else(|| SandboxError::Execution {
+                        entrypoint: entrypoint.clone(),
+                        message: "js runtime turn completed without an execution report"
+                            .to_string(),
+                    })?
+            }
+            outcome => {
+                return Err(SandboxError::Execution {
+                    entrypoint: entrypoint.clone(),
+                    message: format!(
+                        "js runtime turn for {entrypoint} returned unexpected outcome {}",
+                        sandbox_js_turn_outcome_label(&outcome)
+                    ),
+                });
+            }
+        };
+        sync_js_runtime_boundary_state(&state, runtime.as_ref())
             .await
             .map_err(|error| js_substrate_error_to_sandbox(error, &entrypoint))?;
         runtime
@@ -2476,11 +2569,23 @@ fn node_install_base_process_global(
         })?;
 
     for (name, value) in [
-        ("version", JsValue::from(JsString::from(process.version.clone()))),
-        ("platform", JsValue::from(JsString::from(process.platform.clone()))),
+        (
+            "version",
+            JsValue::from(JsString::from(process.version.clone())),
+        ),
+        (
+            "platform",
+            JsValue::from(JsString::from(process.platform.clone())),
+        ),
         ("arch", JsValue::from(JsString::from(process.arch.clone()))),
-        ("title", JsValue::from(JsString::from(process.title.clone()))),
-        ("execPath", JsValue::from(JsString::from(process.exec_path.clone()))),
+        (
+            "title",
+            JsValue::from(JsString::from(process.title.clone())),
+        ),
+        (
+            "execPath",
+            JsValue::from(JsString::from(process.exec_path.clone())),
+        ),
         ("pid", JsValue::from(process.pid)),
         ("ppid", JsValue::from(process.ppid)),
         ("debugPort", JsValue::from(process.debug_port)),
@@ -2558,7 +2663,12 @@ fn node_install_base_process_global(
     .constructor(false)
     .build();
     process_object
-        .set(js_string!("_rawDebug"), JsValue::from(raw_debug), true, context)
+        .set(
+            js_string!("_rawDebug"),
+            JsValue::from(raw_debug),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
 
     drop(process);
@@ -2635,12 +2745,13 @@ fn node_prepare_process_for_bootstrap(
     process: &JsValue,
     internal_binding: &JsValue,
 ) -> Result<(), SandboxError> {
-    let internal_binding = internal_binding
-        .as_callable()
-        .ok_or_else(|| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: "internalBinding is not callable".to_string(),
-        })?;
+    let internal_binding =
+        internal_binding
+            .as_callable()
+            .ok_or_else(|| SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: "internalBinding is not callable".to_string(),
+            })?;
     let util_binding = internal_binding
         .call(
             &JsValue::undefined(),
@@ -2648,10 +2759,12 @@ fn node_prepare_process_for_bootstrap(
             context,
         )
         .map_err(sandbox_execution_error)?;
-    let util_binding = util_binding.as_object().ok_or_else(|| SandboxError::Execution {
-        entrypoint: "<node-runtime>".to_string(),
-        message: "internalBinding('util') did not return an object".to_string(),
-    })?;
+    let util_binding = util_binding
+        .as_object()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: "internalBinding('util') did not return an object".to_string(),
+        })?;
     let private_symbols = util_binding
         .get(js_string!("privateSymbols"), context)
         .map_err(sandbox_execution_error)?;
@@ -2796,10 +2909,12 @@ fn node_call_builtin_with_node_runtime(
         &["process", "require", "internalBinding", "primordials"],
         None,
     )?;
-    let callable = function.as_callable().ok_or_else(|| SandboxError::Execution {
-        entrypoint: entrypoint.to_string(),
-        message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
-    })?;
+    let callable = function
+        .as_callable()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: entrypoint.to_string(),
+            message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
+        })?;
     callable
         .call(&JsValue::undefined(), args, context)
         .map_err(sandbox_execution_error)
@@ -3356,7 +3471,12 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
         };
         let path = path.to_string_lossy().into_owned();
         if let Ok(url) = node_file_url_from_path(&path) {
-            let _ = import_meta.set(js_string!("url"), JsValue::from(JsString::from(url)), true, context);
+            let _ = import_meta.set(
+                js_string!("url"),
+                JsValue::from(JsString::from(url)),
+                true,
+                context,
+            );
         }
         if let Some(callback) = self
             .host
@@ -3586,8 +3706,13 @@ fn resolve_import_meta_target(
         return node_file_url_from_path(&resolved);
     }
 
-    let resolved =
-        resolve_node_module_path(host, specifier, Some(&referrer_path), NodeResolveMode::Import, None)?;
+    let resolved = resolve_node_module_path(
+        host,
+        specifier,
+        Some(&referrer_path),
+        NodeResolveMode::Import,
+        None,
+    )?;
     if node_builtin_name(&resolved).is_some() {
         return Ok(resolved);
     }
@@ -3603,17 +3728,16 @@ fn node_import_meta_resolve_for_module(
     let request = node_arg_string(args, 0, context)?;
 
     let result = node_with_host(|host| {
-        resolve_import_meta_target(
-            host,
-            &module_path.to_std_string_escaped(),
-            &request,
-        )
+        resolve_import_meta_target(host, &module_path.to_std_string_escaped(), &request)
     })
     .map_err(|error| match error {
         SandboxError::ModuleNotFound { .. } => node_error_with_code(
             context,
             JsNativeError::error(),
-            format!("Cannot find package '{request}' imported from {}", module_path.to_std_string_escaped()),
+            format!(
+                "Cannot find package '{request}' imported from {}",
+                module_path.to_std_string_escaped()
+            ),
             "ERR_MODULE_NOT_FOUND",
         ),
         other => node_error_with_code(
@@ -3677,17 +3801,20 @@ fn node_runtime_progress_snapshot(
     )
 }
 
-fn node_run_microtask_checkpoint(context: &mut Context, host: &NodeRuntimeHost) -> Result<usize, SandboxError> {
-    context
-        .run_jobs()
-        .map_err(sandbox_execution_error)?;
+fn node_run_microtask_checkpoint(
+    context: &mut Context,
+    host: &NodeRuntimeHost,
+) -> Result<usize, SandboxError> {
+    context.run_jobs().map_err(sandbox_execution_error)?;
     let queue = std::mem::take(&mut host.bootstrap.borrow_mut().microtask_queue);
     let count = queue.len();
     for callback in queue {
-        let callable = JsValue::from(callback.clone()).as_callable().ok_or_else(|| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: "queued microtask is not callable".to_string(),
-        })?;
+        let callable = JsValue::from(callback.clone())
+            .as_callable()
+            .ok_or_else(|| SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: "queued microtask is not callable".to_string(),
+            })?;
         callable
             .call(&JsValue::undefined(), &[], context)
             .map_err(sandbox_execution_error)?;
@@ -3753,7 +3880,9 @@ fn drain_node_next_ticks(
                 message: other.to_string(),
             },
         })?;
-    Ok(drained + usize::from(scheduled_after > 0 || rejection_before > 0 || rejection_after > 0) + drained_microtasks)
+    Ok(drained
+        + usize::from(scheduled_after > 0 || rejection_before > 0 || rejection_after > 0)
+        + drained_microtasks)
 }
 
 fn drain_node_timers(
@@ -3766,19 +3895,17 @@ fn drain_node_timers(
     let now_ms = node_monotonic_now_ms(host);
     let immediate_count = node_bootstrap_array_entry(context, host, "immediateInfo", 0)?;
     let timeout_count = node_bootstrap_array_entry(context, host, "timeoutInfo", 0)?;
-    let timer_is_due = bootstrap
-        .next_timer_due_ms
-        .is_some_and(|due| due <= now_ms);
-    let should_run_immediates = immediate_count > 0
-        && (bootstrap.immediate_is_refed
-            || timeout_count > 0
-            || timer_is_due);
+    let timer_is_due = bootstrap.next_timer_due_ms.is_some_and(|due| due <= now_ms);
+    let should_run_immediates =
+        immediate_count > 0 && (bootstrap.immediate_is_refed || timeout_count > 0 || timer_is_due);
     if should_run_immediates {
         if let Some(callback) = bootstrap.process_immediate_callback {
-            let callable = JsValue::from(callback.clone()).as_callable().ok_or_else(|| SandboxError::Execution {
-                entrypoint: entrypoint.to_string(),
-                message: "processImmediate callback is not callable".to_string(),
-            })?;
+            let callable = JsValue::from(callback.clone())
+                .as_callable()
+                .ok_or_else(|| SandboxError::Execution {
+                    entrypoint: entrypoint.to_string(),
+                    message: "processImmediate callback is not callable".to_string(),
+                })?;
             callable
                 .call(&JsValue::undefined(), &[], context)
                 .map_err(|error| node_execution_error(entrypoint, host, error))?;
@@ -3788,10 +3915,12 @@ fn drain_node_timers(
     }
     if timeout_count > 0 && timer_is_due {
         if let Some(callback) = bootstrap.process_timers_callback {
-            let callable = JsValue::from(callback.clone()).as_callable().ok_or_else(|| SandboxError::Execution {
-                entrypoint: entrypoint.to_string(),
-                message: "processTimers callback is not callable".to_string(),
-            })?;
+            let callable = JsValue::from(callback.clone())
+                .as_callable()
+                .ok_or_else(|| SandboxError::Execution {
+                    entrypoint: entrypoint.to_string(),
+                    message: "processTimers callback is not callable".to_string(),
+                })?;
             let now = JsValue::from(now_ms);
             let next_expiry = callable
                 .call(&JsValue::undefined(), &[now], context)
@@ -3875,7 +4004,8 @@ fn node_get_cwd(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> J
         Ok(JsValue::from(JsString::from(
             host.process.borrow().cwd.clone(),
         )))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_chdir(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -3884,7 +4014,8 @@ fn node_chdir(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         node_debug_event(host, "process", format!("chdir path={path}"))?;
         host.process.borrow_mut().cwd = resolve_node_path(&host.process.borrow().cwd, &path);
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_set_exit_code(
@@ -3906,7 +4037,8 @@ fn node_set_exit_code(
     node_with_host(|host| {
         host.process.borrow_mut().exit_code = code;
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_write_stdout(
@@ -3918,7 +4050,8 @@ fn node_write_stdout(
     node_with_host(|host| {
         host.process.borrow_mut().stdout.push_str(&chunk);
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_write_stderr(
@@ -3932,7 +4065,6 @@ fn node_write_stderr(
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
-
 }
 
 fn node_read_builtin_source(
@@ -3942,9 +4074,17 @@ fn node_read_builtin_source(
 ) -> JsResult<JsValue> {
     let name = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
-        node_debug_event(host, "builtin", format!("read_source start specifier={name}"))?;
+        node_debug_event(
+            host,
+            "builtin",
+            format!("read_source start specifier={name}"),
+        )?;
         let Some(path) = node_upstream_builtin_vfs_path(&name) else {
-            node_debug_event(host, "builtin", format!("read_source empty specifier={name}"))?;
+            node_debug_event(
+                host,
+                "builtin",
+                format!("read_source empty specifier={name}"),
+            )?;
             return Ok(JsValue::from(JsString::from(String::new())));
         };
         let bytes = node_read_file(host, &path)?.ok_or_else(|| SandboxError::Execution {
@@ -3989,13 +4129,20 @@ fn node_initialize_bootstrap_realm(
             context,
             host,
             specifier,
-            &["exports", "primordials", "privateSymbols", "perIsolateSymbols"],
+            &[
+                "exports",
+                "primordials",
+                "privateSymbols",
+                "perIsolateSymbols",
+            ],
             None,
         )?;
-        let callable = function.as_callable().ok_or_else(|| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
-        })?;
+        let callable = function
+            .as_callable()
+            .ok_or_else(|| SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
+            })?;
         callable
             .call(
                 &JsValue::undefined(),
@@ -4034,8 +4181,15 @@ fn node_initialize_bootstrap_realm(
         context,
         host,
         "internal/bootstrap/realm",
-        &["process", "getLinkedBinding", "getInternalBinding", "primordials"],
-        Some("; return { internalBinding, BuiltinModule, require: requireBuiltin, requireBuiltin };"),
+        &[
+            "process",
+            "getLinkedBinding",
+            "getInternalBinding",
+            "primordials",
+        ],
+        Some(
+            "; return { internalBinding, BuiltinModule, require: requireBuiltin, requireBuiltin };",
+        ),
     )?;
     let callable = realm_factory
         .as_callable()
@@ -4080,8 +4234,7 @@ fn node_advance_monotonic_now_ms(host: &NodeRuntimeHost, delta_ms: f64) -> f64 {
     let mut state = host.bootstrap.borrow_mut();
     let delta_ms = delta_ms.max(0.0);
     state.monotonic_now_ms = (state.monotonic_now_ms + delta_ms).max(0.0);
-    state.performance_loop_idle_time_ms =
-        (state.performance_loop_idle_time_ms + delta_ms).max(0.0);
+    state.performance_loop_idle_time_ms = (state.performance_loop_idle_time_ms + delta_ms).max(0.0);
     if delta_ms > 0.0 {
         state.performance_uv_loop_count = state.performance_uv_loop_count.saturating_add(1);
     }
@@ -4144,19 +4297,23 @@ fn node_symbol(description: &str) -> Result<JsValue, SandboxError> {
     Ok(JsValue::from(symbol))
 }
 
-fn node_host_private_symbol(
-    host: &NodeRuntimeHost,
-    name: &str,
-) -> Result<JsSymbol, SandboxError> {
-    if let Some(symbol) = host.bootstrap.borrow().host_private_symbols.get(name).cloned() {
+fn node_host_private_symbol(host: &NodeRuntimeHost, name: &str) -> Result<JsSymbol, SandboxError> {
+    if let Some(symbol) = host
+        .bootstrap
+        .borrow()
+        .host_private_symbols
+        .get(name)
+        .cloned()
+    {
         return Ok(symbol);
     }
-    let symbol = JsSymbol::new(Some(JsString::from(format!("node.internal.{name}")))).ok_or_else(
-        || SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: format!("failed to create host private symbol `{name}`"),
-        },
-    )?;
+    let symbol =
+        JsSymbol::new(Some(JsString::from(format!("node.internal.{name}")))).ok_or_else(|| {
+            SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: format!("failed to create host private symbol `{name}`"),
+            }
+        })?;
     host.bootstrap
         .borrow_mut()
         .host_private_symbols
@@ -4262,10 +4419,13 @@ fn node_read_builtin_source_text(
     host: &NodeRuntimeHost,
     specifier: &str,
 ) -> Result<String, SandboxError> {
-    let path = node_upstream_builtin_vfs_path(specifier).ok_or_else(|| SandboxError::Execution {
-        entrypoint: "<node-runtime>".to_string(),
-        message: format!("upstream Node builtin source `{specifier}` is missing from sandbox VFS"),
-    })?;
+    let path =
+        node_upstream_builtin_vfs_path(specifier).ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!(
+                "upstream Node builtin source `{specifier}` is missing from sandbox VFS"
+            ),
+        })?;
     let bytes = node_read_file(host, &path)?.ok_or_else(|| SandboxError::Execution {
         entrypoint: "<node-runtime>".to_string(),
         message: format!("upstream Node builtin source `{specifier}` is missing from sandbox VFS"),
@@ -4300,10 +4460,9 @@ fn node_compile_builtin_wrapper(
     ));
     context
         .eval(
-            Source::from_bytes(wrapped.as_bytes())
-                .with_path(&PathBuf::from(
-                    node_upstream_builtin_vfs_path(specifier).unwrap(),
-                )),
+            Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(
+                node_upstream_builtin_vfs_path(specifier).unwrap(),
+            )),
         )
         .map_err(sandbox_execution_error)
 }
@@ -4324,7 +4483,9 @@ fn node_get_internal_binding(
     let name = node_arg_string(args, 0, context)?;
     node_with_host_js(context, |host, context| {
         node_debug_event(host, "bootstrap", format!("getInternalBinding {name}"))?;
-        Ok(JsValue::from(node_internal_binding_object(host, context, &name)?))
+        Ok(JsValue::from(node_internal_binding_object(
+            host, context, &name,
+        )?))
     })
 }
 
@@ -4474,7 +4635,10 @@ fn node_internal_binding_stream_wrap(
             "kArrayBufferOffset",
             JsValue::from(NODE_STREAM_WRAP_K_ARRAY_BUFFER_OFFSET),
         ),
-        ("kBytesWritten", JsValue::from(NODE_STREAM_WRAP_K_BYTES_WRITTEN)),
+        (
+            "kBytesWritten",
+            JsValue::from(NODE_STREAM_WRAP_K_BYTES_WRITTEN),
+        ),
         (
             "kLastWriteWasAsync",
             JsValue::from(NODE_STREAM_WRAP_K_LAST_WRITE_WAS_ASYNC),
@@ -4613,10 +4777,20 @@ fn node_stream_handle_write_bytes(
         (state.fd, state.bytes_written)
     })?;
     object
-        .set(js_string!("bytesWritten"), JsValue::from(total_bytes as f64), true, context)
+        .set(
+            js_string!("bytesWritten"),
+            JsValue::from(total_bytes as f64),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
-        .set(js_string!("writeQueueSize"), JsValue::from(0), true, context)
+        .set(
+            js_string!("writeQueueSize"),
+            JsValue::from(0),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     node_stream_handle_set_base_state(host, context, 0, 0, bytes.len() as i32, false)?;
     match fd {
@@ -4883,7 +5057,9 @@ fn node_stream_handle_write_buffer(
     };
     let data = node_bytes_from_js(args.get(1).unwrap_or(&JsValue::undefined()), context)?;
     node_with_host_js(context, |host, context| {
-        Ok(JsValue::from(node_stream_handle_write_bytes(host, &this, &data, context)?))
+        Ok(JsValue::from(node_stream_handle_write_bytes(
+            host, &this, &data, context,
+        )?))
     })
 }
 
@@ -4904,7 +5080,9 @@ fn node_stream_handle_write_string_with_encoding(
         .to_std_string_escaped();
     let bytes = node_buffer_encode_string(&input, encoding).unwrap_or_default();
     node_with_host_js(context, |host, context| {
-        Ok(JsValue::from(node_stream_handle_write_bytes(host, &this, &bytes, context)?))
+        Ok(JsValue::from(node_stream_handle_write_bytes(
+            host, &this, &bytes, context,
+        )?))
     })
 }
 
@@ -4952,7 +5130,9 @@ fn node_stream_handle_writev(
     let all_buffers = args.get(2).is_some_and(JsValue::to_boolean);
     let mut bytes = Vec::new();
     if let Some(chunks) = chunks {
-        let length = chunks.get(js_string!("length"), context)?.to_length(context)?;
+        let length = chunks
+            .get(js_string!("length"), context)?
+            .to_length(context)?;
         if all_buffers {
             for index in 0..length {
                 bytes.extend(node_bytes_from_js(&chunks.get(index, context)?, context)?);
@@ -4966,13 +5146,17 @@ fn node_stream_handle_writev(
                     .to_string(context)?
                     .to_std_string_escaped();
                 let chunk_string = chunk.to_string(context)?.to_std_string_escaped();
-                bytes.extend(node_buffer_encode_string(&chunk_string, &encoding).unwrap_or_default());
+                bytes.extend(
+                    node_buffer_encode_string(&chunk_string, &encoding).unwrap_or_default(),
+                );
                 index += 2;
             }
         }
     }
     node_with_host_js(context, |host, context| {
-        Ok(JsValue::from(node_stream_handle_write_bytes(host, &this, &bytes, context)?))
+        Ok(JsValue::from(node_stream_handle_write_bytes(
+            host, &this, &bytes, context,
+        )?))
     })
 }
 
@@ -4992,8 +5176,13 @@ fn node_stream_handle_shutdown(
         this.set(js_string!("reading"), JsValue::from(false), true, context)
             .map_err(sandbox_execution_error)?;
         if let Some(req) = req {
-            req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
-                .map_err(sandbox_execution_error)?;
+            req.set(
+                js_string!("handle"),
+                JsValue::from(this.clone()),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
             if let Some(oncomplete) = req
                 .get(js_string!("oncomplete"), context)
                 .map_err(sandbox_execution_error)?
@@ -5022,24 +5211,45 @@ fn node_stream_handle_getsockname(
             Ok(kind) => kind,
             Err(code) => return Ok(JsValue::from(code)),
         };
-        if !matches!(kind, NodeStreamHandleKind::TcpSocket | NodeStreamHandleKind::TcpServer) {
+        if !matches!(
+            kind,
+            NodeStreamHandleKind::TcpSocket | NodeStreamHandleKind::TcpServer
+        ) {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
         let (address, family, port) = node_stream_handle_state(host, &this, context, |state| {
             (
                 state.bound_address.clone().unwrap_or_else(|| {
-                    if state.fd.is_some() { "127.0.0.1".to_string() } else { String::new() }
+                    if state.fd.is_some() {
+                        "127.0.0.1".to_string()
+                    } else {
+                        String::new()
+                    }
                 }),
                 state.bound_family.clone().unwrap_or_else(|| {
-                    if state.fd.is_some() { "IPv4".to_string() } else { String::new() }
+                    if state.fd.is_some() {
+                        "IPv4".to_string()
+                    } else {
+                        String::new()
+                    }
                 }),
                 state.bound_port.unwrap_or(0),
             )
         })?;
-        out.set(js_string!("address"), JsValue::from(JsString::from(address)), true, context)
-            .map_err(sandbox_execution_error)?;
-        out.set(js_string!("family"), JsValue::from(JsString::from(family)), true, context)
-            .map_err(sandbox_execution_error)?;
+        out.set(
+            js_string!("address"),
+            JsValue::from(JsString::from(address)),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+        out.set(
+            js_string!("family"),
+            JsValue::from(JsString::from(family)),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
         out.set(js_string!("port"), JsValue::from(port), true, context)
             .map_err(sandbox_execution_error)?;
         Ok(JsValue::from(0))
@@ -5072,10 +5282,20 @@ fn node_stream_handle_getpeername(
                 state.peer_port.unwrap_or(0),
             )
         })?;
-        out.set(js_string!("address"), JsValue::from(JsString::from(address)), true, context)
-            .map_err(sandbox_execution_error)?;
-        out.set(js_string!("family"), JsValue::from(JsString::from(family)), true, context)
-            .map_err(sandbox_execution_error)?;
+        out.set(
+            js_string!("address"),
+            JsValue::from(JsString::from(address)),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+        out.set(
+            js_string!("family"),
+            JsValue::from(JsString::from(family)),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
         out.set(js_string!("port"), JsValue::from(port), true, context)
             .map_err(sandbox_execution_error)?;
         Ok(JsValue::from(0))
@@ -5115,7 +5335,11 @@ fn node_stream_handle_set_keep_alive(
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
     let enable = args.first().is_some_and(JsValue::to_boolean);
-    let delay = args.get(1).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)?;
+    let delay = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_u32(context)?;
     node_with_host_js(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
@@ -5160,8 +5384,17 @@ fn node_stream_handle_bind(
     let Some(this) = this.as_object() else {
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
-    let address = args.first().cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
-    let port = args.get(1).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)? as u16;
+    let address = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let port = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_u32(context)? as u16;
     node_with_host_js(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
@@ -5213,15 +5446,26 @@ fn node_stream_handle_bind6(
     let Some(this) = this.as_object() else {
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
-    let address = args.first().cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
-    let port = args.get(1).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)? as u16;
+    let address = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let port = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_u32(context)? as u16;
     node_with_host_js(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
             Err(code) => return Ok(JsValue::from(code)),
         };
-        if !matches!(kind, NodeStreamHandleKind::TcpSocket | NodeStreamHandleKind::TcpServer) ||
-            address.parse::<std::net::Ipv6Addr>().is_err()
+        if !matches!(
+            kind,
+            NodeStreamHandleKind::TcpSocket | NodeStreamHandleKind::TcpServer
+        ) || address.parse::<std::net::Ipv6Addr>().is_err()
         {
             return Ok(JsValue::from(NODE_UV_EINVAL));
         }
@@ -5258,12 +5502,17 @@ fn node_stream_handle_listen(
             Ok(kind) => kind,
             Err(code) => return Ok(JsValue::from(code)),
         };
-        let is_server = matches!(kind, NodeStreamHandleKind::TcpServer | NodeStreamHandleKind::PipeServer);
+        let is_server = matches!(
+            kind,
+            NodeStreamHandleKind::TcpServer | NodeStreamHandleKind::PipeServer
+        );
         if !is_server || backlog < 0 {
             return Ok(JsValue::from(NODE_UV_EINVAL));
         }
         let ready = node_stream_handle_state(host, &this, context, |state| {
-            !state.closed && !state.listening && (state.fd.is_some() || state.bound_address.is_some())
+            !state.closed
+                && !state.listening
+                && (state.fd.is_some() || state.bound_address.is_some())
         })?;
         if !ready {
             return Ok(JsValue::from(NODE_UV_EINVAL));
@@ -5284,7 +5533,12 @@ fn node_stream_handle_connect(
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
     let req = args.first().and_then(JsValue::as_object);
-    let address = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
+    let address = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
     let port_value = args.get(2).cloned().unwrap_or_else(|| JsValue::from(0));
     node_with_host_js(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
@@ -5302,8 +5556,9 @@ fn node_stream_handle_connect(
             if address.parse::<std::net::Ipv4Addr>().is_err() {
                 return Ok(JsValue::from(NODE_UV_EINVAL));
             }
-            let already_connected =
-                node_stream_handle_state(host, &this, context, |state| state.peer_address.is_some())?;
+            let already_connected = node_stream_handle_state(host, &this, context, |state| {
+                state.peer_address.is_some()
+            })?;
             if already_connected {
                 return Ok(JsValue::from(NODE_UV_EISCONN));
             }
@@ -5317,9 +5572,18 @@ fn node_stream_handle_connect(
                     state.bound_port = Some(0);
                 }
             })?;
-            req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
-                .map_err(sandbox_execution_error)?;
-            if let Some(oncomplete) = req.get(js_string!("oncomplete"), context).map_err(sandbox_execution_error)?.as_callable() {
+            req.set(
+                js_string!("handle"),
+                JsValue::from(this.clone()),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+            if let Some(oncomplete) = req
+                .get(js_string!("oncomplete"), context)
+                .map_err(sandbox_execution_error)?
+                .as_callable()
+            {
                 let _ = oncomplete.call(
                     &JsValue::from(req.clone()),
                     &[
@@ -5333,15 +5597,19 @@ fn node_stream_handle_connect(
                 );
             }
             return Ok(JsValue::from(0));
-        } else if matches!(kind, NodeStreamHandleKind::PipeSocket | NodeStreamHandleKind::PipeIpc) {
+        } else if matches!(
+            kind,
+            NodeStreamHandleKind::PipeSocket | NodeStreamHandleKind::PipeIpc
+        ) {
             let Some(req) = req else {
                 return Ok(JsValue::from(NODE_UV_EINVAL));
             };
             if address.is_empty() {
                 return Ok(JsValue::from(NODE_UV_EINVAL));
             }
-            let already_connected =
-                node_stream_handle_state(host, &this, context, |state| state.peer_address.is_some())?;
+            let already_connected = node_stream_handle_state(host, &this, context, |state| {
+                state.peer_address.is_some()
+            })?;
             if already_connected {
                 return Ok(JsValue::from(NODE_UV_EISCONN));
             }
@@ -5350,9 +5618,18 @@ fn node_stream_handle_connect(
                 state.peer_family = None;
                 state.peer_port = None;
             })?;
-            req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
-                .map_err(sandbox_execution_error)?;
-            if let Some(oncomplete) = req.get(js_string!("oncomplete"), context).map_err(sandbox_execution_error)?.as_callable() {
+            req.set(
+                js_string!("handle"),
+                JsValue::from(this.clone()),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+            if let Some(oncomplete) = req
+                .get(js_string!("oncomplete"), context)
+                .map_err(sandbox_execution_error)?
+                .as_callable()
+            {
                 let _ = oncomplete.call(
                     &JsValue::from(req.clone()),
                     &[
@@ -5380,15 +5657,24 @@ fn node_stream_handle_connect6(
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
     let req = args.first().and_then(JsValue::as_object);
-    let address = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
-    let port = args.get(2).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)? as u16;
+    let address = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let port = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_u32(context)? as u16;
     node_with_host_js(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
             Err(code) => return Ok(JsValue::from(code)),
         };
-        if !matches!(kind, NodeStreamHandleKind::TcpSocket) ||
-            address.parse::<std::net::Ipv6Addr>().is_err()
+        if !matches!(kind, NodeStreamHandleKind::TcpSocket)
+            || address.parse::<std::net::Ipv6Addr>().is_err()
         {
             return Ok(JsValue::from(NODE_UV_EINVAL));
         }
@@ -5410,9 +5696,18 @@ fn node_stream_handle_connect6(
                 state.bound_port = Some(0);
             }
         })?;
-        req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
-            .map_err(sandbox_execution_error)?;
-        if let Some(oncomplete) = req.get(js_string!("oncomplete"), context).map_err(sandbox_execution_error)?.as_callable() {
+        req.set(
+            js_string!("handle"),
+            JsValue::from(this.clone()),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+        if let Some(oncomplete) = req
+            .get(js_string!("oncomplete"), context)
+            .map_err(sandbox_execution_error)?
+            .as_callable()
+        {
             let _ = oncomplete.call(
                 &JsValue::from(req.clone()),
                 &[
@@ -5475,13 +5770,15 @@ fn node_stream_handle_get_window_size(
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
     let is_tty = node_with_host(|host| {
-        let kind = node_stream_handle_kind_or_code(host, &this, context)
-            .map_err(|_| SandboxError::Execution {
+        let kind = node_stream_handle_kind_or_code(host, &this, context).map_err(|_| {
+            SandboxError::Execution {
                 entrypoint: "<node-runtime>".to_string(),
                 message: "invalid tty handle".to_string(),
-            })?;
-        let has_fd =
-            node_stream_handle_state(host, &this, context, |state| state.fd.is_some() && !state.closed)?;
+            }
+        })?;
+        let has_fd = node_stream_handle_state(host, &this, context, |state| {
+            state.fd.is_some() && !state.closed
+        })?;
         Ok(kind.is_tty() && has_fd)
     })
     .map_err(js_error)?;
@@ -5531,8 +5828,9 @@ fn node_stream_handle_set_raw_mode(
         if !kind.is_tty() {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
-        let has_fd =
-            node_stream_handle_state(host, &this, context, |state| state.fd.is_some() && !state.closed)?;
+        let has_fd = node_stream_handle_state(host, &this, context, |state| {
+            state.fd.is_some() && !state.closed
+        })?;
         if !has_fd {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
@@ -5551,7 +5849,11 @@ fn node_stream_handle_fchmod(
     let Some(this) = this.as_object() else {
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
-    let mode = args.first().cloned().unwrap_or_else(|| JsValue::from(0)).to_i32(context)?;
+    let mode = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_i32(context)?;
     node_with_host_js(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
@@ -5560,8 +5862,7 @@ fn node_stream_handle_fchmod(
         if !kind.is_pipe() {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
-        let is_alive =
-            node_stream_handle_state(host, &this, context, |state| !state.closed)?;
+        let is_alive = node_stream_handle_state(host, &this, context, |state| !state.closed)?;
         if !is_alive {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
@@ -5621,14 +5922,11 @@ fn node_stream_handle_define_method(
         .set(
             JsString::from(method_name),
             JsValue::from(
-                FunctionObjectBuilder::new(
-                    context.realm(),
-                    NativeFunction::from_fn_ptr(function),
-                )
-                .name(JsString::from(method_name))
-                .length(length)
-                .constructor(false)
-                .build(),
+                FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                    .name(JsString::from(method_name))
+                    .length(length)
+                    .constructor(false)
+                    .build(),
             ),
             true,
             context,
@@ -5642,15 +5940,35 @@ fn node_stream_handle_install_base_methods(
     context: &mut Context,
 ) -> Result<(), SandboxError> {
     for (method_name, length, function) in [
-        ("close", 1usize, node_stream_handle_close as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "close",
+            1usize,
+            node_stream_handle_close as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("readStart", 0usize, node_stream_handle_read_start),
         ("readStop", 0usize, node_stream_handle_read_stop),
         ("useUserBuffer", 1usize, node_stream_handle_use_user_buffer),
         ("writeBuffer", 2usize, node_stream_handle_write_buffer),
-        ("writeLatin1String", 2usize, node_stream_handle_write_latin1_string),
-        ("writeUtf8String", 2usize, node_stream_handle_write_utf8_string),
-        ("writeAsciiString", 2usize, node_stream_handle_write_ascii_string),
-        ("writeUcs2String", 2usize, node_stream_handle_write_ucs2_string),
+        (
+            "writeLatin1String",
+            2usize,
+            node_stream_handle_write_latin1_string,
+        ),
+        (
+            "writeUtf8String",
+            2usize,
+            node_stream_handle_write_utf8_string,
+        ),
+        (
+            "writeAsciiString",
+            2usize,
+            node_stream_handle_write_ascii_string,
+        ),
+        (
+            "writeUcs2String",
+            2usize,
+            node_stream_handle_write_ucs2_string,
+        ),
         ("writev", 3usize, node_stream_handle_writev),
         ("shutdown", 1usize, node_stream_handle_shutdown),
         ("getAsyncId", 0usize, node_stream_handle_get_async_id),
@@ -5704,7 +6022,11 @@ fn node_stream_handle_install_tcp_methods(
     context: &mut Context,
 ) -> Result<(), SandboxError> {
     for (method_name, length, function) in [
-        ("open", 1usize, node_stream_handle_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "open",
+            1usize,
+            node_stream_handle_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("bind", 3usize, node_stream_handle_bind),
         ("bind6", 3usize, node_stream_handle_bind6),
         ("listen", 1usize, node_stream_handle_listen),
@@ -5726,7 +6048,11 @@ fn node_stream_handle_install_pipe_methods(
     context: &mut Context,
 ) -> Result<(), SandboxError> {
     for (method_name, length, function) in [
-        ("open", 1usize, node_stream_handle_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "open",
+            1usize,
+            node_stream_handle_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("bind", 3usize, node_stream_handle_bind),
         ("listen", 1usize, node_stream_handle_listen),
         ("connect", 3usize, node_stream_handle_connect),
@@ -5742,7 +6068,12 @@ fn node_stream_handle_install_tty_methods(
     context: &mut Context,
 ) -> Result<(), SandboxError> {
     for (method_name, length, function) in [
-        ("getWindowSize", 1usize, node_stream_handle_get_window_size as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "getWindowSize",
+            1usize,
+            node_stream_handle_get_window_size
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("setRawMode", 1usize, node_stream_handle_set_raw_mode),
     ] {
         node_stream_handle_define_method(target, method_name, length, function, context)?;
@@ -5756,20 +6087,28 @@ fn node_stream_handle_constructor(
     install: fn(&JsObject, &mut Context) -> Result<(), SandboxError>,
     context: &mut Context,
 ) -> Result<JsFunction, SandboxError> {
-    let constructor = FunctionObjectBuilder::new(
-        context.realm(),
-        NativeFunction::from_fn_ptr(constructor_fn),
-    )
-    .name(JsString::from(name))
-    .length(1)
-    .constructor(true)
-    .build();
+    let constructor =
+        FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(constructor_fn))
+            .name(JsString::from(name))
+            .length(1)
+            .constructor(true)
+            .build();
     let prototype = JsObject::with_null_proto();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype.clone()),
+            false,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     prototype
-        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .set(
+            js_string!("constructor"),
+            JsValue::from(constructor.clone()),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     node_stream_handle_install_base_methods(&prototype, context)?;
     install(&prototype, context)?;
@@ -5810,10 +6149,20 @@ fn node_stream_connect_wrap_constructor(
     .build();
     let prototype = JsObject::with_null_proto();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype.clone()),
+            false,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     prototype
-        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .set(
+            js_string!("constructor"),
+            JsValue::from(constructor.clone()),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     Ok(constructor)
 }
@@ -5830,8 +6179,16 @@ fn node_internal_binding_tcp_wrap(context: &mut Context) -> Result<JsObject, San
     let constants = ObjectInitializer::new(context)
         .property(js_string!("SOCKET"), JsValue::from(0), Attribute::all())
         .property(js_string!("SERVER"), JsValue::from(1), Attribute::all())
-        .property(js_string!("UV_TCP_IPV6ONLY"), JsValue::from(1), Attribute::all())
-        .property(js_string!("UV_TCP_REUSEPORT"), JsValue::from(2), Attribute::all())
+        .property(
+            js_string!("UV_TCP_IPV6ONLY"),
+            JsValue::from(1),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("UV_TCP_REUSEPORT"),
+            JsValue::from(2),
+            Attribute::all(),
+        )
         .build();
     for (name, value) in [
         ("TCP", JsValue::from(tcp)),
@@ -5858,8 +6215,16 @@ fn node_internal_binding_pipe_wrap(context: &mut Context) -> Result<JsObject, Sa
         .property(js_string!("SOCKET"), JsValue::from(0), Attribute::all())
         .property(js_string!("SERVER"), JsValue::from(1), Attribute::all())
         .property(js_string!("IPC"), JsValue::from(2), Attribute::all())
-        .property(js_string!("UV_READABLE"), JsValue::from(1), Attribute::all())
-        .property(js_string!("UV_WRITABLE"), JsValue::from(2), Attribute::all())
+        .property(
+            js_string!("UV_READABLE"),
+            JsValue::from(1),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("UV_WRITABLE"),
+            JsValue::from(2),
+            Attribute::all(),
+        )
         .build();
     for (name, value) in [
         ("Pipe", JsValue::from(pipe)),
@@ -5902,7 +6267,10 @@ fn node_internal_binding_tty_wrap(context: &mut Context) -> Result<JsObject, San
     .length(1)
     .constructor(false)
     .build();
-    for (name, value) in [("TTY", JsValue::from(tty)), ("isTTY", JsValue::from(is_tty))] {
+    for (name, value) in [
+        ("TTY", JsValue::from(tty)),
+        ("isTTY", JsValue::from(is_tty)),
+    ] {
         object
             .set(JsString::from(name), value, true, context)
             .map_err(sandbox_execution_error)?;
@@ -5991,13 +6359,27 @@ fn node_udp_handle_constructor(context: &mut Context) -> Result<JsFunction, Sand
     .build();
     let prototype = JsObject::with_null_proto();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype.clone()),
+            false,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     prototype
-        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .set(
+            js_string!("constructor"),
+            JsValue::from(constructor.clone()),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("close", 0usize, node_udp_close as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "close",
+            0usize,
+            node_udp_close as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("ref", 0usize, node_udp_ref),
         ("unref", 0usize, node_udp_unref),
         ("hasRef", 0usize, node_udp_has_ref),
@@ -6014,13 +6396,29 @@ fn node_udp_handle_constructor(context: &mut Context) -> Result<JsFunction, Sand
         ("recvStop", 0usize, node_udp_recv_stop),
         ("getsockname", 1usize, node_udp_getsockname),
         ("getpeername", 1usize, node_udp_getpeername),
-        ("setMulticastInterface", 1usize, node_udp_set_multicast_interface),
+        (
+            "setMulticastInterface",
+            1usize,
+            node_udp_set_multicast_interface,
+        ),
         ("addMembership", 2usize, node_udp_add_membership),
         ("dropMembership", 2usize, node_udp_drop_membership),
-        ("addSourceSpecificMembership", 3usize, node_udp_add_source_specific_membership),
-        ("dropSourceSpecificMembership", 3usize, node_udp_drop_source_specific_membership),
+        (
+            "addSourceSpecificMembership",
+            3usize,
+            node_udp_add_source_specific_membership,
+        ),
+        (
+            "dropSourceSpecificMembership",
+            3usize,
+            node_udp_drop_source_specific_membership,
+        ),
         ("setMulticastTTL", 1usize, node_udp_set_multicast_ttl),
-        ("setMulticastLoopback", 1usize, node_udp_set_multicast_loopback),
+        (
+            "setMulticastLoopback",
+            1usize,
+            node_udp_set_multicast_loopback,
+        ),
         ("setBroadcast", 1usize, node_udp_set_broadcast),
         ("setTTL", 1usize, node_udp_set_ttl),
         ("bufferSize", 3usize, node_udp_buffer_size),
@@ -6112,7 +6510,9 @@ fn node_udp_construct(
 
 fn node_udp_close(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let Some(this) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("UDP receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("UDP receiver must be an object")
+            .into());
     };
     node_with_host(|host| {
         node_udp_handle_state_mut(host, &this, context, |state| {
@@ -6129,7 +6529,9 @@ fn node_udp_close(this: &JsValue, _args: &[JsValue], context: &mut Context) -> J
 
 fn node_udp_ref(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let Some(this) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("UDP receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("UDP receiver must be an object")
+            .into());
     };
     node_with_host(|host| {
         node_udp_handle_state_mut(host, &this, context, |state| state.refed = true)?;
@@ -6140,7 +6542,9 @@ fn node_udp_ref(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsR
 
 fn node_udp_unref(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let Some(this) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("UDP receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("UDP receiver must be an object")
+            .into());
     };
     node_with_host(|host| {
         node_udp_handle_state_mut(host, &this, context, |state| state.refed = false)?;
@@ -6154,17 +6558,27 @@ fn node_udp_has_ref(this: &JsValue, _args: &[JsValue], context: &mut Context) ->
         return Ok(JsValue::from(false));
     };
     node_with_host(|host| {
-        let refed = node_udp_handle_state(host, &this, context, |state| state.refed && !state.closed)?;
+        let refed =
+            node_udp_handle_state(host, &this, context, |state| state.refed && !state.closed)?;
         Ok(JsValue::from(refed))
     })
     .map_err(js_error)
 }
 
-fn node_udp_get_async_id(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_udp_get_async_id(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     let Some(this) = this.as_object() else {
         return Ok(JsValue::from(0));
     };
-    node_with_host(|host| Ok(JsValue::from(node_udp_handle_id(host, &this, context)? as i32))).map_err(js_error)
+    node_with_host(|host| {
+        Ok(JsValue::from(
+            node_udp_handle_id(host, &this, context)? as i32
+        ))
+    })
+    .map_err(js_error)
 }
 
 fn node_udp_get_fd(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -6173,7 +6587,11 @@ fn node_udp_get_fd(this: &JsValue, _args: &[JsValue], context: &mut Context) -> 
     };
     node_with_host(|host| {
         let fd = node_udp_handle_state(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.fd.unwrap_or(NODE_UV_EBADF) }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.fd.unwrap_or(NODE_UV_EBADF)
+            }
         })?;
         Ok(JsValue::from(fd))
     })
@@ -6184,7 +6602,11 @@ fn node_udp_open(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
     let Some(this) = this.as_object() else {
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
-    let fd = args.first().cloned().unwrap_or_else(|| JsValue::from(-1)).to_i32(context)?;
+    let fd = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(-1))
+        .to_i32(context)?;
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
             if state.closed || fd < 0 {
@@ -6199,7 +6621,14 @@ fn node_udp_open(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
     .map_err(js_error)
 }
 
-fn node_udp_bind_impl(this: &JsObject, address: String, port: u16, family: &str, _flags: u32, context: &mut Context) -> JsResult<JsValue> {
+fn node_udp_bind_impl(
+    this: &JsObject,
+    address: String,
+    port: u16,
+    family: &str,
+    _flags: u32,
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, this, context, |state| {
             if state.closed {
@@ -6214,26 +6643,53 @@ fn node_udp_bind_impl(this: &JsObject, address: String, port: u16, family: &str,
             }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_udp_bind(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     let address = node_arg_string(args, 0, context)?;
-    let port = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)? as u16;
-    let flags = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)?;
+    let port = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)? as u16;
+    let flags = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)?;
     node_udp_bind_impl(&this, address, port, "IPv4", flags, context)
 }
 
 fn node_udp_bind6(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     let address = node_arg_string(args, 0, context)?;
-    let port = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)? as u16;
-    let flags = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)?;
+    let port = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)? as u16;
+    let flags = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)?;
     node_udp_bind_impl(&this, address, port, "IPv6", flags, context)
 }
 
-fn node_udp_connect_impl(this: &JsObject, address: String, port: u16, family: &str, context: &mut Context) -> JsResult<JsValue> {
+fn node_udp_connect_impl(
+    this: &JsObject,
+    address: String,
+    port: u16,
+    family: &str,
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, this, context, |state| {
             if state.closed {
@@ -6246,25 +6702,44 @@ fn node_udp_connect_impl(this: &JsObject, address: String, port: u16, family: &s
             }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_udp_connect(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     let address = node_arg_string(args, 0, context)?;
-    let port = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)? as u16;
+    let port = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)? as u16;
     node_udp_connect_impl(&this, address, port, "IPv4", context)
 }
 
 fn node_udp_connect6(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     let address = node_arg_string(args, 0, context)?;
-    let port = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)? as u16;
+    let port = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)? as u16;
     node_udp_connect_impl(&this, address, port, "IPv6", context)
 }
 
-fn node_udp_disconnect(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+fn node_udp_disconnect(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
             if state.closed {
@@ -6277,19 +6752,51 @@ fn node_udp_disconnect(this: &JsValue, _args: &[JsValue], context: &mut Context)
             }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_send_impl(this: &JsObject, args: &[JsValue], family: &str, context: &mut Context) -> JsResult<JsValue> {
+fn node_udp_send_impl(
+    this: &JsObject,
+    args: &[JsValue],
+    family: &str,
+    context: &mut Context,
+) -> JsResult<JsValue> {
     let sendto = args.len() == 6;
-    let list = args.get(1).and_then(JsValue::as_object).ok_or_else(|| JsNativeError::typ().with_message("UDP send list must be an array"))?;
-    let count = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)? as u64;
-    let port_arg = if sendto { Some(args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)? as u16) } else { None };
-    let address_arg = if sendto { Some(node_arg_string(args, 4, context)?) } else { None };
-    let _has_callback = if sendto {
-        args.get(5).cloned().unwrap_or_else(JsValue::undefined).to_boolean()
+    let list = args
+        .get(1)
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| JsNativeError::typ().with_message("UDP send list must be an array"))?;
+    let count = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)? as u64;
+    let port_arg = if sendto {
+        Some(
+            args.get(3)
+                .cloned()
+                .unwrap_or_else(JsValue::undefined)
+                .to_u32(context)? as u16,
+        )
     } else {
-        args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_boolean()
+        None
+    };
+    let address_arg = if sendto {
+        Some(node_arg_string(args, 4, context)?)
+    } else {
+        None
+    };
+    let _has_callback = if sendto {
+        args.get(5)
+            .cloned()
+            .unwrap_or_else(JsValue::undefined)
+            .to_boolean()
+    } else {
+        args.get(3)
+            .cloned()
+            .unwrap_or_else(JsValue::undefined)
+            .to_boolean()
     };
     let mut msg_size = 0usize;
     let mut payload = Vec::new();
@@ -6315,9 +6822,11 @@ fn node_udp_send_impl(this: &JsObject, args: &[JsValue], family: &str, context: 
                     address_arg.clone().unwrap_or_default(),
                     port_arg.unwrap_or(0),
                 )
-            } else if let (Some(peer_family), Some(peer_address), Some(peer_port)) =
-                (state.peer_family.clone(), state.peer_address.clone(), state.peer_port)
-            {
+            } else if let (Some(peer_family), Some(peer_address), Some(peer_port)) = (
+                state.peer_family.clone(),
+                state.peer_address.clone(),
+                state.peer_port,
+            ) {
                 (peer_family, peer_address, peer_port)
             } else {
                 return Ok(JsValue::from(NODE_UV_EDESTADDRREQ));
@@ -6326,14 +6835,25 @@ fn node_udp_send_impl(this: &JsObject, args: &[JsValue], family: &str, context: 
                 state.bound_family = Some(family.to_string());
             }
             if state.bound_address.is_none() {
-                state.bound_address = Some(if family == "IPv6" { "::1".to_string() } else { "127.0.0.1".to_string() });
+                state.bound_address = Some(if family == "IPv6" {
+                    "::1".to_string()
+                } else {
+                    "127.0.0.1".to_string()
+                });
             }
             if state.bound_port.is_none() {
                 state.bound_port = Some(0);
             }
-            let source_family = state.bound_family.clone().unwrap_or_else(|| family.to_string());
+            let source_family = state
+                .bound_family
+                .clone()
+                .unwrap_or_else(|| family.to_string());
             let source_address = state.bound_address.clone().unwrap_or_else(|| {
-                if family == "IPv6" { "::1".to_string() } else { "127.0.0.1".to_string() }
+                if family == "IPv6" {
+                    "::1".to_string()
+                } else {
+                    "127.0.0.1".to_string()
+                }
             });
             let source_port = state.bound_port.unwrap_or(0);
             state.send_queue_count = 0;
@@ -6363,46 +6883,96 @@ fn node_udp_send_impl(this: &JsObject, args: &[JsValue], family: &str, context: 
             );
         }
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_udp_send(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     node_udp_send_impl(&this, args, "IPv4", context)
 }
 
 fn node_udp_send6(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     node_udp_send_impl(&this, args, "IPv6", context)
 }
 
-fn node_udp_recv_start(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+fn node_udp_recv_start(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.recv_started = true; 0 }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.recv_started = true;
+                0
+            }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_recv_stop(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+fn node_udp_recv_stop(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.recv_started = false; 0 }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.recv_started = false;
+                0
+            }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_fill_name(out: &JsObject, address: Option<String>, family: Option<String>, port: Option<u16>, context: &mut Context) -> Result<(), SandboxError> {
-    out.set(js_string!("address"), JsValue::from(JsString::from(address.unwrap_or_default())), true, context)
-        .map_err(sandbox_execution_error)?;
-    out.set(js_string!("family"), JsValue::from(JsString::from(family.unwrap_or_default())), true, context)
-        .map_err(sandbox_execution_error)?;
-    out.set(js_string!("port"), JsValue::from(port.unwrap_or(0)), true, context)
-        .map_err(sandbox_execution_error)?;
+fn node_udp_fill_name(
+    out: &JsObject,
+    address: Option<String>,
+    family: Option<String>,
+    port: Option<u16>,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    out.set(
+        js_string!("address"),
+        JsValue::from(JsString::from(address.unwrap_or_default())),
+        true,
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
+    out.set(
+        js_string!("family"),
+        JsValue::from(JsString::from(family.unwrap_or_default())),
+        true,
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
+    out.set(
+        js_string!("port"),
+        JsValue::from(port.unwrap_or(0)),
+        true,
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
     Ok(())
 }
 
@@ -6469,28 +7039,57 @@ fn node_udp_schedule_message_delivery(
     );
 }
 
-fn node_udp_getsockname(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
-    let Some(out) = args.first().and_then(JsValue::as_object) else { return Ok(JsValue::from(NODE_UV_EINVAL)); };
+fn node_udp_getsockname(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let Some(out) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::from(NODE_UV_EINVAL));
+    };
     node_with_host(|host| {
-        let (closed, address, family, port) = node_udp_handle_state(host, &this, context, |state| {
-            (state.closed, state.bound_address.clone(), state.bound_family.clone(), state.bound_port)
-        })?;
+        let (closed, address, family, port) =
+            node_udp_handle_state(host, &this, context, |state| {
+                (
+                    state.closed,
+                    state.bound_address.clone(),
+                    state.bound_family.clone(),
+                    state.bound_port,
+                )
+            })?;
         if closed {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
         node_udp_fill_name(&out, address, family, port, context)?;
         Ok(JsValue::from(0))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_getpeername(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
-    let Some(out) = args.first().and_then(JsValue::as_object) else { return Ok(JsValue::from(NODE_UV_EINVAL)); };
+fn node_udp_getpeername(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let Some(out) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::from(NODE_UV_EINVAL));
+    };
     node_with_host(|host| {
-        let (closed, address, family, port) = node_udp_handle_state(host, &this, context, |state| {
-            (state.closed, state.peer_address.clone(), state.peer_family.clone(), state.peer_port)
-        })?;
+        let (closed, address, family, port) =
+            node_udp_handle_state(host, &this, context, |state| {
+                (
+                    state.closed,
+                    state.peer_address.clone(),
+                    state.peer_family.clone(),
+                    state.peer_port,
+                )
+            })?;
         if closed {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
@@ -6499,98 +7098,221 @@ fn node_udp_getpeername(this: &JsValue, args: &[JsValue], context: &mut Context)
         }
         node_udp_fill_name(&out, address, family, port, context)?;
         Ok(JsValue::from(0))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_set_multicast_interface(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+fn node_udp_set_multicast_interface(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     let iface = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.multicast_interface = Some(iface); 0 }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.multicast_interface = Some(iface);
+                0
+            }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_add_membership(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+fn node_udp_add_membership(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     let _address = node_arg_string(args, 0, context)?;
-    let _iface = args.get(1).filter(|v| !v.is_null() && !v.is_undefined()).map(|_| node_arg_string(args, 1, context)).transpose()?;
+    let _iface = args
+        .get(1)
+        .filter(|v| !v.is_null() && !v.is_undefined())
+        .map(|_| node_arg_string(args, 1, context))
+        .transpose()?;
     node_with_host(|host| {
-        let code = node_udp_handle_state(host, &this, context, |state| if state.closed { NODE_UV_EBADF } else { 0 })?;
+        let code = node_udp_handle_state(host, &this, context, |state| {
+            if state.closed { NODE_UV_EBADF } else { 0 }
+        })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_drop_membership(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_udp_drop_membership(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_udp_add_membership(this, args, context)
 }
 
-fn node_udp_add_source_specific_membership(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
+fn node_udp_add_source_specific_membership(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
     let _source = node_arg_string(args, 0, context)?;
     let _group = node_arg_string(args, 1, context)?;
-    let _iface = args.get(2).filter(|v| !v.is_null() && !v.is_undefined()).map(|_| node_arg_string(args, 2, context)).transpose()?;
+    let _iface = args
+        .get(2)
+        .filter(|v| !v.is_null() && !v.is_undefined())
+        .map(|_| node_arg_string(args, 2, context))
+        .transpose()?;
     node_with_host(|host| {
-        let code = node_udp_handle_state(host, &this, context, |state| if state.closed { NODE_UV_EBADF } else { 0 })?;
+        let code = node_udp_handle_state(host, &this, context, |state| {
+            if state.closed { NODE_UV_EBADF } else { 0 }
+        })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_drop_source_specific_membership(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_udp_drop_source_specific_membership(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_udp_add_source_specific_membership(this, args, context)
 }
 
-fn node_udp_set_multicast_ttl(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
-    let ttl = args.first().cloned().unwrap_or_else(JsValue::undefined).to_i32(context)?;
+fn node_udp_set_multicast_ttl(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let ttl = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.multicast_ttl = ttl; 0 }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.multicast_ttl = ttl;
+                0
+            }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_set_multicast_loopback(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
-    let enabled = args.first().cloned().unwrap_or_else(JsValue::undefined).to_i32(context)?;
+fn node_udp_set_multicast_loopback(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let enabled = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.multicast_loopback = enabled; 0 }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.multicast_loopback = enabled;
+                0
+            }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_set_broadcast(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
-    let enabled = args.first().cloned().unwrap_or_else(JsValue::undefined).to_i32(context)?;
+fn node_udp_set_broadcast(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let enabled = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.broadcast = enabled; 0 }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.broadcast = enabled;
+                0
+            }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_udp_set_ttl(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(NODE_UV_EBADF)); };
-    let ttl = args.first().cloned().unwrap_or_else(JsValue::undefined).to_i32(context)?;
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let ttl = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
     node_with_host(|host| {
         let code = node_udp_handle_state_mut(host, &this, context, |state| {
-            if state.closed { NODE_UV_EBADF } else { state.ttl = ttl; 0 }
+            if state.closed {
+                NODE_UV_EBADF
+            } else {
+                state.ttl = ttl;
+                0
+            }
         })?;
         Ok(JsValue::from(code))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_buffer_size(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::undefined()); };
-    let size = args.first().cloned().unwrap_or_else(JsValue::undefined).to_u32(context)?;
-    let is_recv = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
-    let Some(ctx_obj) = args.get(2).and_then(JsValue::as_object) else { return Ok(JsValue::undefined()); };
+fn node_udp_buffer_size(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    let size = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)?;
+    let is_recv = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
+    let Some(ctx_obj) = args.get(2).and_then(JsValue::as_object) else {
+        return Ok(JsValue::undefined());
+    };
     node_with_host(|host| {
         let result = node_udp_handle_state_mut(host, &this, context, |state| {
             if state.closed {
@@ -6607,27 +7329,50 @@ fn node_udp_buffer_size(this: &JsValue, args: &[JsValue], context: &mut Context)
         if let Some(value) = result {
             Ok(JsValue::from(value))
         } else {
-            ctx_obj.set(js_string!("errno"), JsValue::from(NODE_UV_EBADF), true, context)
+            ctx_obj
+                .set(
+                    js_string!("errno"),
+                    JsValue::from(NODE_UV_EBADF),
+                    true,
+                    context,
+                )
                 .map_err(sandbox_execution_error)?;
             Ok(JsValue::undefined())
         }
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_get_send_queue_size(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(0)); };
+fn node_udp_get_send_queue_size(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(0));
+    };
     node_with_host(|host| {
-        let size = node_udp_handle_state(host, &this, context, |state| state.send_queue_size as u32)?;
+        let size =
+            node_udp_handle_state(host, &this, context, |state| state.send_queue_size as u32)?;
         Ok(JsValue::from(size))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_udp_get_send_queue_count(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(this) = this.as_object() else { return Ok(JsValue::from(0)); };
+fn node_udp_get_send_queue_count(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(0));
+    };
     node_with_host(|host| {
-        let count = node_udp_handle_state(host, &this, context, |state| state.send_queue_count as u32)?;
+        let count =
+            node_udp_handle_state(host, &this, context, |state| state.send_queue_count as u32)?;
         Ok(JsValue::from(count))
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
 fn node_internal_binding_udp_wrap(context: &mut Context) -> Result<JsObject, SandboxError> {
@@ -6642,9 +7387,21 @@ fn node_internal_binding_udp_wrap(context: &mut Context) -> Result<JsObject, San
     .constructor(true)
     .build();
     let constants = ObjectInitializer::new(context)
-        .property(js_string!("UV_UDP_IPV6ONLY"), JsValue::from(1), Attribute::all())
-        .property(js_string!("UV_UDP_REUSEADDR"), JsValue::from(4), Attribute::all())
-        .property(js_string!("UV_UDP_REUSEPORT"), JsValue::from(2), Attribute::all())
+        .property(
+            js_string!("UV_UDP_IPV6ONLY"),
+            JsValue::from(1),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("UV_UDP_REUSEADDR"),
+            JsValue::from(4),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("UV_UDP_REUSEPORT"),
+            JsValue::from(2),
+            Attribute::all(),
+        )
         .build();
     for (name, value) in [
         ("UDP", JsValue::from(udp)),
@@ -6724,7 +7481,10 @@ fn node_process_schedule_onexit(
             let signal = term_signal.unwrap_or_default();
             onexit.call(
                 &JsValue::from(handle),
-                &[JsValue::from(exit_status), JsValue::from(JsString::from(signal))],
+                &[
+                    JsValue::from(exit_status),
+                    JsValue::from(JsString::from(signal)),
+                ],
                 context,
             )?;
             Ok(JsValue::undefined())
@@ -6744,13 +7504,27 @@ fn node_process_wrap_constructor(context: &mut Context) -> Result<JsFunction, Sa
     .build();
     let prototype = JsObject::with_null_proto();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype.clone()),
+            false,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     prototype
-        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .set(
+            js_string!("constructor"),
+            JsValue::from(constructor.clone()),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("spawn", 1usize, node_process_wrap_spawn as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "spawn",
+            1usize,
+            node_process_wrap_spawn as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("kill", 1usize, node_process_wrap_kill),
         ("close", 0usize, node_process_wrap_close),
         ("ref", 0usize, node_process_wrap_ref),
@@ -6783,7 +7557,9 @@ fn node_process_wrap_construct(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let Some(this) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("Process constructor requires receiver").into());
+        return Err(JsNativeError::typ()
+            .with_message("Process constructor requires receiver")
+            .into());
     };
     node_with_host_js(context, |host, context| {
         let id = node_next_host_handle_id(host);
@@ -6929,9 +7705,14 @@ fn node_process_wrap_kill(
     let Some(this) = this.as_object() else {
         return Ok(JsValue::from(NODE_UV_EBADF));
     };
-    let signal = args.first().cloned().unwrap_or_else(JsValue::undefined).to_i32(context)?;
+    let signal = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
     node_with_host(|host| {
-        let (closed, pid) = node_process_handle_state(host, &this, context, |state| (state.closed, state.pid))?;
+        let (closed, pid) =
+            node_process_handle_state(host, &this, context, |state| (state.closed, state.pid))?;
         if closed || pid.is_none() {
             return Ok(JsValue::from(-3));
         }
@@ -7041,41 +7822,57 @@ fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxEr
         )
         .map_err(sandbox_execution_error)?;
     object
-        .set(js_string!("kUsePromises"), JsValue::from(true), true, context)
+        .set(
+            js_string!("kUsePromises"),
+            JsValue::from(true),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     for (name, function) in [
-        ("internalModuleStat", node_internal_fs_internal_module_stat as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "internalModuleStat",
+            node_internal_fs_internal_module_stat
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("stat", node_internal_fs_stat),
         ("lstat", node_internal_fs_lstat),
         ("readlink", node_internal_fs_readlink),
         ("realpath", node_internal_fs_realpath),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(4)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(4)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
     for (name, length, function) in [
-        ("open", 4usize, node_internal_fs_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "open",
+            4usize,
+            node_internal_fs_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("close", 2usize, node_internal_fs_close),
         ("read", 6usize, node_internal_fs_read),
         ("readFileUtf8", 2usize, node_internal_fs_read_file_utf8),
         ("writeBuffer", 7usize, node_internal_fs_write_buffer),
         ("writeString", 6usize, node_internal_fs_write_string),
-        ("getFormatOfExtensionlessFile", 1usize, node_internal_fs_get_format_of_extensionless_file),
+        (
+            "getFormatOfExtensionlessFile",
+            1usize,
+            node_internal_fs_get_format_of_extensionless_file,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -7105,13 +7902,12 @@ fn node_fs_req_callback_construct(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let object = this.as_object().unwrap_or_else(JsObject::with_null_proto);
-    object
-        .set(
-            js_string!("useBigInt"),
-            args.first().cloned().unwrap_or_else(JsValue::undefined),
-            true,
-            context,
-        )?;
+    object.set(
+        js_string!("useBigInt"),
+        args.first().cloned().unwrap_or_else(JsValue::undefined),
+        true,
+        context,
+    )?;
     Ok(JsValue::from(object))
 }
 
@@ -7172,14 +7968,19 @@ fn node_fs_dir_make_handle(
         .set(closed_symbol, JsValue::from(false), true, context)
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("read", 3usize, node_fs_dir_handle_read as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "read",
+            3usize,
+            node_fs_dir_handle_read as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("close", 1usize, node_fs_dir_handle_close),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         handle
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -7212,15 +8013,13 @@ fn node_fs_dir_handle_read(
     let index_symbol = node_host_private_symbol(&host, "fs_dir.index").map_err(js_error)?;
     let names_symbol = node_host_private_symbol(&host, "fs_dir.names").map_err(js_error)?;
     let types_symbol = node_host_private_symbol(&host, "fs_dir.types").map_err(js_error)?;
-    let handle = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("DirHandle.read receiver must be an object"))?;
+    let handle = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("DirHandle.read receiver must be an object")
+    })?;
     if handle.get(closed_symbol, context)?.to_boolean() {
         return Ok(JsValue::null());
     }
-    let index = handle
-        .get(index_symbol.clone(), context)?
-        .to_u32(context)? as usize;
+    let index = handle.get(index_symbol.clone(), context)?.to_u32(context)? as usize;
     let names = handle
         .get(names_symbol, context)?
         .as_object()
@@ -7261,9 +8060,9 @@ fn node_fs_dir_handle_close(
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
     let closed_symbol = node_host_private_symbol(&host, "fs_dir.closed").map_err(js_error)?;
-    let handle = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("DirHandle.close receiver must be an object"))?;
+    let handle = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("DirHandle.close receiver must be an object")
+    })?;
     handle.set(closed_symbol, JsValue::from(true), true, context)?;
     let req = args.first().cloned();
     node_fs_req_complete(req.as_ref(), context, JsValue::undefined()).map_err(js_error)
@@ -7279,10 +8078,12 @@ fn node_fs_binding_stat_values(context: &mut Context) -> Result<JsObject, Sandbo
     }
     let stat_values = JsValue::from_json(&serde_json::json!(vec![0.0; 18]), context)
         .map_err(sandbox_execution_error)?;
-    let object = stat_values.as_object().ok_or_else(|| SandboxError::Execution {
-        entrypoint: "<node-runtime>".to_string(),
-        message: "failed to allocate fs statValues scratch array".to_string(),
-    })?;
+    let object = stat_values
+        .as_object()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: "failed to allocate fs statValues scratch array".to_string(),
+        })?;
     node_store_global(context, "__terraceNodeFsStatValues", stat_values)?;
     Ok(object)
 }
@@ -7384,7 +8185,6 @@ fn node_internal_fs_internal_module_stat(
         Ok(JsValue::from(code))
     })
     .map_err(js_error)
-
 }
 
 fn node_internal_fs_stat_like(
@@ -7588,7 +8388,6 @@ fn node_internal_fs_write_buffer(
             .map_err(js_error)?;
     }
     node_fs_req_complete(req, context, result).map_err(js_error)
-
 }
 
 fn node_internal_fs_write_string(
@@ -7619,7 +8418,8 @@ fn node_internal_fs_write_string(
     let req = args.get(4);
     let ctx = args.get(5);
     let result = node_with_host(|host| {
-        node_fs_write_impl(host, fd, data.as_bytes(), position).map(|written| JsValue::from(written as u32))
+        node_fs_write_impl(host, fd, data.as_bytes(), position)
+            .map(|written| JsValue::from(written as u32))
     })
     .map_err(js_error)?;
     if let Some(ctx_object) = ctx.and_then(JsValue::as_object) {
@@ -7653,9 +8453,10 @@ fn node_internal_fs_read_file_utf8(
         .unwrap_or_default();
     node_with_host(|host| {
         let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        let bytes = node_read_file(host, &resolved)?.ok_or_else(|| SandboxError::ModuleNotFound {
-            specifier: resolved.clone(),
-        })?;
+        let bytes =
+            node_read_file(host, &resolved)?.ok_or_else(|| SandboxError::ModuleNotFound {
+                specifier: resolved.clone(),
+            })?;
         let text = String::from_utf8(bytes).map_err(|error| SandboxError::Execution {
             entrypoint: resolved,
             message: error.to_string(),
@@ -7670,7 +8471,8 @@ fn node_internal_binding_builtins(
     context: &mut Context,
 ) -> Result<JsObject, SandboxError> {
     let ids = node_builtin_ids(host)?;
-    let ids = JsValue::from_json(&serde_json::json!(ids), context).map_err(sandbox_execution_error)?;
+    let ids =
+        JsValue::from_json(&serde_json::json!(ids), context).map_err(sandbox_execution_error)?;
     let object = ObjectInitializer::new(context).build();
     let compile = FunctionObjectBuilder::new(
         context.realm(),
@@ -7702,7 +8504,12 @@ fn node_internal_binding_builtins(
         )
         .map_err(sandbox_execution_error)?;
     object
-        .set(js_string!("compileFunction"), JsValue::from(compile), true, context)
+        .set(
+            js_string!("compileFunction"),
+            JsValue::from(compile),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
         .set(
@@ -7718,21 +8525,27 @@ fn node_internal_binding_builtins(
 fn node_internal_binding_blob(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, length, function) in [
-        ("createBlob", 2usize, node_blob_create_blob as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("createBlobFromFilePath", 1usize, node_blob_create_blob_from_file_path),
+        (
+            "createBlob",
+            2usize,
+            node_blob_create_blob as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "createBlobFromFilePath",
+            1usize,
+            node_blob_create_blob_from_file_path,
+        ),
         ("concat", 1usize, node_blob_concat),
         ("getDataObject", 1usize, node_blob_get_data_object),
         ("storeDataObject", 4usize, node_blob_store_data_object),
         ("revokeObjectURL", 1usize, node_blob_revoke_object_url),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -7743,7 +8556,12 @@ fn node_internal_binding_blob(context: &mut Context) -> Result<JsObject, Sandbox
 fn node_internal_binding_buffer(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     object
-        .set(js_string!("kMaxLength"), JsValue::from(i32::MAX), true, context)
+        .set(
+            js_string!("kMaxLength"),
+            JsValue::from(i32::MAX),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
         .set(
@@ -7760,7 +8578,11 @@ fn node_internal_binding_buffer(context: &mut Context) -> Result<JsObject, Sandb
             node_buffer_create_unsafe_array_buffer
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("setBufferPrototype", 1usize, node_buffer_set_buffer_prototype),
+        (
+            "setBufferPrototype",
+            1usize,
+            node_buffer_set_buffer_prototype,
+        ),
         ("byteLengthUtf8", 1usize, node_buffer_byte_length_utf8),
         ("compare", 2usize, node_buffer_compare),
         ("compareOffset", 6usize, node_buffer_compare_offset),
@@ -7792,14 +8614,12 @@ fn node_internal_binding_buffer(context: &mut Context) -> Result<JsObject, Sandb
         ("ucs2Write", 4usize, node_buffer_ucs2_write),
         ("utf8WriteStatic", 4usize, node_buffer_utf8_write_static),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -7809,13 +8629,18 @@ fn node_internal_binding_buffer(context: &mut Context) -> Result<JsObject, Sandb
 
 fn node_internal_binding_url(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
-    let url_components = JsValue::from_json(&serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 1]), context)
-        .map_err(sandbox_execution_error)?;
+    let url_components =
+        JsValue::from_json(&serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 1]), context)
+            .map_err(sandbox_execution_error)?;
     object
         .set(js_string!("urlComponents"), url_components, true, context)
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("canParse", 2usize, node_url_can_parse as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "canParse",
+            2usize,
+            node_url_can_parse as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("parse", 3usize, node_url_parse),
         ("pathToFileURL", 3usize, node_url_path_to_file_url),
         ("update", 3usize, node_url_update),
@@ -7824,14 +8649,12 @@ fn node_internal_binding_url(context: &mut Context) -> Result<JsObject, SandboxE
         ("getOrigin", 1usize, node_url_get_origin),
         ("format", 5usize, node_url_format),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -7843,20 +8666,28 @@ fn node_internal_binding_url_pattern(context: &mut Context) -> Result<JsObject, 
     let object = ObjectInitializer::new(context).build();
     let prototype = JsObject::with_null_proto();
     for (name, function) in [
-        ("test", node_url_pattern_test as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "test",
+            node_url_pattern_test as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("exec", node_url_pattern_exec),
     ] {
-        let method = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(1)
-            .constructor(false)
-            .build();
+        let method =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         prototype
             .set(JsString::from(name), JsValue::from(method), true, context)
             .map_err(sandbox_execution_error)?;
     }
     for (name, getter) in [
-        ("protocol", node_url_pattern_get_protocol as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "protocol",
+            node_url_pattern_get_protocol
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("username", node_url_pattern_get_username),
         ("password", node_url_pattern_get_password),
         ("hostname", node_url_pattern_get_hostname),
@@ -7866,14 +8697,12 @@ fn node_internal_binding_url_pattern(context: &mut Context) -> Result<JsObject, 
         ("hash", node_url_pattern_get_hash),
         ("hasRegExpGroups", node_url_pattern_get_has_regexp_groups),
     ] {
-        let function = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(getter),
-        )
-        .name(JsString::from(name))
-        .length(0)
-        .constructor(false)
-        .build();
+        let function =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(getter))
+                .name(JsString::from(name))
+                .length(0)
+                .constructor(false)
+                .build();
         prototype
             .set(JsString::from(name), JsValue::from(function), true, context)
             .map_err(sandbox_execution_error)?;
@@ -7887,10 +8716,20 @@ fn node_internal_binding_url_pattern(context: &mut Context) -> Result<JsObject, 
     .constructor(true)
     .build();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype), true, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
-        .set(js_string!("URLPattern"), JsValue::from(constructor), true, context)
+        .set(
+            js_string!("URLPattern"),
+            JsValue::from(constructor),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     Ok(object)
 }
@@ -7930,22 +8769,56 @@ fn node_internal_binding_modules(context: &mut Context) -> Result<JsObject, Sand
         )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("enableCompileCache", 0usize, node_modules_enable_compile_cache as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("getCompileCacheDir", 0usize, node_modules_get_compile_cache_dir),
-        ("getNearestParentPackageJSONType", 1usize, node_modules_get_nearest_parent_package_json_type),
-        ("getNearestParentPackageJSON", 1usize, node_modules_get_nearest_parent_package_json),
-        ("getPackageScopeConfig", 1usize, node_modules_get_package_scope_config),
+        (
+            "enableCompileCache",
+            0usize,
+            node_modules_enable_compile_cache
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "getCompileCacheDir",
+            0usize,
+            node_modules_get_compile_cache_dir,
+        ),
+        (
+            "getNearestParentPackageJSONType",
+            1usize,
+            node_modules_get_nearest_parent_package_json_type,
+        ),
+        (
+            "getNearestParentPackageJSON",
+            1usize,
+            node_modules_get_nearest_parent_package_json,
+        ),
+        (
+            "getPackageScopeConfig",
+            1usize,
+            node_modules_get_package_scope_config,
+        ),
         ("getPackageType", 1usize, node_modules_get_package_type),
         ("readPackageJSON", 4usize, node_modules_read_package_json),
-        ("flushCompileCache", 0usize, node_modules_flush_compile_cache),
-        ("getCompileCacheEntry", 3usize, node_modules_get_compile_cache_entry),
-        ("saveCompileCacheEntry", 2usize, node_modules_save_compile_cache_entry),
+        (
+            "flushCompileCache",
+            0usize,
+            node_modules_flush_compile_cache,
+        ),
+        (
+            "getCompileCacheEntry",
+            3usize,
+            node_modules_get_compile_cache_entry,
+        ),
+        (
+            "saveCompileCacheEntry",
+            2usize,
+            node_modules_save_compile_cache_entry,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8007,16 +8880,22 @@ fn node_internal_binding_encoding(context: &mut Context) -> Result<JsObject, San
         )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("encodeInto", 2usize, node_encoding_encode_into as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "encodeInto",
+            2usize,
+            node_encoding_encode_into
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("encodeUtf8String", 1usize, node_encoding_encode_utf8_string),
         ("decodeUTF8", 3usize, node_encoding_decode_utf8),
         ("toASCII", 1usize, node_encoding_to_ascii),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8107,10 +8986,12 @@ fn node_internal_binding_constants(context: &mut Context) -> Result<JsObject, Sa
         context,
     )
     .map_err(sandbox_execution_error)?;
-    let constants = constants.as_object().ok_or_else(|| SandboxError::Execution {
-        entrypoint: "<node-runtime>".to_string(),
-        message: "internalBinding('constants') payload must be an object".to_string(),
-    })?;
+    let constants = constants
+        .as_object()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: "internalBinding('constants') payload must be an object".to_string(),
+        })?;
     object
         .set(
             js_string!("os"),
@@ -8139,18 +9020,44 @@ fn node_internal_binding_constants(context: &mut Context) -> Result<JsObject, Sa
 fn node_internal_binding_options(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, length, function) in [
-        ("getCLIOptionsValues", 0usize, node_options_get_cli_options_values as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("getCLIOptionsInfo", 0usize, node_options_get_cli_options_info),
-        ("getOptionsAsFlags", 0usize, node_options_get_options_as_flags),
-        ("getEmbedderOptions", 0usize, node_options_get_embedder_options),
-        ("getEnvOptionsInputType", 0usize, node_options_get_env_options_input_type),
-        ("getNamespaceOptionsInputType", 0usize, node_options_get_namespace_options_input_type),
+        (
+            "getCLIOptionsValues",
+            0usize,
+            node_options_get_cli_options_values
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "getCLIOptionsInfo",
+            0usize,
+            node_options_get_cli_options_info,
+        ),
+        (
+            "getOptionsAsFlags",
+            0usize,
+            node_options_get_options_as_flags,
+        ),
+        (
+            "getEmbedderOptions",
+            0usize,
+            node_options_get_embedder_options,
+        ),
+        (
+            "getEnvOptionsInputType",
+            0usize,
+            node_options_get_env_options_input_type,
+        ),
+        (
+            "getNamespaceOptionsInputType",
+            0usize,
+            node_options_get_namespace_options_input_type,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8160,8 +9067,8 @@ fn node_internal_binding_options(context: &mut Context) -> Result<JsObject, Sand
     object
         .set(js_string!("envSettings"), env_settings, true, context)
         .map_err(sandbox_execution_error)?;
-    let types = JsValue::from_json(&node_options_types_json(), context)
-        .map_err(sandbox_execution_error)?;
+    let types =
+        JsValue::from_json(&node_options_types_json(), context).map_err(sandbox_execution_error)?;
     object
         .set(js_string!("types"), types, true, context)
         .map_err(sandbox_execution_error)?;
@@ -8171,7 +9078,11 @@ fn node_internal_binding_options(context: &mut Context) -> Result<JsObject, Sand
 fn node_internal_binding_types(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, function) in [
-        ("isArrayBufferView", node_type_is_array_buffer_view as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "isArrayBufferView",
+            node_type_is_array_buffer_view
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("isArgumentsObject", node_type_is_arguments_object),
         ("isArrayBuffer", node_type_is_array_buffer),
         ("isAsyncFunction", node_type_is_async_function),
@@ -8185,7 +9096,10 @@ fn node_internal_binding_types(context: &mut Context) -> Result<JsObject, Sandbo
         ("isGeneratorObject", node_type_is_generator_object),
         ("isMap", node_type_is_map),
         ("isMapIterator", node_type_is_map_iterator),
-        ("isModuleNamespaceObject", node_type_is_module_namespace_object),
+        (
+            "isModuleNamespaceObject",
+            node_type_is_module_namespace_object,
+        ),
         ("isNativeError", node_type_is_native_error),
         ("isNumberObject", node_type_is_number_object),
         ("isPromise", node_type_is_promise),
@@ -8200,11 +9114,12 @@ fn node_internal_binding_types(context: &mut Context) -> Result<JsObject, Sandbo
         ("isWeakSet", node_type_is_weak_set),
         ("isAnyArrayBuffer", node_type_is_any_array_buffer),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(1)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8216,24 +9131,38 @@ fn node_internal_binding_module_wrap(context: &mut Context) -> Result<JsObject, 
     let binding = ObjectInitializer::new(context).build();
     let prototype = JsObject::with_null_proto();
     for (name, function) in [
-        ("link", node_module_wrap_link as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "link",
+            node_module_wrap_link as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("getModuleRequests", node_module_wrap_get_module_requests),
-        ("instantiate", node_module_wrap_instantiate as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "instantiate",
+            node_module_wrap_instantiate
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("evaluateSync", node_module_wrap_evaluate_sync),
         ("evaluate", node_module_wrap_evaluate),
         ("setExport", node_module_wrap_set_export),
-        ("setModuleSourceObject", node_module_wrap_set_module_source_object),
-        ("getModuleSourceObject", node_module_wrap_get_module_source_object),
+        (
+            "setModuleSourceObject",
+            node_module_wrap_set_module_source_object,
+        ),
+        (
+            "getModuleSourceObject",
+            node_module_wrap_get_module_source_object,
+        ),
         ("createCachedData", node_module_wrap_create_cached_data),
         ("getNamespace", node_module_wrap_get_namespace),
         ("getStatus", node_module_wrap_get_status),
         ("getError", node_module_wrap_get_error),
     ] {
-        let method = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(1)
-            .constructor(false)
-            .build();
+        let method =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         prototype
             .set(JsString::from(name), JsValue::from(method), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8265,10 +9194,20 @@ fn node_internal_binding_module_wrap(context: &mut Context) -> Result<JsObject, 
     .constructor(true)
     .build();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype), true, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     binding
-        .set(js_string!("ModuleWrap"), JsValue::from(constructor), true, context)
+        .set(
+            js_string!("ModuleWrap"),
+            JsValue::from(constructor),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     for (name, value) in [
         ("kUninstantiated", 0i32),
@@ -8285,19 +9224,30 @@ fn node_internal_binding_module_wrap(context: &mut Context) -> Result<JsObject, 
             .map_err(sandbox_execution_error)?;
     }
     for (name, function) in [
-        ("setImportModuleDynamicallyCallback", node_module_wrap_set_import_module_dynamically_callback as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("setInitializeImportMetaObjectCallback", node_module_wrap_set_initialize_import_meta_object_callback),
-        ("createRequiredModuleFacade", node_module_wrap_create_required_module_facade),
-        ("throwIfPromiseRejected", node_module_wrap_throw_if_promise_rejected),
+        (
+            "setImportModuleDynamicallyCallback",
+            node_module_wrap_set_import_module_dynamically_callback
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "setInitializeImportMetaObjectCallback",
+            node_module_wrap_set_initialize_import_meta_object_callback,
+        ),
+        (
+            "createRequiredModuleFacade",
+            node_module_wrap_create_required_module_facade,
+        ),
+        (
+            "throwIfPromiseRejected",
+            node_module_wrap_throw_if_promise_rejected,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(1)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         binding
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8319,16 +9269,27 @@ fn node_internal_binding_errors(context: &mut Context) -> Result<JsObject, Sandb
         .set(js_string!("exitCodes"), exit_codes, true, context)
         .map_err(sandbox_execution_error)?;
     for (name, function) in [
-        ("setEnhanceStackForFatalException", node_errors_set_enhance_stack_for_fatal_exception as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("setPrepareStackTraceCallback", node_errors_set_prepare_stack_trace_callback),
+        (
+            "setEnhanceStackForFatalException",
+            node_errors_set_enhance_stack_for_fatal_exception
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "setPrepareStackTraceCallback",
+            node_errors_set_prepare_stack_trace_callback,
+        ),
         ("setSourceMapsEnabled", node_errors_set_source_maps_enabled),
-        ("setMaybeCacheGeneratedSourceMap", node_errors_set_maybe_cache_generated_source_map),
+        (
+            "setMaybeCacheGeneratedSourceMap",
+            node_errors_set_maybe_cache_generated_source_map,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(1)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8355,25 +9316,63 @@ fn node_internal_binding_util(context: &mut Context) -> Result<JsObject, Sandbox
     )
     .map_err(sandbox_execution_error)?;
     for (name, description) in [
-        ("arrow_message_private_symbol", "node.arrow_message_private_symbol"),
-        ("contextify_context_private_symbol", "node:contextify:context"),
+        (
+            "arrow_message_private_symbol",
+            "node.arrow_message_private_symbol",
+        ),
+        (
+            "contextify_context_private_symbol",
+            "node:contextify:context",
+        ),
         ("decorated_private_symbol", "node.decorated_private_symbol"),
         ("exit_info_private_symbol", "node.exit_info_private_symbol"),
-        ("host_defined_option_symbol", "node.host_defined_option_symbol"),
+        (
+            "host_defined_option_symbol",
+            "node.host_defined_option_symbol",
+        ),
         ("transfer_mode_private_symbol", "node:transfer_mode"),
-        ("entry_point_module_private_symbol", "node:entry_point_module"),
-        ("entry_point_promise_private_symbol", "node:entry_point_promise"),
+        (
+            "entry_point_module_private_symbol",
+            "node:entry_point_module",
+        ),
+        (
+            "entry_point_promise_private_symbol",
+            "node:entry_point_promise",
+        ),
         ("module_source_private_symbol", "node:module_source"),
-        ("module_export_names_private_symbol", "node:module_export_names"),
-        ("module_circular_visited_private_symbol", "node:module_circular_visited"),
+        (
+            "module_export_names_private_symbol",
+            "node:module_export_names",
+        ),
+        (
+            "module_circular_visited_private_symbol",
+            "node:module_circular_visited",
+        ),
         ("module_export_private_symbol", "node:module_export"),
-        ("module_first_parent_private_symbol", "node:module_first_parent"),
-        ("module_last_parent_private_symbol", "node:module_last_parent"),
-        ("untransferable_object_private_symbol", "node:untransferableObject"),
-        ("source_map_data_private_symbol", "node:source_map_data_private_symbol"),
+        (
+            "module_first_parent_private_symbol",
+            "node:module_first_parent",
+        ),
+        (
+            "module_last_parent_private_symbol",
+            "node:module_last_parent",
+        ),
+        (
+            "untransferable_object_private_symbol",
+            "node:untransferableObject",
+        ),
+        (
+            "source_map_data_private_symbol",
+            "node:source_map_data_private_symbol",
+        ),
     ] {
         private_symbols
-            .set(JsString::from(name), node_symbol(description)?, true, context)
+            .set(
+                JsString::from(name),
+                node_symbol(description)?,
+                true,
+                context,
+            )
             .map_err(sandbox_execution_error)?;
     }
     object
@@ -8418,12 +9417,33 @@ fn node_internal_binding_util(context: &mut Context) -> Result<JsObject, Sandbox
         )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("constructSharedArrayBuffer", 1usize, node_util_construct_shared_array_buffer as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "constructSharedArrayBuffer",
+            1usize,
+            node_util_construct_shared_array_buffer
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("guessHandleType", 1usize, node_util_guess_handle_type),
-        ("defineLazyProperties", 4usize, node_util_define_lazy_properties),
-        ("getOwnNonIndexProperties", 2usize, node_util_get_own_non_index_properties),
-        ("isInsideNodeModules", 1usize, node_util_is_inside_node_modules),
-        ("arrayBufferViewHasBuffer", 1usize, node_util_array_buffer_view_has_buffer),
+        (
+            "defineLazyProperties",
+            4usize,
+            node_util_define_lazy_properties,
+        ),
+        (
+            "getOwnNonIndexProperties",
+            2usize,
+            node_util_get_own_non_index_properties,
+        ),
+        (
+            "isInsideNodeModules",
+            1usize,
+            node_util_is_inside_node_modules,
+        ),
+        (
+            "arrayBufferViewHasBuffer",
+            1usize,
+            node_util_array_buffer_view_has_buffer,
+        ),
         ("previewEntries", 2usize, node_util_preview_entries),
         ("getCallSites", 1usize, node_util_get_call_sites),
         ("getCallerLocation", 0usize, node_util_get_caller_location),
@@ -8433,11 +9453,12 @@ fn node_internal_binding_util(context: &mut Context) -> Result<JsObject, Sandbox
         ("getExternalValue", 1usize, node_util_get_external_value),
         ("sleep", 1usize, node_util_sleep),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8481,7 +9502,12 @@ fn node_internal_binding_uv(context: &mut Context) -> Result<JsObject, SandboxEr
     .constructor(false)
     .build();
     object
-        .set(js_string!("getErrorMap"), JsValue::from(get_error_map), true, context)
+        .set(
+            js_string!("getErrorMap"),
+            JsValue::from(get_error_map),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     Ok(object)
 }
@@ -8489,36 +9515,54 @@ fn node_internal_binding_uv(context: &mut Context) -> Result<JsObject, SandboxEr
 fn node_internal_binding_cares_wrap(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, length, function) in [
-        ("getaddrinfo", 5usize, node_cares_getaddrinfo as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "getaddrinfo",
+            5usize,
+            node_cares_getaddrinfo as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("getnameinfo", 3usize, node_cares_getnameinfo),
         ("canonicalizeIP", 1usize, node_cares_canonicalize_ip),
-        ("convertIpv6StringToBuffer", 1usize, node_cares_convert_ipv6_string_to_buffer),
+        (
+            "convertIpv6StringToBuffer",
+            1usize,
+            node_cares_convert_ipv6_string_to_buffer,
+        ),
         ("strerror", 1usize, node_cares_strerror),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
     for (name, constructor) in [
-        ("GetAddrInfoReqWrap", node_cares_req_wrap_construct as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "GetAddrInfoReqWrap",
+            node_cares_req_wrap_construct
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("GetNameInfoReqWrap", node_cares_req_wrap_construct),
         ("QueryReqWrap", node_cares_req_wrap_construct),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(constructor))
-            .name(JsString::from(name))
-            .length(0)
-            .constructor(true)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(constructor))
+                .name(JsString::from(name))
+                .length(0)
+                .constructor(true)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
-    let af_inet6 = if cfg!(target_os = "macos") || cfg!(target_os = "ios") { 30 } else { 10 };
+    let af_inet6 = if cfg!(target_os = "macos") || cfg!(target_os = "ios") {
+        30
+    } else {
+        10
+    };
     for (name, value) in [
         ("AF_INET", 2),
         ("AF_INET6", af_inet6),
@@ -8629,7 +9673,11 @@ fn node_cares_getaddrinfo(
             .into_iter()
             .map(|value| JsValue::from(JsString::from(value)));
         let result = JsArray::from_iter(values, context);
-        let _ = oncomplete.call(&JsValue::from(req.clone()), &[JsValue::from(0), JsValue::from(result)], context);
+        let _ = oncomplete.call(
+            &JsValue::from(req.clone()),
+            &[JsValue::from(0), JsValue::from(result)],
+            context,
+        );
     }
     Ok(JsValue::from(0))
 }
@@ -8667,12 +9715,21 @@ fn node_cares_getnameinfo(
 fn node_internal_binding_os(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, length, function) in [
-        ("getAvailableParallelism", 0usize, node_os_get_available_parallelism as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "getAvailableParallelism",
+            0usize,
+            node_os_get_available_parallelism
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("getCPUs", 0usize, node_os_get_cpus),
         ("getFreeMem", 0usize, node_os_get_free_mem),
         ("getHomeDirectory", 0usize, node_os_get_home_directory),
         ("getHostname", 0usize, node_os_get_hostname),
-        ("getInterfaceAddresses", 0usize, node_os_get_interface_addresses),
+        (
+            "getInterfaceAddresses",
+            0usize,
+            node_os_get_interface_addresses,
+        ),
         ("getLoadAvg", 0usize, node_os_get_load_avg),
         ("getPriority", 0usize, node_os_get_priority),
         ("getOSInformation", 0usize, node_os_get_os_information),
@@ -8681,11 +9738,12 @@ fn node_internal_binding_os(context: &mut Context) -> Result<JsObject, SandboxEr
         ("getUptime", 0usize, node_os_get_uptime),
         ("setPriority", 2usize, node_os_set_priority),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8720,10 +9778,20 @@ fn node_internal_binding_credentials(context: &mut Context) -> Result<JsObject, 
     .constructor(false)
     .build();
     object
-        .set(js_string!("safeGetenv"), JsValue::from(safe_getenv), true, context)
+        .set(
+            js_string!("safeGetenv"),
+            JsValue::from(safe_getenv),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
-        .set(js_string!("getTempDir"), JsValue::from(get_temp_dir), true, context)
+        .set(
+            js_string!("getTempDir"),
+            JsValue::from(get_temp_dir),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
         .set(
@@ -8750,13 +9818,30 @@ fn node_internal_binding_process_methods(
         )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("patchProcessObject", 1usize, node_process_methods_patch_process_object as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "patchProcessObject",
+            1usize,
+            node_process_methods_patch_process_object
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("dlopen", 0usize, node_process_methods_dlopen),
         ("uptime", 0usize, node_process_methods_uptime),
         ("causeSegfault", 0usize, node_process_methods_cause_segfault),
-        ("_getActiveRequests", 0usize, node_process_methods_get_active_requests),
-        ("_getActiveHandles", 0usize, node_process_methods_get_active_handles),
-        ("getActiveResourcesInfo", 0usize, node_process_methods_get_active_resources_info),
+        (
+            "_getActiveRequests",
+            0usize,
+            node_process_methods_get_active_requests,
+        ),
+        (
+            "_getActiveHandles",
+            0usize,
+            node_process_methods_get_active_handles,
+        ),
+        (
+            "getActiveResourcesInfo",
+            0usize,
+            node_process_methods_get_active_resources_info,
+        ),
         ("reallyExit", 1usize, node_process_methods_really_exit),
         ("_kill", 2usize, node_process_methods_kill),
         ("cpuUsage", 1usize, node_process_methods_cpu_usage),
@@ -8766,27 +9851,37 @@ fn node_internal_binding_process_methods(
         ("resourceUsage", 1usize, node_process_methods_resource_usage),
         ("loadEnvFile", 1usize, node_process_methods_load_env_file),
         ("execve", 3usize, node_process_methods_execve),
-        ("constrainedMemory", 0usize, node_process_methods_constrained_memory),
-        ("availableMemory", 0usize, node_process_methods_available_memory),
+        (
+            "constrainedMemory",
+            0usize,
+            node_process_methods_constrained_memory,
+        ),
+        (
+            "availableMemory",
+            0usize,
+            node_process_methods_available_memory,
+        ),
         ("abort", 0usize, node_process_methods_abort),
         ("cwd", 0usize, node_process_methods_cwd),
         ("chdir", 1usize, node_process_methods_chdir),
         ("umask", 1usize, node_process_methods_umask),
-        ("setEmitWarningSync", 1usize, node_process_methods_set_emit_warning_sync),
+        (
+            "setEmitWarningSync",
+            1usize,
+            node_process_methods_set_emit_warning_sync,
+        ),
         ("_rawDebug", 1usize, node_process_methods_raw_debug),
         ("_debugProcess", 1usize, node_process_methods_debug_process),
         ("_debugEnd", 0usize, node_process_methods_debug_end),
         ("hrtime", 0usize, node_process_methods_hrtime),
         ("hrtimeBigInt", 0usize, node_process_methods_hrtime_bigint),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8805,7 +9900,12 @@ fn node_internal_binding_trace_events(context: &mut Context) -> Result<JsObject,
     .constructor(true)
     .build();
     object
-        .set(js_string!("CategorySet"), JsValue::from(category_set), true, context)
+        .set(
+            js_string!("CategorySet"),
+            JsValue::from(category_set),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     let getter = FunctionObjectBuilder::new(
         context.realm(),
@@ -8856,17 +9956,21 @@ fn node_internal_binding_trace_events(context: &mut Context) -> Result<JsObject,
         )
         .map_err(sandbox_execution_error)?;
     for (name, function) in [
-        ("trace", node_trace_events_trace as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("isTraceCategoryEnabled", node_trace_events_is_category_enabled),
+        (
+            "trace",
+            node_trace_events_trace as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "isTraceCategoryEnabled",
+            node_trace_events_is_category_enabled,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(1)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8882,25 +9986,35 @@ fn node_internal_binding_task_queue(
     object
         .set(
             js_string!("tickInfo"),
-            JsValue::from(node_bootstrap_cached_array(host, context, "tickInfo", &serde_json::json!([0, 0]))?),
+            JsValue::from(node_bootstrap_cached_array(
+                host,
+                context,
+                "tickInfo",
+                &serde_json::json!([0, 0]),
+            )?),
             true,
             context,
         )
         .map_err(sandbox_execution_error)?;
     for (name, function) in [
-        ("runMicrotasks", node_task_queue_run_microtasks as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "runMicrotasks",
+            node_task_queue_run_microtasks
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("setTickCallback", node_task_queue_set_tick_callback),
         ("enqueueMicrotask", node_task_queue_enqueue_microtask),
-        ("setPromiseRejectCallback", node_task_queue_set_promise_reject_callback),
+        (
+            "setPromiseRejectCallback",
+            node_task_queue_set_promise_reject_callback,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(1)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8958,20 +10072,26 @@ fn node_internal_binding_timers(
         )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("setupTimers", 2usize, node_timers_setup_timers as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "setupTimers",
+            2usize,
+            node_timers_setup_timers as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("scheduleTimer", 1usize, node_timers_schedule_timer),
         ("toggleTimerRef", 1usize, node_timers_toggle_timer_ref),
-        ("toggleImmediateRef", 1usize, node_timers_toggle_immediate_ref),
+        (
+            "toggleImmediateRef",
+            1usize,
+            node_timers_toggle_immediate_ref,
+        ),
         ("getLibuvNow", 0usize, node_timers_get_libuv_now),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -8983,15 +10103,25 @@ fn node_internal_binding_locks(context: &mut Context) -> Result<JsObject, Sandbo
     let object = ObjectInitializer::new(context).build();
     for (name, value) in [
         ("LOCK_MODE_SHARED", JsValue::from(js_string!("shared"))),
-        ("LOCK_MODE_EXCLUSIVE", JsValue::from(js_string!("exclusive"))),
-        ("LOCK_STOLEN_ERROR", JsValue::from(js_string!("LOCK_STOLEN"))),
+        (
+            "LOCK_MODE_EXCLUSIVE",
+            JsValue::from(js_string!("exclusive")),
+        ),
+        (
+            "LOCK_STOLEN_ERROR",
+            JsValue::from(js_string!("LOCK_STOLEN")),
+        ),
     ] {
         object
             .set(JsString::from(name), value, true, context)
             .map_err(sandbox_execution_error)?;
     }
     for (name, length, function) in [
-        ("request", 6usize, node_locks_request as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "request",
+            6usize,
+            node_locks_request as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("query", 0usize, node_locks_query),
     ] {
         object
@@ -9015,7 +10145,11 @@ fn node_internal_binding_locks(context: &mut Context) -> Result<JsObject, Sandbo
     Ok(object)
 }
 
-fn node_locks_make_internal_lock(name: &str, mode: &str, context: &mut Context) -> Result<JsValue, SandboxError> {
+fn node_locks_make_internal_lock(
+    name: &str,
+    mode: &str,
+    context: &mut Context,
+) -> Result<JsValue, SandboxError> {
     Ok(JsValue::from_json(
         &serde_json::json!({
             "name": name,
@@ -9043,7 +10177,12 @@ fn node_locks_release_request(
         .borrow()
         .held_locks
         .iter()
-        .filter_map(|(name, locks)| locks.iter().any(|lock| lock.request_id == request_id).then_some(name.clone()))
+        .filter_map(|(name, locks)| {
+            locks
+                .iter()
+                .any(|lock| lock.request_id == request_id)
+                .then_some(name.clone())
+        })
         .collect::<Vec<_>>();
 
     {
@@ -9162,12 +10301,19 @@ fn node_locks_grant_request(
     node_locks_attach_release_handlers(host, request_id, result, resolve, reject, context)
 }
 
-fn node_locks_process_pending(host: &NodeRuntimeHost, context: &mut Context) -> Result<(), SandboxError> {
+fn node_locks_process_pending(
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
     loop {
         let grantable_index = {
             let bootstrap = host.bootstrap.borrow();
             bootstrap.pending_locks.iter().position(|pending| {
-                let held = bootstrap.held_locks.get(&pending.name).map(Vec::as_slice).unwrap_or(&[]);
+                let held = bootstrap
+                    .held_locks
+                    .get(&pending.name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
                 node_locks_is_compatible(held, &pending.mode)
             })
         };
@@ -9199,15 +10345,24 @@ fn node_locks_request(
     let name = node_arg_string(args, 0, context)?;
     let client_id = node_arg_string(args, 1, context)?;
     let mode = node_arg_string(args, 2, context)?;
-    let steal = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
-    let if_available = args.get(4).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
-    let callback = args
-        .get(5)
-        .and_then(JsValue::as_object)
-        .ok_or_else(|| JsNativeError::typ().with_message("locks.request callback must be callable"))?;
+    let steal = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
+    let if_available = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
+    let callback = args.get(5).and_then(JsValue::as_object).ok_or_else(|| {
+        JsNativeError::typ().with_message("locks.request callback must be callable")
+    })?;
     let _ = JsValue::from(callback.clone())
         .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("locks.request callback must be callable"))?;
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("locks.request callback must be callable")
+        })?;
 
     node_with_host_js(context, |host, context| {
         let (promise, resolvers) = JsPromise::new_pending(context);
@@ -9236,7 +10391,11 @@ fn node_locks_request(
 
         let compatible = {
             let bootstrap = host.bootstrap.borrow();
-            let held = bootstrap.held_locks.get(&name).map(Vec::as_slice).unwrap_or(&[]);
+            let held = bootstrap
+                .held_locks
+                .get(&name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             node_locks_is_compatible(held, &mode)
         };
 
@@ -9261,12 +10420,11 @@ fn node_locks_request(
                 context.realm(),
                 NativeFunction::from_copy_closure_with_captures(
                     |_this, args, resolve, context| {
-                        resolve
-                            .call(
-                                &JsValue::undefined(),
-                                &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
-                                context,
-                            )?;
+                        resolve.call(
+                            &JsValue::undefined(),
+                            &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
+                            context,
+                        )?;
                         Ok(JsValue::undefined())
                     },
                     resolvers.resolve.clone(),
@@ -9295,15 +10453,18 @@ fn node_locks_request(
                 .then(Some(on_fulfilled), Some(on_rejected), context)
                 .map_err(sandbox_execution_error)?;
         } else {
-            host.bootstrap.borrow_mut().pending_locks.push(NodePendingLockState {
-                request_id,
-                name,
-                client_id,
-                mode,
-                callback: callback.clone(),
-                resolve: resolvers.resolve.clone().into(),
-                reject: resolvers.reject.clone().into(),
-            });
+            host.bootstrap
+                .borrow_mut()
+                .pending_locks
+                .push(NodePendingLockState {
+                    request_id,
+                    name,
+                    client_id,
+                    mode,
+                    callback: callback.clone(),
+                    resolve: resolvers.resolve.clone().into(),
+                    reject: resolvers.reject.clone().into(),
+                });
         }
 
         Ok(JsValue::from(promise))
@@ -9394,7 +10555,9 @@ fn node_worker_get_env_message_port(
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, context| {
         if let Some(id) = host.bootstrap.borrow().env_message_port {
-            return Ok(JsValue::from(node_messaging_materialize_port(host, id, context)?));
+            return Ok(JsValue::from(node_messaging_materialize_port(
+                host, id, context,
+            )?));
         }
         Ok(JsValue::undefined())
     })
@@ -9440,9 +10603,15 @@ fn node_internal_binding_async_wrap(
     for (name, value) in [
         ("async_hook_fields", JsValue::from(async_hook_fields)),
         ("async_id_fields", JsValue::from(async_id_fields)),
-        ("execution_async_resources", JsValue::from(execution_async_resources)),
+        (
+            "execution_async_resources",
+            JsValue::from(execution_async_resources),
+        ),
         ("async_ids_stack", JsValue::from(async_ids_stack)),
-        ("Providers", JsValue::from_json(&serde_json::json!({}), context).map_err(sandbox_execution_error)?),
+        (
+            "Providers",
+            JsValue::from_json(&serde_json::json!({}), context).map_err(sandbox_execution_error)?,
+        ),
         (
             "constants",
             JsValue::from_json(
@@ -9471,25 +10640,48 @@ fn node_internal_binding_async_wrap(
             .map_err(sandbox_execution_error)?;
     }
     for (name, length, function) in [
-        ("setCallbackTrampoline", 1usize, node_async_wrap_set_callback_trampoline as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("registerDestroyHook", 2usize, node_async_wrap_register_destroy_hook),
-        ("queueDestroyAsyncId", 1usize, node_async_wrap_queue_destroy_async_id),
+        (
+            "setCallbackTrampoline",
+            1usize,
+            node_async_wrap_set_callback_trampoline
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "registerDestroyHook",
+            2usize,
+            node_async_wrap_register_destroy_hook,
+        ),
+        (
+            "queueDestroyAsyncId",
+            1usize,
+            node_async_wrap_queue_destroy_async_id,
+        ),
         ("setPromiseHooks", 4usize, node_async_wrap_set_promise_hooks),
         ("getPromiseHooks", 0usize, node_async_wrap_get_promise_hooks),
         ("setupHooks", 1usize, node_async_wrap_setup_hooks),
-        ("pushAsyncContext", 3usize, node_async_wrap_push_async_context),
+        (
+            "pushAsyncContext",
+            3usize,
+            node_async_wrap_push_async_context,
+        ),
         ("popAsyncContext", 1usize, node_async_wrap_pop_async_context),
-        ("executionAsyncResource", 1usize, node_async_wrap_execution_async_resource),
-        ("clearAsyncIdStack", 0usize, node_async_wrap_clear_async_id_stack),
+        (
+            "executionAsyncResource",
+            1usize,
+            node_async_wrap_execution_async_resource,
+        ),
+        (
+            "clearAsyncIdStack",
+            0usize,
+            node_async_wrap_clear_async_id_stack,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -9505,7 +10697,8 @@ fn node_internal_binding_async_context_frame(
         (
             "getContinuationPreservedEmbedderData",
             0usize,
-            node_async_context_frame_get as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            node_async_context_frame_get
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "setContinuationPreservedEmbedderData",
@@ -9513,14 +10706,12 @@ fn node_internal_binding_async_context_frame(
             node_async_context_frame_set,
         ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -9539,23 +10730,52 @@ fn node_internal_binding_symbols(context: &mut Context) -> Result<JsObject, Sand
         ("constructor_key_symbol", "constructor_key_symbol"),
         ("handle_onclose_symbol", "handle_onclose"),
         ("no_message_symbol", "no_message_symbol"),
-        ("messaging_deserialize_symbol", "messaging_deserialize_symbol"),
+        (
+            "messaging_deserialize_symbol",
+            "messaging_deserialize_symbol",
+        ),
         ("messaging_transfer_symbol", "messaging_transfer_symbol"),
         ("messaging_clone_symbol", "messaging_clone_symbol"),
-        ("messaging_transfer_list_symbol", "messaging_transfer_list_symbol"),
+        (
+            "messaging_transfer_list_symbol",
+            "messaging_transfer_list_symbol",
+        ),
         ("imported_cjs_symbol", "imported_cjs_symbol"),
         ("oninit", "oninit"),
         ("onpskexchange", "onpskexchange"),
-        ("source_text_module_default_hdo", "source_text_module_default_hdo"),
+        (
+            "source_text_module_default_hdo",
+            "source_text_module_default_hdo",
+        ),
         ("vm_context_no_contextify", "vm_context_no_contextify"),
-        ("vm_dynamic_import_default_internal", "node.vm_dynamic_import_default_internal"),
-        ("vm_dynamic_import_main_context_default", "vm_dynamic_import_main_context_default"),
-        ("vm_dynamic_import_missing_flag", "vm_dynamic_import_missing_flag"),
-        ("vm_dynamic_import_no_callback", "vm_dynamic_import_no_callback"),
-        ("contextify_context_private_symbol", "node:contextify:context"),
+        (
+            "vm_dynamic_import_default_internal",
+            "node.vm_dynamic_import_default_internal",
+        ),
+        (
+            "vm_dynamic_import_main_context_default",
+            "vm_dynamic_import_main_context_default",
+        ),
+        (
+            "vm_dynamic_import_missing_flag",
+            "vm_dynamic_import_missing_flag",
+        ),
+        (
+            "vm_dynamic_import_no_callback",
+            "vm_dynamic_import_no_callback",
+        ),
+        (
+            "contextify_context_private_symbol",
+            "node:contextify:context",
+        ),
     ] {
         object
-            .set(JsString::from(name), node_symbol(description)?, true, context)
+            .set(
+                JsString::from(name),
+                node_symbol(description)?,
+                true,
+                context,
+            )
             .map_err(sandbox_execution_error)?;
     }
     Ok(object)
@@ -9568,18 +10788,21 @@ fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, S
         (
             "runInContext",
             5usize,
-            node_contextify_script_run_in_context as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            node_contextify_script_run_in_context
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("createCachedData", 0usize, node_contextify_script_create_cached_data),
+        (
+            "createCachedData",
+            0usize,
+            node_contextify_script_create_cached_data,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         script_prototype
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -9593,7 +10816,12 @@ fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, S
     .constructor(true)
     .build();
     script_constructor
-        .set(js_string!("prototype"), JsValue::from(script_prototype), true, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(script_prototype),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
         .set(
@@ -9623,23 +10851,47 @@ fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, S
         .set(js_string!("constants"), constants, true, context)
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("makeContext", 7usize, node_contextify_make_context as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("containsModuleSyntax", 2usize, node_contextify_contains_module_syntax as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("compileFunctionForCJSLoader", 4usize, node_contextify_compile_function_for_cjs_loader),
+        (
+            "makeContext",
+            7usize,
+            node_contextify_make_context
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "containsModuleSyntax",
+            2usize,
+            node_contextify_contains_module_syntax
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "compileFunctionForCJSLoader",
+            4usize,
+            node_contextify_compile_function_for_cjs_loader,
+        ),
         ("compileFunction", 10usize, node_contextify_compile_function),
-        ("startSigintWatchdog", 0usize, node_contextify_start_sigint_watchdog),
-        ("stopSigintWatchdog", 0usize, node_contextify_stop_sigint_watchdog),
-        ("watchdogHasPendingSigint", 0usize, node_contextify_watchdog_has_pending_sigint),
+        (
+            "startSigintWatchdog",
+            0usize,
+            node_contextify_start_sigint_watchdog,
+        ),
+        (
+            "stopSigintWatchdog",
+            0usize,
+            node_contextify_stop_sigint_watchdog,
+        ),
+        (
+            "watchdogHasPendingSigint",
+            0usize,
+            node_contextify_watchdog_has_pending_sigint,
+        ),
         ("measureMemory", 2usize, node_contextify_measure_memory),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -9686,7 +10938,12 @@ fn node_internal_binding_messaging(context: &mut Context) -> Result<JsObject, Sa
     let message_port = node_messaging_message_port_constructor(context)?;
     let message_channel = node_messaging_message_channel_constructor(context)?;
     object
-        .set(js_string!("MessagePort"), JsValue::from(message_port), true, context)
+        .set(
+            js_string!("MessagePort"),
+            JsValue::from(message_port),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
         .set(
@@ -9704,20 +10961,30 @@ fn node_internal_binding_messaging(context: &mut Context) -> Result<JsObject, Sa
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         ("structuredClone", 2usize, node_messaging_structured_clone),
-        ("receiveMessageOnPort", 1usize, node_messaging_receive_message_on_port),
-        ("drainMessagePort", 1usize, node_messaging_drain_message_port),
-        ("moveMessagePortToContext", 2usize, node_messaging_move_message_port_to_context),
+        (
+            "receiveMessageOnPort",
+            1usize,
+            node_messaging_receive_message_on_port,
+        ),
+        (
+            "drainMessagePort",
+            1usize,
+            node_messaging_drain_message_port,
+        ),
+        (
+            "moveMessagePortToContext",
+            2usize,
+            node_messaging_move_message_port_to_context,
+        ),
         ("stopMessagePort", 1usize, node_messaging_stop_message_port),
         ("broadcastChannel", 1usize, node_messaging_broadcast_channel),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -9781,9 +11048,7 @@ fn node_messaging_port_id(
         .ok_or_else(|| sandbox_execution_error("message port is missing host id"))
 }
 
-fn node_messaging_new_port(
-    context: &mut Context,
-) -> Result<JsObject, SandboxError> {
+fn node_messaging_new_port(context: &mut Context) -> Result<JsObject, SandboxError> {
     let constructor = node_internal_binding_messaging(context)?
         .get(js_string!("MessagePort"), context)
         .map_err(sandbox_execution_error)?
@@ -9842,13 +11107,28 @@ fn node_messaging_message_port_constructor(
     .build();
     let prototype = JsObject::with_null_proto();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype.clone()),
+            false,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     prototype
-        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .set(
+            js_string!("constructor"),
+            JsValue::from(constructor.clone()),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("postMessage", 1usize, node_messaging_message_port_post_message as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "postMessage",
+            1usize,
+            node_messaging_message_port_post_message
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("start", 0usize, node_messaging_message_port_start),
         ("close", 0usize, node_messaging_message_port_close),
         ("ref", 0usize, node_messaging_message_port_ref),
@@ -9925,16 +11205,14 @@ fn node_messaging_message_port_construct(
 fn node_messaging_message_channel_constructor(
     context: &mut Context,
 ) -> Result<JsFunction, SandboxError> {
-    Ok(
-        FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(node_messaging_message_channel_construct),
-        )
-        .name(js_string!("MessageChannel"))
-        .length(0)
-        .constructor(true)
-        .build(),
+    Ok(FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_messaging_message_channel_construct),
     )
+    .name(js_string!("MessageChannel"))
+    .length(0)
+    .constructor(true)
+    .build())
 }
 
 fn node_messaging_message_channel_construct(
@@ -9962,9 +11240,7 @@ fn node_messaging_message_channel_construct(
     Ok(JsValue::from(channel))
 }
 
-fn node_messaging_no_message_symbol(
-    context: &mut Context,
-) -> Result<JsValue, SandboxError> {
+fn node_messaging_no_message_symbol(context: &mut Context) -> Result<JsValue, SandboxError> {
     let symbols = node_internal_binding_symbols(context)?;
     let symbol = symbols
         .get(js_string!("no_message_symbol"), context)
@@ -10005,7 +11281,11 @@ fn node_messaging_emit_pending_messages(
         emit_message
             .call(
                 &JsValue::from(port),
-                &[message, JsValue::from(JsArray::new(context).map_err(sandbox_execution_error)?), JsValue::from(js_string!("message"))],
+                &[
+                    message,
+                    JsValue::from(JsArray::new(context).map_err(sandbox_execution_error)?),
+                    JsValue::from(js_string!("message")),
+                ],
                 context,
             )
             .map_err(sandbox_execution_error)?;
@@ -10058,12 +11338,9 @@ fn node_messaging_move_message_port_to_context(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let port = args
-        .first()
-        .and_then(JsValue::as_object)
-        .ok_or_else(|| {
-            JsNativeError::typ().with_message("The \"port\" argument must be a MessagePort instance")
-        })?;
+    let port = args.first().and_then(JsValue::as_object).ok_or_else(|| {
+        JsNativeError::typ().with_message("The \"port\" argument must be a MessagePort instance")
+    })?;
     let sandbox = args
         .get(1)
         .and_then(JsValue::as_object)
@@ -10071,10 +11348,7 @@ fn node_messaging_move_message_port_to_context(
 
     let marker = node_contextify_private_symbol(context, "contextify_context_private_symbol")
         .map_err(js_error)?;
-    if sandbox
-        .get(marker, context)?
-        .is_undefined()
-    {
+    if sandbox.get(marker, context)?.is_undefined() {
         return Err(JsNativeError::typ()
             .with_message("Invalid context argument")
             .into());
@@ -10087,7 +11361,9 @@ fn node_messaging_move_message_port_to_context(
             return Err(sandbox_execution_error("message port is missing host id"));
         };
         if state.closed {
-            return Err(sandbox_execution_error("Cannot send data on closed MessagePort"));
+            return Err(sandbox_execution_error(
+                "Cannot send data on closed MessagePort",
+            ));
         }
         let new_id = node_next_host_handle_id(host);
         state.object = None;
@@ -10123,7 +11399,9 @@ fn node_messaging_move_message_port_to_context(
             );
         }
 
-        Ok(JsValue::from(node_messaging_materialize_port(host, new_id, context)?))
+        Ok(JsValue::from(node_messaging_materialize_port(
+            host, new_id, context,
+        )?))
     })
 }
 
@@ -10179,7 +11457,9 @@ fn node_messaging_message_port_post_message(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let Some(port) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("MessagePort receiver must be an object")
+            .into());
     };
     let message = args.first().cloned().unwrap_or_else(JsValue::undefined);
     node_with_host(|host| {
@@ -10205,7 +11485,13 @@ fn node_messaging_message_port_post_message(
                 }
             }
             drop(bootstrap);
-            if let Some(targets) = host.bootstrap.borrow().broadcast_channels.get(&name).cloned() {
+            if let Some(targets) = host
+                .bootstrap
+                .borrow()
+                .broadcast_channels
+                .get(&name)
+                .cloned()
+            {
                 for target_id in targets {
                     if target_id != port_id {
                         node_messaging_emit_pending_messages(host, target_id, false, context)?;
@@ -10235,7 +11521,9 @@ fn node_messaging_message_port_start(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let Some(port) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("MessagePort receiver must be an object")
+            .into());
     };
     node_with_host(|host| {
         let id = node_messaging_port_id(host, &port, context)?;
@@ -10254,7 +11542,9 @@ fn node_messaging_message_port_close(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let Some(port) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("MessagePort receiver must be an object")
+            .into());
     };
     node_with_host(|host| {
         let id = node_messaging_port_id(host, &port, context)?;
@@ -10295,7 +11585,9 @@ fn node_messaging_message_port_close(
     let onclose = symbols
         .get(js_string!("handle_onclose_symbol"), context)?
         .as_symbol()
-        .ok_or_else(|| JsNativeError::typ().with_message("handle_onclose_symbol must be a symbol"))?;
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("handle_onclose_symbol must be a symbol")
+        })?;
     if let Some(callback) = port.get(onclose, context)?.as_callable() {
         let _ = callback.call(&JsValue::from(port.clone()), &[], context)?;
     }
@@ -10308,7 +11600,9 @@ fn node_messaging_message_port_ref(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let Some(port) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("MessagePort receiver must be an object")
+            .into());
     };
     node_with_host(|host| {
         let id = node_messaging_port_id(host, &port, context)?;
@@ -10326,7 +11620,9 @@ fn node_messaging_message_port_unref(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let Some(port) = this.as_object() else {
-        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+        return Err(JsNativeError::typ()
+            .with_message("MessagePort receiver must be an object")
+            .into());
     };
     node_with_host(|host| {
         let id = node_messaging_port_id(host, &port, context)?;
@@ -10394,24 +11690,28 @@ fn node_messaging_structured_clone(
     let callable = structured_clone.as_callable().ok_or_else(|| {
         JsNativeError::typ().with_message("global structuredClone is not callable")
     })?;
-    callable.call(
-        &JsValue::undefined(),
-        &[value, options],
-        context,
-    )
+    callable.call(&JsValue::undefined(), &[value, options], context)
 }
 
 fn node_internal_binding_profiler(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, function) in [
-        ("setCoverageDirectory", node_profiler_set_coverage_directory as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("setSourceMapCacheGetter", node_profiler_set_source_map_cache_getter),
+        (
+            "setCoverageDirectory",
+            node_profiler_set_coverage_directory
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "setSourceMapCacheGetter",
+            node_profiler_set_source_map_cache_getter,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(1)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10437,27 +11737,69 @@ fn node_internal_binding_inspector(context: &mut Context) -> Result<JsObject, Sa
         .set(js_string!("console"), console, true, context)
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("callAndPauseOnStart", 6usize, node_inspector_call_and_pause_on_start as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "callAndPauseOnStart",
+            6usize,
+            node_inspector_call_and_pause_on_start
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("consoleCall", 3usize, node_inspector_console_call),
         ("open", 2usize, node_inspector_open),
         ("url", 0usize, node_inspector_url),
         ("waitForDebugger", 0usize, node_inspector_wait_for_debugger),
-        ("asyncTaskScheduled", 3usize, node_inspector_async_task_scheduled),
-        ("asyncTaskCanceled", 1usize, node_inspector_async_task_canceled),
-        ("asyncTaskStarted", 1usize, node_inspector_async_task_started),
-        ("asyncTaskFinished", 1usize, node_inspector_async_task_finished),
-        ("registerAsyncHook", 2usize, node_inspector_register_async_hook),
+        (
+            "asyncTaskScheduled",
+            3usize,
+            node_inspector_async_task_scheduled,
+        ),
+        (
+            "asyncTaskCanceled",
+            1usize,
+            node_inspector_async_task_canceled,
+        ),
+        (
+            "asyncTaskStarted",
+            1usize,
+            node_inspector_async_task_started,
+        ),
+        (
+            "asyncTaskFinished",
+            1usize,
+            node_inspector_async_task_finished,
+        ),
+        (
+            "registerAsyncHook",
+            2usize,
+            node_inspector_register_async_hook,
+        ),
         ("isEnabled", 0usize, node_inspector_is_enabled),
-        ("emitProtocolEvent", 2usize, node_inspector_emit_protocol_event),
-        ("setupNetworkTracking", 2usize, node_inspector_setup_network_tracking),
-        ("setConsoleExtensionInstaller", 1usize, node_inspector_set_console_extension_installer),
-        ("putNetworkResource", 2usize, node_inspector_put_network_resource),
+        (
+            "emitProtocolEvent",
+            2usize,
+            node_inspector_emit_protocol_event,
+        ),
+        (
+            "setupNetworkTracking",
+            2usize,
+            node_inspector_setup_network_tracking,
+        ),
+        (
+            "setConsoleExtensionInstaller",
+            1usize,
+            node_inspector_set_console_extension_installer,
+        ),
+        (
+            "putNetworkResource",
+            2usize,
+            node_inspector_put_network_resource,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10532,20 +11874,39 @@ fn node_internal_binding_mksnapshot(context: &mut Context) -> Result<JsObject, S
         )
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("runEmbedderPreload", 2usize, node_mksnapshot_run_embedder_preload as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("setSerializeCallback", 1usize, node_mksnapshot_set_serialize_callback),
-        ("setDeserializeCallback", 1usize, node_mksnapshot_set_deserialize_callback),
-        ("setDeserializeMainFunction", 1usize, node_mksnapshot_set_deserialize_main_function),
-        ("compileSerializeMain", 2usize, node_mksnapshot_compile_serialize_main),
+        (
+            "runEmbedderPreload",
+            2usize,
+            node_mksnapshot_run_embedder_preload
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "setSerializeCallback",
+            1usize,
+            node_mksnapshot_set_serialize_callback,
+        ),
+        (
+            "setDeserializeCallback",
+            1usize,
+            node_mksnapshot_set_deserialize_callback,
+        ),
+        (
+            "setDeserializeMainFunction",
+            1usize,
+            node_mksnapshot_set_deserialize_main_function,
+        ),
+        (
+            "compileSerializeMain",
+            2usize,
+            node_mksnapshot_compile_serialize_main,
+        ),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10624,23 +11985,34 @@ fn node_internal_binding_performance(context: &mut Context) -> Result<JsObject, 
         host.bootstrap.borrow_mut().performance_observer_counts = Some(observer_counts.clone());
     }
     for (name, length, function) in [
-        ("markBootstrapComplete", 0usize, node_performance_mark_bootstrap_complete as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "markBootstrapComplete",
+            0usize,
+            node_performance_mark_bootstrap_complete
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("now", 0usize, node_performance_now),
         ("loopIdleTime", 0usize, node_performance_loop_idle_time),
         ("uvMetricsInfo", 0usize, node_performance_uv_metrics_info),
-        ("installGarbageCollectionTracking", 0usize, node_performance_install_garbage_collection_tracking),
-        ("removeGarbageCollectionTracking", 0usize, node_performance_remove_garbage_collection_tracking),
+        (
+            "installGarbageCollectionTracking",
+            0usize,
+            node_performance_install_garbage_collection_tracking,
+        ),
+        (
+            "removeGarbageCollectionTracking",
+            0usize,
+            node_performance_remove_garbage_collection_tracking,
+        ),
         ("notify", 2usize, node_performance_notify),
         ("setupObservers", 2usize, node_performance_setup_observers),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10651,19 +12023,25 @@ fn node_internal_binding_performance(context: &mut Context) -> Result<JsObject, 
 fn node_internal_binding_sea(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, length, function) in [
-        ("isSea", 0usize, node_sea_is_sea as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
-        ("isExperimentalSeaWarningNeeded", 0usize, node_sea_is_experimental_warning_needed),
+        (
+            "isSea",
+            0usize,
+            node_sea_is_sea as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "isExperimentalSeaWarningNeeded",
+            0usize,
+            node_sea_is_experimental_warning_needed,
+        ),
         ("getAsset", 1usize, node_sea_get_asset),
         ("getAssetKeys", 0usize, node_sea_get_asset_keys),
     ] {
-        let value = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_fn_ptr(function),
-        )
-        .name(JsString::from(name))
-        .length(length)
-        .constructor(false)
-        .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10674,7 +12052,11 @@ fn node_internal_binding_sea(context: &mut Context) -> Result<JsObject, SandboxE
 fn node_internal_binding_report(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, length, function) in [
-        ("writeReport", 4usize, node_report_write_report as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "writeReport",
+            4usize,
+            node_report_write_report as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("getReport", 1usize, node_report_get_report),
         ("getDirectory", 0usize, node_report_get_directory),
         ("setDirectory", 1usize, node_report_set_directory),
@@ -10686,20 +12068,45 @@ fn node_internal_binding_report(context: &mut Context) -> Result<JsObject, Sandb
         ("setExcludeNetwork", 1usize, node_report_set_exclude_network),
         ("getSignal", 0usize, node_report_get_signal),
         ("setSignal", 1usize, node_report_set_signal),
-        ("shouldReportOnFatalError", 0usize, node_report_get_report_on_fatal_error),
-        ("setReportOnFatalError", 1usize, node_report_set_report_on_fatal_error),
-        ("shouldReportOnSignal", 0usize, node_report_get_report_on_signal),
-        ("setReportOnSignal", 1usize, node_report_set_report_on_signal),
-        ("shouldReportOnUncaughtException", 0usize, node_report_get_report_on_uncaught_exception),
-        ("setReportOnUncaughtException", 1usize, node_report_set_report_on_uncaught_exception),
+        (
+            "shouldReportOnFatalError",
+            0usize,
+            node_report_get_report_on_fatal_error,
+        ),
+        (
+            "setReportOnFatalError",
+            1usize,
+            node_report_set_report_on_fatal_error,
+        ),
+        (
+            "shouldReportOnSignal",
+            0usize,
+            node_report_get_report_on_signal,
+        ),
+        (
+            "setReportOnSignal",
+            1usize,
+            node_report_set_report_on_signal,
+        ),
+        (
+            "shouldReportOnUncaughtException",
+            0usize,
+            node_report_get_report_on_uncaught_exception,
+        ),
+        (
+            "setReportOnUncaughtException",
+            1usize,
+            node_report_set_report_on_uncaught_exception,
+        ),
         ("getExcludeEnv", 0usize, node_report_get_exclude_env),
         ("setExcludeEnv", 1usize, node_report_set_exclude_env),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10711,15 +12118,20 @@ fn node_internal_binding_signal_wrap(context: &mut Context) -> Result<JsObject, 
     let object = ObjectInitializer::new(context).build();
     let prototype = JsObject::with_null_proto();
     for (name, length, function) in [
-        ("unref", 0usize, node_signal_wrap_unref as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "unref",
+            0usize,
+            node_signal_wrap_unref as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("start", 1usize, node_signal_wrap_start),
         ("close", 0usize, node_signal_wrap_close),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         prototype
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10733,10 +12145,20 @@ fn node_internal_binding_signal_wrap(context: &mut Context) -> Result<JsObject, 
     .constructor(true)
     .build();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype), true, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
-        .set(js_string!("Signal"), JsValue::from(constructor), true, context)
+        .set(
+            js_string!("Signal"),
+            JsValue::from(constructor),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     Ok(object)
 }
@@ -10745,14 +12167,19 @@ fn node_internal_binding_watchdog(context: &mut Context) -> Result<JsObject, San
     let object = ObjectInitializer::new(context).build();
     let prototype = JsObject::with_null_proto();
     for (name, length, function) in [
-        ("start", 0usize, node_watchdog_start as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "start",
+            0usize,
+            node_watchdog_start as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("stop", 0usize, node_watchdog_stop),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         prototype
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -10766,7 +12193,12 @@ fn node_internal_binding_watchdog(context: &mut Context) -> Result<JsObject, San
     .constructor(true)
     .build();
     constructor
-        .set(js_string!("prototype"), JsValue::from(prototype), true, context)
+        .set(
+            js_string!("prototype"),
+            JsValue::from(prototype),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     object
         .set(
@@ -10784,10 +12216,9 @@ fn node_inspector_call_and_pause_on_start(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let function = args
-        .first()
-        .and_then(JsValue::as_callable)
-        .ok_or_else(|| JsNativeError::typ().with_message("inspector.callAndPauseOnStart requires callable"))?;
+    let function = args.first().and_then(JsValue::as_callable).ok_or_else(|| {
+        JsNativeError::typ().with_message("inspector.callAndPauseOnStart requires callable")
+    })?;
     let this_value = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
     let call_args = args.get(2..).unwrap_or(&[]);
     function.call(&this_value, call_args, context)
@@ -10798,14 +12229,12 @@ fn node_inspector_console_call(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let inspector_method = args
-        .first()
-        .and_then(JsValue::as_callable)
-        .ok_or_else(|| JsNativeError::typ().with_message("inspector consoleCall requires inspector callable"))?;
-    let node_method = args
-        .get(1)
-        .and_then(JsValue::as_callable)
-        .ok_or_else(|| JsNativeError::typ().with_message("inspector consoleCall requires node callable"))?;
+    let inspector_method = args.first().and_then(JsValue::as_callable).ok_or_else(|| {
+        JsNativeError::typ().with_message("inspector consoleCall requires inspector callable")
+    })?;
+    let node_method = args.get(1).and_then(JsValue::as_callable).ok_or_else(|| {
+        JsNativeError::typ().with_message("inspector consoleCall requires node callable")
+    })?;
     let call_args = args.get(2..).unwrap_or(&[]);
     let _ = inspector_method.call(this, call_args, context)?;
     node_method.call(this, call_args, context)
@@ -10816,7 +12245,10 @@ fn node_inspector_open(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let port = if args.first().is_some_and(|value| !value.is_null() && !value.is_undefined()) {
+    let port = if args
+        .first()
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
         let value = args
             .first()
             .cloned()
@@ -10827,7 +12259,10 @@ fn node_inspector_open(
     } else {
         9229
     };
-    let host_name = if args.get(1).is_some_and(|value| !value.is_null() && !value.is_undefined()) {
+    let host_name = if args
+        .get(1)
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
         node_arg_string(args, 1, context)?
     } else {
         "127.0.0.1".to_string()
@@ -10911,7 +12346,11 @@ fn node_inspector_async_task_canceled(
         .unwrap_or_else(JsValue::undefined)
         .to_number(context)? as u64;
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().inspector.async_tasks.remove(&task_id);
+        host.bootstrap
+            .borrow_mut()
+            .inspector
+            .async_tasks
+            .remove(&task_id);
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -10936,7 +12375,11 @@ fn node_inspector_async_task_started(
             );
         }
         Ok(JsValue::from(
-            host.bootstrap.borrow().inspector.async_tasks.contains_key(&task_id),
+            host.bootstrap
+                .borrow()
+                .inspector
+                .async_tasks
+                .contains_key(&task_id),
         ))
     })
     .map_err(js_error)
@@ -10962,7 +12405,11 @@ fn node_inspector_async_task_finished(
         }
         if let Some((_, recurring)) = host.bootstrap.borrow().inspector.async_tasks.get(&task_id) {
             if !*recurring {
-                host.bootstrap.borrow_mut().inspector.async_tasks.remove(&task_id);
+                host.bootstrap
+                    .borrow_mut()
+                    .inspector
+                    .async_tasks
+                    .remove(&task_id);
             }
         }
         Ok(JsValue::undefined())
@@ -11002,9 +12449,7 @@ fn node_inspector_emit_protocol_event(
 ) -> JsResult<JsValue> {
     let event_name = node_arg_string(args, 0, context)?;
     let params = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
-    let params_json = params
-        .to_json(context)?
-        .unwrap_or(JsonValue::Null);
+    let params_json = params.to_json(context)?.unwrap_or(JsonValue::Null);
     node_with_host(|host| {
         host.bootstrap
             .borrow_mut()
@@ -11039,8 +12484,10 @@ fn node_inspector_set_console_extension_installer(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().inspector.console_extension_installer =
-            args.first().and_then(JsValue::as_object);
+        host.bootstrap
+            .borrow_mut()
+            .inspector
+            .console_extension_installer = args.first().and_then(JsValue::as_object);
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -11080,7 +12527,8 @@ fn node_wasm_web_api_set_implementation(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().wasm_web_api_callback = args.first().and_then(JsValue::as_object);
+        host.bootstrap.borrow_mut().wasm_web_api_callback =
+            args.first().and_then(JsValue::as_object);
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -11091,7 +12539,10 @@ fn node_cjs_lexer_parse(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let source = if args.first().is_some_and(|value| !value.is_null() && !value.is_undefined()) {
+    let source = if args
+        .first()
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
         args.first()
             .cloned()
             .unwrap_or_else(JsValue::undefined)
@@ -11105,7 +12556,11 @@ fn node_cjs_lexer_parse(
         .map_err(sandbox_execution_error)
         .map_err(js_error)?
         .as_object()
-        .ok_or_else(|| js_error(sandbox_execution_error("failed to create Set for cjs lexer")))?;
+        .ok_or_else(|| {
+            js_error(sandbox_execution_error(
+                "failed to create Set for cjs lexer",
+            ))
+        })?;
     let add = exports_set
         .get(js_string!("add"), context)?
         .as_callable()
@@ -11153,7 +12608,8 @@ fn node_permission_has(
                         &host.process.borrow().cwd,
                         &path.to_std_string_escaped(),
                     );
-                    path.starts_with(&host.workspace_root) || path.starts_with(NODE_UPSTREAM_VFS_ROOT)
+                    path.starts_with(&host.workspace_root)
+                        || path.starts_with(NODE_UPSTREAM_VFS_ROOT)
                 } else {
                     true
                 }
@@ -11193,7 +12649,12 @@ fn node_mksnapshot_set_serialize_callback(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
-        if host.bootstrap.borrow().snapshot_serialize_callback.is_some() {
+        if host
+            .bootstrap
+            .borrow()
+            .snapshot_serialize_callback
+            .is_some()
+        {
             return Err(sandbox_execution_error(
                 "mksnapshot serialize callback already registered",
             ));
@@ -11211,7 +12672,12 @@ fn node_mksnapshot_set_deserialize_callback(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
-        if host.bootstrap.borrow().snapshot_deserialize_callback.is_some() {
+        if host
+            .bootstrap
+            .borrow()
+            .snapshot_deserialize_callback
+            .is_some()
+        {
             return Err(sandbox_execution_error(
                 "mksnapshot deserialize callback already registered",
             ));
@@ -11229,13 +12695,19 @@ fn node_mksnapshot_set_deserialize_main_function(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
-        if host.bootstrap.borrow().snapshot_deserialize_main_function.is_some() {
+        if host
+            .bootstrap
+            .borrow()
+            .snapshot_deserialize_main_function
+            .is_some()
+        {
             return Err(sandbox_execution_error(
                 "mksnapshot deserialize main function already registered",
             ));
         }
-        host.bootstrap.borrow_mut().snapshot_deserialize_main_function =
-            args.first().and_then(JsValue::as_object);
+        host.bootstrap
+            .borrow_mut()
+            .snapshot_deserialize_main_function = args.first().and_then(JsValue::as_object);
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -11286,8 +12758,12 @@ fn node_performance_loop_idle_time(
     _args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().performance_loop_idle_time_ms)))
-        .map_err(js_error)
+    node_with_host(|host| {
+        Ok(JsValue::from(
+            host.bootstrap.borrow().performance_loop_idle_time_ms,
+        ))
+    })
+    .map_err(js_error)
 }
 
 fn node_performance_uv_metrics_info(
@@ -11407,9 +12883,9 @@ fn node_performance_notify(
                 return Ok(JsValue::undefined());
             }
         }
-        let callable = JsValue::from(callback)
-            .as_callable()
-            .ok_or_else(|| sandbox_execution_error("performance observer callback is not callable"))?;
+        let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
+            sandbox_execution_error("performance observer callback is not callable")
+        })?;
         callable
             .call(&JsValue::undefined(), &[entry], context)
             .map_err(sandbox_execution_error)?;
@@ -11422,10 +12898,7 @@ fn node_sea_is_sea(
     _args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_with_host(|host| {
-        Ok(JsValue::from(host.bootstrap.borrow().sea.enabled))
-    })
-    .map_err(js_error)
+    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().sea.enabled))).map_err(js_error)
 }
 
 fn node_sea_is_experimental_warning_needed(
@@ -11435,7 +12908,9 @@ fn node_sea_is_experimental_warning_needed(
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
         let sea = &host.bootstrap.borrow().sea;
-        Ok(JsValue::from(sea.enabled && sea.experimental_warning_needed))
+        Ok(JsValue::from(
+            sea.enabled && sea.experimental_warning_needed,
+        ))
     })
     .map_err(js_error)
 }
@@ -11484,7 +12959,10 @@ fn node_report_write_report(
 ) -> JsResult<JsValue> {
     let event = node_arg_string(args, 0, context)?;
     let trigger = node_arg_string(args, 1, context)?;
-    let file = if args.get(2).is_some_and(|value| !value.is_null() && !value.is_undefined()) {
+    let file = if args
+        .get(2)
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
         Some(node_arg_string(args, 2, context)?)
     } else {
         None
@@ -11527,7 +13005,10 @@ fn node_report_get_report(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let (event, trigger) = if let Some(error) = args.first().filter(|value| !value.is_null() && !value.is_undefined()) {
+    let (event, trigger) = if let Some(error) = args
+        .first()
+        .filter(|value| !value.is_null() && !value.is_undefined())
+    {
         let message = error
             .as_object()
             .and_then(|object| object.get(js_string!("message"), context).ok())
@@ -11537,8 +13018,10 @@ fn node_report_get_report(
     } else {
         ("JavaScript API".to_string(), "API".to_string())
     };
-    node_with_host(|host| node_report_json(host, &event, &trigger).map(|report| JsValue::from(JsString::from(report))))
-        .map_err(js_error)
+    node_with_host(|host| {
+        node_report_json(host, &event, &trigger).map(|report| JsValue::from(JsString::from(report)))
+    })
+    .map_err(js_error)
 }
 
 fn node_report_get_directory(
@@ -11546,8 +13029,12 @@ fn node_report_get_directory(
     _args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(JsString::from(host.bootstrap.borrow().report.directory.clone()))))
-        .map_err(js_error)
+    node_with_host(|host| {
+        Ok(JsValue::from(JsString::from(
+            host.bootstrap.borrow().report.directory.clone(),
+        )))
+    })
+    .map_err(js_error)
 }
 
 fn node_report_set_directory(
@@ -11568,8 +13055,12 @@ fn node_report_get_filename(
     _args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(JsString::from(host.bootstrap.borrow().report.filename.clone()))))
-        .map_err(js_error)
+    node_with_host(|host| {
+        Ok(JsValue::from(JsString::from(
+            host.bootstrap.borrow().report.filename.clone(),
+        )))
+    })
+    .map_err(js_error)
 }
 
 fn node_report_set_filename(
@@ -11585,82 +13076,179 @@ fn node_report_set_filename(
     .map_err(js_error)
 }
 
-fn node_report_get_compact(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.compact))).map_err(js_error)
+fn node_report_get_compact(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.compact)))
+        .map_err(js_error)
 }
 
-fn node_report_set_compact(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+fn node_report_set_compact(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
         host.bootstrap.borrow_mut().report.compact = args.first().is_some_and(JsValue::to_boolean);
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_report_get_exclude_network(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.exclude_network))).map_err(js_error)
-}
-
-fn node_report_set_exclude_network(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+fn node_report_get_exclude_network(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().report.exclude_network = args.first().is_some_and(JsValue::to_boolean);
+        Ok(JsValue::from(
+            host.bootstrap.borrow().report.exclude_network,
+        ))
+    })
+    .map_err(js_error)
+}
+
+fn node_report_set_exclude_network(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| {
+        host.bootstrap.borrow_mut().report.exclude_network =
+            args.first().is_some_and(JsValue::to_boolean);
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_report_get_signal(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(JsString::from(host.bootstrap.borrow().report.signal.clone())))).map_err(js_error)
+fn node_report_get_signal(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| {
+        Ok(JsValue::from(JsString::from(
+            host.bootstrap.borrow().report.signal.clone(),
+        )))
+    })
+    .map_err(js_error)
 }
 
-fn node_report_set_signal(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_report_set_signal(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     let signal = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
         host.bootstrap.borrow_mut().report.signal = signal;
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_report_get_report_on_fatal_error(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.report_on_fatal_error))).map_err(js_error)
-}
-
-fn node_report_set_report_on_fatal_error(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+fn node_report_get_report_on_fatal_error(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().report.report_on_fatal_error = args.first().is_some_and(JsValue::to_boolean);
-        Ok(JsValue::undefined())
-    }).map_err(js_error)
+        Ok(JsValue::from(
+            host.bootstrap.borrow().report.report_on_fatal_error,
+        ))
+    })
+    .map_err(js_error)
 }
 
-fn node_report_get_report_on_signal(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.report_on_signal))).map_err(js_error)
-}
-
-fn node_report_set_report_on_signal(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+fn node_report_set_report_on_fatal_error(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().report.report_on_signal = args.first().is_some_and(JsValue::to_boolean);
+        host.bootstrap.borrow_mut().report.report_on_fatal_error =
+            args.first().is_some_and(JsValue::to_boolean);
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
 }
 
-fn node_report_get_report_on_uncaught_exception(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.report_on_uncaught_exception))).map_err(js_error)
-}
-
-fn node_report_set_report_on_uncaught_exception(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+fn node_report_get_report_on_signal(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().report.report_on_uncaught_exception = args.first().is_some_and(JsValue::to_boolean);
-        Ok(JsValue::undefined())
-    }).map_err(js_error)
+        Ok(JsValue::from(
+            host.bootstrap.borrow().report.report_on_signal,
+        ))
+    })
+    .map_err(js_error)
 }
 
-fn node_report_get_exclude_env(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.exclude_env))).map_err(js_error)
-}
-
-fn node_report_set_exclude_env(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+fn node_report_set_report_on_signal(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().report.exclude_env = args.first().is_some_and(JsValue::to_boolean);
+        host.bootstrap.borrow_mut().report.report_on_signal =
+            args.first().is_some_and(JsValue::to_boolean);
         Ok(JsValue::undefined())
-    }).map_err(js_error)
+    })
+    .map_err(js_error)
+}
+
+fn node_report_get_report_on_uncaught_exception(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| {
+        Ok(JsValue::from(
+            host.bootstrap.borrow().report.report_on_uncaught_exception,
+        ))
+    })
+    .map_err(js_error)
+}
+
+fn node_report_set_report_on_uncaught_exception(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| {
+        host.bootstrap
+            .borrow_mut()
+            .report
+            .report_on_uncaught_exception = args.first().is_some_and(JsValue::to_boolean);
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_report_get_exclude_env(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().report.exclude_env)))
+        .map_err(js_error)
+}
+
+fn node_report_set_exclude_env(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| {
+        host.bootstrap.borrow_mut().report.exclude_env =
+            args.first().is_some_and(JsValue::to_boolean);
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
 }
 
 fn node_signal_wrap_construct(
@@ -11686,9 +13274,9 @@ fn node_signal_wrap_unref(
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
     let refed_symbol = node_host_private_symbol(&host, "signal.refed").map_err(js_error)?;
-    let object = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("Signal.unref receiver must be an object"))?;
+    let object = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("Signal.unref receiver must be an object")
+    })?;
     object.set(refed_symbol, JsValue::from(false), true, context)?;
     Ok(JsValue::undefined())
 }
@@ -11706,9 +13294,9 @@ fn node_signal_wrap_start(
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .to_i32(context)?;
-    let object = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("Signal.start receiver must be an object"))?;
+    let object = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("Signal.start receiver must be an object")
+    })?;
     object.set(active_symbol, JsValue::from(true), true, context)?;
     object.set(signal_symbol, JsValue::from(signal_number), true, context)?;
     Ok(JsValue::from(0))
@@ -11721,9 +13309,9 @@ fn node_signal_wrap_close(
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
     let active_symbol = node_host_private_symbol(&host, "signal.active").map_err(js_error)?;
-    let object = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("Signal.close receiver must be an object"))?;
+    let object = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("Signal.close receiver must be an object")
+    })?;
     object.set(active_symbol, JsValue::from(false), true, context)?;
     Ok(JsValue::undefined())
 }
@@ -11747,9 +13335,9 @@ fn node_watchdog_start(
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
     let started_symbol = node_host_private_symbol(&host, "watchdog.started").map_err(js_error)?;
-    let object = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("TraceSigintWatchdog.start receiver must be an object"))?;
+    let object = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("TraceSigintWatchdog.start receiver must be an object")
+    })?;
     object.set(started_symbol, JsValue::from(true), true, context)?;
     node_with_host(|host| {
         host.bootstrap.borrow_mut().sigint_watchdog_active = true;
@@ -11765,9 +13353,9 @@ fn node_watchdog_stop(
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
     let started_symbol = node_host_private_symbol(&host, "watchdog.started").map_err(js_error)?;
-    let object = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("TraceSigintWatchdog.stop receiver must be an object"))?;
+    let object = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("TraceSigintWatchdog.stop receiver must be an object")
+    })?;
     object.set(started_symbol, JsValue::from(false), true, context)?;
     node_with_host(|host| {
         host.bootstrap.borrow_mut().sigint_watchdog_active = false;
@@ -11910,9 +13498,9 @@ fn node_trace_events_category_set_construct(
     let host = active_node_host().map_err(js_error)?;
     let categories_symbol =
         node_host_private_symbol(&host, "trace_events.categories").map_err(js_error)?;
-    let target = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("CategorySet receiver must be an object"))?;
+    let target = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("CategorySet receiver must be an object")
+    })?;
     let categories = node_arg_json::<Vec<String>>(args, 0, context).unwrap_or_default();
     target
         .set(
@@ -11926,14 +13514,19 @@ fn node_trace_events_category_set_construct(
         .map_err(sandbox_execution_error)
         .map_err(js_error)?;
     for (name, function) in [
-        ("enable", node_trace_events_category_set_enable as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "enable",
+            node_trace_events_category_set_enable
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("disable", node_trace_events_category_set_disable),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(0)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(0)
+                .constructor(false)
+                .build();
         target
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)
@@ -11965,7 +13558,10 @@ fn node_trace_events_category_set_enable(
         .map_err(sandbox_execution_error)
         .map_err(js_error)?;
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().trace_categories.extend(categories);
+        host.bootstrap
+            .borrow_mut()
+            .trace_categories
+            .extend(categories);
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -11977,9 +13573,9 @@ fn node_trace_events_category_set_enable(
             .trace_category_state_update_handler
             .clone()
         {
-            let callable = JsValue::from(callback)
-                .as_callable()
-                .ok_or_else(|| sandbox_execution_error("trace category state update handler is not callable"))?;
+            let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
+                sandbox_execution_error("trace category state update handler is not callable")
+            })?;
             let _ = callable
                 .call(&JsValue::undefined(), &[], context)
                 .map_err(sandbox_execution_error)?;
@@ -12026,9 +13622,9 @@ fn node_trace_events_category_set_disable(
             .trace_category_state_update_handler
             .clone()
         {
-            let callable = JsValue::from(callback)
-                .as_callable()
-                .ok_or_else(|| sandbox_execution_error("trace category state update handler is not callable"))?;
+            let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
+                sandbox_execution_error("trace category state update handler is not callable")
+            })?;
             let _ = callable
                 .call(&JsValue::undefined(), &[], context)
                 .map_err(sandbox_execution_error)?;
@@ -12063,7 +13659,9 @@ fn node_trace_events_set_category_state_update_handler(
 ) -> JsResult<JsValue> {
     let callback = args.first().and_then(JsValue::as_object);
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().trace_category_state_update_handler = callback;
+        host.bootstrap
+            .borrow_mut()
+            .trace_category_state_update_handler = callback;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -12087,9 +13685,11 @@ fn node_trace_events_get_category_enabled_buffer(
         }
         let enabled = host.bootstrap.borrow().trace_categories.contains(&category);
         let value = context
-            .eval(Source::from_bytes(
-                if enabled { b"new Uint8Array([1])" } else { b"new Uint8Array([0])" },
-            ))
+            .eval(Source::from_bytes(if enabled {
+                b"new Uint8Array([1])"
+            } else {
+                b"new Uint8Array([0])"
+            }))
             .map_err(sandbox_execution_error)?;
         let object = value.as_object().ok_or_else(|| SandboxError::Execution {
             entrypoint: "<node-runtime>".to_string(),
@@ -12114,8 +13714,9 @@ fn node_trace_events_trace(
         .unwrap_or_else(JsValue::undefined)
         .to_string(context)?
         .to_std_string_escaped();
-    let enabled = node_with_host(|host| Ok(host.bootstrap.borrow().trace_categories.contains(&category)))
-        .map_err(js_error)?;
+    let enabled =
+        node_with_host(|host| Ok(host.bootstrap.borrow().trace_categories.contains(&category)))
+            .map_err(js_error)?;
     if enabled {
         let detail = args
             .iter()
@@ -12137,8 +13738,12 @@ fn node_trace_events_is_category_enabled(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let category = node_arg_string(args, 0, context)?;
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().trace_categories.contains(&category))))
-        .map_err(js_error)
+    node_with_host(|host| {
+        Ok(JsValue::from(
+            host.bootstrap.borrow().trace_categories.contains(&category),
+        ))
+    })
+    .map_err(js_error)
 }
 
 fn node_trace_events_sync_category_buffers(
@@ -12149,7 +13754,12 @@ fn node_trace_events_sync_category_buffers(
     for (category, buffer) in &state.trace_category_buffers {
         let enabled = state.trace_categories.contains(category);
         buffer
-            .set(0u32, JsValue::from(if enabled { 1 } else { 0 }), true, context)
+            .set(
+                0u32,
+                JsValue::from(if enabled { 1 } else { 0 }),
+                true,
+                context,
+            )
             .map_err(sandbox_execution_error)?;
     }
     Ok(())
@@ -12501,7 +14111,10 @@ fn node_process_methods_get_active_handles(
             .and_then(|value| value.to_u32(context).ok())
             .unwrap_or(0);
         for _ in 0..immediate_count {
-            handles.push(node_process_methods_make_named_handle(context, "Immediate")?);
+            handles.push(node_process_methods_make_named_handle(
+                context,
+                "Immediate",
+            )?);
         }
         if state.sigint_watchdog_active {
             handles.push(node_process_methods_make_named_handle(
@@ -12529,7 +14142,10 @@ fn node_process_methods_get_active_requests(
         }
         let zlib_stream_count = host.zlib_streams.borrow().entries.len();
         for _ in 0..zlib_stream_count {
-            requests.push(node_process_methods_make_named_handle(context, "ZlibStream")?);
+            requests.push(node_process_methods_make_named_handle(
+                context,
+                "ZlibStream",
+            )?);
         }
         Ok(JsValue::from(JsArray::from_iter(requests, context)))
     })
@@ -12595,7 +14211,6 @@ fn node_process_methods_really_exit(
         Err(SandboxError::ProcessExited)
     })
     .map_err(js_error)
-
 }
 
 fn node_process_methods_kill(
@@ -12703,7 +14318,10 @@ fn node_process_methods_rss(
             .map(|file| file.contents.len())
             .sum::<usize>() as f64;
         let process = host.process.borrow();
-        let rss = module_bytes + open_file_bytes + process.stdout.len() as f64 + process.stderr.len() as f64;
+        let rss = module_bytes
+            + open_file_bytes
+            + process.stdout.len() as f64
+            + process.stderr.len() as f64;
         Ok(JsValue::from(rss))
     })
     .map_err(js_error)
@@ -12714,10 +14332,9 @@ fn node_process_methods_resource_usage(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let array = args
-        .first()
-        .and_then(JsValue::as_object)
-        .ok_or_else(|| JsNativeError::typ().with_message("resourceUsage target must be an object"))?;
+    let array = args.first().and_then(JsValue::as_object).ok_or_else(|| {
+        JsNativeError::typ().with_message("resourceUsage target must be an object")
+    })?;
     node_with_host(|host| {
         let user_micros = node_monotonic_now_ms(host) * 1000.0;
         let max_rss = host
@@ -12781,11 +14398,16 @@ fn node_process_methods_execve(
         .map_err(js_error)?;
     let env = env
         .into_iter()
-        .filter_map(|entry| entry.split_once('=').map(|(key, value)| (key.to_string(), value.to_string())))
+        .filter_map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+        })
         .collect::<BTreeMap<_, _>>();
     node_with_host(|host| {
         let cwd = host.process.borrow().cwd.clone();
-        let result = execute_direct_child_process(host, command.clone(), argv.clone(), cwd, env, None)?;
+        let result =
+            execute_direct_child_process(host, command.clone(), argv.clone(), cwd, env, None)?;
         if let Some(error) = result.error {
             return Err(SandboxError::Execution {
                 entrypoint: "<node-runtime>".to_string(),
@@ -12829,7 +14451,10 @@ fn node_process_methods_available_memory(
             .map(|file| file.contents.len() as f64)
             .sum::<f64>();
         let process = host.process.borrow();
-        let used = module_bytes + open_file_bytes + process.stdout.len() as f64 + process.stderr.len() as f64;
+        let used = module_bytes
+            + open_file_bytes
+            + process.stdout.len() as f64
+            + process.stderr.len() as f64;
         let total = 512_f64 * 1024_f64 * 1024_f64;
         Ok(JsValue::from((total - used).max(0.0)))
     })
@@ -12891,8 +14516,12 @@ fn node_process_methods_cwd(
     _args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(JsString::from(host.process.borrow().cwd.clone()))))
-        .map_err(js_error)
+    node_with_host(|host| {
+        Ok(JsValue::from(JsString::from(
+            host.process.borrow().cwd.clone(),
+        )))
+    })
+    .map_err(js_error)
 }
 
 fn node_process_methods_chdir(
@@ -12952,13 +14581,14 @@ fn node_process_methods_set_emit_warning_sync(
     args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    let callback = args
-        .first()
-        .and_then(JsValue::as_object)
-        .ok_or_else(|| JsNativeError::typ().with_message("emitWarningSync callback must be a function"))?;
+    let callback = args.first().and_then(JsValue::as_object).ok_or_else(|| {
+        JsNativeError::typ().with_message("emitWarningSync callback must be a function")
+    })?;
     let _ = JsValue::from(callback.clone())
         .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("emitWarningSync callback must be a function"))?;
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("emitWarningSync callback must be a function")
+        })?;
     node_with_host(|host| {
         host.bootstrap.borrow_mut().emit_warning_sync = Some(callback);
         Ok(JsValue::undefined())
@@ -13046,7 +14676,9 @@ fn node_process_methods_hrtime_bigint(
     node_with_host_js(context, |host, context| {
         let nanos = (node_monotonic_now_ms(host) * 1_000_000.0) as u128;
         context
-            .eval(Source::from_bytes(format!("BigInt(\"{nanos}\")").as_bytes()))
+            .eval(Source::from_bytes(
+                format!("BigInt(\"{nanos}\")").as_bytes(),
+            ))
             .map_err(sandbox_execution_error)
     })
 }
@@ -13172,8 +14804,7 @@ fn node_timers_get_libuv_now(
     _args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(node_monotonic_now_ms(host))))
-        .map_err(js_error)
+    node_with_host(|host| Ok(JsValue::from(node_monotonic_now_ms(host)))).map_err(js_error)
 }
 
 fn node_async_wrap_set_callback_trampoline(
@@ -13233,9 +14864,9 @@ fn node_async_wrap_queue_destroy_async_id(
     })
     .map_err(js_error)?;
     if let (true, Some(callback)) = destroy {
-        let callable = JsValue::from(callback)
-            .as_callable()
-            .ok_or_else(|| JsNativeError::typ().with_message("async_hooks.destroy must be callable"))?;
+        let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
+            JsNativeError::typ().with_message("async_hooks.destroy must be callable")
+        })?;
         let _ = callable.call(
             &JsValue::undefined(),
             &[JsValue::from(async_id as f64)],
@@ -13312,17 +14943,19 @@ fn node_async_wrap_push_async_context(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let binding = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("async_wrap receiver must be an object"))?;
-    let async_hook_fields = node_get_object_property_as_object(context, &binding, "async_hook_fields")
-        .map_err(js_error)?;
+    let binding = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("async_wrap receiver must be an object")
+    })?;
+    let async_hook_fields =
+        node_get_object_property_as_object(context, &binding, "async_hook_fields")
+            .map_err(js_error)?;
     let async_id_fields = node_get_object_property_as_object(context, &binding, "async_id_fields")
         .map_err(js_error)?;
     let async_ids_stack = node_get_object_property_as_object(context, &binding, "async_ids_stack")
         .map_err(js_error)?;
-    let resources = node_get_object_property_as_object(context, &binding, "execution_async_resources")
-        .map_err(js_error)?;
+    let resources =
+        node_get_object_property_as_object(context, &binding, "execution_async_resources")
+            .map_err(js_error)?;
 
     let async_id = args
         .first()
@@ -13340,8 +14973,13 @@ fn node_async_wrap_push_async_context(
     let current_trigger_async_id = async_id_fields.get(1u32, context)?.to_number(context)?;
 
     resources.set(stack_length, resource.clone(), true, context)?;
-    node_set_array_like_entry(context, &async_ids_stack, stack_length * 2, execution_async_id)
-        .map_err(js_error)?;
+    node_set_array_like_entry(
+        context,
+        &async_ids_stack,
+        stack_length * 2,
+        execution_async_id,
+    )
+    .map_err(js_error)?;
     node_set_array_like_entry(
         context,
         &async_ids_stack,
@@ -13352,8 +14990,7 @@ fn node_async_wrap_push_async_context(
     node_set_array_like_entry(context, &async_hook_fields, 4, stack_length + 1)
         .map_err(js_error)?;
     node_set_array_like_entry(context, &async_id_fields, 0, async_id).map_err(js_error)?;
-    node_set_array_like_entry(context, &async_id_fields, 1, trigger_async_id)
-        .map_err(js_error)?;
+    node_set_array_like_entry(context, &async_id_fields, 1, trigger_async_id).map_err(js_error)?;
     node_with_host(|host| {
         let state = &mut *host.bootstrap.borrow_mut();
         state.execution_async_id = async_id.max(0.0) as u64;
@@ -13370,17 +15007,19 @@ fn node_async_wrap_pop_async_context(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let binding = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("async_wrap receiver must be an object"))?;
-    let async_hook_fields = node_get_object_property_as_object(context, &binding, "async_hook_fields")
-        .map_err(js_error)?;
+    let binding = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("async_wrap receiver must be an object")
+    })?;
+    let async_hook_fields =
+        node_get_object_property_as_object(context, &binding, "async_hook_fields")
+            .map_err(js_error)?;
     let async_id_fields = node_get_object_property_as_object(context, &binding, "async_id_fields")
         .map_err(js_error)?;
     let async_ids_stack = node_get_object_property_as_object(context, &binding, "async_ids_stack")
         .map_err(js_error)?;
-    let resources = node_get_object_property_as_object(context, &binding, "execution_async_resources")
-        .map_err(js_error)?;
+    let resources =
+        node_get_object_property_as_object(context, &binding, "execution_async_resources")
+            .map_err(js_error)?;
 
     let expected_async_id = args
         .first()
@@ -13400,9 +15039,12 @@ fn node_async_wrap_pop_async_context(
     }
 
     let offset = stack_length - 1;
-    let previous_execution_async_id = async_ids_stack.get(offset * 2, context)?.to_number(context)?;
-    let previous_trigger_async_id =
-        async_ids_stack.get(offset * 2 + 1, context)?.to_number(context)?;
+    let previous_execution_async_id = async_ids_stack
+        .get(offset * 2, context)?
+        .to_number(context)?;
+    let previous_trigger_async_id = async_ids_stack
+        .get(offset * 2 + 1, context)?
+        .to_number(context)?;
     node_set_array_like_entry(context, &async_id_fields, 0, previous_execution_async_id)
         .map_err(js_error)?;
     node_set_array_like_entry(context, &async_id_fields, 1, previous_trigger_async_id)
@@ -13421,7 +15063,9 @@ fn node_async_wrap_pop_async_context(
         .map_err(sandbox_execution_error)
         .map_err(js_error)?
         .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("execution_async_resources.pop is not callable"))?
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("execution_async_resources.pop is not callable")
+        })?
         .call(&JsValue::from(resources.clone()), &[], context)?;
     Ok(JsValue::from(offset > 0))
 }
@@ -13431,17 +15075,21 @@ fn node_async_wrap_execution_async_resource(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let binding = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("async_wrap receiver must be an object"))?;
-    let resources = node_get_object_property_as_object(context, &binding, "execution_async_resources")
-        .map_err(js_error)?;
+    let binding = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("async_wrap receiver must be an object")
+    })?;
+    let resources =
+        node_get_object_property_as_object(context, &binding, "execution_async_resources")
+            .map_err(js_error)?;
     let index = args
         .first()
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .to_length(context)? as u32;
-    resources.get(index, context).map_err(sandbox_execution_error).map_err(js_error)
+    resources
+        .get(index, context)
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)
 }
 
 fn node_async_wrap_clear_async_id_stack(
@@ -13449,15 +15097,17 @@ fn node_async_wrap_clear_async_id_stack(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let binding = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("async_wrap receiver must be an object"))?;
-    let async_hook_fields = node_get_object_property_as_object(context, &binding, "async_hook_fields")
-        .map_err(js_error)?;
+    let binding = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("async_wrap receiver must be an object")
+    })?;
+    let async_hook_fields =
+        node_get_object_property_as_object(context, &binding, "async_hook_fields")
+            .map_err(js_error)?;
     let async_id_fields = node_get_object_property_as_object(context, &binding, "async_id_fields")
         .map_err(js_error)?;
-    let resources = node_get_object_property_as_object(context, &binding, "execution_async_resources")
-        .map_err(js_error)?;
+    let resources =
+        node_get_object_property_as_object(context, &binding, "execution_async_resources")
+            .map_err(js_error)?;
     node_set_array_like_entry(context, &async_hook_fields, 4, 0).map_err(js_error)?;
     node_set_array_like_entry(context, &async_id_fields, 0, 0).map_err(js_error)?;
     node_set_array_like_entry(context, &async_id_fields, 1, 0).map_err(js_error)?;
@@ -13561,10 +15211,20 @@ fn node_contextify_mark_context_object(
         .map_err(sandbox_execution_error)?;
     node_contextify_attach_host_defined_option(target, host_defined_option_id, context)?;
     target
-        .set(js_string!("global"), JsValue::from(target.clone()), true, context)
+        .set(
+            js_string!("global"),
+            JsValue::from(target.clone()),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     target
-        .set(js_string!("globalThis"), JsValue::from(target.clone()), true, context)
+        .set(
+            js_string!("globalThis"),
+            JsValue::from(target.clone()),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     Ok(())
 }
@@ -13575,10 +15235,20 @@ fn node_contextify_sync_context_into_global(
     context: &mut Context,
 ) -> Result<Vec<(PropertyKey, Option<JsValue>)>, SandboxError> {
     let mut previous = Vec::new();
-    for key in sandbox.own_property_keys(context).map_err(sandbox_execution_error)? {
-        let current = global.get(key.clone(), context).map_err(sandbox_execution_error)?;
-        let had_current = !current.is_undefined() || global.has_property(key.clone(), context).map_err(sandbox_execution_error)?;
-        let next = sandbox.get(key.clone(), context).map_err(sandbox_execution_error)?;
+    for key in sandbox
+        .own_property_keys(context)
+        .map_err(sandbox_execution_error)?
+    {
+        let current = global
+            .get(key.clone(), context)
+            .map_err(sandbox_execution_error)?;
+        let had_current = !current.is_undefined()
+            || global
+                .has_property(key.clone(), context)
+                .map_err(sandbox_execution_error)?;
+        let next = sandbox
+            .get(key.clone(), context)
+            .map_err(sandbox_execution_error)?;
         previous.push((key.clone(), had_current.then_some(current)));
         global
             .set(key, next, true, context)
@@ -13593,8 +15263,13 @@ fn node_contextify_sync_global_back_into_context(
     previous: &[(PropertyKey, Option<JsValue>)],
     context: &mut Context,
 ) -> Result<(), SandboxError> {
-    for key in sandbox.own_property_keys(context).map_err(sandbox_execution_error)? {
-        let value = global.get(key.clone(), context).map_err(sandbox_execution_error)?;
+    for key in sandbox
+        .own_property_keys(context)
+        .map_err(sandbox_execution_error)?
+    {
+        let value = global
+            .get(key.clone(), context)
+            .map_err(sandbox_execution_error)?;
         sandbox
             .set(key, value, true, context)
             .map_err(sandbox_execution_error)?;
@@ -13660,24 +15335,19 @@ fn node_contextify_make_context(
 ) -> JsResult<JsValue> {
     let sandbox_or_sentinel = args.first().cloned().unwrap_or_else(JsValue::undefined);
     let name = node_arg_string(args, 1, context)?;
-    let origin = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(JsValue::undefined);
+    let origin = args.get(2).cloned().unwrap_or_else(JsValue::undefined);
     let origin = if origin.is_undefined() || origin.is_null() {
         None
     } else {
         Some(origin.to_string(context)?.to_std_string_escaped())
     };
-    let allow_code_gen_strings = args
-        .get(3)
-        .map(JsValue::to_boolean)
-        .unwrap_or(true);
-    let allow_code_gen_wasm = args
-        .get(4)
-        .map(JsValue::to_boolean)
-        .unwrap_or(true);
-    let own_microtask_queue = args.get(5).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
+    let allow_code_gen_strings = args.get(3).map(JsValue::to_boolean).unwrap_or(true);
+    let allow_code_gen_wasm = args.get(4).map(JsValue::to_boolean).unwrap_or(true);
+    let own_microtask_queue = args
+        .get(5)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
     let host_defined_option_id = args.get(6).cloned();
 
     let target = if let Some(sandbox) = sandbox_or_sentinel.as_object() {
@@ -13886,7 +15556,9 @@ fn node_contextify_array_like_objects(
             .get(index, context)
             .map_err(sandbox_execution_error)?
             .as_object()
-            .ok_or_else(|| sandbox_execution_error(format!("contextExtensions[{index}] must be an object")))?;
+            .ok_or_else(|| {
+                sandbox_execution_error(format!("contextExtensions[{index}] must be an object"))
+            })?;
         values.push(value);
     }
     Ok(values)
@@ -13902,7 +15574,9 @@ fn node_contextify_cached_data_bytes(
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
-    node_bytes_from_js(value, context).map(Some).map_err(sandbox_execution_error)
+    node_bytes_from_js(value, context)
+        .map(Some)
+        .map_err(sandbox_execution_error)
 }
 
 fn node_contextify_compile_function_for_cjs_loader(
@@ -13923,7 +15597,10 @@ fn node_contextify_compile_function_for_cjs_loader(
     let can_parse_as_esm = if should_detect_module {
         node_contextify_contains_module_syntax(
             &JsValue::undefined(),
-            &[JsValue::from(JsString::from(content.clone())), JsValue::from(JsString::from(filename.clone()))],
+            &[
+                JsValue::from(JsString::from(content.clone())),
+                JsValue::from(JsString::from(filename.clone())),
+            ],
             context,
         )?
         .to_boolean()
@@ -13935,9 +15612,9 @@ fn node_contextify_compile_function_for_cjs_loader(
         content,
         filename.replace('\\', "\\\\")
     );
-    let function = match context.eval(
-        Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(filename.clone())),
-    ) {
+    let function = match context
+        .eval(Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(filename.clone())))
+    {
         Ok(value) => Some(value),
         Err(error) => {
             if should_detect_module && can_parse_as_esm {
@@ -14030,8 +15707,7 @@ fn node_contextify_compile_function(
         .unwrap_or_else(JsValue::undefined)
         .to_i32(context)
         .unwrap_or_default();
-    let cached_data =
-        node_contextify_cached_data_bytes(args.get(4), context).map_err(js_error)?;
+    let cached_data = node_contextify_cached_data_bytes(args.get(4), context).map_err(js_error)?;
     let produce_cached_data = args.get(5).is_some_and(JsValue::to_boolean);
     let params = node_contextify_array_like_strings(args.get(8), context).map_err(js_error)?;
     let context_extensions =
@@ -14105,9 +15781,9 @@ fn node_contextify_compile_function(
             .map_err(js_error)?;
     }
     let factory = factory?;
-    let factory = factory
-        .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("compileFunction factory is not callable"))?;
+    let factory = factory.as_callable().ok_or_else(|| {
+        JsNativeError::typ().with_message("compileFunction factory is not callable")
+    })?;
     let function = factory
         .call(
             &JsValue::undefined(),
@@ -14128,7 +15804,9 @@ fn node_contextify_compile_function(
     result
         .set(
             js_string!("sourceURL"),
-            JsValue::from(JsString::from(source_url.unwrap_or_else(|| filename.clone()))),
+            JsValue::from(JsString::from(
+                source_url.unwrap_or_else(|| filename.clone()),
+            )),
             true,
             context,
         )
@@ -14158,7 +15836,12 @@ fn node_contextify_compile_function(
     }
     if produce_cached_data {
         result
-            .set(js_string!("cachedDataProduced"), JsValue::from(true), true, context)
+            .set(
+                js_string!("cachedDataProduced"),
+                JsValue::from(true),
+                true,
+                context,
+            )
             .map_err(sandbox_execution_error)
             .map_err(js_error)?;
         result
@@ -14177,12 +15860,8 @@ fn node_contextify_compile_function(
         .map_err(js_error)?
         .as_object()
     {
-        node_contextify_attach_host_defined_option(
-            &function_object,
-            args.get(9).cloned(),
-            context,
-        )
-        .map_err(js_error)?;
+        node_contextify_attach_host_defined_option(&function_object, args.get(9).cloned(), context)
+            .map_err(js_error)?;
     }
     Ok(JsValue::from(result))
 }
@@ -14196,9 +15875,9 @@ fn node_contextify_script_construct(
     let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
     let cached_data_symbol =
         node_host_private_symbol(&host, "contextify.cached_data").map_err(js_error)?;
-    let target = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("ContextifyScript receiver must be an object"))?;
+    let target = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("ContextifyScript receiver must be an object")
+    })?;
     let code = node_arg_string(args, 0, context)?;
     let filename = node_arg_string(args, 1, context)?;
     let line_offset = args
@@ -14213,8 +15892,7 @@ fn node_contextify_script_construct(
         .unwrap_or_else(JsValue::undefined)
         .to_i32(context)
         .unwrap_or_default();
-    let cached_data =
-        node_contextify_cached_data_bytes(args.get(4), context).map_err(js_error)?;
+    let cached_data = node_contextify_cached_data_bytes(args.get(4), context).map_err(js_error)?;
     let produce_cached_data = args.get(5).is_some_and(JsValue::to_boolean);
     let host_defined_option_id = args.get(7).cloned();
     let (annotated_source_url, source_map_url) = node_extract_source_annotations(&code);
@@ -14240,7 +15918,10 @@ fn node_contextify_script_construct(
     .map_err(sandbox_execution_error)
     .map_err(js_error)?;
     for (key, value) in [
-        (PropertyKey::from(js_string!("sourceURL")), JsValue::from(JsString::from(source_url))),
+        (
+            PropertyKey::from(js_string!("sourceURL")),
+            JsValue::from(JsString::from(source_url)),
+        ),
         (
             PropertyKey::from(js_string!("sourceMapURL")),
             source_map_url
@@ -14306,7 +15987,10 @@ fn node_contextify_script_construct(
             NodeContextifyScriptState {
                 script,
                 filename,
-                cached_data: target.get(cached_data_symbol, context).ok().filter(|v| !v.is_undefined()),
+                cached_data: target
+                    .get(cached_data_symbol, context)
+                    .ok()
+                    .filter(|v| !v.is_undefined()),
             },
         );
         Ok(JsValue::undefined())
@@ -14321,9 +16005,9 @@ fn node_contextify_script_run_in_context(
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
     let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
-    let target = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("ContextifyScript receiver must be an object"))?;
+    let target = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("ContextifyScript receiver must be an object")
+    })?;
     let timeout = args
         .get(1)
         .cloned()
@@ -14333,10 +16017,13 @@ fn node_contextify_script_run_in_context(
     let display_errors = args.get(2).is_none_or(JsValue::to_boolean);
     let break_on_sigint = args.get(3).is_some_and(JsValue::to_boolean);
     let _break_on_first_line = args.get(4).is_some_and(JsValue::to_boolean);
-    let sandbox = if let Some(sandbox) = args.first().filter(|value| !value.is_null() && !value.is_undefined()) {
-        let sandbox = sandbox
-            .as_object()
-            .ok_or_else(|| JsNativeError::typ().with_message("sandbox must be a contextified object"))?;
+    let sandbox = if let Some(sandbox) = args
+        .first()
+        .filter(|value| !value.is_null() && !value.is_undefined())
+    {
+        let sandbox = sandbox.as_object().ok_or_else(|| {
+            JsNativeError::typ().with_message("sandbox must be a contextified object")
+        })?;
         let marker = node_contextify_private_symbol(context, "contextify_context_private_symbol")
             .map_err(js_error)?;
         let is_context = sandbox
@@ -14398,12 +16085,8 @@ fn node_contextify_script_run_in_context(
             .into());
     }
     if break_on_sigint
-        && node_contextify_watchdog_has_pending_sigint(
-            &JsValue::undefined(),
-            &[],
-            context,
-        )?
-        .to_boolean()
+        && node_contextify_watchdog_has_pending_sigint(&JsValue::undefined(), &[], context)?
+            .to_boolean()
     {
         return Err(JsNativeError::error()
             .with_message("Script execution was interrupted by SIGINT")
@@ -14424,7 +16107,10 @@ fn node_contextify_script_run_in_context(
         .and_then(|metadata| metadata.get(js_string!("ownMicrotaskQueue"), context).ok())
         .is_some_and(|value| value.to_boolean());
     if run_microtasks {
-        context.run_jobs().map_err(sandbox_execution_error).map_err(js_error)?;
+        context
+            .run_jobs()
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
     }
     Ok(result)
 }
@@ -14434,9 +16120,9 @@ fn node_contextify_script_create_cached_data(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let target = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("ContextifyScript receiver must be an object"))?;
+    let target = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("ContextifyScript receiver must be an object")
+    })?;
     let host = active_node_host().map_err(js_error)?;
     let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
     let script_id = target
@@ -14470,7 +16156,14 @@ fn node_builtins_compile_function(
             context,
             host,
             &id,
-            &["exports", "require", "module", "process", "internalBinding", "primordials"],
+            &[
+                "exports",
+                "require",
+                "module",
+                "process",
+                "internalBinding",
+                "primordials",
+            ],
             None,
         )
     })
@@ -14548,7 +16241,9 @@ fn node_errors_set_maybe_cache_generated_source_map(
 ) -> JsResult<JsValue> {
     let callback = args.first().and_then(JsValue::as_object);
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().maybe_cache_generated_source_map_callback = callback;
+        host.bootstrap
+            .borrow_mut()
+            .maybe_cache_generated_source_map_callback = callback;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -14901,42 +16596,72 @@ fn node_buffer_compare_offset(
 ) -> JsResult<JsValue> {
     let source = args.first().cloned().unwrap_or_else(JsValue::undefined);
     let target = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
-    let target_start = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let source_start = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let target_end = args.get(4).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let source_end = args.get(5).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
+    let target_start = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let source_start = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let target_end = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let source_end = args
+        .get(5)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
     let left = node_buffer_bytes_range(&source, source_start, source_end, context)?;
     let right = node_buffer_bytes_range(&target, target_start, target_end, context)?;
     Ok(JsValue::from(node_buffer_compare_bytes(&left, &right)))
 }
 
-fn node_buffer_copy(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_buffer_copy(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let source = args.first().cloned().unwrap_or_else(JsValue::undefined);
     let target = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
-    let target_start = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let source_start = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let count = args.get(4).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let source_bytes = node_buffer_bytes_range(&source, source_start, source_start.saturating_add(count), context)?;
+    let target_start = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let source_start = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let count = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let source_bytes = node_buffer_bytes_range(
+        &source,
+        source_start,
+        source_start.saturating_add(count),
+        context,
+    )?;
     let written = node_buffer_write_bytes(&target, target_start, &source_bytes, context)?;
     Ok(JsValue::from(written as i32))
 }
 
-fn node_buffer_fill(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_buffer_fill(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let target = args.first().cloned().unwrap_or_else(JsValue::undefined);
-    let start = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let end = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let encoding = args
-        .get(4)
+    let start = args
+        .get(2)
         .cloned()
-        .unwrap_or_else(JsValue::undefined);
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let end = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let encoding = args.get(4).cloned().unwrap_or_else(JsValue::undefined);
 
     let length = node_buffer_length(&target, context)?;
     if start > end || end > length {
@@ -14949,10 +16674,9 @@ fn node_buffer_fill(
 
     let pattern = if args.get(1).is_some_and(JsValue::is_string) {
         let value = args[1].to_string(context)?.to_std_string_escaped();
-        let encoding_name = node_buffer_normalize_encoding(
-            &encoding.to_string(context)?.to_std_string_escaped(),
-        )
-        .unwrap_or("utf8");
+        let encoding_name =
+            node_buffer_normalize_encoding(&encoding.to_string(context)?.to_std_string_escaped())
+                .unwrap_or("utf8");
         if value.is_empty() {
             vec![0]
         } else if value.len() == 1 && (encoding_name == "utf8" || encoding_name == "latin1") {
@@ -14993,7 +16717,9 @@ fn node_buffer_is_ascii(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    Ok(JsValue::from(node_buffer_bytes(&args[0], context)?.is_ascii()))
+    Ok(JsValue::from(
+        node_buffer_bytes(&args[0], context)?.is_ascii(),
+    ))
 }
 
 fn node_buffer_is_utf8(
@@ -15001,7 +16727,9 @@ fn node_buffer_is_utf8(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    Ok(JsValue::from(std::str::from_utf8(&node_buffer_bytes(&args[0], context)?).is_ok()))
+    Ok(JsValue::from(
+        std::str::from_utf8(&node_buffer_bytes(&args[0], context)?).is_ok(),
+    ))
 }
 
 fn node_buffer_index_of_buffer(
@@ -15011,13 +16739,26 @@ fn node_buffer_index_of_buffer(
 ) -> JsResult<JsValue> {
     let haystack = node_buffer_bytes(&args[0], context)?;
     let needle = node_buffer_bytes(&args[1], context)?;
-    let offset = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_i32(context)? as i64;
+    let offset = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)? as i64;
     let encoding = node_buffer_encoding_from_index(
-        args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_i32(context)?,
+        args.get(3)
+            .cloned()
+            .unwrap_or_else(JsValue::undefined)
+            .to_i32(context)?,
     );
-    let is_forward = args.get(4).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
+    let is_forward = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
     let step = if encoding == "utf16le" { 2 } else { 1 };
-    Ok(JsValue::from(node_buffer_find_subsequence(&haystack, &needle, offset, is_forward, step)))
+    Ok(JsValue::from(node_buffer_find_subsequence(
+        &haystack, &needle, offset, is_forward, step,
+    )))
 }
 
 fn node_buffer_index_of_number(
@@ -15026,11 +16767,26 @@ fn node_buffer_index_of_number(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let haystack = node_buffer_bytes(&args[0], context)?;
-    let needle = (args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_u32(context)? & 0xff) as u8;
-    let offset = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_i32(context)? as i64;
-    let is_forward = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
+    let needle = (args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)?
+        & 0xff) as u8;
+    let offset = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)? as i64;
+    let is_forward = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
     let needle = [needle];
-    Ok(JsValue::from(node_buffer_find_subsequence(&haystack, &needle, offset, is_forward, 1)))
+    Ok(JsValue::from(node_buffer_find_subsequence(
+        &haystack, &needle, offset, is_forward, 1,
+    )))
 }
 
 fn node_buffer_index_of_string(
@@ -15039,15 +16795,33 @@ fn node_buffer_index_of_string(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let haystack = node_buffer_bytes(&args[0], context)?;
-    let needle_text = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
-    let offset = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_i32(context)? as i64;
+    let needle_text = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let offset = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)? as i64;
     let encoding = node_buffer_encoding_from_index(
-        args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_i32(context)?,
+        args.get(3)
+            .cloned()
+            .unwrap_or_else(JsValue::undefined)
+            .to_i32(context)?,
     );
-    let is_forward = args.get(4).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
+    let is_forward = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
     let needle = node_buffer_encode_string(&needle_text, encoding).unwrap_or_default();
     let step = if encoding == "utf16le" { 2 } else { 1 };
-    Ok(JsValue::from(node_buffer_find_subsequence(&haystack, &needle, offset, is_forward, step)))
+    Ok(JsValue::from(node_buffer_find_subsequence(
+        &haystack, &needle, offset, is_forward, step,
+    )))
 }
 
 fn node_buffer_swap_impl(
@@ -15063,24 +16837,37 @@ fn node_buffer_swap_impl(
     Ok(value.clone())
 }
 
-fn node_buffer_swap16(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    node_buffer_swap_impl(&args[0], 2, context)
-}
-
-fn node_buffer_swap32(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    node_buffer_swap_impl(&args[0], 4, context)
-}
-
-fn node_buffer_swap64(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    node_buffer_swap_impl(&args[0], 8, context)
-}
-
-fn node_buffer_btoa(
+fn node_buffer_swap16(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let input = args.first().cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
+    node_buffer_swap_impl(&args[0], 2, context)
+}
+
+fn node_buffer_swap32(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_buffer_swap_impl(&args[0], 4, context)
+}
+
+fn node_buffer_swap64(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_buffer_swap_impl(&args[0], 8, context)
+}
+
+fn node_buffer_btoa(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let input = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
     let mut bytes = Vec::with_capacity(input.len());
     for ch in input.chars() {
         let code = ch as u32;
@@ -15092,15 +16879,17 @@ fn node_buffer_btoa(
     Ok(JsValue::from(JsString::from(BASE64_STANDARD.encode(bytes))))
 }
 
-fn node_buffer_atob(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
-    let input = args.first().cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
-    let has_invalid_char = input
-        .chars()
-        .any(|ch| !ch.is_ascii_whitespace() && !matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' | '='));
+fn node_buffer_atob(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let input = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let has_invalid_char = input.chars().any(|ch| {
+        !ch.is_ascii_whitespace()
+            && !matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' | '=')
+    });
     if has_invalid_char {
         return Ok(JsValue::from(-2));
     }
@@ -15118,37 +16907,75 @@ fn node_buffer_slice_with_encoding(
     encoding: &'static str,
 ) -> JsResult<JsValue> {
     let buffer = args.first().cloned().unwrap_or_else(JsValue::undefined);
-    let start = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let end = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
+    let start = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let end = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
     let bytes = node_buffer_bytes_range(&buffer, start, end, context)?;
-    Ok(JsValue::from(JsString::from(node_buffer_decode_string(&bytes, encoding))))
+    Ok(JsValue::from(JsString::from(node_buffer_decode_string(
+        &bytes, encoding,
+    ))))
 }
 
-fn node_buffer_ascii_slice(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_ascii_slice(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_slice_with_encoding(args, context, "ascii")
 }
 
-fn node_buffer_base64_slice(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_base64_slice(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_slice_with_encoding(args, context, "base64")
 }
 
-fn node_buffer_base64url_slice(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_base64url_slice(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_slice_with_encoding(args, context, "base64url")
 }
 
-fn node_buffer_latin1_slice(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_latin1_slice(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_slice_with_encoding(args, context, "latin1")
 }
 
-fn node_buffer_hex_slice(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_hex_slice(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_slice_with_encoding(args, context, "hex")
 }
 
-fn node_buffer_ucs2_slice(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_ucs2_slice(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_slice_with_encoding(args, context, "utf16le")
 }
 
-fn node_buffer_utf8_slice(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_utf8_slice(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_slice_with_encoding(args, context, "utf8")
 }
 
@@ -15158,39 +16985,85 @@ fn node_buffer_write_string_with_encoding(
     encoding: &'static str,
 ) -> JsResult<JsValue> {
     let target = args.first().cloned().unwrap_or_else(JsValue::undefined);
-    let input = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
-    let offset = args.get(2).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
-    let max_length = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_length(context)? as usize;
+    let input = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let offset = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let max_length = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
     let bytes = node_buffer_encode_string(&input, encoding).unwrap_or_default();
-    let written = node_buffer_write_bytes(&target, offset, &bytes[..bytes.len().min(max_length)], context)?;
+    let written = node_buffer_write_bytes(
+        &target,
+        offset,
+        &bytes[..bytes.len().min(max_length)],
+        context,
+    )?;
     Ok(JsValue::from(written as i32))
 }
 
-fn node_buffer_ascii_write_static(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_ascii_write_static(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_write_string_with_encoding(args, context, "ascii")
 }
 
-fn node_buffer_base64_write(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_base64_write(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_write_string_with_encoding(args, context, "base64")
 }
 
-fn node_buffer_base64url_write(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_base64url_write(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_write_string_with_encoding(args, context, "base64url")
 }
 
-fn node_buffer_latin1_write_static(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_latin1_write_static(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_write_string_with_encoding(args, context, "latin1")
 }
 
-fn node_buffer_hex_write(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_hex_write(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_write_string_with_encoding(args, context, "hex")
 }
 
-fn node_buffer_ucs2_write(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_ucs2_write(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_write_string_with_encoding(args, context, "utf16le")
 }
 
-fn node_buffer_utf8_write_static(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_buffer_utf8_write_static(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
     node_buffer_write_string_with_encoding(args, context, "utf8")
 }
 
@@ -15199,19 +17072,17 @@ fn node_buffer_copy_array_buffer(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let destination = args
-        .first()
-        .and_then(JsValue::as_object)
-        .ok_or_else(|| JsNativeError::typ().with_message("destination must be an ArrayBuffer-compatible object"))?;
+    let destination = args.first().and_then(JsValue::as_object).ok_or_else(|| {
+        JsNativeError::typ().with_message("destination must be an ArrayBuffer-compatible object")
+    })?;
     let destination_offset = args
         .get(1)
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .to_length(context)? as u64;
-    let source = args
-        .get(2)
-        .and_then(JsValue::as_object)
-        .ok_or_else(|| JsNativeError::typ().with_message("source must be an ArrayBuffer-compatible object"))?;
+    let source = args.get(2).and_then(JsValue::as_object).ok_or_else(|| {
+        JsNativeError::typ().with_message("source must be an ArrayBuffer-compatible object")
+    })?;
     let source_offset = args
         .get(3)
         .cloned()
@@ -15229,7 +17100,11 @@ fn node_buffer_copy_array_buffer(
         .checked_add(bytes_to_copy)
         .ok_or_else(|| JsNativeError::range().with_message("source range overflow"))?;
     let source_slice = source.subarray(source_offset, source_end, context)?;
-    destination.set_values(JsValue::from(source_slice), Some(destination_offset), context)?;
+    destination.set_values(
+        JsValue::from(source_slice),
+        Some(destination_offset),
+        context,
+    )?;
     Ok(JsValue::undefined())
 }
 
@@ -15272,7 +17147,10 @@ fn node_blob_bytes_from_id(host: &NodeRuntimeHost, blob_id: u64) -> Result<Vec<u
 fn node_blob_handle_blob_id(object: &JsObject, context: &mut Context) -> JsResult<u64> {
     let host = active_node_host().map_err(js_error)?;
     let blob_id_symbol = node_host_private_symbol(&host, "blob.id").map_err(js_error)?;
-    object.get(blob_id_symbol, context)?.to_u32(context).map(u64::from)
+    object
+        .get(blob_id_symbol, context)?
+        .to_u32(context)
+        .map(u64::from)
 }
 
 fn node_blob_make_handle(context: &mut Context, blob_id: u64) -> Result<JsObject, SandboxError> {
@@ -15283,14 +17161,19 @@ fn node_blob_make_handle(context: &mut Context, blob_id: u64) -> Result<JsObject
         .set(blob_id_symbol, JsValue::from(blob_id as f64), true, context)
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
-        ("slice", 2usize, node_blob_handle_slice as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        (
+            "slice",
+            2usize,
+            node_blob_handle_slice as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         ("getReader", 0usize, node_blob_handle_get_reader),
     ] {
-        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -15311,13 +17194,21 @@ fn node_blob_reader_make(
         .set(blob_id_symbol, JsValue::from(blob_id as f64), true, context)
         .map_err(sandbox_execution_error)?;
     object
-        .set(blob_offset_symbol, JsValue::from(offset as f64), true, context)
+        .set(
+            blob_offset_symbol,
+            JsValue::from(offset as f64),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
-    let pull = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(node_blob_reader_pull))
-        .name(js_string!("pull"))
-        .length(1)
-        .constructor(false)
-        .build();
+    let pull = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_blob_reader_pull),
+    )
+    .name(js_string!("pull"))
+    .length(1)
+    .constructor(false)
+    .build();
     object
         .set(js_string!("pull"), JsValue::from(pull), true, context)
         .map_err(sandbox_execution_error)?;
@@ -15348,7 +17239,10 @@ fn node_blob_create_blob(
                 .is_some_and(|v| !v.is_undefined())
             {
                 let blob_id = node_blob_handle_blob_id(&object, context)?;
-                bytes.extend(node_with_host(|host| node_blob_bytes_from_id(host, blob_id)).map_err(js_error)?);
+                bytes.extend(
+                    node_with_host(|host| node_blob_bytes_from_id(host, blob_id))
+                        .map_err(js_error)?,
+                );
                 continue;
             }
         }
@@ -15381,16 +17275,14 @@ fn node_blob_create_blob_from_file_path(
     })
 }
 
-fn node_blob_concat(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_blob_concat(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let list = args
         .first()
         .and_then(JsValue::as_object)
         .ok_or_else(|| JsNativeError::typ().with_message("blob concat list must be an array"))?;
-    let length = list.get(js_string!("length"), context)?.to_length(context)?;
+    let length = list
+        .get(js_string!("length"), context)?
+        .to_length(context)?;
     let mut bytes = Vec::new();
     for index in 0..length {
         bytes.extend(node_buffer_bytes(&list.get(index, context)?, context)?);
@@ -15409,7 +17301,14 @@ fn node_blob_get_data_object(
 ) -> JsResult<JsValue> {
     let key = node_arg_string(args, 0, context)?;
     node_with_host_js(context, |host, context| {
-        let Some(data) = host.bootstrap.borrow().blobs.data_objects.get(&key).cloned() else {
+        let Some(data) = host
+            .bootstrap
+            .borrow()
+            .blobs
+            .data_objects
+            .get(&key)
+            .cloned()
+        else {
             return Ok(JsValue::undefined());
         };
         let handle = node_blob_make_handle(context, data.blob_id)?;
@@ -15482,9 +17381,9 @@ fn node_blob_handle_slice(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let handle = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("blob handle receiver must be an object"))?;
+    let handle = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("blob handle receiver must be an object")
+    })?;
     let blob_id = node_blob_handle_blob_id(&handle, context)?;
     let start = args
         .first()
@@ -15510,11 +17409,13 @@ fn node_blob_handle_get_reader(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let handle = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("blob handle receiver must be an object"))?;
+    let handle = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("blob handle receiver must be an object")
+    })?;
     let blob_id = node_blob_handle_blob_id(&handle, context)?;
-    node_blob_reader_make(context, blob_id, 0).map(JsValue::from).map_err(js_error)
+    node_blob_reader_make(context, blob_id, 0)
+        .map(JsValue::from)
+        .map_err(js_error)
 }
 
 fn node_blob_reader_pull(
@@ -15525,15 +17426,17 @@ fn node_blob_reader_pull(
     let host = active_node_host().map_err(js_error)?;
     let blob_id_symbol = node_host_private_symbol(&host, "blob.id").map_err(js_error)?;
     let blob_offset_symbol = node_host_private_symbol(&host, "blob.offset").map_err(js_error)?;
-    let reader = this
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("blob reader receiver must be an object"))?;
+    let reader = this.as_object().ok_or_else(|| {
+        JsNativeError::typ().with_message("blob reader receiver must be an object")
+    })?;
     let callback = args
         .first()
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("blob reader callback must be callable"))?;
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("blob reader callback must be callable")
+        })?;
     let blob_id = reader
         .get(blob_id_symbol, context)?
         .to_u32(context)
@@ -15575,19 +17478,19 @@ fn node_url_can_parse(
     } else {
         None
     };
-    let parsed = base
-        .as_deref()
-        .map_or_else(|| Url::parse(&input), |base| Url::parse(base).and_then(|base| base.join(&input)));
+    let parsed = base.as_deref().map_or_else(
+        || Url::parse(&input),
+        |base| Url::parse(base).and_then(|base| base.join(&input)),
+    );
     Ok(JsValue::from(parsed.is_ok()))
 }
 
-fn node_url_parse(
-    this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_url_parse(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let input = node_arg_string(args, 0, context)?;
-    let base = if args.get(1).is_some_and(|value| !value.is_null() && !value.is_undefined()) {
+    let base = if args
+        .get(1)
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
         Some(node_arg_string(args, 1, context)?)
     } else {
         None
@@ -15615,7 +17518,10 @@ fn node_url_path_to_file_url(
 ) -> JsResult<JsValue> {
     let input = node_arg_string(args, 0, context)?;
     let windows = args.get(1).is_some_and(JsValue::to_boolean);
-    let hostname = if args.get(2).is_some_and(|value| !value.is_null() && !value.is_undefined()) {
+    let hostname = if args
+        .get(2)
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
         Some(node_arg_string(args, 2, context)?)
     } else {
         None
@@ -15627,17 +17533,18 @@ fn node_url_path_to_file_url(
     }
     .map_err(js_error)?;
     let parsed = Url::parse(&href).map_err(|_| {
-        node_error_with_code(context, JsNativeError::typ(), "Invalid URL", "ERR_INVALID_URL")
+        node_error_with_code(
+            context,
+            JsNativeError::typ(),
+            "Invalid URL",
+            "ERR_INVALID_URL",
+        )
     })?;
     node_url_update_components(this, &parsed, context)?;
     Ok(JsValue::from(JsString::from(href)))
 }
 
-fn node_url_update(
-    this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_url_update(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let href = node_arg_string(args, 0, context)?;
     let action = args
         .get(1)
@@ -15645,8 +17552,14 @@ fn node_url_update(
         .unwrap_or_else(JsValue::undefined)
         .to_u32(context)?;
     let new_value = node_arg_string(args, 2, context)?;
-    let mut url = Url::parse(&href)
-        .map_err(|_| node_error_with_code(context, JsNativeError::typ(), "Invalid URL", "ERR_INVALID_URL"))?;
+    let mut url = Url::parse(&href).map_err(|_| {
+        node_error_with_code(
+            context,
+            JsNativeError::typ(),
+            "Invalid URL",
+            "ERR_INVALID_URL",
+        )
+    })?;
     let ok = match action {
         0 => url.set_scheme(new_value.trim_end_matches(':')).is_ok(),
         1 => url.set_host(Some(&new_value)).is_ok(),
@@ -15661,9 +17574,7 @@ fn node_url_update(
                 }
             }
         }
-        4 => {
-            url.set_username(&new_value).is_ok()
-        }
+        4 => url.set_username(&new_value).is_ok(),
         5 => {
             if new_value.is_empty() {
                 url.set_password(None).is_ok()
@@ -15718,7 +17629,10 @@ fn node_url_domain_to_ascii(
     }
     let parsed = Url::parse(&format!("ws://{input}"));
     Ok(JsValue::from(JsString::from(
-        parsed.ok().and_then(|url| url.host_str().map(str::to_string)).unwrap_or_default(),
+        parsed
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default(),
     )))
 }
 
@@ -15742,23 +17656,33 @@ fn node_url_get_origin(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let input = node_arg_string(args, 0, context)?;
-    let url = Url::parse(&input)
-        .map_err(|_| node_error_with_code(context, JsNativeError::typ(), "Invalid URL", "ERR_INVALID_URL"))?;
-    Ok(JsValue::from(JsString::from(url.origin().ascii_serialization())))
+    let url = Url::parse(&input).map_err(|_| {
+        node_error_with_code(
+            context,
+            JsNativeError::typ(),
+            "Invalid URL",
+            "ERR_INVALID_URL",
+        )
+    })?;
+    Ok(JsValue::from(JsString::from(
+        url.origin().ascii_serialization(),
+    )))
 }
 
-fn node_url_format(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_url_format(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let href = node_arg_string(args, 0, context)?;
     let hash = args.get(1).is_some_and(JsValue::to_boolean);
     let unicode = args.get(2).is_some_and(JsValue::to_boolean);
     let search = args.get(3).is_some_and(JsValue::to_boolean);
     let auth = args.get(4).is_some_and(JsValue::to_boolean);
-    let mut url = Url::parse(&href)
-        .map_err(|_| node_error_with_code(context, JsNativeError::typ(), "Invalid URL", "ERR_INVALID_URL"))?;
+    let mut url = Url::parse(&href).map_err(|_| {
+        node_error_with_code(
+            context,
+            JsNativeError::typ(),
+            "Invalid URL",
+            "ERR_INVALID_URL",
+        )
+    })?;
     if !hash {
         url.set_fragment(None);
     }
@@ -15778,7 +17702,10 @@ fn node_url_format(
 }
 
 fn node_url_parse_resolved(input: &str, base: Option<&str>) -> Result<Url, url::ParseError> {
-    base.map_or_else(|| Url::parse(input), |base| Url::parse(base).and_then(|base| base.join(input)))
+    base.map_or_else(
+        || Url::parse(input),
+        |base| Url::parse(base).and_then(|base| base.join(input)),
+    )
 }
 
 fn node_url_windows_path_to_file_href(
@@ -15800,8 +17727,7 @@ fn node_url_windows_path_to_file_href(
         &path
             .split('/')
             .map(|segment| {
-                utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC)
-                    .to_string()
+                utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC).to_string()
             })
             .collect::<Vec<_>>()
             .join("/"),
@@ -15809,11 +17735,7 @@ fn node_url_windows_path_to_file_href(
     Ok(href)
 }
 
-fn node_url_update_components(
-    binding: &JsValue,
-    url: &Url,
-    context: &mut Context,
-) -> JsResult<()> {
+fn node_url_update_components(binding: &JsValue, url: &Url, context: &mut Context) -> JsResult<()> {
     let Some(binding) = binding.as_object() else {
         return Ok(());
     };
@@ -15830,7 +17752,10 @@ fn node_url_update_components(
             .map(|index| index as u32)
             .unwrap_or(protocol_end)
     };
-    let host_start = href.find("//").map(|index| index as u32 + 2).unwrap_or(protocol_end);
+    let host_start = href
+        .find("//")
+        .map(|index| index as u32 + 2)
+        .unwrap_or(protocol_end);
     let host_end = if let Some(start) = href[host_start as usize..].find(['/', '?', '#']) {
         host_start + start as u32
     } else {
@@ -15838,8 +17763,14 @@ fn node_url_update_components(
     };
     let port = url.port().map(u32::from).unwrap_or(0);
     let pathname_start = host_end;
-    let search_start = href.find('?').map(|index| index as u32).unwrap_or(href.len() as u32);
-    let hash_start = href.find('#').map(|index| index as u32).unwrap_or(href.len() as u32);
+    let search_start = href
+        .find('?')
+        .map(|index| index as u32)
+        .unwrap_or(href.len() as u32);
+    let hash_start = href
+        .find('#')
+        .map(|index| index as u32)
+        .unwrap_or(href.len() as u32);
     let scheme_type = node_url_scheme_type(url);
     for (index, value) in [
         protocol_end,
@@ -15912,14 +17843,7 @@ fn node_url_pattern_init_object_from_js(
 ) -> Result<quirks::UrlPatternInit, SandboxError> {
     let mut init = quirks::UrlPatternInit::default();
     for key in [
-        "protocol",
-        "username",
-        "password",
-        "hostname",
-        "port",
-        "pathname",
-        "search",
-        "hash",
+        "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
         "baseURL",
     ] {
         let value = object
@@ -15967,9 +17891,9 @@ fn node_url_pattern_input_spec_from_value(
         entrypoint: "<node-runtime>".to_string(),
         message: "URLPattern input needs to be a string or an object".to_string(),
     })?;
-    Ok(quirks::StringOrInit::Init(node_url_pattern_init_object_from_js(
-        &object, context,
-    )?))
+    Ok(quirks::StringOrInit::Init(
+        node_url_pattern_init_object_from_js(&object, context)?,
+    ))
 }
 
 fn node_url_pattern_options_from_value(
@@ -15996,9 +17920,7 @@ fn node_url_pattern_options_from_value(
     Ok(options)
 }
 
-fn node_url_pattern_input_json(
-    input: &quirks::StringOrInit<'_>,
-) -> JsonValue {
+fn node_url_pattern_input_json(input: &quirks::StringOrInit<'_>) -> JsonValue {
     match input {
         quirks::StringOrInit::String(value) => JsonValue::String(value.to_string()),
         quirks::StringOrInit::Init(init) => serde_json::json!({
@@ -16075,8 +17997,9 @@ fn node_url_pattern_construct(
     let options_index = if base.is_some() { 2 } else { 1 };
     let options =
         node_url_pattern_options_from_value(args.get(options_index), context).map_err(js_error)?;
-    let init =
-        quirks::process_construct_pattern_input(input, base.as_deref()).map_err(sandbox_execution_error).map_err(js_error)?;
+    let init = quirks::process_construct_pattern_input(input, base.as_deref())
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?;
     let compiled = RustUrlPattern::parse(init, options)
         .map_err(sandbox_execution_error)
         .map_err(js_error)?;
@@ -16098,7 +18021,10 @@ fn node_url_pattern_construct(
         object
             .set(id_symbol, JsValue::from(id as f64), true, context)
             .map_err(sandbox_execution_error)?;
-        host.bootstrap.borrow_mut().url_patterns.insert(id, pattern.clone());
+        host.bootstrap
+            .borrow_mut()
+            .url_patterns
+            .insert(id, pattern.clone());
         Ok(JsValue::from(object))
     })
 }
@@ -16119,8 +18045,9 @@ fn node_url_pattern_test(
         .filter(|value| value.is_string())
         .map(|_| node_arg_string(args, 1, context))
         .transpose()?;
-    let Some((match_input, _inputs)) =
-        quirks::process_match_input(input, base.as_deref()).map_err(sandbox_execution_error).map_err(js_error)?
+    let Some((match_input, _inputs)) = quirks::process_match_input(input, base.as_deref())
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?
     else {
         return Ok(JsValue::from(false));
     };
@@ -16148,8 +18075,9 @@ fn node_url_pattern_exec(
         .filter(|value| value.is_string())
         .map(|_| node_arg_string(args, 1, context))
         .transpose()?;
-    let Some((match_input, inputs)) =
-        quirks::process_match_input(input, base.as_deref()).map_err(sandbox_execution_error).map_err(js_error)?
+    let Some((match_input, inputs)) = quirks::process_match_input(input, base.as_deref())
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?
     else {
         return Ok(JsValue::null());
     };
@@ -16159,7 +18087,9 @@ fn node_url_pattern_exec(
         .map_err(sandbox_execution_error)
         .map_err(js_error)?;
     match result {
-        Some(result) => node_url_pattern_exec_result_to_js(&result, &inputs, context).map_err(js_error),
+        Some(result) => {
+            node_url_pattern_exec_result_to_js(&result, &inputs, context).map_err(js_error)
+        }
         None => Ok(JsValue::null()),
     }
 }
@@ -16286,9 +18216,8 @@ fn node_modules_enable_compile_cache(
                 context,
             )));
         }
-        let directory = directory.unwrap_or_else(|| {
-            format!("{}/node-compile-cache", host.workspace_root)
-        });
+        let directory =
+            directory.unwrap_or_else(|| format!("{}/node-compile-cache", host.workspace_root));
         state.compile_cache_enabled = true;
         state.compile_cache_dir = Some(directory.clone());
         Ok(JsValue::from(JsArray::from_iter(
@@ -16327,14 +18256,15 @@ fn node_modules_get_nearest_parent_package_json_type(
     let path = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
         let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        let package_type = node_modules_traverse_parent_package_json(host, &resolved)?
-            .and_then(|(package_json, _)| {
+        let package_type = node_modules_traverse_parent_package_json(host, &resolved)?.and_then(
+            |(package_json, _)| {
                 package_json
                     .get("type")
                     .and_then(|value| value.as_str())
                     .filter(|value| *value == "commonjs" || *value == "module")
                     .map(str::to_string)
-            });
+            },
+        );
         Ok(match package_type {
             Some(value) => JsValue::from(JsString::from(value)),
             None => JsValue::undefined(),
@@ -16387,10 +18317,7 @@ fn node_modules_package_scope_start_path(
             return Ok(normalized);
         }
         let base = std::path::Path::new(&normalized);
-        let package_json = base
-            .parent()
-            .unwrap_or(base)
-            .join("package.json");
+        let package_json = base.parent().unwrap_or(base).join("package.json");
         return Ok(normalize_node_path(&package_json.to_string_lossy()));
     }
 
@@ -16451,8 +18378,7 @@ fn node_modules_traverse_parent_package_json(
         {
             return Ok(None);
         }
-        let package_json_path =
-            normalize_node_path(&format!("{}/package.json", current.display()));
+        let package_json_path = normalize_node_path(&format!("{}/package.json", current.display()));
         if let Some(package_json) = read_package_json(host, &package_json_path)? {
             return Ok(Some((package_json, package_json_path)));
         }
@@ -16468,10 +18394,13 @@ fn node_modules_get_nearest_parent_package_json(
     let path = node_arg_string(args, 0, context)?;
     let value = node_with_host(|host| {
         let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        Ok(node_modules_traverse_parent_package_json(host, &resolved)?
-            .map(|(package_json, package_json_path)| {
-                node_modules_serialize_package_json(&package_json, Some(&package_json_path))
-            }))
+        Ok(
+            node_modules_traverse_parent_package_json(host, &resolved)?.map(
+                |(package_json, package_json_path)| {
+                    node_modules_serialize_package_json(&package_json, Some(&package_json_path))
+                },
+            ),
+        )
     })
     .map_err(js_error)?;
     match value {
@@ -16490,13 +18419,11 @@ fn node_modules_get_package_scope_config(
         let (package_json, package_json_path) =
             node_modules_find_package_scope_config(host, &path)?;
         match package_json {
-            Some(package_json) => {
-                JsValue::from_json(
-                    &node_modules_serialize_package_json(&package_json, Some(&package_json_path)),
-                    context,
-                )
-                .map_err(sandbox_execution_error)
-            }
+            Some(package_json) => JsValue::from_json(
+                &node_modules_serialize_package_json(&package_json, Some(&package_json_path)),
+                context,
+            )
+            .map_err(sandbox_execution_error),
             None => Ok(JsValue::from(JsString::from(package_json_path))),
         }
     })
@@ -16556,11 +18483,7 @@ fn node_modules_flush_compile_cache(
     .map_err(js_error)
 }
 
-fn node_modules_compile_cache_key(
-    source: &str,
-    filename: &str,
-    code_type: i32,
-) -> String {
+fn node_modules_compile_cache_key(source: &str, filename: &str, code_type: i32) -> String {
     format!("{code_type}:{filename}:{source}")
 }
 
@@ -16590,9 +18513,13 @@ fn node_modules_get_compile_cache_entry(
                 bootstrap.next_compile_cache_entry_id =
                     bootstrap.next_compile_cache_entry_id.saturating_add(1);
                 let id = bootstrap.next_compile_cache_entry_id;
-                bootstrap
-                    .compile_cache_entries
-                    .insert(id, NodeCompileCacheEntryState { key, transpiled: None });
+                bootstrap.compile_cache_entries.insert(
+                    id,
+                    NodeCompileCacheEntryState {
+                        key,
+                        transpiled: None,
+                    },
+                );
                 id
             });
         let entry = bootstrap
@@ -16609,7 +18536,12 @@ fn node_modules_get_compile_cache_entry(
             .map_err(sandbox_execution_error)?;
         let payload = JsObject::with_null_proto();
         payload
-            .set(js_string!("external"), JsValue::from(external), true, context)
+            .set(
+                js_string!("external"),
+                JsValue::from(external),
+                true,
+                context,
+            )
             .map_err(sandbox_execution_error)?;
         payload
             .set(
@@ -16624,7 +18556,6 @@ fn node_modules_get_compile_cache_entry(
             .map_err(sandbox_execution_error)?;
         Ok(JsValue::from(payload))
     })
-
 }
 
 fn node_modules_save_compile_cache_entry(
@@ -16632,10 +18563,9 @@ fn node_modules_save_compile_cache_entry(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let external = args
-        .first()
-        .and_then(JsValue::as_object)
-        .ok_or_else(|| JsNativeError::typ().with_message("compile cache external handle must be an object"))?;
+    let external = args.first().and_then(JsValue::as_object).ok_or_else(|| {
+        JsNativeError::typ().with_message("compile cache external handle must be an object")
+    })?;
     let transpiled = node_arg_string(args, 1, context)?;
     node_with_host_js(context, |host, context| {
         let symbol = node_host_private_symbol(host, "compile_cache.entry_id")?;
@@ -16652,7 +18582,6 @@ fn node_modules_save_compile_cache_entry(
         entry.transpiled = Some(transpiled);
         Ok(JsValue::undefined())
     })
-
 }
 
 fn node_global_escape(
@@ -16811,7 +18740,9 @@ fn node_options_get_cli_options_values(
     node_with_host_js(context, |host, context| {
         let mut values = node_default_cli_option_values();
         let Some(object) = values.as_object_mut() else {
-            return Err(sandbox_execution_error("CLI option defaults must be an object"));
+            return Err(sandbox_execution_error(
+                "CLI option defaults must be an object",
+            ));
         };
         let exec_argv = host.process.borrow().exec_argv.clone();
         for (name, value) in node_collect_cli_options(&exec_argv) {
@@ -16830,7 +18761,9 @@ fn node_options_get_cli_options_values(
                             .entry(name.clone())
                             .or_insert_with(|| JsonValue::Array(Vec::new()))
                             .as_array_mut()
-                            .ok_or_else(|| sandbox_execution_error("CLI string-list option must be an array"))?
+                            .ok_or_else(|| {
+                                sandbox_execution_error("CLI string-list option must be an array")
+                            })?
                             .push(JsonValue::String(value));
                     }
                 }
@@ -16927,7 +18860,13 @@ fn node_option_info_entries() -> Vec<(&'static str, i32, i32, bool, &'static str
         ("--inspect-brk-node", 2, 0, false, ""),
         ("--interactive", 2, 0, false, ""),
         ("--network-family-autoselection", 2, 0, true, ""),
-        ("--network-family-autoselection-attempt-timeout", 4, 0, false, ""),
+        (
+            "--network-family-autoselection-attempt-timeout",
+            4,
+            0,
+            false,
+            "",
+        ),
         ("--permission", 2, 1, false, ""),
         ("--print", 2, 0, false, ""),
         ("--prof-process", 2, 0, false, ""),
@@ -16953,10 +18892,15 @@ fn node_option_info_entries() -> Vec<(&'static str, i32, i32, bool, &'static str
 
 fn node_options_build_info_map(context: &mut Context) -> Result<JsObject, SandboxError> {
     let map = node_make_js_map(context)?;
-    for (name, option_type, env_var_settings, default_is_true, help_text) in node_option_info_entries()
+    for (name, option_type, env_var_settings, default_is_true, help_text) in
+        node_option_info_entries()
     {
         let info = ObjectInitializer::new(context)
-            .property(js_string!("type"), JsValue::from(option_type), Attribute::all())
+            .property(
+                js_string!("type"),
+                JsValue::from(option_type),
+                Attribute::all(),
+            )
             .property(
                 js_string!("envVarSettings"),
                 JsValue::from(env_var_settings),
@@ -17062,8 +19006,7 @@ fn node_options_get_options_as_flags(
                 None => name,
             })
             .collect();
-        JsValue::from_json(&serde_json::json!(flags), context)
-            .map_err(sandbox_execution_error)
+        JsValue::from_json(&serde_json::json!(flags), context).map_err(sandbox_execution_error)
     })
 }
 
@@ -17133,8 +19076,7 @@ fn node_options_get_namespace_options_input_type(
             .map_err(js_error)?,
         ),
         context,
-    )
-    ?;
+    )?;
     Ok(JsValue::from(map))
 }
 
@@ -17151,10 +19093,7 @@ fn node_config_get_default_locale(
     .map_err(js_error)
 }
 
-fn node_type_constructor_name(
-    value: &JsValue,
-    context: &mut Context,
-) -> JsResult<Option<String>> {
+fn node_type_constructor_name(value: &JsValue, context: &mut Context) -> JsResult<Option<String>> {
     let Some(object) = value.as_object() else {
         return Ok(None);
     };
@@ -17168,11 +19107,7 @@ fn node_type_constructor_name(
         .map(|value| value.to_std_string_escaped()))
 }
 
-fn node_type_has_tag(
-    value: &JsValue,
-    context: &mut Context,
-    expected: &str,
-) -> JsResult<bool> {
+fn node_type_has_tag(value: &JsValue, context: &mut Context, expected: &str) -> JsResult<bool> {
     Ok(node_type_constructor_name(value, context)?.as_deref() == Some(expected))
 }
 
@@ -17181,11 +19116,11 @@ fn node_type_is_array_buffer_view(
     args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    Ok(JsValue::from(
-        args.first().is_some_and(|value| value.as_object().is_some_and(|object| {
-            JsUint8Array::from_object(object.clone()).is_ok()
-        })),
-    ))
+    Ok(JsValue::from(args.first().is_some_and(|value| {
+        value
+            .as_object()
+            .is_some_and(|object| JsUint8Array::from_object(object.clone()).is_ok())
+    })))
 }
 
 fn node_type_is_arguments_object(
@@ -17226,7 +19161,11 @@ fn node_type_is_async_function(
         return Ok(JsValue::from(false));
     };
     let _ = object;
-    Ok(JsValue::from(node_type_has_tag(value, context, "AsyncFunction")?))
+    Ok(JsValue::from(node_type_has_tag(
+        value,
+        context,
+        "AsyncFunction",
+    )?))
 }
 
 fn node_type_is_bigint_object(
@@ -17330,11 +19269,7 @@ fn node_type_is_generator_object(
     ))
 }
 
-fn node_type_is_map(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_type_is_map(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::from(
         args.first()
             .map(|value| node_type_has_tag(value, context, "Map"))
@@ -17377,8 +19312,16 @@ fn node_type_is_native_error(
     let is_error = match args.first() {
         Some(value) => matches!(
             node_type_constructor_name(value, context)?.as_deref(),
-            Some("Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError"
-                | "URIError" | "EvalError" | "AggregateError")
+            Some(
+                "Error"
+                    | "TypeError"
+                    | "RangeError"
+                    | "SyntaxError"
+                    | "ReferenceError"
+                    | "URIError"
+                    | "EvalError"
+                    | "AggregateError"
+            )
         ),
         None => false,
     };
@@ -17437,11 +19380,7 @@ fn node_type_is_regexp(
     Ok(JsValue::from(node_type_has_tag(value, context, "RegExp")?))
 }
 
-fn node_type_is_set(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_type_is_set(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::from(
         args.first()
             .map(|value| node_type_has_tag(value, context, "Set"))
@@ -17601,8 +19540,9 @@ fn node_module_wrap_synthetic_namespace(
 fn node_source_text_has_top_level_await(source: &str) -> bool {
     let mut interner = Interner::default();
     let scope = Scope::new_global();
-    let Ok(module) = BoaParser::new(BoaParserSource::from_bytes(source))
-        .parse_module(&scope, &mut interner) else {
+    let Ok(module) =
+        BoaParser::new(BoaParserSource::from_bytes(source)).parse_module(&scope, &mut interner)
+    else {
         return false;
     };
     format!("{module:?}").contains("Await")
@@ -17611,8 +19551,9 @@ fn node_source_text_has_top_level_await(source: &str) -> bool {
 fn node_module_wrap_request_entries(source: &str) -> Vec<(String, JsonValue, i32)> {
     let mut interner = Interner::default();
     let scope = Scope::new_global();
-    let Ok(module) = BoaParser::new(BoaParserSource::from_bytes(source))
-        .parse_module(&scope, &mut interner) else {
+    let Ok(module) =
+        BoaParser::new(BoaParserSource::from_bytes(source)).parse_module(&scope, &mut interner)
+    else {
         return Vec::new();
     };
     let phase = 1;
@@ -17712,11 +19653,10 @@ fn node_module_wrap_compute_has_async_graph(
         .source_text
         .as_deref()
         .is_some_and(node_source_text_has_top_level_await);
-    let child_async = state
-        .linked_request_ids
-        .iter()
-        .copied()
-        .any(|child_id| node_module_wrap_compute_has_async_graph(module_wraps, child_id, visiting));
+    let child_async =
+        state.linked_request_ids.iter().copied().any(|child_id| {
+            node_module_wrap_compute_has_async_graph(module_wraps, child_id, visiting)
+        });
     visiting.remove(&id);
     own_async || child_async
 }
@@ -17764,12 +19704,22 @@ fn node_module_wrap_construct(
                 context,
             )
             .map_err(sandbox_execution_error)?;
-            node_contextify_attach_host_defined_option(&object, host_defined_option_id.clone(), context)?;
-            let (annotated_source_url, source_map_url) = node_extract_source_annotations(&source_text);
+            node_contextify_attach_host_defined_option(
+                &object,
+                host_defined_option_id.clone(),
+                context,
+            )?;
+            let (annotated_source_url, source_map_url) =
+                node_extract_source_annotations(&source_text);
             let source_url = annotated_source_url.unwrap_or_else(|| url.clone());
             let has_top_level_await = node_source_text_has_top_level_await(&source_text);
             object
-                .set(js_string!("url"), JsValue::from(JsString::from(url.clone())), true, context)
+                .set(
+                    js_string!("url"),
+                    JsValue::from(JsString::from(url.clone())),
+                    true,
+                    context,
+                )
                 .map_err(sandbox_execution_error)?;
             object
                 .set(js_string!("synthetic"), JsValue::from(false), true, context)
@@ -17783,7 +19733,12 @@ fn node_module_wrap_construct(
                 )
                 .map_err(sandbox_execution_error)?;
             object
-                .set(js_string!("sourceURL"), JsValue::from(JsString::from(source_url.clone())), true, context)
+                .set(
+                    js_string!("sourceURL"),
+                    JsValue::from(JsString::from(source_url.clone())),
+                    true,
+                    context,
+                )
                 .map_err(sandbox_execution_error)?;
             object
                 .set(
@@ -17842,7 +19797,12 @@ fn node_module_wrap_construct(
                 })
                 .unwrap_or_default();
             object
-                .set(js_string!("url"), JsValue::from(JsString::from(url.clone())), true, context)
+                .set(
+                    js_string!("url"),
+                    JsValue::from(JsString::from(url.clone())),
+                    true,
+                    context,
+                )
                 .map_err(sandbox_execution_error)?;
             object
                 .set(js_string!("synthetic"), JsValue::from(true), true, context)
@@ -17853,9 +19813,16 @@ fn node_module_wrap_construct(
                     .get(js_string!("imported_cjs_symbol"), context)
                     .map_err(sandbox_execution_error)?
                     .as_symbol()
-                    .ok_or_else(|| sandbox_execution_error("symbols.imported_cjs_symbol must be a symbol"))?;
+                    .ok_or_else(|| {
+                        sandbox_execution_error("symbols.imported_cjs_symbol must be a symbol")
+                    })?;
                 object
-                    .set(imported_cjs_symbol, JsValue::from(imported_cjs.clone()), true, context)
+                    .set(
+                        imported_cjs_symbol,
+                        JsValue::from(imported_cjs.clone()),
+                        true,
+                        context,
+                    )
                     .map_err(sandbox_execution_error)?;
             }
             NodeModuleWrapState {
@@ -17937,16 +19904,20 @@ fn node_module_wrap_link(
         }
         let mut linked_request_ids = Vec::with_capacity(length);
         for (index, (specifier, _attributes, _phase)) in requests.iter().enumerate() {
-            let value = modules.get(index as u32, context).map_err(sandbox_execution_error)?;
-            let module_object = value.as_object().ok_or_else(|| {
-                node_error_with_code(
-                    context,
-                    JsNativeError::typ(),
-                    "linked module must be a ModuleWrap",
-                    "ERR_INVALID_ARG_TYPE",
-                )
-            })
-            .map_err(sandbox_execution_error)?;
+            let value = modules
+                .get(index as u32, context)
+                .map_err(sandbox_execution_error)?;
+            let module_object = value
+                .as_object()
+                .ok_or_else(|| {
+                    node_error_with_code(
+                        context,
+                        JsNativeError::typ(),
+                        "linked module must be a ModuleWrap",
+                        "ERR_INVALID_ARG_TYPE",
+                    )
+                })
+                .map_err(sandbox_execution_error)?;
             let target_id = node_module_wrap_id(host, &module_object, context)?;
             if let Some(previous_index) = requests[..index]
                 .iter()
@@ -17991,7 +19962,8 @@ fn node_module_wrap_get_module_requests(
     if state.synthetic {
         return Ok(JsValue::from(JsArray::new(context)?));
     }
-    let requests = node_module_wrap_request_entries(state.source_text.as_deref().unwrap_or_default());
+    let requests =
+        node_module_wrap_request_entries(state.source_text.as_deref().unwrap_or_default());
     let request_values = requests
         .into_iter()
         .map(|(specifier, attributes, phase)| {
@@ -18102,7 +20074,9 @@ fn node_module_wrap_evaluate_sync(
             if let Some(callback) = state.synthetic_evaluation_steps.take() {
                 let callable = JsValue::from(callback.clone())
                     .as_callable()
-                    .ok_or_else(|| sandbox_execution_error("synthetic evaluation step is not callable"))?;
+                    .ok_or_else(|| {
+                        sandbox_execution_error("synthetic evaluation step is not callable")
+                    })?;
                 if let Err(error) = callable.call(&JsValue::from(object.clone()), &[], context) {
                     state.status = 5;
                     state.error = Some(
@@ -18164,7 +20138,9 @@ fn node_module_wrap_evaluate(
             if let Some(callback) = state.synthetic_evaluation_steps.take() {
                 let callable = JsValue::from(callback.clone())
                     .as_callable()
-                    .ok_or_else(|| sandbox_execution_error("synthetic evaluation step is not callable"))?;
+                    .ok_or_else(|| {
+                        sandbox_execution_error("synthetic evaluation step is not callable")
+                    })?;
                 if let Err(error) = callable.call(&JsValue::from(object.clone()), &[], context) {
                     state.status = 5;
                     state.error = Some(
@@ -18177,7 +20153,10 @@ fn node_module_wrap_evaluate(
                 }
             }
             state.status = 4;
-            JsValue::from(JsPromise::resolve(JsValue::undefined(), context).map_err(sandbox_execution_error)?)
+            JsValue::from(
+                JsPromise::resolve(JsValue::undefined(), context)
+                    .map_err(sandbox_execution_error)?,
+            )
         } else if let Some(module) = state.module.clone() {
             let promise = module.evaluate(context).map_err(sandbox_execution_error)?;
             let on_fulfilled = FunctionObjectBuilder::new(
@@ -18185,7 +20164,9 @@ fn node_module_wrap_evaluate(
                 NativeFunction::from_copy_closure_with_captures(
                     |_this, args, module_id, context| {
                         node_with_host_js(context, |host, _context| {
-                            if let Some(state) = host.bootstrap.borrow_mut().module_wraps.get_mut(module_id) {
+                            if let Some(state) =
+                                host.bootstrap.borrow_mut().module_wraps.get_mut(module_id)
+                            {
                                 state.status = 4;
                             }
                             Ok(JsValue::undefined())
@@ -18205,7 +20186,9 @@ fn node_module_wrap_evaluate(
                     |_this, args, module_id, context| {
                         let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
                         node_with_host_js(context, |host, _context| {
-                            if let Some(state) = host.bootstrap.borrow_mut().module_wraps.get_mut(module_id) {
+                            if let Some(state) =
+                                host.bootstrap.borrow_mut().module_wraps.get_mut(module_id)
+                            {
                                 state.status = 5;
                                 state.error = Some(reason.clone());
                             }
@@ -18296,14 +20279,17 @@ fn node_module_wrap_get_module_source_object(
     };
     let host = active_node_host().map_err(js_error)?;
     let state = node_module_wrap_state(&host, &object, context).map_err(js_error)?;
-    state.module_source_object.map(JsValue::from).ok_or_else(|| {
-        node_error_with_code(
-            context,
-            JsNativeError::error(),
-            format!("Source phase not defined for module '{}'", state.url),
-            "ERR_SOURCE_PHASE_NOT_DEFINED",
-        )
-    })
+    state
+        .module_source_object
+        .map(JsValue::from)
+        .ok_or_else(|| {
+            node_error_with_code(
+                context,
+                JsNativeError::error(),
+                format!("Source phase not defined for module '{}'", state.url),
+                "ERR_SOURCE_PHASE_NOT_DEFINED",
+            )
+        })
 }
 
 fn node_module_wrap_create_cached_data(
@@ -18446,7 +20432,9 @@ fn node_module_wrap_facade_getter(
         .get(js_string!("namespace"), context)?
         .as_object()
         .ok_or_else(|| JsNativeError::typ().with_message("missing facade namespace"))?;
-    let key = captures.get(js_string!("key"), context)?.to_string(context)?;
+    let key = captures
+        .get(js_string!("key"), context)?
+        .to_string(context)?;
     namespace.get(key, context)
 }
 
@@ -18472,12 +20460,18 @@ fn node_module_wrap_create_required_module_facade(
     for key in keys {
         if let boa_engine::property::PropertyKey::String(name) = key {
             let captures = JsObject::with_null_proto();
-            captures
-                .set(js_string!("namespace"), JsValue::from(namespace.clone()), true, context)
-                ?;
-            captures
-                .set(js_string!("key"), JsValue::from(name.clone()), true, context)
-                ?;
+            captures.set(
+                js_string!("namespace"),
+                JsValue::from(namespace.clone()),
+                true,
+                context,
+            )?;
+            captures.set(
+                js_string!("key"),
+                JsValue::from(name.clone()),
+                true,
+                context,
+            )?;
             let getter = FunctionObjectBuilder::new(
                 context.realm(),
                 NativeFunction::from_copy_closure_with_captures(
@@ -18489,16 +20483,14 @@ fn node_module_wrap_create_required_module_facade(
             .length(0)
             .constructor(false)
             .build();
-            facade
-                .define_property_or_throw(
-                    name,
-                    PropertyDescriptor::builder()
-                        .get(getter)
-                        .enumerable(true)
-                        .configurable(false),
-                    context,
-                )
-                ?;
+            facade.define_property_or_throw(
+                name,
+                PropertyDescriptor::builder()
+                    .get(getter)
+                    .enumerable(true)
+                    .configurable(false),
+                context,
+            )?;
         }
     }
     facade.set(js_string!("__esModule"), JsValue::from(true), true, context)?;
@@ -18545,7 +20537,9 @@ fn node_util_lazy_property_getter(
         .as_callable()
         .ok_or_else(|| JsNativeError::typ().with_message("builtin require is not callable"))?;
     let id = captures.get(js_string!("id"), context)?;
-    let key = captures.get(js_string!("key"), context)?.to_string(context)?;
+    let key = captures
+        .get(js_string!("key"), context)?
+        .to_string(context)?;
     let exports = builtin_require.call(&JsValue::undefined(), &[id], context)?;
     Ok(exports
         .as_object()
@@ -18573,9 +20567,12 @@ fn node_util_guess_handle_type(
                 .borrow()
                 .udp_handles
                 .values()
-                .any(|state| state.fd == Some(fd) && !state.closed) => 2, // UDP
+                .any(|state| state.fd == Some(fd) && !state.closed) =>
+            {
+                2
+            } // UDP
             _ if host.open_files.borrow().entries.contains_key(&fd) => 3, // FILE
-            _ => 5, // UNKNOWN
+            _ => 5,     // UNKNOWN
         };
         let _ = &process;
         Ok(JsValue::from(code))
@@ -18603,14 +20600,19 @@ fn node_util_define_lazy_properties(
     let builtin_require = builtin_require
         .as_callable()
         .ok_or_else(|| JsNativeError::typ().with_message("builtin require is not callable"))?;
-    let length = keys.get(js_string!("length"), context)?.to_length(context)?;
+    let length = keys
+        .get(js_string!("length"), context)?
+        .to_length(context)?;
     for index in 0..length {
         let key = keys.get(index, context)?.to_string(context)?;
         let captures = JsObject::with_null_proto();
-        captures
-            .set(js_string!("id"), JsValue::from(JsString::from(id.clone())), true, context)?;
-        captures
-            .set(js_string!("key"), JsValue::from(key.clone()), true, context)?;
+        captures.set(
+            js_string!("id"),
+            JsValue::from(JsString::from(id.clone())),
+            true,
+            context,
+        )?;
+        captures.set(js_string!("key"), JsValue::from(key.clone()), true, context)?;
         captures.set(
             js_string!("builtinRequire"),
             JsValue::from(builtin_require.clone()),
@@ -18628,16 +20630,14 @@ fn node_util_define_lazy_properties(
         .length(0)
         .constructor(false)
         .build();
-        target
-            .define_property_or_throw(
-                key,
-                PropertyDescriptor::builder()
-                    .get(getter)
-                    .enumerable(enumerable)
-                    .configurable(true),
-                context,
-            )
-            ?;
+        target.define_property_or_throw(
+            key,
+            PropertyDescriptor::builder()
+                .get(getter)
+                .enumerable(enumerable)
+                .configurable(true),
+            context,
+        )?;
     }
     Ok(JsValue::undefined())
 }
@@ -18668,7 +20668,9 @@ fn node_util_get_own_non_index_properties(
     let get_own_property_descriptor = object_ctor
         .get(js_string!("getOwnPropertyDescriptor"), context)?
         .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("Object.getOwnPropertyDescriptor is not callable"))?;
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("Object.getOwnPropertyDescriptor is not callable")
+        })?;
     let mut result = Vec::new();
     for key in keys {
         let key_value = match &key {
@@ -18699,7 +20701,9 @@ fn node_util_get_own_non_index_properties(
             continue;
         }
         if only_writable {
-            let writable = descriptor.get(js_string!("writable"), context)?.to_boolean()
+            let writable = descriptor
+                .get(js_string!("writable"), context)?
+                .to_boolean()
                 || descriptor
                     .get(js_string!("set"), context)?
                     .as_object()
@@ -18740,10 +20744,13 @@ fn node_util_is_inside_node_modules(
         .map_err(js_error)?
         .to_string(context)?
         .to_std_string_escaped();
-    let line = stack.lines().skip(2 + extra_frames).find(|line| !line.trim().is_empty());
-    Ok(JsValue::from(
-        line.is_some_and(|line| line.contains("/node_modules/") || line.contains("\\node_modules\\")),
-    ))
+    let line = stack
+        .lines()
+        .skip(2 + extra_frames)
+        .find(|line| !line.trim().is_empty());
+    Ok(JsValue::from(line.is_some_and(|line| {
+        line.contains("/node_modules/") || line.contains("\\node_modules\\")
+    })))
 }
 
 fn node_util_array_buffer_view_has_buffer(
@@ -18761,11 +20768,7 @@ fn node_util_array_buffer_view_has_buffer(
     Ok(JsValue::from(!buffer.is_undefined() && !buffer.is_null()))
 }
 
-fn node_util_sleep(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn node_util_sleep(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let milliseconds = args
         .first()
         .cloned()
@@ -18822,10 +20825,7 @@ fn node_util_preview_entries(
         .and_then(|value| value.as_string().map(|value| value.to_std_string_escaped()))
         .unwrap_or_default();
     Ok(JsValue::from(JsArray::from_iter(
-        [
-            entries,
-            JsValue::from(constructor_name == "Map"),
-        ],
+        [entries, JsValue::from(constructor_name == "Map")],
         context,
     )))
 }
@@ -18841,19 +20841,16 @@ fn node_util_get_caller_location(
         .map_err(js_error)?
         .to_string(context)?
         .to_std_string_escaped();
-    let location = stack
-        .lines()
-        .skip(2)
-        .find_map(|line| {
-            let trimmed = line.trim();
-            let start = trimmed.rfind('(').map(|index| index + 1).unwrap_or(0);
-            let location = trimmed[start..].trim_end_matches(')');
-            let mut parts = location.rsplitn(3, ':');
-            let column = parts.next()?.parse::<u32>().ok()?;
-            let line = parts.next()?.parse::<u32>().ok()?;
-            let file = parts.next()?.to_string();
-            Some((line, column, file))
-        });
+    let location = stack.lines().skip(2).find_map(|line| {
+        let trimmed = line.trim();
+        let start = trimmed.rfind('(').map(|index| index + 1).unwrap_or(0);
+        let location = trimmed[start..].trim_end_matches(')');
+        let mut parts = location.rsplitn(3, ':');
+        let column = parts.next()?.parse::<u32>().ok()?;
+        let line = parts.next()?.parse::<u32>().ok()?;
+        let file = parts.next()?.to_string();
+        Some((line, column, file))
+    });
     let Some((line, column, file)) = location else {
         return Ok(JsValue::undefined());
     };
@@ -18892,13 +20889,16 @@ fn node_util_get_call_sites(
             .and_then(|rest| rest.split(" (").next())
             .unwrap_or("")
             .to_string();
-        let start = trimmed.rfind('(').map(|index| index + 1).unwrap_or_else(|| {
-            trimmed
-                .strip_prefix("at ")
-                .and_then(|rest| rest.split(' ').next())
-                .map(|prefix| trimmed.len().saturating_sub(prefix.len()))
-                .unwrap_or(0)
-        });
+        let start = trimmed
+            .rfind('(')
+            .map(|index| index + 1)
+            .unwrap_or_else(|| {
+                trimmed
+                    .strip_prefix("at ")
+                    .and_then(|rest| rest.split(' ').next())
+                    .map(|prefix| trimmed.len().saturating_sub(prefix.len()))
+                    .unwrap_or(0)
+            });
         let location = trimmed[start..].trim_end_matches(')');
         let mut parts = location.rsplitn(3, ':');
         let column = parts
@@ -18994,13 +20994,16 @@ fn node_util_get_external_value(
 fn node_encoding_encode_into_results(context: &mut Context) -> Result<JsObject, SandboxError> {
     let existing = context
         .global_object()
-        .get(js_string!("__terraceNodeEncodingEncodeIntoResults"), context)
+        .get(
+            js_string!("__terraceNodeEncodingEncodeIntoResults"),
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     if let Some(object) = existing.as_object() {
         return Ok(object);
     }
-    let values = JsValue::from_json(&serde_json::json!([0, 0]), context)
-        .map_err(sandbox_execution_error)?;
+    let values =
+        JsValue::from_json(&serde_json::json!([0, 0]), context).map_err(sandbox_execution_error)?;
     let object = values.as_object().ok_or_else(|| SandboxError::Execution {
         entrypoint: "<node-runtime>".to_string(),
         message: "failed to allocate encoding encodeIntoResults scratch array".to_string(),
@@ -19025,12 +21028,11 @@ fn node_encoding_encode_into(
             "encoding_binding.encodeInto requires Uint8Array destination",
         )));
     };
-    let dest = JsUint8Array::from_object(dest_object.clone())
-        .map_err(|_| {
-            js_error(sandbox_execution_error(
-                "encoding_binding.encodeInto requires Uint8Array destination",
-            ))
-        })?;
+    let dest = JsUint8Array::from_object(dest_object.clone()).map_err(|_| {
+        js_error(sandbox_execution_error(
+            "encoding_binding.encodeInto requires Uint8Array destination",
+        ))
+    })?;
     let capacity = dest.length(context)?;
     let mut read = 0usize;
     let mut written = 0usize;
@@ -19551,7 +21553,6 @@ fn node_read_module_source(
         Ok(JsValue::from(JsString::from(strip_shebang(&loaded.source))))
     })
     .map_err(js_error)
-
 }
 
 fn node_require_resolve(
@@ -19662,19 +21663,19 @@ fn resolve_require_target(
         paths,
         extensions,
     )
-        .map_err(|error| {
-            let message = match &error {
-                SandboxError::ModuleNotFound { .. } => {
-                    format!("Cannot find module '{specifier}'")
-                }
-                other => other.to_string(),
-            };
-            let code = match error {
-                SandboxError::ModuleNotFound { .. } => "MODULE_NOT_FOUND",
-                _ => "ERR_TERRACE_NODE_RESOLVE",
-            };
-            (code.to_string(), message)
-        })
+    .map_err(|error| {
+        let message = match &error {
+            SandboxError::ModuleNotFound { .. } => {
+                format!("Cannot find module '{specifier}'")
+            }
+            other => other.to_string(),
+        };
+        let code = match error {
+            SandboxError::ModuleNotFound { .. } => "MODULE_NOT_FOUND",
+            _ => "ERR_TERRACE_NODE_RESOLVE",
+        };
+        (code.to_string(), message)
+    })
 }
 
 fn require_resolve_lookup_paths(
@@ -20111,13 +22112,13 @@ fn node_fs_open(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
     let path = node_arg_string(args, 0, context)?;
     let flags = node_fs_open_flags_from_js(args, 1, context)?;
     node_with_host(|host| node_fs_open_impl(host, &path, flags).map(JsValue::from))
-    .map_err(js_error)
+        .map_err(js_error)
 }
 
 fn node_fs_close(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let fd = node_arg_i32(args, 0, context)?;
     node_with_host(|host| node_fs_close_impl(host, fd).map(|_| JsValue::undefined()))
-    .map_err(js_error)
+        .map_err(js_error)
 }
 
 fn node_fs_read_fd(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -22147,15 +24148,9 @@ fn resolve_node_module_path_with_paths(
         });
     }
 
-    let result =
-        resolve_node_module_path_with_paths_uncached(
-            host,
-            specifier,
-            referrer,
-            mode,
-            paths,
-            extensions,
-        );
+    let result = resolve_node_module_path_with_paths_uncached(
+        host, specifier, referrer, mode, paths, extensions,
+    );
     match &result {
         Ok(resolved) => {
             host.module_graph
@@ -22189,9 +24184,9 @@ fn resolve_node_module_path_with_paths_uncached(
             mode,
             extensions,
         )?
-            .ok_or_else(|| SandboxError::ModuleNotFound {
-                specifier: specifier.to_string(),
-            });
+        .ok_or_else(|| SandboxError::ModuleNotFound {
+            specifier: specifier.to_string(),
+        });
     }
 
     if matches!(specifier, "." | "..")
@@ -22228,9 +24223,9 @@ fn resolve_node_module_path_with_paths_uncached(
             mode,
             extensions,
         )?
-            .ok_or_else(|| SandboxError::ModuleNotFound {
-                specifier: specifier.to_string(),
-            });
+        .ok_or_else(|| SandboxError::ModuleNotFound {
+            specifier: specifier.to_string(),
+        });
     }
 
     if specifier.starts_with('#') {
@@ -22238,7 +24233,9 @@ fn resolve_node_module_path_with_paths_uncached(
     }
 
     if let Some(paths) = paths {
-        return resolve_bare_node_module_with_lookup_paths(host, specifier, mode, paths, extensions);
+        return resolve_bare_node_module_with_lookup_paths(
+            host, specifier, mode, paths, extensions,
+        );
     }
 
     let base = referrer
@@ -22247,15 +24244,13 @@ fn resolve_node_module_path_with_paths_uncached(
     let (package_name, subpath) = split_package_request(specifier)?;
     for directory in node_module_lookup_paths_from(host, &base) {
         let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
-        if let Some(resolved) =
-            resolve_package_entry_from_directory(
-                host,
-                &package_root,
-                subpath.as_deref(),
-                mode,
-                extensions,
-            )?
-        {
+        if let Some(resolved) = resolve_package_entry_from_directory(
+            host,
+            &package_root,
+            subpath.as_deref(),
+            mode,
+            extensions,
+        )? {
             return Ok(resolved);
         }
     }
@@ -22282,15 +24277,13 @@ fn resolve_bare_node_module_with_lookup_paths(
         };
         for directory in node_module_lookup_paths_from(host, &normalized) {
             let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
-            if let Some(resolved) =
-                resolve_package_entry_from_directory(
-                    host,
-                    &package_root,
-                    subpath.as_deref(),
-                    mode,
-                    extensions,
-                )?
-            {
+            if let Some(resolved) = resolve_package_entry_from_directory(
+                host,
+                &package_root,
+                subpath.as_deref(),
+                mode,
+                extensions,
+            )? {
                 return Ok(resolved);
             }
         }
@@ -22783,11 +24776,7 @@ fn nearest_package_type(
 }
 
 fn normalize_require_extensions(extensions: Option<&[String]>) -> Vec<String> {
-    let mut resolved = vec![
-        ".js".to_string(),
-        ".json".to_string(),
-        ".node".to_string(),
-    ];
+    let mut resolved = vec![".js".to_string(), ".json".to_string(), ".node".to_string()];
     if let Some(extensions) = extensions {
         for extension in extensions {
             if !resolved.contains(extension) {
@@ -22982,6 +24971,7 @@ async fn open_js_runtime(
                 durable_snapshot: session_info.provenance.base_snapshot.durable,
                 fork_policy: JsForkPolicy::simulation_native_baseline(),
             },
+            environment: js_runtime_environment_for_session(session_info),
             metadata: BTreeMap::from([
                 (
                     "session_revision".to_string(),
@@ -22995,6 +24985,43 @@ async fn open_js_runtime(
         })
         .await
         .map_err(|error| js_substrate_error_to_sandbox(error, &handle.actor_id))
+}
+
+fn js_runtime_environment_for_session(session_info: &SandboxSessionInfo) -> JsRuntimeEnvironment {
+    JsRuntimeEnvironment {
+        cwd: session_info.workspace_root.clone(),
+        argv: vec!["/terrace/js".to_string()],
+        exec_path: "/terrace/js".to_string(),
+        temp_dir: Some(format!("{}/.terrace/tmp", session_info.workspace_root)),
+        home_dir: Some(session_info.workspace_root.clone()),
+        ..JsRuntimeEnvironment::default()
+    }
+}
+
+async fn sync_js_runtime_boundary_state(
+    state: &SandboxRuntimeStateHandle,
+    runtime: &dyn JsRuntime,
+) -> Result<(), JsSubstrateError> {
+    state
+        .set_js_boundary(SandboxJsRuntimeBoundaryState {
+            configuration: runtime.configuration(),
+            attachment: runtime.attachment_state().await?,
+            suspended: runtime.suspended_state().await?,
+        })
+        .await;
+    Ok(())
+}
+
+fn sandbox_js_turn_outcome_label(outcome: &JsRuntimeTurnOutcome) -> &'static str {
+    match outcome {
+        JsRuntimeTurnOutcome::Completed { .. } => "completed",
+        JsRuntimeTurnOutcome::Yielded { .. } => "yielded",
+        JsRuntimeTurnOutcome::PendingHostOp { .. } => "pending_host_op",
+        JsRuntimeTurnOutcome::PendingTimer { .. } => "pending_timer",
+        JsRuntimeTurnOutcome::PendingMicrotasks => "pending_microtasks",
+        JsRuntimeTurnOutcome::Threw { .. } => "threw",
+        JsRuntimeTurnOutcome::Terminated { .. } => "terminated",
+    }
 }
 
 async fn prepare_js_execution_request(
@@ -23339,6 +25366,10 @@ fn js_substrate_error_to_sandbox(
         JsSubstrateError::InvalidDirective { module, message } => SandboxError::Execution {
             entrypoint: module,
             message,
+        },
+        JsSubstrateError::UnsupportedTurn { turn } => SandboxError::Execution {
+            entrypoint: fallback_entrypoint.to_string(),
+            message: format!("unsupported js runtime turn: {turn}"),
         },
         JsSubstrateError::SerdeJson(error) => SandboxError::SerdeJson(error),
         JsSubstrateError::Vfs(error) => SandboxError::Vfs(error),
