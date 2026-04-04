@@ -796,6 +796,7 @@ struct NodeResolveCacheKey {
 #[derive(Clone, Debug)]
 struct NodeProcessState {
     argv: Vec<String>,
+    exec_argv: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: String,
     stdout: String,
@@ -805,9 +806,11 @@ struct NodeProcessState {
     exec_path: String,
     platform: String,
     arch: String,
+    locale: String,
     title: String,
     pid: u32,
     ppid: u32,
+    debug_port: u16,
     umask: u32,
 }
 
@@ -857,6 +860,88 @@ fn node_process_config_json() -> serde_json::Value {
             "ubsan": 0,
             "want_separate_host_toolset": 0,
         },
+    })
+}
+
+fn node_process_release_json() -> serde_json::Value {
+    serde_json::json!({
+        "name": "node",
+        "lts": "Krypton",
+    })
+}
+
+fn node_option_takes_value(name: &str) -> bool {
+    matches!(
+        name,
+        "--allow-fs-read"
+            | "--allow-fs-write"
+            | "--conditions"
+            | "--diagnostic-dir"
+            | "--experimental-config-file"
+            | "--experimental-default-type"
+            | "--experimental-loader"
+            | "--heapsnapshot-signal"
+            | "--import"
+            | "--loader"
+            | "--network-family-autoselection-attempt-timeout"
+            | "--require"
+    )
+}
+
+fn node_split_argv(exec_path: &str, argv: Vec<String>) -> (Vec<String>, Vec<String>) {
+    if argv.is_empty() {
+        return (vec![exec_path.to_string()], Vec::new());
+    }
+
+    let argv_len = argv.len();
+    let mut normalized_argv = vec![exec_path.to_string()];
+    let mut exec_argv = Vec::new();
+    let mut index = 1usize;
+    let mut parsing_options = true;
+
+    while index < argv_len {
+        let arg = argv[index].clone();
+        if parsing_options && arg == "--" {
+            normalized_argv.push(arg);
+            normalized_argv.extend(argv[index + 1..].iter().cloned());
+            return (normalized_argv, exec_argv);
+        }
+        if parsing_options && arg.starts_with('-') {
+            let option_name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg.as_str());
+            exec_argv.push(arg.clone());
+            if !arg.contains('=') && node_option_takes_value(option_name) && index + 1 < argv_len {
+                exec_argv.push(argv[index + 1].clone());
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        parsing_options = false;
+        normalized_argv.extend(argv[index..].iter().cloned());
+        return (normalized_argv, exec_argv);
+    }
+
+    (normalized_argv, exec_argv)
+}
+
+fn node_options_env_settings_json() -> serde_json::Value {
+    serde_json::json!({
+        "kAllowedInEnvvar": 0,
+        "kDisallowedInEnvvar": 1,
+    })
+}
+
+fn node_options_types_json() -> serde_json::Value {
+    serde_json::json!({
+        "kNoOp": 0,
+        "kV8Option": 1,
+        "kBoolean": 2,
+        "kInteger": 3,
+        "kUInteger": 4,
+        "kString": 5,
+        "kHostPort": 6,
+        "kStringList": 7,
     })
 }
 
@@ -1006,20 +1091,25 @@ impl Default for NodeOpenFileTable {
 
 impl NodeProcessState {
     fn new(argv: Vec<String>, env: BTreeMap<String, String>, cwd: String) -> Self {
+        let exec_path = "/node/bin/node".to_string();
+        let (argv, exec_argv) = node_split_argv(&exec_path, argv);
         Self {
             argv,
+            exec_argv,
             env,
             cwd,
             stdout: String::new(),
             stderr: String::new(),
             exit_code: 0,
             version: NODE_COMPAT_TARGET_VERSION.to_string(),
-            exec_path: "/usr/bin/node".to_string(),
+            exec_path,
             platform: "linux".to_string(),
             arch: "x64".to_string(),
+            locale: "en-US".to_string(),
             title: "node".to_string(),
             pid: 1,
             ppid: 0,
+            debug_port: 9229,
             umask: 0o022,
         }
     }
@@ -1032,13 +1122,17 @@ impl NodeProcessState {
             "stdout": self.stdout,
             "stderr": self.stderr,
             "exitCode": self.exit_code,
+            "argv0": self.argv.first().cloned().unwrap_or_else(|| self.exec_path.clone()),
+            "execArgv": self.exec_argv,
             "execPath": self.exec_path,
             "version": self.version,
             "platform": self.platform,
             "arch": self.arch,
+            "locale": self.locale,
             "title": self.title,
             "pid": self.pid,
             "ppid": self.ppid,
+            "debugPort": self.debug_port,
             "umask": self.umask,
         })
     }
@@ -1818,6 +1912,10 @@ async fn execute_node_command(
         .transpose()
         .map_err(sandbox_execution_error)?
         .unwrap_or_default();
+    let mut process = NodeProcessState::new(argv, env, cwd);
+    if let Some(locale) = metadata.get("node_locale").and_then(JsonValue::as_str) {
+        process.locale = locale.to_string();
+    }
     let node_host = Rc::new(NodeRuntimeHost {
         runtime_name: runtime_name.to_string(),
         runtime_handle: handle.clone(),
@@ -1829,7 +1927,7 @@ async fn execute_node_command(
             || std::env::var_os("TERRACE_CAPTURE_NODE_TRACE").is_some(),
         debug_options,
         entropy: entropy.clone(),
-        process: Rc::new(RefCell::new(NodeProcessState::new(argv, env, cwd))),
+        process: Rc::new(RefCell::new(process)),
         open_files: Rc::new(RefCell::new(NodeOpenFileTable::default())),
         loaded_modules: Rc::new(RefCell::new(BTreeMap::new())),
         materialized_modules: Rc::new(RefCell::new(BTreeMap::new())),
@@ -2007,6 +2105,7 @@ fn node_install_base_process_global(
         ("execPath", JsValue::from(JsString::from(process.exec_path.clone()))),
         ("pid", JsValue::from(process.pid)),
         ("ppid", JsValue::from(process.ppid)),
+        ("debugPort", JsValue::from(process.debug_port)),
     ] {
         process_object
             .set(JsString::from(name), value, true, context)
@@ -2018,7 +2117,7 @@ fn node_install_base_process_global(
     process_object
         .set(js_string!("argv"), argv, true, context)
         .map_err(sandbox_execution_error)?;
-    let exec_argv = JsValue::from_json(&serde_json::json!([]), context)
+    let exec_argv = JsValue::from_json(&serde_json::json!(process.exec_argv), context)
         .map_err(sandbox_execution_error)?;
     process_object
         .set(js_string!("execArgv"), exec_argv, true, context)
@@ -2043,24 +2142,35 @@ fn node_install_base_process_global(
     process_object
         .set(js_string!("config"), config, true, context)
         .map_err(sandbox_execution_error)?;
-    let release = JsValue::from_json(
-        &serde_json::json!({
-            "name": "node",
-            "lts": "Krypton",
-        }),
-        context,
-    )
-    .map_err(sandbox_execution_error)?;
+    let release = JsValue::from_json(&node_process_release_json(), context)
+        .map_err(sandbox_execution_error)?;
     process_object
         .set(js_string!("release"), release, true, context)
         .map_err(sandbox_execution_error)?;
     process_object
         .set(
             js_string!("argv0"),
-            JsValue::from(JsString::from(process.exec_path.clone())),
+            JsValue::from(JsString::from(
+                process
+                    .argv
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| process.exec_path.clone()),
+            )),
             true,
             context,
         )
+        .map_err(sandbox_execution_error)?;
+    let raw_debug = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_process_methods_raw_debug),
+    )
+    .name(js_string!("_rawDebug"))
+    .length(1)
+    .constructor(false)
+    .build();
+    process_object
+        .set(js_string!("_rawDebug"), JsValue::from(raw_debug), true, context)
         .map_err(sandbox_execution_error)?;
 
     drop(process);
@@ -7360,10 +7470,13 @@ fn node_internal_binding_config(context: &mut Context) -> Result<JsObject, Sandb
         .map_err(sandbox_execution_error)?;
     for (name, value) in [
         ("bits", JsValue::from(64)),
+        ("isDebugBuild", JsValue::from(false)),
+        ("openSSLIsBoringSSL", JsValue::from(false)),
+        ("fipsMode", JsValue::from(true)),
         ("hasIntl", JsValue::from(has_intl)),
         ("hasInspector", JsValue::from(false)),
         ("hasNodeOptions", JsValue::from(true)),
-        ("hasOpenSSL", JsValue::from(true)),
+        ("hasOpenSSL", JsValue::from(false)),
         ("hasSmallICU", JsValue::from(false)),
         ("hasTracing", JsValue::from(true)),
         ("noBrowserGlobals", JsValue::from(false)),
@@ -7372,6 +7485,22 @@ fn node_internal_binding_config(context: &mut Context) -> Result<JsObject, Sandb
             .set(JsString::from(name), value, true, context)
             .map_err(sandbox_execution_error)?;
     }
+    let get_default_locale = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_config_get_default_locale),
+    )
+    .name(js_string!("getDefaultLocale"))
+    .length(0)
+    .constructor(false)
+    .build();
+    object
+        .set(
+            js_string!("getDefaultLocale"),
+            JsValue::from(get_default_locale),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -7535,6 +7664,16 @@ fn node_internal_binding_options(context: &mut Context) -> Result<JsObject, Sand
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    let env_settings = JsValue::from_json(&node_options_env_settings_json(), context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("envSettings"), env_settings, true, context)
+        .map_err(sandbox_execution_error)?;
+    let types = JsValue::from_json(&node_options_types_json(), context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("types"), types, true, context)
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -8073,6 +8212,14 @@ fn node_internal_binding_os(context: &mut Context) -> Result<JsObject, SandboxEr
 
 fn node_internal_binding_credentials(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
+    let safe_getenv = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_credentials_safe_getenv),
+    )
+    .name(js_string!("safeGetenv"))
+    .length(1)
+    .constructor(false)
+    .build();
     let get_temp_dir = FunctionObjectBuilder::new(
         context.realm(),
         NativeFunction::from_fn_ptr(node_credentials_get_temp_dir),
@@ -8082,7 +8229,18 @@ fn node_internal_binding_credentials(context: &mut Context) -> Result<JsObject, 
     .constructor(false)
     .build();
     object
+        .set(js_string!("safeGetenv"), JsValue::from(safe_getenv), true, context)
+        .map_err(sandbox_execution_error)?;
+    object
         .set(js_string!("getTempDir"), JsValue::from(get_temp_dir), true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("implementsPosixCredentials"),
+            JsValue::from(false),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
     Ok(object)
 }
@@ -11605,18 +11763,166 @@ fn node_process_methods_patch_process_object(
         let process = host.process.borrow();
         for (name, value) in [
             ("argv", JsValue::from_json(&serde_json::json!(process.argv), context).map_err(sandbox_execution_error)?),
-            ("execArgv", JsValue::from_json(&serde_json::json!([]), context).map_err(sandbox_execution_error)?),
+            ("execArgv", JsValue::from_json(&serde_json::json!(process.exec_argv), context).map_err(sandbox_execution_error)?),
             ("execPath", JsValue::from(JsString::from(process.exec_path.clone()))),
             ("pid", JsValue::from(process.pid)),
-            ("ppid", JsValue::from(process.ppid)),
-            ("title", JsValue::from(JsString::from(process.title.clone()))),
+            (
+                "versions",
+                JsValue::from_json(&node_process_versions_json(&process), context)
+                    .map_err(sandbox_execution_error)?,
+            ),
         ] {
             target
                 .set(JsString::from(name), value, true, context)
                 .map_err(sandbox_execution_error)?;
         }
+        drop(process);
+
+        let title_getter = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_process_title_getter),
+        )
+        .name(js_string!("get title"))
+        .length(0)
+        .constructor(false)
+        .build();
+        let title_setter = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_process_title_setter),
+        )
+        .name(js_string!("set title"))
+        .length(1)
+        .constructor(false)
+        .build();
+        target
+            .define_property_or_throw(
+                js_string!("title"),
+                PropertyDescriptor::builder()
+                    .get(title_getter)
+                    .set(title_setter)
+                    .enumerable(true)
+                    .configurable(true),
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+
+        let ppid_getter = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_process_ppid_getter),
+        )
+        .name(js_string!("get ppid"))
+        .length(0)
+        .constructor(false)
+        .build();
+        target
+            .define_property_or_throw(
+                js_string!("ppid"),
+                PropertyDescriptor::builder()
+                    .get(ppid_getter)
+                    .enumerable(true)
+                    .configurable(true),
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+
+        let debug_port_getter = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_process_debug_port_getter),
+        )
+        .name(js_string!("get debugPort"))
+        .length(0)
+        .constructor(false)
+        .build();
+        let debug_port_setter = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_process_debug_port_setter),
+        )
+        .name(js_string!("set debugPort"))
+        .length(1)
+        .constructor(false)
+        .build();
+        target
+            .define_property_or_throw(
+                js_string!("debugPort"),
+                PropertyDescriptor::builder()
+                    .get(debug_port_getter)
+                    .set(debug_port_setter)
+                    .enumerable(true)
+                    .configurable(true),
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
         Ok(JsValue::undefined())
     })
+}
+
+fn node_process_title_getter(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| {
+        Ok(JsValue::from(JsString::from(
+            host.process.borrow().title.clone(),
+        )))
+    })
+    .map_err(js_error)
+}
+
+fn node_process_title_setter(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let title = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    node_with_host(|host| {
+        host.process.borrow_mut().title = title;
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_process_ppid_getter(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| Ok(JsValue::from(host.process.borrow().ppid))).map_err(js_error)
+}
+
+fn node_process_debug_port_getter(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| Ok(JsValue::from(host.process.borrow().debug_port))).map_err(js_error)
+}
+
+fn node_process_debug_port_setter(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let port = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
+    if port != 0 && !(1024..=65535).contains(&port) {
+        return Err(JsNativeError::range()
+            .with_message("process.debugPort must be 0 or in range 1024 to 65535")
+            .into());
+    }
+    node_with_host(|host| {
+        host.process.borrow_mut().debug_port = port as u16;
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
 }
 
 fn node_process_methods_uptime(
@@ -11956,9 +12262,13 @@ fn node_process_methods_execve(
         .unwrap_or_else(JsValue::undefined)
         .to_json(context)?
         .unwrap_or(JsonValue::Null);
-    let env = serde_json::from_value::<BTreeMap<String, String>>(env)
+    let env = serde_json::from_value::<Vec<String>>(env)
         .map_err(sandbox_execution_error)
         .map_err(js_error)?;
+    let env = env
+        .into_iter()
+        .filter_map(|entry| entry.split_once('=').map(|(key, value)| (key.to_string(), value.to_string())))
+        .collect::<BTreeMap<_, _>>();
     node_with_host(|host| {
         let cwd = host.process.borrow().cwd.clone();
         let result = execute_direct_child_process(host, command.clone(), argv.clone(), cwd, env, None)?;
@@ -12034,7 +12344,10 @@ fn node_process_methods_load_env_file(
             .map(|path| resolve_node_path(&host.process.borrow().cwd, path))
             .unwrap_or_else(|| resolve_node_path(&host.process.borrow().cwd, ".env"));
         let Some(bytes) = node_read_file(host, &resolved)? else {
-            return Ok(JsValue::undefined());
+            return Err(SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: format!("ENOENT: no such file or directory, open '{resolved}'"),
+            });
         };
         let mut process = host.process.borrow_mut();
         for line in String::from_utf8_lossy(&bytes).lines() {
@@ -12134,9 +12447,15 @@ fn node_process_methods_set_emit_warning_sync(
     args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    let callback = args.first().and_then(JsValue::as_object);
+    let callback = args
+        .first()
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| JsNativeError::typ().with_message("emitWarningSync callback must be a function"))?;
+    let _ = JsValue::from(callback.clone())
+        .as_callable()
+        .ok_or_else(|| JsNativeError::typ().with_message("emitWarningSync callback must be a function"))?;
     node_with_host(|host| {
-        host.bootstrap.borrow_mut().emit_warning_sync = callback;
+        host.bootstrap.borrow_mut().emit_warning_sync = Some(callback);
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -15984,8 +16303,8 @@ fn node_options_get_cli_options_values(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    JsValue::from_json(
-        &serde_json::json!({
+    node_with_host_js(context, |host, context| {
+        let mut values = serde_json::json!({
             "--permission": false,
             "--allow-fs-read": [],
             "--allow-fs-write": [],
@@ -16026,9 +16345,198 @@ fn node_options_get_cli_options_values(
             "--pending-deprecation": false,
             "--no-deprecation": false,
             "--require-module": false
-        }),
-        context,
-    )
+        });
+        let Some(object) = values.as_object_mut() else {
+            return Err(sandbox_execution_error("CLI option defaults must be an object"));
+        };
+        let exec_argv = host.process.borrow().exec_argv.clone();
+        let mut index = 0usize;
+        while index < exec_argv.len() {
+            let arg = &exec_argv[index];
+            let (name, inline_value) = if let Some((name, value)) = arg.split_once('=') {
+                (name.to_string(), Some(value.to_string()))
+            } else {
+                (arg.clone(), None)
+            };
+            match name.as_str() {
+                "--allow-fs-read"
+                | "--allow-fs-write"
+                | "--conditions"
+                | "--experimental-loader"
+                | "--import"
+                | "--require" => {
+                    let value = inline_value.or_else(|| {
+                        exec_argv
+                            .get(index + 1)
+                            .filter(|next| !next.starts_with('-'))
+                            .cloned()
+                    });
+                    if let Some(value) = value {
+                        object
+                            .entry(name.clone())
+                            .or_insert_with(|| JsonValue::Array(Vec::new()))
+                            .as_array_mut()
+                            .ok_or_else(|| sandbox_execution_error("CLI string-list option must be an array"))?
+                            .push(JsonValue::String(value));
+                        if inline_value.is_none()
+                            && exec_argv
+                                .get(index + 1)
+                                .is_some_and(|next| !next.starts_with('-'))
+                        {
+                            index += 1;
+                        }
+                    }
+                }
+                "--diagnostic-dir"
+                | "--experimental-config-file"
+                | "--experimental-default-type"
+                | "--heapsnapshot-signal" => {
+                    let value = inline_value.or_else(|| exec_argv.get(index + 1).cloned());
+                    if let Some(value) = value {
+                        object.insert(name.clone(), JsonValue::String(value));
+                        if inline_value.is_none() {
+                            index += 1;
+                        }
+                    }
+                }
+                "--network-family-autoselection-attempt-timeout" => {
+                    let value = inline_value.or_else(|| exec_argv.get(index + 1).cloned());
+                    if let Some(value) = value {
+                        if let Ok(value) = value.parse::<i64>() {
+                            object.insert(name.clone(), JsonValue::from(value));
+                        }
+                        if inline_value.is_none() {
+                            index += 1;
+                        }
+                    }
+                }
+                "--no-network-family-autoselection" => {
+                    object.insert(
+                        "--network-family-autoselection".to_string(),
+                        JsonValue::Bool(false),
+                    );
+                }
+                _ if object
+                    .get(name.as_str())
+                    .is_some_and(|value| matches!(value, JsonValue::Bool(_))) =>
+                {
+                    object.insert(name, JsonValue::Bool(true));
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        JsValue::from_json(&values, context).map_err(sandbox_execution_error)
+    })
+}
+
+fn node_option_info_entries() -> Vec<(&'static str, i32, i32, &'static str)> {
+    vec![
+        ("--allow-addons", 2, 1, ""),
+        ("--allow-child-process", 2, 1, ""),
+        ("--allow-fs-read", 7, 1, ""),
+        ("--allow-fs-write", 7, 1, ""),
+        ("--allow-inspector", 2, 1, ""),
+        ("--allow-wasi", 2, 1, ""),
+        ("--allow-worker", 2, 1, ""),
+        ("--conditions", 7, 0, ""),
+        ("--diagnostic-dir", 5, 0, ""),
+        ("--enable-source-maps", 2, 0, ""),
+        ("--entry-url", 2, 0, ""),
+        ("--experimental-config-file", 5, 0, ""),
+        ("--experimental-default-config-file", 2, 0, ""),
+        ("--experimental-default-type", 5, 0, ""),
+        ("--experimental-eventsource", 2, 0, ""),
+        ("--experimental-loader", 7, 0, ""),
+        ("--experimental-quic", 2, 0, ""),
+        ("--experimental-require-module", 2, 0, ""),
+        ("--experimental-vm-modules", 2, 0, ""),
+        ("--expose-internals", 2, 0, ""),
+        ("--heapsnapshot-signal", 5, 0, ""),
+        ("--import", 7, 0, ""),
+        ("--network-family-autoselection", 2, 0, ""),
+        ("--network-family-autoselection-attempt-timeout", 4, 0, ""),
+        ("--no-addons", 2, 0, ""),
+        ("--no-deprecation", 2, 0, ""),
+        ("--no-experimental-global-navigator", 2, 0, ""),
+        ("--no-experimental-sqlite", 2, 0, ""),
+        ("--no-experimental-websocket", 2, 0, ""),
+        ("--pending-deprecation", 2, 0, ""),
+        ("--permission", 2, 1, ""),
+        ("--preserve-symlinks", 2, 0, ""),
+        ("--preserve-symlinks-main", 2, 0, ""),
+        ("--report-on-signal", 2, 0, ""),
+        ("--require", 7, 1, ""),
+        ("--require-module", 2, 0, ""),
+        ("--strip-types", 2, 0, ""),
+        ("--trace-sigint", 2, 0, ""),
+        ("--use-env-proxy", 2, 0, ""),
+        ("--warnings", 2, 0, ""),
+    ]
+}
+
+fn node_options_build_info_map(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let map = node_make_js_map(context)?;
+    for (name, option_type, env_var_settings, help_text) in node_option_info_entries() {
+        let info = ObjectInitializer::new(context)
+            .property(js_string!("type"), JsValue::from(option_type), Attribute::all())
+            .property(
+                js_string!("envVarSettings"),
+                JsValue::from(env_var_settings),
+                Attribute::all(),
+            )
+            .property(
+                js_string!("helpText"),
+                JsValue::from(JsString::from(help_text)),
+                Attribute::all(),
+            )
+            .build();
+        node_js_map_set(
+            &map,
+            JsValue::from(JsString::from(name)),
+            JsValue::from(info),
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    }
+    Ok(map)
+}
+
+fn node_options_build_alias_map(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let map = node_make_js_map(context)?;
+    for (alias, expansion) in [
+        ("--experimental-strip-types", vec!["--strip-types"]),
+        ("--loader", vec!["--experimental-loader"]),
+    ] {
+        node_js_map_set(
+            &map,
+            JsValue::from(JsString::from(alias)),
+            JsValue::from(JsArray::from_iter(
+                expansion.into_iter().map(JsString::from).map(JsValue::from),
+                context,
+            )),
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    }
+    Ok(map)
+}
+
+fn node_options_build_input_type_map(
+    entries: &[(&str, &str)],
+    context: &mut Context,
+) -> Result<JsObject, SandboxError> {
+    let map = node_make_js_map(context)?;
+    for (name, input_type) in entries {
+        node_js_map_set(
+            &map,
+            JsValue::from(JsString::from(*name)),
+            JsValue::from(JsString::from(*input_type)),
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    }
+    Ok(map)
 }
 
 fn node_options_get_cli_options_info(
@@ -16036,7 +16544,20 @@ fn node_options_get_cli_options_info(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    JsValue::from_json(&serde_json::json!({}), context)
+    Ok(JsValue::from(
+        ObjectInitializer::new(context)
+            .property(
+                js_string!("options"),
+                JsValue::from(node_options_build_info_map(context).map_err(sandbox_execution_error)?),
+                Attribute::all(),
+            )
+            .property(
+                js_string!("aliases"),
+                JsValue::from(node_options_build_alias_map(context).map_err(sandbox_execution_error)?),
+                Attribute::all(),
+            )
+            .build(),
+    ))
 }
 
 fn node_options_get_options_as_flags(
@@ -16044,7 +16565,10 @@ fn node_options_get_options_as_flags(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    JsValue::from_json(&serde_json::json!([]), context)
+    node_with_host_js(context, |host, context| {
+        JsValue::from_json(&serde_json::json!(host.process.borrow().exec_argv), context)
+            .map_err(sandbox_execution_error)
+    })
 }
 
 fn node_options_get_embedder_options(
@@ -16053,7 +16577,11 @@ fn node_options_get_embedder_options(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     JsValue::from_json(
-        &serde_json::json!({ "noGlobalSearchPaths": true }),
+        &serde_json::json!({
+            "noGlobalSearchPaths": true,
+            "hasEmbedderPreload": false,
+            "noBrowserGlobals": false
+        }),
         context,
     )
 }
@@ -16063,7 +16591,18 @@ fn node_options_get_env_options_input_type(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    JsValue::from_json(&serde_json::json!([]), context)
+    Ok(JsValue::from(
+        node_options_build_input_type_map(
+            &[
+                ("--conditions", "array"),
+                ("--experimental-default-type", "string"),
+                ("--import", "array"),
+                ("--require", "array"),
+            ],
+            context,
+        )
+        .map_err(sandbox_execution_error)?,
+    ))
 }
 
 fn node_options_get_namespace_options_input_type(
@@ -16071,7 +16610,39 @@ fn node_options_get_namespace_options_input_type(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    JsValue::from_json(&serde_json::json!([]), context)
+    let map = node_make_js_map(context).map_err(sandbox_execution_error)?;
+    node_js_map_set(
+        &map,
+        JsValue::from(js_string!("nodeOptions")),
+        JsValue::from(
+            node_options_build_input_type_map(
+                &[
+                    ("--conditions", "array"),
+                    ("--experimental-default-type", "string"),
+                    ("--import", "array"),
+                    ("--require", "array"),
+                ],
+                context,
+            )
+            .map_err(sandbox_execution_error)?,
+        ),
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
+    Ok(JsValue::from(map))
+}
+
+fn node_config_get_default_locale(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host(|host| {
+        Ok(JsValue::from(JsString::from(
+            host.process.borrow().locale.clone(),
+        )))
+    })
+    .map_err(js_error)
 }
 
 fn node_type_constructor_name(
@@ -18039,21 +18610,9 @@ fn node_uv_get_error_map(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let map = context
-        .eval(Source::from_bytes(b"new Map()"))
+    let map = node_make_js_map(context)
         .map_err(sandbox_execution_error)
-        .map_err(js_error)?
-        .as_object()
-        .ok_or_else(|| {
-            js_error(SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: "uv.getErrorMap() failed to allocate Map".to_string(),
-            })
-        })?;
-    let set = map
-        .get(js_string!("set"), context)?
-        .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("Map.set is not callable"))?;
+        .map_err(js_error)?;
     for (code, name, message) in [
         (-1, "EOF", "end of file"),
         (-2, "ENOENT", "no such file or directory"),
@@ -18073,13 +18632,34 @@ fn node_uv_get_error_map(
             ],
             context,
         );
-        let _ = set.call(
-            &JsValue::from(map.clone()),
-            &[JsValue::from(code), JsValue::from(pair)],
-            context,
-        )?;
+        node_js_map_set(&map, JsValue::from(code), JsValue::from(pair), context)?;
     }
     Ok(JsValue::from(map))
+}
+
+fn node_make_js_map(context: &mut Context) -> Result<JsObject, SandboxError> {
+    context
+        .eval(Source::from_bytes(b"new Map()"))
+        .map_err(sandbox_execution_error)?
+        .as_object()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: "failed to allocate Map".to_string(),
+        })
+}
+
+fn node_js_map_set(
+    map: &JsObject,
+    key: JsValue,
+    value: JsValue,
+    context: &mut Context,
+) -> Result<(), JsError> {
+    let set = map
+        .get(js_string!("set"), context)?
+        .as_callable()
+        .ok_or_else(|| JsNativeError::typ().with_message("Map.set is not callable"))?;
+    set.call(&JsValue::from(map.clone()), &[key, value], context)?;
+    Ok(())
 }
 
 fn node_os_get_available_parallelism(
@@ -18349,6 +18929,24 @@ fn node_credentials_get_temp_dir(
             .cloned()
             .unwrap_or_else(|| "/tmp".to_string());
         Ok(JsValue::from(JsString::from(temp_dir)))
+    })
+}
+
+fn node_credentials_safe_getenv(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let name = node_arg_string(args, 0, context)?;
+    node_with_host_js(context, |host, _context| {
+        Ok(host
+            .process
+            .borrow()
+            .env
+            .get(&name)
+            .cloned()
+            .map(|value| JsValue::from(JsString::from(value)))
+            .unwrap_or_else(JsValue::undefined))
     })
 }
 
@@ -20760,6 +21358,8 @@ fn execute_node_child_process(
         (resolved_command, argv)
     };
 
+    let mut child_process = NodeProcessState::new(child_argv.clone(), env, cwd);
+    child_process.locale = host.process.borrow().locale.clone();
     let child_host = Rc::new(NodeRuntimeHost {
         runtime_name: host.runtime_name.clone(),
         runtime_handle: host.runtime_handle.clone(),
@@ -20770,11 +21370,7 @@ fn execute_node_child_process(
         capture_debug_trace: host.capture_debug_trace,
         debug_options: host.debug_options.clone(),
         entropy: host.entropy.clone(),
-        process: Rc::new(RefCell::new(NodeProcessState::new(
-            child_argv.clone(),
-            env,
-            cwd,
-        ))),
+        process: Rc::new(RefCell::new(child_process)),
         open_files: Rc::new(RefCell::new(NodeOpenFileTable::default())),
         loaded_modules: Rc::new(RefCell::new(BTreeMap::new())),
         materialized_modules: Rc::new(RefCell::new(BTreeMap::new())),
