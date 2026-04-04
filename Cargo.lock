@@ -1163,6 +1163,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3513,16 +3519,23 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
+ "boa_ast 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
  "boa_engine 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
+ "boa_gc 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
+ "boa_interner 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
+ "boa_parser 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
  "brotli",
  "crc32fast",
  "flate2",
  "futures",
+ "hex",
  "hkdf",
  "hmac",
  "include_dir",
  "md-5",
  "pbkdf2",
+ "regex",
  "ripemd",
  "scrypt",
  "serde",
@@ -3543,6 +3556,7 @@ dependencies = [
  "tracing-subscriber",
  "turmoil",
  "url",
+ "urlpattern",
  "uuid",
  "zstd",
 ]
@@ -4123,6 +4137,18 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "urlpattern"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df16f50ef4cc145211879a3867ba757076b25dfee812040dcb0658bd9ae7904b"
+dependencies = [
+ "icu_properties",
+ "regex",
+ "serde",
+ "url",
 ]
 
 [[package]]

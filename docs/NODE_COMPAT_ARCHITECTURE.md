@@ -360,10 +360,8 @@ The right posture is not "throw it all away." It is:
 
 These are the main areas that do not fit the long-term architecture and should be retired as we move onto upstream Node JS.
 
-- [crates/terracedb-sandbox/src/node_compat_bootstrap.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/node_compat_bootstrap.js)
-  The large `__terraceBuiltin(...)` switch is currently acting like a handwritten public Node stdlib. That was useful for bring-up, but it is the wrong ownership boundary long-term.
-- [crates/terracedb-sandbox/src/node_compat_bootstrap.js](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/node_compat_bootstrap.js)
-  `__terraceWrapBuiltinValue(...)` and `__terraceCreateBuiltinStubModule(...)` are useful debugging tools, but they should become debug-only helpers, not the way production builtins behave.
+- The deleted handwritten JS bootstrap / builtin shim
+  The old `node_compat_bootstrap.js` path was the wrong ownership boundary. Bootstrap now starts in Rust, and public Node behavior should come from upstream Node JS plus Rust-backed `internalBinding(...)` implementations.
 - [crates/terracedb-sandbox/src/loader.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/loader.rs)
   `load_node_builtin_module(...)` currently special-cases a small preview-style builtin path. That should be replaced by loading upstream Node JS with a thinner builtin/internal bridge.
 - [crates/terracedb-sandbox/src/packages.rs](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/packages.rs)
