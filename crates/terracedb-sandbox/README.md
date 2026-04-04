@@ -2,11 +2,11 @@
 
 ## Generated Upstream Node Tests
 
-The upstream Node smoke tests live under `tests/generated/` and are checked in.
+The upstream Node smoke tests live under `tests/generated_node_upstream/` and are checked in.
 
 - Generator binary: [`src/bin/generate_node_upstream_tests.rs`](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/src/bin/generate_node_upstream_tests.rs)
-- Cargo-discovered wrapper: [`tests/generated_node_upstream_common_subset.rs`](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/tests/generated_node_upstream_common_subset.rs)
-- Generated body: [`tests/generated/node_upstream_common_subset_body.rs`](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/tests/generated/node_upstream_common_subset_body.rs)
+- Cargo-discovered wrapper: [`tests/generated_node_upstream/main.rs`](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/tests/generated_node_upstream/main.rs)
+- Generated body: [`tests/generated_node_upstream/body.rs`](/Users/maxwellgurewitz/.codex/worktrees/fc5a/terracedb/crates/terracedb-sandbox/tests/generated_node_upstream/body.rs)
 
 Regenerate them with:
 
