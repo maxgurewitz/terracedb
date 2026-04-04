@@ -98,3 +98,48 @@ async fn upstream_test_require_resolve_runs() {
         stdout, stderr
     );
 }
+
+#[tokio::test]
+async fn upstream_test_module_nodemodulepaths_runs() {
+    let result = node_compat::exec_upstream_node_test(
+        "/node/test/parallel/test-module-nodemodulepaths.js",
+    )
+    .await
+    .expect("execute upstream test");
+    let (stdout, stderr, exit_code) = stdout_stderr_exit(&result);
+    assert_eq!(
+        exit_code, 0,
+        "stdout:\n{}\n\nstderr:\n{}",
+        stdout, stderr
+    );
+}
+
+#[tokio::test]
+async fn upstream_test_require_dot_runs() {
+    let result = node_compat::exec_upstream_node_test(
+        "/node/test/parallel/test-require-dot.js",
+    )
+    .await
+    .expect("execute upstream test");
+    let (stdout, stderr, exit_code) = stdout_stderr_exit(&result);
+    assert_eq!(
+        exit_code, 0,
+        "stdout:\n{}\n\nstderr:\n{}",
+        stdout, stderr
+    );
+}
+
+#[tokio::test]
+async fn upstream_test_module_wrapper_runs() {
+    let result = node_compat::exec_upstream_node_test(
+        "/node/test/parallel/test-module-wrapper.js",
+    )
+    .await
+    .expect("execute upstream test");
+    let (stdout, stderr, exit_code) = stdout_stderr_exit(&result);
+    assert_eq!(
+        exit_code, 0,
+        "stdout:\n{}\n\nstderr:\n{}",
+        stdout, stderr
+    );
+}
