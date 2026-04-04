@@ -1,0 +1,86 @@
+namespace terracedb.vfs;
+
+table OverlayBase {
+  volume_id:[ubyte] (required);
+  sequence:ulong;
+  durable:bool;
+}
+
+table PathEntry {
+  path:string (required);
+  inode:ulong;
+}
+
+enum PayloadCompression:ubyte {
+  None = 0,
+  Zlib = 1
+}
+
+table FilePayloadEntry {
+  payload_offset:ulong;
+  payload_len:ulong;
+  compression:PayloadCompression = None;
+}
+
+table InodeEntry {
+  inode:ulong;
+  kind:ubyte;
+  mode:uint;
+  nlink:uint;
+  uid:uint;
+  gid:uint;
+  size:ulong;
+  created_at:ulong;
+  modified_at:ulong;
+  changed_at:ulong;
+  accessed_at:ulong;
+  rdev:ulong;
+  symlink_target:string;
+  file_payload:FilePayloadEntry;
+}
+
+table KvEntry {
+  key:string (required);
+  value_json:string (required);
+}
+
+table ToolRunEntry {
+  id:ulong;
+  name:string (required);
+  status:ubyte;
+  params_json:string;
+  result_json:string;
+  error:string;
+  started_at:ulong;
+  has_completed_at:bool;
+  completed_at:ulong;
+}
+
+table OriginEntry {
+  inode:ulong;
+  base_volume_id:[ubyte] (required);
+  base_sequence:ulong;
+  base_durable:bool;
+  base_inode:ulong;
+}
+
+table VolumeArtifactManifest {
+  format_version:uint;
+  volume_id:[ubyte] (required);
+  sequence:ulong;
+  durable:bool;
+  chunk_size:uint;
+  volume_format_version:ubyte;
+  root_inode:ulong;
+  created_at:ulong;
+  overlay_base:OverlayBase;
+  paths:[PathEntry] (required);
+  inodes:[InodeEntry] (required);
+  kv:[KvEntry] (required);
+  tool_runs:[ToolRunEntry] (required);
+  whiteouts:[string] (required);
+  origins:[OriginEntry] (required);
+}
+
+root_type VolumeArtifactManifest;
+file_identifier "TDVM";

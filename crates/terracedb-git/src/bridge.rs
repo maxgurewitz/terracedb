@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io::{Cursor, Read},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -98,6 +102,27 @@ pub struct GitImportReport {
 }
 
 #[async_trait]
+pub trait GitImportSink: Send {
+    async fn add_directory(
+        &mut self,
+        path: &str,
+        mode: Option<u32>,
+    ) -> Result<(), GitSubstrateError>;
+    async fn add_file(
+        &mut self,
+        path: &str,
+        mode: Option<u32>,
+        reader: &mut (dyn Read + Send),
+    ) -> Result<(), GitSubstrateError>;
+    async fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        mode: Option<u32>,
+    ) -> Result<(), GitSubstrateError>;
+}
+
+#[async_trait]
 pub trait GitHostBridge: Send + Sync {
     fn name(&self) -> &str;
     fn supports_host_filesystem_bridge(&self) -> bool {
@@ -112,6 +137,52 @@ pub trait GitHostBridge: Send + Sync {
         request: GitImportRequest,
         cancellation: Arc<dyn GitCancellationToken>,
     ) -> Result<GitImportReport, GitSubstrateError>;
+
+    async fn import_repository_streaming(
+        &self,
+        request: GitImportRequest,
+        sink: &mut dyn GitImportSink,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitImportReport, GitSubstrateError> {
+        let mut report = self.import_repository(request, cancellation).await?;
+        for entry in &report.entries {
+            match entry.kind {
+                GitImportEntryKind::Directory => {
+                    sink.add_directory(&entry.path, entry.mode).await?;
+                }
+                GitImportEntryKind::File => {
+                    let mut cursor = Cursor::new(entry.data.as_deref().ok_or_else(|| {
+                        GitSubstrateError::Bridge {
+                            operation: "import_repository_streaming",
+                            message: format!(
+                                "missing file payload for imported path {}",
+                                entry.path
+                            ),
+                        }
+                    })?);
+                    sink.add_file(&entry.path, entry.mode, &mut cursor).await?;
+                }
+                GitImportEntryKind::Symlink => {
+                    sink.add_symlink(
+                        &entry.path,
+                        entry.symlink_target.as_deref().ok_or_else(|| {
+                            GitSubstrateError::Bridge {
+                                operation: "import_repository_streaming",
+                                message: format!(
+                                    "missing symlink target for imported path {}",
+                                    entry.path
+                                ),
+                            }
+                        })?,
+                        entry.mode,
+                    )
+                    .await?;
+                }
+            }
+        }
+        report.entries.clear();
+        Ok(report)
+    }
 
     async fn export_repository(
         &self,

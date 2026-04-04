@@ -2011,6 +2011,61 @@ async fn host_git_bridge_can_import_tree_only_layout_without_git_metadata() {
 }
 
 #[tokio::test]
+async fn host_git_bridge_can_import_remote_tree_only_layout_without_git_metadata() {
+    let repo = unique_test_dir("host-bridge-remote-tree-only");
+    let remote = unique_test_dir("host-bridge-remote-tree-only-remote");
+    init_git_repo(&repo, Some(&remote));
+
+    let bridge = HostGitBridge::default();
+    let imported = bridge
+        .import_repository(
+            GitImportRequest {
+                source: terracedb_git::GitImportSource::RemoteRepository {
+                    remote_url: remote.to_string_lossy().into_owned(),
+                    reference: Some("main".to_string()),
+                },
+                target_root: "/repo".to_string(),
+                mode: GitImportMode::Head,
+                layout: GitImportLayout::TreeOnly,
+                pathspec: vec!["tracked.txt".to_string()],
+                metadata: BTreeMap::new(),
+            },
+            Arc::new(NeverCancel),
+        )
+        .await
+        .expect("import remote repo tree only");
+
+    assert_eq!(imported.target_root, "/repo");
+    assert_eq!(imported.layout, GitImportLayout::TreeOnly);
+    assert_eq!(imported.origin, GitRepositoryOrigin::RemoteImport);
+    assert_eq!(
+        imported.remote_url.as_deref(),
+        Some(remote.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        imported
+            .entries
+            .iter()
+            .find(|entry| entry.path == "tracked.txt")
+            .and_then(|entry| entry.data.as_ref())
+            .cloned(),
+        Some(b"tracked\n".to_vec())
+    );
+    assert!(
+        imported.entries.iter().all(|entry| !entry.path.starts_with(".git")),
+        "remote tree-only imports should not synthesize .git metadata: {:?}",
+        imported
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>()
+    );
+
+    cleanup(&repo);
+    cleanup(&remote);
+}
+
+#[tokio::test]
 async fn host_git_bridge_preserves_empty_sha256_repo_format_for_first_commit() {
     if !host_git_supports_sha256() {
         return;

@@ -1,39 +1,18 @@
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
-
-use terracedb::{
-    Clock, DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp,
-};
-use terracedb_sandbox::{
-    CapabilityManifest, ConflictPolicy, DefaultSandboxStore, HoistMode, HoistedSource,
-    NodeDebugExecutionOptions, PackageCompatibilityMode, SandboxConfig, SandboxServices,
-    SandboxSession, SandboxStore,
-    disk::apply_hoist_to_volume,
-};
-use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 use tracing::info;
+
+use terracedb_sandbox::{
+    NodeDebugExecutionOptions, PackageCompatibilityMode, SandboxBaseLayer, SandboxConfig,
+    SandboxHarness, SandboxServices, SandboxSession,
+};
+use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId};
 
 pub const SANDBOX_NPM_ROOT: &str = "/workspace/npm";
 pub const SANDBOX_PROJECT_ROOT: &str = "/workspace/project";
 
 const CACHED_NPM_BASE_VOLUME_ID: VolumeId = VolumeId::new(0xA7F0_0000_0000_0001);
 const SESSION_VOLUME_BASE: u128 = 0xA8F0_0000_0000_0000;
-
-static CACHED_NPM_BASE: OnceLock<tokio::sync::Mutex<Option<CachedNpmBase>>> = OnceLock::new();
-static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone)]
-struct CachedNpmBase {
-    npm_root: String,
-    vfs: InMemoryVfsStore,
-    clock: Arc<dyn Clock>,
-}
-
-fn cached_npm_base_cell() -> &'static tokio::sync::Mutex<Option<CachedNpmBase>> {
-    CACHED_NPM_BASE.get_or_init(|| tokio::sync::Mutex::new(None))
-}
+static NEXT_SESSION_SUFFIX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 pub fn npm_cli_root() -> Option<String> {
     std::env::var("TERRACE_NPM_CLI_ROOT")
@@ -62,139 +41,35 @@ fn host_npm_root() -> Option<String> {
     )
 }
 
-pub fn sandbox_store(
-    now: u64,
-    seed: u64,
-    services: SandboxServices,
-) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
-    let dependencies = DbDependencies::new(
-        Arc::new(StubFileSystem::default()),
-        Arc::new(StubObjectStore::default()),
-        Arc::new(StubClock::new(Timestamp::new(now))),
-        Arc::new(StubRng::seeded(seed)),
-    );
-    let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
-    let sandbox = DefaultSandboxStore::new(Arc::new(vfs.clone()), dependencies.clock, services);
-    (vfs, sandbox)
-}
-
-pub async fn seed_base(vfs: &InMemoryVfsStore, base_volume_id: VolumeId) {
-    let base = vfs
-        .open_volume(
-            VolumeConfig::new(base_volume_id)
-                .with_chunk_size(4096)
-                .with_create_if_missing(true),
-        )
-        .await
-        .expect("open base volume");
-    base.fs()
-        .write_file(
-            "/workspace/.keep",
-            b"npm-cli".to_vec(),
-            CreateOptions {
-                create_parents: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("write base workspace marker");
-}
-
-async fn cached_npm_base() -> Option<CachedNpmBase> {
-    let npm_root = npm_cli_root()?;
-    let cell = cached_npm_base_cell();
-    let mut guard = cell.lock().await;
-    if let Some(cached) = guard.as_ref() {
-        return Some(cached.clone());
-    }
-
-    info!(
-        target: "terracedb.sandbox.test",
-        npm_root = %npm_root,
-        "building cached npm base volume"
-    );
-    let dependencies = DbDependencies::new(
-        Arc::new(StubFileSystem::default()),
-        Arc::new(StubObjectStore::default()),
-        Arc::new(StubClock::new(Timestamp::new(0))),
-        Arc::new(StubRng::seeded(0xC0FFEE)),
-    );
-    let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
-    seed_base(&vfs, CACHED_NPM_BASE_VOLUME_ID).await;
-    let base = vfs
-        .open_volume(VolumeConfig::new(CACHED_NPM_BASE_VOLUME_ID))
-        .await
-        .expect("open cached npm base volume");
-    apply_hoist_to_volume(
-        base.as_ref(),
-        &terracedb_sandbox::HoistRequest {
-            source_path: npm_root.clone(),
-            target_root: SANDBOX_NPM_ROOT.to_string(),
-            mode: HoistMode::DirectorySnapshot,
-            delete_missing: true,
-        },
-    )
-    .await
-    .expect("seed cached npm base volume");
-    base.fs()
-        .mkdir(
-            SANDBOX_PROJECT_ROOT,
-            terracedb_vfs::MkdirOptions {
-                recursive: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("create cached sandbox project root");
-
-    let cached = CachedNpmBase {
-        npm_root,
-        vfs,
-        clock: dependencies.clock,
-    };
-    *guard = Some(cached.clone());
-    Some(cached)
-}
-
 pub async fn open_npm_cli_session(
     now: u64,
     seed: u64,
 ) -> Option<(SandboxSession, InMemoryVfsStore)> {
-    let cached = cached_npm_base().await?;
-    info!(
-        target: "terracedb.sandbox.test",
-        now,
-        seed,
-        npm_root = %cached.npm_root,
-        "opening npm cli session from cached base"
-    );
-    let services = SandboxServices::deterministic();
-    let vfs = cached.vfs.clone();
-    let sandbox = DefaultSandboxStore::new(Arc::new(vfs.clone()), cached.clock.clone(), services);
-    let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
+    let artifact_path =
+        terracedb_sandbox::NODE_V24_14_1_NPM_CLI_V11_12_1_BASE_LAYER_ARTIFACT_PATH;
+    if !std::path::Path::new(artifact_path).exists() {
+        return None;
+    }
+
+    let harness = SandboxHarness::deterministic(now, seed, SandboxServices::deterministic());
+    let vfs = harness.volumes().as_ref().clone();
+    let session_suffix =
+        NEXT_SESSION_SUFFIX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
     let session_volume_id =
         VolumeId::new(SESSION_VOLUME_BASE + ((seed as u128) << 16) + session_suffix);
-    info!(target: "terracedb.sandbox.test", "cached base ready, opening session");
-    let session = sandbox
-        .open_session(SandboxConfig {
+    let session = harness
+        .open_session_from_base_layer_with(
+            &SandboxBaseLayer::vendored_node_v24_14_1_npm_cli_v11_12_1(),
+            CACHED_NPM_BASE_VOLUME_ID,
             session_volume_id,
-            session_chunk_size: Some(4096),
-            base_volume_id: CACHED_NPM_BASE_VOLUME_ID,
-            durable_base: false,
-            workspace_root: SANDBOX_NPM_ROOT.to_string(),
-            package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
-            conflict_policy: ConflictPolicy::Fail,
-            capabilities: CapabilityManifest::default(),
-            execution_policy: None,
-            hoisted_source: Some(HoistedSource {
-                source_path: cached.npm_root.clone(),
-                mode: HoistMode::DirectorySnapshot,
-            }),
-            git_provenance: None,
-        })
+            |config| SandboxConfig {
+                workspace_root: SANDBOX_PROJECT_ROOT.to_string(),
+                package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
+                ..config
+            },
+        )
         .await
         .expect("open npm cli sandbox session");
-    info!(target: "terracedb.sandbox.test", "npm cli session ready");
     Some((session, vfs))
 }
 

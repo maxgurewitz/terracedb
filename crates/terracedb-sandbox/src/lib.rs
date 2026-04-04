@@ -1,4 +1,5 @@
 pub mod bash;
+pub mod base_layers;
 pub mod capabilities;
 pub mod disk;
 pub mod error;
@@ -19,6 +20,14 @@ pub mod workflow_sdk;
 pub use bash::{
     BashReport, BashRequest, BashService, BashSessionState, DeterministicBashService,
     JustBashFilesystemAdapter, TERRACE_BASH_SESSION_STATE_PATH,
+};
+pub use base_layers::{
+    NODE_V24_14_1_COMMIT, NODE_V24_14_1_JS_TREE_BASE_LAYER_ARTIFACT_PATH,
+    NODE_V24_14_1_NPM_CLI_V11_12_1_BASE_LAYER_ARTIFACT_PATH, NODE_V24_14_1_REMOTE_URL,
+    NPM_CLI_V11_12_1_COMMIT, NPM_CLI_V11_12_1_REMOTE_URL, SandboxBaseLayer,
+    SandboxSnapshotLayer, SandboxSnapshotLayerSource, SandboxSnapshotRecipe,
+    node_v24_14_1_js_tree_recipe, node_v24_14_1_npm_cli_v11_12_1_recipe,
+    npm_cli_v11_12_1_runtime_tree_recipe,
 };
 pub use capabilities::{
     CapabilityCallRequest, CapabilityCallResult, CapabilityManifest, CapabilityMethod0,

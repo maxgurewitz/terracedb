@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -17,8 +18,9 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     GitCancellationToken, GitExportReport, GitExportRequest, GitHeadState, GitHostBridge,
-    GitImportEntry, GitImportEntryKind, GitImportLayout, GitImportMode, GitImportReport, GitImportRequest,
-    GitImportSource, GitIndexEntry, GitIndexSnapshot, GitObjectFormat, GitObjectKind,
+    GitImportEntry, GitImportEntryKind, GitImportLayout, GitImportMode, GitImportReport,
+    GitImportRequest, GitImportSink, GitImportSource, GitIndexEntry, GitIndexSnapshot,
+    GitObjectFormat, GitObjectKind,
     GitPullRequestReport, GitPullRequestRequest, GitPushReport, GitPushRequest, GitRemoteProvider,
     GitRepository, GitRepositoryOrigin, GitSubstrateError,
 };
@@ -80,7 +82,7 @@ impl GitHostBridge for HostGitBridge {
     }
 
     fn supports_remote_repository_bridge(&self) -> bool {
-        !self.remote_providers.is_empty()
+        true
     }
 
     async fn import_repository(
@@ -94,15 +96,44 @@ impl GitHostBridge for HostGitBridge {
                 import_host_repository(&path, request, cancellation.as_ref())
             }
             GitImportSource::RemoteRepository { remote_url, .. } => {
-                self.resolve_remote_provider(&remote_url, &request.metadata)
-                    .ok_or_else(|| GitSubstrateError::Bridge {
-                        operation: "import_repository",
-                        message: format!(
-                            "no configured remote repository provider supports {remote_url}"
-                        ),
-                    })?
-                    .import_repository(request, cancellation)
-                    .await
+                if let Some(provider) = self.resolve_remote_provider(&remote_url, &request.metadata)
+                {
+                    return provider.import_repository(request, cancellation).await;
+                }
+                import_remote_repository(request, cancellation.as_ref()).await
+            }
+        }
+    }
+
+    async fn import_repository_streaming(
+        &self,
+        request: GitImportRequest,
+        sink: &mut dyn GitImportSink,
+        cancellation: Arc<dyn GitCancellationToken>,
+    ) -> Result<GitImportReport, GitSubstrateError> {
+        ensure_not_cancelled(cancellation.as_ref(), "import_repository")?;
+        if request.layout != GitImportLayout::TreeOnly {
+            return GitHostBridge::import_repository_streaming(self, request, sink, cancellation)
+                .await;
+        }
+        match request.source.clone() {
+            GitImportSource::HostPath { path } => {
+                import_host_repository_streaming(&path, request, sink, cancellation.as_ref()).await
+            }
+            GitImportSource::RemoteRepository { remote_url, .. } => {
+                if self
+                    .resolve_remote_provider(&remote_url, &request.metadata)
+                    .is_some()
+                {
+                    return GitHostBridge::import_repository_streaming(
+                        self,
+                        request,
+                        sink,
+                        cancellation,
+                    )
+                    .await;
+                }
+                import_remote_repository_streaming(request, sink, cancellation.as_ref()).await
             }
         }
     }
@@ -210,25 +241,8 @@ fn import_host_repository(
     request: GitImportRequest,
     _cancellation: &dyn GitCancellationToken,
 ) -> Result<GitImportReport, GitSubstrateError> {
-    let source_path = canonicalize_for_storage(Path::new(source_path))?;
-    let repo_root = git_repo_root(Path::new(&source_path))?;
-    let head_commit = git_stdout_optional(
-        &repo_root,
-        &["rev-parse", "HEAD"],
-        OptionalGitLookup::HeadCommit,
-    )?;
-    let branch = git_stdout_optional(
-        &repo_root,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        OptionalGitLookup::SymbolicHead,
-    )?;
-    let remote_url = git_stdout_optional(
-        &repo_root,
-        &["remote", "get-url", "origin"],
-        OptionalGitLookup::OriginRemote,
-    )?;
-    let object_format = git_object_format(&repo_root)?;
-    let layout = request.layout.clone();
+    let (mut report, repo_root) = host_import_report_without_entries(source_path, &request)?;
+    let layout = report.layout.clone();
     let worktree_entries = match &request.mode {
         GitImportMode::Head => {
             let export_root = export_git_head(&repo_root, &request.pathspec)?;
@@ -253,10 +267,15 @@ fn import_host_repository(
         GitImportLayout::RepositoryImage => {
             let refs = git_references(&repo_root)?;
             let index = git_index_snapshot(&repo_root)?;
-            let objects = git_object_closure(&repo_root, &refs, head_commit.as_deref(), &index)?;
+            let objects = git_object_closure(
+                &repo_root,
+                &refs,
+                report.head_commit.as_deref(),
+                &index,
+            )?;
             import_repository_image_entries(
-                &branch,
-                head_commit.as_deref(),
+                &report.branch,
+                report.head_commit.as_deref(),
                 refs,
                 index,
                 objects,
@@ -265,29 +284,133 @@ fn import_host_repository(
         }
         GitImportLayout::TreeOnly => worktree_entries,
     };
-    Ok(GitImportReport {
-        source: request.source,
-        target_root: request.target_root,
-        repository_root: canonicalize_for_storage(&repo_root)?,
-        origin: GitRepositoryOrigin::HostImport,
-        object_format,
-        layout,
-        head_commit,
-        branch,
-        remote_url,
-        pathspec: if request.pathspec.is_empty() {
-            vec![".".to_string()]
-        } else {
-            request.pathspec.clone()
+    report.entries = entries;
+    Ok(report)
+}
+
+async fn import_host_repository_streaming(
+    source_path: &str,
+    request: GitImportRequest,
+    sink: &mut dyn GitImportSink,
+    _cancellation: &dyn GitCancellationToken,
+) -> Result<GitImportReport, GitSubstrateError> {
+    let (report, repo_root) = host_import_report_without_entries(source_path, &request)?;
+    match &request.mode {
+        GitImportMode::Head => {
+            stream_head_archive(&repo_root, &request.pathspec, sink).await?;
+        }
+        GitImportMode::WorkingTree {
+            include_untracked,
+            include_ignored,
+        } => {
+            let included = git_working_tree_paths(
+                &repo_root,
+                *include_untracked,
+                *include_ignored,
+                &request.pathspec,
+            )?;
+            stream_selected_paths(&repo_root, &included, sink).await?;
+        }
+    }
+    Ok(report)
+}
+
+async fn import_remote_repository(
+    request: GitImportRequest,
+    cancellation: &dyn GitCancellationToken,
+) -> Result<GitImportReport, GitSubstrateError> {
+    let workspace = prepare_remote_import_workspace(&request)?;
+    let host_path = workspace.path().to_string_lossy().into_owned();
+    let host_request = GitImportRequest {
+        source: GitImportSource::HostPath {
+            path: host_path.clone(),
         },
-        dirty: !git_stdout(
-            &repo_root,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )?
-        .is_empty(),
-        entries,
-        metadata: request.metadata,
-    })
+        ..request.clone()
+    };
+    let report = import_host_repository(&host_path, host_request, cancellation)?;
+    Ok(rewrite_remote_import_report(report, &request))
+}
+
+async fn import_remote_repository_streaming(
+    request: GitImportRequest,
+    sink: &mut dyn GitImportSink,
+    cancellation: &dyn GitCancellationToken,
+) -> Result<GitImportReport, GitSubstrateError> {
+    let workspace = prepare_remote_import_workspace(&request)?;
+    let host_path = workspace.path().to_string_lossy().into_owned();
+    let host_request = GitImportRequest {
+        source: GitImportSource::HostPath {
+            path: host_path.clone(),
+        },
+        ..request.clone()
+    };
+    let report =
+        import_host_repository_streaming(&host_path, host_request, sink, cancellation).await?;
+    Ok(rewrite_remote_import_report(report, &request))
+}
+
+fn rewrite_remote_import_report(
+    mut report: GitImportReport,
+    request: &GitImportRequest,
+) -> GitImportReport {
+    if let GitImportSource::RemoteRepository { remote_url, .. } = &request.source {
+        report.source = request.source.clone();
+        report.origin = GitRepositoryOrigin::RemoteImport;
+        report.repository_root = remote_url.clone();
+        report.remote_url = Some(remote_url.clone());
+    }
+    report
+}
+
+fn host_import_report_without_entries(
+    source_path: &str,
+    request: &GitImportRequest,
+) -> Result<(GitImportReport, PathBuf), GitSubstrateError> {
+    let source_path = canonicalize_for_storage(Path::new(source_path))?;
+    let repo_root = git_repo_root(Path::new(&source_path))?;
+    let head_commit = git_stdout_optional(
+        &repo_root,
+        &["rev-parse", "HEAD"],
+        OptionalGitLookup::HeadCommit,
+    )?;
+    let branch = git_stdout_optional(
+        &repo_root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        OptionalGitLookup::SymbolicHead,
+    )?;
+    let remote_url = git_stdout_optional(
+        &repo_root,
+        &["remote", "get-url", "origin"],
+        OptionalGitLookup::OriginRemote,
+    )?;
+    let object_format = git_object_format(&repo_root)?;
+    let dirty = !git_stdout(
+        &repo_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?
+    .is_empty();
+    Ok((
+        GitImportReport {
+            source: request.source.clone(),
+            target_root: request.target_root.clone(),
+            repository_root: canonicalize_for_storage(&repo_root)?,
+            origin: GitRepositoryOrigin::HostImport,
+            object_format,
+            layout: request.layout.clone(),
+            head_commit,
+            branch,
+            remote_url,
+            pathspec: if request.pathspec.is_empty() {
+                vec![".".to_string()]
+            } else {
+                request.pathspec.clone()
+            },
+            dirty,
+            entries: Vec::new(),
+            metadata: request.metadata.clone(),
+        },
+        repo_root,
+    ))
 }
 
 async fn push_via_host_checkout(
@@ -453,6 +576,47 @@ fn collect_selected_paths(
     Ok(entries)
 }
 
+async fn stream_selected_paths(
+    root: &Path,
+    included: &BTreeSet<String>,
+    sink: &mut dyn GitImportSink,
+) -> Result<(), GitSubstrateError> {
+    let mut created_dirs = BTreeSet::new();
+    for relative in included {
+        let path = root.join(relative);
+        if !path.exists() {
+            continue;
+        }
+        for ancestor in ancestor_relatives(relative) {
+            if created_dirs.insert(ancestor.clone()) {
+                sink.add_directory(&ancestor, None).await?;
+            }
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: format!("{}: {}", path.display(), error),
+        })?;
+        if metadata.file_type().is_file() {
+            let mut file = fs::File::open(&path).map_err(|error| GitSubstrateError::Bridge {
+                operation: "import_repository",
+                message: format!("{}: {}", path.display(), error),
+            })?;
+            sink.add_file(relative, Some(host_import_file_mode(&metadata)), &mut file)
+                .await?;
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path).map_err(|error| GitSubstrateError::Bridge {
+                operation: "import_repository",
+                message: format!("{}: {}", path.display(), error),
+            })?;
+            sink.add_symlink(relative, &target.to_string_lossy(), None)
+                .await?;
+        } else if metadata.file_type().is_dir() && created_dirs.insert(relative.clone()) {
+            sink.add_directory(relative, None).await?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_directory_tree_recursive(
     root: &Path,
     current: &Path,
@@ -531,6 +695,169 @@ fn collect_directory_tree_recursive(
     Ok(())
 }
 
+async fn stream_head_archive(
+    repo_root: &Path,
+    pathspec: &[String],
+    sink: &mut dyn GitImportSink,
+) -> Result<(), GitSubstrateError> {
+    #[derive(Debug)]
+    enum BufferedArchiveEntryKind {
+        Directory,
+        File(Vec<u8>),
+        Symlink(String),
+    }
+
+    #[derive(Debug)]
+    struct BufferedArchiveEntry {
+        path: String,
+        mode: Option<u32>,
+        kind: BufferedArchiveEntryKind,
+    }
+
+    let repo_root = repo_root.to_path_buf();
+    let pathspec = pathspec.to_vec();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<BufferedArchiveEntry>(16);
+    let worker = tokio::task::spawn_blocking(move || -> Result<(), GitSubstrateError> {
+        let mut command = sanitized_git_command(&repo_root);
+        command
+            .arg("archive")
+            .arg("--format=tar")
+            .arg("HEAD")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for entry in &pathspec {
+            command.arg(entry);
+        }
+        let mut child = command.spawn().map_err(|error| GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: format!("failed to spawn git archive: {error}"),
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: "git archive did not provide stdout".to_string(),
+        })?;
+        let mut archive = tar::Archive::new(stdout);
+        for entry in archive.entries().map_err(|error| GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: format!("failed to read git archive entries: {error}"),
+        })? {
+            let mut entry = entry.map_err(|error| GitSubstrateError::Bridge {
+                operation: "import_repository",
+                message: format!("failed to decode git archive entry: {error}"),
+            })?;
+            let relative = normalize_relative_path(
+                entry
+                    .path()
+                    .map_err(|error| GitSubstrateError::Bridge {
+                        operation: "import_repository",
+                        message: format!("failed to read git archive entry path: {error}"),
+                    })?
+                    .as_ref(),
+            )?;
+            if relative.is_empty() {
+                continue;
+            }
+            let mode = entry.header().mode().ok();
+            let entry_type = entry.header().entry_type();
+            let buffered = if entry_type.is_dir() {
+                BufferedArchiveEntry {
+                    path: relative,
+                    mode,
+                    kind: BufferedArchiveEntryKind::Directory,
+                }
+            } else if entry_type.is_symlink() {
+                let target = entry
+                    .link_name()
+                    .map_err(|error| GitSubstrateError::Bridge {
+                        operation: "import_repository",
+                        message: format!("failed to read git archive symlink target: {error}"),
+                    })?
+                    .ok_or_else(|| GitSubstrateError::Bridge {
+                        operation: "import_repository",
+                        message: format!("git archive symlink missing target for {relative}"),
+                    })?;
+                BufferedArchiveEntry {
+                    path: relative,
+                    mode,
+                    kind: BufferedArchiveEntryKind::Symlink(target.to_string_lossy().into_owned()),
+                }
+            } else if entry_type.is_file() {
+                let mut bytes = Vec::new();
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| GitSubstrateError::Bridge {
+                        operation: "import_repository",
+                        message: format!(
+                            "failed to read git archive file payload for {relative}: {error}"
+                        ),
+                    })?;
+                BufferedArchiveEntry {
+                    path: relative,
+                    mode,
+                    kind: BufferedArchiveEntryKind::File(bytes),
+                }
+            } else {
+                continue;
+            };
+            tx.blocking_send(buffered).map_err(|_| GitSubstrateError::Bridge {
+                operation: "import_repository",
+                message: "git archive consumer dropped before import completed".to_string(),
+            })?;
+        }
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_string(&mut stderr)
+                .map_err(|error| GitSubstrateError::Bridge {
+                    operation: "import_repository",
+                    message: format!("failed to read git archive stderr: {error}"),
+                })?;
+        }
+        let status = child.wait().map_err(|error| GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: format!("failed to wait for git archive: {error}"),
+        })?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: format!(
+                "git -C {} archive HEAD{} failed: {}",
+                repo_root.display(),
+                if pathspec.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", pathspec.join(" "))
+                },
+                stderr.trim()
+            ),
+        })
+    });
+
+    while let Some(entry) = rx.recv().await {
+        match entry.kind {
+            BufferedArchiveEntryKind::Directory => {
+                sink.add_directory(&entry.path, entry.mode).await?;
+            }
+            BufferedArchiveEntryKind::File(bytes) => {
+                let mut cursor = std::io::Cursor::new(bytes);
+                sink.add_file(&entry.path, entry.mode, &mut cursor).await?;
+            }
+            BufferedArchiveEntryKind::Symlink(target) => {
+                sink.add_symlink(&entry.path, &target, entry.mode).await?;
+            }
+        }
+    }
+
+    worker.await.map_err(|error| GitSubstrateError::Bridge {
+        operation: "import_repository",
+        message: format!("git archive worker failed to join: {error}"),
+    })??;
+    return Ok(());
+
+}
+
 fn export_git_head(repo_root: &Path, pathspec: &[String]) -> Result<PathBuf, GitSubstrateError> {
     let export_root = temp_export_path("git-head");
     fs::create_dir_all(&export_root).map_err(|error| GitSubstrateError::Bridge {
@@ -545,14 +872,17 @@ fn export_git_head(repo_root: &Path, pathspec: &[String]) -> Result<PathBuf, Git
         if files.is_empty() {
             return Ok(export_root);
         }
-        let mut args = vec![
-            "checkout-index".to_string(),
-            "--prefix".to_string(),
-            prefix,
-            "--".to_string(),
-        ];
-        args.extend(files);
-        run_git_dynamic(repo_root, &args)?;
+        run_git_with_nul_stdin(
+            repo_root,
+            &[
+                "checkout-index",
+                "-z",
+                "--stdin",
+                "--prefix",
+                prefix.as_str(),
+            ],
+            files.iter().map(String::as_str),
+        )?;
     }
     Ok(export_root)
 }
@@ -1261,6 +1591,83 @@ fn clone_remote_checkout(
     })
 }
 
+struct RemoteImportWorkspace {
+    path: PathBuf,
+}
+
+impl RemoteImportWorkspace {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RemoteImportWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn prepare_remote_import_workspace(
+    request: &GitImportRequest,
+) -> Result<RemoteImportWorkspace, GitSubstrateError> {
+    let GitImportSource::RemoteRepository {
+        remote_url,
+        reference,
+    } = &request.source
+    else {
+        return Err(GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: "remote import workspace requested for non-remote source".to_string(),
+        });
+    };
+    if !matches!(request.mode, GitImportMode::Head) {
+        return Err(GitSubstrateError::Bridge {
+            operation: "import_repository",
+            message: "remote repository imports currently support only head mode".to_string(),
+        });
+    }
+
+    let workspace_path = temp_export_path("remote-import");
+    if workspace_path.exists() {
+        let _ = fs::remove_dir_all(&workspace_path);
+    }
+    fs::create_dir_all(&workspace_path).map_err(|error| GitSubstrateError::Bridge {
+        operation: "import_repository",
+        message: format!("{}: {}", workspace_path.display(), error),
+    })?;
+    let workspace = RemoteImportWorkspace {
+        path: workspace_path,
+    };
+
+    run_git(workspace.path(), &["init"])?;
+    run_git(workspace.path(), &["remote", "add", "origin", remote_url])?;
+
+    let fetch_args = vec![
+        "fetch".to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        "--no-tags".to_string(),
+        "--filter=blob:none".to_string(),
+        "origin".to_string(),
+        reference.clone().unwrap_or_else(|| "HEAD".to_string()),
+    ];
+    run_git_dynamic(workspace.path(), &fetch_args)?;
+
+    if !request.pathspec.is_empty() {
+        run_git(workspace.path(), &["sparse-checkout", "init", "--no-cone"])?;
+        let mut sparse_args = vec![
+            "sparse-checkout".to_string(),
+            "set".to_string(),
+            "--no-cone".to_string(),
+        ];
+        sparse_args.extend(request.pathspec.iter().cloned());
+        run_git_dynamic(workspace.path(), &sparse_args)?;
+    }
+
+    run_git(workspace.path(), &["checkout", "--detach", "FETCH_HEAD"])?;
+    Ok(workspace)
+}
+
 fn git_ref_exists(repo_root: &Path, reference: &str) -> Result<bool, GitSubstrateError> {
     let output = sanitized_git_command(repo_root)
         .args(["show-ref", "--verify", "--quiet", reference])
@@ -1370,6 +1777,59 @@ fn run_git_dynamic(repo_root: &Path, args: &[String]) -> Result<(), GitSubstrate
             operation: "host_git",
             message: format!("{}: {}", repo_root.display(), error),
         })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(GitSubstrateError::Bridge {
+        operation: "host_git",
+        message: format!(
+            "git -C {} {} failed: {}",
+            repo_root.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    })
+}
+
+fn run_git_with_nul_stdin<'a, I>(
+    repo_root: &Path,
+    args: &[&str],
+    stdin_entries: I,
+) -> Result<(), GitSubstrateError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut child = sanitized_git_command(repo_root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| GitSubstrateError::Bridge {
+            operation: "host_git",
+            message: format!("{}: {}", repo_root.display(), error),
+        })?;
+
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| GitSubstrateError::Bridge {
+            operation: "host_git",
+            message: "failed to open git stdin".to_string(),
+        })?;
+        for entry in stdin_entries {
+            stdin
+                .write_all(entry.as_bytes())
+                .and_then(|_| stdin.write_all(&[0]))
+                .map_err(|error| GitSubstrateError::Bridge {
+                    operation: "host_git",
+                    message: format!("{}: {}", repo_root.display(), error),
+                })?;
+        }
+    }
+
+    let output = child.wait_with_output().map_err(|error| GitSubstrateError::Bridge {
+        operation: "host_git",
+        message: format!("{}: {}", repo_root.display(), error),
+    })?;
     if output.status.success() {
         return Ok(());
     }

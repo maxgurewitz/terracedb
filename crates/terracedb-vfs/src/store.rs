@@ -1,6 +1,7 @@
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
+    io::{Cursor, Read, Write},
     sync::{Arc, Mutex},
 };
 
@@ -19,12 +20,20 @@ use crate::{
     ToolRunId, ToolRunStatus, ToolRunStore, VfsBatchOperation, VfsError, VfsFileSystem, VfsKvStore,
 };
 
+mod artifact;
+use artifact::{
+    EncodedPayloads, encode_bytes_payload_to_spool, new_encoded_payloads, read_volume_artifact,
+    write_encoded_volume_artifact, write_volume_artifact,
+};
+
 pub const VFS_FORMAT_VERSION: u8 = 1;
 pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024;
 pub const ROOT_INODE_ID: InodeId = InodeId::new(1);
 const DEFAULT_ALLOCATOR_BLOCK_SIZE: u64 = 32;
 
 const MAX_SYMLINK_DEPTH: usize = 40;
+const VFS_VOLUME_ARTIFACT_FORMAT_VERSION: u32 = 2;
+const VFS_VOLUME_ARTIFACT_MAGIC: &[u8; 4] = b"TDVA";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeConfig {
@@ -85,7 +94,7 @@ pub struct OverlayBaseDescriptor {
     pub durable: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeInfo {
     pub volume_id: crate::VolumeId,
     pub chunk_size: u32,
@@ -151,6 +160,12 @@ pub struct VolumeExport {
     snapshot: SnapshotState,
 }
 
+pub struct VolumeArtifactBuilder {
+    snapshot: SnapshotState,
+    next_inode: u64,
+    encoded_payloads: EncodedPayloads,
+}
+
 impl VolumeExport {
     pub fn volume_id(&self) -> crate::VolumeId {
         self.snapshot.info.volume_id
@@ -162,6 +177,225 @@ impl VolumeExport {
 
     pub fn durable(&self) -> bool {
         self.snapshot.durable
+    }
+
+    pub fn to_artifact_bytes(&self) -> Result<Vec<u8>, VfsError> {
+        let mut bytes = Vec::new();
+        self.write_artifact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub fn from_artifact_bytes(bytes: &[u8]) -> Result<Self, VfsError> {
+        let mut cursor = Cursor::new(bytes);
+        Self::read_artifact(&mut cursor)
+    }
+
+    pub fn write_artifact<W: Write>(&self, writer: &mut W) -> Result<(), VfsError> {
+        write_volume_artifact(&self.snapshot, writer)
+    }
+
+    pub fn read_artifact<R: Read>(reader: &mut R) -> Result<Self, VfsError> {
+        Ok(Self {
+            snapshot: read_volume_artifact(reader)?,
+        })
+    }
+}
+
+impl VolumeArtifactBuilder {
+    pub fn new(
+        volume_id: crate::VolumeId,
+        chunk_size: u32,
+        created_at: Timestamp,
+    ) -> Result<Self, VfsError> {
+        let chunk_size = configured_chunk_size(Some(chunk_size))?;
+        let info = VolumeInfo {
+            volume_id,
+            chunk_size,
+            format_version: VFS_FORMAT_VERSION,
+            root_inode: ROOT_INODE_ID,
+            created_at,
+            overlay_base: None,
+        };
+        let root = InodeRecord {
+            stats: inode_stats(ROOT_INODE_ID, FileKind::Directory, 0o755, created_at, 0),
+            data: InodeData::Directory,
+        };
+        let mut paths = BTreeMap::new();
+        paths.insert("/".to_string(), ROOT_INODE_ID);
+        let mut inodes = BTreeMap::new();
+        inodes.insert(ROOT_INODE_ID, root);
+        Ok(Self {
+            snapshot: SnapshotState {
+                info,
+                sequence: SequenceNumber::new(0),
+                durable: false,
+                paths,
+                children_by_parent: BTreeMap::new(),
+                paths_by_inode: BTreeMap::new(),
+                inodes,
+                kv: BTreeMap::new(),
+                tool_runs: BTreeMap::new(),
+                whiteouts: BTreeSet::new(),
+                origins: BTreeMap::new(),
+            },
+            next_inode: ROOT_INODE_ID.get().saturating_add(1),
+            encoded_payloads: new_encoded_payloads()?,
+        })
+    }
+
+    pub fn add_directory(&mut self, path: &str, mode: Option<u32>) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        self.ensure_parent_directories(&path)?;
+        if path == "/" {
+            return Ok(());
+        }
+        let inode_id = self.allocate_inode();
+        self.insert_path(
+            &path,
+            InodeRecord {
+                stats: inode_stats(
+                    inode_id,
+                    FileKind::Directory,
+                    mode.unwrap_or(0o755),
+                    self.snapshot.info.created_at,
+                    0,
+                ),
+                data: InodeData::Directory,
+            },
+        )
+    }
+
+    pub fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        mode: Option<u32>,
+    ) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        self.ensure_parent_directories(&path)?;
+        let inode_id = self.allocate_inode();
+        self.insert_path(
+            &path,
+            InodeRecord {
+                stats: inode_stats(
+                    inode_id,
+                    FileKind::Symlink,
+                    mode.unwrap_or(0o777),
+                    self.snapshot.info.created_at,
+                    target.len() as u64,
+                ),
+                data: InodeData::Symlink(target.to_string()),
+            },
+        )
+    }
+
+    pub fn add_file_from_reader(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        mode: Option<u32>,
+    ) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        self.ensure_parent_directories(&path)?;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).map_err(|error| VfsError::StreamRead {
+            operation: "volume_artifact_builder.add_file_from_reader",
+            message: error.to_string(),
+        })?;
+        let inode_id = self.allocate_inode();
+        if !bytes.is_empty() {
+            let payload = encode_bytes_payload_to_spool(&bytes, &mut self.encoded_payloads.spool)?;
+            self.encoded_payloads.entries.insert(inode_id, payload);
+        }
+        self.insert_path(
+            &path,
+            InodeRecord {
+                stats: inode_stats(
+                    inode_id,
+                    FileKind::File,
+                    mode.unwrap_or(0o644),
+                    self.snapshot.info.created_at,
+                    bytes.len() as u64,
+                ),
+                data: InodeData::File(FileContent::default()),
+            },
+        )
+    }
+
+    pub fn finish_to_writer<W: Write>(mut self, writer: &mut W) -> Result<(), VfsError> {
+        self.snapshot.children_by_parent = build_children_by_parent(&self.snapshot.paths);
+        self.snapshot.paths_by_inode = build_paths_by_inode(&self.snapshot.paths);
+        write_encoded_volume_artifact(&self.snapshot, self.encoded_payloads, writer)
+    }
+
+    pub fn finish_to_bytes(self) -> Result<Vec<u8>, VfsError> {
+        let mut bytes = Vec::new();
+        self.finish_to_writer(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn allocate_inode(&mut self) -> InodeId {
+        let inode = InodeId::new(self.next_inode);
+        self.next_inode = self.next_inode.saturating_add(1);
+        inode
+    }
+
+    fn ensure_parent_directories(&mut self, path: &str) -> Result<(), VfsError> {
+        let mut current = String::new();
+        let mut components = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            return Ok(());
+        }
+        components.pop();
+        for component in components {
+            current.push('/');
+            current.push_str(component);
+            if self.snapshot.paths.contains_key(&current) {
+                continue;
+            }
+            let inode_id = self.allocate_inode();
+            self.snapshot.paths.insert(current.clone(), inode_id);
+            self.snapshot.inodes.insert(
+                inode_id,
+                InodeRecord {
+                    stats: inode_stats(
+                        inode_id,
+                        FileKind::Directory,
+                        0o755,
+                        self.snapshot.info.created_at,
+                        0,
+                    ),
+                    data: InodeData::Directory,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn insert_path(&mut self, path: &str, record: InodeRecord) -> Result<(), VfsError> {
+        if let Some(existing) = self.snapshot.paths.get(path).copied() {
+            let kind = self
+                .snapshot
+                .inodes
+                .get(&existing)
+                .map(|inode| inode.stats.kind)
+                .ok_or_else(|| VfsError::NotFound {
+                    path: path.to_string(),
+                })?;
+            if kind == FileKind::Directory && record.stats.kind == FileKind::Directory {
+                return Ok(());
+            }
+            return Err(VfsError::AlreadyExists {
+                path: path.to_string(),
+            });
+        }
+        self.snapshot.paths.insert(path.to_string(), record.stats.inode);
+        self.snapshot.inodes.insert(record.stats.inode, record);
+        Ok(())
     }
 }
 
@@ -931,6 +1165,24 @@ impl VfsFileSystem for InMemoryVfsFileSystem {
         })
     }
 
+    async fn write_file_from_reader(
+        &self,
+        path: &str,
+        reader: &mut (dyn Read + Send),
+        opts: CreateOptions,
+    ) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        let opts = opts.clone();
+        let (content, size) = file_content_from_reader(reader, self.volume.info().chunk_size)?;
+        self.volume.mutate(|state, now| {
+            mutate_write_file_content_state(state, &path, content.clone(), size, &opts, now)?;
+            Ok(Some((
+                (),
+                activity_spec(ActivityKind::FileWritten, Some(path.clone()), None, None),
+            )))
+        })
+    }
+
     async fn write_file(
         &self,
         path: &str,
@@ -1107,6 +1359,81 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
         self.overlay.delta.mutate(|state, now| {
             apply_overlay_batch_to_state(state, base.as_ref(), ops, now)?;
             Ok(None)
+        })
+    }
+
+    async fn write_file_from_reader(
+        &self,
+        path: &str,
+        reader: &mut (dyn Read + Send),
+        opts: CreateOptions,
+    ) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        let opts = opts.clone();
+        let (content, size) = file_content_from_reader(reader, self.overlay.delta.info().chunk_size)?;
+        let base = self.overlay.base.clone();
+        self.overlay.delta.mutate(|state, now| {
+            if let Some(resolved_path) =
+                try_fast_overlay_new_target_path(state, base.as_ref(), &path)?
+            {
+                let delta_opts = CreateOptions {
+                    create_parents: false,
+                    ..opts.clone()
+                };
+                mutate_write_file_content_state(
+                    state,
+                    &resolved_path,
+                    content.clone(),
+                    size,
+                    &delta_opts,
+                    now,
+                )?;
+                return Ok(Some((
+                    (),
+                    activity_spec(ActivityKind::FileWritten, Some(path.clone()), None, None),
+                )));
+            }
+            let merged = overlay_visible_snapshot_with_metrics(state, base.as_ref());
+            let resolved_path = if let Some((resolved_path, _)) =
+                resolve_existing_in_maps_with_mode(&merged.paths, &merged.inodes, &path, true)?
+            {
+                ensure_overlay_existing_path(
+                    state,
+                    base.as_ref(),
+                    &merged,
+                    &resolved_path,
+                    false,
+                    now,
+                )?;
+                resolved_path
+            } else {
+                materialize_overlay_parent_chain(
+                    state,
+                    base.as_ref(),
+                    &merged,
+                    &path,
+                    opts.create_parents,
+                    now,
+                )?;
+                resolve_target_path(state, &path)?
+            };
+
+            let delta_opts = CreateOptions {
+                create_parents: false,
+                ..opts.clone()
+            };
+            mutate_write_file_content_state(
+                state,
+                &resolved_path,
+                content.clone(),
+                size,
+                &delta_opts,
+                now,
+            )?;
+            Ok(Some((
+                (),
+                activity_spec(ActivityKind::FileWritten, Some(path.clone()), None, None),
+            )))
         })
     }
 
@@ -2432,6 +2759,24 @@ fn mutate_write_file_state(
     opts: &CreateOptions,
     now: Timestamp,
 ) -> Result<(), VfsError> {
+    mutate_write_file_content_state(
+        state,
+        path,
+        file_content_from_bytes(data, state.info.chunk_size),
+        data.len() as u64,
+        opts,
+        now,
+    )
+}
+
+fn mutate_write_file_content_state(
+    state: &mut VolumeState,
+    path: &str,
+    new_content: FileContent,
+    new_size: u64,
+    opts: &CreateOptions,
+    now: Timestamp,
+) -> Result<(), VfsError> {
     if path == "/" {
         return Err(VfsError::RootInvariant);
     }
@@ -2460,8 +2805,8 @@ fn mutate_write_file_state(
                     path: resolved_path,
                 });
             }
-            *content = file_content_from_bytes(data, state.info.chunk_size);
-            inode.stats.size = data.len() as u64;
+            *content = new_content;
+            inode.stats.size = new_size;
             inode.stats.modified_at = now;
             inode.stats.changed_at = now;
             inode.stats.accessed_at = now;
@@ -2480,13 +2825,13 @@ fn mutate_write_file_state(
             }
 
             let inode_id = allocate_inode(state);
-            let stats = inode_stats(inode_id, FileKind::File, opts.mode, now, data.len() as u64);
+            let stats = inode_stats(inode_id, FileKind::File, opts.mode, now, new_size);
             insert_volume_path(state, resolved_path.clone(), inode_id);
             state.inodes.insert(
                 inode_id,
                 InodeRecord {
                     stats,
-                    data: InodeData::File(file_content_from_bytes(data, state.info.chunk_size)),
+                    data: InodeData::File(new_content),
                 },
             );
             touch_parent_directory(state, &resolved_path, now)?;
@@ -4653,6 +4998,31 @@ fn file_content_from_bytes(bytes: &[u8], chunk_size: u32) -> FileContent {
         content.chunks.insert(index as u64, chunk.to_vec());
     }
     content
+}
+
+fn file_content_from_reader(
+    reader: &mut dyn Read,
+    chunk_size: u32,
+) -> Result<(FileContent, u64), VfsError> {
+    let mut content = FileContent::default();
+    let mut size = 0_u64;
+    let mut chunk_index = 0_u64;
+    let mut buffer = vec![0_u8; chunk_size as usize];
+    loop {
+        let bytes_read = reader.read(&mut buffer).map_err(|error| VfsError::StreamRead {
+            operation: "write_file_from_reader",
+            message: error.to_string(),
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        content
+            .chunks
+            .insert(chunk_index, buffer[..bytes_read].to_vec());
+        size = size.saturating_add(bytes_read as u64);
+        chunk_index = chunk_index.saturating_add(1);
+    }
+    Ok((content, size))
 }
 
 fn file_content_to_bytes(content: &FileContent, size: u64, chunk_size: u32) -> Vec<u8> {

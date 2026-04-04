@@ -10,15 +10,15 @@ use std::{
 
 use async_trait::async_trait;
 use boa_engine::{
-    Context, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
+    Context, JsNativeError, JsResult, JsString, JsSymbol, JsValue, NativeFunction, Source,
     builtins::promise::PromiseState,
     js_string,
     module::{
         Module, ModuleLoader as BoaModuleLoader, ModuleRequest, Referrer,
         SyntheticModuleInitializer,
     },
-    object::FunctionObjectBuilder,
-    object::builtins::{JsPromise, JsUint8Array},
+    object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
+    object::builtins::{JsArray, JsArrayBuffer, JsPromise, JsUint8Array},
     property::Attribute,
 };
 use brotli::{CompressorReader as BrotliCompressorReader, Decompressor as BrotliDecompressor};
@@ -58,8 +58,7 @@ use url::Url;
 
 use crate::{
     CapabilityCallRequest, CapabilityCallResult, GIT_REMOTE_IMPORT_CAPABILITY_SPECIFIER,
-    HOST_CAPABILITY_PREFIX, HoistMode, HoistRequest, LoadedSandboxModule,
-    PackageCompatibilityMode, SandboxError,
+    HOST_CAPABILITY_PREFIX, LoadedSandboxModule, PackageCompatibilityMode, SandboxError,
     SandboxModuleCacheEntry, SandboxModuleKind, SandboxModuleLoadTrace, SandboxSession,
     SandboxSessionInfo, TERRACE_RUNTIME_MODULE_CACHE_PATH,
     loader::{
@@ -75,9 +74,8 @@ thread_local! {
 
 const NODE_COMPAT_TARGET_VERSION: &str = "v24.14.1";
 const NODE_COMPAT_BOOTSTRAP_SOURCE: &str = include_str!("node_compat_bootstrap.js");
-const NODE_UPSTREAM_VFS_ROOT: &str = "/.terrace/runtime-support/node-src";
-const NODE_UPSTREAM_BOOTSTRAP_REALM_PATH: &str =
-    "/.terrace/runtime-support/node-src/lib/internal/bootstrap/realm.js";
+const NODE_UPSTREAM_VFS_ROOT: &str = "/node";
+const NODE_UPSTREAM_BOOTSTRAP_REALM_PATH: &str = "/node/lib/internal/bootstrap/realm.js";
 const NODE_RUNTIME_RESOLVE_BUDGET: u64 = 16_384;
 const NODE_RUNTIME_LOAD_BUDGET: u64 = 8_192;
 const NODE_RUNTIME_FS_BUDGET: u64 = 131_072;
@@ -197,6 +195,7 @@ struct NodeRuntimeHost {
     materialized_modules: Rc<RefCell<BTreeMap<String, Module>>>,
     module_graph: Rc<RefCell<NodeModuleGraph>>,
     read_snapshot_fs: Rc<RefCell<Option<Arc<dyn ReadOnlyVfsFileSystem>>>>,
+    builtin_ids: Rc<RefCell<Option<Vec<String>>>>,
     debug_trace: Rc<RefCell<NodeRuntimeDebugTrace>>,
     next_child_pid: Rc<RefCell<u32>>,
     zlib_streams: Rc<RefCell<NodeZlibStreamTable>>,
@@ -1279,7 +1278,7 @@ async fn execute_node_command(
     env: BTreeMap<String, String>,
     metadata: &BTreeMap<String, JsonValue>,
 ) -> Result<SandboxExecutionResult, SandboxError> {
-    ensure_node_upstream_support_tree(session).await?;
+    ensure_node_upstream_support_tree_present(session).await?;
     let normalized_entrypoint = resolve_node_path(&cwd, &entrypoint);
     let entropy = DeterministicJsEntropySource::new(js_entropy_seed(&session_info));
     let debug_options = metadata
@@ -1306,6 +1305,7 @@ async fn execute_node_command(
         materialized_modules: Rc::new(RefCell::new(BTreeMap::new())),
         module_graph: Rc::new(RefCell::new(NodeModuleGraph::default())),
         read_snapshot_fs: Rc::new(RefCell::new(None)),
+        builtin_ids: Rc::new(RefCell::new(None)),
         debug_trace: Rc::new(RefCell::new(NodeRuntimeDebugTrace::default())),
         next_child_pid: Rc::new(RefCell::new(1000)),
         zlib_streams: Rc::new(RefCell::new(NodeZlibStreamTable::default())),
@@ -1315,18 +1315,9 @@ async fn execute_node_command(
     Ok(result)
 }
 
-fn repo_root_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn node_support_source_host_path(name: &str) -> PathBuf {
-    repo_root_path().join("third_party").join(name)
-}
-
-async fn ensure_node_upstream_support_tree(session: &SandboxSession) -> Result<(), SandboxError> {
-    if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
-        eprintln!("[terrace-node][stage] ensure-node-support-tree:start");
-    }
+async fn ensure_node_upstream_support_tree_present(
+    session: &SandboxSession,
+) -> Result<(), SandboxError> {
     if session
         .volume()
         .fs()
@@ -1334,32 +1325,16 @@ async fn ensure_node_upstream_support_tree(session: &SandboxSession) -> Result<(
         .await?
         .is_some()
     {
-        if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
-            eprintln!("[terrace-node][stage] ensure-node-support-tree:already-present");
-        }
         return Ok(());
     }
 
-    let source_path = node_support_source_host_path("node-src");
-    if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
-        eprintln!(
-            "[terrace-node][stage] ensure-node-support-tree:import-start source={} target={}",
-            source_path.display(),
-            NODE_UPSTREAM_VFS_ROOT
-        );
-    }
-    session
-        .import_git_tree_into_root(HoistRequest {
-            source_path: source_path.display().to_string(),
-            target_root: NODE_UPSTREAM_VFS_ROOT.to_string(),
-            mode: HoistMode::GitHead,
-            delete_missing: true,
-        }, vec!["lib".to_string(), "deps".to_string(), "test".to_string()])
-        .await?;
-    if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
-        eprintln!("[terrace-node][stage] ensure-node-support-tree:import-done");
-    }
-    Ok(())
+    Err(SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: format!(
+            "missing upstream Node bootstrap tree at `{NODE_UPSTREAM_VFS_ROOT}`; \
+open this session from a Node-capable base layer"
+        ),
+    })
 }
 
 fn execute_node_command_inner(
@@ -1548,6 +1523,8 @@ fn execute_node_command_inner(
 }
 
 fn install_node_host_bindings(context: &mut Context) -> Result<(), SandboxError> {
+    register_global_native(context, "escape", 1, node_global_escape)?;
+    register_global_native(context, "unescape", 1, node_global_unescape)?;
     register_global_native(context, "__terraceNodeDebugEvent", 2, node_trace_event)?;
     register_global_native(context, "__terraceGetProcessInfo", 0, node_get_process_info)?;
     register_global_native(context, "__terraceGetCwd", 0, node_get_cwd)?;
@@ -1560,6 +1537,12 @@ fn install_node_host_bindings(context: &mut Context) -> Result<(), SandboxError>
         "__terraceReadBuiltinSource",
         1,
         node_read_builtin_source,
+    )?;
+    register_global_native(
+        context,
+        "__terraceInitBootstrapRealm",
+        0,
+        node_init_bootstrap_realm,
     )?;
     register_global_native(context, "__terraceResolveModule", 3, node_resolve_module)?;
     register_global_native(
@@ -2531,15 +2514,2255 @@ fn node_read_builtin_source(
     .map_err(js_error)
 }
 
+fn node_init_bootstrap_realm(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    if args
+        .first()
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
+        return Err(js_error(SandboxError::Service {
+            service: "node_runtime",
+            message:
+                "bootstrap realm initialization only supports real upstream builtins".to_string(),
+        }));
+    }
+    node_with_host_js(context, |host, context| {
+        node_debug_event(host, "bootstrap", "init_bootstrap_realm:start".to_string())?;
+        let exports = ObjectInitializer::new(context).build();
+        let primordials = JsObject::with_null_proto();
+        let private_symbols = node_private_symbols_object(context)?;
+        let per_isolate_symbols = node_per_isolate_symbols_object(context)?;
+        node_store_global(
+            context,
+            "__terraceNodePerContextExports",
+            JsValue::from(exports.clone()),
+        )?;
+        node_store_global(
+            context,
+            "__terraceNodePrimordials",
+            JsValue::from(primordials.clone()),
+        )?;
+
+        for specifier in [
+            "internal/per_context/primordials",
+            "internal/per_context/domexception",
+            "internal/per_context/messageport",
+        ] {
+            let function = node_compile_builtin_wrapper(
+                context,
+                host,
+                specifier,
+                &["exports", "primordials", "privateSymbols", "perIsolateSymbols"],
+                None,
+            )?;
+            let callable = function.as_callable().ok_or_else(|| SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
+            })?;
+            callable
+                .call(
+                    &JsValue::undefined(),
+                    &[
+                        JsValue::from(exports.clone()),
+                        JsValue::from(primordials.clone()),
+                        JsValue::from(private_symbols.clone()),
+                        JsValue::from(per_isolate_symbols.clone()),
+                    ],
+                    context,
+                )
+                .map_err(sandbox_execution_error)?;
+        }
+
+        let process = context
+            .global_object()
+            .get(js_string!("process"), context)
+            .map_err(sandbox_execution_error)?;
+        let get_linked_binding = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_get_linked_binding),
+        )
+        .name(js_string!("getLinkedBinding"))
+        .length(1)
+        .constructor(false)
+        .build();
+        let get_internal_binding = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_get_internal_binding),
+        )
+        .name(js_string!("getInternalBinding"))
+        .length(1)
+        .constructor(false)
+        .build();
+        let realm_factory = node_compile_builtin_wrapper(
+            context,
+            host,
+            "internal/bootstrap/realm",
+            &["process", "getLinkedBinding", "getInternalBinding", "primordials"],
+            Some("; return { internalBinding, BuiltinModule, require: requireBuiltin, requireBuiltin };"),
+        )?;
+        let callable = realm_factory
+            .as_callable()
+            .ok_or_else(|| SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: "bootstrap realm did not compile to a callable wrapper".to_string(),
+            })?;
+        let realm = callable
+            .call(
+                &JsValue::undefined(),
+                &[
+                    process,
+                    JsValue::from(get_linked_binding),
+                    JsValue::from(get_internal_binding),
+                    JsValue::from(primordials),
+                ],
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+        node_debug_event(host, "bootstrap", "init_bootstrap_realm:done".to_string())?;
+        Ok(realm)
+    })
+}
+
+fn node_store_global(
+    context: &mut Context,
+    name: &str,
+    value: JsValue,
+) -> Result<(), SandboxError> {
+    context
+        .global_object()
+        .set(JsString::from(name), value, true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(())
+}
+
+fn node_symbol(description: &str) -> Result<JsValue, SandboxError> {
+    let symbol = JsSymbol::new(Some(JsString::from(description))).ok_or_else(|| {
+        SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!("failed to create symbol `{description}`"),
+        }
+    })?;
+    Ok(JsValue::from(symbol))
+}
+
+fn node_private_symbols_object(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = JsObject::with_null_proto();
+    object
+        .set(
+            js_string!("transfer_mode_private_symbol"),
+            node_symbol("node.transfer_mode_private_symbol")?,
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_per_isolate_symbols_object(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = JsObject::with_null_proto();
+    object
+        .set(
+            js_string!("messaging_clone_symbol"),
+            node_symbol("node.messaging_clone_symbol")?,
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("messaging_deserialize_symbol"),
+            node_symbol("node.messaging_deserialize_symbol")?,
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_builtin_ids(host: &NodeRuntimeHost) -> Result<Vec<String>, SandboxError> {
+    if let Some(ids) = host.builtin_ids.borrow().clone() {
+        return Ok(ids);
+    }
+    let mut ids = Vec::new();
+    node_collect_builtin_ids(host, &format!("{NODE_UPSTREAM_VFS_ROOT}/lib"), "", &mut ids)?;
+    if node_read_stat(host, &format!("{NODE_UPSTREAM_VFS_ROOT}/deps"))?.is_some() {
+        node_collect_builtin_ids(
+            host,
+            &format!("{NODE_UPSTREAM_VFS_ROOT}/deps"),
+            "internal/deps",
+            &mut ids,
+        )?;
+    }
+    ids.sort();
+    ids.dedup();
+    *host.builtin_ids.borrow_mut() = Some(ids.clone());
+    Ok(ids)
+}
+
+fn node_collect_builtin_ids(
+    host: &NodeRuntimeHost,
+    directory: &str,
+    prefix: &str,
+    output: &mut Vec<String>,
+) -> Result<(), SandboxError> {
+    for entry in node_read_readdir(host, directory)? {
+        let child_path = format!("{directory}/{}", entry.name);
+        match entry.kind {
+            FileKind::Directory => {
+                let next_prefix = if prefix.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{prefix}/{}", entry.name)
+                };
+                node_collect_builtin_ids(host, &child_path, &next_prefix, output)?;
+            }
+            FileKind::File => {
+                if let Some(stem) = entry.name.strip_suffix(".js") {
+                    let id = if prefix.is_empty() {
+                        stem.to_string()
+                    } else {
+                        format!("{prefix}/{}", stem)
+                    };
+                    output.push(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn node_read_builtin_source_text(
+    host: &NodeRuntimeHost,
+    specifier: &str,
+) -> Result<String, SandboxError> {
+    let path = node_upstream_builtin_vfs_path(specifier).ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: format!("upstream Node builtin source `{specifier}` is missing from sandbox VFS"),
+    })?;
+    let bytes = node_read_file(host, &path)?.ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: format!("upstream Node builtin source `{specifier}` is missing from sandbox VFS"),
+    })?;
+    String::from_utf8(bytes).map_err(|error| SandboxError::Service {
+        service: "node_runtime",
+        message: format!("builtin `{specifier}` is not valid UTF-8: {error}"),
+    })
+}
+
+fn node_compile_builtin_wrapper(
+    context: &mut Context,
+    host: &NodeRuntimeHost,
+    specifier: &str,
+    parameters: &[&str],
+    suffix: Option<&str>,
+) -> Result<JsValue, SandboxError> {
+    let source = node_read_builtin_source_text(host, specifier)?;
+    let mut wrapped = format!("(function({}) {{\n{}", parameters.join(", "), source);
+    if !wrapped.ends_with('\n') {
+        wrapped.push('\n');
+    }
+    if let Some(suffix) = suffix {
+        wrapped.push_str(suffix);
+        if !suffix.ends_with('\n') {
+            wrapped.push('\n');
+        }
+    }
+    wrapped.push_str(&format!(
+        "//# sourceURL=node:{}\n}})",
+        specifier.replace('\\', "\\\\")
+    ));
+    context
+        .eval(
+            Source::from_bytes(wrapped.as_bytes())
+                .with_path(&PathBuf::from(
+                    node_upstream_builtin_vfs_path(specifier).unwrap(),
+                )),
+        )
+        .map_err(sandbox_execution_error)
+}
+
+fn node_get_linked_binding(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsObject::with_null_proto()))
+}
+
+fn node_get_internal_binding(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let name = node_arg_string(args, 0, context)?;
+    node_with_host_js(context, |host, context| {
+        node_debug_event(host, "bootstrap", format!("getInternalBinding {name}"))?;
+        Ok(JsValue::from(node_internal_binding_object(host, context, &name)?))
+    })
+}
+
+fn node_internal_binding_object(
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+    name: &str,
+) -> Result<JsObject, SandboxError> {
+    match name {
+        "builtins" => node_internal_binding_builtins(host, context),
+        "constants" => node_internal_binding_constants(context),
+        "options" => node_internal_binding_options(context),
+        "types" => node_internal_binding_types(context),
+        "module_wrap" => node_internal_binding_module_wrap(context),
+        "errors" => node_internal_binding_errors(context),
+        "util" => node_internal_binding_util(context),
+        "fs" => node_internal_binding_fs(context),
+        "blob" => node_internal_binding_blob(context),
+        "buffer" => node_internal_binding_buffer(context),
+        "url" => node_internal_binding_url(context),
+        "url_pattern" => node_internal_binding_url_pattern(context),
+        "modules" => node_internal_binding_modules(context),
+        "config" => node_internal_binding_config(context),
+        "encoding_binding" => node_internal_binding_encoding(context),
+        "string_decoder" => node_internal_binding_string_decoder(context),
+        "uv" => node_internal_binding_uv(context),
+        "os" => node_internal_binding_os(context),
+        "credentials" => node_internal_binding_credentials(context),
+        "messaging" => node_internal_binding_messaging(context),
+        "profiler" => node_internal_binding_profiler(context),
+        other => Err(SandboxError::Service {
+            service: "node_runtime",
+            message: format!("unsupported internal binding: {other}"),
+        }),
+    }
+}
+
+fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let stat_values = node_fs_binding_stat_values(context)?;
+    let fs_req_callback = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_fs_req_callback_construct),
+    )
+    .name(js_string!("FSReqCallback"))
+    .length(1)
+    .constructor(true)
+    .build();
+    object
+        .set(
+            js_string!("FSReqCallback"),
+            JsValue::from(fs_req_callback),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("statValues"),
+            JsValue::from(stat_values),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("kUsePromises"), JsValue::from(true), true, context)
+        .map_err(sandbox_execution_error)?;
+    for (name, function) in [
+        ("internalModuleStat", node_internal_fs_internal_module_stat as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("stat", node_internal_fs_stat),
+        ("lstat", node_internal_fs_lstat),
+        ("readlink", node_internal_fs_readlink),
+        ("realpath", node_internal_fs_realpath),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(4)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_fs_req_callback_construct(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let object = this.as_object().unwrap_or_else(JsObject::with_null_proto);
+    object
+        .set(
+            js_string!("useBigInt"),
+            args.first().cloned().unwrap_or_else(JsValue::undefined),
+            true,
+            context,
+        )?;
+    Ok(JsValue::from(object))
+}
+
+fn node_fs_binding_stat_values(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let existing = context
+        .global_object()
+        .get(js_string!("__terraceNodeFsStatValues"), context)
+        .map_err(sandbox_execution_error)?;
+    if let Some(object) = existing.as_object() {
+        return Ok(object);
+    }
+    let stat_values = JsValue::from_json(&serde_json::json!(vec![0.0; 18]), context)
+        .map_err(sandbox_execution_error)?;
+    let object = stat_values.as_object().ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: "failed to allocate fs statValues scratch array".to_string(),
+    })?;
+    node_store_global(context, "__terraceNodeFsStatValues", stat_values)?;
+    Ok(object)
+}
+
+fn node_fs_mode_with_kind(stats: &terracedb_vfs::Stats) -> u32 {
+    let kind_bits = match stats.kind {
+        FileKind::File => 0o100000,
+        FileKind::Directory => 0o040000,
+        FileKind::Symlink => 0o120000,
+    };
+    if stats.mode & 0o170000 == 0 {
+        stats.mode | kind_bits
+    } else {
+        stats.mode
+    }
+}
+
+fn node_timestamp_parts(timestamp_ms: u64) -> (f64, f64) {
+    let seconds = timestamp_ms / 1000;
+    let nanos = (timestamp_ms % 1000) * 1_000_000;
+    (seconds as f64, nanos as f64)
+}
+
+fn node_fill_fs_stat_values(
+    context: &mut Context,
+    target: &JsObject,
+    stats: &terracedb_vfs::Stats,
+) -> Result<(), SandboxError> {
+    let (atime_sec, atime_nsec) = node_timestamp_parts(stats.accessed_at.get());
+    let (mtime_sec, mtime_nsec) = node_timestamp_parts(stats.modified_at.get());
+    let (ctime_sec, ctime_nsec) = node_timestamp_parts(stats.changed_at.get());
+    let (birth_sec, birth_nsec) = node_timestamp_parts(stats.created_at.get());
+    let values = [
+        0.0,
+        node_fs_mode_with_kind(stats) as f64,
+        stats.nlink as f64,
+        stats.uid as f64,
+        stats.gid as f64,
+        stats.rdev as f64,
+        4096.0,
+        stats.inode.get() as f64,
+        stats.size as f64,
+        stats.size.div_ceil(512) as f64,
+        atime_sec,
+        atime_nsec,
+        mtime_sec,
+        mtime_nsec,
+        ctime_sec,
+        ctime_nsec,
+        birth_sec,
+        birth_nsec,
+    ];
+    for (index, value) in values.into_iter().enumerate() {
+        target
+            .set(index as u32, JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(())
+}
+
+fn node_fs_req_complete(
+    req: Option<&JsValue>,
+    context: &mut Context,
+    result: JsValue,
+) -> Result<JsValue, SandboxError> {
+    let Some(req) = req else {
+        return Ok(result);
+    };
+    let Some(req_object) = req.as_object() else {
+        return Ok(result);
+    };
+    let callback = req_object
+        .get(js_string!("oncomplete"), context)
+        .map_err(sandbox_execution_error)?;
+    if let Some(callable) = callback.as_callable() {
+        callable
+            .call(req, &[JsValue::null(), result], context)
+            .map_err(sandbox_execution_error)?;
+        Ok(JsValue::undefined())
+    } else {
+        Ok(result)
+    }
+}
+
+fn node_internal_fs_internal_module_stat(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    node_with_host(|host| {
+        let path = resolve_node_path(&host.process.borrow().cwd, &path);
+        let stats = node_read_stat(host, &path)?;
+        let code = match stats.map(|value| value.kind) {
+            Some(FileKind::File) | Some(FileKind::Symlink) => 0,
+            Some(FileKind::Directory) => 1,
+            None => -1,
+        };
+        Ok(JsValue::from(code))
+    })
+    .map_err(js_error)
+}
+
+fn node_internal_fs_stat_like(
+    context: &mut Context,
+    args: &[JsValue],
+    lstat: bool,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    let req = args.get(2);
+    node_with_host_js(context, |host, context| {
+        let path = resolve_node_path(&host.process.borrow().cwd, &path);
+        let stats = if lstat {
+            node_read_lstat(host, &path)?
+        } else {
+            node_read_stat(host, &path)?
+        };
+        let Some(stats) = stats else {
+            return node_fs_req_complete(req, context, JsValue::undefined());
+        };
+        let stat_values = node_fs_binding_stat_values(context)?;
+        node_fill_fs_stat_values(context, &stat_values, &stats)?;
+        node_fs_req_complete(req, context, JsValue::from(stat_values))
+    })
+}
+
+fn node_internal_fs_stat(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let _ = this;
+    node_internal_fs_stat_like(context, args, false)
+}
+
+fn node_internal_fs_lstat(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let _ = this;
+    node_internal_fs_stat_like(context, args, true)
+}
+
+fn node_internal_fs_readlink(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    let req = args.get(2);
+    node_with_host(|host| {
+        let path = resolve_node_path(&host.process.borrow().cwd, &path);
+        let target = node_read_readlink(host, &path)?;
+        Ok(JsValue::from(JsString::from(target)))
+    })
+    .and_then(|result| node_fs_req_complete(req, context, result))
+    .map_err(js_error)
+}
+
+fn node_internal_fs_realpath(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    let req = args.get(2);
+    node_with_host(|host| {
+        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+        Ok(JsValue::from(JsString::from(resolved)))
+    })
+    .and_then(|result| node_fs_req_complete(req, context, result))
+    .map_err(js_error)
+}
+
+fn node_internal_binding_builtins(
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+) -> Result<JsObject, SandboxError> {
+    let ids = node_builtin_ids(host)?;
+    let ids = JsValue::from_json(&serde_json::json!(ids), context).map_err(sandbox_execution_error)?;
+    let object = ObjectInitializer::new(context).build();
+    let compile = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_builtins_compile_function),
+    )
+    .name(js_string!("compileFunction"))
+    .length(1)
+    .constructor(false)
+    .build();
+    let set_loaders = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_builtins_set_internal_loaders),
+    )
+    .name(js_string!("setInternalLoaders"))
+    .length(2)
+    .constructor(false)
+    .build();
+    object
+        .set(js_string!("builtinIds"), ids, true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("config"),
+            JsValue::from(JsString::from(
+                r#"{"target_defaults":{"default_configuration":"Release"},"variables":{"v8_enable_i18n_support":0}}"#,
+            )),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("compileFunction"), JsValue::from(compile), true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("setInternalLoaders"),
+            JsValue::from(set_loaders),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_blob(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for name in [
+        "createBlob",
+        "createBlobFromFilePath",
+        "concat",
+        "getDataObject",
+    ] {
+        let value = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_blob_unimplemented),
+        )
+        .name(JsString::from(name))
+        .length(1)
+        .constructor(false)
+        .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_buffer(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    object
+        .set(js_string!("kMaxLength"), JsValue::from(i32::MAX), true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("kStringMaxLength"),
+            JsValue::from(i32::MAX),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    for (name, length, function) in [
+        (
+            "createUnsafeArrayBuffer",
+            1usize,
+            node_buffer_create_unsafe_array_buffer
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        ("byteLengthUtf8", 1usize, node_buffer_byte_length_utf8),
+        ("compare", 2usize, node_buffer_unimplemented),
+        ("compareOffset", 6usize, node_buffer_unimplemented),
+        ("copy", 5usize, node_buffer_unimplemented),
+        ("fill", 5usize, node_buffer_unimplemented),
+        ("isAscii", 1usize, node_buffer_unimplemented),
+        ("isUtf8", 1usize, node_buffer_unimplemented),
+        ("indexOfBuffer", 5usize, node_buffer_unimplemented),
+        ("indexOfNumber", 4usize, node_buffer_unimplemented),
+        ("indexOfString", 5usize, node_buffer_unimplemented),
+        ("swap16", 1usize, node_buffer_unimplemented),
+        ("swap32", 1usize, node_buffer_unimplemented),
+        ("swap64", 1usize, node_buffer_unimplemented),
+        ("atob", 1usize, node_buffer_unimplemented),
+        ("btoa", 1usize, node_buffer_unimplemented),
+        ("asciiSlice", 3usize, node_buffer_unimplemented),
+        ("base64Slice", 3usize, node_buffer_unimplemented),
+        ("base64urlSlice", 3usize, node_buffer_unimplemented),
+        ("latin1Slice", 3usize, node_buffer_unimplemented),
+        ("hexSlice", 3usize, node_buffer_unimplemented),
+        ("ucs2Slice", 3usize, node_buffer_unimplemented),
+        ("utf8Slice", 3usize, node_buffer_unimplemented),
+        ("asciiWriteStatic", 4usize, node_buffer_unimplemented),
+        ("base64Write", 4usize, node_buffer_unimplemented),
+        ("base64urlWrite", 4usize, node_buffer_unimplemented),
+        ("latin1WriteStatic", 4usize, node_buffer_unimplemented),
+        ("hexWrite", 4usize, node_buffer_unimplemented),
+        ("ucs2Write", 4usize, node_buffer_unimplemented),
+        ("utf8WriteStatic", 4usize, node_buffer_unimplemented),
+    ] {
+        let value = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(function),
+        )
+        .name(JsString::from(name))
+        .length(length)
+        .constructor(false)
+        .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_url(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let can_parse = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_url_can_parse),
+    )
+    .name(js_string!("canParse"))
+    .length(2)
+    .constructor(false)
+    .build();
+    object
+        .set(js_string!("canParse"), JsValue::from(can_parse), true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_url_pattern(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let prototype = JsObject::with_null_proto();
+    for (name, function) in [
+        ("test", node_url_pattern_test as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("exec", node_url_pattern_exec),
+    ] {
+        let method = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(1)
+            .constructor(false)
+            .build();
+        prototype
+            .set(JsString::from(name), JsValue::from(method), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    let constructor = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_url_pattern_construct),
+    )
+    .name(js_string!("URLPattern"))
+    .length(2)
+    .constructor(true)
+    .build();
+    constructor
+        .set(js_string!("prototype"), JsValue::from(prototype), true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("URLPattern"), JsValue::from(constructor), true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_modules(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, length, function) in [
+        ("enableCompileCache", 0usize, node_modules_enable_compile_cache as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("getCompileCacheDir", 0usize, node_modules_get_compile_cache_dir),
+        ("compileCacheStatus", 0usize, node_modules_compile_cache_status),
+        ("flushCompileCache", 0usize, node_noop),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(length)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_config(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, value) in [
+        ("bits", JsValue::from(64)),
+        ("hasIntl", JsValue::from(false)),
+        ("hasInspector", JsValue::from(false)),
+        ("hasNodeOptions", JsValue::from(false)),
+        ("hasOpenSSL", JsValue::from(false)),
+        ("hasSmallICU", JsValue::from(false)),
+        ("hasTracing", JsValue::from(false)),
+        ("noBrowserGlobals", JsValue::from(true)),
+    ] {
+        object
+            .set(JsString::from(name), value, true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_encoding(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let encode_into_results = node_encoding_encode_into_results(context)?;
+    object
+        .set(
+            js_string!("encodeIntoResults"),
+            JsValue::from(encode_into_results),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    for (name, length, function) in [
+        ("encodeInto", 2usize, node_encoding_encode_into as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("encodeUtf8String", 1usize, node_encoding_encode_utf8_string),
+        ("decodeUTF8", 3usize, node_encoding_decode_utf8),
+        ("toASCII", 1usize, node_encoding_to_ascii),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(length)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_constants(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let constants = JsValue::from_json(
+        &serde_json::json!({
+            "os": {
+                "UV_UDP_REUSEADDR": 4,
+                "dlopen": {},
+                "errno": {
+                    "EACCES": 13,
+                    "EEXIST": 17,
+                    "EINVAL": 22,
+                    "EISDIR": 21,
+                    "ENOENT": 2,
+                    "ENOTDIR": 20,
+                    "EPERM": 1
+                },
+                "priority": {
+                    "PRIORITY_LOW": 19,
+                    "PRIORITY_BELOW_NORMAL": 10,
+                    "PRIORITY_NORMAL": 0,
+                    "PRIORITY_ABOVE_NORMAL": -7,
+                    "PRIORITY_HIGH": -14,
+                    "PRIORITY_HIGHEST": -20
+                },
+                "signals": {
+                    "SIGABRT": 6,
+                    "SIGBREAK": 21,
+                    "SIGFPE": 8,
+                    "SIGHUP": 1,
+                    "SIGILL": 4,
+                    "SIGINT": 2,
+                    "SIGKILL": 9,
+                    "SIGSEGV": 11,
+                    "SIGTERM": 15,
+                    "SIGUSR1": 10,
+                    "SIGUSR2": 12
+                }
+            },
+            "fs": {
+                "O_RDONLY": 0,
+                "O_WRONLY": 1,
+            "O_RDWR": 2,
+            "O_CREAT": 64,
+            "O_EXCL": 128,
+            "O_TRUNC": 512,
+            "O_APPEND": 1024,
+            "O_SYNC": 1052672,
+            "F_OK": 0,
+            "R_OK": 4,
+            "W_OK": 2,
+            "X_OK": 1,
+            "COPYFILE_EXCL": 1,
+            "COPYFILE_FICLONE": 2,
+            "COPYFILE_FICLONE_FORCE": 4,
+            "S_IFMT": 61440,
+            "S_IFREG": 32768,
+            "S_IFDIR": 16384,
+            "S_IFCHR": 8192,
+            "S_IFBLK": 24576,
+            "S_IFIFO": 4096,
+            "S_IFLNK": 40960,
+            "S_IFSOCK": 49152,
+            "UV_FS_SYMLINK_DIR": 1,
+            "UV_FS_SYMLINK_JUNCTION": 2,
+            "UV_DIRENT_UNKNOWN": 0,
+            "UV_DIRENT_FILE": 1,
+            "UV_DIRENT_DIR": 2,
+            "UV_DIRENT_LINK": 3,
+            "UV_DIRENT_FIFO": 4,
+            "UV_DIRENT_SOCKET": 5,
+            "UV_DIRENT_CHAR": 6,
+            "UV_DIRENT_BLOCK": 7
+        },
+        "crypto": {},
+        "zlib": {},
+        "tls": {},
+        "internal": {
+            "EXTENSIONLESS_FORMAT_JAVASCRIPT": 0,
+            "EXTENSIONLESS_FORMAT_WASM": 1
+        }}),
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
+    let constants = constants.as_object().ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: "internalBinding('constants') payload must be an object".to_string(),
+    })?;
+    object
+        .set(
+            js_string!("os"),
+            constants
+                .get(js_string!("os"), context)
+                .map_err(sandbox_execution_error)?,
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    for name in ["fs", "crypto", "zlib", "tls", "internal"] {
+        object
+            .set(
+                JsString::from(name),
+                constants
+                    .get(JsString::from(name), context)
+                    .map_err(sandbox_execution_error)?,
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_options(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, length, function) in [
+        ("getCLIOptionsValues", 0usize, node_options_get_cli_options_values as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("getCLIOptionsInfo", 0usize, node_options_get_cli_options_info),
+        ("getOptionsAsFlags", 0usize, node_options_get_options_as_flags),
+        ("getEmbedderOptions", 0usize, node_options_get_embedder_options),
+        ("getEnvOptionsInputType", 0usize, node_options_get_env_options_input_type),
+        ("getNamespaceOptionsInputType", 0usize, node_options_get_namespace_options_input_type),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(length)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_types(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, function) in [
+        ("isArrayBufferView", node_type_is_array_buffer_view as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("isAsyncFunction", node_type_is_async_function),
+        ("isNativeError", node_type_is_native_error),
+        ("isPromise", node_type_is_promise),
+        ("isProxy", node_type_is_proxy),
+        ("isRegExp", node_type_is_regexp),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(1)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_module_wrap(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let binding = ObjectInitializer::new(context).build();
+    let prototype = JsObject::with_null_proto();
+    for (name, function) in [
+        ("instantiate", node_module_wrap_instantiate as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("evaluate", node_module_wrap_evaluate),
+        ("setExport", node_module_wrap_set_export),
+    ] {
+        let method = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(1)
+            .constructor(false)
+            .build();
+        prototype
+            .set(JsString::from(name), JsValue::from(method), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    let constructor = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_module_wrap_construct),
+    )
+    .name(js_string!("ModuleWrap"))
+    .length(4)
+    .constructor(true)
+    .build();
+    constructor
+        .set(js_string!("prototype"), JsValue::from(prototype), true, context)
+        .map_err(sandbox_execution_error)?;
+    binding
+        .set(js_string!("ModuleWrap"), JsValue::from(constructor), true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(binding)
+}
+
+fn node_internal_binding_errors(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, function) in [
+        ("setEnhanceStackForFatalException", node_noop as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("setPrepareStackTraceCallback", node_noop),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(1)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_util(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let private_symbols = JsObject::with_null_proto();
+    let constants = JsValue::from_json(
+        &serde_json::json!({
+            "ALL_PROPERTIES": 0,
+            "ONLY_ENUMERABLE": 2,
+            "SKIP_SYMBOLS": 16,
+            "kPending": 0,
+            "kFulfilled": 1,
+            "kRejected": 2
+        }),
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
+    for (name, description) in [
+        ("arrow_message_private_symbol", "node.arrow_message_private_symbol"),
+        ("decorated_private_symbol", "node.decorated_private_symbol"),
+        ("exit_info_private_symbol", "node.exit_info_private_symbol"),
+        ("host_defined_option_symbol", "node.host_defined_option_symbol"),
+    ] {
+        private_symbols
+            .set(JsString::from(name), node_symbol(description)?, true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    object
+        .set(
+            js_string!("privateSymbols"),
+            JsValue::from(private_symbols),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("constants"), constants, true, context)
+        .map_err(sandbox_execution_error)?;
+    for (name, length, function) in [
+        ("constructSharedArrayBuffer", 1usize, node_util_construct_shared_array_buffer as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("guessHandleType", 1usize, node_util_guess_handle_type),
+        ("defineLazyProperties", 4usize, node_util_define_lazy_properties),
+        ("getOwnNonIndexProperties", 2usize, node_util_get_own_non_index_properties),
+        ("isInsideNodeModules", 1usize, node_util_is_inside_node_modules),
+        ("arrayBufferViewHasBuffer", 1usize, node_util_array_buffer_view_has_buffer),
+        ("previewEntries", 2usize, node_util_preview_entries),
+        ("getCallerLocation", 0usize, node_util_get_caller_location),
+        (
+            "shouldAbortOnUncaughtToggle",
+            0usize,
+            node_util_should_abort_on_uncaught_toggle,
+        ),
+        ("getPromiseDetails", 1usize, node_util_get_promise_details),
+        ("getProxyDetails", 2usize, node_util_get_proxy_details),
+        ("getConstructorName", 1usize, node_util_get_constructor_name),
+        ("getExternalValue", 1usize, node_util_get_external_value),
+        ("sleep", 1usize, node_noop),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(length)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_string_decoder(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let encodings = JsValue::from_json(
+        &serde_json::json!([
+            "ascii",
+            "base64",
+            "base64url",
+            "hex",
+            "latin1",
+            "ucs2",
+            "ucs-2",
+            "utf16le",
+            "utf-16le",
+            "utf8",
+            "utf-8"
+        ]),
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("encodings"), encodings, true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_uv(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let get_error_map = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_uv_get_error_map),
+    )
+    .name(js_string!("getErrorMap"))
+    .length(0)
+    .constructor(false)
+    .build();
+    object
+        .set(js_string!("getErrorMap"), JsValue::from(get_error_map), true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_os(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, length, function) in [
+        ("getAvailableParallelism", 0usize, node_os_get_available_parallelism as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("getCPUs", 0usize, node_os_get_cpus),
+        ("getFreeMem", 0usize, node_os_get_free_mem),
+        ("getHomeDirectory", 0usize, node_os_get_home_directory),
+        ("getHostname", 0usize, node_os_get_hostname),
+        ("getInterfaceAddresses", 0usize, node_os_get_interface_addresses),
+        ("getLoadAvg", 0usize, node_os_get_load_avg),
+        ("getPriority", 0usize, node_os_get_priority),
+        ("getOSInformation", 0usize, node_os_get_os_information),
+        ("getTotalMem", 0usize, node_os_get_total_mem),
+        ("getUserInfo", 0usize, node_os_get_user_info),
+        ("getUptime", 0usize, node_os_get_uptime),
+        ("setPriority", 2usize, node_os_set_priority),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(length)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    object
+        .set(js_string!("isBigEndian"), JsValue::from(false), true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_credentials(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let get_temp_dir = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_credentials_get_temp_dir),
+    )
+    .name(js_string!("getTempDir"))
+    .length(0)
+    .constructor(false)
+    .build();
+    object
+        .set(js_string!("getTempDir"), JsValue::from(get_temp_dir), true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_messaging(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let exports = context
+        .global_object()
+        .get(js_string!("__terraceNodePerContextExports"), context)
+        .map_err(sandbox_execution_error)?;
+    let exports = exports.as_object().unwrap_or_else(JsObject::with_null_proto);
+    let dom_exception = exports
+        .get(js_string!("DOMException"), context)
+        .map_err(sandbox_execution_error)?;
+    let emit_message = exports
+        .get(js_string!("emitMessage"), context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("DOMException"), dom_exception, true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("emitMessage"), emit_message, true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(object)
+}
+
+fn node_internal_binding_profiler(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for name in ["setCoverageDirectory", "setSourceMapCacheGetter"] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(node_noop))
+            .name(JsString::from(name))
+            .length(1)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_builtins_compile_function(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let id = node_arg_string(args, 0, context)?;
+    node_with_host_js(context, |host, context| {
+        node_compile_builtin_wrapper(
+            context,
+            host,
+            &id,
+            &["exports", "require", "module", "process", "internalBinding", "primordials"],
+            None,
+        )
+    })
+}
+
+fn node_builtins_set_internal_loaders(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let internal_binding_loader = args.first().cloned().unwrap_or_else(JsValue::undefined);
+    let builtin_require = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
+    node_store_global(
+        context,
+        "__terraceInternalBindingLoader",
+        internal_binding_loader,
+    )
+    .map_err(js_error)?;
+    node_store_global(context, "__terraceBuiltinRequire", builtin_require).map_err(js_error)?;
+    Ok(JsValue::undefined())
+}
+
 fn node_upstream_builtin_vfs_path(specifier: &str) -> Option<String> {
     if specifier.is_empty() {
         return None;
     }
-    let mut relative = PathBuf::from("lib");
-    relative.push(specifier);
+    let mut relative = if let Some(remainder) = specifier.strip_prefix("internal/deps/") {
+        let mut path = PathBuf::from("deps");
+        path.push(remainder);
+        path
+    } else {
+        let mut path = PathBuf::from("lib");
+        path.push(specifier);
+        path
+    };
     relative.set_extension("js");
     let relative = relative.to_string_lossy().replace('\\', "/");
     Some(format!("{NODE_UPSTREAM_VFS_ROOT}/{relative}"))
+}
+
+fn node_noop(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn node_buffer_create_unsafe_array_buffer(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let size = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    Ok(JsValue::from(JsArrayBuffer::new(size, context)?))
+}
+
+fn node_buffer_byte_length_utf8(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let input = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    Ok(JsValue::from(input.len() as i32))
+}
+
+fn node_buffer_unimplemented(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Err(js_error(SandboxError::Service {
+        service: "node_runtime",
+        message: "internal buffer binding operation is not implemented yet".to_string(),
+    }))
+}
+
+fn node_blob_unimplemented(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Err(js_error(SandboxError::Service {
+        service: "node_runtime",
+        message: "internal blob binding is not implemented yet".to_string(),
+    }))
+}
+
+fn node_url_can_parse(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let input = node_arg_string(args, 0, context)?;
+    let base = if args
+        .get(1)
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    {
+        Some(node_arg_string(args, 1, context)?)
+    } else {
+        None
+    };
+    let parsed = base
+        .as_deref()
+        .map_or_else(|| Url::parse(&input), |base| Url::parse(base).and_then(|base| base.join(&input)));
+    Ok(JsValue::from(parsed.is_ok()))
+}
+
+fn node_url_pattern_construct(
+    this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(this.clone())
+}
+
+fn node_url_pattern_test(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(false))
+}
+
+fn node_url_pattern_exec(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::null())
+}
+
+fn node_modules_enable_compile_cache(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_modules_get_compile_cache_dir(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from("")))
+}
+
+fn node_modules_compile_cache_status(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_global_escape(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    fn is_unescaped(cp: u16) -> bool {
+        let Ok(cp) = u8::try_from(cp) else {
+            return false;
+        };
+        cp.is_ascii_alphanumeric() || [b'_', b'@', b'*', b'+', b'-', b'.', b'/'].contains(&cp)
+    }
+
+    let string = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?;
+    let mut utf16 = Vec::with_capacity(string.len());
+    for cp in &string {
+        if is_unescaped(cp) {
+            utf16.push(cp);
+            continue;
+        }
+        let escaped = if cp < 256 {
+            format!("%{cp:02X}")
+        } else {
+            format!("%u{cp:04X}")
+        };
+        utf16.extend(escaped.encode_utf16());
+    }
+    Ok(js_string!(&utf16[..]).into())
+}
+
+fn node_global_unescape(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    fn to_hex_digit(cp: u16) -> Option<u16> {
+        char::from_u32(u32::from(cp))
+            .and_then(|c| c.to_digit(16))
+            .and_then(|digit| u16::try_from(digit).ok())
+    }
+
+    #[derive(Clone)]
+    struct PeekableN<I, const N: usize>
+    where
+        I: Iterator,
+    {
+        iterator: I,
+        buffer: [I::Item; N],
+        buffered_end: usize,
+    }
+
+    impl<I, const N: usize> PeekableN<I, N>
+    where
+        I: Iterator,
+        I::Item: Default + Copy,
+    {
+        fn new(iterator: I) -> Self {
+            Self {
+                iterator,
+                buffer: [I::Item::default(); N],
+                buffered_end: 0,
+            }
+        }
+
+        fn peek_n(&mut self, count: usize) -> &[I::Item] {
+            if count <= self.buffered_end {
+                return &self.buffer[..count];
+            }
+            for _ in 0..(count - self.buffered_end) {
+                let Some(next) = self.iterator.next() else {
+                    return &self.buffer[..self.buffered_end];
+                };
+                self.buffer[self.buffered_end] = next;
+                self.buffered_end += 1;
+            }
+            &self.buffer[..count]
+        }
+    }
+
+    impl<I, const N: usize> Iterator for PeekableN<I, N>
+    where
+        I: Iterator,
+        I::Item: Copy,
+    {
+        type Item = I::Item;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.buffered_end > 0 {
+                let item = self.buffer[0];
+                self.buffer.rotate_left(1);
+                self.buffered_end -= 1;
+                return Some(item);
+            }
+            self.iterator.next()
+        }
+    }
+
+    let string = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?;
+    let mut utf16 = Vec::with_capacity(string.len());
+    let mut codepoints = PeekableN::<_, 6>::new(string.iter());
+
+    loop {
+        let Some(cp) = codepoints.next() else {
+            break;
+        };
+        if cp != u16::from(b'%') {
+            utf16.push(cp);
+            continue;
+        }
+
+        let Some(unescaped_cp) = (|| match *codepoints.peek_n(5) {
+            [u, n1, n2, n3, n4] if u == u16::from(b'u') => {
+                let n1 = to_hex_digit(n1)?;
+                let n2 = to_hex_digit(n2)?;
+                let n3 = to_hex_digit(n3)?;
+                let n4 = to_hex_digit(n4)?;
+                for _ in 0..5 {
+                    codepoints.next();
+                }
+                Some((n1 << 12) + (n2 << 8) + (n3 << 4) + n4)
+            }
+            [n1, n2, ..] => {
+                let n1 = to_hex_digit(n1)?;
+                let n2 = to_hex_digit(n2)?;
+                for _ in 0..2 {
+                    codepoints.next();
+                }
+                Some((n1 << 4) + n2)
+            }
+            _ => None,
+        })() else {
+            utf16.push(u16::from(b'%'));
+            continue;
+        };
+
+        utf16.push(unescaped_cp);
+    }
+
+    Ok(js_string!(&utf16[..]).into())
+}
+
+fn node_options_get_cli_options_values(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(
+        &serde_json::json!({
+            "--experimental-quic": false,
+            "--preserve-symlinks": false,
+            "--preserve-symlinks-main": false,
+            "--pending-deprecation": false,
+            "--no-deprecation": false,
+            "--require-module": false
+        }),
+        context,
+    )
+}
+
+fn node_options_get_cli_options_info(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(&serde_json::json!({}), context)
+}
+
+fn node_options_get_options_as_flags(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(&serde_json::json!([]), context)
+}
+
+fn node_options_get_embedder_options(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(
+        &serde_json::json!({ "noGlobalSearchPaths": true }),
+        context,
+    )
+}
+
+fn node_options_get_env_options_input_type(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(&serde_json::json!([]), context)
+}
+
+fn node_options_get_namespace_options_input_type(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(&serde_json::json!([]), context)
+}
+
+fn node_type_is_array_buffer_view(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(
+        args.first().is_some_and(|value| value.as_object().is_some_and(|object| {
+            JsUint8Array::from_object(object.clone()).is_ok()
+        })),
+    ))
+}
+
+fn node_type_is_async_function(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(value) = args.first() else {
+        return Ok(JsValue::from(false));
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(JsValue::from(false));
+    };
+    let constructor = object
+        .get(js_string!("constructor"), context)
+        ?;
+    let name = constructor
+        .as_object()
+        .and_then(|object| object.get(js_string!("name"), context).ok())
+        .and_then(|value| value.as_string().map(|value| value.to_std_string_escaped()));
+    Ok(JsValue::from(name.as_deref() == Some("AsyncFunction")))
+}
+
+fn node_type_is_native_error(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(args.first().is_some_and(JsValue::is_object)))
+}
+
+fn node_type_is_promise(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(
+        args.first()
+            .and_then(JsValue::as_object)
+            .is_some_and(|object| JsPromise::from_object(object.clone()).is_ok()),
+    ))
+}
+
+fn node_type_is_proxy(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(false))
+}
+
+fn node_type_is_regexp(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(value) = args.first() else {
+        return Ok(JsValue::from(false));
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(JsValue::from(false));
+    };
+    let tag = object
+        .get(js_string!("constructor"), context)
+        ?
+        .as_object()
+        .and_then(|object| object.get(js_string!("name"), context).ok())
+        .and_then(|value| value.as_string().map(|value| value.to_std_string_escaped()));
+    Ok(JsValue::from(tag.as_deref() == Some("RegExp")))
+}
+
+fn node_module_wrap_construct(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let object = this.as_object().unwrap_or_else(JsObject::with_null_proto);
+    object
+        .set(
+            js_string!("url"),
+            args.first().cloned().unwrap_or_else(JsValue::undefined),
+            true,
+            context,
+        )
+        ?;
+    object
+        .set(
+            js_string!("exportKeys"),
+            args.get(2).cloned().unwrap_or_else(JsValue::undefined),
+            true,
+            context,
+        )
+        ?;
+    object
+        .set(
+            js_string!("evaluateCallback"),
+            args.get(3).cloned().unwrap_or_else(JsValue::undefined),
+            true,
+            context,
+        )
+        ?;
+    object
+        .set(
+            js_string!("exports"),
+            JsValue::from(JsObject::with_null_proto()),
+            true,
+            context,
+        )
+        ?;
+    Ok(JsValue::from(object))
+}
+
+fn node_module_wrap_instantiate(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn node_module_wrap_evaluate(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(object) = this.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    let callback = object
+        .get(js_string!("evaluateCallback"), context)
+        ?;
+    if let Some(callable) = callback.as_callable() {
+        callable.call(this, &[], context)?;
+    }
+    Ok(JsValue::undefined())
+}
+
+fn node_module_wrap_set_export(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(object) = this.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    let exports = object
+        .get(js_string!("exports"), context)
+        ?;
+    let Some(exports) = exports.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    let name = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?;
+    let value = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
+    exports
+        .set(name, value, true, context)
+        ?;
+    Ok(JsValue::undefined())
+}
+
+fn node_util_construct_shared_array_buffer(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let size = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_length(context)? as usize;
+    let script = format!("new ArrayBuffer({size})");
+    context
+        .eval(Source::from_bytes(script.as_bytes()))
+        
+}
+
+fn node_util_guess_handle_type(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from("UNKNOWN")))
+}
+
+fn node_util_define_lazy_properties(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn node_util_get_own_non_index_properties(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(target) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::from(JsArray::new(context)?));
+    };
+    let filter = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)?;
+    let skip_symbols = filter & 16 != 0;
+    let keys = target.own_property_keys(context)?;
+    let mut result = Vec::new();
+    for key in keys {
+        match key {
+            boa_engine::property::PropertyKey::Index(_) => {}
+            boa_engine::property::PropertyKey::String(name) => result.push(JsValue::from(name)),
+            boa_engine::property::PropertyKey::Symbol(symbol) if !skip_symbols => {
+                result.push(JsValue::from(symbol));
+            }
+            boa_engine::property::PropertyKey::Symbol(_) => {}
+        }
+    }
+    Ok(JsValue::from(JsArray::from_iter(result, context)))
+}
+
+fn node_util_is_inside_node_modules(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(false))
+}
+
+fn node_util_array_buffer_view_has_buffer(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(object) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::from(false));
+    };
+    if JsUint8Array::from_object(object.clone()).is_ok() {
+        return Ok(JsValue::from(true));
+    }
+    let buffer = object.get(js_string!("buffer"), context)?;
+    Ok(JsValue::from(!buffer.is_undefined() && !buffer.is_null()))
+}
+
+fn node_util_preview_entries(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsArray::new(context)?))
+}
+
+fn node_util_get_caller_location(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn node_util_should_abort_on_uncaught_toggle(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(false))
+}
+
+fn node_util_get_promise_details(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(object) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::undefined());
+    };
+    let Ok(promise) = JsPromise::from_object(object.clone()) else {
+        return Ok(JsValue::undefined());
+    };
+    let values = match promise.state() {
+        PromiseState::Pending => vec![JsValue::from(0)],
+        PromiseState::Fulfilled(value) => vec![JsValue::from(1), value.clone()],
+        PromiseState::Rejected(value) => vec![JsValue::from(2), value.clone()],
+    };
+    Ok(JsValue::from(JsArray::from_iter(values, context)))
+}
+
+fn node_util_get_proxy_details(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn node_util_get_constructor_name(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(object) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::undefined());
+    };
+    let constructor = object.get(js_string!("constructor"), context)?;
+    let Some(constructor) = constructor.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    constructor.get(js_string!("name"), context)
+}
+
+fn node_util_get_external_value(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn node_encoding_encode_into_results(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let existing = context
+        .global_object()
+        .get(js_string!("__terraceNodeEncodingEncodeIntoResults"), context)
+        .map_err(sandbox_execution_error)?;
+    if let Some(object) = existing.as_object() {
+        return Ok(object);
+    }
+    let values = JsValue::from_json(&serde_json::json!([0, 0]), context)
+        .map_err(sandbox_execution_error)?;
+    let object = values.as_object().ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: "failed to allocate encoding encodeIntoResults scratch array".to_string(),
+    })?;
+    node_store_global(context, "__terraceNodeEncodingEncodeIntoResults", values)?;
+    Ok(object)
+}
+
+fn node_encoding_encode_into(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let src = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let Some(dest_object) = args.get(1).and_then(JsValue::as_object) else {
+        return Err(js_error(sandbox_execution_error(
+            "encoding_binding.encodeInto requires Uint8Array destination",
+        )));
+    };
+    let dest = JsUint8Array::from_object(dest_object.clone())
+        .map_err(|_| {
+            js_error(sandbox_execution_error(
+                "encoding_binding.encodeInto requires Uint8Array destination",
+            ))
+        })?;
+    let capacity = dest.length(context)?;
+    let mut read = 0usize;
+    let mut written = 0usize;
+    for ch in src.chars() {
+        let mut encoded = [0u8; 4];
+        let chunk = ch.encode_utf8(&mut encoded).as_bytes();
+        if written + chunk.len() > capacity {
+            break;
+        }
+        for byte in chunk {
+            dest_object.set(written as u32, JsValue::from(*byte), true, context)?;
+            written += 1;
+        }
+        read += ch.len_utf16();
+    }
+    let results = node_encoding_encode_into_results(context).map_err(js_error)?;
+    results.set(0u32, JsValue::from(read as i32), true, context)?;
+    results.set(1u32, JsValue::from(written as i32), true, context)?;
+    Ok(JsValue::undefined())
+}
+
+fn node_encoding_encode_utf8_string(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let input = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    Ok(JsValue::from(JsUint8Array::from_iter(
+        input.into_bytes(),
+        context,
+    )?))
+}
+
+fn node_encoding_decode_utf8(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let input = args.first().cloned().unwrap_or_else(JsValue::undefined);
+    let ignore_bom = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
+    let fatal = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
+    let mut bytes = node_bytes_from_js(&input, context)?;
+    if ignore_bom && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    let text = if fatal {
+        String::from_utf8(bytes).map_err(|error| js_error(sandbox_execution_error(error)))?
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(JsValue::from(JsString::from(text)))
+}
+
+fn node_encoding_to_ascii(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let input = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    Ok(JsValue::from(JsString::from(input)))
+}
+
+fn node_uv_get_error_map(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    context
+        .eval(Source::from_bytes(b"new Map()"))
+        
+}
+
+fn node_os_get_available_parallelism(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(1))
+}
+
+fn node_os_get_cpus(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(
+        &serde_json::json!([{
+            "model": "Terrace Deterministic CPU",
+            "speed": 2400,
+            "times": {
+                "user": 1,
+                "nice": 0,
+                "sys": 1,
+                "idle": 1,
+                "irq": 0
+            }
+        }]),
+        context,
+    )
+}
+
+fn node_os_get_free_mem(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_os_get_home_directory(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host_js(context, |host, _context| {
+        Ok(JsValue::from(JsString::from(
+            host.process
+                .borrow()
+                .env
+                .get("HOME")
+                .cloned()
+                .unwrap_or_else(|| "/workspace/home".to_string()),
+        )))
+    })
+}
+
+fn node_os_get_hostname(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from("terrace")))
+}
+
+fn node_os_get_interface_addresses(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(
+        &serde_json::json!({
+            "lo": [
+                {
+                    "address": "127.0.0.1",
+                    "netmask": "255.0.0.0",
+                    "family": "IPv4",
+                    "mac": "00:00:00:00:00:00",
+                    "internal": true,
+                    "cidr": "127.0.0.1/8"
+                }
+            ]
+        }),
+        context,
+    )
+}
+
+fn node_os_get_load_avg(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(&serde_json::json!([0, 0, 0]), context)
+}
+
+fn node_os_get_priority(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_os_get_os_information(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    JsValue::from_json(
+        &serde_json::json!(["Linux", "terrace", "1.0.0", "x86_64"]),
+        context,
+    )
+}
+
+fn node_os_get_total_mem(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_os_get_user_info(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host_js(context, |host, context| {
+        JsValue::from_json(
+            &serde_json::json!({
+                "username": "sandbox",
+                "uid": 1000,
+                "gid": 1000,
+                "shell": "/bin/sh",
+                "homedir": host.process.borrow().env.get("HOME").cloned().unwrap_or_else(|| "/workspace/home".to_string())
+            }),
+            context,
+        )
+        .map_err(sandbox_execution_error)
+    })
+}
+
+fn node_os_get_uptime(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_os_set_priority(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn node_credentials_get_temp_dir(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host_js(context, |host, _context| {
+        let temp_dir = host
+            .process
+            .borrow()
+            .env
+            .get("TMPDIR")
+            .cloned()
+            .unwrap_or_else(|| "/tmp".to_string());
+        Ok(JsValue::from(JsString::from(temp_dir)))
+    })
 }
 
 fn node_resolve_module(
@@ -4668,6 +6891,7 @@ fn execute_node_child_process(
         materialized_modules: Rc::new(RefCell::new(BTreeMap::new())),
         module_graph: Rc::new(RefCell::new(NodeModuleGraph::default())),
         read_snapshot_fs: Rc::new(RefCell::new(None)),
+        builtin_ids: Rc::new(RefCell::new(None)),
         debug_trace: Rc::new(RefCell::new(NodeRuntimeDebugTrace::default())),
         next_child_pid: host.next_child_pid.clone(),
         zlib_streams: Rc::new(RefCell::new(NodeZlibStreamTable::default())),

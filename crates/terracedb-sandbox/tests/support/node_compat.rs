@@ -3,38 +3,22 @@ use std::{
     fs,
     path::PathBuf,
     process::Command,
-    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use terracedb::{DbDependencies, StubClock, StubFileSystem, StubObjectStore, StubRng, Timestamp};
 use terracedb_sandbox::{
-    ConflictPolicy, DefaultSandboxStore, PackageCompatibilityMode, SandboxConfig, SandboxError,
-    SandboxServices, SandboxStore,
+    ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer, SandboxConfig, SandboxError,
+    SandboxHarness, SandboxServices,
 };
-use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
+use terracedb_vfs::{CreateOptions, VolumeId};
 
 #[path = "tracing.rs"]
 mod tracing_support;
 
-pub fn sandbox_store(
-    now: u64,
-    seed: u64,
-) -> (InMemoryVfsStore, DefaultSandboxStore<InMemoryVfsStore>) {
-    let dependencies = DbDependencies::new(
-        Arc::new(StubFileSystem::default()),
-        Arc::new(StubObjectStore::default()),
-        Arc::new(StubClock::new(Timestamp::new(now))),
-        Arc::new(StubRng::seeded(seed)),
-    );
-    let vfs = InMemoryVfsStore::with_dependencies(dependencies.clone());
-    let sandbox = DefaultSandboxStore::new(
-        Arc::new(vfs.clone()),
-        dependencies.clock,
-        SandboxServices::deterministic_with_host_git(),
-    );
-    (vfs, sandbox)
-}
+const CACHED_NODE_BASE_VOLUME_ID: VolumeId = VolumeId::new(0xA9F0_0000_0000_0001);
+const SESSION_VOLUME_BASE: u128 = 0xAAF0_0000_0000_0000;
+static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 pub async fn open_node_session(
     now: u64,
@@ -43,18 +27,26 @@ pub async fn open_node_session(
     source: &str,
 ) -> terracedb_sandbox::SandboxSession {
     tracing_support::init_tracing();
-    let (vfs, sandbox) = sandbox_store(now, seed);
-    let base_volume_id = VolumeId::new(0xA910u128 + (seed as u128 % 0x100));
-    let session_volume_id = VolumeId::new(0xAA10u128 + (seed as u128 % 0x100));
-    let base = vfs
-        .open_volume(
-            VolumeConfig::new(base_volume_id)
-                .with_chunk_size(4096)
-                .with_create_if_missing(true),
+    let harness = SandboxHarness::deterministic(now, seed, SandboxServices::deterministic());
+    let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
+    let session_volume_id =
+        VolumeId::new(SESSION_VOLUME_BASE + ((seed as u128) << 16) + session_suffix);
+    let session = harness
+        .open_session_from_base_layer_with(
+            &SandboxBaseLayer::vendored_node_v24_14_1_js_tree(),
+            CACHED_NODE_BASE_VOLUME_ID,
+            session_volume_id,
+            |config| SandboxConfig {
+                workspace_root: "/workspace".to_string(),
+                package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
+                conflict_policy: ConflictPolicy::Fail,
+                ..config
+            },
         )
         .await
-        .expect("open base volume");
-    base.fs()
+        .expect("open node sandbox session");
+    session
+        .filesystem()
         .write_file(
             entrypoint,
             source.as_bytes().to_vec(),
@@ -66,23 +58,7 @@ pub async fn open_node_session(
         )
         .await
         .expect("write node fixture");
-
-    sandbox
-        .open_session(SandboxConfig {
-            session_volume_id,
-            session_chunk_size: Some(4096),
-            base_volume_id,
-            durable_base: false,
-            workspace_root: "/workspace".to_string(),
-            package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
-            conflict_policy: ConflictPolicy::Fail,
-            capabilities: Default::default(),
-            execution_policy: None,
-            hoisted_source: None,
-            git_provenance: None,
-        })
-        .await
-        .expect("open node sandbox session")
+    session
 }
 
 pub async fn exec_node_fixture(

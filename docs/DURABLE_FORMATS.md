@@ -14,6 +14,7 @@ T23a currently covers:
 - remote manifest files
 - remote-cache metadata files
 - backup-GC birth metadata files
+- VFS volume artifact files
 - workflow public-contract JSON fixtures in `crates/terracedb-workflows-core`
 - workflow runtime records and checkpoint artifacts in `crates/terracedb-workflows`
 
@@ -33,6 +34,13 @@ Today that means:
 
 The checked FlatBuffers schema reference lives at `schemas/durable_metadata.fbs`. Commit-log frames and segment footers remain custom binary formats.
 
+The VFS volume-artifact schema reference lives at `schemas/vfs_volume_artifact.fbs`, and the
+checked generated Rust bindings live under `crates/terracedb-vfs/src/generated/`. The manifest is
+FlatBuffers; bulk file contents are intentionally stored outside the FlatBuffer in a streamed
+per-file payload section so artifact export/import does not need to buffer artifact bytes into a
+second manifest representation. Payloads are compressed when worthwhile and expanded back into VFS
+chunks only on import.
+
 The current per-format policy is:
 
 | Format | Representative location | Compatibility boundary | Version rule | Fail-closed rule |
@@ -45,6 +53,7 @@ The current per-format policy is:
 | Remote manifest FlatBuffer | `backup/manifest/MANIFEST-*` | Exact emitted bytes are stable within `format_version` 1, including persisted SSTable shard ownership when present. | Bump `format_version` when remote recovery should reject earlier bodies. | Remote manifest load rejects invalid FlatBuffers, bad checksums, unsupported versions, and shard-ownership mismatches against reopened SSTables. |
 | Remote-cache metadata FlatBuffer | cache `meta/*` records | Exact emitted bytes are stable within `format_version` 1. | Bump `format_version` when rebuilt cache state should no longer trust earlier metadata bytes. | Cache rebuild must ignore invalid/unsupported metadata and fetch from remote again instead of trusting it. |
 | Backup-GC birth metadata FlatBuffer | `backup/gc/objects/*` | Exact emitted bytes are stable within `format_version` 1. | Bump `format_version` when GC should reject earlier birth records. | GC metadata decode must treat invalid/unsupported metadata as unusable so GC leaves the object alone. |
+| VFS volume artifact | single-file VFS base-layer artifact bytes exported by `terracedb-vfs` | Exact artifact bytes are stable within `format_version` 2 for the current container: fixed header (`TDVA`, version, manifest length), FlatBuffers manifest, then streamed per-file payload bytes compressed when worthwhile. | Bump the artifact `format_version` when import should reject earlier container or manifest layouts instead of guessing. | Artifact import must reject bad magic, unsupported versions, invalid FlatBuffers, manifest identifier mismatch, payload offset mismatches, malformed compressed payloads, trailing bytes, and malformed embedded JSON. |
 | Workflow runtime versioned-JSON records | workflow-owned row payloads and workflow checkpoint table artifacts | Exact emitted bytes are stable within the current version byte `1` for the frozen T108/T109 workflow contracts. | Bump the leading version byte when workflow recovery/checkpoint restore should reject earlier record or artifact layouts. | Workflow runtime load/restore must reject malformed JSON, bad table-artifact kinds, and unsupported versions instead of treating them as valid workflow state. |
 
 ## Workflow Runtime Records
@@ -115,6 +124,13 @@ Use these commands for intentional durable-format changes:
 1. Run `scripts/check-durable-format-fixtures.sh` to verify the current fixtures.
 2. If the byte change is intentional, run `scripts/regenerate-durable-format-fixtures.sh`.
 3. Review the fixture diffs together with the code change before committing.
+
+For VFS volume-artifact schema changes:
+
+1. Update `schemas/vfs_volume_artifact.fbs`.
+2. Run `scripts/regenerate-vfs-volume-artifact-bindings.sh`.
+3. Run `cargo nextest run -p terracedb-vfs --test artifact_roundtrip`.
+4. Review the generated binding diff together with the artifact implementation change.
 
 The shared pre-commit hook runs the check script before the broader test/lint pass, so accidental format drift fails locally.
 

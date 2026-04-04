@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    io::{Read, Write},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use terracedb::LogCursor;
@@ -27,13 +30,74 @@ impl<T: VolumeStore + ?Sized> VfsStoreExt for T {}
 
 #[async_trait]
 pub trait VfsArtifactStoreExt: VolumeStore {
+    /// Open an existing base volume if present, otherwise import it from the
+    /// provided artifact reader exactly once.
+    async fn ensure_imported_volume_artifact_from_reader<R: Read + Send>(
+        &self,
+        reader: &mut R,
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError> {
+        match self
+            .open_volume(target.clone().with_create_if_missing(false))
+            .await
+        {
+            Ok(volume) => return Ok(volume),
+            Err(VfsError::VolumeNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        match self.import_volume_artifact_from_reader(reader, target.clone()).await {
+            Ok(volume) => Ok(volume),
+            Err(VfsError::VolumeAlreadyExists { .. }) => self
+                .open_volume(target.with_create_if_missing(false))
+                .await,
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Open an existing base volume if present, otherwise import it from the
+    /// provided artifact bytes exactly once.
+    async fn ensure_imported_volume_artifact(
+        &self,
+        bytes: &[u8],
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        self.ensure_imported_volume_artifact_from_reader(&mut cursor, target)
+            .await
+    }
+
+    /// Export a volume cut into a caller-provided writer without buffering the
+    /// full artifact in a second in-memory byte vector.
+    async fn export_volume_artifact_to_writer<W: Write + Send>(
+        &self,
+        source: crate::CloneVolumeSource,
+        writer: &mut W,
+    ) -> Result<(), VfsError> {
+        let export = self.export_volume(source).await?;
+        export.write_artifact(writer)
+    }
+
     /// Export a volume cut as a single-file durable artifact.
     async fn export_volume_artifact(
         &self,
         source: crate::CloneVolumeSource,
     ) -> Result<Vec<u8>, VfsError> {
-        let export = self.export_volume(source).await?;
-        export.to_artifact_bytes()
+        let mut bytes = Vec::new();
+        self.export_volume_artifact_to_writer(source, &mut bytes)
+            .await?;
+        Ok(bytes)
+    }
+
+    /// Import a previously exported durable artifact from a caller-provided
+    /// reader so the artifact does not need to be buffered as a single slice.
+    async fn import_volume_artifact_from_reader<R: Read + Send>(
+        &self,
+        reader: &mut R,
+        target: VolumeConfig,
+    ) -> Result<Arc<dyn Volume>, VfsError> {
+        let export = VolumeExport::read_artifact(reader)?;
+        self.import_volume(export, target).await
     }
 
     /// Import a previously exported durable artifact into a new base volume.
@@ -42,8 +106,9 @@ pub trait VfsArtifactStoreExt: VolumeStore {
         bytes: &[u8],
         target: VolumeConfig,
     ) -> Result<Arc<dyn Volume>, VfsError> {
-        let export = VolumeExport::from_artifact_bytes(bytes)?;
-        self.import_volume(export, target).await
+        let mut cursor = std::io::Cursor::new(bytes);
+        self.import_volume_artifact_from_reader(&mut cursor, target)
+            .await
     }
 }
 

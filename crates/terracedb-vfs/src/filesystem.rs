@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use terracedb::Timestamp;
@@ -127,6 +129,12 @@ pub trait ReadOnlyVfsFileSystem: Send + Sync {
 #[async_trait]
 pub trait VfsFileSystem: ReadOnlyVfsFileSystem {
     async fn apply_batch(&self, ops: &[VfsBatchOperation]) -> Result<(), VfsError>;
+    async fn write_file_from_reader(
+        &self,
+        path: &str,
+        reader: &mut (dyn Read + Send),
+        opts: CreateOptions,
+    ) -> Result<(), VfsError>;
     async fn write_file(
         &self,
         path: &str,

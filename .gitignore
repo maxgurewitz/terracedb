@@ -22,3 +22,6 @@ Thumbs.db
 # Temporary directory (keep the dir via .gitkeep)
 .tmp/*
 !.tmp/.gitkeep
+
+# Generated sandbox base-layer artifacts
+crates/terracedb-sandbox/assets/*.tdva

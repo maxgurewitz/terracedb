@@ -317,49 +317,6 @@ pub(crate) async fn replace_vfs_tree(
     Ok(deleted_paths)
 }
 
-pub(crate) async fn populate_vfs_tree_fresh(
-    fs: &dyn VfsFileSystem,
-    target_root: &str,
-    entries: &[TreeEntry],
-) -> Result<(), SandboxError> {
-    let target_root = normalize_vfs_path(target_root)?;
-    info!(
-        target: "terracedb.sandbox.hoist",
-        target_root = %target_root,
-        entries = entries.len(),
-        "populating fresh vfs tree"
-    );
-    let mut ops = Vec::with_capacity(entries.len() + 1);
-    ops.push(VfsBatchOperation::Mkdir {
-        path: target_root.clone(),
-        opts: MkdirOptions {
-            recursive: true,
-            ..Default::default()
-        },
-    });
-    for entry in entries {
-        if matches!(entry.data, TreeEntryData::Directory) {
-            ops.push(VfsBatchOperation::Mkdir {
-                path: join_vfs_path(&target_root, &entry.path),
-                opts: MkdirOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            });
-        }
-    }
-    info!(
-        target: "terracedb.sandbox.hoist",
-        operations = ops.len(),
-        "applying fresh vfs batch"
-    );
-    fs.apply_batch(&ops).await?;
-
-    apply_non_directory_entry_batches(fs, &target_root, entries, false).await?;
-
-    Ok(())
-}
-
 pub(crate) async fn write_hoist_manifest(
     volume: &dyn Volume,
     manifest: &HoistManifest,

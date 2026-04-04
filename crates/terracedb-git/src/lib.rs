@@ -11,8 +11,9 @@ pub mod worktree;
 
 pub use adapters::{SandboxGitBinding, SandboxGitRequest};
 pub use bridge::{
-    DeterministicGitHostBridge, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportMode,
-    GitImportReport, GitImportRequest, GitImportSource, GitRemoteProvider,
+    DeterministicGitHostBridge, GitHostBridge, GitImportEntry, GitImportEntryKind,
+    GitImportLayout, GitImportMode, GitImportReport, GitImportRequest, GitImportSink,
+    GitImportSource, GitRemoteProvider,
 };
 pub use error::GitSubstrateError;
 pub use host::HostGitBridge;

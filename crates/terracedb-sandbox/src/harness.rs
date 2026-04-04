@@ -6,7 +6,8 @@ use terracedb::{
 use terracedb_vfs::{InMemoryVfsStore, VolumeConfig, VolumeId, VolumeStore};
 
 use crate::{
-    DefaultSandboxStore, SandboxConfig, SandboxError, SandboxServices, SandboxSession, SandboxStore,
+    DefaultSandboxStore, SandboxBaseLayer, SandboxConfig, SandboxError, SandboxServices,
+    SandboxSession, SandboxStore,
 };
 
 pub struct SandboxHarness<S> {
@@ -69,6 +70,39 @@ where
         F: FnOnce(SandboxConfig) -> SandboxConfig,
     {
         self.ensure_volume(base_volume_id).await?;
+        let config =
+            configure(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096));
+        self.store.open_session(config).await
+    }
+
+    pub async fn open_session_from_base_layer(
+        &self,
+        base_layer: &SandboxBaseLayer,
+        base_volume_id: VolumeId,
+        session_volume_id: VolumeId,
+    ) -> Result<SandboxSession, SandboxError> {
+        self.open_session_from_base_layer_with(
+            base_layer,
+            base_volume_id,
+            session_volume_id,
+            |config| config,
+        )
+        .await
+    }
+
+    pub async fn open_session_from_base_layer_with<F>(
+        &self,
+        base_layer: &SandboxBaseLayer,
+        base_volume_id: VolumeId,
+        session_volume_id: VolumeId,
+        configure: F,
+    ) -> Result<SandboxSession, SandboxError>
+    where
+        F: FnOnce(SandboxConfig) -> SandboxConfig,
+    {
+        base_layer
+            .ensure_volume(self.volumes.as_ref(), base_volume_id)
+            .await?;
         let config =
             configure(SandboxConfig::new(base_volume_id, session_volume_id).with_chunk_size(4096));
         self.store.open_session(config).await

@@ -410,3 +410,61 @@ If it is the second kind, it is probably transitional and should be replaced.
 - We should have a base layer with node / npm.
 - That base layer should be vendored into our crate so that others can re-use it, in the file format that our db expects.
 - We should export public utilities that allow people to define their own base layer to e.g. install their own required dependencies, pre-install their own application repos for efficient sandbox cloning.
+
+## Current Base-Layer Primitive
+
+The first reusable layer primitive now exists:
+
+- `terracedb-vfs` exports single-file volume artifacts with a fixed header, FlatBuffers manifest, and streamed payload section.
+- `terracedb-vfs::VfsArtifactStoreExt` now supports:
+  - export/import through byte slices,
+  - export/import through caller-provided readers and writers, and
+  - idempotent `ensure_imported_volume_artifact*` helpers so a shared base volume can be imported once and reused.
+- `terracedb-sandbox::SandboxBaseLayer` now wraps either:
+  - bundled artifact bytes, or
+  - an on-disk artifact path,
+  and can ensure the corresponding base volume exists before opening overlay-backed sandbox sessions.
+- `terracedb-sandbox` now exposes a generic recipe API for building snapshots from reusable layers:
+  - `SandboxSnapshotLayer::git_host_path(...)`
+  - `SandboxSnapshotLayer::git_remote(...)`
+  - `SandboxSnapshotLayer::host_tree(...)`
+  - `SandboxSnapshotRecipe::new(...).layer(...).write_artifact(...)`
+  - `SandboxSnapshotRecipe::build_base_layer(...)`
+  - `SandboxSnapshotRecipe::write_artifact_to_path(...)`
+- The git-backed path uses `GitImportLayout::TreeOnly` and the same VFS write path as sandbox hoisting, so it stays on the native git/VFS substrate instead of reintroducing a host-side copy path.
+- The host-tree path streams file contents from a plain materialized directory tree without buffering whole files into memory first. This is the bootstrap path for npm runtime trees that include `node_modules`.
+- `terracedb-sandbox` now exports pinned first-party recipes built on the same public surface:
+  - `node_v24_14_1_js_tree_recipe()`
+  - `npm_cli_v11_12_1_runtime_tree_recipe(...)`
+- A real remote-import contract now passes for `git_remote(...)`, so the public recipe API is exercising actual pinned-remote imports rather than only local host paths.
+
+Example:
+
+```rust
+let layer = SandboxSnapshotRecipe::new("runtime-and-app")
+    .layer(
+        SandboxSnapshotLayer::git_remote(
+            "node-source",
+            "https://github.com/nodejs/node.git",
+            Some("d89bb1b482fa09245c4f2cbb3b5b6a70bea6deaf".to_string()),
+        )
+            .with_target_root("/node")
+            .with_pathspec(vec!["lib".into(), "deps".into(), "test".into()]),
+    )
+    .layer(
+        SandboxSnapshotLayer::host_tree("npm-runtime", "/path/to/materialized/npm")
+            .with_target_root("/npm")
+            .with_pathspec(vec![
+                "bin".into(),
+                "lib".into(),
+                "index.js".into(),
+                "package.json".into(),
+                "package-lock.json".into(),
+                "node_modules".into(),
+            ]),
+    )
+    .build_base_layer(git_bridge)
+    .await?;
+```
+
+This is the substrate we should build the Node/npm base layer on top of.
