@@ -24,4 +24,5 @@ Thumbs.db
 !.tmp/.gitkeep
 
 # Generated sandbox base-layer artifacts
-crates/terracedb-sandbox/assets/*.tdva
+crates/terracedb-sandbox/assets/*
+!crates/terracedb-sandbox/assets/.gitkeep
