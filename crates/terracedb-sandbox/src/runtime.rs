@@ -65,9 +65,9 @@ use sha3::{
 };
 use terracedb_git::{GitCheckoutRequest, GitDiffRequest, GitRefUpdate, GitStatusOptions};
 use terracedb_js::{
-    BoaJsRuntimeHost, DeterministicJsEntropySource, FixedJsClock, JsCompatibilityProfile,
-    JsEntropySource, JsExecutionKind, JsExecutionRequest, JsForkPolicy, JsHostServiceAdapter,
-    JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsRuntime,
+    BoaJsRuntimeHost, DeterministicJsEntropySource, DeterministicJsRuntimeHost, FixedJsClock,
+    JsCompatibilityProfile, JsEntropySource, JsExecutionKind, JsExecutionRequest, JsForkPolicy,
+    JsHostServiceAdapter, JsHostServiceRequest, JsHostServiceResponse, JsHostServices, JsRuntime,
     JsRuntimeAttachmentState, JsRuntimeConfiguration, JsRuntimeEnvironment, JsRuntimeHost,
     JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsRuntimeSuspendedState,
     JsRuntimeTurn, JsRuntimeTurnOutcome, JsSubstrateError, NeverCancel, RoutedJsHostServices,
@@ -24953,15 +24953,28 @@ async fn open_js_runtime(
     loader: SandboxModuleLoader,
     host_services: Arc<dyn JsHostServices>,
 ) -> Result<Arc<dyn JsRuntime>, SandboxError> {
-    let runtime_host = BoaJsRuntimeHost::new(Arc::new(loader), host_services)
-        .with_clock(Arc::new(FixedJsClock::new(session_info.updated_at.get())))
-        .with_entropy(Arc::new(DeterministicJsEntropySource::new(
-            js_entropy_seed(session_info),
-        )));
+    let policy = runtime_policy_for_session(session, session_info);
+    let loader: Arc<dyn terracedb_js::JsModuleLoader> = Arc::new(loader);
+    let clock = Arc::new(FixedJsClock::new(session_info.updated_at.get()));
+    let entropy = Arc::new(DeterministicJsEntropySource::new(js_entropy_seed(session_info)));
+    let runtime_host: Arc<dyn JsRuntimeHost> = match policy.compatibility_profile {
+        JsCompatibilityProfile::TerraceOnly => Arc::new(
+            DeterministicJsRuntimeHost::new(loader.clone(), host_services.clone())
+                .with_clock(clock.clone())
+                .with_entropy(entropy.clone()),
+        ),
+        JsCompatibilityProfile::SandboxCompat | JsCompatibilityProfile::BoaRuntimeCompat => {
+            Arc::new(
+                BoaJsRuntimeHost::new(loader.clone(), host_services.clone())
+                    .with_clock(clock.clone())
+                    .with_entropy(entropy.clone()),
+            )
+        }
+    };
     runtime_host
         .open_runtime(JsRuntimeOpenRequest {
             runtime_id: handle.actor_id.clone(),
-            policy: runtime_policy_for_session(session, session_info),
+            policy,
             provenance: JsRuntimeProvenance {
                 backend: handle.backend.clone(),
                 host_model: "sandbox-session".to_string(),

@@ -527,6 +527,17 @@ impl<'a> JsAttachedRuntimeContext<'a> {
         self.heap.snapshot()
     }
 
+    pub fn allocate_heap_object(
+        &mut self,
+        kind: impl Into<String>,
+        label: impl Into<String>,
+        size_bytes: usize,
+    ) -> Result<JsHeapObjectId, JsContextError> {
+        Ok(self
+            .heap
+            .allocate_object(JsHeapObjectDescriptor::labeled(kind, label, size_bytes))?)
+    }
+
     pub fn detach(mut self) -> Result<JsContextDetachedSnapshot, JsContextError> {
         self.state.attachment.attached = false;
         self.state.attachment.thread_id = None;

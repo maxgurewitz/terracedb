@@ -28,6 +28,7 @@ pub use engine::heap::{
     JsHeapError, JsHeapObjectDescriptor, JsHeapObjectId, JsHeapPhase, JsHeapRootId, JsHeapSnapshot,
     JsRuntimeHeap, JsWeakObjectId,
 };
+pub use engine::runtime_engine::EngineJsRuntimeHost;
 pub use entropy::{DeterministicJsEntropySource, JsEntropySnapshot, JsEntropySource};
 pub use error::JsSubstrateError;
 pub use host::{

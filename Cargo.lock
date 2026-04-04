@@ -3503,8 +3503,11 @@ name = "terracedb-js"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "boa_ast 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4)",
  "boa_engine 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4)",
  "boa_gc 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4)",
+ "boa_interner 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4)",
+ "boa_parser 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4)",
  "futures",
  "serde",
  "serde_json",

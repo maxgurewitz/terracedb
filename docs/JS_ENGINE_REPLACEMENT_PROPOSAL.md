@@ -13,6 +13,7 @@ The runtime is intended to support:
 - thread-level parallelism across sandboxes
 - explicit host control over time, I/O, randomness, and scheduling
 - upstream Node JavaScript running on top of Terrace-owned primitives
+- portable durable artifacts that can package filesystem state together with paused JavaScript runtime state
 
 ## Runtime Vision
 
@@ -1033,6 +1034,14 @@ Primary input material:
 - `~/dev/boa/docs/bytecompiler.md`
 - `~/dev/boa/docs/vm.md`
 
+Phase 3.c now provides:
+
+- `crates/terracedb-js/src/engine/artifact.rs`
+- an immutable compiled-artifact model for scripts, modules, and synthetic host modules
+- stable code-block ids and instruction streams owned independently of any attached runtime
+- lowering from `boa_parser` / `boa_ast` into Terrace code blocks
+- compile-time tests for script artifacts, module request/export tracking, and synthetic module artifacts
+
 #### Phase 3.d: turn-based VM execution
 
 Implement the VM loop that runs bounded turns and yields only at legal safepoints.
@@ -1050,6 +1059,14 @@ Primary input material:
 - `~/dev/boa/core/engine/src/vm/*`
 - `~/dev/boa/core/engine/src/native_function/continuation.rs`
 - `~/dev/boa/core/engine/src/script.rs`
+
+Phase 3.d now provides:
+
+- `crates/terracedb-js/src/engine/runtime_engine.rs`
+- a turn-based execution loop with explicit frame, stack, and safepoint handling
+- attached-only heap allocation for runtime objects and intrinsics
+- detachable execution state that survives between turns in `JsRuntimeSuspendedState`
+- public `DeterministicJsRuntimeHost` cut over to the new engine path instead of the old fake deterministic executor
 
 #### Phase 3.e: jobs, promises, and host-operation delivery
 
@@ -1069,6 +1086,14 @@ Primary input material:
 - `~/dev/boa/core/runtime/src/microtask/*`
 - `~/dev/boa/core/runtime/src/interval.rs`
 
+Phase 3.e now provides:
+
+- explicit promise bookkeeping in suspended state
+- `PendingMicrotasks` turn outcomes and `DrainMicrotasks` follow-up turns
+- `deliver_host_completion(...)` on the runtime boundary so host completions can be injected explicitly
+- promise resolution and rejection across host completions instead of only through the `execute()` convenience loop
+- engine tests covering cross-turn host completion delivery and promise-microtask progression
+
 #### Phase 3.f: modules and loader integration
 
 Rebuild module loading and module evaluation around explicit host-issued operations and turn boundaries.
@@ -1086,6 +1111,15 @@ Primary input material:
 - `~/dev/boa/core/engine/src/module/*`
 - `~/dev/boa/core/engine/src/script.rs`
 
+Phase 3.f now provides:
+
+- module graph state in suspended state
+- synthetic host-module compilation for capability imports
+- dependency loading through explicit pending operations instead of eager preloading before the first turn
+- module-load completion decoding and registration on follow-up turns
+- module execution ordering derived from the loaded dependency graph
+- engine tests covering module execution with helper modules and host capability imports
+
 #### Phase 3.g: Terrace integration cutover
 
 Swap the old Boa-backed execution internals out from underneath the Phase 2 boundary.
@@ -1100,6 +1134,13 @@ Success criterion:
 
 - the runtime boundary introduced in Phase 2 remains stable while the underlying engine implementation changes
 
+Phase 3.g now provides:
+
+- `terracedb-js::DeterministicJsRuntimeHost` cut over to `EngineJsRuntimeHost`
+- removal of the old fake deterministic executor from `crates/terracedb-js/src/runtime.rs`
+- `terracedb-sandbox` selecting the new engine for `JsCompatibilityProfile::TerraceOnly`
+- `terracedb-sandbox` continuing to use the Boa path for `SandboxCompat` / Node-oriented sessions until the rewritten engine is ready for that compatibility layer
+
 ### Phase 4: reconnect Node compatibility
 
 Run the existing Node compatibility plan on top of the new runtime substrate:
@@ -1107,6 +1148,68 @@ Run the existing Node compatibility plan on top of the new runtime substrate:
 - upstream Node JavaScript
 - Terrace-owned deterministic primitive bindings
 - upstream tests and ecosystem canaries
+
+### Phase 5: portable runtime checkpoints
+
+Extend the runtime and snapshot layers so Terrace can persist a paused JavaScript program together
+with its filesystem substrate as one outer durable artifact.
+
+Deliverables:
+
+- a runtime checkpoint format for heap, realms, stacks, queues, timers, pending host operations,
+  and scheduler-visible runtime metadata
+- a resume-contract manifest that describes the minimum runtime and injected host bridge required
+  to restore and resume the checkpoint safely
+- a packaging model that can combine:
+  - a VFS/base-layer snapshot
+  - immutable compiled code artifacts
+  - one or more paused runtime checkpoints
+- explicit versioning rules for checkpoint compatibility
+- checkpoint restore rules that only permit resume from legal safepoints
+- virtualization requirements for external resources so resumed programs remain portable and
+  deterministic
+
+Design constraints:
+
+- the filesystem snapshot, compiled artifacts, and runtime checkpoint remain separate internal
+  sections even when shipped as one outer file
+- the runtime checkpoint must carry an explicit resume contract rather than assuming ambient host
+  defaults
+- only Terrace-owned or virtualized resources may appear in a portable checkpoint
+- checkpoints are more version-sensitive than plain VFS snapshots and must be validated explicitly
+  on restore
+
+The resume contract should include at least:
+
+- engine and checkpoint schema versions
+- the compatible `terracedb-js` version or version range required to satisfy the internal binding
+  contract expected by the checkpoint
+- the injected external API interface exposed by the parent Rust application, including the
+  permissioned host capabilities made available through that bridge
+- runtime environment expectations such as locale, timezone, cwd, argv, and process metadata shape
+- identities or digests for the filesystem and compiled-artifact sections the checkpoint expects
+
+Restore must validate this contract before resuming execution and fail closed on mismatch.
+
+In particular, the resume contract is intended to validate the external seams that are not already
+contained inside the filesystem or compiled-artifact sections. Examples include:
+
+- the `terracedb-js` runtime version range that provides the internal binding behavior expected by
+  the checkpoint
+- the injected external API bridge exposed by the parent Rust application
+- the permissioned host capability set available through that bridge, such as VFS, networking,
+  subprocess, and time services
+- the host-created process/bootstrap surface that is injected rather than loaded from the bundled
+  filesystem layer
+
+It is not intended to redundantly enumerate Node's internal JavaScript globals or builtins when
+those are already supplied by the bundled filesystem and compiled-artifact layers.
+
+Success criterion:
+
+- Terrace can produce and restore a single portable artifact that contains both a virtual
+  filesystem and a paused JavaScript runtime, together with the host contract needed to resume it,
+  without relying on ambient host process state
 
 ## Summary
 
