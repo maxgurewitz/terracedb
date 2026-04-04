@@ -13,6 +13,7 @@ boa_interner = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0
 boa_parser = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
 brotli = "8.0.2"
 clap = { version = "4.5.40", features = ["derive"] }
+clap_lex = "0.7.6"
 crc32fast = "1.5.0"
 dotenvy = "0.15.7"
 flate2 = { version = "1.1.5", features = ["zlib-rs"] }

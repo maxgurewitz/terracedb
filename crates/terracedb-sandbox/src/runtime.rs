@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     io::{Cursor, Read, Write},
     net::ToSocketAddrs,
     path::PathBuf,
@@ -18,7 +19,7 @@ use base64::{
 use boa_ast::scope::Scope;
 use boa_ast::visitor::Visitor;
 use boa_engine::{
-    Context, JsNativeError, JsResult, JsString, JsSymbol, JsValue, NativeFunction, Script, Source,
+    Context, JsError, JsNativeError, JsResult, JsString, JsSymbol, JsValue, NativeFunction, Script, Source,
     builtins::promise::{OperationType, Promise, PromiseState},
     context::HostHooks,
     Finalize, JsData, Trace,
@@ -39,6 +40,7 @@ use boa_engine::{
 use boa_interner::Interner;
 use boa_parser::{Parser as BoaParser, Source as BoaParserSource};
 use brotli::{CompressorReader as BrotliCompressorReader, Decompressor as BrotliDecompressor};
+use clap_lex::RawArgs;
 use dotenvy::from_read_iter as dotenv_from_read_iter;
 use flate2::{
     Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
@@ -49,7 +51,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use pbkdf2::pbkdf2_hmac;
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::utf8_percent_encode;
 use ripemd::Ripemd160;
 use scrypt::{Params as ScryptParams, scrypt};
 use serde::de::DeserializeOwned;
@@ -903,10 +905,7 @@ fn node_option_takes_value(name: &str) -> bool {
 
 fn node_parse_dotenv(input: &str) -> Result<Vec<(String, String)>, SandboxError> {
     let reader = Cursor::new(input.as_bytes());
-    let iter = dotenv_from_read_iter(reader).map_err(|error| SandboxError::Execution {
-        entrypoint: "<node-runtime>".to_string(),
-        message: error.to_string(),
-    })?;
+    let iter = dotenv_from_read_iter(reader);
     let mut entries = Vec::new();
     for item in iter {
         let (key, value) = item.map_err(|error| SandboxError::Execution {
@@ -923,38 +922,249 @@ fn node_split_argv(exec_path: &str, argv: Vec<String>) -> (Vec<String>, Vec<Stri
         return (vec![exec_path.to_string()], Vec::new());
     }
 
-    let argv_len = argv.len();
     let mut normalized_argv = vec![exec_path.to_string()];
     let mut exec_argv = Vec::new();
-    let mut index = 1usize;
-    let mut parsing_options = true;
+    let raw = RawArgs::new(argv.iter().cloned().map(OsString::from));
+    let mut cursor = raw.cursor();
+    let _ = raw.next(&mut cursor);
 
-    while index < argv_len {
-        let arg = argv[index].clone();
-        if parsing_options && arg == "--" {
-            normalized_argv.push(arg);
-            normalized_argv.extend(argv[index + 1..].iter().cloned());
+    while let Some(arg) = raw.next(&mut cursor) {
+        if arg.is_escape() {
+            normalized_argv.push("--".to_string());
+            normalized_argv.extend(
+                raw.remaining(&mut cursor)
+                    .map(|value| value.to_string_lossy().into_owned()),
+            );
             return (normalized_argv, exec_argv);
         }
-        if parsing_options && arg.starts_with('-') {
-            let option_name = node_option_canonical_name(
-                arg.split_once('=').map(|(name, _)| name).unwrap_or(arg.as_str()),
-            );
-            exec_argv.push(arg.clone());
-            if !arg.contains('=') && node_option_takes_value(option_name) && index + 1 < argv_len {
-                exec_argv.push(argv[index + 1].clone());
-                index += 2;
-                continue;
+
+        if let Some((long, value)) = arg.to_long() {
+            let raw_name = long.unwrap_or_default();
+            let canonical_name = node_option_canonical_name(raw_name);
+            if let Some(value) = value {
+                exec_argv.push(format!("{canonical_name}={}", value.to_string_lossy()));
+            } else {
+                exec_argv.push(canonical_name.to_string());
+                if node_option_takes_value(canonical_name) {
+                    if let Some(next) = raw.next_os(&mut cursor) {
+                        exec_argv.push(next.to_string_lossy().into_owned());
+                    }
+                }
             }
-            index += 1;
             continue;
         }
-        parsing_options = false;
-        normalized_argv.extend(argv[index..].iter().cloned());
+
+        if let Some(mut shorts) = arg.to_short() {
+            let mut handled_as_exec_argv = true;
+            while let Some(short) = shorts.next_flag() {
+                let Ok(short) = short else {
+                    handled_as_exec_argv = false;
+                    break;
+                };
+                let canonical_name = match short {
+                    'c' => Some("--check"),
+                    'e' => Some("--eval"),
+                    'i' => Some("--interactive"),
+                    'p' => Some("--print"),
+                    _ => None,
+                };
+                let Some(canonical_name) = canonical_name else {
+                    handled_as_exec_argv = false;
+                    break;
+                };
+                exec_argv.push(canonical_name.to_string());
+                if node_option_takes_value(canonical_name) {
+                    if let Some(value) = shorts.next_value_os() {
+                        exec_argv.push(value.to_string_lossy().into_owned());
+                    } else if let Some(value) = raw.next_os(&mut cursor) {
+                        exec_argv.push(value.to_string_lossy().into_owned());
+                    }
+                    break;
+                }
+            }
+            if handled_as_exec_argv {
+                continue;
+            }
+        }
+
+        normalized_argv.push(arg.display().to_string());
+        normalized_argv.extend(
+            raw.remaining(&mut cursor)
+                .map(|value| value.to_string_lossy().into_owned()),
+        );
         return (normalized_argv, exec_argv);
     }
 
     (normalized_argv, exec_argv)
+}
+
+fn node_default_cli_option_values() -> JsonValue {
+    let mut values = serde_json::Map::from_iter([
+        ("--permission".to_string(), JsonValue::Bool(false)),
+        ("--allow-fs-read".to_string(), JsonValue::Array(Vec::new())),
+        ("--allow-fs-write".to_string(), JsonValue::Array(Vec::new())),
+        ("--allow-addons".to_string(), JsonValue::Bool(false)),
+        ("--allow-child-process".to_string(), JsonValue::Bool(false)),
+        ("--allow-inspector".to_string(), JsonValue::Bool(false)),
+        ("--allow-wasi".to_string(), JsonValue::Bool(false)),
+        ("--allow-worker".to_string(), JsonValue::Bool(false)),
+        ("--check".to_string(), JsonValue::Bool(false)),
+        ("--conditions".to_string(), JsonValue::Array(Vec::new())),
+        ("--env-file".to_string(), JsonValue::Array(Vec::new())),
+        ("--env-file-if-exists".to_string(), JsonValue::Array(Vec::new())),
+        ("--eval".to_string(), JsonValue::Array(Vec::new())),
+        ("--no-addons".to_string(), JsonValue::Bool(false)),
+        ("--no-warnings".to_string(), JsonValue::Bool(false)),
+        ("--interactive".to_string(), JsonValue::Bool(false)),
+        ("--print".to_string(), JsonValue::Bool(false)),
+        ("--prof-process".to_string(), JsonValue::Bool(false)),
+        ("--require".to_string(), JsonValue::Array(Vec::new())),
+        ("--experimental-loader".to_string(), JsonValue::Array(Vec::new())),
+        ("--import".to_string(), JsonValue::Array(Vec::new())),
+        ("--entry-url".to_string(), JsonValue::Bool(false)),
+        ("--enable-source-maps".to_string(), JsonValue::Bool(false)),
+        ("--experimental-require-module".to_string(), JsonValue::Bool(false)),
+        ("--experimental-vm-modules".to_string(), JsonValue::Bool(false)),
+        ("--strip-types".to_string(), JsonValue::Bool(false)),
+        (
+            "--experimental-default-type".to_string(),
+            JsonValue::String("commonjs".to_string()),
+        ),
+        ("--use-env-proxy".to_string(), JsonValue::Bool(false)),
+        ("--inspect-brk".to_string(), JsonValue::Bool(false)),
+        ("--inspect-brk-node".to_string(), JsonValue::Bool(false)),
+        (
+            "--network-family-autoselection".to_string(),
+            JsonValue::Bool(true),
+        ),
+        (
+            "--network-family-autoselection-attempt-timeout".to_string(),
+            JsonValue::from(250_i64),
+        ),
+        ("--warnings".to_string(), JsonValue::Bool(true)),
+        (
+            "--no-experimental-websocket".to_string(),
+            JsonValue::Bool(false),
+        ),
+        ("--experimental-eventsource".to_string(), JsonValue::Bool(false)),
+        (
+            "--no-experimental-global-navigator".to_string(),
+            JsonValue::Bool(false),
+        ),
+        ("--no-experimental-sqlite".to_string(), JsonValue::Bool(false)),
+        (
+            "--experimental-default-config-file".to_string(),
+            JsonValue::Bool(false),
+        ),
+        ("--experimental-config-file".to_string(), JsonValue::String(String::new())),
+        (
+            "--experimental-network-inspection".to_string(),
+            JsonValue::Bool(false),
+        ),
+        ("--trace-sigint".to_string(), JsonValue::Bool(false)),
+        ("--experimental-test-coverage".to_string(), JsonValue::Bool(false)),
+        ("--experimental-webstorage".to_string(), JsonValue::Bool(false)),
+        ("--expose-internals".to_string(), JsonValue::Bool(false)),
+        ("--frozen-intrinsics".to_string(), JsonValue::Bool(false)),
+        ("--report-on-signal".to_string(), JsonValue::Bool(false)),
+        ("--heapsnapshot-signal".to_string(), JsonValue::String(String::new())),
+        ("--diagnostic-dir".to_string(), JsonValue::String(String::new())),
+        ("--experimental-quic".to_string(), JsonValue::Bool(false)),
+        ("--preserve-symlinks".to_string(), JsonValue::Bool(false)),
+        ("--preserve-symlinks-main".to_string(), JsonValue::Bool(false)),
+        ("--pending-deprecation".to_string(), JsonValue::Bool(false)),
+        ("--no-deprecation".to_string(), JsonValue::Bool(false)),
+        ("--require-module".to_string(), JsonValue::Bool(false)),
+        ("--trace-warnings".to_string(), JsonValue::Bool(false)),
+        ("--throw-deprecation".to_string(), JsonValue::Bool(false)),
+        ("--trace-deprecation".to_string(), JsonValue::Bool(false)),
+        ("--test".to_string(), JsonValue::Bool(false)),
+        ("--test-force-exit".to_string(), JsonValue::Bool(false)),
+        (
+            "--test-isolation".to_string(),
+            JsonValue::String("process".to_string()),
+        ),
+        ("--watch".to_string(), JsonValue::Bool(false)),
+        ("--watch-path".to_string(), JsonValue::Array(Vec::new())),
+    ]);
+    for (name, option_type, _env_var_settings, default_is_true, _help_text) in
+        node_option_info_entries()
+    {
+        if option_type == 2 {
+            let negated_name = format!("--no-{}", &name[2..]);
+            values
+                .entry(negated_name)
+                .or_insert_with(|| JsonValue::Bool(!default_is_true));
+        }
+    }
+    JsonValue::Object(values)
+}
+
+fn node_collect_cli_options(exec_argv: &[String]) -> Vec<(String, Option<String>)> {
+    let raw = RawArgs::new(
+        std::iter::once(OsString::from("node"))
+            .chain(exec_argv.iter().cloned().map(OsString::from)),
+    );
+    let mut cursor = raw.cursor();
+    let _ = raw.next(&mut cursor);
+    let mut options = Vec::new();
+
+    while let Some(arg) = raw.next(&mut cursor) {
+        if arg.is_escape() {
+            break;
+        }
+        if let Some((long, value)) = arg.to_long() {
+            let raw_name = match long {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            let name = node_option_canonical_name(raw_name).to_string();
+            let value = if let Some(value) = value {
+                Some(value.to_string_lossy().into_owned())
+            } else if node_option_takes_value(&name) {
+                raw.next_os(&mut cursor)
+                    .map(|value| value.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            options.push((name, value));
+            continue;
+        }
+        if let Some(mut shorts) = arg.to_short() {
+            while let Some(short) = shorts.next_flag() {
+                let short = match short {
+                    Ok(short) => short,
+                    Err(_) => break,
+                };
+                let Some(name) = (match short {
+                    'c' => Some("--check"),
+                    'e' => Some("--eval"),
+                    'i' => Some("--interactive"),
+                    'p' => Some("--print"),
+                    _ => None,
+                }) else {
+                    break;
+                };
+                let value = if node_option_takes_value(name) {
+                    shorts
+                        .next_value_os()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .or_else(|| {
+                            raw.next_os(&mut cursor)
+                                .map(|value| value.to_string_lossy().into_owned())
+                        })
+                } else {
+                    None
+                };
+                options.push((name.to_string(), value));
+                if node_option_takes_value(name) {
+                    break;
+                }
+            }
+        }
+    }
+
+    options
 }
 
 fn node_options_env_settings_json() -> serde_json::Value {
@@ -2155,13 +2365,19 @@ fn execute_node_command_inner(
         node_debug_event(node_host, "stage", "host-bindings-installed".to_string())?;
         node_install_base_process_global(&mut context, node_host)?;
         node_debug_event(node_host, "stage", "base-process-installed".to_string())?;
-        node_execute_upstream_bootstrap_and_main(
+        match node_execute_upstream_bootstrap_and_main(
             &mut context,
             node_host,
             &entrypoint,
             &normalized_entrypoint,
-        )?;
-        drain_node_jobs_until_quiescent(&mut context, node_host, &entrypoint)?;
+        ) {
+            Ok(()) => {
+                drain_node_jobs_until_quiescent(&mut context, node_host, &entrypoint)?;
+            }
+            Err(SandboxError::ProcessExited) => {}
+            Err(SandboxError::ExecveReplaced) => {}
+            Err(error) => return Err(error),
+        }
         let result = node_command_report_json(node_host);
 
         let module_graph = node_host
@@ -12376,7 +12592,7 @@ fn node_process_methods_really_exit(
         .unwrap_or_default();
     node_with_host(|host| {
         host.process.borrow_mut().exit_code = code;
-        Ok(JsValue::undefined())
+        Err(SandboxError::ProcessExited)
     })
     .map_err(js_error)
 
@@ -12580,10 +12796,7 @@ fn node_process_methods_execve(
         process.stdout.push_str(&result.stdout);
         process.stderr.push_str(&result.stderr);
         process.exit_code = result.status.unwrap_or_default();
-        Err(SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: format!("process.execve() replaced the current process with `{command}`"),
-        })
+        Err(SandboxError::ExecveReplaced)
     })
     .map_err(js_error)
 }
@@ -12668,12 +12881,9 @@ fn node_process_methods_abort(
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
         host.process.borrow_mut().exit_code = 134;
-        Ok(JsValue::undefined())
+        Err(SandboxError::ProcessExited)
     })
-    .map_err(js_error)?;
-    Err(JsNativeError::error()
-        .with_message("process.abort() terminated the sandboxed process")
-        .into())
+    .map_err(js_error)
 }
 
 fn node_process_methods_cwd(
@@ -16599,83 +16809,12 @@ fn node_options_get_cli_options_values(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, context| {
-        let mut values = serde_json::json!({
-            "--permission": false,
-            "--allow-fs-read": [],
-            "--allow-fs-write": [],
-            "--allow-addons": false,
-            "--allow-child-process": false,
-            "--allow-inspector": false,
-            "--allow-wasi": false,
-            "--allow-worker": false,
-            "--check": false,
-            "--conditions": [],
-            "--env-file": [],
-            "--env-file-if-exists": [],
-            "--eval": [],
-            "--no-addons": false,
-            "--no-warnings": false,
-            "--interactive": false,
-            "--print": false,
-            "--prof-process": false,
-            "--require": [],
-            "--experimental-loader": [],
-            "--import": [],
-            "--entry-url": false,
-            "--enable-source-maps": false,
-            "--experimental-require-module": false,
-            "--experimental-vm-modules": false,
-            "--strip-types": false,
-            "--experimental-default-type": "commonjs",
-            "--use-env-proxy": false,
-            "--inspect-brk": false,
-            "--inspect-brk-node": false,
-            "--network-family-autoselection": true,
-            "--network-family-autoselection-attempt-timeout": 250,
-            "--warnings": true,
-            "--no-experimental-websocket": false,
-            "--experimental-eventsource": false,
-            "--no-experimental-global-navigator": false,
-            "--no-experimental-sqlite": false,
-            "--experimental-default-config-file": false,
-            "--experimental-config-file": false,
-            "--experimental-network-inspection": false,
-            "--trace-sigint": false,
-            "--experimental-test-coverage": false,
-            "--experimental-webstorage": false,
-            "--expose-internals": false,
-            "--frozen-intrinsics": false,
-            "--report-on-signal": false,
-            "--heapsnapshot-signal": "",
-            "--diagnostic-dir": "",
-            "--experimental-quic": false,
-            "--preserve-symlinks": false,
-            "--preserve-symlinks-main": false,
-            "--pending-deprecation": false,
-            "--no-deprecation": false,
-            "--require-module": false,
-            "--trace-warnings": false,
-            "--throw-deprecation": false,
-            "--trace-deprecation": false,
-            "--test": false,
-            "--test-force-exit": false,
-            "--test-isolation": "process",
-            "--watch": false,
-            "--watch-path": []
-        });
+        let mut values = node_default_cli_option_values();
         let Some(object) = values.as_object_mut() else {
             return Err(sandbox_execution_error("CLI option defaults must be an object"));
         };
         let exec_argv = host.process.borrow().exec_argv.clone();
-        let mut index = 0usize;
-        while index < exec_argv.len() {
-            let arg = &exec_argv[index];
-            let (name, inline_value) = if let Some((name, value)) = arg.split_once('=') {
-                (name.to_string(), Some(value.to_string()))
-            } else {
-                (arg.clone(), None)
-            };
-            let name = node_option_canonical_name(&name).to_string();
+        for (name, value) in node_collect_cli_options(&exec_argv) {
             match name.as_str() {
                 "--allow-fs-read"
                 | "--allow-fs-write"
@@ -16686,7 +16825,6 @@ fn node_options_get_cli_options_values(
                 | "--experimental-loader"
                 | "--import"
                 | "--require" => {
-                    let value = inline_value.or_else(|| exec_argv.get(index + 1).cloned());
                     if let Some(value) = value {
                         object
                             .entry(name.clone())
@@ -16694,31 +16832,20 @@ fn node_options_get_cli_options_values(
                             .as_array_mut()
                             .ok_or_else(|| sandbox_execution_error("CLI string-list option must be an array"))?
                             .push(JsonValue::String(value));
-                        if inline_value.is_none() {
-                            index += 1;
-                        }
                     }
                 }
                 "--diagnostic-dir"
                 | "--experimental-config-file"
                 | "--experimental-default-type"
                 | "--heapsnapshot-signal" => {
-                    let value = inline_value.or_else(|| exec_argv.get(index + 1).cloned());
                     if let Some(value) = value {
                         object.insert(name.clone(), JsonValue::String(value));
-                        if inline_value.is_none() {
-                            index += 1;
-                        }
                     }
                 }
                 "--network-family-autoselection-attempt-timeout" => {
-                    let value = inline_value.or_else(|| exec_argv.get(index + 1).cloned());
                     if let Some(value) = value {
                         if let Ok(value) = value.parse::<i64>() {
                             object.insert(name.clone(), JsonValue::from(value));
-                        }
-                        if inline_value.is_none() {
-                            index += 1;
                         }
                     }
                 }
@@ -16736,9 +16863,19 @@ fn node_options_get_cli_options_values(
                 }
                 _ => {}
             }
-            index += 1;
         }
-        JsValue::from_json(&values, context).map_err(sandbox_execution_error)
+        let result = JsObject::with_null_proto();
+        for (key, value) in object.iter() {
+            result
+                .set(
+                    JsString::from(key.as_str()),
+                    JsValue::from_json(value, context).map_err(sandbox_execution_error)?,
+                    true,
+                    context,
+                )
+                .map_err(sandbox_execution_error)?;
+        }
+        Ok(JsValue::from(result))
     })
 }
 
@@ -16754,81 +16891,80 @@ fn node_option_canonical_name(name: &str) -> &str {
     }
 }
 
-fn node_option_info_entries() -> Vec<(&'static str, i32, i32, &'static str)> {
+fn node_option_info_entries() -> Vec<(&'static str, i32, i32, bool, &'static str)> {
     vec![
-        ("--allow-addons", 2, 1, ""),
-        ("--allow-child-process", 2, 1, ""),
-        ("--allow-fs-read", 7, 1, ""),
-        ("--allow-fs-write", 7, 1, ""),
-        ("--allow-inspector", 2, 1, ""),
-        ("--allow-wasi", 2, 1, ""),
-        ("--allow-worker", 2, 1, ""),
-        ("--check", 2, 0, ""),
-        ("--conditions", 7, 0, ""),
-        ("--diagnostic-dir", 5, 0, ""),
-        ("--enable-source-maps", 2, 0, ""),
-        ("--entry-url", 2, 0, ""),
-        ("--env-file", 7, 0, ""),
-        ("--env-file-if-exists", 7, 0, ""),
-        ("--eval", 7, 0, ""),
-        ("--experimental-config-file", 5, 0, ""),
-        ("--experimental-default-config-file", 2, 0, ""),
-        ("--experimental-default-type", 5, 0, ""),
-        ("--experimental-eventsource", 2, 0, ""),
-        ("--experimental-loader", 7, 0, ""),
-        ("--experimental-network-inspection", 2, 0, ""),
-        ("--experimental-quic", 2, 0, ""),
-        ("--experimental-require-module", 2, 0, ""),
-        ("--experimental-test-coverage", 2, 0, ""),
-        ("--experimental-vm-modules", 2, 0, ""),
-        ("--experimental-webstorage", 2, 0, ""),
-        ("--expose-internals", 2, 0, ""),
-        ("--frozen-intrinsics", 2, 0, ""),
-        ("--heapsnapshot-signal", 5, 0, ""),
-        ("--import", 7, 0, ""),
-        ("--inspect-brk", 2, 0, ""),
-        ("--inspect-brk-node", 2, 0, ""),
-        ("--interactive", 2, 0, ""),
-        ("--network-family-autoselection", 2, 0, ""),
-        ("--network-family-autoselection-attempt-timeout", 4, 0, ""),
-        ("--no-addons", 2, 0, ""),
-        ("--no-deprecation", 2, 0, ""),
-        ("--no-experimental-global-navigator", 2, 0, ""),
-        ("--no-experimental-sqlite", 2, 0, ""),
-        ("--no-experimental-websocket", 2, 0, ""),
-        ("--no-warnings", 2, 0, ""),
-        ("--pending-deprecation", 2, 0, ""),
-        ("--permission", 2, 1, ""),
-        ("--print", 2, 0, ""),
-        ("--prof-process", 2, 0, ""),
-        ("--preserve-symlinks", 2, 0, ""),
-        ("--preserve-symlinks-main", 2, 0, ""),
-        ("--report-on-signal", 2, 0, ""),
-        ("--require", 7, 1, ""),
-        ("--require-module", 2, 0, ""),
-        ("--strip-types", 2, 0, ""),
-        ("--test", 2, 0, ""),
-        ("--test-force-exit", 2, 0, ""),
-        ("--test-isolation", 5, 0, ""),
-        ("--throw-deprecation", 2, 0, ""),
-        ("--trace-deprecation", 2, 0, ""),
-        ("--trace-sigint", 2, 0, ""),
-        ("--trace-warnings", 2, 0, ""),
-        ("--use-env-proxy", 2, 0, ""),
-        ("--watch", 2, 0, ""),
-        ("--watch-path", 7, 0, ""),
-        ("--warnings", 2, 0, ""),
+        ("--allow-addons", 2, 1, false, ""),
+        ("--allow-child-process", 2, 1, false, ""),
+        ("--allow-fs-read", 7, 1, false, ""),
+        ("--allow-fs-write", 7, 1, false, ""),
+        ("--allow-inspector", 2, 1, false, ""),
+        ("--allow-wasi", 2, 1, false, ""),
+        ("--allow-worker", 2, 1, false, ""),
+        ("--check", 2, 0, false, ""),
+        ("--conditions", 7, 0, false, ""),
+        ("--diagnostic-dir", 5, 0, false, ""),
+        ("--enable-source-maps", 2, 0, false, ""),
+        ("--entry-url", 2, 0, false, ""),
+        ("--env-file", 7, 0, false, ""),
+        ("--env-file-if-exists", 7, 0, false, ""),
+        ("--eval", 7, 0, false, ""),
+        ("--experimental-config-file", 5, 0, false, ""),
+        ("--experimental-default-config-file", 2, 0, false, ""),
+        ("--experimental-default-type", 5, 0, false, ""),
+        ("--experimental-eventsource", 2, 0, false, ""),
+        ("--experimental-loader", 7, 0, false, ""),
+        ("--experimental-network-inspection", 2, 0, false, ""),
+        ("--experimental-quic", 2, 0, false, ""),
+        ("--experimental-require-module", 2, 0, false, ""),
+        ("--experimental-test-coverage", 2, 0, false, ""),
+        ("--experimental-vm-modules", 2, 0, false, ""),
+        ("--experimental-webstorage", 2, 0, false, ""),
+        ("--expose-internals", 2, 0, false, ""),
+        ("--frozen-intrinsics", 2, 0, false, ""),
+        ("--heapsnapshot-signal", 5, 0, false, ""),
+        ("--import", 7, 0, false, ""),
+        ("--inspect-brk", 2, 0, false, ""),
+        ("--inspect-brk-node", 2, 0, false, ""),
+        ("--interactive", 2, 0, false, ""),
+        ("--network-family-autoselection", 2, 0, true, ""),
+        ("--network-family-autoselection-attempt-timeout", 4, 0, false, ""),
+        ("--permission", 2, 1, false, ""),
+        ("--print", 2, 0, false, ""),
+        ("--prof-process", 2, 0, false, ""),
+        ("--preserve-symlinks", 2, 0, false, ""),
+        ("--preserve-symlinks-main", 2, 0, false, ""),
+        ("--report-on-signal", 2, 0, false, ""),
+        ("--require", 7, 1, false, ""),
+        ("--require-module", 2, 0, false, ""),
+        ("--strip-types", 2, 0, false, ""),
+        ("--test", 2, 0, false, ""),
+        ("--test-force-exit", 2, 0, false, ""),
+        ("--test-isolation", 5, 0, false, ""),
+        ("--throw-deprecation", 2, 0, false, ""),
+        ("--trace-deprecation", 2, 0, false, ""),
+        ("--trace-sigint", 2, 0, false, ""),
+        ("--trace-warnings", 2, 0, false, ""),
+        ("--use-env-proxy", 2, 0, false, ""),
+        ("--watch", 2, 0, false, ""),
+        ("--watch-path", 7, 0, false, ""),
+        ("--warnings", 2, 0, true, ""),
     ]
 }
 
 fn node_options_build_info_map(context: &mut Context) -> Result<JsObject, SandboxError> {
     let map = node_make_js_map(context)?;
-    for (name, option_type, env_var_settings, help_text) in node_option_info_entries() {
+    for (name, option_type, env_var_settings, default_is_true, help_text) in node_option_info_entries()
+    {
         let info = ObjectInitializer::new(context)
             .property(js_string!("type"), JsValue::from(option_type), Attribute::all())
             .property(
                 js_string!("envVarSettings"),
                 JsValue::from(env_var_settings),
+                Attribute::all(),
+            )
+            .property(
+                js_string!("defaultIsTrue"),
+                JsValue::from(default_is_true),
                 Attribute::all(),
             )
             .property(
@@ -16894,16 +17030,18 @@ fn node_options_get_cli_options_info(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    let options = node_options_build_info_map(context).map_err(js_error)?;
+    let aliases = node_options_build_alias_map(context).map_err(js_error)?;
     Ok(JsValue::from(
         ObjectInitializer::new(context)
             .property(
                 js_string!("options"),
-                JsValue::from(node_options_build_info_map(context).map_err(sandbox_execution_error)?),
+                JsValue::from(options),
                 Attribute::all(),
             )
             .property(
                 js_string!("aliases"),
-                JsValue::from(node_options_build_alias_map(context).map_err(sandbox_execution_error)?),
+                JsValue::from(aliases),
                 Attribute::all(),
             )
             .build(),
@@ -16917,25 +17055,13 @@ fn node_options_get_options_as_flags(
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, context| {
         let exec_argv = host.process.borrow().exec_argv.clone();
-        let mut flags = Vec::new();
-        let mut index = 0usize;
-        while index < exec_argv.len() {
-            let arg = &exec_argv[index];
-            let (name, inline_value) = if let Some((name, value)) = arg.split_once('=') {
-                (node_option_canonical_name(name).to_string(), Some(value.to_string()))
-            } else {
-                (node_option_canonical_name(arg).to_string(), None)
-            };
-            if let Some(value) = inline_value {
-                flags.push(format!("{name}={value}"));
-            } else if node_option_takes_value(&name) && index + 1 < exec_argv.len() {
-                flags.push(format!("{name}={}", exec_argv[index + 1]));
-                index += 1;
-            } else {
-                flags.push(name);
-            }
-            index += 1;
-        }
+        let flags: Vec<String> = node_collect_cli_options(&exec_argv)
+            .into_iter()
+            .map(|(name, value)| match value {
+                Some(value) => format!("{name}={value}"),
+                None => name,
+            })
+            .collect();
         JsValue::from_json(&serde_json::json!(flags), context)
             .map_err(sandbox_execution_error)
     })
@@ -16976,7 +17102,7 @@ fn node_options_get_env_options_input_type(
             ],
             context,
         )
-        .map_err(sandbox_execution_error)?,
+        .map_err(js_error)?,
     ))
 }
 
@@ -16985,7 +17111,7 @@ fn node_options_get_namespace_options_input_type(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let map = node_make_js_map(context).map_err(sandbox_execution_error)?;
+    let map = node_make_js_map(context).map_err(js_error)?;
     node_js_map_set(
         &map,
         JsValue::from(js_string!("nodeOptions")),
@@ -17004,11 +17130,11 @@ fn node_options_get_namespace_options_input_type(
                 ],
                 context,
             )
-            .map_err(sandbox_execution_error)?,
+            .map_err(js_error)?,
         ),
         context,
     )
-    .map_err(sandbox_execution_error)?;
+    ?;
     Ok(JsValue::from(map))
 }
 
@@ -22820,6 +22946,14 @@ fn node_execution_error(
 }
 
 fn js_error(error: SandboxError) -> boa_engine::JsError {
+    if matches!(
+        error,
+        SandboxError::ExecveReplaced | SandboxError::ProcessExited
+    ) {
+        return JsNativeError::error()
+            .with_message("sandbox process terminated")
+            .into();
+    }
     JsNativeError::typ().with_message(error.to_string()).into()
 }
 

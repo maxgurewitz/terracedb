@@ -11,7 +11,8 @@ use terracedb_sandbox::{
     ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer, SandboxConfig, SandboxError,
     SandboxHarness, SandboxServices,
 };
-use terracedb_vfs::{CreateOptions, VolumeId};
+use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId};
+use tokio::sync::OnceCell;
 
 #[path = "tracing.rs"]
 mod tracing_support;
@@ -19,6 +20,21 @@ mod tracing_support;
 const CACHED_NODE_BASE_VOLUME_ID: VolumeId = VolumeId::new(0xA9F0_0000_0000_0001);
 const SESSION_VOLUME_BASE: u128 = 0xAAF0_0000_0000_0000;
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
+static SHARED_UPSTREAM_NODE_HARNESS: OnceCell<SandboxHarness<InMemoryVfsStore>> = OnceCell::const_new();
+
+async fn shared_upstream_node_harness() -> &'static SandboxHarness<InMemoryVfsStore> {
+    SHARED_UPSTREAM_NODE_HARNESS
+        .get_or_init(|| async {
+            tracing_support::init_tracing();
+            let harness = SandboxHarness::deterministic(510, 121, SandboxServices::deterministic());
+            SandboxBaseLayer::vendored_node_v24_14_1_js_tree()
+                .ensure_volume(harness.volumes().as_ref(), CACHED_NODE_BASE_VOLUME_ID)
+                .await
+                .expect("import shared node base layer");
+            harness
+        })
+        .await
+}
 
 pub async fn open_node_session(
     now: u64,
@@ -27,8 +43,8 @@ pub async fn open_node_session(
     source: &str,
 ) -> terracedb_sandbox::SandboxSession {
     tracing_support::init_tracing();
-    let harness = SandboxHarness::deterministic(now, seed, SandboxServices::deterministic());
     let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
+    let harness = SandboxHarness::deterministic(now, seed, SandboxServices::deterministic());
     let session_volume_id =
         VolumeId::new(SESSION_VOLUME_BASE + ((seed as u128) << 16) + session_suffix);
     let session = harness
@@ -102,12 +118,10 @@ pub async fn exec_node_fixture_with_seed(
 pub async fn exec_upstream_node_test(
     entrypoint: &str,
 ) -> Result<terracedb_sandbox::SandboxExecutionResult, SandboxError> {
-    tracing_support::init_tracing();
-    let harness = SandboxHarness::deterministic(510, 121, SandboxServices::deterministic());
+    let harness = shared_upstream_node_harness().await;
     let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
     let session = harness
-        .open_session_from_base_layer_with(
-            &SandboxBaseLayer::vendored_node_v24_14_1_js_tree(),
+        .open_session_with(
             CACHED_NODE_BASE_VOLUME_ID,
             VolumeId::new(SESSION_VOLUME_BASE + 0x1000_0000_0000_0000 + session_suffix),
             |config| SandboxConfig {
@@ -119,10 +133,15 @@ pub async fn exec_upstream_node_test(
         )
         .await
         .expect("open node sandbox session");
+    let runtime_entrypoint = if entrypoint.starts_with("/node/") {
+        entrypoint.to_string()
+    } else {
+        format!("/node{entrypoint}")
+    };
     session
         .exec_node_command(
-            entrypoint,
-            vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
+            &runtime_entrypoint,
+            vec!["/usr/bin/node".to_string(), runtime_entrypoint.clone()],
             "/node/test/parallel".to_string(),
             BTreeMap::from([
                 ("HOME".to_string(), "/workspace/home".to_string()),

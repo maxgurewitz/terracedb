@@ -63,6 +63,10 @@ pub enum SandboxError {
     ViewHandleNotFound { handle_id: String },
     #[error("sandbox execution failed for {entrypoint}: {message}")]
     Execution { entrypoint: String, message: String },
+    #[error("sandbox process exited")]
+    ProcessExited,
+    #[error("sandbox process was replaced via execve")]
+    ExecveReplaced,
     #[error("readonly view session {session_volume_id} not found")]
     ReadonlyViewSessionNotFound { session_volume_id: VolumeId },
     #[error("readonly view request is unauthorized")]
