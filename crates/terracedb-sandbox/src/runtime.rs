@@ -3,6 +3,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
+    net::ToSocketAddrs,
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -29,7 +30,10 @@ use boa_engine::{
         SyntheticModuleInitializer,
     },
     object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
-    object::builtins::{JsArray, JsArrayBuffer, JsPromise, JsProxy, JsSharedArrayBuffer, JsUint8Array},
+    object::builtins::{
+        JsArray, JsArrayBuffer, JsFunction, JsPromise, JsProxy, JsSharedArrayBuffer,
+        JsUint8Array,
+    },
     property::{Attribute, PropertyDescriptor, PropertyKey},
 };
 use boa_interner::Interner;
@@ -266,11 +270,17 @@ struct NodeModuleWrapState {
     url: String,
     wrapper: JsObject,
     status: i32,
-    source_phase: bool,
     synthetic: bool,
     source_text: Option<String>,
+    line_offset: i32,
+    column_offset: i32,
+    host_defined_option_id: Option<JsValue>,
+    has_top_level_await: bool,
+    source_url: Option<String>,
+    source_map_url: Option<String>,
     synthetic_export_names: Vec<String>,
     synthetic_evaluation_steps: Option<JsObject>,
+    imported_cjs: Option<JsObject>,
     synthetic_exports: BTreeMap<String, JsValue>,
     module: Option<Module>,
     module_source_object: Option<JsObject>,
@@ -279,6 +289,98 @@ struct NodeModuleWrapState {
     instantiated: bool,
     has_async_graph: Option<bool>,
     error: Option<JsValue>,
+}
+
+#[derive(Clone)]
+struct NodeContextifyScriptState {
+    script: Script,
+    filename: String,
+    cached_data: Option<JsValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NodeStreamHandleKind {
+    TcpSocket,
+    TcpServer,
+    PipeSocket,
+    PipeServer,
+    PipeIpc,
+    Tty,
+}
+
+impl NodeStreamHandleKind {
+    fn is_tcp(&self) -> bool {
+        matches!(self, Self::TcpSocket | Self::TcpServer)
+    }
+
+    fn is_pipe(&self) -> bool {
+        matches!(self, Self::PipeSocket | Self::PipeServer | Self::PipeIpc)
+    }
+
+    fn is_tty(&self) -> bool {
+        matches!(self, Self::Tty)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NodeStreamHandleState {
+    kind: NodeStreamHandleKind,
+    fd: Option<i32>,
+    reading: bool,
+    closed: bool,
+    bytes_written: u64,
+    listening: bool,
+    bound_address: Option<String>,
+    bound_family: Option<String>,
+    bound_port: Option<u16>,
+    peer_address: Option<String>,
+    peer_family: Option<String>,
+    peer_port: Option<u16>,
+    no_delay: bool,
+    keep_alive: bool,
+    keep_alive_delay: u32,
+    blocking: bool,
+    raw_mode: bool,
+    pending_instances: i32,
+    pipe_mode: i32,
+}
+
+#[derive(Clone, Debug)]
+struct NodeMessagePortState {
+    object: Option<JsObject>,
+    entangled: Option<u64>,
+    refed: bool,
+    started: bool,
+    closed: bool,
+    broadcast_name: Option<String>,
+    queue: Vec<JsValue>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeHeldLockState {
+    request_id: u64,
+    name: String,
+    client_id: String,
+    mode: String,
+    resolve: JsObject,
+    reject: JsObject,
+}
+
+#[derive(Clone, Debug)]
+struct NodePendingLockState {
+    request_id: u64,
+    name: String,
+    client_id: String,
+    mode: String,
+    callback: JsObject,
+    resolve: JsObject,
+    reject: JsObject,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NodeCompileCacheEntryState {
+    key: String,
+    transpiled: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -461,6 +563,7 @@ struct NodeBootstrapState {
     immediate_info: Option<JsObject>,
     timeout_info: Option<JsObject>,
     hrtime_buffer: Option<JsObject>,
+    stream_base_state: Option<JsObject>,
     microtask_queue: Vec<JsObject>,
     async_context_frame: Option<JsValue>,
     promise_reject_callback: Option<JsObject>,
@@ -482,6 +585,7 @@ struct NodeBootstrapState {
     trace_category_state_update_handler: Option<JsObject>,
     buffer_prototype: Option<JsObject>,
     prepare_stack_trace_callback: Option<JsObject>,
+    source_maps_enabled: bool,
     maybe_cache_generated_source_map_callback: Option<JsObject>,
     enhance_stack_before_inspector: Option<JsObject>,
     enhance_stack_after_inspector: Option<JsObject>,
@@ -490,6 +594,7 @@ struct NodeBootstrapState {
     performance_observer_callback: Option<JsObject>,
     performance_milestones: Option<JsObject>,
     performance_observer_counts: Option<JsObject>,
+    messaging_deserialize_create_object_callback: Option<JsObject>,
     should_abort_on_uncaught_toggle: Option<JsObject>,
     module_wrap_import_module_dynamically_callback: Option<JsObject>,
     module_wrap_initialize_import_meta_object_callback: Option<JsObject>,
@@ -503,6 +608,8 @@ struct NodeBootstrapState {
     performance_uv_loop_count: u64,
     performance_uv_events: u64,
     performance_uv_events_waiting: u64,
+    next_compile_cache_entry_id: u64,
+    compile_cache_entries: BTreeMap<u64, NodeCompileCacheEntryState>,
     next_host_handle_id: u64,
     host_private_symbols: BTreeMap<String, JsSymbol>,
     execution_async_id: u64,
@@ -515,8 +622,16 @@ struct NodeBootstrapState {
     permission_enabled: bool,
     bootstrap_completed: bool,
     blobs: NodeBlobTable,
+    contextify_scripts: BTreeMap<u64, NodeContextifyScriptState>,
     module_wraps: BTreeMap<u64, NodeModuleWrapState>,
     url_patterns: BTreeMap<u64, NodeUrlPatternState>,
+    stream_handles: BTreeMap<u64, NodeStreamHandleState>,
+    message_ports: BTreeMap<u64, NodeMessagePortState>,
+    env_message_port: Option<u64>,
+    broadcast_channels: BTreeMap<String, BTreeSet<u64>>,
+    next_lock_request_id: u64,
+    held_locks: BTreeMap<String, Vec<NodeHeldLockState>>,
+    pending_locks: Vec<NodePendingLockState>,
     registered_destroy_async_ids: BTreeSet<u64>,
     sigint_watchdog_active: bool,
     monotonic_now_ms: f64,
@@ -654,6 +769,55 @@ struct NodeProcessState {
     pid: u32,
     ppid: u32,
     umask: u32,
+}
+
+fn node_process_versions_json(process: &NodeProcessState) -> serde_json::Value {
+    serde_json::json!({
+        "node": process.version.trim_start_matches('v'),
+        "uv": "1.48.0",
+        "modules": "137",
+        "napi": "9",
+        "v8": "12.4.254.21-node.27",
+        "zlib": "1.3.0.1-motley",
+        "openssl": "",
+        "sqlite": "",
+    })
+}
+
+fn node_process_features_json() -> serde_json::Value {
+    serde_json::json!({
+        "inspector": false,
+        "debug": false,
+        "uv": true,
+        "ipv6": true,
+        "tls_alpn": false,
+        "tls_sni": false,
+        "tls_ocsp": false,
+        "tls": false,
+        "cached_builtins": false,
+        "require_module": true,
+    })
+}
+
+fn node_process_config_json() -> serde_json::Value {
+    serde_json::json!({
+        "target_defaults": {
+            "default_configuration": "Release",
+        },
+        "variables": {
+            "v8_enable_i18n_support": 0,
+            "node_quic": 0,
+            "asan": 0,
+            "icu_small": false,
+            "single_executable_application": 0,
+            "node_shared": 0,
+            "node_shared_openssl": 0,
+            "node_use_openssl": 0,
+            "is_debug": 0,
+            "ubsan": 0,
+            "want_separate_host_toolset": 0,
+        },
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1824,21 +1988,20 @@ fn node_install_base_process_global(
     process_object
         .set(js_string!("env"), env, true, context)
         .map_err(sandbox_execution_error)?;
-    let versions = JsValue::from_json(
-        &serde_json::json!({
-            "node": process.version.trim_start_matches('v'),
-            "uv": "1.48.0",
-            "modules": "137",
-            "napi": "9",
-            "v8": "12.4.254.21-node.27",
-            "zlib": "1.3.0.1-motley",
-            "openssl": "",
-        }),
-        context,
-    )
-    .map_err(sandbox_execution_error)?;
+    let versions = JsValue::from_json(&node_process_versions_json(&process), context)
+        .map_err(sandbox_execution_error)?;
     process_object
         .set(js_string!("versions"), versions, true, context)
+        .map_err(sandbox_execution_error)?;
+    let features = JsValue::from_json(&node_process_features_json(), context)
+        .map_err(sandbox_execution_error)?;
+    process_object
+        .set(js_string!("features"), features, true, context)
+        .map_err(sandbox_execution_error)?;
+    let config = JsValue::from_json(&node_process_config_json(), context)
+        .map_err(sandbox_execution_error)?;
+    process_object
+        .set(js_string!("config"), config, true, context)
         .map_err(sandbox_execution_error)?;
     let release = JsValue::from_json(
         &serde_json::json!({
@@ -1850,6 +2013,14 @@ fn node_install_base_process_global(
     .map_err(sandbox_execution_error)?;
     process_object
         .set(js_string!("release"), release, true, context)
+        .map_err(sandbox_execution_error)?;
+    process_object
+        .set(
+            js_string!("argv0"),
+            JsValue::from(JsString::from(process.exec_path.clone())),
+            true,
+            context,
+        )
         .map_err(sandbox_execution_error)?;
 
     drop(process);
@@ -2556,7 +2727,14 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
             if let Some(callable) = JsValue::from(callback).as_callable() {
                 let _ = callable.call(
                     &JsValue::undefined(),
-                    &[JsValue::from(import_meta.clone()), JsValue::from(state.wrapper)],
+                    &[
+                        state
+                            .host_defined_option_id
+                            .clone()
+                            .unwrap_or_else(JsValue::undefined),
+                        JsValue::from(import_meta.clone()),
+                        JsValue::from(state.wrapper),
+                    ],
                     context,
                 );
             }
@@ -3105,6 +3283,7 @@ fn node_write_stderr(
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
+
 }
 
 fn node_read_builtin_source(
@@ -3529,12 +3708,18 @@ fn node_internal_binding_object(
         "encoding_binding" => node_internal_binding_encoding(context),
         "string_decoder" => node_internal_binding_string_decoder(context),
         "uv" => node_internal_binding_uv(context),
+        "cares_wrap" => node_internal_binding_cares_wrap(context),
+        "stream_wrap" => node_internal_binding_stream_wrap(host, context),
+        "tcp_wrap" => node_internal_binding_tcp_wrap(context),
+        "pipe_wrap" => node_internal_binding_pipe_wrap(context),
+        "tty_wrap" => node_internal_binding_tty_wrap(context),
         "os" => node_internal_binding_os(context),
         "credentials" => node_internal_binding_credentials(context),
         "process_methods" => node_internal_binding_process_methods(host, context),
         "trace_events" => node_internal_binding_trace_events(context),
         "task_queue" => node_internal_binding_task_queue(host, context),
         "timers" => node_internal_binding_timers(host, context),
+        "locks" => node_internal_binding_locks(context),
         "worker" => node_internal_binding_worker(context),
         "async_wrap" => node_internal_binding_async_wrap(host, context),
         "async_context_frame" => node_internal_binding_async_context_frame(context),
@@ -3557,6 +3742,1523 @@ fn node_internal_binding_object(
             message: format!("unsupported internal binding: {other}"),
         }),
     }
+}
+
+const NODE_STREAM_WRAP_K_READ_BYTES_OR_ERROR: i32 = 0;
+const NODE_STREAM_WRAP_K_ARRAY_BUFFER_OFFSET: i32 = 1;
+const NODE_STREAM_WRAP_K_BYTES_WRITTEN: i32 = 2;
+const NODE_STREAM_WRAP_K_LAST_WRITE_WAS_ASYNC: i32 = 3;
+const NODE_UV_EBADF: i32 = -9;
+const NODE_UV_EINVAL: i32 = -22;
+const NODE_UV_EADDRINUSE: i32 = -98;
+const NODE_UV_EISCONN: i32 = -106;
+
+fn node_stream_wrap_state_array(
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+) -> Result<JsObject, SandboxError> {
+    if let Some(existing) = host.bootstrap.borrow().stream_base_state.clone() {
+        return Ok(existing);
+    }
+    let value = context
+        .eval(Source::from_bytes(b"new Int32Array(4)"))
+        .map_err(sandbox_execution_error)?;
+    let object = value.as_object().ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: "failed to create stream base state array".to_string(),
+    })?;
+    host.bootstrap.borrow_mut().stream_base_state = Some(object.clone());
+    Ok(object)
+}
+
+fn node_stream_wrap_req_construct(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let _ = args;
+    let Some(this) = this.as_object() else {
+        return Err(JsNativeError::typ()
+            .with_message("stream request constructor requires receiver")
+            .into());
+    };
+    for (name, value) in [
+        ("oncomplete", JsValue::null()),
+        ("callback", JsValue::null()),
+        ("handle", JsValue::null()),
+    ] {
+        this.set(JsString::from(name), value, true, context)?;
+    }
+    Ok(JsValue::from(this.clone()))
+}
+
+fn node_internal_binding_stream_wrap(
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let shutdown_wrap = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_stream_wrap_req_construct),
+    )
+    .name(js_string!("ShutdownWrap"))
+    .length(0)
+    .constructor(true)
+    .build();
+    let write_wrap = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_stream_wrap_req_construct),
+    )
+    .name(js_string!("WriteWrap"))
+    .length(0)
+    .constructor(true)
+    .build();
+    let stream_base_state = node_stream_wrap_state_array(host, context)?;
+    for (name, value) in [
+        ("ShutdownWrap", JsValue::from(shutdown_wrap)),
+        ("WriteWrap", JsValue::from(write_wrap)),
+        (
+            "kReadBytesOrError",
+            JsValue::from(NODE_STREAM_WRAP_K_READ_BYTES_OR_ERROR),
+        ),
+        (
+            "kArrayBufferOffset",
+            JsValue::from(NODE_STREAM_WRAP_K_ARRAY_BUFFER_OFFSET),
+        ),
+        ("kBytesWritten", JsValue::from(NODE_STREAM_WRAP_K_BYTES_WRITTEN)),
+        (
+            "kLastWriteWasAsync",
+            JsValue::from(NODE_STREAM_WRAP_K_LAST_WRITE_WAS_ASYNC),
+        ),
+        ("streamBaseState", JsValue::from(stream_base_state)),
+    ] {
+        object
+            .set(JsString::from(name), value, true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_stream_handle_id(
+    host: &NodeRuntimeHost,
+    object: &JsObject,
+    context: &mut Context,
+) -> Result<u64, SandboxError> {
+    let symbol = node_host_private_symbol(host, "stream_handle.id")?;
+    object
+        .get(symbol, context)
+        .map_err(sandbox_execution_error)?
+        .as_number()
+        .map(|number| number as u64)
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: "stream handle is missing host id".to_string(),
+        })
+}
+
+fn node_stream_handle_state<F, T>(
+    host: &NodeRuntimeHost,
+    object: &JsObject,
+    context: &mut Context,
+    map: F,
+) -> Result<T, SandboxError>
+where
+    F: FnOnce(&NodeStreamHandleState) -> T,
+{
+    let id = node_stream_handle_id(host, object, context)?;
+    let state = host
+        .bootstrap
+        .borrow()
+        .stream_handles
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!("unknown stream handle {id}"),
+        })?;
+    Ok(map(&state))
+}
+
+fn node_stream_handle_state_mut<F, T>(
+    host: &NodeRuntimeHost,
+    object: &JsObject,
+    context: &mut Context,
+    map: F,
+) -> Result<T, SandboxError>
+where
+    F: FnOnce(&mut NodeStreamHandleState) -> T,
+{
+    let id = node_stream_handle_id(host, object, context)?;
+    let mut bootstrap = host.bootstrap.borrow_mut();
+    let state = bootstrap
+        .stream_handles
+        .get_mut(&id)
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!("unknown stream handle {id}"),
+        })?;
+    Ok(map(state))
+}
+
+fn node_stream_handle_kind_or_code(
+    host: &NodeRuntimeHost,
+    object: &JsObject,
+    context: &mut Context,
+) -> Result<NodeStreamHandleKind, i32> {
+    node_stream_handle_state(host, object, context, |state| state.kind.clone())
+        .map_err(|_| NODE_UV_EBADF)
+}
+
+fn node_stream_handle_set_base_state(
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+    read_bytes_or_error: i32,
+    array_buffer_offset: i32,
+    bytes_written: i32,
+    last_write_was_async: bool,
+) -> Result<(), SandboxError> {
+    let state = node_stream_wrap_state_array(host, context)?;
+    state
+        .set(
+            NODE_STREAM_WRAP_K_READ_BYTES_OR_ERROR as u32,
+            JsValue::from(read_bytes_or_error),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    state
+        .set(
+            NODE_STREAM_WRAP_K_ARRAY_BUFFER_OFFSET as u32,
+            JsValue::from(array_buffer_offset),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    state
+        .set(
+            NODE_STREAM_WRAP_K_BYTES_WRITTEN as u32,
+            JsValue::from(bytes_written),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    state
+        .set(
+            NODE_STREAM_WRAP_K_LAST_WRITE_WAS_ASYNC as u32,
+            JsValue::from(if last_write_was_async { 1 } else { 0 }),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    Ok(())
+}
+
+fn node_stream_handle_write_bytes(
+    host: &NodeRuntimeHost,
+    object: &JsObject,
+    bytes: &[u8],
+    context: &mut Context,
+) -> Result<i32, SandboxError> {
+    let (fd, total_bytes) = node_stream_handle_state_mut(host, object, context, |state| {
+        state.bytes_written = state.bytes_written.saturating_add(bytes.len() as u64);
+        (state.fd, state.bytes_written)
+    })?;
+    object
+        .set(js_string!("bytesWritten"), JsValue::from(total_bytes as f64), true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(js_string!("writeQueueSize"), JsValue::from(0), true, context)
+        .map_err(sandbox_execution_error)?;
+    node_stream_handle_set_base_state(host, context, 0, 0, bytes.len() as i32, false)?;
+    match fd {
+        Some(1) => {
+            host.process
+                .borrow_mut()
+                .stdout
+                .push_str(&String::from_utf8_lossy(bytes));
+        }
+        Some(2) => {
+            host.process
+                .borrow_mut()
+                .stderr
+                .push_str(&String::from_utf8_lossy(bytes));
+        }
+        _ => {}
+    }
+    Ok(0)
+}
+
+fn node_stream_handle_construct_with_kind(
+    this: &JsValue,
+    expected_kind: NodeStreamHandleKind,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Err(JsNativeError::typ()
+            .with_message("stream handle constructor requires receiver")
+            .into());
+    };
+    node_with_host_js(context, |host, context| {
+        let id = node_next_host_handle_id(host);
+        let id_symbol = node_host_private_symbol(host, "stream_handle.id")?;
+        node_stream_handle_install_base_methods(&this, context)?;
+        if expected_kind.is_tcp() {
+            node_stream_handle_install_tcp_methods(&this, context)?;
+        }
+        if expected_kind.is_pipe() {
+            node_stream_handle_install_pipe_methods(&this, context)?;
+        }
+        if expected_kind.is_tty() {
+            node_stream_handle_install_tty_methods(&this, context)?;
+        }
+        this.set(id_symbol, JsValue::from(id as f64), true, context)
+            .map_err(sandbox_execution_error)?;
+        for (name, value) in [
+            ("reading", JsValue::from(false)),
+            ("onconnection", JsValue::null()),
+            ("onread", JsValue::undefined()),
+        ] {
+            this.set(JsString::from(name), value, true, context)
+                .map_err(sandbox_execution_error)?;
+        }
+        for (name, value) in [
+            (js_string!("bytesWritten"), JsValue::from(0)),
+            (js_string!("writeQueueSize"), JsValue::from(0)),
+        ] {
+            this.define_property_or_throw(
+                name,
+                PropertyDescriptor::builder()
+                    .value(value)
+                    .writable(true)
+                    .enumerable(true)
+                    .configurable(true),
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+        }
+        host.bootstrap.borrow_mut().stream_handles.insert(
+            id,
+            NodeStreamHandleState {
+                kind: expected_kind,
+                fd: None,
+                reading: false,
+                closed: false,
+                bytes_written: 0,
+                listening: false,
+                bound_address: None,
+                bound_family: None,
+                bound_port: None,
+                peer_address: None,
+                peer_family: None,
+                peer_port: None,
+                no_delay: false,
+                keep_alive: false,
+                keep_alive_delay: 0,
+                blocking: false,
+                raw_mode: false,
+                pending_instances: 0,
+                pipe_mode: 0,
+            },
+        );
+        Ok(JsValue::from(this.clone()))
+    })
+}
+
+fn node_tcp_construct(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let kind = match args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_i32(context)?
+    {
+        1 => NodeStreamHandleKind::TcpServer,
+        _ => NodeStreamHandleKind::TcpSocket,
+    };
+    node_stream_handle_construct_with_kind(this, kind, context)
+}
+
+fn node_pipe_construct(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let kind = match args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_i32(context)?
+    {
+        1 => NodeStreamHandleKind::PipeServer,
+        2 => NodeStreamHandleKind::PipeIpc,
+        _ => NodeStreamHandleKind::PipeSocket,
+    };
+    node_stream_handle_construct_with_kind(this, kind, context)
+}
+
+fn node_tty_construct(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let fd = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_i32(context)?;
+    let result = node_stream_handle_construct_with_kind(this, NodeStreamHandleKind::Tty, context)?;
+    if let Some(object) = this.as_object() {
+        node_with_host_js(context, |host, context| {
+            node_stream_handle_state_mut(host, &object, context, |state| {
+                state.fd = Some(fd);
+                state.closed = false;
+            })?;
+            Ok(JsValue::undefined())
+        })?;
+    }
+    Ok(result)
+}
+
+fn node_stream_handle_close(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(-1));
+    };
+    let callback = args.first().and_then(JsValue::as_object);
+    node_with_host_js(context, |host, context| {
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.closed = true;
+            state.reading = false;
+        })?;
+        this.set(js_string!("reading"), JsValue::from(false), true, context)
+            .map_err(sandbox_execution_error)?;
+        if let Some(callback) = callback.and_then(|value| JsValue::from(value).as_callable()) {
+            let _ = callback.call(&JsValue::undefined(), &[], context);
+        }
+        Ok(JsValue::undefined())
+    })
+}
+
+fn node_stream_handle_open(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let fd = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if fd < 0 {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        if kind.is_tcp() && (0..=2).contains(&fd) {
+            return Ok(JsValue::from(NODE_UV_EINVAL));
+        }
+        if !kind.is_tcp() && !kind.is_pipe() {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.fd = Some(fd);
+            state.closed = false;
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_read_start(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(-1));
+    };
+    node_with_host_js(context, |host, context| {
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.reading = true;
+        })?;
+        this.set(js_string!("reading"), JsValue::from(true), true, context)
+            .map_err(sandbox_execution_error)?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_read_stop(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(-1));
+    };
+    node_with_host_js(context, |host, context| {
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.reading = false;
+        })?;
+        this.set(js_string!("reading"), JsValue::from(false), true, context)
+            .map_err(sandbox_execution_error)?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_use_user_buffer(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_stream_handle_write_buffer(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(-1));
+    };
+    let data = node_bytes_from_js(args.get(1).unwrap_or(&JsValue::undefined()), context)?;
+    node_with_host_js(context, |host, context| {
+        Ok(JsValue::from(node_stream_handle_write_bytes(host, &this, &data, context)?))
+    })
+}
+
+fn node_stream_handle_write_string_with_encoding(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+    encoding: &'static str,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(-1));
+    };
+    let input = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    let bytes = node_buffer_encode_string(&input, encoding).unwrap_or_default();
+    node_with_host_js(context, |host, context| {
+        Ok(JsValue::from(node_stream_handle_write_bytes(host, &this, &bytes, context)?))
+    })
+}
+
+fn node_stream_handle_write_latin1_string(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_stream_handle_write_string_with_encoding(this, args, context, "latin1")
+}
+
+fn node_stream_handle_write_utf8_string(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_stream_handle_write_string_with_encoding(this, args, context, "utf8")
+}
+
+fn node_stream_handle_write_ascii_string(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_stream_handle_write_string_with_encoding(this, args, context, "ascii")
+}
+
+fn node_stream_handle_write_ucs2_string(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_stream_handle_write_string_with_encoding(this, args, context, "utf16le")
+}
+
+fn node_stream_handle_writev(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(-1));
+    };
+    let chunks = args.get(1).and_then(JsValue::as_object);
+    let all_buffers = args.get(2).is_some_and(JsValue::to_boolean);
+    let mut bytes = Vec::new();
+    if let Some(chunks) = chunks {
+        let length = chunks.get(js_string!("length"), context)?.to_length(context)?;
+        if all_buffers {
+            for index in 0..length {
+                bytes.extend(node_bytes_from_js(&chunks.get(index, context)?, context)?);
+            }
+        } else {
+            let mut index = 0;
+            while index + 1 < length {
+                let chunk = chunks.get(index, context)?;
+                let encoding = chunks
+                    .get(index + 1, context)?
+                    .to_string(context)?
+                    .to_std_string_escaped();
+                let chunk_string = chunk.to_string(context)?.to_std_string_escaped();
+                bytes.extend(node_buffer_encode_string(&chunk_string, &encoding).unwrap_or_default());
+                index += 2;
+            }
+        }
+    }
+    node_with_host_js(context, |host, context| {
+        Ok(JsValue::from(node_stream_handle_write_bytes(host, &this, &bytes, context)?))
+    })
+}
+
+fn node_stream_handle_shutdown(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(-1));
+    };
+    let req = args.first().and_then(JsValue::as_object);
+    node_with_host_js(context, |host, context| {
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.reading = false;
+        })?;
+        this.set(js_string!("reading"), JsValue::from(false), true, context)
+            .map_err(sandbox_execution_error)?;
+        if let Some(req) = req {
+            req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
+                .map_err(sandbox_execution_error)?;
+            if let Some(oncomplete) = req
+                .get(js_string!("oncomplete"), context)
+                .map_err(sandbox_execution_error)?
+                .as_callable()
+            {
+                let _ = oncomplete.call(&JsValue::from(req), &[], context);
+            }
+        }
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_getsockname(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let Some(out) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::from(NODE_UV_EINVAL));
+    };
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !matches!(kind, NodeStreamHandleKind::TcpSocket | NodeStreamHandleKind::TcpServer) {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        let (address, family, port) = node_stream_handle_state(host, &this, context, |state| {
+            (
+                state.bound_address.clone().unwrap_or_else(|| {
+                    if state.fd.is_some() { "127.0.0.1".to_string() } else { String::new() }
+                }),
+                state.bound_family.clone().unwrap_or_else(|| {
+                    if state.fd.is_some() { "IPv4".to_string() } else { String::new() }
+                }),
+                state.bound_port.unwrap_or(0),
+            )
+        })?;
+        out.set(js_string!("address"), JsValue::from(JsString::from(address)), true, context)
+            .map_err(sandbox_execution_error)?;
+        out.set(js_string!("family"), JsValue::from(JsString::from(family)), true, context)
+            .map_err(sandbox_execution_error)?;
+        out.set(js_string!("port"), JsValue::from(port), true, context)
+            .map_err(sandbox_execution_error)?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_getpeername(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let Some(out) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::from(NODE_UV_EINVAL));
+    };
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !kind.is_tcp() {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        let (address, family, port) = node_stream_handle_state(host, &this, context, |state| {
+            (
+                state.peer_address.clone().unwrap_or_default(),
+                state.peer_family.clone().unwrap_or_default(),
+                state.peer_port.unwrap_or(0),
+            )
+        })?;
+        out.set(js_string!("address"), JsValue::from(JsString::from(address)), true, context)
+            .map_err(sandbox_execution_error)?;
+        out.set(js_string!("family"), JsValue::from(JsString::from(family)), true, context)
+            .map_err(sandbox_execution_error)?;
+        out.set(js_string!("port"), JsValue::from(port), true, context)
+            .map_err(sandbox_execution_error)?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_set_no_delay(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let enable = args.first().is_some_and(JsValue::to_boolean);
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !matches!(kind, NodeStreamHandleKind::TcpSocket) {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.no_delay = enable;
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_set_keep_alive(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let enable = args.first().is_some_and(JsValue::to_boolean);
+    let delay = args.get(1).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)?;
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !matches!(kind, NodeStreamHandleKind::TcpSocket) {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.keep_alive = enable;
+            state.keep_alive_delay = delay;
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_set_blocking(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let enable = args.first().is_some_and(JsValue::to_boolean);
+    node_with_host_js(context, |host, context| {
+        if let Err(code) = node_stream_handle_kind_or_code(host, &this, context) {
+            return Ok(JsValue::from(code));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.blocking = enable;
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_bind(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let address = args.first().cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
+    let port = args.get(1).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)? as u16;
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if kind.is_tcp() {
+            if address.parse::<std::net::Ipv4Addr>().is_err() {
+                return Ok(JsValue::from(NODE_UV_EINVAL));
+            }
+            let already_bound = node_stream_handle_state(host, &this, context, |state| {
+                state.bound_address.is_some() || state.listening
+            })?;
+            if already_bound {
+                return Ok(JsValue::from(NODE_UV_EADDRINUSE));
+            }
+            node_stream_handle_state_mut(host, &this, context, |state| {
+                state.bound_address = Some(address.clone());
+                state.bound_family = Some("IPv4".to_string());
+                state.bound_port = Some(port);
+            })?;
+            return Ok(JsValue::from(0));
+        }
+        if kind.is_pipe() {
+            if address.is_empty() {
+                return Ok(JsValue::from(NODE_UV_EINVAL));
+            }
+            let already_bound = node_stream_handle_state(host, &this, context, |state| {
+                state.bound_address.is_some() || state.listening
+            })?;
+            if already_bound {
+                return Ok(JsValue::from(NODE_UV_EADDRINUSE));
+            }
+            node_stream_handle_state_mut(host, &this, context, |state| {
+                state.bound_address = Some(address.clone());
+                state.bound_family = None;
+                state.bound_port = None;
+            })?;
+            return Ok(JsValue::from(0));
+        }
+        Ok(JsValue::from(NODE_UV_EBADF))
+    })
+}
+
+fn node_stream_handle_bind6(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let address = args.first().cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
+    let port = args.get(1).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)? as u16;
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !matches!(kind, NodeStreamHandleKind::TcpSocket | NodeStreamHandleKind::TcpServer) ||
+            address.parse::<std::net::Ipv6Addr>().is_err()
+        {
+            return Ok(JsValue::from(NODE_UV_EINVAL));
+        }
+        let already_bound = node_stream_handle_state(host, &this, context, |state| {
+            state.bound_address.is_some() || state.listening
+        })?;
+        if already_bound {
+            return Ok(JsValue::from(NODE_UV_EADDRINUSE));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.bound_address = Some(address.clone());
+            state.bound_family = Some("IPv6".to_string());
+            state.bound_port = Some(port);
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_listen(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let backlog = _args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_i32(context)?;
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        let is_server = matches!(kind, NodeStreamHandleKind::TcpServer | NodeStreamHandleKind::PipeServer);
+        if !is_server || backlog < 0 {
+            return Ok(JsValue::from(NODE_UV_EINVAL));
+        }
+        let ready = node_stream_handle_state(host, &this, context, |state| {
+            !state.closed && !state.listening && (state.fd.is_some() || state.bound_address.is_some())
+        })?;
+        if !ready {
+            return Ok(JsValue::from(NODE_UV_EINVAL));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.listening = true;
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_connect(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let req = args.first().and_then(JsValue::as_object);
+    let address = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
+    let port_value = args.get(2).cloned().unwrap_or_else(|| JsValue::from(0));
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if matches!(kind, NodeStreamHandleKind::TcpSocket) {
+            let Some(req) = req else {
+                return Ok(JsValue::from(NODE_UV_EINVAL));
+            };
+            let port = match port_value.to_u32(context) {
+                Ok(value) => value as u16,
+                Err(_) => return Ok(JsValue::from(NODE_UV_EINVAL)),
+            };
+            if address.parse::<std::net::Ipv4Addr>().is_err() {
+                return Ok(JsValue::from(NODE_UV_EINVAL));
+            }
+            let already_connected =
+                node_stream_handle_state(host, &this, context, |state| state.peer_address.is_some())?;
+            if already_connected {
+                return Ok(JsValue::from(NODE_UV_EISCONN));
+            }
+            node_stream_handle_state_mut(host, &this, context, |state| {
+                state.peer_address = Some(address.clone());
+                state.peer_family = Some("IPv4".to_string());
+                state.peer_port = Some(port);
+                if state.bound_address.is_none() {
+                    state.bound_address = Some("0.0.0.0".to_string());
+                    state.bound_family = Some("IPv4".to_string());
+                    state.bound_port = Some(0);
+                }
+            })?;
+            req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
+                .map_err(sandbox_execution_error)?;
+            if let Some(oncomplete) = req.get(js_string!("oncomplete"), context).map_err(sandbox_execution_error)?.as_callable() {
+                let _ = oncomplete.call(
+                    &JsValue::from(req.clone()),
+                    &[
+                        JsValue::from(0),
+                        JsValue::from(this.clone()),
+                        JsValue::from(req.clone()),
+                        JsValue::from(true),
+                        JsValue::from(true),
+                    ],
+                    context,
+                );
+            }
+            return Ok(JsValue::from(0));
+        } else if matches!(kind, NodeStreamHandleKind::PipeSocket | NodeStreamHandleKind::PipeIpc) {
+            let Some(req) = req else {
+                return Ok(JsValue::from(NODE_UV_EINVAL));
+            };
+            if address.is_empty() {
+                return Ok(JsValue::from(NODE_UV_EINVAL));
+            }
+            let already_connected =
+                node_stream_handle_state(host, &this, context, |state| state.peer_address.is_some())?;
+            if already_connected {
+                return Ok(JsValue::from(NODE_UV_EISCONN));
+            }
+            node_stream_handle_state_mut(host, &this, context, |state| {
+                state.peer_address = Some(address.clone());
+                state.peer_family = None;
+                state.peer_port = None;
+            })?;
+            req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
+                .map_err(sandbox_execution_error)?;
+            if let Some(oncomplete) = req.get(js_string!("oncomplete"), context).map_err(sandbox_execution_error)?.as_callable() {
+                let _ = oncomplete.call(
+                    &JsValue::from(req.clone()),
+                    &[
+                        JsValue::from(0),
+                        JsValue::from(this.clone()),
+                        JsValue::from(req.clone()),
+                        JsValue::from(true),
+                        JsValue::from(true),
+                    ],
+                    context,
+                );
+            }
+            return Ok(JsValue::from(0));
+        }
+        Ok(JsValue::from(NODE_UV_EBADF))
+    })
+}
+
+fn node_stream_handle_connect6(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let req = args.first().and_then(JsValue::as_object);
+    let address = args.get(1).cloned().unwrap_or_else(JsValue::undefined).to_string(context)?.to_std_string_escaped();
+    let port = args.get(2).cloned().unwrap_or_else(|| JsValue::from(0)).to_u32(context)? as u16;
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !matches!(kind, NodeStreamHandleKind::TcpSocket) ||
+            address.parse::<std::net::Ipv6Addr>().is_err()
+        {
+            return Ok(JsValue::from(NODE_UV_EINVAL));
+        }
+        let Some(req) = req else {
+            return Ok(JsValue::from(NODE_UV_EINVAL));
+        };
+        let already_connected =
+            node_stream_handle_state(host, &this, context, |state| state.peer_address.is_some())?;
+        if already_connected {
+            return Ok(JsValue::from(NODE_UV_EISCONN));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.peer_address = Some(address.clone());
+            state.peer_family = Some("IPv6".to_string());
+            state.peer_port = Some(port);
+            if state.bound_address.is_none() {
+                state.bound_address = Some("::".to_string());
+                state.bound_family = Some("IPv6".to_string());
+                state.bound_port = Some(0);
+            }
+        })?;
+        req.set(js_string!("handle"), JsValue::from(this.clone()), true, context)
+            .map_err(sandbox_execution_error)?;
+        if let Some(oncomplete) = req.get(js_string!("oncomplete"), context).map_err(sandbox_execution_error)?.as_callable() {
+            let _ = oncomplete.call(
+                &JsValue::from(req.clone()),
+                &[
+                    JsValue::from(0),
+                    JsValue::from(this.clone()),
+                    JsValue::from(req.clone()),
+                    JsValue::from(true),
+                    JsValue::from(true),
+                ],
+                context,
+            );
+        }
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_reset(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let close_callback = _args.first().cloned();
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !matches!(kind, NodeStreamHandleKind::TcpSocket) {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.closed = true;
+            state.reading = false;
+        })?;
+        this.set(js_string!("reading"), JsValue::from(false), true, context)
+            .map_err(sandbox_execution_error)?;
+        if let Some(callback) = close_callback.and_then(|value| value.as_callable()) {
+            let symbols = node_internal_binding_symbols(context)?;
+            let onclose = symbols
+                .get(js_string!("handle_onclose_symbol"), context)
+                .map_err(sandbox_execution_error)?
+                .as_symbol()
+                .ok_or_else(|| sandbox_execution_error("handle_onclose_symbol must be a symbol"))?;
+            this.set(onclose, JsValue::from(callback.clone()), true, context)
+                .map_err(sandbox_execution_error)?;
+        }
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_get_window_size(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let is_tty = node_with_host(|host| {
+        let kind = node_stream_handle_kind_or_code(host, &this, context)
+            .map_err(|_| SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: "invalid tty handle".to_string(),
+            })?;
+        let has_fd =
+            node_stream_handle_state(host, &this, context, |state| state.fd.is_some() && !state.closed)?;
+        Ok(kind.is_tty() && has_fd)
+    })
+    .map_err(js_error)?;
+    if !is_tty {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    }
+    let Some(out) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::from(NODE_UV_EINVAL));
+    };
+    node_with_host_js(context, |host, context| {
+        let columns = host
+            .process
+            .borrow()
+            .env
+            .get("COLUMNS")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(80);
+        let lines = host
+            .process
+            .borrow()
+            .env
+            .get("LINES")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(24);
+        out.set(0u32, JsValue::from(columns), true, context)
+            .map_err(sandbox_execution_error)?;
+        out.set(1u32, JsValue::from(lines), true, context)
+            .map_err(sandbox_execution_error)?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_set_raw_mode(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let enable = args.first().is_some_and(JsValue::to_boolean);
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !kind.is_tty() {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        let has_fd =
+            node_stream_handle_state(host, &this, context, |state| state.fd.is_some() && !state.closed)?;
+        if !has_fd {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.raw_mode = enable;
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_fchmod(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(NODE_UV_EBADF));
+    };
+    let mode = args.first().cloned().unwrap_or_else(|| JsValue::from(0)).to_i32(context)?;
+    node_with_host_js(context, |host, context| {
+        let kind = match node_stream_handle_kind_or_code(host, &this, context) {
+            Ok(kind) => kind,
+            Err(code) => return Ok(JsValue::from(code)),
+        };
+        if !kind.is_pipe() {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        let is_alive =
+            node_stream_handle_state(host, &this, context, |state| !state.closed)?;
+        if !is_alive {
+            return Ok(JsValue::from(NODE_UV_EBADF));
+        }
+        node_stream_handle_state_mut(host, &this, context, |state| {
+            state.pipe_mode = mode;
+        })?;
+        Ok(JsValue::from(0))
+    })
+}
+
+fn node_stream_handle_bytes_written_getter(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(0));
+    };
+    node_with_host(|host| {
+        let bytes = node_stream_handle_state(host, &this, context, |state| state.bytes_written)?;
+        Ok(JsValue::from(bytes as f64))
+    })
+    .map_err(js_error)
+}
+
+fn node_stream_handle_get_async_id(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Ok(JsValue::from(0));
+    };
+    node_with_host(|host| {
+        let id = node_stream_handle_id(host, &this, context)?;
+        Ok(JsValue::from(id as f64))
+    })
+    .map_err(js_error)
+}
+
+fn node_stream_handle_write_queue_size_getter(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(0))
+}
+
+fn node_stream_handle_define_method(
+    target: &JsObject,
+    method_name: &'static str,
+    length: usize,
+    function: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    target
+        .set(
+            JsString::from(method_name),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_fn_ptr(function),
+                )
+                .name(JsString::from(method_name))
+                .length(length)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    Ok(())
+}
+
+fn node_stream_handle_install_base_methods(
+    target: &JsObject,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    for (method_name, length, function) in [
+        ("close", 1usize, node_stream_handle_close as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("readStart", 0usize, node_stream_handle_read_start),
+        ("readStop", 0usize, node_stream_handle_read_stop),
+        ("useUserBuffer", 1usize, node_stream_handle_use_user_buffer),
+        ("writeBuffer", 2usize, node_stream_handle_write_buffer),
+        ("writeLatin1String", 2usize, node_stream_handle_write_latin1_string),
+        ("writeUtf8String", 2usize, node_stream_handle_write_utf8_string),
+        ("writeAsciiString", 2usize, node_stream_handle_write_ascii_string),
+        ("writeUcs2String", 2usize, node_stream_handle_write_ucs2_string),
+        ("writev", 3usize, node_stream_handle_writev),
+        ("shutdown", 1usize, node_stream_handle_shutdown),
+        ("getAsyncId", 0usize, node_stream_handle_get_async_id),
+        ("setBlocking", 1usize, node_stream_handle_set_blocking),
+    ] {
+        node_stream_handle_define_method(target, method_name, length, function, context)?;
+    }
+    target
+        .define_property_or_throw(
+            js_string!("bytesWritten"),
+            PropertyDescriptor::builder()
+                .get(
+                    FunctionObjectBuilder::new(
+                        context.realm(),
+                        NativeFunction::from_fn_ptr(node_stream_handle_bytes_written_getter),
+                    )
+                    .name(js_string!("get bytesWritten"))
+                    .length(0)
+                    .constructor(false)
+                    .build(),
+                )
+                .enumerable(true)
+                .configurable(true),
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    target
+        .define_property_or_throw(
+            js_string!("writeQueueSize"),
+            PropertyDescriptor::builder()
+                .get(
+                    FunctionObjectBuilder::new(
+                        context.realm(),
+                        NativeFunction::from_fn_ptr(node_stream_handle_write_queue_size_getter),
+                    )
+                    .name(js_string!("get writeQueueSize"))
+                    .length(0)
+                    .constructor(false)
+                    .build(),
+                )
+                .enumerable(true)
+                .configurable(true),
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    Ok(())
+}
+
+fn node_stream_handle_install_tcp_methods(
+    target: &JsObject,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    for (method_name, length, function) in [
+        ("open", 1usize, node_stream_handle_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("bind", 3usize, node_stream_handle_bind),
+        ("bind6", 3usize, node_stream_handle_bind6),
+        ("listen", 1usize, node_stream_handle_listen),
+        ("connect", 3usize, node_stream_handle_connect),
+        ("connect6", 3usize, node_stream_handle_connect6),
+        ("getsockname", 1usize, node_stream_handle_getsockname),
+        ("getpeername", 1usize, node_stream_handle_getpeername),
+        ("setNoDelay", 1usize, node_stream_handle_set_no_delay),
+        ("setKeepAlive", 2usize, node_stream_handle_set_keep_alive),
+        ("reset", 0usize, node_stream_handle_reset),
+    ] {
+        node_stream_handle_define_method(target, method_name, length, function, context)?;
+    }
+    Ok(())
+}
+
+fn node_stream_handle_install_pipe_methods(
+    target: &JsObject,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    for (method_name, length, function) in [
+        ("open", 1usize, node_stream_handle_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("bind", 3usize, node_stream_handle_bind),
+        ("listen", 1usize, node_stream_handle_listen),
+        ("connect", 3usize, node_stream_handle_connect),
+        ("fchmod", 1usize, node_stream_handle_fchmod),
+    ] {
+        node_stream_handle_define_method(target, method_name, length, function, context)?;
+    }
+    Ok(())
+}
+
+fn node_stream_handle_install_tty_methods(
+    target: &JsObject,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    for (method_name, length, function) in [
+        ("getWindowSize", 1usize, node_stream_handle_get_window_size as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("setRawMode", 1usize, node_stream_handle_set_raw_mode),
+    ] {
+        node_stream_handle_define_method(target, method_name, length, function, context)?;
+    }
+    Ok(())
+}
+
+fn node_stream_handle_constructor(
+    constructor_fn: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+    name: &'static str,
+    install: fn(&JsObject, &mut Context) -> Result<(), SandboxError>,
+    context: &mut Context,
+) -> Result<JsFunction, SandboxError> {
+    let constructor = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(constructor_fn),
+    )
+    .name(JsString::from(name))
+    .length(1)
+    .constructor(true)
+    .build();
+    let prototype = JsObject::with_null_proto();
+    constructor
+        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .map_err(sandbox_execution_error)?;
+    prototype
+        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .map_err(sandbox_execution_error)?;
+    node_stream_handle_install_base_methods(&prototype, context)?;
+    install(&prototype, context)?;
+    Ok(constructor)
+}
+
+fn node_stream_connect_wrap_construct(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Err(JsNativeError::typ()
+            .with_message("connect request constructor requires receiver")
+            .into());
+    };
+    for (name, value) in [
+        ("oncomplete", JsValue::null()),
+        ("callback", JsValue::null()),
+        ("handle", JsValue::null()),
+    ] {
+        this.set(JsString::from(name), value, true, context)?;
+    }
+    Ok(JsValue::from(this.clone()))
+}
+
+fn node_stream_connect_wrap_constructor(
+    name: &'static str,
+    context: &mut Context,
+) -> Result<JsFunction, SandboxError> {
+    let constructor = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_stream_connect_wrap_construct),
+    )
+    .name(JsString::from(name))
+    .length(0)
+    .constructor(true)
+    .build();
+    let prototype = JsObject::with_null_proto();
+    constructor
+        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .map_err(sandbox_execution_error)?;
+    prototype
+        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(constructor)
+}
+
+fn node_internal_binding_tcp_wrap(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let tcp = node_stream_handle_constructor(
+        node_tcp_construct,
+        "TCP",
+        node_stream_handle_install_tcp_methods,
+        context,
+    )?;
+    let tcp_connect_wrap = node_stream_connect_wrap_constructor("TCPConnectWrap", context)?;
+    let constants = ObjectInitializer::new(context)
+        .property(js_string!("SOCKET"), JsValue::from(0), Attribute::all())
+        .property(js_string!("SERVER"), JsValue::from(1), Attribute::all())
+        .property(js_string!("UV_TCP_IPV6ONLY"), JsValue::from(1), Attribute::all())
+        .property(js_string!("UV_TCP_REUSEPORT"), JsValue::from(2), Attribute::all())
+        .build();
+    for (name, value) in [
+        ("TCP", JsValue::from(tcp)),
+        ("TCPConnectWrap", JsValue::from(tcp_connect_wrap)),
+        ("constants", JsValue::from(constants)),
+    ] {
+        object
+            .set(JsString::from(name), value, true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_internal_binding_pipe_wrap(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let pipe = node_stream_handle_constructor(
+        node_pipe_construct,
+        "Pipe",
+        node_stream_handle_install_pipe_methods,
+        context,
+    )?;
+    let pipe_connect_wrap = node_stream_connect_wrap_constructor("PipeConnectWrap", context)?;
+    let constants = ObjectInitializer::new(context)
+        .property(js_string!("SOCKET"), JsValue::from(0), Attribute::all())
+        .property(js_string!("SERVER"), JsValue::from(1), Attribute::all())
+        .property(js_string!("IPC"), JsValue::from(2), Attribute::all())
+        .property(js_string!("UV_READABLE"), JsValue::from(1), Attribute::all())
+        .property(js_string!("UV_WRITABLE"), JsValue::from(2), Attribute::all())
+        .build();
+    for (name, value) in [
+        ("Pipe", JsValue::from(pipe)),
+        ("PipeConnectWrap", JsValue::from(pipe_connect_wrap)),
+        ("constants", JsValue::from(constants)),
+    ] {
+        object
+            .set(JsString::from(name), value, true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_tty_wrap_is_tty(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let fd = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(-1))
+        .to_i32(context)?;
+    Ok(JsValue::from(false))
+}
+
+fn node_internal_binding_tty_wrap(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    let tty = node_stream_handle_constructor(
+        node_tty_construct,
+        "TTY",
+        node_stream_handle_install_tty_methods,
+        context,
+    )?;
+    let is_tty = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_tty_wrap_is_tty),
+    )
+    .name(js_string!("isTTY"))
+    .length(1)
+    .constructor(false)
+    .build();
+    for (name, value) in [("TTY", JsValue::from(tty)), ("isTTY", JsValue::from(is_tty))] {
+        object
+            .set(JsString::from(name), value, true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
 }
 
 fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxError> {
@@ -3609,6 +5311,7 @@ fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxEr
         ("open", 4usize, node_internal_fs_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
         ("close", 2usize, node_internal_fs_close),
         ("read", 6usize, node_internal_fs_read),
+        ("readFileUtf8", 2usize, node_internal_fs_read_file_utf8),
         ("writeBuffer", 7usize, node_internal_fs_write_buffer),
         ("writeString", 6usize, node_internal_fs_write_string),
         ("getFormatOfExtensionlessFile", 1usize, node_internal_fs_get_format_of_extensionless_file),
@@ -3929,6 +5632,7 @@ fn node_internal_fs_internal_module_stat(
         Ok(JsValue::from(code))
     })
     .map_err(js_error)
+
 }
 
 fn node_internal_fs_stat_like(
@@ -4121,16 +5825,18 @@ fn node_internal_fs_write_buffer(
     } else {
         bytes[offset..end].to_vec()
     };
-    node_with_host(|host| node_fs_write_impl(host, fd, &slice, position).map(|written| JsValue::from(written as u32)))
-        .and_then(|result| {
-            if let Some(ctx_object) = ctx.and_then(JsValue::as_object) {
-                ctx_object
-                    .set(js_string!("errno"), JsValue::undefined(), true, context)
-                    .map_err(sandbox_execution_error)?;
-            }
-            node_fs_req_complete(req, context, result)
-        })
-        .map_err(js_error)
+    let result = node_with_host(|host| {
+        node_fs_write_impl(host, fd, &slice, position).map(|written| JsValue::from(written as u32))
+    })
+    .map_err(js_error)?;
+    if let Some(ctx_object) = ctx.and_then(JsValue::as_object) {
+        ctx_object
+            .set(js_string!("errno"), JsValue::undefined(), true, context)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+    }
+    node_fs_req_complete(req, context, result).map_err(js_error)
+
 }
 
 fn node_internal_fs_write_string(
@@ -4160,18 +5866,17 @@ fn node_internal_fs_write_string(
     };
     let req = args.get(4);
     let ctx = args.get(5);
-    node_with_host(|host| {
+    let result = node_with_host(|host| {
         node_fs_write_impl(host, fd, data.as_bytes(), position).map(|written| JsValue::from(written as u32))
     })
-    .and_then(|result| {
-        if let Some(ctx_object) = ctx.and_then(JsValue::as_object) {
-            ctx_object
-                .set(js_string!("errno"), JsValue::undefined(), true, context)
-                .map_err(sandbox_execution_error)?;
-        }
-        node_fs_req_complete(req, context, result)
-    })
-    .map_err(js_error)
+    .map_err(js_error)?;
+    if let Some(ctx_object) = ctx.and_then(JsValue::as_object) {
+        ctx_object
+            .set(js_string!("errno"), JsValue::undefined(), true, context)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+    }
+    node_fs_req_complete(req, context, result).map_err(js_error)
 }
 
 fn node_internal_fs_get_format_of_extensionless_file(
@@ -4180,6 +5885,32 @@ fn node_internal_fs_get_format_of_extensionless_file(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     Ok(JsValue::from(0))
+}
+
+fn node_internal_fs_read_file_utf8(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    let _flags = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)
+        .unwrap_or_default();
+    node_with_host(|host| {
+        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+        let bytes = node_read_file(host, &resolved)?.ok_or_else(|| SandboxError::ModuleNotFound {
+            specifier: resolved.clone(),
+        })?;
+        let text = String::from_utf8(bytes).map_err(|error| SandboxError::Execution {
+            entrypoint: resolved,
+            message: error.to_string(),
+        })?;
+        Ok(JsValue::from(JsString::from(text)))
+    })
+    .map_err(js_error)
 }
 
 fn node_internal_binding_builtins(
@@ -4414,10 +6145,33 @@ fn node_internal_binding_modules(context: &mut Context) -> Result<JsObject, Sand
             context,
         )
         .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("cachedCodeTypes"),
+            JsValue::from_json(
+                &serde_json::json!({
+                    "kStrippedTypeScript": 0,
+                    "kTransformedTypeScript": 1,
+                    "kTransformedTypeScriptWithSourceMaps": 2,
+                }),
+                context,
+            )
+            .map_err(sandbox_execution_error)?,
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
         ("enableCompileCache", 0usize, node_modules_enable_compile_cache as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
         ("getCompileCacheDir", 0usize, node_modules_get_compile_cache_dir),
+        ("getNearestParentPackageJSONType", 1usize, node_modules_get_nearest_parent_package_json_type),
+        ("getNearestParentPackageJSON", 1usize, node_modules_get_nearest_parent_package_json),
+        ("getPackageScopeConfig", 1usize, node_modules_get_package_scope_config),
+        ("getPackageType", 1usize, node_modules_get_package_type),
+        ("readPackageJSON", 4usize, node_modules_read_package_json),
         ("flushCompileCache", 0usize, node_modules_flush_compile_cache),
+        ("getCompileCacheEntry", 3usize, node_modules_get_compile_cache_entry),
+        ("saveCompileCacheEntry", 2usize, node_modules_save_compile_cache_entry),
     ] {
         let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
             .name(JsString::from(name))
@@ -4748,6 +6502,7 @@ fn node_internal_binding_errors(context: &mut Context) -> Result<JsObject, Sandb
     for (name, function) in [
         ("setEnhanceStackForFatalException", node_errors_set_enhance_stack_for_fatal_exception as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
         ("setPrepareStackTraceCallback", node_errors_set_prepare_stack_trace_callback),
+        ("setSourceMapsEnabled", node_errors_set_source_maps_enabled),
         ("setMaybeCacheGeneratedSourceMap", node_errors_set_maybe_cache_generated_source_map),
     ] {
         let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
@@ -4910,6 +6665,184 @@ fn node_internal_binding_uv(context: &mut Context) -> Result<JsObject, SandboxEr
         .set(js_string!("getErrorMap"), JsValue::from(get_error_map), true, context)
         .map_err(sandbox_execution_error)?;
     Ok(object)
+}
+
+fn node_internal_binding_cares_wrap(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, length, function) in [
+        ("getaddrinfo", 5usize, node_cares_getaddrinfo as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("getnameinfo", 3usize, node_cares_getnameinfo),
+        ("canonicalizeIP", 1usize, node_cares_canonicalize_ip),
+        ("convertIpv6StringToBuffer", 1usize, node_cares_convert_ipv6_string_to_buffer),
+        ("strerror", 1usize, node_cares_strerror),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            .name(JsString::from(name))
+            .length(length)
+            .constructor(false)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    for (name, constructor) in [
+        ("GetAddrInfoReqWrap", node_cares_req_wrap_construct as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("GetNameInfoReqWrap", node_cares_req_wrap_construct),
+        ("QueryReqWrap", node_cares_req_wrap_construct),
+    ] {
+        let value = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(constructor))
+            .name(JsString::from(name))
+            .length(0)
+            .constructor(true)
+            .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    let af_inet6 = if cfg!(target_os = "macos") || cfg!(target_os = "ios") { 30 } else { 10 };
+    for (name, value) in [
+        ("AF_INET", 2),
+        ("AF_INET6", af_inet6),
+        ("AF_UNSPEC", 0),
+        ("AI_ADDRCONFIG", 0x0400),
+        ("AI_ALL", 0x0100),
+        ("AI_V4MAPPED", 0x0800),
+        ("DNS_ORDER_VERBATIM", 0),
+        ("DNS_ORDER_IPV4_FIRST", 1),
+        ("DNS_ORDER_IPV6_FIRST", 2),
+    ] {
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_cares_req_wrap_construct(
+    this: &JsValue,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(this.clone())
+}
+
+fn node_cares_canonicalize_ip(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let input = node_arg_string(args, 0, context)?;
+    Ok(match input.parse::<std::net::IpAddr>() {
+        Ok(address) => JsValue::from(JsString::from(address.to_string())),
+        Err(_) => JsValue::undefined(),
+    })
+}
+
+fn node_cares_convert_ipv6_string_to_buffer(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let input = node_arg_string(args, 0, context)?;
+    let address = input
+        .parse::<std::net::Ipv6Addr>()
+        .map_err(|_| JsNativeError::typ().with_message("invalid IPv6 address"))?;
+    Ok(JsValue::from(JsUint8Array::from_iter(
+        address.octets(),
+        context,
+    )?))
+}
+
+fn node_cares_strerror(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let code = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)
+        .unwrap_or_default();
+    Ok(JsValue::from(JsString::from(format!("DNS error {code}"))))
+}
+
+fn node_cares_getaddrinfo(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let req = args
+        .first()
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| JsNativeError::typ().with_message("request must be an object"))?;
+    let hostname = node_arg_string(args, 1, context)?;
+    let family = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)
+        .unwrap_or_default();
+    let addresses = if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
+        vec![ip.to_string()]
+    } else {
+        let iter = (hostname.as_str(), 0)
+            .to_socket_addrs()
+            .map_err(|error| JsNativeError::typ().with_message(error.to_string()))?;
+        let mut resolved = Vec::new();
+        for address in iter {
+            let ip = address.ip();
+            if family == 4 && !ip.is_ipv4() {
+                continue;
+            }
+            if family == 6 && !ip.is_ipv6() {
+                continue;
+            }
+            let ip = ip.to_string();
+            if !resolved.contains(&ip) {
+                resolved.push(ip);
+            }
+        }
+        resolved
+    };
+    if let Some(oncomplete) = req.get(js_string!("oncomplete"), context)?.as_callable() {
+        let values = addresses
+            .into_iter()
+            .map(|value| JsValue::from(JsString::from(value)));
+        let result = JsArray::from_iter(values, context);
+        let _ = oncomplete.call(&JsValue::from(req.clone()), &[JsValue::from(0), JsValue::from(result)], context);
+    }
+    Ok(JsValue::from(0))
+}
+
+fn node_cares_getnameinfo(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let req = args
+        .first()
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| JsNativeError::typ().with_message("request must be an object"))?;
+    let hostname = node_arg_string(args, 1, context)?;
+    let port = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_u32(context)
+        .unwrap_or_default();
+    if let Some(oncomplete) = req.get(js_string!("oncomplete"), context)?.as_callable() {
+        let _ = oncomplete.call(
+            &JsValue::from(req.clone()),
+            &[
+                JsValue::from(0),
+                JsValue::from(JsString::from(hostname)),
+                JsValue::from(JsString::from(port.to_string())),
+            ],
+            context,
+        );
+    }
+    Ok(JsValue::from(0))
 }
 
 fn node_internal_binding_os(context: &mut Context) -> Result<JsObject, SandboxError> {
@@ -5208,6 +7141,384 @@ fn node_internal_binding_timers(
     Ok(object)
 }
 
+fn node_internal_binding_locks(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let object = ObjectInitializer::new(context).build();
+    for (name, value) in [
+        ("LOCK_MODE_SHARED", JsValue::from(js_string!("shared"))),
+        ("LOCK_MODE_EXCLUSIVE", JsValue::from(js_string!("exclusive"))),
+        ("LOCK_STOLEN_ERROR", JsValue::from(js_string!("LOCK_STOLEN"))),
+    ] {
+        object
+            .set(JsString::from(name), value, true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    for (name, length, function) in [
+        ("request", 6usize, node_locks_request as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("query", 0usize, node_locks_query),
+    ] {
+        object
+            .set(
+                JsString::from(name),
+                JsValue::from(
+                    FunctionObjectBuilder::new(
+                        context.realm(),
+                        NativeFunction::from_fn_ptr(function),
+                    )
+                    .name(JsString::from(name))
+                    .length(length)
+                    .constructor(false)
+                    .build(),
+                ),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(object)
+}
+
+fn node_locks_make_internal_lock(name: &str, mode: &str, context: &mut Context) -> Result<JsValue, SandboxError> {
+    Ok(JsValue::from_json(
+        &serde_json::json!({
+            "name": name,
+            "mode": mode,
+        }),
+        context,
+    )
+    .map_err(sandbox_execution_error)?)
+}
+
+fn node_locks_is_compatible(existing: &[NodeHeldLockState], mode: &str) -> bool {
+    if mode == "exclusive" {
+        return existing.is_empty();
+    }
+    existing.iter().all(|lock| lock.mode == "shared")
+}
+
+fn node_locks_release_request(
+    host: &NodeRuntimeHost,
+    request_id: u64,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    let resource_names = host
+        .bootstrap
+        .borrow()
+        .held_locks
+        .iter()
+        .filter_map(|(name, locks)| locks.iter().any(|lock| lock.request_id == request_id).then_some(name.clone()))
+        .collect::<Vec<_>>();
+
+    {
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        for name in resource_names {
+            if let Some(locks) = bootstrap.held_locks.get_mut(&name) {
+                locks.retain(|lock| lock.request_id != request_id);
+                if locks.is_empty() {
+                    bootstrap.held_locks.remove(&name);
+                }
+            }
+        }
+    }
+
+    node_locks_process_pending(host, context)
+}
+
+fn node_locks_attach_release_handlers(
+    host: &NodeRuntimeHost,
+    request_id: u64,
+    result: JsValue,
+    resolve: JsObject,
+    reject: JsObject,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    let promise = JsPromise::resolve(result, context).map_err(sandbox_execution_error)?;
+    let on_fulfilled = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_copy_closure_with_captures(
+            |_this, args, captures, context| {
+                let (request_id, resolve, reject) = captures;
+                node_with_host_js(context, |host, context| {
+                    node_locks_release_request(host, *request_id, context)?;
+                    resolve
+                        .call(
+                            &JsValue::undefined(),
+                            &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
+                            context,
+                        )
+                        .map_err(sandbox_execution_error)?;
+                    let _ = reject;
+                    Ok(JsValue::undefined())
+                })
+            },
+            (request_id, resolve.clone(), reject.clone()),
+        ),
+    )
+    .name(js_string!("lockRequestFulfilled"))
+    .length(1)
+    .constructor(false)
+    .build();
+    let on_rejected = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_copy_closure_with_captures(
+            |_this, args, captures, context| {
+                let (request_id, _resolve, reject) = captures;
+                let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
+                node_with_host_js(context, |host, context| {
+                    node_locks_release_request(host, *request_id, context)?;
+                    reject
+                        .call(&JsValue::undefined(), &[reason.clone()], context)
+                        .map_err(sandbox_execution_error)?;
+                    Ok(JsValue::undefined())
+                })?;
+                Err(boa_engine::JsError::from_opaque(reason))
+            },
+            (request_id, resolve, reject),
+        ),
+    )
+    .name(js_string!("lockRequestRejected"))
+    .length(1)
+    .constructor(false)
+    .build();
+    let _ = promise
+        .then(Some(on_fulfilled), Some(on_rejected), context)
+        .map_err(sandbox_execution_error)?;
+    Ok(())
+}
+
+fn node_locks_grant_request(
+    host: &NodeRuntimeHost,
+    request_id: u64,
+    name: String,
+    client_id: String,
+    mode: String,
+    callback: JsObject,
+    resolve: JsObject,
+    reject: JsObject,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    {
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        bootstrap
+            .held_locks
+            .entry(name.clone())
+            .or_default()
+            .push(NodeHeldLockState {
+                request_id,
+                name: name.clone(),
+                client_id,
+                mode: mode.clone(),
+                resolve: resolve.clone(),
+                reject: reject.clone(),
+            });
+    }
+    let callback = JsValue::from(callback)
+        .as_callable()
+        .ok_or_else(|| sandbox_execution_error("locks.request callback must be callable"))?;
+    let result = callback
+        .call(
+            &JsValue::undefined(),
+            &[node_locks_make_internal_lock(&name, &mode, context)?],
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    node_locks_attach_release_handlers(host, request_id, result, resolve, reject, context)
+}
+
+fn node_locks_process_pending(host: &NodeRuntimeHost, context: &mut Context) -> Result<(), SandboxError> {
+    loop {
+        let grantable_index = {
+            let bootstrap = host.bootstrap.borrow();
+            bootstrap.pending_locks.iter().position(|pending| {
+                let held = bootstrap.held_locks.get(&pending.name).map(Vec::as_slice).unwrap_or(&[]);
+                node_locks_is_compatible(held, &pending.mode)
+            })
+        };
+
+        let Some(index) = grantable_index else {
+            return Ok(());
+        };
+
+        let pending = host.bootstrap.borrow_mut().pending_locks.remove(index);
+        node_locks_grant_request(
+            host,
+            pending.request_id,
+            pending.name,
+            pending.client_id,
+            pending.mode,
+            pending.callback,
+            pending.resolve,
+            pending.reject,
+            context,
+        )?;
+    }
+}
+
+fn node_locks_request(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let name = node_arg_string(args, 0, context)?;
+    let client_id = node_arg_string(args, 1, context)?;
+    let mode = node_arg_string(args, 2, context)?;
+    let steal = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
+    let if_available = args.get(4).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
+    let callback = args
+        .get(5)
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| JsNativeError::typ().with_message("locks.request callback must be callable"))?;
+    let _ = JsValue::from(callback.clone())
+        .as_callable()
+        .ok_or_else(|| JsNativeError::typ().with_message("locks.request callback must be callable"))?;
+
+    node_with_host_js(context, |host, context| {
+        let (promise, resolvers) = JsPromise::new_pending(context);
+        let request_id = {
+            let mut bootstrap = host.bootstrap.borrow_mut();
+            let request_id = bootstrap.next_lock_request_id;
+            bootstrap.next_lock_request_id = bootstrap.next_lock_request_id.saturating_add(1);
+            request_id
+        };
+
+        if steal {
+            let stolen = {
+                let mut bootstrap = host.bootstrap.borrow_mut();
+                bootstrap.held_locks.remove(&name).unwrap_or_default()
+            };
+            for held in stolen {
+                held.reject
+                    .call(
+                        &JsValue::undefined(),
+                        &[JsValue::from(js_string!("LOCK_STOLEN"))],
+                        context,
+                    )
+                    .map_err(sandbox_execution_error)?;
+            }
+        }
+
+        let compatible = {
+            let bootstrap = host.bootstrap.borrow();
+            let held = bootstrap.held_locks.get(&name).map(Vec::as_slice).unwrap_or(&[]);
+            node_locks_is_compatible(held, &mode)
+        };
+
+        if compatible {
+            node_locks_grant_request(
+                host,
+                request_id,
+                name,
+                client_id,
+                mode,
+                callback.clone(),
+                resolvers.resolve.clone().into(),
+                resolvers.reject.clone().into(),
+                context,
+            )?;
+        } else if if_available {
+            let result = callback
+                .call(&JsValue::undefined(), &[JsValue::null()], context)
+                .map_err(sandbox_execution_error)?;
+            let resolved = JsPromise::resolve(result, context).map_err(sandbox_execution_error)?;
+            let on_fulfilled = FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_copy_closure_with_captures(
+                    |_this, args, resolve, context| {
+                        resolve
+                            .call(
+                                &JsValue::undefined(),
+                                &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
+                                context,
+                            )?;
+                        Ok(JsValue::undefined())
+                    },
+                    resolvers.resolve.clone(),
+                ),
+            )
+            .name(js_string!("lockIfAvailableFulfilled"))
+            .length(1)
+            .constructor(false)
+            .build();
+            let on_rejected = FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_copy_closure_with_captures(
+                    |_this, args, reject, context| {
+                        let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
+                        reject.call(&JsValue::undefined(), &[reason.clone()], context)?;
+                        Err(boa_engine::JsError::from_opaque(reason))
+                    },
+                    resolvers.reject.clone(),
+                ),
+            )
+            .name(js_string!("lockIfAvailableRejected"))
+            .length(1)
+            .constructor(false)
+            .build();
+            let _ = resolved
+                .then(Some(on_fulfilled), Some(on_rejected), context)
+                .map_err(sandbox_execution_error)?;
+        } else {
+            host.bootstrap.borrow_mut().pending_locks.push(NodePendingLockState {
+                request_id,
+                name,
+                client_id,
+                mode,
+                callback: callback.clone(),
+                resolve: resolvers.resolve.clone().into(),
+                reject: resolvers.reject.clone().into(),
+            });
+        }
+
+        Ok(JsValue::from(promise))
+    })
+}
+
+fn node_locks_query(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host_js(context, |host, context| {
+        let bootstrap = host.bootstrap.borrow();
+        let held = bootstrap
+            .held_locks
+            .values()
+            .flat_map(|locks| locks.iter())
+            .map(|lock| {
+                serde_json::json!({
+                    "name": lock.name,
+                    "mode": lock.mode,
+                    "clientId": lock.client_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        let pending = bootstrap
+            .pending_locks
+            .iter()
+            .map(|lock| {
+                serde_json::json!({
+                    "name": lock.name,
+                    "mode": lock.mode,
+                    "clientId": lock.client_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(JsValue::from(
+            JsPromise::resolve(
+                JsValue::from_json(
+                    &serde_json::json!({
+                        "held": held,
+                        "pending": pending,
+                    }),
+                    context,
+                )
+                .map_err(sandbox_execution_error)?,
+                context,
+            )
+            .map_err(sandbox_execution_error)?,
+        ))
+    })
+}
+
 fn node_internal_binding_worker(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
     for (name, value) in [
@@ -5219,7 +7530,36 @@ fn node_internal_binding_worker(context: &mut Context) -> Result<JsObject, Sandb
             .set(JsString::from(name), value, true, context)
             .map_err(sandbox_execution_error)?;
     }
+    let get_env_message_port = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_worker_get_env_message_port),
+    )
+    .name(js_string!("getEnvMessagePort"))
+    .length(0)
+    .constructor(false)
+    .build();
+    object
+        .set(
+            js_string!("getEnvMessagePort"),
+            JsValue::from(get_env_message_port),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
+}
+
+fn node_worker_get_env_message_port(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    node_with_host_js(context, |host, context| {
+        if let Some(id) = host.bootstrap.borrow().env_message_port {
+            return Ok(JsValue::from(node_messaging_materialize_port(host, id, context)?));
+        }
+        Ok(JsValue::undefined())
+    })
 }
 
 fn node_internal_binding_async_wrap(
@@ -5488,7 +7828,680 @@ fn node_internal_binding_messaging(context: &mut Context) -> Result<JsObject, Sa
     object
         .set(js_string!("emitMessage"), emit_message, true, context)
         .map_err(sandbox_execution_error)?;
+    let message_port = node_messaging_message_port_constructor(context)?;
+    let message_channel = node_messaging_message_channel_constructor(context)?;
+    object
+        .set(js_string!("MessagePort"), JsValue::from(message_port), true, context)
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("MessageChannel"),
+            JsValue::from(message_channel),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    for (name, length, function) in [
+        (
+            "setDeserializerCreateObjectFunction",
+            1usize,
+            node_messaging_set_deserializer_create_object_function
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        ("structuredClone", 2usize, node_messaging_structured_clone),
+        ("receiveMessageOnPort", 1usize, node_messaging_receive_message_on_port),
+        ("drainMessagePort", 1usize, node_messaging_drain_message_port),
+        ("moveMessagePortToContext", 2usize, node_messaging_move_message_port_to_context),
+        ("stopMessagePort", 1usize, node_messaging_stop_message_port),
+        ("broadcastChannel", 1usize, node_messaging_broadcast_channel),
+    ] {
+        let value = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(function),
+        )
+        .name(JsString::from(name))
+        .length(length)
+        .constructor(false)
+        .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
     Ok(object)
+}
+
+fn node_messaging_port_id(
+    host: &NodeRuntimeHost,
+    object: &JsObject,
+    context: &mut Context,
+) -> Result<u64, SandboxError> {
+    let symbol = node_host_private_symbol(host, "message_port.id")?;
+    object
+        .get(symbol, context)
+        .map_err(sandbox_execution_error)?
+        .as_number()
+        .map(|value| value as u64)
+        .ok_or_else(|| sandbox_execution_error("message port is missing host id"))
+}
+
+fn node_messaging_new_port(
+    context: &mut Context,
+) -> Result<JsObject, SandboxError> {
+    let constructor = node_internal_binding_messaging(context)?
+        .get(js_string!("MessagePort"), context)
+        .map_err(sandbox_execution_error)?
+        .as_object()
+        .ok_or_else(|| sandbox_execution_error("messaging.MessagePort must be a constructor"))?;
+    constructor
+        .construct(&[], None, context)
+        .map_err(sandbox_execution_error)
+}
+
+fn node_messaging_materialize_port(
+    host: &NodeRuntimeHost,
+    id: u64,
+    context: &mut Context,
+) -> Result<JsObject, SandboxError> {
+    if let Some(port) = host
+        .bootstrap
+        .borrow()
+        .message_ports
+        .get(&id)
+        .and_then(|state| state.object.clone())
+    {
+        return Ok(port);
+    }
+    let constructor = node_internal_binding_messaging(context)?
+        .get(js_string!("MessagePort"), context)
+        .map_err(sandbox_execution_error)?
+        .as_object()
+        .ok_or_else(|| sandbox_execution_error("messaging.MessagePort must be a constructor"))?;
+    let port = JsObject::with_null_proto();
+    let prototype = constructor
+        .get(js_string!("prototype"), context)
+        .map_err(sandbox_execution_error)?
+        .as_object()
+        .ok_or_else(|| sandbox_execution_error("MessagePort.prototype must be an object"))?;
+    port.set_prototype(Some(prototype));
+    let symbol = node_host_private_symbol(host, "message_port.id")?;
+    port.set(symbol, JsValue::from(id as f64), true, context)
+        .map_err(sandbox_execution_error)?;
+    if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&id) {
+        state.object = Some(port.clone());
+    }
+    Ok(port)
+}
+
+fn node_messaging_message_port_constructor(
+    context: &mut Context,
+) -> Result<JsFunction, SandboxError> {
+    let constructor = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_messaging_message_port_construct),
+    )
+    .name(js_string!("MessagePort"))
+    .length(0)
+    .constructor(true)
+    .build();
+    let prototype = JsObject::with_null_proto();
+    constructor
+        .set(js_string!("prototype"), JsValue::from(prototype.clone()), false, context)
+        .map_err(sandbox_execution_error)?;
+    prototype
+        .set(js_string!("constructor"), JsValue::from(constructor.clone()), true, context)
+        .map_err(sandbox_execution_error)?;
+    for (name, length, function) in [
+        ("postMessage", 1usize, node_messaging_message_port_post_message as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("start", 0usize, node_messaging_message_port_start),
+        ("close", 0usize, node_messaging_message_port_close),
+        ("ref", 0usize, node_messaging_message_port_ref),
+        ("unref", 0usize, node_messaging_message_port_unref),
+        ("hasRef", 0usize, node_messaging_message_port_has_ref),
+    ] {
+        prototype
+            .set(
+                JsString::from(name),
+                JsValue::from(
+                    FunctionObjectBuilder::new(
+                        context.realm(),
+                        NativeFunction::from_fn_ptr(function),
+                    )
+                    .name(JsString::from(name))
+                    .length(length)
+                    .constructor(false)
+                    .build(),
+                ),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+    }
+    Ok(constructor)
+}
+
+fn node_messaging_message_port_construct(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(this) = this.as_object() else {
+        return Err(JsNativeError::typ()
+            .with_message("MessagePort constructor requires receiver")
+            .into());
+    };
+    node_with_host_js(context, |host, context| {
+        let id = node_next_host_handle_id(host);
+        let symbol = node_host_private_symbol(host, "message_port.id")?;
+        this.set(symbol, JsValue::from(id as f64), true, context)
+            .map_err(sandbox_execution_error)?;
+        host.bootstrap.borrow_mut().message_ports.insert(
+            id,
+            NodeMessagePortState {
+                object: Some(this.clone()),
+                entangled: None,
+                refed: true,
+                started: false,
+                closed: false,
+                broadcast_name: None,
+                queue: Vec::new(),
+            },
+        );
+        let symbols = node_internal_binding_symbols(context)?;
+        let oninit = symbols
+            .get(js_string!("oninit"), context)
+            .map_err(sandbox_execution_error)?
+            .as_symbol()
+            .ok_or_else(|| sandbox_execution_error("symbols.oninit must be a symbol"))?;
+        if let Some(callback) = this
+            .get(oninit, context)
+            .map_err(sandbox_execution_error)?
+            .as_callable()
+        {
+            let _ = callback
+                .call(&JsValue::from(this.clone()), &[], context)
+                .map_err(sandbox_execution_error)?;
+        }
+        Ok(JsValue::from(this.clone()))
+    })
+}
+
+fn node_messaging_message_channel_constructor(
+    context: &mut Context,
+) -> Result<JsFunction, SandboxError> {
+    Ok(
+        FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(node_messaging_message_channel_construct),
+        )
+        .name(js_string!("MessageChannel"))
+        .length(0)
+        .constructor(true)
+        .build(),
+    )
+}
+
+fn node_messaging_message_channel_construct(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let channel = this.as_object().unwrap_or_else(JsObject::with_null_proto);
+    let port1 = node_messaging_new_port(context).map_err(js_error)?;
+    let port2 = node_messaging_new_port(context).map_err(js_error)?;
+    node_with_host(|host| {
+        let port1_id = node_messaging_port_id(host, &port1, context)?;
+        let port2_id = node_messaging_port_id(host, &port2, context)?;
+        if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&port1_id) {
+            state.entangled = Some(port2_id);
+        }
+        if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&port2_id) {
+            state.entangled = Some(port1_id);
+        }
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)?;
+    channel.set(js_string!("port1"), JsValue::from(port1), true, context)?;
+    channel.set(js_string!("port2"), JsValue::from(port2), true, context)?;
+    Ok(JsValue::from(channel))
+}
+
+fn node_messaging_no_message_symbol(
+    context: &mut Context,
+) -> Result<JsValue, SandboxError> {
+    let symbols = node_internal_binding_symbols(context)?;
+    let symbol = symbols
+        .get(js_string!("no_message_symbol"), context)
+        .map_err(sandbox_execution_error)?;
+    Ok(symbol)
+}
+
+fn node_messaging_emit_pending_messages(
+    host: &NodeRuntimeHost,
+    port_id: u64,
+    force: bool,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    loop {
+        let (port, message) = {
+            let mut bootstrap = host.bootstrap.borrow_mut();
+            let Some(state) = bootstrap.message_ports.get_mut(&port_id) else {
+                return Ok(());
+            };
+            if state.closed || (!force && !state.started) {
+                return Ok(());
+            }
+            let Some(port) = state.object.clone() else {
+                return Ok(());
+            };
+            let Some(message) = state.queue.first().cloned() else {
+                return Ok(());
+            };
+            state.queue.remove(0);
+            (port, message)
+        };
+
+        let emit_message = node_internal_binding_messaging(context)?
+            .get(js_string!("emitMessage"), context)
+            .map_err(sandbox_execution_error)?
+            .as_callable()
+            .ok_or_else(|| sandbox_execution_error("messaging.emitMessage must be callable"))?;
+        emit_message
+            .call(
+                &JsValue::from(port),
+                &[message, JsValue::from(JsArray::new(context).map_err(sandbox_execution_error)?), JsValue::from(js_string!("message"))],
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+    }
+}
+
+fn node_messaging_receive_message_on_port(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = args.first().and_then(JsValue::as_object) else {
+        return node_messaging_no_message_symbol(context).map_err(js_error);
+    };
+    node_with_host_js(context, |host, context| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        let Some(state) = bootstrap.message_ports.get_mut(&id) else {
+            return node_messaging_no_message_symbol(context);
+        };
+        if state.closed {
+            return node_messaging_no_message_symbol(context);
+        }
+        Ok(if state.queue.is_empty() {
+            node_messaging_no_message_symbol(context).unwrap_or_else(|_| JsValue::undefined())
+        } else {
+            state.queue.remove(0)
+        })
+    })
+}
+
+fn node_messaging_drain_message_port(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::undefined());
+    };
+    node_with_host(|host| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        node_messaging_emit_pending_messages(host, id, true, context)?;
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_move_message_port_to_context(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let port = args
+        .first()
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("The \"port\" argument must be a MessagePort instance")
+        })?;
+    let sandbox = args
+        .get(1)
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| JsNativeError::typ().with_message("Invalid context argument"))?;
+
+    let marker = node_contextify_private_symbol(context, "contextify_context_private_symbol")
+        .map_err(js_error)?;
+    if sandbox
+        .get(marker, context)?
+        .is_undefined()
+    {
+        return Err(JsNativeError::typ()
+            .with_message("Invalid context argument")
+            .into());
+    }
+
+    node_with_host_js(context, |host, context| {
+        let old_id = node_messaging_port_id(host, &port, context)?;
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        let Some(mut state) = bootstrap.message_ports.remove(&old_id) else {
+            return Err(sandbox_execution_error("message port is missing host id"));
+        };
+        if state.closed {
+            return Err(sandbox_execution_error("Cannot send data on closed MessagePort"));
+        }
+        let new_id = node_next_host_handle_id(host);
+        state.object = None;
+        bootstrap.message_ports.insert(new_id, state);
+
+        for peer in bootstrap.message_ports.values_mut() {
+            if peer.entangled == Some(old_id) {
+                peer.entangled = Some(new_id);
+            }
+        }
+
+        let symbol = node_host_private_symbol(host, "message_port.id")?;
+        port.set(symbol, JsValue::from(old_id as f64), true, context)
+            .map_err(sandbox_execution_error)?;
+        if let Some(old_state) = bootstrap.message_ports.get_mut(&old_id) {
+            old_state.closed = true;
+            old_state.started = false;
+            old_state.entangled = None;
+            old_state.queue.clear();
+            old_state.object = Some(port.clone());
+        } else {
+            bootstrap.message_ports.insert(
+                old_id,
+                NodeMessagePortState {
+                    object: Some(port.clone()),
+                    entangled: None,
+                    refed: false,
+                    started: false,
+                    closed: true,
+                    broadcast_name: None,
+                    queue: Vec::new(),
+                },
+            );
+        }
+
+        Ok(JsValue::from(node_messaging_materialize_port(host, new_id, context)?))
+    })
+}
+
+fn node_messaging_stop_message_port(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = args.first().and_then(JsValue::as_object) else {
+        return Ok(JsValue::undefined());
+    };
+    node_with_host(|host| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&id) {
+            state.started = false;
+        }
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_broadcast_channel(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let name = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_string(context)?
+        .to_std_string_escaped();
+    node_with_host_js(context, |host, context| {
+        let port = node_messaging_new_port(context)?;
+        let id = node_messaging_port_id(host, &port, context)?;
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        if let Some(state) = bootstrap.message_ports.get_mut(&id) {
+            state.broadcast_name = Some(name.clone());
+            state.started = true;
+        }
+        bootstrap
+            .broadcast_channels
+            .entry(name)
+            .or_default()
+            .insert(id);
+        Ok(JsValue::from(port))
+    })
+}
+
+fn node_messaging_message_port_post_message(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = this.as_object() else {
+        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+    };
+    let message = args.first().cloned().unwrap_or_else(JsValue::undefined);
+    node_with_host(|host| {
+        let port_id = node_messaging_port_id(host, &port, context)?;
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        let Some(port_state) = bootstrap.message_ports.get(&port_id).cloned() else {
+            return Ok(JsValue::undefined());
+        };
+        if port_state.closed {
+            return Ok(JsValue::undefined());
+        }
+        if let Some(name) = port_state.broadcast_name {
+            if let Some(targets) = bootstrap.broadcast_channels.get(&name).cloned() {
+                for target_id in targets {
+                    if target_id == port_id {
+                        continue;
+                    }
+                    if let Some(target) = bootstrap.message_ports.get_mut(&target_id) {
+                        if !target.closed {
+                            target.queue.push(message.clone());
+                        }
+                    }
+                }
+            }
+            drop(bootstrap);
+            if let Some(targets) = host.bootstrap.borrow().broadcast_channels.get(&name).cloned() {
+                for target_id in targets {
+                    if target_id != port_id {
+                        node_messaging_emit_pending_messages(host, target_id, false, context)?;
+                    }
+                }
+            }
+            return Ok(JsValue::undefined());
+        }
+        if let Some(target_id) = port_state.entangled {
+            if let Some(target) = bootstrap.message_ports.get_mut(&target_id) {
+                if !target.closed {
+                    target.queue.push(message);
+                }
+            }
+            drop(bootstrap);
+            node_messaging_emit_pending_messages(host, target_id, false, context)?;
+            return Ok(JsValue::undefined());
+        }
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_message_port_start(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = this.as_object() else {
+        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+    };
+    node_with_host(|host| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&id) {
+            state.started = true;
+        }
+        node_messaging_emit_pending_messages(host, id, false, context)?;
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_message_port_close(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = this.as_object() else {
+        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+    };
+    node_with_host(|host| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        let entangled = bootstrap
+            .message_ports
+            .get(&id)
+            .and_then(|state| state.entangled);
+        let broadcast_name = bootstrap
+            .message_ports
+            .get(&id)
+            .and_then(|state| state.broadcast_name.clone());
+        if let Some(state) = bootstrap.message_ports.get_mut(&id) {
+            state.closed = true;
+            state.started = false;
+            state.queue.clear();
+            state.entangled = None;
+        }
+        if let Some(peer_id) = entangled {
+            if let Some(peer) = bootstrap.message_ports.get_mut(&peer_id) {
+                if peer.entangled == Some(id) {
+                    peer.entangled = None;
+                }
+            }
+        }
+        if let Some(name) = broadcast_name {
+            if let Some(channels) = bootstrap.broadcast_channels.get_mut(&name) {
+                channels.remove(&id);
+                if channels.is_empty() {
+                    bootstrap.broadcast_channels.remove(&name);
+                }
+            }
+        }
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)?;
+    let symbols = node_internal_binding_symbols(context).map_err(js_error)?;
+    let onclose = symbols
+        .get(js_string!("handle_onclose_symbol"), context)?
+        .as_symbol()
+        .ok_or_else(|| JsNativeError::typ().with_message("handle_onclose_symbol must be a symbol"))?;
+    if let Some(callback) = port.get(onclose, context)?.as_callable() {
+        let _ = callback.call(&JsValue::from(port.clone()), &[], context)?;
+    }
+    Ok(JsValue::undefined())
+}
+
+fn node_messaging_message_port_ref(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = this.as_object() else {
+        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+    };
+    node_with_host(|host| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&id) {
+            state.refed = true;
+        }
+        Ok(JsValue::from(port.clone()))
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_message_port_unref(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = this.as_object() else {
+        return Err(JsNativeError::typ().with_message("MessagePort receiver must be an object").into());
+    };
+    node_with_host(|host| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&id) {
+            state.refed = false;
+        }
+        Ok(JsValue::from(port.clone()))
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_message_port_has_ref(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(port) = this.as_object() else {
+        return Ok(JsValue::from(false));
+    };
+    node_with_host(|host| {
+        let id = node_messaging_port_id(host, &port, context)?;
+        let refed = host
+            .bootstrap
+            .borrow()
+            .message_ports
+            .get(&id)
+            .map(|state| state.refed && !state.closed)
+            .unwrap_or(false);
+        Ok(JsValue::from(refed))
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_set_deserializer_create_object_function(
+    _this: &JsValue,
+    args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    let callback = args
+        .first()
+        .and_then(JsValue::as_object)
+        .filter(|object| object.is_callable())
+        .ok_or_else(|| {
+            JsNativeError::typ()
+                .with_message("deserializer create-object callback must be callable")
+        })?;
+    node_with_host(|host| {
+        host.bootstrap
+            .borrow_mut()
+            .messaging_deserialize_create_object_callback = Some(callback);
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_messaging_structured_clone(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let value = args.first().cloned().unwrap_or_else(JsValue::undefined);
+    let options = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
+    let global = context.global_object();
+    let structured_clone = global.get(js_string!("structuredClone"), context)?;
+    let callable = structured_clone.as_callable().ok_or_else(|| {
+        JsNativeError::typ().with_message("global structuredClone is not callable")
+    })?;
+    callable.call(
+        &JsValue::undefined(),
+        &[value, options],
+        context,
+    )
 }
 
 fn node_internal_binding_profiler(context: &mut Context) -> Result<JsObject, SandboxError> {
@@ -7514,6 +10527,7 @@ fn node_process_methods_really_exit(
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
+
 }
 
 fn node_process_methods_kill(
@@ -8048,7 +11062,7 @@ fn node_timers_schedule_timer(
         .map_err(js_error)? as i64;
     node_with_host(|host| {
         let now = node_monotonic_now_ms(host);
-        let due = now + duration.max(1) as f64;
+        let due = now + duration.max(0) as f64;
         host.bootstrap.borrow_mut().next_timer_due_ms = Some(due);
         Ok(JsValue::undefined())
     })
@@ -8583,8 +11597,14 @@ fn node_contextify_make_context(
     } else {
         Some(origin.to_string(context)?.to_std_string_escaped())
     };
-    let allow_code_gen_strings = args.get(3).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
-    let allow_code_gen_wasm = args.get(4).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
+    let allow_code_gen_strings = args
+        .get(3)
+        .map(JsValue::to_boolean)
+        .unwrap_or(true);
+    let allow_code_gen_wasm = args
+        .get(4)
+        .map(JsValue::to_boolean)
+        .unwrap_or(true);
     let own_microtask_queue = args.get(5).cloned().unwrap_or_else(JsValue::undefined).to_boolean();
     let host_defined_option_id = args.get(6).cloned();
 
@@ -8627,10 +11647,8 @@ fn node_contextify_stop_sigint_watchdog(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
-        let mut state = host.bootstrap.borrow_mut();
-        let was_active = state.sigint_watchdog_active;
-        state.sigint_watchdog_active = false;
-        Ok(JsValue::from(was_active))
+        host.bootstrap.borrow_mut().sigint_watchdog_active = false;
+        Ok(JsValue::from(false))
     })
     .map_err(js_error)
 }
@@ -8640,8 +11658,7 @@ fn node_contextify_watchdog_has_pending_sigint(
     _args: &[JsValue],
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_with_host(|host| Ok(JsValue::from(host.bootstrap.borrow().sigint_watchdog_active)))
-        .map_err(js_error)
+    Ok(JsValue::from(false))
 }
 
 fn node_contextify_measure_memory(
@@ -8735,6 +11752,22 @@ fn node_contextify_compile_cache_bytes(
         "params": params,
     }))
     .map_err(sandbox_execution_error)
+}
+
+fn node_js_buffer_from_bytes(bytes: Vec<u8>, context: &mut Context) -> JsResult<JsValue> {
+    let buffer_ctor = context.global_object().get(js_string!("Buffer"), context)?;
+    if let Some(buffer_ctor) = buffer_ctor.as_object() {
+        let from = buffer_ctor.get(js_string!("from"), context)?;
+        if let Some(from) = from.as_callable() {
+            let view = JsUint8Array::from_iter(bytes, context)?;
+            return from.call(&JsValue::from(buffer_ctor), &[JsValue::from(view)], context);
+        }
+    }
+    Ok(JsValue::from(
+        JsUint8Array::from_iter(bytes, context)?
+            .buffer(context)?
+            .clone(),
+    ))
 }
 
 fn node_contextify_array_like_strings(
@@ -9059,11 +12092,7 @@ fn node_contextify_compile_function(
         result
             .set(
                 js_string!("cachedData"),
-                JsValue::from(
-                    JsUint8Array::from_iter(cache_bytes.clone(), context)?
-                        .buffer(context)?
-                        .clone(),
-                ),
+                node_js_buffer_from_bytes(cache_bytes.clone(), context)?,
                 true,
                 context,
             )
@@ -9092,17 +12121,9 @@ fn node_contextify_script_construct(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
-    let code_symbol = node_host_private_symbol(&host, "contextify.code").map_err(js_error)?;
-    let filename_symbol =
-        node_host_private_symbol(&host, "contextify.filename").map_err(js_error)?;
-    let line_offset_symbol =
-        node_host_private_symbol(&host, "contextify.line_offset").map_err(js_error)?;
-    let column_offset_symbol =
-        node_host_private_symbol(&host, "contextify.column_offset").map_err(js_error)?;
+    let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
     let cached_data_symbol =
         node_host_private_symbol(&host, "contextify.cached_data").map_err(js_error)?;
-    let cached_data_rejected_symbol =
-        node_host_private_symbol(&host, "contextify.cached_data_rejected").map_err(js_error)?;
     let target = this
         .as_object()
         .ok_or_else(|| JsNativeError::typ().with_message("ContextifyScript receiver must be an object"))?;
@@ -9139,21 +12160,14 @@ fn node_contextify_script_construct(
         .as_ref()
         .map(|cached| *cached != cache_bytes)
         .unwrap_or(false);
+    let script = Script::parse(
+        Source::from_bytes(code.as_bytes()).with_path(&PathBuf::from(filename.clone())),
+        None,
+        context,
+    )
+    .map_err(sandbox_execution_error)
+    .map_err(js_error)?;
     for (key, value) in [
-        (PropertyKey::from(code_symbol), JsValue::from(JsString::from(code))),
-        (
-            PropertyKey::from(filename_symbol),
-            JsValue::from(JsString::from(filename)),
-        ),
-        (PropertyKey::from(line_offset_symbol), JsValue::from(line_offset)),
-        (
-            PropertyKey::from(column_offset_symbol),
-            JsValue::from(column_offset),
-        ),
-        (
-            PropertyKey::from(cached_data_rejected_symbol),
-            JsValue::from(cached_data_rejected),
-        ),
         (PropertyKey::from(js_string!("sourceURL")), JsValue::from(JsString::from(source_url))),
         (
             PropertyKey::from(js_string!("sourceMapURL")),
@@ -9167,15 +12181,41 @@ fn node_contextify_script_construct(
             .map_err(sandbox_execution_error)
             .map_err(js_error)?;
     }
-    if produce_cached_data {
+    if cached_data.is_some() {
         target
             .set(
-                PropertyKey::from(cached_data_symbol),
-                JsValue::from(
-                    JsUint8Array::from_iter(cache_bytes, context)?
-                        .buffer(context)?
-                        .clone(),
-                ),
+                PropertyKey::from(js_string!("cachedDataRejected")),
+                JsValue::from(cached_data_rejected),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+    }
+    if produce_cached_data {
+        let cached_data_value = node_js_buffer_from_bytes(cache_bytes.clone(), context)?;
+        target
+            .set(
+                PropertyKey::from(cached_data_symbol.clone()),
+                cached_data_value.clone(),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+        target
+            .set(
+                PropertyKey::from(js_string!("cachedDataProduced")),
+                JsValue::from(true),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+        target
+            .set(
+                PropertyKey::from(js_string!("cachedData")),
+                cached_data_value,
                 true,
                 context,
             )
@@ -9184,6 +12224,21 @@ fn node_contextify_script_construct(
     }
     node_contextify_attach_host_defined_option(&target, host_defined_option_id, context)
         .map_err(js_error)?;
+    node_with_host_js(context, |host, context| {
+        let id = node_next_host_handle_id(host);
+        target
+            .set(id_symbol, JsValue::from(id as f64), true, context)
+            .map_err(sandbox_execution_error)?;
+        host.bootstrap.borrow_mut().contextify_scripts.insert(
+            id,
+            NodeContextifyScriptState {
+                script,
+                filename,
+                cached_data: target.get(cached_data_symbol, context).ok().filter(|v| !v.is_undefined()),
+            },
+        );
+        Ok(JsValue::undefined())
+    })?;
     Ok(JsValue::undefined())
 }
 
@@ -9193,9 +12248,7 @@ fn node_contextify_script_run_in_context(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let host = active_node_host().map_err(js_error)?;
-    let code_symbol = node_host_private_symbol(&host, "contextify.code").map_err(js_error)?;
-    let filename_symbol =
-        node_host_private_symbol(&host, "contextify.filename").map_err(js_error)?;
+    let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
     let target = this
         .as_object()
         .ok_or_else(|| JsNativeError::typ().with_message("ContextifyScript receiver must be an object"))?;
@@ -9228,18 +12281,20 @@ fn node_contextify_script_run_in_context(
     } else {
         None
     };
-    let code = target
-        .get(code_symbol, context)
+    let script_id = target
+        .get(id_symbol, context)
         .map_err(sandbox_execution_error)
         .map_err(js_error)?
-        .to_string(context)?
-        .to_std_string_escaped();
-    let filename = target
-        .get(filename_symbol, context)
+        .to_number(context)
         .map_err(sandbox_execution_error)
-        .map_err(js_error)?
-        .to_string(context)?
-        .to_std_string_escaped();
+        .map_err(js_error)? as u64;
+    let script_state = host
+        .bootstrap
+        .borrow()
+        .contextify_scripts
+        .get(&script_id)
+        .cloned()
+        .ok_or_else(|| JsNativeError::error().with_message("unknown ContextifyScript handle"))?;
     let global = context.global_object().clone();
     let previous = if let Some(sandbox) = sandbox.as_ref() {
         Some(
@@ -9250,8 +12305,9 @@ fn node_contextify_script_run_in_context(
         None
     };
     let started_ms = node_with_host(|host| Ok(node_monotonic_now_ms(host))).map_err(js_error)?;
-    let result = context
-        .eval(Source::from_bytes(code.as_bytes()).with_path(&PathBuf::from(filename)))
+    let result = script_state
+        .script
+        .evaluate(context)
         .map_err(sandbox_execution_error)
         .map_err(js_error);
     if let (Some(sandbox), Some(previous)) = (sandbox.as_ref(), previous.as_ref()) {
@@ -9270,7 +12326,12 @@ fn node_contextify_script_run_in_context(
             .into());
     }
     if break_on_sigint
-        && node_with_host(|host| Ok(host.bootstrap.borrow().sigint_watchdog_active)).map_err(js_error)?
+        && node_contextify_watchdog_has_pending_sigint(
+            &JsValue::undefined(),
+            &[],
+            context,
+        )?
+        .to_boolean()
     {
         return Err(JsNativeError::error()
             .with_message("Script execution was interrupted by SIGINT")
@@ -9301,22 +12362,27 @@ fn node_contextify_script_create_cached_data(
     _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let host = active_node_host().map_err(js_error)?;
-    let cached_data_symbol =
-        node_host_private_symbol(&host, "contextify.cached_data").map_err(js_error)?;
     let target = this
         .as_object()
         .ok_or_else(|| JsNativeError::typ().with_message("ContextifyScript receiver must be an object"))?;
-    let cached_data = target
-        .get(cached_data_symbol, context)
+    let host = active_node_host().map_err(js_error)?;
+    let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
+    let script_id = target
+        .get(id_symbol, context)
         .map_err(sandbox_execution_error)
-        .map_err(js_error)?;
+        .map_err(js_error)?
+        .to_number(context)
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)? as u64;
+    let cached_data = host
+        .bootstrap
+        .borrow()
+        .contextify_scripts
+        .get(&script_id)
+        .and_then(|state| state.cached_data.clone())
+        .unwrap_or_else(JsValue::undefined);
     if cached_data.is_undefined() {
-        return Ok(JsValue::from(
-            JsUint8Array::from_iter(Vec::<u8>::new(), context)?
-                .buffer(context)?
-                .clone(),
-        ));
+        return node_js_buffer_from_bytes(Vec::new(), context);
     }
     Ok(cached_data)
 }
@@ -9381,6 +12447,23 @@ fn node_errors_set_prepare_stack_trace_callback(
     let callback = args.first().and_then(JsValue::as_object);
     node_with_host(|host| {
         host.bootstrap.borrow_mut().prepare_stack_trace_callback = callback;
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
+}
+
+fn node_errors_set_source_maps_enabled(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let enabled = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_boolean();
+    node_with_host(|host| {
+        host.bootstrap.borrow_mut().source_maps_enabled = enabled;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -10876,6 +13959,230 @@ fn node_modules_get_compile_cache_dir(
     .map_err(js_error)
 }
 
+fn node_modules_get_nearest_parent_package_json_type(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    node_with_host(|host| {
+        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+        let package_type = node_modules_traverse_parent_package_json(host, &resolved)?
+            .and_then(|(package_json, _)| {
+                package_json
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| *value == "commonjs" || *value == "module")
+                    .map(str::to_string)
+            });
+        Ok(match package_type {
+            Some(value) => JsValue::from(JsString::from(value)),
+            None => JsValue::undefined(),
+        })
+    })
+    .map_err(js_error)
+}
+
+fn node_modules_serialize_package_json(
+    package_json: &serde_json::Value,
+    package_json_path: Option<&str>,
+) -> serde_json::Value {
+    let imports = package_json.get("imports").map(|value| {
+        value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string())
+    });
+    let exports = package_json.get("exports").map(|value| {
+        value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string())
+    });
+    serde_json::json!([
+        package_json.get("name").and_then(|value| value.as_str()),
+        package_json.get("main").and_then(|value| value.as_str()),
+        package_json
+            .get("type")
+            .and_then(|value| value.as_str())
+            .filter(|value| *value == "commonjs" || *value == "module")
+            .unwrap_or("none"),
+        imports,
+        exports,
+        package_json_path,
+    ])
+}
+
+fn node_modules_package_scope_start_path(
+    host: &NodeRuntimeHost,
+    input: &str,
+) -> Result<String, SandboxError> {
+    if let Ok(url) = Url::parse(input) {
+        let path = url.to_file_path().map_err(|_| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!("invalid file URL: {input}"),
+        })?;
+        let normalized = normalize_node_path(&path.to_string_lossy());
+        if normalized.ends_with("/package.json") {
+            return Ok(normalized);
+        }
+        let base = std::path::Path::new(&normalized);
+        let package_json = base
+            .parent()
+            .unwrap_or(base)
+            .join("package.json");
+        return Ok(normalize_node_path(&package_json.to_string_lossy()));
+    }
+
+    let resolved = resolve_node_path(&host.process.borrow().cwd, input);
+    if resolved.ends_with("/package.json") {
+        return Ok(resolved);
+    }
+    let path = std::path::Path::new(&resolved);
+    let package_json = path.parent().unwrap_or(path).join("package.json");
+    Ok(normalize_node_path(&package_json.to_string_lossy()))
+}
+
+fn node_modules_find_package_scope_config(
+    host: &NodeRuntimeHost,
+    input: &str,
+) -> Result<(Option<serde_json::Value>, String), SandboxError> {
+    let mut current = node_modules_package_scope_start_path(host, input)?;
+    let initial = current.clone();
+    loop {
+        if current.ends_with("/node_modules/package.json") {
+            break;
+        }
+        if let Some(package_json) = read_package_json(host, &current)? {
+            return Ok((Some(package_json), current));
+        }
+        let parent = std::path::Path::new(&current)
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| normalize_node_path(&format!("{}/package.json", path.display())));
+        let Some(parent) = parent else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    Ok((None, initial))
+}
+
+fn node_modules_traverse_parent_package_json(
+    host: &NodeRuntimeHost,
+    path: &str,
+) -> Result<Option<(serde_json::Value, String)>, SandboxError> {
+    let mut current = std::path::PathBuf::from(path);
+    loop {
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+        if current
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value == "node_modules")
+        {
+            return Ok(None);
+        }
+        let package_json_path =
+            normalize_node_path(&format!("{}/package.json", current.display()));
+        if let Some(package_json) = read_package_json(host, &package_json_path)? {
+            return Ok(Some((package_json, package_json_path)));
+        }
+    }
+    Ok(None)
+}
+
+fn node_modules_get_nearest_parent_package_json(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    let value = node_with_host(|host| {
+        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+        Ok(node_modules_traverse_parent_package_json(host, &resolved)?
+            .map(|(package_json, package_json_path)| {
+                node_modules_serialize_package_json(&package_json, Some(&package_json_path))
+            }))
+    })
+    .map_err(js_error)?;
+    match value {
+        Some(value) => JsValue::from_json(&value, context),
+        None => Ok(JsValue::undefined()),
+    }
+}
+
+fn node_modules_get_package_scope_config(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    node_with_host_js(context, |host, context| {
+        let (package_json, package_json_path) =
+            node_modules_find_package_scope_config(host, &path)?;
+        match package_json {
+            Some(package_json) => {
+                JsValue::from_json(
+                    &node_modules_serialize_package_json(&package_json, Some(&package_json_path)),
+                    context,
+                )
+                .map_err(sandbox_execution_error)
+            }
+            None => Ok(JsValue::from(JsString::from(package_json_path))),
+        }
+    })
+}
+
+fn node_modules_get_package_type(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path = node_arg_string(args, 0, context)?;
+    node_with_host(|host| {
+        let (package_json, _) = node_modules_find_package_scope_config(host, &path)?;
+        let value = package_json
+            .and_then(|package_json| {
+                package_json
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| *value == "commonjs" || *value == "module")
+                    .map(str::to_string)
+            })
+            .map(|value| JsValue::from(JsString::from(value)))
+            .unwrap_or_else(JsValue::undefined);
+        Ok(value)
+    })
+    .map_err(js_error)
+}
+
+fn node_modules_read_package_json(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let json_path = node_arg_string(args, 0, context)?;
+    let value = node_with_host(|host| {
+        let resolved = resolve_node_path(&host.process.borrow().cwd, &json_path);
+        let package_json = read_package_json(host, &resolved)?;
+        Ok(package_json.map(|value| node_modules_serialize_package_json(&value, Some(&resolved))))
+    })
+    .map_err(js_error)?;
+    match value {
+        Some(value) => JsValue::from_json(&value, context),
+        None => Ok(JsValue::undefined()),
+    }
+}
+
 fn node_modules_flush_compile_cache(
     _this: &JsValue,
     _args: &[JsValue],
@@ -10887,6 +14194,105 @@ fn node_modules_flush_compile_cache(
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
+}
+
+fn node_modules_compile_cache_key(
+    source: &str,
+    filename: &str,
+    code_type: i32,
+) -> String {
+    format!("{code_type}:{filename}:{source}")
+}
+
+fn node_modules_get_compile_cache_entry(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let source = node_arg_string(args, 0, context)?;
+    let filename = node_arg_string(args, 1, context)?;
+    let code_type = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_i32(context)?;
+    node_with_host_js(context, |host, context| {
+        let key = node_modules_compile_cache_key(&source, &filename, code_type);
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        if !bootstrap.compile_cache_enabled {
+            return Ok(JsValue::undefined());
+        }
+        let entry_id = bootstrap
+            .compile_cache_entries
+            .iter()
+            .find_map(|(id, entry)| (entry.key == key).then_some(*id))
+            .unwrap_or_else(|| {
+                bootstrap.next_compile_cache_entry_id =
+                    bootstrap.next_compile_cache_entry_id.saturating_add(1);
+                let id = bootstrap.next_compile_cache_entry_id;
+                bootstrap
+                    .compile_cache_entries
+                    .insert(id, NodeCompileCacheEntryState { key, transpiled: None });
+                id
+            });
+        let entry = bootstrap
+            .compile_cache_entries
+            .get(&entry_id)
+            .cloned()
+            .ok_or_else(|| sandbox_execution_error("missing compile cache entry"))?;
+        drop(bootstrap);
+
+        let external = JsObject::with_null_proto();
+        let symbol = node_host_private_symbol(host, "compile_cache.entry_id")?;
+        external
+            .set(symbol, JsValue::from(entry_id as f64), true, context)
+            .map_err(sandbox_execution_error)?;
+        let payload = JsObject::with_null_proto();
+        payload
+            .set(js_string!("external"), JsValue::from(external), true, context)
+            .map_err(sandbox_execution_error)?;
+        payload
+            .set(
+                js_string!("transpiled"),
+                entry
+                    .transpiled
+                    .map(|value| JsValue::from(JsString::from(value)))
+                    .unwrap_or_else(JsValue::undefined),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+        Ok(JsValue::from(payload))
+    })
+
+}
+
+fn node_modules_save_compile_cache_entry(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let external = args
+        .first()
+        .and_then(JsValue::as_object)
+        .ok_or_else(|| JsNativeError::typ().with_message("compile cache external handle must be an object"))?;
+    let transpiled = node_arg_string(args, 1, context)?;
+    node_with_host_js(context, |host, context| {
+        let symbol = node_host_private_symbol(host, "compile_cache.entry_id")?;
+        let entry_id = external
+            .get(symbol, context)
+            .map_err(sandbox_execution_error)?
+            .to_number(context)
+            .map_err(sandbox_execution_error)? as u64;
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        let entry = bootstrap
+            .compile_cache_entries
+            .get_mut(&entry_id)
+            .ok_or_else(|| sandbox_execution_error("unknown compile cache entry"))?;
+        entry.transpiled = Some(transpiled);
+        Ok(JsValue::undefined())
+    })
+
 }
 
 fn node_global_escape(
@@ -11044,6 +14450,38 @@ fn node_options_get_cli_options_values(
 ) -> JsResult<JsValue> {
     JsValue::from_json(
         &serde_json::json!({
+            "--permission": false,
+            "--allow-fs-read": [],
+            "--allow-fs-write": [],
+            "--allow-addons": false,
+            "--allow-child-process": false,
+            "--allow-inspector": false,
+            "--allow-wasi": false,
+            "--allow-worker": false,
+            "--conditions": [],
+            "--no-addons": false,
+            "--require": [],
+            "--experimental-loader": [],
+            "--import": [],
+            "--entry-url": false,
+            "--enable-source-maps": false,
+            "--experimental-require-module": false,
+            "--experimental-vm-modules": false,
+            "--strip-types": false,
+            "--experimental-default-type": "commonjs",
+            "--use-env-proxy": false,
+            "--warnings": true,
+            "--no-experimental-websocket": false,
+            "--experimental-eventsource": false,
+            "--no-experimental-global-navigator": false,
+            "--no-experimental-sqlite": false,
+            "--experimental-default-config-file": false,
+            "--experimental-config-file": false,
+            "--trace-sigint": false,
+            "--expose-internals": false,
+            "--report-on-signal": false,
+            "--heapsnapshot-signal": "",
+            "--diagnostic-dir": "",
             "--experimental-quic": false,
             "--preserve-symlinks": false,
             "--preserve-symlinks-main": false,
@@ -11248,14 +14686,14 @@ fn node_source_text_has_top_level_await(source: &str) -> bool {
     format!("{module:?}").contains("Await")
 }
 
-fn node_module_wrap_request_entries(source: &str, source_phase: bool) -> Vec<(String, JsonValue, i32)> {
+fn node_module_wrap_request_entries(source: &str) -> Vec<(String, JsonValue, i32)> {
     let mut interner = Interner::default();
     let scope = Scope::new_global();
     let Ok(module) = BoaParser::new(BoaParserSource::from_bytes(source))
         .parse_module(&scope, &mut interner) else {
         return Vec::new();
     };
-    let phase = if source_phase { 0 } else { 1 };
+    let phase = 1;
     #[derive(Debug)]
     struct RequestVisitor<'a> {
         interner: &'a Interner,
@@ -11373,13 +14811,6 @@ fn node_module_wrap_construct(
         .unwrap_or_else(JsValue::undefined)
         .to_string(context)?
         .to_std_string_escaped();
-    let source_phase = args
-        .get(4)
-        .cloned()
-        .unwrap_or_else(|| JsValue::from(1))
-        .to_i32(context)
-        .unwrap_or(1)
-        == 0;
     node_with_host_js(context, |host, context| {
         let id = node_next_host_handle_id(host);
         let id_symbol = node_host_private_symbol(host, "module_wrap.id")?;
@@ -11392,21 +14823,72 @@ fn node_module_wrap_construct(
                 .to_string(context)
                 .map_err(sandbox_execution_error)?
                 .to_std_string_escaped();
+            let line_offset = args
+                .get(3)
+                .cloned()
+                .unwrap_or_else(|| JsValue::from(0))
+                .to_i32(context)
+                .unwrap_or(0);
+            let column_offset = args
+                .get(4)
+                .cloned()
+                .unwrap_or_else(|| JsValue::from(0))
+                .to_i32(context)
+                .unwrap_or(0);
+            let host_defined_option_id = args.get(5).cloned().filter(|value| !value.is_undefined());
             let module = Module::parse(
                 Source::from_bytes(source_text.as_bytes()).with_path(&PathBuf::from(url.clone())),
                 None,
                 context,
             )
             .map_err(sandbox_execution_error)?;
+            node_contextify_attach_host_defined_option(&object, host_defined_option_id.clone(), context)?;
+            let (annotated_source_url, source_map_url) = node_extract_source_annotations(&source_text);
+            let source_url = annotated_source_url.unwrap_or_else(|| url.clone());
+            let has_top_level_await = node_source_text_has_top_level_await(&source_text);
+            object
+                .set(js_string!("url"), JsValue::from(JsString::from(url.clone())), true, context)
+                .map_err(sandbox_execution_error)?;
+            object
+                .set(js_string!("synthetic"), JsValue::from(false), true, context)
+                .map_err(sandbox_execution_error)?;
+            object
+                .set(
+                    js_string!("hasTopLevelAwait"),
+                    JsValue::from(has_top_level_await),
+                    true,
+                    context,
+                )
+                .map_err(sandbox_execution_error)?;
+            object
+                .set(js_string!("sourceURL"), JsValue::from(JsString::from(source_url.clone())), true, context)
+                .map_err(sandbox_execution_error)?;
+            object
+                .set(
+                    js_string!("sourceMapURL"),
+                    source_map_url
+                        .clone()
+                        .map(|value| JsValue::from(JsString::from(value)))
+                        .unwrap_or_else(JsValue::undefined),
+                    true,
+                    context,
+                )
+                .map_err(sandbox_execution_error)?;
             NodeModuleWrapState {
                 url,
                 wrapper: object.clone(),
                 status: 0,
-                source_phase,
                 synthetic: false,
                 source_text: Some(source_text),
+                line_offset,
+                column_offset,
+                host_defined_option_id,
+                has_top_level_await,
+                source_url: Some(source_url),
+                source_map_url,
                 synthetic_export_names: Vec::new(),
                 synthetic_evaluation_steps: None,
+                imported_cjs: None,
                 synthetic_exports: BTreeMap::new(),
                 module: Some(module),
                 module_source_object: None,
@@ -11437,15 +14919,38 @@ fn node_module_wrap_construct(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            object
+                .set(js_string!("url"), JsValue::from(JsString::from(url.clone())), true, context)
+                .map_err(sandbox_execution_error)?;
+            object
+                .set(js_string!("synthetic"), JsValue::from(true), true, context)
+                .map_err(sandbox_execution_error)?;
+            if let Some(imported_cjs) = args.get(4).and_then(JsValue::as_object) {
+                let symbols = node_internal_binding_symbols(context)?;
+                let imported_cjs_symbol = symbols
+                    .get(js_string!("imported_cjs_symbol"), context)
+                    .map_err(sandbox_execution_error)?
+                    .as_symbol()
+                    .ok_or_else(|| sandbox_execution_error("symbols.imported_cjs_symbol must be a symbol"))?;
+                object
+                    .set(imported_cjs_symbol, JsValue::from(imported_cjs.clone()), true, context)
+                    .map_err(sandbox_execution_error)?;
+            }
             NodeModuleWrapState {
                 url,
                 wrapper: object.clone(),
                 status: 0,
-                source_phase,
                 synthetic: true,
                 source_text: None,
+                line_offset: 0,
+                column_offset: 0,
+                host_defined_option_id: None,
+                has_top_level_await: false,
+                source_url: None,
+                source_map_url: None,
                 synthetic_export_names: export_names,
                 synthetic_evaluation_steps: args.get(3).and_then(JsValue::as_object),
+                imported_cjs: args.get(4).and_then(JsValue::as_object),
                 synthetic_exports: BTreeMap::new(),
                 module: None,
                 module_source_object: None,
@@ -11480,10 +14985,7 @@ fn node_module_wrap_link(
             if state.synthetic {
                 Vec::new()
             } else {
-                node_module_wrap_request_entries(
-                    state.source_text.as_deref().unwrap_or_default(),
-                    state.source_phase,
-                )
+                node_module_wrap_request_entries(state.source_text.as_deref().unwrap_or_default())
             }
         };
         let modules = args
@@ -11567,10 +15069,7 @@ fn node_module_wrap_get_module_requests(
     if state.synthetic {
         return Ok(JsValue::from(JsArray::new(context)?));
     }
-    let requests = node_module_wrap_request_entries(
-        state.source_text.as_deref().unwrap_or_default(),
-        state.source_phase,
-    );
+    let requests = node_module_wrap_request_entries(state.source_text.as_deref().unwrap_or_default());
     let request_values = requests
         .into_iter()
         .map(|(specifier, attributes, phase)| {
@@ -11655,10 +15154,64 @@ fn node_module_wrap_instantiate(
 
 fn node_module_wrap_evaluate_sync(
     this: &JsValue,
-    args: &[JsValue],
+    _args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    node_module_wrap_evaluate(this, args, context)
+    let Some(object) = this.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    node_with_host_js(context, |host, context| {
+        let id = node_module_wrap_id(host, &object, context)?;
+        let mut bootstrap = host.bootstrap.borrow_mut();
+        let state = bootstrap
+            .module_wraps
+            .get_mut(&id)
+            .ok_or_else(|| sandbox_execution_error("unknown ModuleWrap handle"))?;
+        if !state.instantiated {
+            return Err(sandbox_execution_error(node_error_with_code(
+                context,
+                JsNativeError::error(),
+                "module is not instantiated",
+                "ERR_VM_MODULE_STATUS",
+            )));
+        }
+        state.status = 3;
+        let namespace = if state.synthetic {
+            if let Some(callback) = state.synthetic_evaluation_steps.take() {
+                let callable = JsValue::from(callback.clone())
+                    .as_callable()
+                    .ok_or_else(|| sandbox_execution_error("synthetic evaluation step is not callable"))?;
+                if let Err(error) = callable.call(&JsValue::from(object.clone()), &[], context) {
+                    state.status = 5;
+                    state.error = Some(
+                        error
+                            .clone()
+                            .into_opaque(context)
+                            .map_err(sandbox_execution_error)?,
+                    );
+                    return Err(sandbox_execution_error(error));
+                }
+            }
+            node_module_wrap_synthetic_namespace(state, context).map_err(sandbox_execution_error)?
+        } else if let Some(module) = state.module.clone() {
+            let promise = module.evaluate(context).map_err(sandbox_execution_error)?;
+            if let Err(error) = promise.await_blocking(context) {
+                state.status = 5;
+                state.error = Some(
+                    error
+                        .clone()
+                        .into_opaque(context)
+                        .map_err(sandbox_execution_error)?,
+                );
+                return Err(sandbox_execution_error(error));
+            }
+            module.namespace(context)
+        } else {
+            JsObject::with_null_proto()
+        };
+        state.status = 4;
+        Ok(JsValue::from(namespace))
+    })
 }
 
 fn node_module_wrap_evaluate(
@@ -11672,9 +15225,6 @@ fn node_module_wrap_evaluate(
     node_with_host_js(context, |host, context| {
         let id = node_module_wrap_id(host, &object, context)?;
         let mut bootstrap = host.bootstrap.borrow_mut();
-        let import_meta_callback = bootstrap
-            .module_wrap_initialize_import_meta_object_callback
-            .clone();
         let state = bootstrap
             .module_wraps
             .get_mut(&id)
@@ -11689,20 +15239,11 @@ fn node_module_wrap_evaluate(
         }
         state.status = 3;
         let result = if state.synthetic {
-            if let Some(callback) = state.synthetic_evaluation_steps.clone() {
+            if let Some(callback) = state.synthetic_evaluation_steps.take() {
                 let callable = JsValue::from(callback.clone())
                     .as_callable()
                     .ok_or_else(|| sandbox_execution_error("synthetic evaluation step is not callable"))?;
-                callable
-                    .call(&JsValue::from(object.clone()), &[], context)
-                    .map_err(sandbox_execution_error)?;
-            }
-            JsValue::undefined()
-        } else if let Some(module) = state.module.clone() {
-            let promise = module.load_link_evaluate(context);
-            match promise.await_blocking(context) {
-                Ok(value) => value,
-                Err(error) => {
+                if let Err(error) = callable.call(&JsValue::from(object.clone()), &[], context) {
                     state.status = 5;
                     state.error = Some(
                         error
@@ -11713,28 +15254,58 @@ fn node_module_wrap_evaluate(
                     return Err(sandbox_execution_error(error));
                 }
             }
+            state.status = 4;
+            JsValue::from(JsPromise::resolve(JsValue::undefined(), context).map_err(sandbox_execution_error)?)
+        } else if let Some(module) = state.module.clone() {
+            let promise = module.evaluate(context).map_err(sandbox_execution_error)?;
+            let on_fulfilled = FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_copy_closure_with_captures(
+                    |_this, args, module_id, context| {
+                        node_with_host_js(context, |host, _context| {
+                            if let Some(state) = host.bootstrap.borrow_mut().module_wraps.get_mut(module_id) {
+                                state.status = 4;
+                            }
+                            Ok(JsValue::undefined())
+                        })?;
+                        Ok(args.first().cloned().unwrap_or_else(JsValue::undefined))
+                    },
+                    id,
+                ),
+            )
+            .name(js_string!("moduleWrapFulfilled"))
+            .length(1)
+            .constructor(false)
+            .build();
+            let on_rejected = FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_copy_closure_with_captures(
+                    |_this, args, module_id, context| {
+                        let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
+                        node_with_host_js(context, |host, _context| {
+                            if let Some(state) = host.bootstrap.borrow_mut().module_wraps.get_mut(module_id) {
+                                state.status = 5;
+                                state.error = Some(reason.clone());
+                            }
+                            Ok(JsValue::undefined())
+                        })?;
+                        Err(boa_engine::JsError::from_opaque(reason))
+                    },
+                    id,
+                ),
+            )
+            .name(js_string!("moduleWrapRejected"))
+            .length(1)
+            .constructor(false)
+            .build();
+            JsValue::from(
+                promise
+                    .then(Some(on_fulfilled), Some(on_rejected), context)
+                    .map_err(sandbox_execution_error)?,
+            )
         } else {
             JsValue::undefined()
         };
-        if let Some(callback) = import_meta_callback {
-            let meta = JsObject::with_null_proto();
-            meta.set(
-                js_string!("url"),
-                JsValue::from(JsString::from(state.url.clone())),
-                true,
-                context,
-            )
-            .map_err(sandbox_execution_error)?;
-            let callable = JsValue::from(callback)
-                .as_callable()
-                .ok_or_else(|| sandbox_execution_error("importMeta callback is not callable"))?;
-            let _ = callable.call(
-                &JsValue::undefined(),
-                &[JsValue::from(meta), JsValue::from(object.clone())],
-                context,
-            );
-        }
-        state.status = 4;
         Ok(result)
     })
 }
@@ -11783,6 +15354,11 @@ fn node_module_wrap_set_module_source_object(
             .module_wraps
             .get_mut(&id)
             .ok_or_else(|| sandbox_execution_error("unknown ModuleWrap handle"))?;
+        if state.module_source_object.is_some() {
+            return Err(sandbox_execution_error(
+                "ModuleWrap source object is already initialized",
+            ));
+        }
         state.module_source_object = source_object;
         Ok(JsValue::undefined())
     })
@@ -11798,10 +15374,14 @@ fn node_module_wrap_get_module_source_object(
     };
     let host = active_node_host().map_err(js_error)?;
     let state = node_module_wrap_state(&host, &object, context).map_err(js_error)?;
-    Ok(state
-        .module_source_object
-        .map(JsValue::from)
-        .unwrap_or_else(JsValue::undefined))
+    state.module_source_object.map(JsValue::from).ok_or_else(|| {
+        node_error_with_code(
+            context,
+            JsNativeError::error(),
+            format!("Source phase not defined for module '{}'", state.url),
+            "ERR_SOURCE_PHASE_NOT_DEFINED",
+        )
+    })
 }
 
 fn node_module_wrap_create_cached_data(
@@ -11840,13 +15420,13 @@ fn node_module_wrap_create_cached_data(
             "module_wrap",
             state.source_text.as_deref().unwrap_or_default(),
             &state.url,
-            0,
-            0,
+            state.line_offset,
+            state.column_offset,
             &[],
         )
         .map_err(js_error)?
     };
-    Ok(JsValue::from(JsUint8Array::from_iter(bytes, context)?))
+    node_js_buffer_from_bytes(bytes, context)
 }
 
 fn node_module_wrap_get_namespace(
@@ -13033,6 +16613,7 @@ fn node_read_module_source(
         Ok(JsValue::from(JsString::from(strip_shebang(&loaded.source))))
     })
     .map_err(js_error)
+
 }
 
 fn node_require_resolve(

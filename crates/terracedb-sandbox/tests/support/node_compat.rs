@@ -99,6 +99,39 @@ pub async fn exec_node_fixture_with_seed(
         .await
 }
 
+pub async fn exec_upstream_node_test(
+    entrypoint: &str,
+) -> Result<terracedb_sandbox::SandboxExecutionResult, SandboxError> {
+    tracing_support::init_tracing();
+    let harness = SandboxHarness::deterministic(510, 121, SandboxServices::deterministic());
+    let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
+    let session = harness
+        .open_session_from_base_layer_with(
+            &SandboxBaseLayer::vendored_node_v24_14_1_js_tree(),
+            CACHED_NODE_BASE_VOLUME_ID,
+            VolumeId::new(SESSION_VOLUME_BASE + 0x1000_0000_0000_0000 + session_suffix),
+            |config| SandboxConfig {
+                workspace_root: "/workspace".to_string(),
+                package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
+                conflict_policy: ConflictPolicy::Fail,
+                ..config
+            },
+        )
+        .await
+        .expect("open node sandbox session");
+    session
+        .exec_node_command(
+            entrypoint,
+            vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
+            "/node/test/parallel".to_string(),
+            BTreeMap::from([
+                ("HOME".to_string(), "/workspace/home".to_string()),
+                ("NODE_SKIP_FLAG_CHECK".to_string(), "1".to_string()),
+            ]),
+        )
+        .await
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealNodeExecution {
     pub stdout: String,
