@@ -14,6 +14,7 @@ boa_parser = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae
 brotli = "8.0.2"
 clap = { version = "4.5.40", features = ["derive"] }
 crc32fast = "1.5.0"
+dotenvy = "0.15.7"
 flate2 = { version = "1.1.5", features = ["zlib-rs"] }
 futures = "0.3.31"
 hex = "0.4.3"

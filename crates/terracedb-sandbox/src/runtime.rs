@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     net::ToSocketAddrs,
     path::PathBuf,
     rc::Rc,
@@ -39,6 +39,7 @@ use boa_engine::{
 use boa_interner::Interner;
 use boa_parser::{Parser as BoaParser, Source as BoaParserSource};
 use brotli::{CompressorReader as BrotliCompressorReader, Decompressor as BrotliDecompressor};
+use dotenvy::from_read_iter as dotenv_from_read_iter;
 use flate2::{
     Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
     read::{DeflateDecoder, GzDecoder, ZlibDecoder},
@@ -807,11 +808,25 @@ struct NodeProcessState {
     platform: String,
     arch: String,
     locale: String,
+    timezone: String,
     title: String,
     pid: u32,
     ppid: u32,
     debug_port: u16,
     umask: u32,
+    home_dir: String,
+    temp_dir: String,
+    hostname: String,
+    os_name: String,
+    os_version: String,
+    os_release: String,
+    release_name: String,
+    release_lts: String,
+    priority: i32,
+    username: String,
+    uid: u32,
+    gid: u32,
+    shell: String,
 }
 
 fn node_process_versions_json(process: &NodeProcessState) -> serde_json::Value {
@@ -842,16 +857,16 @@ fn node_process_features_json() -> serde_json::Value {
     })
 }
 
-fn node_process_config_json() -> serde_json::Value {
+fn node_process_config_json(has_intl: bool) -> serde_json::Value {
     serde_json::json!({
         "target_defaults": {
             "default_configuration": "Release",
         },
         "variables": {
-            "v8_enable_i18n_support": 0,
+            "v8_enable_i18n_support": if has_intl { 1 } else { 0 },
             "node_quic": 0,
             "asan": 0,
-            "icu_small": false,
+            "icu_small": !has_intl,
             "single_executable_application": 0,
             "node_shared": 0,
             "node_shared_openssl": 0,
@@ -863,13 +878,6 @@ fn node_process_config_json() -> serde_json::Value {
     })
 }
 
-fn node_process_release_json() -> serde_json::Value {
-    serde_json::json!({
-        "name": "node",
-        "lts": "Krypton",
-    })
-}
-
 fn node_option_takes_value(name: &str) -> bool {
     matches!(
         name,
@@ -877,6 +885,9 @@ fn node_option_takes_value(name: &str) -> bool {
             | "--allow-fs-write"
             | "--conditions"
             | "--diagnostic-dir"
+            | "--env-file"
+            | "--env-file-if-exists"
+            | "--eval"
             | "--experimental-config-file"
             | "--experimental-default-type"
             | "--experimental-loader"
@@ -885,7 +896,26 @@ fn node_option_takes_value(name: &str) -> bool {
             | "--loader"
             | "--network-family-autoselection-attempt-timeout"
             | "--require"
+            | "--test-isolation"
+            | "--watch-path"
     )
+}
+
+fn node_parse_dotenv(input: &str) -> Result<Vec<(String, String)>, SandboxError> {
+    let reader = Cursor::new(input.as_bytes());
+    let iter = dotenv_from_read_iter(reader).map_err(|error| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: error.to_string(),
+    })?;
+    let mut entries = Vec::new();
+    for item in iter {
+        let (key, value) = item.map_err(|error| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: error.to_string(),
+        })?;
+        entries.push((key, value));
+    }
+    Ok(entries)
 }
 
 fn node_split_argv(exec_path: &str, argv: Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -907,7 +937,9 @@ fn node_split_argv(exec_path: &str, argv: Vec<String>) -> (Vec<String>, Vec<Stri
             return (normalized_argv, exec_argv);
         }
         if parsing_options && arg.starts_with('-') {
-            let option_name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg.as_str());
+            let option_name = node_option_canonical_name(
+                arg.split_once('=').map(|(name, _)| name).unwrap_or(arg.as_str()),
+            );
             exec_argv.push(arg.clone());
             if !arg.contains('=') && node_option_takes_value(option_name) && index + 1 < argv_len {
                 exec_argv.push(argv[index + 1].clone());
@@ -943,6 +975,108 @@ fn node_options_types_json() -> serde_json::Value {
         "kHostPort": 6,
         "kStringList": 7,
     })
+}
+
+fn node_apply_process_metadata_overrides(
+    process: &mut NodeProcessState,
+    metadata: &BTreeMap<String, JsonValue>,
+) {
+    if let Some(locale) = metadata.get("node_locale").and_then(JsonValue::as_str) {
+        process.locale = locale.to_string();
+    }
+    if let Some(process_config) = metadata.get("node_process").and_then(JsonValue::as_object) {
+        if let Some(value) = process_config.get("execPath").and_then(JsonValue::as_str) {
+            process.exec_path = value.to_string();
+            if let Some(argv0) = process.argv.first_mut() {
+                *argv0 = value.to_string();
+            }
+        }
+        if let Some(value) = process_config.get("platform").and_then(JsonValue::as_str) {
+            process.platform = value.to_string();
+        }
+        if let Some(value) = process_config.get("arch").and_then(JsonValue::as_str) {
+            process.arch = value.to_string();
+        }
+        if let Some(value) = process_config.get("locale").and_then(JsonValue::as_str) {
+            process.locale = value.to_string();
+        }
+        if let Some(value) = process_config.get("timezone").and_then(JsonValue::as_str) {
+            process.timezone = value.to_string();
+        }
+        if let Some(value) = process_config.get("title").and_then(JsonValue::as_str) {
+            process.title = value.to_string();
+        }
+        if let Some(value) = process_config.get("pid").and_then(JsonValue::as_u64) {
+            process.pid = value as u32;
+        }
+        if let Some(value) = process_config.get("ppid").and_then(JsonValue::as_u64) {
+            process.ppid = value as u32;
+        }
+        if let Some(value) = process_config.get("debugPort").and_then(JsonValue::as_u64) {
+            process.debug_port = value as u16;
+        }
+        if let Some(value) = process_config.get("umask").and_then(JsonValue::as_u64) {
+            process.umask = value as u32;
+        }
+        if let Some(value) = process_config.get("homeDir").and_then(JsonValue::as_str) {
+            process.home_dir = value.to_string();
+        }
+        if let Some(value) = process_config.get("tempDir").and_then(JsonValue::as_str) {
+            process.temp_dir = value.to_string();
+        }
+        if let Some(value) = process_config.get("hostname").and_then(JsonValue::as_str) {
+            process.hostname = value.to_string();
+        }
+        if let Some(value) = process_config.get("osName").and_then(JsonValue::as_str) {
+            process.os_name = value.to_string();
+        }
+        if let Some(value) = process_config.get("osVersion").and_then(JsonValue::as_str) {
+            process.os_version = value.to_string();
+        }
+        if let Some(value) = process_config.get("osRelease").and_then(JsonValue::as_str) {
+            process.os_release = value.to_string();
+        }
+        if let Some(value) = process_config.get("releaseName").and_then(JsonValue::as_str) {
+            process.release_name = value.to_string();
+        }
+        if let Some(value) = process_config.get("releaseLts").and_then(JsonValue::as_str) {
+            process.release_lts = value.to_string();
+        }
+        if let Some(value) = process_config.get("priority").and_then(JsonValue::as_i64) {
+            process.priority = value as i32;
+        }
+        if let Some(value) = process_config.get("username").and_then(JsonValue::as_str) {
+            process.username = value.to_string();
+        }
+        if let Some(value) = process_config.get("uid").and_then(JsonValue::as_u64) {
+            process.uid = value as u32;
+        }
+        if let Some(value) = process_config.get("gid").and_then(JsonValue::as_u64) {
+            process.gid = value as u32;
+        }
+        if let Some(value) = process_config.get("shell").and_then(JsonValue::as_str) {
+            process.shell = value.to_string();
+        }
+    }
+    node_sync_process_env_defaults(process);
+}
+
+fn node_sync_process_env_defaults(process: &mut NodeProcessState) {
+    process
+        .env
+        .insert("HOME".to_string(), process.home_dir.clone());
+    process
+        .env
+        .insert("TMPDIR".to_string(), process.temp_dir.clone());
+    process
+        .env
+        .insert("HOSTNAME".to_string(), process.hostname.clone());
+    process
+        .env
+        .insert("TZ".to_string(), process.timezone.clone());
+    process
+        .env
+        .insert("LANG".to_string(), process.locale.clone());
 }
 
 #[derive(Clone, Debug)]
@@ -1093,7 +1227,7 @@ impl NodeProcessState {
     fn new(argv: Vec<String>, env: BTreeMap<String, String>, cwd: String) -> Self {
         let exec_path = "/node/bin/node".to_string();
         let (argv, exec_argv) = node_split_argv(&exec_path, argv);
-        Self {
+        let mut process = Self {
             argv,
             exec_argv,
             env,
@@ -1106,12 +1240,28 @@ impl NodeProcessState {
             platform: "linux".to_string(),
             arch: "x64".to_string(),
             locale: "en-US".to_string(),
+            timezone: "UTC".to_string(),
             title: "node".to_string(),
             pid: 1,
             ppid: 0,
             debug_port: 9229,
             umask: 0o022,
-        }
+            home_dir: "/workspace/home".to_string(),
+            temp_dir: "/tmp".to_string(),
+            hostname: "localhost".to_string(),
+            os_name: "Linux".to_string(),
+            os_version: "#1 SMP".to_string(),
+            os_release: "5.10.0".to_string(),
+            release_name: "node".to_string(),
+            release_lts: "Krypton".to_string(),
+            priority: 0,
+            username: "sandbox".to_string(),
+            uid: 1000,
+            gid: 1000,
+            shell: "/bin/sh".to_string(),
+        };
+        node_sync_process_env_defaults(&mut process);
+        process
     }
 
     fn to_process_info_json(&self) -> serde_json::Value {
@@ -1129,11 +1279,25 @@ impl NodeProcessState {
             "platform": self.platform,
             "arch": self.arch,
             "locale": self.locale,
+            "timezone": self.timezone,
             "title": self.title,
             "pid": self.pid,
             "ppid": self.ppid,
             "debugPort": self.debug_port,
             "umask": self.umask,
+            "homeDir": self.home_dir,
+            "tempDir": self.temp_dir,
+            "hostname": self.hostname,
+            "osName": self.os_name,
+            "osVersion": self.os_version,
+            "osRelease": self.os_release,
+            "releaseName": self.release_name,
+            "releaseLts": self.release_lts,
+            "priority": self.priority,
+            "username": self.username,
+            "uid": self.uid,
+            "gid": self.gid,
+            "shell": self.shell,
         })
     }
 }
@@ -1913,9 +2077,7 @@ async fn execute_node_command(
         .map_err(sandbox_execution_error)?
         .unwrap_or_default();
     let mut process = NodeProcessState::new(argv, env, cwd);
-    if let Some(locale) = metadata.get("node_locale").and_then(JsonValue::as_str) {
-        process.locale = locale.to_string();
-    }
+    node_apply_process_metadata_overrides(&mut process, metadata);
     let node_host = Rc::new(NodeRuntimeHost {
         runtime_name: runtime_name.to_string(),
         runtime_handle: handle.clone(),
@@ -2127,6 +2289,10 @@ fn node_install_base_process_global(
     process_object
         .set(js_string!("env"), env, true, context)
         .map_err(sandbox_execution_error)?;
+    let has_intl = context
+        .global_object()
+        .has_property(js_string!("Intl"), context)
+        .map_err(sandbox_execution_error)?;
     let versions = JsValue::from_json(&node_process_versions_json(&process), context)
         .map_err(sandbox_execution_error)?;
     process_object
@@ -2137,13 +2303,19 @@ fn node_install_base_process_global(
     process_object
         .set(js_string!("features"), features, true, context)
         .map_err(sandbox_execution_error)?;
-    let config = JsValue::from_json(&node_process_config_json(), context)
+    let config = JsValue::from_json(&node_process_config_json(has_intl), context)
         .map_err(sandbox_execution_error)?;
     process_object
         .set(js_string!("config"), config, true, context)
         .map_err(sandbox_execution_error)?;
-    let release = JsValue::from_json(&node_process_release_json(), context)
-        .map_err(sandbox_execution_error)?;
+    let release = JsValue::from_json(
+        &serde_json::json!({
+            "name": process.release_name,
+            "lts": process.release_lts,
+        }),
+        context,
+    )
+    .map_err(sandbox_execution_error)?;
     process_object
         .set(js_string!("release"), release, true, context)
         .map_err(sandbox_execution_error)?;
@@ -2295,6 +2467,105 @@ fn node_prepare_process_for_bootstrap(
     Ok(())
 }
 
+fn node_process_env_object(context: &mut Context) -> Result<JsObject, SandboxError> {
+    let process = context
+        .global_object()
+        .get(js_string!("process"), context)
+        .map_err(sandbox_execution_error)?;
+    let process = process.as_object().ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: "global process is not an object".to_string(),
+    })?;
+    let env = process
+        .get(js_string!("env"), context)
+        .map_err(sandbox_execution_error)?;
+    env.as_object().ok_or_else(|| SandboxError::Execution {
+        entrypoint: "<node-runtime>".to_string(),
+        message: "process.env is not an object".to_string(),
+    })
+}
+
+fn node_sync_process_env_from_js(
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    let env_object = node_process_env_object(context)?;
+    let keys = env_object
+        .own_property_keys(context)
+        .map_err(sandbox_execution_error)?;
+    let mut env = BTreeMap::new();
+    for key in keys {
+        let PropertyKey::String(name) = key else {
+            continue;
+        };
+        let value = env_object
+            .get(name.clone(), context)
+            .map_err(sandbox_execution_error)?;
+        if value.is_undefined() || value.is_null() {
+            continue;
+        }
+        env.insert(
+            name.to_std_string_escaped(),
+            value
+                .to_string(context)
+                .map_err(sandbox_execution_error)?
+                .to_std_string_escaped(),
+        );
+    }
+    let mut process = host.process.borrow_mut();
+    process.env = env;
+    if let Some(value) = process.env.get("HOME").cloned() {
+        process.home_dir = value;
+    }
+    if let Some(value) = process.env.get("TMPDIR").cloned() {
+        process.temp_dir = value;
+    }
+    if let Some(value) = process.env.get("HOSTNAME").cloned() {
+        process.hostname = value;
+    }
+    if let Some(value) = process.env.get("TZ").cloned() {
+        process.timezone = value;
+    }
+    if let Some(value) = process
+        .env
+        .get("LC_ALL")
+        .cloned()
+        .or_else(|| process.env.get("LC_MESSAGES").cloned())
+        .or_else(|| process.env.get("LANG").cloned())
+    {
+        process.locale = value;
+    }
+    Ok(())
+}
+
+fn node_set_process_env_value(
+    key: &str,
+    value: &str,
+    host: &NodeRuntimeHost,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    let env_object = node_process_env_object(context)?;
+    env_object
+        .set(
+            JsString::from(key),
+            JsValue::from(JsString::from(value)),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    let mut process = host.process.borrow_mut();
+    process.env.insert(key.to_string(), value.to_string());
+    match key {
+        "HOME" => process.home_dir = value.to_string(),
+        "TMPDIR" => process.temp_dir = value.to_string(),
+        "HOSTNAME" => process.hostname = value.to_string(),
+        "TZ" => process.timezone = value.to_string(),
+        "LANG" | "LC_ALL" | "LC_MESSAGES" => process.locale = value.to_string(),
+        _ => {}
+    }
+    Ok(())
+}
+
 fn node_call_builtin_with_node_runtime(
     context: &mut Context,
     host: &NodeRuntimeHost,
@@ -2351,6 +2622,10 @@ fn node_command_report_json(host: &NodeRuntimeHost) -> Option<JsonValue> {
         "stderr": process.stderr,
         "exitCode": process.exit_code,
         "argv": process.argv,
+        "execArgv": process.exec_argv,
+        "execPath": process.exec_path,
+        "locale": process.locale,
+        "timezone": process.timezone,
         "builtinAccesses": [],
         "nodeCommandDebug": {
             "topLevelResultKind": "undefined",
@@ -6402,7 +6677,7 @@ fn node_process_wrap_spawn(
             shell: false,
             input: None,
         };
-        let result = execute_child_process_request(host, request)?;
+        let result = execute_child_process_request(host, request, context)?;
         let pid = result.pid.unwrap_or(0);
         let exit_status = result.status.unwrap_or(0);
         let term_signal = result.signal.clone();
@@ -11761,19 +12036,42 @@ fn node_process_methods_patch_process_object(
         .ok_or_else(|| JsNativeError::typ().with_message("process object must be an object"))?;
     node_with_host_js(context, |host, context| {
         let process = host.process.borrow();
-        for (name, value) in [
-            ("argv", JsValue::from_json(&serde_json::json!(process.argv), context).map_err(sandbox_execution_error)?),
-            ("execArgv", JsValue::from_json(&serde_json::json!(process.exec_argv), context).map_err(sandbox_execution_error)?),
-            ("execPath", JsValue::from(JsString::from(process.exec_path.clone()))),
-            ("pid", JsValue::from(process.pid)),
+        for (name, value, writable) in [
+            (
+                "argv",
+                JsValue::from_json(&serde_json::json!(process.argv), context)
+                    .map_err(sandbox_execution_error)?,
+                true,
+            ),
+            (
+                "execArgv",
+                JsValue::from_json(&serde_json::json!(process.exec_argv), context)
+                    .map_err(sandbox_execution_error)?,
+                true,
+            ),
+            (
+                "execPath",
+                JsValue::from(JsString::from(process.exec_path.clone())),
+                true,
+            ),
+            ("pid", JsValue::from(process.pid), false),
             (
                 "versions",
                 JsValue::from_json(&node_process_versions_json(&process), context)
                     .map_err(sandbox_execution_error)?,
+                false,
             ),
         ] {
             target
-                .set(JsString::from(name), value, true, context)
+                .define_property_or_throw(
+                    JsString::from(name),
+                    PropertyDescriptor::builder()
+                        .value(value)
+                        .writable(writable)
+                        .enumerable(true)
+                        .configurable(true),
+                    context,
+                )
                 .map_err(sandbox_execution_error)?;
         }
         drop(process);
@@ -12338,7 +12636,8 @@ fn node_process_methods_load_env_file(
     } else {
         None
     };
-    node_with_host(|host| {
+    node_with_host_js(context, |host, context| {
+        let display_path = path.clone().unwrap_or_else(|| ".env".to_string());
         let resolved = path
             .as_deref()
             .map(|path| resolve_node_path(&host.process.borrow().cwd, path))
@@ -12346,24 +12645,20 @@ fn node_process_methods_load_env_file(
         let Some(bytes) = node_read_file(host, &resolved)? else {
             return Err(SandboxError::Execution {
                 entrypoint: "<node-runtime>".to_string(),
-                message: format!("ENOENT: no such file or directory, open '{resolved}'"),
+                message: format!("ENOENT: no such file or directory, open '{display_path}'"),
             });
         };
-        let mut process = host.process.borrow_mut();
-        for line in String::from_utf8_lossy(&bytes).lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
+        let parsed = node_parse_dotenv(&String::from_utf8_lossy(&bytes)).map_err(|_| {
+            SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: format!("Contents of '{display_path}' should be a valid string."),
             }
-            if let Some((key, value)) = trimmed.split_once('=') {
-                process
-                    .env
-                    .insert(key.trim().to_string(), value.trim().to_string());
-            }
+        })?;
+        for (key, value) in parsed {
+            node_set_process_env_value(&key, &value, host, context)?;
         }
         Ok(JsValue::undefined())
     })
-    .map_err(js_error)
 }
 
 fn node_process_methods_abort(
@@ -16313,8 +16608,16 @@ fn node_options_get_cli_options_values(
             "--allow-inspector": false,
             "--allow-wasi": false,
             "--allow-worker": false,
+            "--check": false,
             "--conditions": [],
+            "--env-file": [],
+            "--env-file-if-exists": [],
+            "--eval": [],
             "--no-addons": false,
+            "--no-warnings": false,
+            "--interactive": false,
+            "--print": false,
+            "--prof-process": false,
             "--require": [],
             "--experimental-loader": [],
             "--import": [],
@@ -16325,6 +16628,8 @@ fn node_options_get_cli_options_values(
             "--strip-types": false,
             "--experimental-default-type": "commonjs",
             "--use-env-proxy": false,
+            "--inspect-brk": false,
+            "--inspect-brk-node": false,
             "--network-family-autoselection": true,
             "--network-family-autoselection-attempt-timeout": 250,
             "--warnings": true,
@@ -16334,8 +16639,12 @@ fn node_options_get_cli_options_values(
             "--no-experimental-sqlite": false,
             "--experimental-default-config-file": false,
             "--experimental-config-file": false,
+            "--experimental-network-inspection": false,
             "--trace-sigint": false,
+            "--experimental-test-coverage": false,
+            "--experimental-webstorage": false,
             "--expose-internals": false,
+            "--frozen-intrinsics": false,
             "--report-on-signal": false,
             "--heapsnapshot-signal": "",
             "--diagnostic-dir": "",
@@ -16344,7 +16653,15 @@ fn node_options_get_cli_options_values(
             "--preserve-symlinks-main": false,
             "--pending-deprecation": false,
             "--no-deprecation": false,
-            "--require-module": false
+            "--require-module": false,
+            "--trace-warnings": false,
+            "--throw-deprecation": false,
+            "--trace-deprecation": false,
+            "--test": false,
+            "--test-force-exit": false,
+            "--test-isolation": "process",
+            "--watch": false,
+            "--watch-path": []
         });
         let Some(object) = values.as_object_mut() else {
             return Err(sandbox_execution_error("CLI option defaults must be an object"));
@@ -16358,19 +16675,18 @@ fn node_options_get_cli_options_values(
             } else {
                 (arg.clone(), None)
             };
+            let name = node_option_canonical_name(&name).to_string();
             match name.as_str() {
                 "--allow-fs-read"
                 | "--allow-fs-write"
+                | "--env-file"
+                | "--env-file-if-exists"
+                | "--eval"
                 | "--conditions"
                 | "--experimental-loader"
                 | "--import"
                 | "--require" => {
-                    let value = inline_value.or_else(|| {
-                        exec_argv
-                            .get(index + 1)
-                            .filter(|next| !next.starts_with('-'))
-                            .cloned()
-                    });
+                    let value = inline_value.or_else(|| exec_argv.get(index + 1).cloned());
                     if let Some(value) = value {
                         object
                             .entry(name.clone())
@@ -16378,11 +16694,7 @@ fn node_options_get_cli_options_values(
                             .as_array_mut()
                             .ok_or_else(|| sandbox_execution_error("CLI string-list option must be an array"))?
                             .push(JsonValue::String(value));
-                        if inline_value.is_none()
-                            && exec_argv
-                                .get(index + 1)
-                                .is_some_and(|next| !next.starts_with('-'))
-                        {
+                        if inline_value.is_none() {
                             index += 1;
                         }
                     }
@@ -16430,6 +16742,18 @@ fn node_options_get_cli_options_values(
     })
 }
 
+fn node_option_canonical_name(name: &str) -> &str {
+    match name {
+        "-c" => "--check",
+        "-e" => "--eval",
+        "-i" => "--interactive",
+        "-p" => "--print",
+        "--loader" => "--experimental-loader",
+        "--experimental-strip-types" => "--strip-types",
+        _ => name,
+    }
+}
+
 fn node_option_info_entries() -> Vec<(&'static str, i32, i32, &'static str)> {
     vec![
         ("--allow-addons", 2, 1, ""),
@@ -16439,21 +16763,32 @@ fn node_option_info_entries() -> Vec<(&'static str, i32, i32, &'static str)> {
         ("--allow-inspector", 2, 1, ""),
         ("--allow-wasi", 2, 1, ""),
         ("--allow-worker", 2, 1, ""),
+        ("--check", 2, 0, ""),
         ("--conditions", 7, 0, ""),
         ("--diagnostic-dir", 5, 0, ""),
         ("--enable-source-maps", 2, 0, ""),
         ("--entry-url", 2, 0, ""),
+        ("--env-file", 7, 0, ""),
+        ("--env-file-if-exists", 7, 0, ""),
+        ("--eval", 7, 0, ""),
         ("--experimental-config-file", 5, 0, ""),
         ("--experimental-default-config-file", 2, 0, ""),
         ("--experimental-default-type", 5, 0, ""),
         ("--experimental-eventsource", 2, 0, ""),
         ("--experimental-loader", 7, 0, ""),
+        ("--experimental-network-inspection", 2, 0, ""),
         ("--experimental-quic", 2, 0, ""),
         ("--experimental-require-module", 2, 0, ""),
+        ("--experimental-test-coverage", 2, 0, ""),
         ("--experimental-vm-modules", 2, 0, ""),
+        ("--experimental-webstorage", 2, 0, ""),
         ("--expose-internals", 2, 0, ""),
+        ("--frozen-intrinsics", 2, 0, ""),
         ("--heapsnapshot-signal", 5, 0, ""),
         ("--import", 7, 0, ""),
+        ("--inspect-brk", 2, 0, ""),
+        ("--inspect-brk-node", 2, 0, ""),
+        ("--interactive", 2, 0, ""),
         ("--network-family-autoselection", 2, 0, ""),
         ("--network-family-autoselection-attempt-timeout", 4, 0, ""),
         ("--no-addons", 2, 0, ""),
@@ -16461,16 +16796,27 @@ fn node_option_info_entries() -> Vec<(&'static str, i32, i32, &'static str)> {
         ("--no-experimental-global-navigator", 2, 0, ""),
         ("--no-experimental-sqlite", 2, 0, ""),
         ("--no-experimental-websocket", 2, 0, ""),
+        ("--no-warnings", 2, 0, ""),
         ("--pending-deprecation", 2, 0, ""),
         ("--permission", 2, 1, ""),
+        ("--print", 2, 0, ""),
+        ("--prof-process", 2, 0, ""),
         ("--preserve-symlinks", 2, 0, ""),
         ("--preserve-symlinks-main", 2, 0, ""),
         ("--report-on-signal", 2, 0, ""),
         ("--require", 7, 1, ""),
         ("--require-module", 2, 0, ""),
         ("--strip-types", 2, 0, ""),
+        ("--test", 2, 0, ""),
+        ("--test-force-exit", 2, 0, ""),
+        ("--test-isolation", 5, 0, ""),
+        ("--throw-deprecation", 2, 0, ""),
+        ("--trace-deprecation", 2, 0, ""),
         ("--trace-sigint", 2, 0, ""),
+        ("--trace-warnings", 2, 0, ""),
         ("--use-env-proxy", 2, 0, ""),
+        ("--watch", 2, 0, ""),
+        ("--watch-path", 7, 0, ""),
         ("--warnings", 2, 0, ""),
     ]
 }
@@ -16507,6 +16853,10 @@ fn node_options_build_alias_map(context: &mut Context) -> Result<JsObject, Sandb
     for (alias, expansion) in [
         ("--experimental-strip-types", vec!["--strip-types"]),
         ("--loader", vec!["--experimental-loader"]),
+        ("-c", vec!["--check"]),
+        ("-e", vec!["--eval"]),
+        ("-i", vec!["--interactive"]),
+        ("-p", vec!["--print"]),
     ] {
         node_js_map_set(
             &map,
@@ -16566,7 +16916,27 @@ fn node_options_get_options_as_flags(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, context| {
-        JsValue::from_json(&serde_json::json!(host.process.borrow().exec_argv), context)
+        let exec_argv = host.process.borrow().exec_argv.clone();
+        let mut flags = Vec::new();
+        let mut index = 0usize;
+        while index < exec_argv.len() {
+            let arg = &exec_argv[index];
+            let (name, inline_value) = if let Some((name, value)) = arg.split_once('=') {
+                (node_option_canonical_name(name).to_string(), Some(value.to_string()))
+            } else {
+                (node_option_canonical_name(arg).to_string(), None)
+            };
+            if let Some(value) = inline_value {
+                flags.push(format!("{name}={value}"));
+            } else if node_option_takes_value(&name) && index + 1 < exec_argv.len() {
+                flags.push(format!("{name}={}", exec_argv[index + 1]));
+                index += 1;
+            } else {
+                flags.push(name);
+            }
+            index += 1;
+        }
+        JsValue::from_json(&serde_json::json!(flags), context)
             .map_err(sandbox_execution_error)
     })
 }
@@ -16595,9 +16965,14 @@ fn node_options_get_env_options_input_type(
         node_options_build_input_type_map(
             &[
                 ("--conditions", "array"),
+                ("--env-file", "array"),
+                ("--env-file-if-exists", "array"),
+                ("--eval", "array"),
                 ("--experimental-default-type", "string"),
                 ("--import", "array"),
                 ("--require", "array"),
+                ("--test-isolation", "string"),
+                ("--watch-path", "array"),
             ],
             context,
         )
@@ -16618,9 +16993,14 @@ fn node_options_get_namespace_options_input_type(
             node_options_build_input_type_map(
                 &[
                     ("--conditions", "array"),
+                    ("--env-file", "array"),
+                    ("--env-file-if-exists", "array"),
+                    ("--eval", "array"),
                     ("--experimental-default-type", "string"),
                     ("--import", "array"),
                     ("--require", "array"),
+                    ("--test-isolation", "string"),
+                    ("--watch-path", "array"),
                 ],
                 context,
             )
@@ -18725,14 +19105,11 @@ fn node_os_get_home_directory(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, _context| {
-        Ok(JsValue::from(JsString::from(
-            host.process
-                .borrow()
-                .env
-                .get("HOME")
-                .cloned()
-                .unwrap_or_else(|| "/workspace/home".to_string()),
-        )))
+        let home_dir = host.process.borrow().home_dir.clone();
+        if home_dir.is_empty() {
+            return Ok(JsValue::undefined());
+        }
+        Ok(JsValue::from(JsString::from(home_dir)))
     })
 }
 
@@ -18742,13 +19119,10 @@ fn node_os_get_hostname(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
-        let hostname = host
-            .process
-            .borrow()
-            .env
-            .get("HOSTNAME")
-            .cloned()
-            .unwrap_or_else(|| "localhost".to_string());
+        let hostname = host.process.borrow().hostname.clone();
+        if hostname.is_empty() {
+            return Ok(JsValue::undefined());
+        }
         Ok(JsValue::from(JsString::from(hostname)))
     })
     .map_err(js_error)
@@ -18803,13 +19177,7 @@ fn node_os_get_priority(
                 message: format!("ESRCH: no such process, getPriority '{pid}'"),
             });
         }
-        let priority = host
-            .process
-            .borrow()
-            .env
-            .get("__TERRACE_NODE_PRIORITY")
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(0);
+        let priority = host.process.borrow().priority;
         Ok(JsValue::from(priority))
     })
     .map_err(js_error)
@@ -18824,13 +19192,9 @@ fn node_os_get_os_information(
         let process = host.process.borrow();
         JsValue::from_json(
             &serde_json::json!([
-                if process.platform == "win32" { "Windows_NT" } else { "Linux" },
-                process
-                    .env
-                    .get("HOSTNAME")
-                    .cloned()
-                    .unwrap_or_else(|| "localhost".to_string()),
-                "5.10.0",
+                process.os_name,
+                process.os_version,
+                process.os_release,
                 process.arch
             ]),
             context,
@@ -18853,13 +19217,14 @@ fn node_os_get_user_info(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, context| {
+        let process = host.process.borrow();
         JsValue::from_json(
             &serde_json::json!({
-                "username": "sandbox",
-                "uid": 1000,
-                "gid": 1000,
-                "shell": "/bin/sh",
-                "homedir": host.process.borrow().env.get("HOME").cloned().unwrap_or_else(|| "/workspace/home".to_string())
+                "username": process.username,
+                "uid": process.uid,
+                "gid": process.gid,
+                "shell": process.shell,
+                "homedir": process.home_dir
             }),
             context,
         )
@@ -18905,10 +19270,7 @@ fn node_os_set_priority(
                 message: format!("ESRCH: no such process, setPriority '{pid}'"),
             });
         }
-        host.process
-            .borrow_mut()
-            .env
-            .insert("__TERRACE_NODE_PRIORITY".to_string(), priority.to_string());
+        host.process.borrow_mut().priority = priority;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -18921,13 +19283,13 @@ fn node_credentials_get_temp_dir(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     node_with_host_js(context, |host, _context| {
-        let temp_dir = host
-            .process
-            .borrow()
-            .env
-            .get("TMPDIR")
-            .cloned()
-            .unwrap_or_else(|| "/tmp".to_string());
+        let mut temp_dir = host.process.borrow().temp_dir.clone();
+        if temp_dir.is_empty() {
+            return Ok(JsValue::undefined());
+        }
+        if temp_dir.len() > 1 && temp_dir.ends_with('/') {
+            temp_dir.pop();
+        }
         Ok(JsValue::from(JsString::from(temp_dir)))
     })
 }
@@ -18938,7 +19300,8 @@ fn node_credentials_safe_getenv(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let name = node_arg_string(args, 0, context)?;
-    node_with_host_js(context, |host, _context| {
+    node_with_host_js(context, |host, context| {
+        node_sync_process_env_from_js(host, context)?;
         Ok(host
             .process
             .borrow()
@@ -20774,7 +21137,7 @@ fn node_child_process_run(
                 request.cwd.as_deref().unwrap_or("<inherit>")
             ),
         )?;
-        let result = execute_child_process_request(host, request)?;
+        let result = execute_child_process_request(host, request, context)?;
         JsValue::from_json(
             &serde_json::to_value(result).map_err(sandbox_execution_error)?,
             context,
@@ -20794,7 +21157,7 @@ fn node_spawn_sync_spawn(
         .ok_or_else(|| JsNativeError::typ().with_message("options must be an object"))?;
     node_with_host_js(context, |host, context| {
         let request = node_spawn_sync_request_from_options(host, &options, context)?;
-        let result = execute_child_process_request(host, request)?;
+        let result = execute_child_process_request(host, request, context)?;
         node_spawn_sync_result_to_js(host, &result, &options, context)
     })
 }
@@ -20863,6 +21226,7 @@ fn node_spawn_sync_request_from_options(
         }
     }
     if env.is_empty() {
+        node_sync_process_env_from_js(host, context)?;
         env = host.process.borrow().env.clone();
     }
 
@@ -21031,6 +21395,7 @@ fn node_spawn_sync_error_number(error: &NodeChildProcessError) -> i32 {
 fn execute_child_process_request(
     host: &NodeRuntimeHost,
     request: NodeChildProcessRequest,
+    context: &mut Context,
 ) -> Result<NodeChildProcessResult, SandboxError> {
     let cwd = request
         .cwd
@@ -21053,6 +21418,7 @@ fn execute_child_process_request(
     }
 
     let env = if request.env.is_empty() {
+        node_sync_process_env_from_js(host, context)?;
         host.process.borrow().env.clone()
     } else {
         request.env
@@ -21241,7 +21607,7 @@ fn execute_shell_child_process(
     env: BTreeMap<String, String>,
     stdin: Option<String>,
 ) -> Result<NodeChildProcessResult, SandboxError> {
-    let shell_path = "/bin/sh".to_string();
+    let shell_path = host.process.borrow().shell.clone();
     let pipeline = split_shell_pipeline(&command);
     let mut stdin = stdin;
     let mut last = NodeChildProcessResult {
@@ -21359,7 +21725,35 @@ fn execute_node_child_process(
     };
 
     let mut child_process = NodeProcessState::new(child_argv.clone(), env, cwd);
-    child_process.locale = host.process.borrow().locale.clone();
+    {
+        let parent_process = host.process.borrow();
+        child_process.exec_path = parent_process.exec_path.clone();
+        if let Some(argv0) = child_process.argv.first_mut() {
+            *argv0 = child_process.exec_path.clone();
+        }
+        child_process.platform = parent_process.platform.clone();
+        child_process.arch = parent_process.arch.clone();
+        child_process.locale = parent_process.locale.clone();
+        child_process.timezone = parent_process.timezone.clone();
+        child_process.title = parent_process.title.clone();
+        child_process.ppid = parent_process.pid;
+        child_process.debug_port = parent_process.debug_port;
+        child_process.umask = parent_process.umask;
+        child_process.home_dir = parent_process.home_dir.clone();
+        child_process.temp_dir = parent_process.temp_dir.clone();
+        child_process.hostname = parent_process.hostname.clone();
+        child_process.os_name = parent_process.os_name.clone();
+        child_process.os_version = parent_process.os_version.clone();
+        child_process.os_release = parent_process.os_release.clone();
+        child_process.release_name = parent_process.release_name.clone();
+        child_process.release_lts = parent_process.release_lts.clone();
+        child_process.priority = parent_process.priority;
+        child_process.username = parent_process.username.clone();
+        child_process.uid = parent_process.uid;
+        child_process.gid = parent_process.gid;
+        child_process.shell = parent_process.shell.clone();
+    }
+    node_sync_process_env_defaults(&mut child_process);
     let child_host = Rc::new(NodeRuntimeHost {
         runtime_name: host.runtime_name.clone(),
         runtime_handle: host.runtime_handle.clone(),
