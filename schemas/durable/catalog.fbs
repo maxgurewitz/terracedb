@@ -1,0 +1,91 @@
+namespace terracedb.durable.catalog;
+
+// Catalog durable metadata format.
+// Root: `Catalog`
+// Identifier: `TDBC`
+
+enum TableFormatTag : ubyte {
+  None = 0,
+  Row = 1,
+  Columnar = 2,
+}
+
+enum CompactionStrategyTag : ubyte {
+  None = 0,
+  Leveled = 1,
+  Tiered = 2,
+  Fifo = 3,
+}
+
+enum FieldTypeTag : ubyte {
+  None = 0,
+  Int64 = 1,
+  Float64 = 2,
+  String = 3,
+  Bytes = 4,
+  Bool = 5,
+}
+
+enum FieldValueKind : ubyte {
+  None = 0,
+  Null = 1,
+  Int64 = 2,
+  Float64 = 3,
+  String = 4,
+  Bytes = 5,
+  Bool = 6,
+}
+
+table MetadataEntry {
+  key:string (required);
+  value_json:string (required);
+}
+
+table FieldValue {
+  kind:FieldValueKind;
+  i64_value:long;
+  f64_value:double;
+  string_value:string;
+  bytes_value:[ubyte];
+  bool_value:bool;
+}
+
+table FieldDefinition {
+  id:uint;
+  name:string (required);
+  field_type:FieldTypeTag;
+  nullable:bool;
+  default_value:FieldValue;
+}
+
+table SchemaDefinition {
+  version:uint;
+  fields:[FieldDefinition] (required);
+}
+
+table TableConfig {
+  name:string (required);
+  format:TableFormatTag;
+  has_max_merge_operand_chain_length:bool;
+  max_merge_operand_chain_length:uint;
+  has_bloom_filter_bits_per_key:bool;
+  bloom_filter_bits_per_key:uint;
+  has_history_retention_sequences:bool;
+  history_retention_sequences:ulong;
+  compaction_strategy:CompactionStrategyTag;
+  schema:SchemaDefinition;
+  metadata_entries:[MetadataEntry] (required);
+}
+
+table CatalogEntry {
+  id:uint;
+  config:TableConfig (required);
+}
+
+table Catalog {
+  format_version:uint;
+  tables:[CatalogEntry] (required);
+}
+
+root_type Catalog;
+file_identifier "TDBC";

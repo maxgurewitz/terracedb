@@ -1,0 +1,14 @@
+namespace terracedb.durable.backup_gc;
+
+// Backup-GC birth metadata format.
+// Root: `BackupGcBirthRecord`
+// Identifier: `TDBG`
+
+table BackupGcBirthRecord {
+  format_version:uint;
+  object_key:string (required);
+  first_uploaded_at_millis:ulong;
+}
+
+root_type BackupGcBirthRecord;
+file_identifier "TDBG";

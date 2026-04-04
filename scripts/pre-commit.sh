@@ -25,6 +25,9 @@ if [[ -z "${nextest_test_threads}" ]]; then
     nextest_test_threads="${nextest_test_threads:-1}"
 fi
 
+echo "Checking generated FlatBuffers bindings..."
+"$repo_root/scripts/check-flatbuffer-bindings.sh"
+
 echo "Running durable-format fixture checks..."
 "$repo_root/scripts/check-durable-format-fixtures.sh"
 

@@ -81,6 +81,14 @@ normalize_review_reasoning_effort() {
     esac
 }
 
+is_binary_staged_file() {
+    local staged_file="$1"
+    local numstat_line=""
+
+    numstat_line="$(git diff --cached --numstat --find-renames --no-color -- "$staged_file" | tail -n 1)"
+    [[ "$numstat_line" == $'-\t-\t'* ]]
+}
+
 review_reasoning_effort="$(normalize_review_reasoning_effort "$review_reasoning_effort")"
 
 if [[ "$review_reasoning_effort" != "$requested_review_reasoning_effort" ]]; then
@@ -108,6 +116,10 @@ fi
 
 if ! command -v jq >/dev/null 2>&1; then
     handle_review_infra_failure "jq is required for the optional review hook."
+fi
+
+if ! command -v iconv >/dev/null 2>&1; then
+    handle_review_infra_failure "iconv is required for the optional review hook."
 fi
 
 guidelines_path="$repo_root/docs/GUIDELINES.md"
@@ -194,8 +206,18 @@ while IFS= read -r staged_file; do
         continue
     fi
 
+    if is_binary_staged_file "$staged_file"; then
+        staged_file_contents+=$'\n'"--- FILE: ${staged_file} omitted because the staged diff is binary; review from the diff metadata instead ---"$'\n'
+        continue
+    fi
+
+    if ! file_content="$(git show ":${staged_file}" | iconv -f UTF-8 -t UTF-8 2>/dev/null)"; then
+        staged_file_contents+=$'\n'"--- FILE: ${staged_file} omitted because the staged contents are not valid UTF-8 ---"$'\n'
+        continue
+    fi
+
     staged_file_contents+=$'\n'"--- FILE: ${staged_file} ---"$'\n'
-    staged_file_contents+="$(git show ":${staged_file}")"
+    staged_file_contents+="$file_content"
     staged_file_contents+=$'\n'
 done <<< "$staged_files"
 
