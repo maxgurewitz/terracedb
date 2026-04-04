@@ -21,6 +21,7 @@ The Git hook at `.githooks/pre-commit` calls that script, which runs:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 
 The Codex review hook expects `jq` to be installed locally.
+The Codex review hook also expects `iconv` to be available locally.
 The FlatBuffers binding check expects `flatc` to be installed locally.
 
 ## Codex review hook
