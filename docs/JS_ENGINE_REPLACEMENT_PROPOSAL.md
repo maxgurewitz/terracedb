@@ -468,6 +468,85 @@ That plan remains:
 
 This document only changes the JavaScript engine substrate used underneath that architecture.
 
+## Node Integration Modes
+
+The rewritten runtime should support three Node-related operating modes.
+
+### 1. No Node injected
+
+This is the plain Terrace JavaScript runtime.
+
+In this mode:
+
+- no Node compatibility layer is installed
+- no Node builtin JavaScript is loaded
+- sandboxes run only Terrace-provided JavaScript functionality
+
+This is the simplest mode and should remain available for sandboxes that do not need Node.
+
+### 2. Node compatibility from VFS
+
+This is the transparent compatibility and debugging mode.
+
+In this mode:
+
+- Rust injects the Node primitive binding surface
+- the runtime loads upstream Node JavaScript from files on the sandbox VFS
+- startup follows the upstream Node bootstrap path as directly as possible
+
+This mode is intended for:
+
+- upstream Node compatibility tests
+- compatibility bring-up work
+- debugging and inspection when we want the Node JavaScript visible as normal files
+
+It is expected to be slower than production because each fresh runtime still has to load and
+prepare the Node JavaScript from the filesystem-backed source tree.
+
+### 3. Node compatibility from a host-prepared runtime package
+
+This is the production and high-throughput mode.
+
+In this mode:
+
+- Rust injects the same Node primitive binding surface as mode 2
+- the parent Rust process owns a prepared Node runtime package
+- sandbox startup reads Node from that host-owned package instead of walking `/node/...` files on
+  the sandbox VFS
+
+The preparation step for this mode is more than "keep Node source in memory". It should front-load
+the expensive work that does not need to be repeated for every sandbox.
+
+That preparation step may include:
+
+- collecting the Node JavaScript needed for bootstrap and core modules from the pinned Node source
+  tree
+- packaging that JavaScript into one host-managed runtime asset rather than many guest-visible
+  files
+- preprocessing that JavaScript into the runtime's compiled or otherwise ready-to-load internal
+  representation
+- recording builtin ids, module metadata, and version/digest information needed to validate that
+  the package matches the injected binding contract
+- loading that prepared package into host memory before sandbox startup when the embedding
+  application wants the lowest startup latency
+
+At sandbox startup, the host should then:
+
+- inject the Rust binding surface
+- attach the prepared Node runtime package
+- boot the sandbox's Node layer from that prepared package
+
+This means:
+
+- the application's own files still live on sandbox VFS
+- the Node runtime installation does not need to exist as a normal executable or source tree on the
+  sandbox VFS
+- production startup can avoid repeated filesystem reads and repeated preparation of the Node core
+  JavaScript
+
+Modes 2 and 3 must preserve the same guest-visible Node behavior. The difference is loading and
+startup strategy, not compatibility semantics.
+
 ## Relationship To Boa
 
 Boa remains useful as a source of implementation ideas and as a source of reusable non-runtime crates.
@@ -1148,6 +1227,97 @@ Run the existing Node compatibility plan on top of the new runtime substrate:
 - upstream Node JavaScript
 - Terrace-owned deterministic primitive bindings
 - upstream tests and ecosystem canaries
+
+### Phase 4.a: domain-backed scheduling and resource accounting
+
+Integrate the JavaScript runtime and the simulation harness with TerraceDB's domain model so tests
+and production use the same resource-control surface.
+
+This phase exists because:
+
+- simulation runs are intended to execute inside real applications, not only inside repo-local test
+  binaries
+- those applications already have domains and scheduler policy
+- JavaScript, Node, and other simulated components need globally coordinated resource limits rather
+  than independent local thread-pool limits
+
+The important design rule is:
+
+- the simulation harness is a client of domains
+- it is not a second scheduler with its own separate resource model
+
+The current harness-level `max_workers` style controls are acceptable as temporary safety valves,
+but they are not the long-term resource interface.
+
+Deliverables:
+
+- a domain-facing runtime resource model in `terracedb-js`
+- runtime allocation counters that are Terrace-owned rather than inferred from host RSS
+- a simulation-harness admission path that acquires domain capacity before starting case work
+- per-runtime memory budgets for JavaScript and Node sandboxes
+- aggregate suite-level memory budgets across all in-flight runtimes in one simulation run
+- explicit resource events so the domain can see allocation growth, release, and peak usage
+- a shared control path that can be used from:
+  - repo-local Rust tests
+  - production Rust code
+  - injected host APIs inside sandboxes
+
+The JavaScript runtime must report at least these allocation classes:
+
+- heap bytes
+- compiled artifact and code-block bytes
+- module cache bytes
+- external JavaScript-visible buffers and host-owned blobs
+- other runtime-owned structures that materially affect admission and memory pressure
+
+The Node compatibility layer in `terracedb-sandbox` must then map its own resource usage onto the
+same accounting model, including:
+
+- bootstrap and builtin module state
+- CommonJS and ESM module caches
+- `Buffer` / `ArrayBuffer`-backed external storage
+- child Node runtimes created through Node-compatible process spawning
+
+The simulation harness must evolve from:
+
+- fixed worker-count admission
+
+to:
+
+- domain-backed admission
+- domain-backed concurrency limits
+- domain-backed aggregate memory limits
+- per-case resource assertions
+
+Per-case assertions should be expressed in Terrace-owned terms, for example:
+
+- maximum heap bytes
+- maximum external-buffer bytes
+- maximum total runtime bytes
+- maximum aggregate bytes across the suite
+
+This is preferable to asserting host-process RSS because:
+
+- RSS is not a stable simulation metric
+- it mixes unrelated allocations
+- it does not map cleanly to per-runtime or per-suite ownership
+
+Implementation order:
+
+1. Add explicit runtime resource counters and peak tracking to `terracedb-js`.
+2. Thread those counters through `terracedb-sandbox` so Node runtimes report against the same
+   model.
+3. Extend the simulation harness so suite and case policies can declare memory budgets and resource
+   assertions.
+4. Replace harness-local concurrency admission with domain-backed admission.
+5. Make Node compatibility runs and production-hosted sandbox execution use the same domain-backed
+   path.
+
+Success criterion:
+
+- a simulation suite can cap in-flight Node and JavaScript runtime work through a domain policy
+- per-case and aggregate memory assertions can fail deterministically using Terrace-owned counters
+- the same resource-control path is used in repo tests and in production-hosted simulation runs
 
 ### Phase 5: portable runtime checkpoints
 

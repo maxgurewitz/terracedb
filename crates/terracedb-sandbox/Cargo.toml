@@ -6,11 +6,11 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.89"
 base64 = "0.22.1"
-boa_ast = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
-boa_engine = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
-boa_gc = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
-boa_interner = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
-boa_parser = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+boa_ast = { path = "/Users/maxwellgurewitz/dev/boa/core/ast" }
+boa_engine = { path = "/Users/maxwellgurewitz/dev/boa/core/engine" }
+boa_gc = { path = "/Users/maxwellgurewitz/dev/boa/core/gc" }
+boa_interner = { path = "/Users/maxwellgurewitz/dev/boa/core/interner" }
+boa_parser = { path = "/Users/maxwellgurewitz/dev/boa/core/parser" }
 brotli = "8.0.2"
 clap = { version = "4.5.40", features = ["derive"] }
 clap_lex = "0.7.6"

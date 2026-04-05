@@ -24,6 +24,7 @@ use boa_engine::{
     Context, Finalize, JsData, JsError, JsNativeError, JsResult, JsString, JsSymbol, JsValue,
     NativeFunction, Script, Source, Trace,
     builtins::promise::{OperationType, Promise, PromiseState},
+    class::{Class, ClassBuilder},
     context::HostHooks,
     job::JobCallback,
     job::NativeAsyncJob,
@@ -38,6 +39,7 @@ use boa_engine::{
     object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
     property::{Attribute, PropertyDescriptor, PropertyKey},
 };
+use boa_gc::runtime_stats as boa_gc_runtime_stats;
 use boa_interner::Interner;
 use boa_parser::{Parser as BoaParser, Source as BoaParserSource};
 use brotli::{CompressorReader as BrotliCompressorReader, Decompressor as BrotliDecompressor};
@@ -300,11 +302,153 @@ struct NodeModuleWrapState {
     error: Option<JsValue>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Trace, Finalize, JsData)]
 struct NodeContextifyScriptState {
     script: Script,
-    filename: String,
     cached_data: Option<JsValue>,
+    source_url: String,
+    source_map_url: Option<String>,
+    cached_data_rejected: Option<bool>,
+}
+
+impl Class for NodeContextifyScriptState {
+    const NAME: &'static str = "ContextifyScript";
+    const LENGTH: usize = 8;
+
+    fn init(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+        class.method(
+            js_string!("runInContext"),
+            5,
+            NativeFunction::from_fn_ptr(node_contextify_script_run_in_context),
+        );
+        class.method(
+            js_string!("createCachedData"),
+            0,
+            NativeFunction::from_fn_ptr(node_contextify_script_create_cached_data),
+        );
+        Ok(())
+    }
+
+    fn data_constructor(
+        _new_target: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<Self> {
+        let code = node_arg_string(args, 0, context)?;
+        let filename = node_arg_string(args, 1, context)?;
+        let line_offset = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(JsValue::undefined)
+            .to_i32(context)
+            .unwrap_or_default();
+        let column_offset = args
+            .get(3)
+            .cloned()
+            .unwrap_or_else(JsValue::undefined)
+            .to_i32(context)
+            .unwrap_or_default();
+        let cached_data =
+            node_contextify_cached_data_bytes(args.get(4), context).map_err(js_error)?;
+        let produce_cached_data = args.get(5).is_some_and(JsValue::to_boolean);
+        let (annotated_source_url, source_map_url) = node_extract_source_annotations(&code);
+        let source_url = annotated_source_url.unwrap_or_else(|| filename.clone());
+        let cache_bytes = node_contextify_compile_cache_bytes(
+            "script",
+            &code,
+            &filename,
+            line_offset,
+            column_offset,
+            &[],
+        )
+        .map_err(js_error)?;
+        let cached_data_rejected = cached_data.as_ref().map(|cached| *cached != cache_bytes);
+        let script = Script::parse(
+            Source::from_bytes(code.as_bytes()).with_path(&PathBuf::from(filename.clone())),
+            None,
+            context,
+        )
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?;
+
+        Ok(Self {
+            script,
+            cached_data: produce_cached_data
+                .then(|| node_js_buffer_from_bytes(cache_bytes, context))
+                .transpose()?,
+            source_url,
+            source_map_url,
+            cached_data_rejected,
+        })
+    }
+
+    fn object_constructor(
+        instance: &JsObject<Self>,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<()> {
+        let object = instance.clone().upcast();
+        let state = instance.borrow();
+        let source_url = state.data().source_url.clone();
+        let source_map_url = state.data().source_map_url.clone();
+        let cached_data_rejected = state.data().cached_data_rejected;
+        let cached_data = state.data().cached_data.clone();
+        drop(state);
+        object
+            .set(
+                PropertyKey::from(js_string!("sourceURL")),
+                JsValue::from(JsString::from(source_url)),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+        object
+            .set(
+                PropertyKey::from(js_string!("sourceMapURL")),
+                source_map_url
+                    .map(|value| JsValue::from(JsString::from(value)))
+                    .unwrap_or_else(JsValue::undefined),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+        if let Some(cached_data_rejected) = cached_data_rejected {
+            object
+                .set(
+                    PropertyKey::from(js_string!("cachedDataRejected")),
+                    JsValue::from(cached_data_rejected),
+                    true,
+                    context,
+                )
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?;
+        }
+        if let Some(cached_data) = cached_data {
+            object
+                .set(
+                    PropertyKey::from(js_string!("cachedDataProduced")),
+                    JsValue::from(true),
+                    true,
+                    context,
+                )
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?;
+            object
+                .set(
+                    PropertyKey::from(js_string!("cachedData")),
+                    cached_data,
+                    true,
+                    context,
+                )
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?;
+        }
+        node_contextify_attach_host_defined_option(&object, args.get(7).cloned(), context)
+            .map_err(js_error)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -668,7 +812,6 @@ struct NodeBootstrapState {
     permission_enabled: bool,
     bootstrap_completed: bool,
     blobs: NodeBlobTable,
-    contextify_scripts: BTreeMap<u64, NodeContextifyScriptState>,
     module_wraps: BTreeMap<u64, NodeModuleWrapState>,
     url_patterns: BTreeMap<u64, NodeUrlPatternState>,
     stream_handles: BTreeMap<u64, NodeStreamHandleState>,
@@ -744,6 +887,25 @@ struct NodeRuntimeDebugTrace {
     structured_events: Vec<NodeRuntimeTraceEvent>,
     recent_events: Vec<String>,
     last_exception: Option<NodeRuntimeExceptionSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+struct NodeRuntimeManagedMemoryStats {
+    total_bytes: u64,
+    loaded_module_count: usize,
+    loaded_module_bytes: u64,
+    materialized_module_count: usize,
+    open_file_count: usize,
+    open_file_bytes: u64,
+    process_dynamic_bytes: u64,
+    module_graph_file_cache_entries: usize,
+    module_graph_file_cache_bytes: u64,
+    module_graph_package_json_entries: usize,
+    module_graph_package_json_bytes: u64,
+    module_graph_lookup_bytes: u64,
+    runtime_module_cache_entries: usize,
+    runtime_module_cache_bytes: u64,
+    debug_trace_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2484,6 +2646,13 @@ fn execute_node_command_inner(
             .filter(|path| path.contains("/node_modules/"))
             .count();
         let debug_trace = node_host.debug_trace.borrow().clone();
+        let runtime_state_snapshot =
+            futures::executor::block_on(node_host.runtime_state.snapshot());
+        let managed_memory = node_runtime_managed_memory_stats(node_host, &runtime_state_snapshot);
+        let gc_stats = boa_gc_runtime_stats();
+        let accounted_bytes = managed_memory
+            .total_bytes
+            .saturating_add(gc_stats.bytes_allocated as u64);
 
         Ok(SandboxExecutionResult {
             backend: node_host.runtime_name.clone(),
@@ -2494,10 +2663,7 @@ fn execute_node_command_inner(
             package_imports: Vec::new(),
             cache_hits: Vec::new(),
             cache_misses: Vec::new(),
-            cache_entries: futures::executor::block_on(node_host.runtime_state.snapshot())
-                .module_cache
-                .into_values()
-                .collect(),
+            cache_entries: runtime_state_snapshot.module_cache.into_values().collect(),
             capability_calls: Vec::new(),
             metadata: BTreeMap::from([
                 (
@@ -2548,6 +2714,42 @@ fn execute_node_command_inner(
                     "node_runtime_last_exception".to_string(),
                     serde_json::to_value(&debug_trace.last_exception)
                         .map_err(sandbox_execution_error)?,
+                ),
+                (
+                    "node_runtime_managed_bytes".to_string(),
+                    JsonValue::from(managed_memory.total_bytes),
+                ),
+                (
+                    "node_runtime_managed_memory".to_string(),
+                    serde_json::to_value(&managed_memory).map_err(sandbox_execution_error)?,
+                ),
+                (
+                    "node_runtime_gc_bytes_allocated".to_string(),
+                    JsonValue::from(gc_stats.bytes_allocated as u64),
+                ),
+                (
+                    "node_runtime_gc_collections".to_string(),
+                    JsonValue::from(gc_stats.collections as u64),
+                ),
+                (
+                    "node_runtime_gc_threshold_bytes".to_string(),
+                    JsonValue::from(gc_stats.threshold as u64),
+                ),
+                (
+                    "node_runtime_gc_strong_count".to_string(),
+                    JsonValue::from(gc_stats.strong_count as u64),
+                ),
+                (
+                    "node_runtime_gc_weak_count".to_string(),
+                    JsonValue::from(gc_stats.weak_count as u64),
+                ),
+                (
+                    "node_runtime_gc_weak_map_count".to_string(),
+                    JsonValue::from(gc_stats.weak_map_count as u64),
+                ),
+                (
+                    "node_runtime_accounted_bytes".to_string(),
+                    JsonValue::from(accounted_bytes),
                 ),
             ]),
         })
@@ -3799,6 +4001,228 @@ fn node_runtime_progress_snapshot(
         process.stdout.len(),
         process.stderr.len(),
     )
+}
+
+fn node_runtime_managed_memory_stats(
+    host: &NodeRuntimeHost,
+    runtime_state: &SandboxRuntimeState,
+) -> NodeRuntimeManagedMemoryStats {
+    let loaded_modules = host.loaded_modules.borrow();
+    let loaded_module_bytes = loaded_modules
+        .iter()
+        .map(|(key, module)| {
+            (key.len() + module.runtime_path.len() + module.media_type.len() + module.source.len())
+                as u64
+        })
+        .sum::<u64>();
+
+    let materialized_module_count = host.materialized_modules.borrow().len();
+
+    let open_files = host.open_files.borrow();
+    let open_file_bytes = open_files
+        .entries
+        .values()
+        .map(|file| (file.path.len() + file.contents.len()) as u64)
+        .sum::<u64>();
+
+    let process = host.process.borrow();
+    let process_dynamic_bytes = (process.cwd.len() + process.stdout.len() + process.stderr.len())
+        as u64
+        + process
+            .argv
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + process
+            .exec_argv
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + process
+            .env
+            .iter()
+            .map(|(key, value)| (key.len() + value.len()) as u64)
+            .sum::<u64>();
+    drop(process);
+
+    let module_graph = host.module_graph.borrow();
+    let module_graph_file_cache_entries = module_graph.file_cache.len();
+    let module_graph_file_cache_bytes = module_graph
+        .file_cache
+        .iter()
+        .map(|(path, contents)| {
+            path.len() as u64
+                + contents
+                    .as_ref()
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default()
+        })
+        .sum::<u64>();
+    let module_graph_package_json_entries = module_graph.package_json_cache.len();
+    let module_graph_package_json_bytes = module_graph
+        .package_json_cache
+        .iter()
+        .map(|(path, value)| {
+            path.len() as u64
+                + value
+                    .as_ref()
+                    .and_then(|value| serde_json::to_vec(value).ok())
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default()
+        })
+        .sum::<u64>();
+    let module_graph_lookup_bytes = module_graph
+        .stat_cache
+        .keys()
+        .map(|value| value.len() as u64)
+        .sum::<u64>()
+        + module_graph
+            .nearest_package_root_cache
+            .iter()
+            .map(|(path, value)| {
+                path.len() as u64
+                    + value
+                        .as_ref()
+                        .map(|value| value.len() as u64)
+                        .unwrap_or_default()
+            })
+            .sum::<u64>()
+        + module_graph
+            .nearest_package_type_cache
+            .iter()
+            .map(|(path, value)| {
+                path.len() as u64
+                    + value
+                        .as_ref()
+                        .map(|value| value.len() as u64)
+                        .unwrap_or_default()
+            })
+            .sum::<u64>()
+        + module_graph
+            .node_modules_lookup_cache
+            .iter()
+            .map(|(path, values)| {
+                path.len() as u64 + values.iter().map(|value| value.len() as u64).sum::<u64>()
+            })
+            .sum::<u64>()
+        + module_graph
+            .file_or_directory_cache
+            .iter()
+            .map(|(key, value)| {
+                (key.base.len()
+                    + key
+                        .extensions
+                        .iter()
+                        .map(|value| value.len())
+                        .sum::<usize>()) as u64
+                    + value
+                        .as_ref()
+                        .map(|value| value.len() as u64)
+                        .unwrap_or_default()
+            })
+            .sum::<u64>()
+        + module_graph
+            .package_entry_cache
+            .iter()
+            .map(|(key, value)| {
+                (key.package_root.len()
+                    + key
+                        .subpath
+                        .as_ref()
+                        .map(|value| value.len())
+                        .unwrap_or_default()
+                    + key
+                        .extensions
+                        .iter()
+                        .map(|value| value.len())
+                        .sum::<usize>()) as u64
+                    + value
+                        .as_ref()
+                        .map(|value| value.len() as u64)
+                        .unwrap_or_default()
+            })
+            .sum::<u64>()
+        + module_graph
+            .resolve_path_cache
+            .iter()
+            .map(|(key, value)| {
+                (key.specifier.len()
+                    + key
+                        .referrer
+                        .as_ref()
+                        .map(|value| value.len())
+                        .unwrap_or_default()
+                    + key.paths.iter().map(|value| value.len()).sum::<usize>()
+                    + key
+                        .extensions
+                        .iter()
+                        .map(|value| value.len())
+                        .sum::<usize>()) as u64
+                    + value
+                        .as_ref()
+                        .map(|value| value.len() as u64)
+                        .unwrap_or_default()
+            })
+            .sum::<u64>();
+    drop(module_graph);
+
+    let runtime_module_cache_entries = runtime_state.module_cache.len();
+    let runtime_module_cache_bytes = runtime_state
+        .module_cache
+        .values()
+        .map(|entry| {
+            (entry.specifier.len()
+                + entry.runtime_path.len()
+                + entry.media_type.len()
+                + entry.cache_key.len()) as u64
+        })
+        .sum::<u64>();
+
+    let debug_trace = host.debug_trace.borrow();
+    let debug_trace_bytes = debug_trace
+        .recent_events
+        .iter()
+        .map(|value| value.len() as u64)
+        .sum::<u64>()
+        + debug_trace
+            .structured_events
+            .iter()
+            .filter_map(|value| serde_json::to_vec(value).ok())
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + debug_trace
+            .last_exception
+            .as_ref()
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .map(|value| value.len() as u64)
+            .unwrap_or_default();
+
+    let total_bytes = loaded_module_bytes
+        + open_file_bytes
+        + process_dynamic_bytes
+        + module_graph_file_cache_bytes
+        + module_graph_package_json_bytes
+        + module_graph_lookup_bytes
+        + runtime_module_cache_bytes
+        + debug_trace_bytes;
+
+    NodeRuntimeManagedMemoryStats {
+        total_bytes,
+        loaded_module_count: loaded_modules.len(),
+        loaded_module_bytes,
+        materialized_module_count,
+        open_file_count: open_files.entries.len(),
+        open_file_bytes,
+        process_dynamic_bytes,
+        module_graph_file_cache_entries,
+        module_graph_file_cache_bytes,
+        module_graph_package_json_entries,
+        module_graph_package_json_bytes,
+        module_graph_lookup_bytes,
+        runtime_module_cache_entries,
+        runtime_module_cache_bytes,
+        debug_trace_bytes,
+    }
 }
 
 fn node_run_microtask_checkpoint(
@@ -10783,46 +11207,9 @@ fn node_internal_binding_symbols(context: &mut Context) -> Result<JsObject, Sand
 
 fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
-    let script_prototype = JsObject::with_null_proto();
-    for (name, length, function) in [
-        (
-            "runInContext",
-            5usize,
-            node_contextify_script_run_in_context
-                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
-        ),
-        (
-            "createCachedData",
-            0usize,
-            node_contextify_script_create_cached_data,
-        ),
-    ] {
-        let value =
-            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-                .name(JsString::from(name))
-                .length(length)
-                .constructor(false)
-                .build();
-        script_prototype
-            .set(JsString::from(name), JsValue::from(value), true, context)
-            .map_err(sandbox_execution_error)?;
-    }
-    let script_constructor = FunctionObjectBuilder::new(
-        context.realm(),
-        NativeFunction::from_fn_ptr(node_contextify_script_construct),
-    )
-    .name(js_string!("ContextifyScript"))
-    .length(8)
-    .constructor(true)
-    .build();
-    script_constructor
-        .set(
-            js_string!("prototype"),
-            JsValue::from(script_prototype),
-            true,
-            context,
-        )
-        .map_err(sandbox_execution_error)?;
+    let mut script_class = ClassBuilder::new::<NodeContextifyScriptState>(context);
+    NodeContextifyScriptState::init(&mut script_class).map_err(sandbox_execution_error)?;
+    let script_constructor = script_class.build().constructor();
     object
         .set(
             js_string!("ContextifyScript"),
@@ -15866,145 +16253,11 @@ fn node_contextify_compile_function(
     Ok(JsValue::from(result))
 }
 
-fn node_contextify_script_construct(
-    this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
-    let host = active_node_host().map_err(js_error)?;
-    let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
-    let cached_data_symbol =
-        node_host_private_symbol(&host, "contextify.cached_data").map_err(js_error)?;
-    let target = this.as_object().ok_or_else(|| {
-        JsNativeError::typ().with_message("ContextifyScript receiver must be an object")
-    })?;
-    let code = node_arg_string(args, 0, context)?;
-    let filename = node_arg_string(args, 1, context)?;
-    let line_offset = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(JsValue::undefined)
-        .to_i32(context)
-        .unwrap_or_default();
-    let column_offset = args
-        .get(3)
-        .cloned()
-        .unwrap_or_else(JsValue::undefined)
-        .to_i32(context)
-        .unwrap_or_default();
-    let cached_data = node_contextify_cached_data_bytes(args.get(4), context).map_err(js_error)?;
-    let produce_cached_data = args.get(5).is_some_and(JsValue::to_boolean);
-    let host_defined_option_id = args.get(7).cloned();
-    let (annotated_source_url, source_map_url) = node_extract_source_annotations(&code);
-    let source_url = annotated_source_url.unwrap_or_else(|| filename.clone());
-    let cache_bytes = node_contextify_compile_cache_bytes(
-        "script",
-        &code,
-        &filename,
-        line_offset,
-        column_offset,
-        &[],
-    )
-    .map_err(js_error)?;
-    let cached_data_rejected = cached_data
-        .as_ref()
-        .map(|cached| *cached != cache_bytes)
-        .unwrap_or(false);
-    let script = Script::parse(
-        Source::from_bytes(code.as_bytes()).with_path(&PathBuf::from(filename.clone())),
-        None,
-        context,
-    )
-    .map_err(sandbox_execution_error)
-    .map_err(js_error)?;
-    for (key, value) in [
-        (
-            PropertyKey::from(js_string!("sourceURL")),
-            JsValue::from(JsString::from(source_url)),
-        ),
-        (
-            PropertyKey::from(js_string!("sourceMapURL")),
-            source_map_url
-                .map(|value| JsValue::from(JsString::from(value)))
-                .unwrap_or_else(JsValue::undefined),
-        ),
-    ] {
-        target
-            .set(key, value, true, context)
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-    }
-    if cached_data.is_some() {
-        target
-            .set(
-                PropertyKey::from(js_string!("cachedDataRejected")),
-                JsValue::from(cached_data_rejected),
-                true,
-                context,
-            )
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-    }
-    if produce_cached_data {
-        let cached_data_value = node_js_buffer_from_bytes(cache_bytes.clone(), context)?;
-        target
-            .set(
-                PropertyKey::from(cached_data_symbol.clone()),
-                cached_data_value.clone(),
-                true,
-                context,
-            )
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-        target
-            .set(
-                PropertyKey::from(js_string!("cachedDataProduced")),
-                JsValue::from(true),
-                true,
-                context,
-            )
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-        target
-            .set(
-                PropertyKey::from(js_string!("cachedData")),
-                cached_data_value,
-                true,
-                context,
-            )
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-    }
-    node_contextify_attach_host_defined_option(&target, host_defined_option_id, context)
-        .map_err(js_error)?;
-    node_with_host_js(context, |host, context| {
-        let id = node_next_host_handle_id(host);
-        target
-            .set(id_symbol, JsValue::from(id as f64), true, context)
-            .map_err(sandbox_execution_error)?;
-        host.bootstrap.borrow_mut().contextify_scripts.insert(
-            id,
-            NodeContextifyScriptState {
-                script,
-                filename,
-                cached_data: target
-                    .get(cached_data_symbol, context)
-                    .ok()
-                    .filter(|v| !v.is_undefined()),
-            },
-        );
-        Ok(JsValue::undefined())
-    })?;
-    Ok(JsValue::undefined())
-}
-
 fn node_contextify_script_run_in_context(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let host = active_node_host().map_err(js_error)?;
-    let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
     let target = this.as_object().ok_or_else(|| {
         JsNativeError::typ().with_message("ContextifyScript receiver must be an object")
     })?;
@@ -16040,20 +16293,14 @@ fn node_contextify_script_run_in_context(
     } else {
         None
     };
-    let script_id = target
-        .get(id_symbol, context)
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?
-        .to_number(context)
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)? as u64;
-    let script_state = host
-        .bootstrap
-        .borrow()
-        .contextify_scripts
-        .get(&script_id)
-        .cloned()
-        .ok_or_else(|| JsNativeError::error().with_message("unknown ContextifyScript handle"))?;
+    let script = target
+        .downcast_ref::<NodeContextifyScriptState>()
+        .ok_or_else(|| {
+            JsNativeError::typ()
+                .with_message("Script methods can only be called on script instances.")
+        })?
+        .script
+        .clone();
     let global = context.global_object().clone();
     let previous = if let Some(sandbox) = sandbox.as_ref() {
         Some(
@@ -16064,8 +16311,7 @@ fn node_contextify_script_run_in_context(
         None
     };
     let started_ms = node_with_host(|host| Ok(node_monotonic_now_ms(host))).map_err(js_error)?;
-    let result = script_state
-        .script
+    let result = script
         .evaluate(context)
         .map_err(sandbox_execution_error)
         .map_err(js_error);
@@ -16123,20 +16369,8 @@ fn node_contextify_script_create_cached_data(
     let target = this.as_object().ok_or_else(|| {
         JsNativeError::typ().with_message("ContextifyScript receiver must be an object")
     })?;
-    let host = active_node_host().map_err(js_error)?;
-    let id_symbol = node_host_private_symbol(&host, "contextify_script.id").map_err(js_error)?;
-    let script_id = target
-        .get(id_symbol, context)
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?
-        .to_number(context)
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)? as u64;
-    let cached_data = host
-        .bootstrap
-        .borrow()
-        .contextify_scripts
-        .get(&script_id)
+    let cached_data = target
+        .downcast_ref::<NodeContextifyScriptState>()
         .and_then(|state| state.cached_data.clone())
         .unwrap_or_else(JsValue::undefined);
     if cached_data.is_undefined() {
@@ -24956,7 +25190,9 @@ async fn open_js_runtime(
     let policy = runtime_policy_for_session(session, session_info);
     let loader: Arc<dyn terracedb_js::JsModuleLoader> = Arc::new(loader);
     let clock = Arc::new(FixedJsClock::new(session_info.updated_at.get()));
-    let entropy = Arc::new(DeterministicJsEntropySource::new(js_entropy_seed(session_info)));
+    let entropy = Arc::new(DeterministicJsEntropySource::new(js_entropy_seed(
+        session_info,
+    )));
     let runtime_host: Arc<dyn JsRuntimeHost> = match policy.compatibility_profile {
         JsCompatibilityProfile::TerraceOnly => Arc::new(
             DeterministicJsRuntimeHost::new(loader.clone(), host_services.clone())

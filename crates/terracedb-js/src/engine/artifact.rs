@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    path::Path,
-};
+use std::{collections::BTreeMap, path::Path};
 
 use boa_ast::{
     Declaration, Expression, ModuleItem, ModuleItemList, Spanned, Statement, StatementListItem,
@@ -13,12 +10,14 @@ use boa_ast::{
         Call, Identifier,
         access::{PropertyAccess, PropertyAccessField},
         literal::{Literal, LiteralKind, PropertyDefinition},
-        operator::{Assign, Binary, Unary},
         operator::assign::{AssignOp, AssignTarget},
         operator::binary::{ArithmeticOp, BinaryOp, LogicalOp, RelationalOp},
         operator::unary::UnaryOp,
+        operator::{Assign, Binary, Unary},
     },
-    function::{ArrowFunction, AsyncArrowFunction, FormalParameter, FunctionBody, FunctionExpression},
+    function::{
+        ArrowFunction, AsyncArrowFunction, FormalParameter, FunctionBody, FunctionExpression,
+    },
     property::PropertyName,
     scope::Scope,
 };
@@ -27,7 +26,9 @@ use boa_parser::{Parser, Source};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct JsCodeBlockId(pub u64);
 
@@ -141,29 +142,64 @@ pub struct JsCompiledArtifact {
 pub enum JsInstruction {
     PushUndefined,
     PushNull,
-    PushBool { value: bool },
-    PushNumber { value: f64 },
-    PushString { value: String },
-    PushBuiltin { name: String },
-    LoadName { name: String },
-    DeclareName { name: String, binding: JsBindingKind },
-    StoreName { name: String },
+    PushBool {
+        value: bool,
+    },
+    PushNumber {
+        value: f64,
+    },
+    PushString {
+        value: String,
+    },
+    PushBuiltin {
+        name: String,
+    },
+    LoadName {
+        name: String,
+    },
+    DeclareName {
+        name: String,
+        binding: JsBindingKind,
+    },
+    StoreName {
+        name: String,
+    },
     Pop,
     Dup,
     CreateObject,
-    CreateArray { element_count: usize },
-    DefineProperty { name: String },
-    GetProperty { name: String },
+    CreateArray {
+        element_count: usize,
+    },
+    DefineProperty {
+        name: String,
+    },
+    GetProperty {
+        name: String,
+    },
     GetPropertyDynamic,
-    SetProperty { name: String },
+    SetProperty {
+        name: String,
+    },
     SetPropertyDynamic,
-    CreateFunction { code_block: JsCodeBlockId, async_function: bool },
-    Call { argc: usize },
-    CallMethod { name: String, argc: usize },
+    CreateFunction {
+        code_block: JsCodeBlockId,
+        async_function: bool,
+    },
+    Call {
+        argc: usize,
+    },
+    CallMethod {
+        name: String,
+        argc: usize,
+    },
     Await,
     TypeOf,
-    Unary { op: JsUnaryOperator },
-    Binary { op: JsBinaryOperator },
+    Unary {
+        op: JsUnaryOperator,
+    },
+    Binary {
+        op: JsBinaryOperator,
+    },
     Return,
 }
 
@@ -284,7 +320,8 @@ impl JsArtifactCompiler {
         if block.instructions.is_empty() {
             block.instructions.push(JsInstruction::PushUndefined);
             block.instructions.push(JsInstruction::Return);
-            block.instruction_spans
+            block
+                .instruction_spans
                 .extend([JsSourceSpan::default(), JsSourceSpan::default()]);
         }
         let mut metadata = BTreeMap::new();
@@ -351,12 +388,7 @@ impl JsArtifactCompiler {
         let attributes = import
             .attributes()
             .iter()
-            .map(|attribute| {
-                (
-                    self.symbol(attribute.key()),
-                    self.symbol(attribute.value()),
-                )
-            })
+            .map(|attribute| (self.symbol(attribute.key()), self.symbol(attribute.value())))
             .collect::<BTreeMap<_, _>>();
         Ok(JsCompiledImport {
             request: self.symbol(import.specifier().sym()),
@@ -413,9 +445,9 @@ impl JsArtifactCompiler {
                 ModuleItem::StatementListItem(item) => statements.push(item.clone()),
                 ModuleItem::ExportDeclaration(export) => match export.as_ref() {
                     ExportDeclaration::VarStatement(var) => {
-                        statements.push(StatementListItem::Statement(Box::new(
-                            Statement::Var(var.clone()),
-                        )));
+                        statements.push(StatementListItem::Statement(Box::new(Statement::Var(
+                            var.clone(),
+                        ))));
                     }
                     ExportDeclaration::Declaration(declaration) => {
                         statements.push(StatementListItem::Declaration(Box::new(
@@ -556,16 +588,14 @@ impl JsArtifactCompiler {
             Declaration::Lexical(LexicalDeclaration::Let(list)) => {
                 self.compile_variable_list(list, JsBindingKind::Let, builder)
             }
-            Declaration::FunctionDeclaration(function) => {
-                self.compile_named_function(
-                    function.name(),
-                    function.parameters(),
-                    function.body(),
-                    false,
-                    builder,
-                    span_for(function),
-                )
-            }
+            Declaration::FunctionDeclaration(function) => self.compile_named_function(
+                function.name(),
+                function.parameters(),
+                function.body(),
+                false,
+                builder,
+                span_for(function),
+            ),
             unsupported => Err(JsCompileError::UnsupportedSyntax {
                 specifier: self.specifier.clone(),
                 detail: format!("unsupported declaration {unsupported:?}"),
@@ -582,12 +612,8 @@ impl JsArtifactCompiler {
         builder: &mut JsCodeBlockBuilder,
         span: JsSourceSpan,
     ) -> Result<(), JsCompileError> {
-        let function_id = self.compile_function_body(
-            self.identifier(name),
-            parameters,
-            body,
-            async_function,
-        )?;
+        let function_id =
+            self.compile_function_body(self.identifier(name), parameters, body, async_function)?;
         builder.push(
             JsInstruction::DeclareName {
                 name: self.identifier(name),
@@ -654,10 +680,7 @@ impl JsArtifactCompiler {
             } else {
                 builder.push(JsInstruction::PushUndefined, span_for(variable));
             }
-            builder.push(
-                JsInstruction::StoreName { name },
-                span_for(variable),
-            );
+            builder.push(JsInstruction::StoreName { name }, span_for(variable));
             builder.push(JsInstruction::Pop, span_for(variable));
         }
         Ok(())
@@ -1201,21 +1224,20 @@ state;
         .expect("compile script");
 
         assert_eq!(artifact.kind, JsCompiledArtifactKind::Script);
-        let block = artifact.code_blocks.get(&artifact.main).expect("main block");
+        let block = artifact
+            .code_blocks
+            .get(&artifact.main)
+            .expect("main block");
         assert_eq!(block.parameters, Vec::<String>::new());
-        assert!(
-            block.instructions.iter().any(|instruction| matches!(
-                instruction,
-                JsInstruction::DeclareName { name, binding: JsBindingKind::Const }
-                    if name == "state"
-            ))
-        );
-        assert!(
-            block.instructions.iter().any(|instruction| matches!(
-                instruction,
-                JsInstruction::CallMethod { name, argc: 1 } if name == "then"
-            ))
-        );
+        assert!(block.instructions.iter().any(|instruction| matches!(
+            instruction,
+            JsInstruction::DeclareName { name, binding: JsBindingKind::Const }
+                if name == "state"
+        )));
+        assert!(block.instructions.iter().any(|instruction| matches!(
+            instruction,
+            JsInstruction::CallMethod { name, argc: 1 } if name == "then"
+        )));
     }
 
     #[test]
@@ -1240,12 +1262,15 @@ export default { helper: helper.helper, echoed: response.echoed };
         assert_eq!(artifact.imports.len(), 2);
         assert_eq!(artifact.exports.len(), 1);
         assert_eq!(artifact.exports[0].exported_name, "default");
-        let block = artifact.code_blocks.get(&artifact.main).expect("main block");
+        let block = artifact
+            .code_blocks
+            .get(&artifact.main)
+            .expect("main block");
         assert!(
-            block.instructions.iter().any(|instruction| matches!(
-                instruction,
-                JsInstruction::Await
-            ))
+            block
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, JsInstruction::Await))
         );
     }
 

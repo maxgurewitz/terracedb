@@ -10,14 +10,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::{
     DeterministicJsEntropySource, FixedJsClock, JsCancellationToken, JsClock,
     JsContextServiceConfiguration, JsExecutionHooks, JsExecutionKind, JsExecutionReport,
-    JsExecutionRequest, JsForkPolicy, JsHeapObjectId,
-    JsHostServiceCallRecord, JsHostServiceRequest, JsHostServices,
-    JsLoadedModule, JsModuleGraphNode, JsModuleId, JsModuleLoader, JsResolvedModule,
-    JsRuntime, JsRuntimeAttachmentState, JsRuntimeConfiguration, JsRuntimeContext,
-    JsRuntimeEnvironment, JsRuntimeErrorReport, JsRuntimeHandle, JsRuntimeHost, JsRuntimeOpenRequest,
-    JsRuntimeSuspendedState, JsRuntimeTurn, JsRuntimeTurnCompletion, JsRuntimeTurnKind,
-    JsRuntimeTurnOutcome, JsScheduledTask, JsScheduler, JsSubstrateError, JsTaskQueue,
-    JsTraceEvent, JsTracePhase,
+    JsExecutionRequest, JsForkPolicy, JsHeapObjectId, JsHostServiceCallRecord,
+    JsHostServiceRequest, JsHostServices, JsLoadedModule, JsModuleGraphNode, JsModuleId,
+    JsModuleLoader, JsResolvedModule, JsRuntime, JsRuntimeAttachmentState, JsRuntimeConfiguration,
+    JsRuntimeContext, JsRuntimeEnvironment, JsRuntimeErrorReport, JsRuntimeHandle, JsRuntimeHost,
+    JsRuntimeOpenRequest, JsRuntimeSuspendedState, JsRuntimeTurn, JsRuntimeTurnCompletion,
+    JsRuntimeTurnKind, JsRuntimeTurnOutcome, JsScheduledTask, JsScheduler, JsSubstrateError,
+    JsTaskQueue, JsTraceEvent, JsTracePhase,
 };
 
 use super::{
@@ -249,7 +248,10 @@ impl JsRuntime for EngineJsRuntime {
 
         let mut next_turn = JsRuntimeTurn::evaluate_entrypoint(request.clone());
         loop {
-            match self.run_turn(next_turn.clone(), cancellation.clone()).await? {
+            match self
+                .run_turn(next_turn.clone(), cancellation.clone())
+                .await?
+            {
                 JsRuntimeTurnOutcome::Completed { completion } => {
                     if let Some(mut report) = completion.execution {
                         report.scheduled_tasks = self.scheduler.drain().await;
@@ -530,12 +532,8 @@ struct EngineFrame {
 enum EngineFrameKind {
     RootScript,
     Module { module_id: JsModuleId },
-    Call {
-        return_target: EngineReturnTarget,
-    },
-    Microtask {
-        promise_id: crate::JsPromiseId,
-    },
+    Call { return_target: EngineReturnTarget },
+    Microtask { promise_id: crate::JsPromiseId },
 }
 
 #[derive(Clone, Debug)]
@@ -670,11 +668,13 @@ impl EngineRuntimeState {
             JsExecutionKind::Module { specifier } => {
                 session.entrypoint = specifier.clone();
                 session.root_kind = EngineRootKind::Module;
-                session.pending_module_requests.push_back(EnginePendingModuleLoad {
-                    requested: specifier.clone(),
-                    referrer: None,
-                    parent: None,
-                });
+                session
+                    .pending_module_requests
+                    .push_back(EnginePendingModuleLoad {
+                        requested: specifier.clone(),
+                        referrer: None,
+                        parent: None,
+                    });
             }
             JsExecutionKind::Eval {
                 source,
@@ -689,10 +689,7 @@ impl EngineRuntimeState {
                 session.trace.push(JsTraceEvent {
                     phase: JsTracePhase::ModuleLoad,
                     label: specifier.clone(),
-                    metadata: BTreeMap::from([(
-                        "eval".to_string(),
-                        JsonValue::Bool(true),
-                    )]),
+                    metadata: BTreeMap::from([("eval".to_string(), JsonValue::Bool(true))]),
                 });
                 session.frames.push(EngineFrame {
                     code_block: artifact.main,
@@ -781,7 +778,11 @@ impl EngineRuntimeState {
         )?;
         self.define_binding(global_env_id, "Date", EngineValue::Object(date_object));
         self.define_binding(global_env_id, "Math", EngineValue::Object(math_object));
-        self.define_binding(global_env_id, "Promise", EngineValue::Object(promise_object));
+        self.define_binding(
+            global_env_id,
+            "Promise",
+            EngineValue::Object(promise_object),
+        );
         self.intrinsics_initialized = true;
         Ok(())
     }
@@ -834,7 +835,10 @@ impl EngineRuntimeState {
         }
     }
 
-    fn module_evaluation_order(&self, root: JsModuleId) -> Result<Vec<JsModuleId>, JsSubstrateError> {
+    fn module_evaluation_order(
+        &self,
+        root: JsModuleId,
+    ) -> Result<Vec<JsModuleId>, JsSubstrateError> {
         fn visit(
             current: JsModuleId,
             modules: &BTreeMap<JsModuleId, EngineModuleRecord>,
@@ -844,10 +848,13 @@ impl EngineRuntimeState {
             if !seen.insert(current) {
                 return Ok(());
             }
-            let module = modules.get(&current).ok_or_else(|| JsSubstrateError::EvaluationFailed {
-                entrypoint: format!("module-{current:?}"),
-                message: "missing module during evaluation ordering".to_string(),
-            })?;
+            let module =
+                modules
+                    .get(&current)
+                    .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+                        entrypoint: format!("module-{current:?}"),
+                        message: "missing module during evaluation ordering".to_string(),
+                    })?;
             for dependency in &module.dependencies {
                 visit(*dependency, modules, seen, order)?;
             }
@@ -878,13 +885,9 @@ impl EngineRuntimeState {
             }),
             JsRuntimeTurnKind::EvaluateEntrypoint { .. }
             | JsRuntimeTurnKind::DrainMicrotasks
-            | JsRuntimeTurnKind::DeliverHostCompletion { .. } => self.run_execution_turn(
-                handle,
-                environment,
-                clock_now_millis,
-                turn,
-                attached,
-            ),
+            | JsRuntimeTurnKind::DeliverHostCompletion { .. } => {
+                self.run_execution_turn(handle, environment, clock_now_millis, turn, attached)
+            }
             JsRuntimeTurnKind::EvaluateModule { .. }
             | JsRuntimeTurnKind::DeliverTimer { .. }
             | JsRuntimeTurnKind::DeliverTask { .. } => Err(JsSubstrateError::UnsupportedTurn {
@@ -911,19 +914,21 @@ impl EngineRuntimeState {
             return Ok(outcome);
         }
 
-        while self.execution.as_ref().is_some_and(|execution| !execution.frames.is_empty()) {
+        while self
+            .execution
+            .as_ref()
+            .is_some_and(|execution| !execution.frames.is_empty())
+        {
             let instruction = {
                 let execution = self.execution.as_ref().expect("execution session exists");
                 let frame = execution.frames.last().expect("frame exists");
                 let module = self.code_block(frame.code_block)?;
-                module
-                    .instructions
-                    .get(frame.pc)
-                    .cloned()
-                    .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+                module.instructions.get(frame.pc).cloned().ok_or_else(|| {
+                    JsSubstrateError::EvaluationFailed {
                         entrypoint: handle.runtime_id.clone(),
                         message: format!("program counter out of bounds in {}", module.label),
-                    })?
+                    }
+                })?
             };
             let outcome = self.execute_instruction(
                 handle,
@@ -941,11 +946,7 @@ impl EngineRuntimeState {
             return Ok(JsRuntimeTurnOutcome::PendingMicrotasks);
         }
 
-        if let Some(report) = self.try_finalize_report(
-            handle,
-            clock_now_millis,
-            Vec::new(),
-        )? {
+        if let Some(report) = self.try_finalize_report(handle, clock_now_millis, Vec::new())? {
             return Ok(JsRuntimeTurnOutcome::Completed {
                 completion: JsRuntimeTurnCompletion {
                     execution: Some(report),
@@ -1049,7 +1050,8 @@ impl EngineRuntimeState {
                 self.push_stack(value)?;
             }
             JsInstruction::LoadName { name } => {
-                let value = self.lookup_name(self.current_frame_env_id()?, &name)
+                let value = self
+                    .lookup_name(self.current_frame_env_id()?, &name)
                     .unwrap_or(EngineValue::Undefined);
                 self.push_stack(value)?;
             }
@@ -1120,14 +1122,19 @@ impl EngineRuntimeState {
                 code_block,
                 async_function,
             } => {
-                let function_id =
-                    self.allocate_function(code_block, self.current_frame_env_id()?, async_function);
+                let function_id = self.allocate_function(
+                    code_block,
+                    self.current_frame_env_id()?,
+                    async_function,
+                );
                 self.push_stack(EngineValue::Function(function_id))?;
             }
             JsInstruction::Call { argc } => {
                 let mut args = self.pop_arguments(argc);
                 let callee = self.pop_stack();
-                if let Some(outcome) = self.invoke_callable(callee, None, &mut args, handle, attached)? {
+                if let Some(outcome) =
+                    self.invoke_callable(callee, None, &mut args, handle, attached)?
+                {
                     return Ok(Some(outcome));
                 }
             }
@@ -1249,7 +1256,10 @@ impl EngineRuntimeState {
                         self.define_binding(
                             env_id,
                             default_binding,
-                            exports.get("default").cloned().unwrap_or(EngineValue::Undefined),
+                            exports
+                                .get("default")
+                                .cloned()
+                                .unwrap_or(EngineValue::Undefined),
                         );
                     }
                     if let Some(namespace_binding) = &import.namespace_binding {
@@ -1465,17 +1475,19 @@ impl EngineRuntimeState {
                     });
             }
             EngineValue::HostFunction(host) => {
-                let value = self.invoke_host_function(
-                    host,
-                    None,
-                    vec![microtask.argument],
-                )?;
+                let value = self.invoke_host_function(host, None, vec![microtask.argument])?;
                 match value {
                     HostInvocation::Immediate(result) => {
                         self.resolve_promise(microtask.chained_promise, result)?;
                     }
-                    HostInvocation::Pending { promise_id, op_id: _ } => {
-                        self.resolve_promise(microtask.chained_promise, EngineValue::Promise(promise_id))?;
+                    HostInvocation::Pending {
+                        promise_id,
+                        op_id: _,
+                    } => {
+                        self.resolve_promise(
+                            microtask.chained_promise,
+                            EngineValue::Promise(promise_id),
+                        )?;
                         return Ok(());
                     }
                 }
@@ -1527,13 +1539,12 @@ impl EngineRuntimeState {
         &self,
         op_id: crate::JsHostOpId,
     ) -> Result<EnginePendingOperation, JsSubstrateError> {
-        self.pending_host_ops
-            .get(&op_id)
-            .cloned()
-            .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+        self.pending_host_ops.get(&op_id).cloned().ok_or_else(|| {
+            JsSubstrateError::EvaluationFailed {
                 entrypoint: format!("host-op-{}", op_id.get()),
                 message: "missing pending host operation".to_string(),
-            })
+            }
+        })
     }
 
     fn accept_host_completion(
@@ -1554,20 +1565,18 @@ impl EngineRuntimeState {
         &mut self,
         op_id: crate::JsHostOpId,
     ) -> Result<(), JsSubstrateError> {
-        let completion = self
-            .completed_host_ops
-            .remove(&op_id)
-            .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+        let completion = self.completed_host_ops.remove(&op_id).ok_or_else(|| {
+            JsSubstrateError::EvaluationFailed {
                 entrypoint: format!("host-op-{}", op_id.get()),
                 message: "missing completed host operation".to_string(),
-            })?;
-        let pending = self
-            .pending_host_ops
-            .remove(&op_id)
-            .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+            }
+        })?;
+        let pending = self.pending_host_ops.remove(&op_id).ok_or_else(|| {
+            JsSubstrateError::EvaluationFailed {
                 entrypoint: format!("host-op-{}", op_id.get()),
                 message: "missing pending host operation".to_string(),
-            })?;
+            }
+        })?;
         match pending {
             EnginePendingOperation::HostService(call) => {
                 let record = JsHostServiceCallRecord {
@@ -1666,11 +1675,13 @@ impl EngineRuntimeState {
 
         if let Some(execution) = self.execution.as_mut() {
             for request in dependency_requests {
-                execution.pending_module_requests.push_back(EnginePendingModuleLoad {
-                    requested: request,
-                    referrer: Some(loaded.resolved.canonical_specifier.clone()),
-                    parent: Some(module_id),
-                });
+                execution
+                    .pending_module_requests
+                    .push_back(EnginePendingModuleLoad {
+                        requested: request,
+                        referrer: Some(loaded.resolved.canonical_specifier.clone()),
+                        parent: Some(module_id),
+                    });
             }
         }
         Ok(())
@@ -1811,30 +1822,32 @@ impl EngineRuntimeState {
                     });
                 Ok(None)
             }
-            EngineValue::HostFunction(host) => match self.invoke_host_function(host, receiver, args.clone())? {
-                HostInvocation::Immediate(value) => {
-                    self.execution
-                        .as_mut()
-                        .expect("execution exists")
-                        .frames
-                        .last_mut()
-                        .expect("frame exists")
-                        .stack
-                        .push(value);
-                    Ok(None)
+            EngineValue::HostFunction(host) => {
+                match self.invoke_host_function(host, receiver, args.clone())? {
+                    HostInvocation::Immediate(value) => {
+                        self.execution
+                            .as_mut()
+                            .expect("execution exists")
+                            .frames
+                            .last_mut()
+                            .expect("frame exists")
+                            .stack
+                            .push(value);
+                        Ok(None)
+                    }
+                    HostInvocation::Pending { promise_id, op_id } => {
+                        self.execution
+                            .as_mut()
+                            .expect("execution exists")
+                            .frames
+                            .last_mut()
+                            .expect("frame exists")
+                            .stack
+                            .push(EngineValue::Promise(promise_id));
+                        Ok(Some(JsRuntimeTurnOutcome::PendingHostOp { op_id }))
+                    }
                 }
-                HostInvocation::Pending { promise_id, op_id } => {
-                    self.execution
-                        .as_mut()
-                        .expect("execution exists")
-                        .frames
-                        .last_mut()
-                        .expect("frame exists")
-                        .stack
-                        .push(EngineValue::Promise(promise_id));
-                    Ok(Some(JsRuntimeTurnOutcome::PendingHostOp { op_id }))
-                }
-            },
+            }
             unsupported => Err(JsSubstrateError::EvaluationFailed {
                 entrypoint: handle.runtime_id.clone(),
                 message: format!("value is not callable: {unsupported:?}"),
@@ -1852,9 +1865,9 @@ impl EngineRuntimeState {
             EngineHostFunction::DateNow => Ok(HostInvocation::Immediate(EngineValue::Number(
                 self.current_clock_now_millis as f64,
             ))),
-            EngineHostFunction::MathRandom => {
-                Ok(HostInvocation::Immediate(EngineValue::Number(self.next_random_f64())))
-            }
+            EngineHostFunction::MathRandom => Ok(HostInvocation::Immediate(EngineValue::Number(
+                self.next_random_f64(),
+            ))),
             EngineHostFunction::PromiseResolve => {
                 let promise_id = self.next_promise_id();
                 self.promises.insert(
@@ -1941,12 +1954,17 @@ impl EngineRuntimeState {
                     }
                 }
                 let _ = receiver;
-                Ok(HostInvocation::Immediate(EngineValue::Promise(chained_promise)))
+                Ok(HostInvocation::Immediate(EngineValue::Promise(
+                    chained_promise,
+                )))
             }
         }
     }
 
-    fn code_block(&self, code_block: JsCodeBlockId) -> Result<&JsCompiledCodeBlock, JsSubstrateError> {
+    fn code_block(
+        &self,
+        code_block: JsCodeBlockId,
+    ) -> Result<&JsCompiledCodeBlock, JsSubstrateError> {
         self.modules
             .values()
             .find_map(|module| module.artifact.code_blocks.get(&code_block))
@@ -1961,19 +1979,22 @@ impl EngineRuntimeState {
         module_id: JsModuleId,
         request: &str,
     ) -> Result<JsModuleId, JsSubstrateError> {
-        let module = self.modules.get(&module_id).ok_or_else(|| JsSubstrateError::EvaluationFailed {
-            entrypoint: format!("module-{}", module_id.get()),
-            message: "module record missing".to_string(),
-        })?;
+        let module =
+            self.modules
+                .get(&module_id)
+                .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+                    entrypoint: format!("module-{}", module_id.get()),
+                    message: "module record missing".to_string(),
+                })?;
         let dependency = module
             .dependencies
             .iter()
             .copied()
             .find(|dependency| {
-                self.modules
-                    .get(dependency)
-                    .is_some_and(|module| module.resolved.requested_specifier == request
-                        || module.resolved.canonical_specifier == request)
+                self.modules.get(dependency).is_some_and(|module| {
+                    module.resolved.requested_specifier == request
+                        || module.resolved.canonical_specifier == request
+                })
             })
             .ok_or_else(|| JsSubstrateError::EvaluationFailed {
                 entrypoint: module.resolved.canonical_specifier.clone(),
@@ -2009,13 +2030,13 @@ impl EngineRuntimeState {
         name: impl Into<String>,
         value: EngineValue,
     ) -> Result<(), JsSubstrateError> {
-        let object = self
-            .objects
-            .get_mut(&object_id)
-            .ok_or_else(|| JsSubstrateError::EvaluationFailed {
-                entrypoint: format!("object-{}", object_id.get()),
-                message: "object not found".to_string(),
-            })?;
+        let object =
+            self.objects
+                .get_mut(&object_id)
+                .ok_or_else(|| JsSubstrateError::EvaluationFailed {
+                    entrypoint: format!("object-{}", object_id.get()),
+                    message: "object not found".to_string(),
+                })?;
         object.properties.insert(name.into(), value);
         Ok(())
     }
@@ -2193,7 +2214,9 @@ impl EngineValue {
                     object
                         .properties
                         .iter()
-                        .filter_map(|(key, value)| value.to_json(state).map(|value| (key.clone(), value)))
+                        .filter_map(|(key, value)| {
+                            value.to_json(state).map(|value| (key.clone(), value))
+                        })
                         .collect(),
                 )
             }),
@@ -2294,7 +2317,9 @@ fn to_number(value: &EngineValue) -> f64 {
         }
         EngineValue::Number(value) => *value,
         EngineValue::String(value) => value.parse::<f64>().unwrap_or(f64::NAN),
-        EngineValue::Object(_) | EngineValue::Function(_) | EngineValue::HostFunction(_) => f64::NAN,
+        EngineValue::Object(_) | EngineValue::Function(_) | EngineValue::HostFunction(_) => {
+            f64::NAN
+        }
         EngineValue::Promise(_) => f64::NAN,
     }
 }
@@ -2369,24 +2394,19 @@ fn compile_error_to_substrate(error: JsCompileError) -> JsSubstrateError {
     }
 }
 
-fn encode_loaded_module_completion(
-    loaded: &JsLoadedModule,
-) -> Result<JsonValue, JsSubstrateError> {
+fn encode_loaded_module_completion(loaded: &JsLoadedModule) -> Result<JsonValue, JsSubstrateError> {
     serde_json::to_value(loaded).map_err(JsSubstrateError::from)
 }
 
 fn decode_loaded_module_completion(
     completion: &crate::JsCompletedHostOperation,
 ) -> Result<JsLoadedModule, JsSubstrateError> {
-    serde_json::from_value(
-        completion
-            .result
-            .clone()
-            .ok_or_else(|| JsSubstrateError::EvaluationFailed {
-                entrypoint: format!("host-op-{}", completion.op_id.get()),
-                message: "module load completion was missing a payload".to_string(),
-            })?,
-    )
+    serde_json::from_value(completion.result.clone().ok_or_else(|| {
+        JsSubstrateError::EvaluationFailed {
+            entrypoint: format!("host-op-{}", completion.op_id.get()),
+            message: "module load completion was missing a payload".to_string(),
+        }
+    })?)
     .map_err(JsSubstrateError::from)
 }
 
@@ -2399,11 +2419,11 @@ mod tests {
 
     use crate::{
         DeterministicJsEntropySource, DeterministicJsHostServices, DeterministicJsRuntimeHost,
-        DeterministicJsServiceOutcome, FixedJsClock, JsCompletedHostOperation,
-        JsExecutionRequest, JsForkPolicy, JsLoadedModule, JsModuleKind,
-        JsModuleLoader, JsResolvedModule, JsRuntime, JsRuntimeEnvironment, JsRuntimeHost,
-        JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsRuntimeTurn,
-        JsRuntimeTurnKind, JsRuntimeTurnOutcome, JsSubstrateError, NeverCancel,
+        DeterministicJsServiceOutcome, FixedJsClock, JsCompletedHostOperation, JsExecutionRequest,
+        JsForkPolicy, JsLoadedModule, JsModuleKind, JsModuleLoader, JsResolvedModule, JsRuntime,
+        JsRuntimeEnvironment, JsRuntimeHost, JsRuntimeOpenRequest, JsRuntimePolicy,
+        JsRuntimeProvenance, JsRuntimeTurn, JsRuntimeTurnKind, JsRuntimeTurnOutcome,
+        JsSubstrateError, NeverCancel,
     };
 
     use super::EngineJsRuntimeHost;
@@ -2453,30 +2473,36 @@ mod tests {
             })
         }
 
-        async fn load(&self, resolved: &JsResolvedModule) -> Result<JsLoadedModule, JsSubstrateError> {
+        async fn load(
+            &self,
+            resolved: &JsResolvedModule,
+        ) -> Result<JsLoadedModule, JsSubstrateError> {
             match resolved.kind {
                 JsModuleKind::HostCapability => Ok(JsLoadedModule {
                     resolved: resolved.clone(),
                     source: String::new(),
                     trace: Vec::new(),
                     metadata: BTreeMap::from([
-                        (
-                            "host_service".to_string(),
-                            json!("capability"),
-                        ),
+                        ("host_service".to_string(), json!("capability")),
                         (
                             "host_exports".to_string(),
-                            json!([resolved.canonical_specifier.rsplit('/').next().unwrap_or("invoke")]),
+                            json!([resolved
+                                .canonical_specifier
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("invoke")]),
                         ),
                     ]),
                 }),
                 JsModuleKind::Workspace => Ok(JsLoadedModule {
                     resolved: resolved.clone(),
-                    source: self.modules.get(&resolved.canonical_specifier).cloned().ok_or_else(|| {
-                        JsSubstrateError::ModuleNotFound {
+                    source: self
+                        .modules
+                        .get(&resolved.canonical_specifier)
+                        .cloned()
+                        .ok_or_else(|| JsSubstrateError::ModuleNotFound {
                             specifier: resolved.canonical_specifier.clone(),
-                        }
-                    })?,
+                        })?,
                     trace: Vec::new(),
                     metadata: BTreeMap::new(),
                 }),
@@ -2600,7 +2626,10 @@ export default {
             }))
         );
         assert_eq!(report.host_calls.len(), 1);
-        assert_eq!(report.host_calls[0].arguments, json!({ "message": "from helper" }));
+        assert_eq!(
+            report.host_calls[0].arguments,
+            json!({ "message": "from helper" })
+        );
         assert_eq!(
             report.module_graph,
             vec![
@@ -2619,16 +2648,14 @@ export default {
 
     #[tokio::test]
     async fn engine_runtime_exposes_pending_host_completion_across_turns() {
-        let loader: Arc<dyn JsModuleLoader> = Arc::new(
-            StaticModuleLoader::default().with_module(
-                "terrace:/workspace/main.mjs",
-                r#"
+        let loader: Arc<dyn JsModuleLoader> = Arc::new(StaticModuleLoader::default().with_module(
+            "terrace:/workspace/main.mjs",
+            r#"
 import { echo } from "terrace:host/echo";
 const response = await echo({ message: "manual" });
 export default { echoed: response.echoed };
 "#,
-            ),
-        );
+        ));
         let runtime = open_runtime(
             Arc::new(
                 EngineJsRuntimeHost::new(loader, Arc::new(DeterministicJsHostServices::new()))
@@ -2694,20 +2721,21 @@ export default { echoed: response.echoed };
         };
         assert_eq!(report.result, Some(json!({ "echoed": "manual" })));
         assert_eq!(report.host_calls.len(), 1);
-        assert_eq!(report.host_calls[0].arguments, json!({ "message": "manual" }));
+        assert_eq!(
+            report.host_calls[0].arguments,
+            json!({ "message": "manual" })
+        );
     }
 
     #[tokio::test]
     async fn engine_runtime_drains_promise_microtasks_in_follow_up_turns() {
-        let loader: Arc<dyn JsModuleLoader> = Arc::new(
-            StaticModuleLoader::default().with_module(
-                "terrace:/workspace/main.mjs",
-                r#"
+        let loader: Arc<dyn JsModuleLoader> = Arc::new(StaticModuleLoader::default().with_module(
+            "terrace:/workspace/main.mjs",
+            r#"
 const result = await Promise.resolve("ok").then((value) => value + "!");
 export default { result };
 "#,
-            ),
-        );
+        ));
         let runtime = open_runtime(
             Arc::new(
                 EngineJsRuntimeHost::new(loader, Arc::new(DeterministicJsHostServices::new()))

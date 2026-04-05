@@ -11,13 +11,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use terracedb_systemtest::{
-    SimulationCaseSpec, SimulationHarness, SimulationHarnessError, SimulationSuiteDefinition,
-    SimulationSuiteReport,
+use terracedb::{
+    DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath,
+    ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionResourceUsage, InMemoryResourceManager,
 };
 use terracedb_sandbox::{
     ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer, SandboxConfig, SandboxError,
     SandboxHarness, SandboxServices,
+};
+use terracedb_systemtest::{
+    SimulationCaseSpec, SimulationDomainConfig, SimulationHarness, SimulationHarnessError,
+    SimulationSuiteDefinition, SimulationSuiteReport,
 };
 use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId};
 use tokio::sync::OnceCell;
@@ -27,6 +31,10 @@ mod tracing_support;
 
 const CACHED_NODE_BASE_VOLUME_ID: VolumeId = VolumeId::new(0xA9F0_0000_0000_0001);
 const SESSION_VOLUME_BASE: u128 = 0xAAF0_0000_0000_0000;
+const GENERATED_UPSTREAM_NODE_MAX_WORKERS: usize = 3;
+const GENERATED_UPSTREAM_NODE_TOTAL_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+const GENERATED_UPSTREAM_NODE_MIN_CASE_MEMORY_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
+const GENERATED_UPSTREAM_NODE_CASE_MEMORY_HEADROOM_MULTIPLIER: u64 = 2;
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 static SHARED_UPSTREAM_NODE_HARNESS: OnceCell<SandboxHarness<InMemoryVfsStore>> =
     OnceCell::const_new();
@@ -56,6 +64,15 @@ struct GeneratedUpstreamNodeFixture {
 
 struct GeneratedUpstreamNodeSuite {
     cases: &'static [GeneratedUpstreamNodeCase],
+    case_requested_usage: ExecutionResourceUsage,
+    per_case_accounted_memory_budget_bytes: u64,
+    calibration_case_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GeneratedUpstreamNodeBudget {
+    case_requested_usage: ExecutionResourceUsage,
+    per_case_accounted_memory_budget_bytes: u64,
 }
 
 async fn shared_upstream_node_harness() -> &'static SandboxHarness<InMemoryVfsStore> {
@@ -223,14 +240,113 @@ pub async fn exec_upstream_node_test(
 pub async fn run_generated_upstream_node_suite(
     cases: &'static [GeneratedUpstreamNodeCase],
 ) -> Result<SimulationSuiteReport, SimulationHarnessError> {
+    if cases.is_empty() {
+        return Ok(SimulationSuiteReport::default());
+    }
+    let budget = calibrate_generated_upstream_node_budget(cases).await?;
+    let resource_manager = Arc::new(InMemoryResourceManager::new(
+        ExecutionDomainBudget::default(),
+    ));
     SimulationHarness::new()
-        .with_max_workers(
-            std::thread::available_parallelism()
-                .map(|value| value.get())
-                .unwrap_or(1),
-        )
-        .run_suite(Arc::new(GeneratedUpstreamNodeSuite { cases }))
+        .with_max_workers(GENERATED_UPSTREAM_NODE_MAX_WORKERS)
+        .with_domain(SimulationDomainConfig {
+            resource_manager,
+            domain_spec: ExecutionDomainSpec {
+                path: ExecutionDomainPath::new(["process", "sandbox-tests", "node-compat"]),
+                owner: ExecutionDomainOwner::Subsystem {
+                    database: None,
+                    name: "node-compat".to_string(),
+                },
+                budget: ExecutionDomainBudget {
+                    cpu: DomainCpuBudget {
+                        worker_slots: Some(GENERATED_UPSTREAM_NODE_MAX_WORKERS as u32),
+                        weight: Some(GENERATED_UPSTREAM_NODE_MAX_WORKERS as u32),
+                    },
+                    memory: terracedb::DomainMemoryBudget {
+                        total_bytes: Some(GENERATED_UPSTREAM_NODE_TOTAL_MEMORY_BUDGET_BYTES),
+                        cache_bytes: None,
+                        mutable_bytes: None,
+                    },
+                    ..Default::default()
+                },
+                placement: ExecutionDomainPlacement::Dedicated,
+                metadata: BTreeMap::from([(
+                    "terracedb.systemtest.suite".to_string(),
+                    "generated-node-upstream".to_string(),
+                )]),
+            },
+            default_case_usage: budget.case_requested_usage,
+        })
+        .run_suite(Arc::new(GeneratedUpstreamNodeSuite {
+            cases,
+            case_requested_usage: budget.case_requested_usage,
+            per_case_accounted_memory_budget_bytes: budget.per_case_accounted_memory_budget_bytes,
+            calibration_case_id: cases[0].case_id.to_string(),
+        }))
         .await
+}
+
+async fn calibrate_generated_upstream_node_budget(
+    cases: &'static [GeneratedUpstreamNodeCase],
+) -> Result<GeneratedUpstreamNodeBudget, SimulationHarnessError> {
+    let calibration_case = cases[0];
+    let harness = SandboxHarness::deterministic(510, 121, SandboxServices::deterministic());
+    SandboxBaseLayer::vendored_node_v24_14_1_js_tree()
+        .ensure_volume(harness.volumes().as_ref(), CACHED_NODE_BASE_VOLUME_ID)
+        .await
+        .map_err(|error| SimulationHarnessError::Setup {
+            message: format!("import calibration node base layer: {error}"),
+        })?;
+    let result = exec_upstream_node_test_in_harness(
+        &harness,
+        CACHED_NODE_BASE_VOLUME_ID,
+        calibration_case.path,
+    )
+    .await
+    .map_err(|error| SimulationHarnessError::Runtime {
+        message: format!(
+            "sandbox execution failed for calibration case {}: {error}",
+            calibration_case.path
+        ),
+    })?;
+    let accounted_bytes =
+        node_runtime_accounted_bytes(&result).ok_or_else(|| SimulationHarnessError::Runtime {
+            message: format!(
+                "node runtime did not publish accounted memory stats for calibration case {}",
+                calibration_case.path
+            ),
+        })?;
+    let per_case_accounted_memory_budget_bytes = accounted_bytes
+        .max(GENERATED_UPSTREAM_NODE_MIN_CASE_MEMORY_BUDGET_BYTES)
+        .saturating_mul(GENERATED_UPSTREAM_NODE_CASE_MEMORY_HEADROOM_MULTIPLIER);
+    Ok(GeneratedUpstreamNodeBudget {
+        case_requested_usage: ExecutionResourceUsage {
+            cpu_workers: 1,
+            memory_bytes: per_case_accounted_memory_budget_bytes,
+            ..Default::default()
+        },
+        per_case_accounted_memory_budget_bytes,
+    })
+}
+
+fn node_runtime_accounted_bytes(result: &terracedb_sandbox::SandboxExecutionResult) -> Option<u64> {
+    result
+        .metadata
+        .get("node_runtime_accounted_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            result
+                .metadata
+                .get("node_runtime_managed_bytes")
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
+fn node_runtime_managed_bytes(result: &terracedb_sandbox::SandboxExecutionResult) -> Option<u64> {
+    result
+        .metadata
+        .get("node_runtime_managed_bytes")
+        .and_then(serde_json::Value::as_u64)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -344,6 +460,7 @@ impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
                     case,
                     Duration::from_secs(case.timeout_secs),
                 )
+                .with_requested_usage(self.case_requested_usage)
             })
             .collect())
     }
@@ -368,6 +485,26 @@ impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
                 message: format!(
                     "non-zero exit for {}\nexit: {}\nstdout:\n{}\nstderr:\n{}",
                     case.input.path, exit_code, stdout, stderr
+                ),
+            });
+        }
+        let accounted_bytes = node_runtime_accounted_bytes(&result).ok_or_else(|| {
+            SimulationHarnessError::Runtime {
+                message: format!(
+                    "missing node runtime accounted memory stats for {}",
+                    case.input.path
+                ),
+            }
+        })?;
+        if accounted_bytes > self.per_case_accounted_memory_budget_bytes {
+            return Err(SimulationHarnessError::Runtime {
+                message: format!(
+                    "node runtime accounted memory budget exceeded for {}\naccounted_bytes: {}\nmanaged_bytes: {:?}\nper_case_budget_bytes: {}\ncalibration_case: {}",
+                    case.input.path,
+                    accounted_bytes,
+                    node_runtime_managed_bytes(&result),
+                    self.per_case_accounted_memory_budget_bytes,
+                    self.calibration_case_id,
                 ),
             });
         }

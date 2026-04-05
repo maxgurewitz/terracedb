@@ -3719,6 +3719,7 @@ dependencies = [
  "async-trait",
  "futures",
  "serde",
+ "terracedb",
  "terracedb-fuzz",
  "terracedb-http",
  "terracedb-simulation",

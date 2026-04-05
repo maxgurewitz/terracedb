@@ -298,10 +298,12 @@ impl VolumeArtifactBuilder {
         let path = normalize_path(path)?;
         self.ensure_parent_directories(&path)?;
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).map_err(|error| VfsError::StreamRead {
-            operation: "volume_artifact_builder.add_file_from_reader",
-            message: error.to_string(),
-        })?;
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| VfsError::StreamRead {
+                operation: "volume_artifact_builder.add_file_from_reader",
+                message: error.to_string(),
+            })?;
         let inode_id = self.allocate_inode();
         if !bytes.is_empty() {
             let payload = encode_bytes_payload_to_spool(&bytes, &mut self.encoded_payloads.spool)?;
@@ -393,7 +395,9 @@ impl VolumeArtifactBuilder {
                 path: path.to_string(),
             });
         }
-        self.snapshot.paths.insert(path.to_string(), record.stats.inode);
+        self.snapshot
+            .paths
+            .insert(path.to_string(), record.stats.inode);
         self.snapshot.inodes.insert(record.stats.inode, record);
         Ok(())
     }
@@ -1370,7 +1374,8 @@ impl VfsFileSystem for InMemoryOverlayFileSystem {
     ) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let opts = opts.clone();
-        let (content, size) = file_content_from_reader(reader, self.overlay.delta.info().chunk_size)?;
+        let (content, size) =
+            file_content_from_reader(reader, self.overlay.delta.info().chunk_size)?;
         let base = self.overlay.base.clone();
         self.overlay.delta.mutate(|state, now| {
             if let Some(resolved_path) =
@@ -5009,10 +5014,12 @@ fn file_content_from_reader(
     let mut chunk_index = 0_u64;
     let mut buffer = vec![0_u8; chunk_size as usize];
     loop {
-        let bytes_read = reader.read(&mut buffer).map_err(|error| VfsError::StreamRead {
-            operation: "write_file_from_reader",
-            message: error.to_string(),
-        })?;
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|error| VfsError::StreamRead {
+                operation: "write_file_from_reader",
+                message: error.to_string(),
+            })?;
         if bytes_read == 0 {
             break;
         }

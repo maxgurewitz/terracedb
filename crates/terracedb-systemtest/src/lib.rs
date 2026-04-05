@@ -25,8 +25,8 @@ pub mod simulation {
 }
 
 pub use harness::{
-    SimulationCaseReport, SimulationCaseSpec, SimulationCaseStatus, SimulationHarness,
-    SimulationHarnessConfig, SimulationHarnessError, SimulationSuiteDefinition,
+    SimulationCaseReport, SimulationCaseSpec, SimulationCaseStatus, SimulationDomainConfig,
+    SimulationHarness, SimulationHarnessConfig, SimulationHarnessError, SimulationSuiteDefinition,
     SimulationSuiteReport,
 };
 

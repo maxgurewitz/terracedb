@@ -9,8 +9,8 @@ use flate2::{Compression as FlateCompression, read::ZlibDecoder, write::ZlibEnco
 use tempfile::tempfile;
 
 use super::{
-    FileContent, InodeData, InodeRecord, OriginRecord, SnapshotState, VfsError,
-    VFS_VOLUME_ARTIFACT_FORMAT_VERSION, VFS_VOLUME_ARTIFACT_MAGIC, VolumeInfo,
+    FileContent, InodeData, InodeRecord, OriginRecord, SnapshotState,
+    VFS_VOLUME_ARTIFACT_FORMAT_VERSION, VFS_VOLUME_ARTIFACT_MAGIC, VfsError, VolumeInfo,
     build_children_by_parent, build_paths_by_inode, file_content_to_bytes,
 };
 use crate::{
@@ -61,9 +61,11 @@ pub(super) fn read_volume_artifact<R: Read>(reader: &mut R) -> Result<SnapshotSt
     }
 
     let manifest_len = u64::from_be_bytes(header[8..16].try_into().expect("header slice"));
-    let manifest_len: usize = manifest_len.try_into().map_err(|_| VfsError::VolumeArtifact {
-        reason: format!("manifest too large: {manifest_len}"),
-    })?;
+    let manifest_len: usize = manifest_len
+        .try_into()
+        .map_err(|_| VfsError::VolumeArtifact {
+            reason: format!("manifest too large: {manifest_len}"),
+        })?;
     let mut manifest_bytes = vec![0_u8; manifest_len];
     reader
         .read_exact(&mut manifest_bytes)
@@ -75,10 +77,11 @@ pub(super) fn read_volume_artifact<R: Read>(reader: &mut R) -> Result<SnapshotSt
         });
     }
 
-    let manifest =
-        root_as_volume_artifact_manifest(&manifest_bytes).map_err(|error| VfsError::VolumeArtifact {
+    let manifest = root_as_volume_artifact_manifest(&manifest_bytes).map_err(|error| {
+        VfsError::VolumeArtifact {
             reason: format!("invalid volume artifact manifest: {error}"),
-        })?;
+        }
+    })?;
 
     if manifest.format_version() != VFS_VOLUME_ARTIFACT_FORMAT_VERSION {
         return Err(VfsError::VolumeArtifact {
@@ -95,7 +98,10 @@ pub(super) fn read_volume_artifact<R: Read>(reader: &mut R) -> Result<SnapshotSt
         format_version: manifest.volume_format_version(),
         root_inode: InodeId::new(manifest.root_inode()),
         created_at: Timestamp::new(manifest.created_at()),
-        overlay_base: manifest.overlay_base().map(decode_overlay_base).transpose()?,
+        overlay_base: manifest
+            .overlay_base()
+            .map(decode_overlay_base)
+            .transpose()?,
     };
 
     let mut paths = BTreeMap::new();
@@ -123,12 +129,14 @@ pub(super) fn read_volume_artifact<R: Read>(reader: &mut R) -> Result<SnapshotSt
                         reason: format!("symlink inode {inode_id} has unexpected file payload"),
                     });
                 }
-                InodeData::Symlink(entry.symlink_target().ok_or_else(|| {
-                    VfsError::VolumeArtifact {
-                        reason: format!("symlink inode {inode_id} missing target"),
-                    }
-                })?
-                .to_string())
+                InodeData::Symlink(
+                    entry
+                        .symlink_target()
+                        .ok_or_else(|| VfsError::VolumeArtifact {
+                            reason: format!("symlink inode {inode_id} missing target"),
+                        })?
+                        .to_string(),
+                )
             }
             FileKind::File => {
                 if entry.symlink_target().is_some() {
@@ -136,8 +144,14 @@ pub(super) fn read_volume_artifact<R: Read>(reader: &mut R) -> Result<SnapshotSt
                         reason: format!("file inode {inode_id} has unexpected symlink target"),
                     });
                 }
-                let content =
-                    decode_file_content(entry.file_payload(), entry.size(), info.chunk_size, reader, &mut payload_offset, inode_id)?;
+                let content = decode_file_content(
+                    entry.file_payload(),
+                    entry.size(),
+                    info.chunk_size,
+                    reader,
+                    &mut payload_offset,
+                    inode_id,
+                )?;
                 InodeData::File(content)
             }
         };
@@ -292,10 +306,14 @@ pub(super) fn write_encoded_volume_artifact<W: Write>(
     writer
         .write_all(&manifest_len.to_be_bytes())
         .map_err(io_error_to_artifact)?;
-    writer.write_all(manifest_bytes).map_err(io_error_to_artifact)?;
+    writer
+        .write_all(manifest_bytes)
+        .map_err(io_error_to_artifact)?;
 
     let mut spool = encoded_payloads.spool;
-    spool.seek(SeekFrom::Start(0)).map_err(io_error_to_artifact)?;
+    spool
+        .seek(SeekFrom::Start(0))
+        .map_err(io_error_to_artifact)?;
     copy(&mut spool, writer).map_err(io_error_to_artifact)?;
     Ok(())
 }
@@ -343,21 +361,17 @@ fn build_manifest<'a>(
     encoded_payloads: &EncodedPayloads,
     builder: &mut FlatBufferBuilder<'a>,
 ) -> Result<flatbuffers::WIPOffset<VolumeArtifactManifest<'a>>, VfsError> {
-    let overlay_base = snapshot
-        .info
-        .overlay_base
-        .as_ref()
-        .map(|overlay| {
-            let volume_id = builder.create_vector(&overlay.volume_id.encode());
-            OverlayBase::create(
-                builder,
-                &OverlayBaseArgs {
-                    volume_id: Some(volume_id),
-                    sequence: overlay.sequence.get(),
-                    durable: overlay.durable,
-                },
-            )
-        });
+    let overlay_base = snapshot.info.overlay_base.as_ref().map(|overlay| {
+        let volume_id = builder.create_vector(&overlay.volume_id.encode());
+        OverlayBase::create(
+            builder,
+            &OverlayBaseArgs {
+                volume_id: Some(volume_id),
+                sequence: overlay.sequence.get(),
+                durable: overlay.durable,
+            },
+        )
+    });
 
     let path_offsets = snapshot
         .paths
@@ -384,16 +398,19 @@ fn build_manifest<'a>(
                 InodeData::Symlink(target) => Some(builder.create_string(target)),
                 InodeData::File(_) => None,
             };
-            let file_payload = encoded_payloads.entries.get(&record.stats.inode).map(|payload| {
-                FilePayloadEntry::create(
-                    builder,
-                    &FilePayloadEntryArgs {
-                        payload_offset: payload.payload_offset,
-                        payload_len: payload.payload_len,
-                        compression: payload.compression,
-                    },
-                )
-            });
+            let file_payload = encoded_payloads
+                .entries
+                .get(&record.stats.inode)
+                .map(|payload| {
+                    FilePayloadEntry::create(
+                        builder,
+                        &FilePayloadEntryArgs {
+                            payload_offset: payload.payload_offset,
+                            payload_len: payload.payload_len,
+                            compression: payload.compression,
+                        },
+                    )
+                });
             Ok(InodeEntry::create(
                 builder,
                 &InodeEntryArgs {
@@ -451,7 +468,10 @@ fn build_manifest<'a>(
                 .map(|value| encode_json(value))
                 .transpose()?
                 .map(|value| builder.create_string(&value));
-            let error = run.error.as_deref().map(|value| builder.create_string(value));
+            let error = run
+                .error
+                .as_deref()
+                .map(|value| builder.create_string(value));
             Ok(ToolRunEntry::create(
                 builder,
                 &ToolRunEntryArgs {
@@ -552,9 +572,11 @@ fn decode_file_content<R: Read>(
     let encoded_len = payload.payload_len();
     let mut content = FileContent::default();
     let mut source = reader.take(encoded_len);
-    let chunk_size: usize = chunk_size.try_into().map_err(|_| VfsError::VolumeArtifact {
-        reason: format!("chunk size too large for inode {inode_id}: {chunk_size}"),
-    })?;
+    let chunk_size: usize = chunk_size
+        .try_into()
+        .map_err(|_| VfsError::VolumeArtifact {
+            reason: format!("chunk size too large for inode {inode_id}: {chunk_size}"),
+        })?;
     let mut remaining: usize = raw_len.try_into().map_err(|_| VfsError::VolumeArtifact {
         reason: format!("file payload too large for inode {inode_id}: {raw_len}"),
     })?;
@@ -572,7 +594,9 @@ fn decode_file_content<R: Read>(
             while remaining > 0 {
                 let chunk_len = remaining.min(chunk_size);
                 let mut bytes = vec![0_u8; chunk_len];
-                source.read_exact(&mut bytes).map_err(io_error_to_artifact)?;
+                source
+                    .read_exact(&mut bytes)
+                    .map_err(io_error_to_artifact)?;
                 content.chunks.insert(chunk_index, bytes);
                 remaining -= chunk_len;
                 chunk_index += 1;
@@ -584,16 +608,22 @@ fn decode_file_content<R: Read>(
             while remaining > 0 {
                 let chunk_len = remaining.min(chunk_size);
                 let mut bytes = vec![0_u8; chunk_len];
-                decoder.read_exact(&mut bytes).map_err(io_error_to_artifact)?;
+                decoder
+                    .read_exact(&mut bytes)
+                    .map_err(io_error_to_artifact)?;
                 content.chunks.insert(chunk_index, bytes);
                 remaining -= chunk_len;
                 chunk_index += 1;
             }
             let mut extra = Vec::new();
-            decoder.read_to_end(&mut extra).map_err(io_error_to_artifact)?;
+            decoder
+                .read_to_end(&mut extra)
+                .map_err(io_error_to_artifact)?;
             if !extra.is_empty() {
                 return Err(VfsError::VolumeArtifact {
-                    reason: format!("compressed payload for inode {inode_id} decoded beyond expected size"),
+                    reason: format!(
+                        "compressed payload for inode {inode_id} decoded beyond expected size"
+                    ),
                 });
             }
             source = decoder.into_inner();
@@ -619,20 +649,18 @@ fn decode_file_content<R: Read>(
 }
 
 fn file_content_len(content: &FileContent) -> Result<u64, VfsError> {
-    content
-        .chunks
-        .values()
-        .try_fold(0_u64, |acc, bytes| {
-            let len: u64 = bytes.len().try_into().map_err(|_| VfsError::VolumeArtifact {
+    content.chunks.values().try_fold(0_u64, |acc, bytes| {
+        let len: u64 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| VfsError::VolumeArtifact {
                 reason: "file chunk length exceeds u64".to_string(),
             })?;
-            Ok(acc.saturating_add(len))
-        })
+        Ok(acc.saturating_add(len))
+    })
 }
 
-fn decode_overlay_base(
-    overlay: OverlayBase<'_>,
-) -> Result<super::OverlayBaseDescriptor, VfsError> {
+fn decode_overlay_base(overlay: OverlayBase<'_>) -> Result<super::OverlayBaseDescriptor, VfsError> {
     Ok(super::OverlayBaseDescriptor {
         volume_id: decode_volume_id(overlay.volume_id())?,
         sequence: SequenceNumber::new(overlay.sequence()),

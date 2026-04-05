@@ -20,9 +20,8 @@ use crate::{
     GitCancellationToken, GitExportReport, GitExportRequest, GitHeadState, GitHostBridge,
     GitImportEntry, GitImportEntryKind, GitImportLayout, GitImportMode, GitImportReport,
     GitImportRequest, GitImportSink, GitImportSource, GitIndexEntry, GitIndexSnapshot,
-    GitObjectFormat, GitObjectKind,
-    GitPullRequestReport, GitPullRequestRequest, GitPushReport, GitPushRequest, GitRemoteProvider,
-    GitRepository, GitRepositoryOrigin, GitSubstrateError,
+    GitObjectFormat, GitObjectKind, GitPullRequestReport, GitPullRequestRequest, GitPushReport,
+    GitPushRequest, GitRemoteProvider, GitRepository, GitRepositoryOrigin, GitSubstrateError,
 };
 
 static IMPORT_EXPORT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -267,12 +266,8 @@ fn import_host_repository(
         GitImportLayout::RepositoryImage => {
             let refs = git_references(&repo_root)?;
             let index = git_index_snapshot(&repo_root)?;
-            let objects = git_object_closure(
-                &repo_root,
-                &refs,
-                report.head_commit.as_deref(),
-                &index,
-            )?;
+            let objects =
+                git_object_closure(&repo_root, &refs, report.head_commit.as_deref(), &index)?;
             import_repository_image_entries(
                 &report.branch,
                 report.head_commit.as_deref(),
@@ -732,15 +727,21 @@ async fn stream_head_archive(
             operation: "import_repository",
             message: format!("failed to spawn git archive: {error}"),
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| GitSubstrateError::Bridge {
-            operation: "import_repository",
-            message: "git archive did not provide stdout".to_string(),
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitSubstrateError::Bridge {
+                operation: "import_repository",
+                message: "git archive did not provide stdout".to_string(),
+            })?;
         let mut archive = tar::Archive::new(stdout);
-        for entry in archive.entries().map_err(|error| GitSubstrateError::Bridge {
-            operation: "import_repository",
-            message: format!("failed to read git archive entries: {error}"),
-        })? {
+        for entry in archive
+            .entries()
+            .map_err(|error| GitSubstrateError::Bridge {
+                operation: "import_repository",
+                message: format!("failed to read git archive entries: {error}"),
+            })?
+        {
             let mut entry = entry.map_err(|error| GitSubstrateError::Bridge {
                 operation: "import_repository",
                 message: format!("failed to decode git archive entry: {error}"),
@@ -799,10 +800,11 @@ async fn stream_head_archive(
             } else {
                 continue;
             };
-            tx.blocking_send(buffered).map_err(|_| GitSubstrateError::Bridge {
-                operation: "import_repository",
-                message: "git archive consumer dropped before import completed".to_string(),
-            })?;
+            tx.blocking_send(buffered)
+                .map_err(|_| GitSubstrateError::Bridge {
+                    operation: "import_repository",
+                    message: "git archive consumer dropped before import completed".to_string(),
+                })?;
         }
 
         let mut stderr = String::new();
@@ -855,7 +857,6 @@ async fn stream_head_archive(
         message: format!("git archive worker failed to join: {error}"),
     })??;
     return Ok(());
-
 }
 
 fn export_git_head(repo_root: &Path, pathspec: &[String]) -> Result<PathBuf, GitSubstrateError> {
@@ -868,7 +869,8 @@ fn export_git_head(repo_root: &Path, pathspec: &[String]) -> Result<PathBuf, Git
     if pathspec.is_empty() {
         run_git(repo_root, &["checkout-index", "--all", "--prefix", &prefix])?;
     } else {
-        let files = git_ls_files_with_pathspec(repo_root, &["ls-files", "-z", "--cached"], pathspec)?;
+        let files =
+            git_ls_files_with_pathspec(repo_root, &["ls-files", "-z", "--cached"], pathspec)?;
         if files.is_empty() {
             return Ok(export_root);
         }
@@ -941,7 +943,10 @@ fn git_ls_files_with_pathspec(
     if pathspec.is_empty() {
         return git_ls_files(repo_root, args);
     }
-    let mut dynamic_args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    let mut dynamic_args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
     dynamic_args.push("--".to_string());
     dynamic_args.extend(pathspec.iter().cloned());
     let output = git_command_dynamic(repo_root, &dynamic_args)?;
@@ -1811,10 +1816,13 @@ where
         })?;
 
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| GitSubstrateError::Bridge {
-            operation: "host_git",
-            message: "failed to open git stdin".to_string(),
-        })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| GitSubstrateError::Bridge {
+                operation: "host_git",
+                message: "failed to open git stdin".to_string(),
+            })?;
         for entry in stdin_entries {
             stdin
                 .write_all(entry.as_bytes())
@@ -1826,10 +1834,12 @@ where
         }
     }
 
-    let output = child.wait_with_output().map_err(|error| GitSubstrateError::Bridge {
-        operation: "host_git",
-        message: format!("{}: {}", repo_root.display(), error),
-    })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| GitSubstrateError::Bridge {
+            operation: "host_git",
+            message: format!("{}: {}", repo_root.display(), error),
+        })?;
     if output.status.success() {
         return Ok(());
     }

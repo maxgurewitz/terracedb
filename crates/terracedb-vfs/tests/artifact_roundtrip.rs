@@ -191,7 +191,10 @@ async fn artifact_streaming_reader_writer_roundtrips_without_slice_api() {
 
     let mut artifact = Vec::new();
     store
-        .export_volume_artifact_to_writer(CloneVolumeSource::new(volume.info().volume_id), &mut artifact)
+        .export_volume_artifact_to_writer(
+            CloneVolumeSource::new(volume.info().volume_id),
+            &mut artifact,
+        )
         .await
         .expect("export to writer");
 
@@ -286,10 +289,14 @@ async fn ensure_imported_volume_artifact_reuses_existing_base_volume() {
         .expect("open source");
     source
         .fs()
-        .write_file("/workspace/base.txt", b"base".to_vec(), CreateOptions {
-            create_parents: true,
-            ..Default::default()
-        })
+        .write_file(
+            "/workspace/base.txt",
+            b"base".to_vec(),
+            CreateOptions {
+                create_parents: true,
+                ..Default::default()
+            },
+        )
         .await
         .expect("write source");
 
@@ -371,10 +378,10 @@ async fn artifact_rejects_bad_magic_corrupt_manifest_and_trailing_bytes() {
         .err()
         .expect("corrupt manifest fails");
     assert!(
-        error.to_string().contains("invalid volume artifact manifest")
-            || error
-                .to_string()
-                .contains("manifest identifier mismatch")
+        error
+            .to_string()
+            .contains("invalid volume artifact manifest")
+            || error.to_string().contains("manifest identifier mismatch")
     );
 
     let mut trailing = bytes.clone();

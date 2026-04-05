@@ -8,6 +8,10 @@ use std::{
 
 use async_trait::async_trait;
 use futures::FutureExt as _;
+use terracedb::{
+    ExecutionDomainBudget, ExecutionDomainPath, ExecutionDomainSpec, ExecutionResourceKind,
+    ExecutionResourceUsage, ExecutionUsageLease, ResourceManager,
+};
 use thiserror::Error;
 use tokio::{runtime::Builder, time::timeout};
 
@@ -17,6 +21,7 @@ pub struct SimulationCaseSpec<C> {
     pub label: String,
     pub input: C,
     pub timeout: Duration,
+    pub requested_usage: Option<ExecutionResourceUsage>,
 }
 
 impl<C> SimulationCaseSpec<C> {
@@ -31,7 +36,13 @@ impl<C> SimulationCaseSpec<C> {
             label: label.into(),
             input,
             timeout,
+            requested_usage: None,
         }
+    }
+
+    pub fn with_requested_usage(mut self, requested_usage: ExecutionResourceUsage) -> Self {
+        self.requested_usage = Some(requested_usage);
+        self
     }
 }
 
@@ -124,9 +135,26 @@ impl Default for SimulationHarnessConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct SimulationDomainConfig {
+    pub resource_manager: Arc<dyn ResourceManager>,
+    pub domain_spec: ExecutionDomainSpec,
+    pub default_case_usage: ExecutionResourceUsage,
+}
+
+impl std::fmt::Debug for SimulationDomainConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulationDomainConfig")
+            .field("domain_spec", &self.domain_spec)
+            .field("default_case_usage", &self.default_case_usage)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SimulationHarness {
     config: SimulationHarnessConfig,
+    domain: Option<SimulationDomainConfig>,
 }
 
 impl SimulationHarness {
@@ -136,6 +164,11 @@ impl SimulationHarness {
 
     pub fn with_max_workers(mut self, max_workers: usize) -> Self {
         self.config.max_workers = max_workers.max(1);
+        self
+    }
+
+    pub fn with_domain(mut self, domain: SimulationDomainConfig) -> Self {
+        self.domain = Some(domain);
         self
     }
 
@@ -150,6 +183,11 @@ impl SimulationHarness {
     where
         S: SimulationSuiteDefinition,
     {
+        if let Some(domain) = &self.domain {
+            domain
+                .resource_manager
+                .register_domain(domain.domain_spec.clone());
+        }
         let fixture = suite.prepare().await?;
         let cases = suite.cases(fixture.clone()).await?;
         if cases.is_empty() {
@@ -166,17 +204,31 @@ impl SimulationHarness {
             let fixture = fixture.clone();
             let queue = queue.clone();
             let results = results.clone();
+            let domain = self.domain.clone();
             workers.push(thread::spawn(move || {
-                let runtime = Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| SimulationHarnessError::Runtime {
-                        message: error.to_string(),
-                    })?;
+                let runtime =
+                    Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| SimulationHarnessError::Runtime {
+                            message: error.to_string(),
+                        })?;
                 runtime.block_on(async move {
                     loop {
                         let Some(case) = pop_case(&queue)? else {
                             return Ok::<(), SimulationHarnessError>(());
+                        };
+                        let _lease = if let Some(domain) = &domain {
+                            Some(
+                                acquire_case_lease(
+                                    domain,
+                                    &case.case_id,
+                                    case.requested_usage.unwrap_or(domain.default_case_usage),
+                                )
+                                .await?,
+                            )
+                        } else {
+                            None
                         };
                         let started = Instant::now();
                         let status = match timeout(
@@ -187,15 +239,15 @@ impl SimulationHarness {
                         .await
                         {
                             Ok(Ok(Ok(()))) => SimulationCaseStatus::Passed,
-                            Ok(Ok(Err(error))) => {
-                                SimulationCaseStatus::Failed {
-                                    message: error.to_string(),
-                                }
-                            }
+                            Ok(Ok(Err(error))) => SimulationCaseStatus::Failed {
+                                message: error.to_string(),
+                            },
                             Ok(Err(payload)) => SimulationCaseStatus::Panicked {
                                 message: panic_message(payload.as_ref()),
                             },
-                            Err(_) => SimulationCaseStatus::TimedOut { after: case.timeout },
+                            Err(_) => SimulationCaseStatus::TimedOut {
+                                after: case.timeout,
+                            },
                         };
                         let report = SimulationCaseReport {
                             case_id: case.case_id,
@@ -211,12 +263,13 @@ impl SimulationHarness {
         }
 
         for (worker_index, worker) in workers.into_iter().enumerate() {
-            let thread_result = worker
-                .join()
-                .map_err(|payload| SimulationHarnessError::WorkerPanicked {
-                    worker_index,
-                    message: panic_message(payload.as_ref()),
-                })?;
+            let thread_result =
+                worker
+                    .join()
+                    .map_err(|payload| SimulationHarnessError::WorkerPanicked {
+                        worker_index,
+                        message: panic_message(payload.as_ref()),
+                    })?;
             thread_result?;
         }
 
@@ -263,18 +316,98 @@ pub enum SimulationHarnessError {
     },
     #[error("simulation harness internal state error: {message}")]
     InternalState { message: String },
+    #[error(
+        "simulation case {case_id} cannot fit in execution domain {path}: requested {requested_usage:?}, blocked by {blocked_by:?}"
+    )]
+    DomainUnschedulable {
+        case_id: String,
+        path: ExecutionDomainPath,
+        requested_usage: ExecutionResourceUsage,
+        blocked_by: Vec<ExecutionResourceKind>,
+    },
 }
 
-fn queue_len<C>(
-    queue: &Arc<StdMutex<VecDeque<SimulationCaseSpec<C>>>>,
-) -> usize {
+async fn acquire_case_lease(
+    domain: &SimulationDomainConfig,
+    case_id: &str,
+    requested_usage: ExecutionResourceUsage,
+) -> Result<ExecutionUsageLease, SimulationHarnessError> {
+    let mut subscription = domain.resource_manager.subscribe();
+    loop {
+        let lease = ExecutionUsageLease::acquire(
+            domain.resource_manager.clone(),
+            domain.domain_spec.path.clone(),
+            requested_usage,
+        );
+        if lease.admitted() {
+            return Ok(lease);
+        }
+        if !budget_can_fit(&lease.decision().effective_budget, requested_usage) {
+            return Err(SimulationHarnessError::DomainUnschedulable {
+                case_id: case_id.to_string(),
+                path: domain.domain_spec.path.clone(),
+                requested_usage,
+                blocked_by: lease.decision().blocked_by.clone(),
+            });
+        }
+        subscription
+            .changed()
+            .await
+            .map_err(|_| SimulationHarnessError::Runtime {
+                message: format!(
+                    "resource manager subscription closed while waiting for domain {}",
+                    domain.domain_spec.path
+                ),
+            })?;
+    }
+}
+
+fn budget_can_fit(budget: &ExecutionDomainBudget, usage: ExecutionResourceUsage) -> bool {
+    metric_fits(
+        budget.cpu.worker_slots.map(u64::from),
+        u64::from(usage.cpu_workers),
+    ) && metric_fits(budget.memory.total_bytes, usage.memory_bytes)
+        && metric_fits(budget.memory.cache_bytes, usage.cache_bytes)
+        && metric_fits(budget.memory.mutable_bytes, usage.mutable_bytes)
+        && metric_fits(
+            budget.io.local_concurrency.map(u64::from),
+            u64::from(usage.local_io_concurrency),
+        )
+        && metric_fits(
+            budget.io.local_bytes_per_second,
+            usage.local_io_bytes_per_second,
+        )
+        && metric_fits(
+            budget.io.remote_concurrency.map(u64::from),
+            u64::from(usage.remote_io_concurrency),
+        )
+        && metric_fits(
+            budget.io.remote_bytes_per_second,
+            usage.remote_io_bytes_per_second,
+        )
+        && metric_fits(
+            budget.background.task_slots.map(u64::from),
+            u64::from(usage.background_tasks),
+        )
+        && metric_fits(
+            budget.background.max_in_flight_bytes,
+            usage.background_in_flight_bytes,
+        )
+}
+
+fn metric_fits(limit: Option<u64>, requested: u64) -> bool {
+    limit.is_none_or(|limit| requested <= limit)
+}
+
+fn queue_len<C>(queue: &Arc<StdMutex<VecDeque<SimulationCaseSpec<C>>>>) -> usize {
     queue.lock().map(|queue| queue.len()).unwrap_or_default()
 }
 
 fn pop_case<C>(
     queue: &Arc<StdMutex<VecDeque<SimulationCaseSpec<C>>>>,
 ) -> Result<Option<SimulationCaseSpec<C>>, SimulationHarnessError> {
-    queue.lock()
+    queue
+        .lock()
         .map_err(|_| SimulationHarnessError::InternalState {
             message: "simulation case queue mutex poisoned".to_string(),
         })
@@ -308,15 +441,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 mod tests {
     use async_trait::async_trait;
     use std::sync::{
-        Arc,
+        Arc, Barrier,
         atomic::{AtomicUsize, Ordering},
-        Barrier,
     };
     use std::time::Duration;
+    use terracedb::{
+        DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath,
+        ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionResourceUsage,
+        InMemoryResourceManager,
+    };
 
     use super::{
-        SimulationCaseSpec, SimulationCaseStatus, SimulationHarness, SimulationHarnessError,
-        SimulationSuiteDefinition,
+        SimulationCaseSpec, SimulationCaseStatus, SimulationDomainConfig, SimulationHarness,
+        SimulationHarnessError, SimulationSuiteDefinition,
     };
 
     #[derive(Clone)]
@@ -348,18 +485,8 @@ mod tests {
             _fixture: Arc<Self::Fixture>,
         ) -> Result<Vec<SimulationCaseSpec<Self::Case>>, SimulationHarnessError> {
             Ok(vec![
-                SimulationCaseSpec::new(
-                    "alpha",
-                    "alpha",
-                    "alpha",
-                    Duration::from_millis(100),
-                ),
-                SimulationCaseSpec::new(
-                    "beta",
-                    "beta",
-                    "beta",
-                    Duration::from_millis(100),
-                ),
+                SimulationCaseSpec::new("alpha", "alpha", "alpha", Duration::from_millis(100)),
+                SimulationCaseSpec::new("beta", "beta", "beta", Duration::from_millis(100)),
             ])
         }
 
@@ -436,6 +563,179 @@ mod tests {
         assert!(matches!(
             report.cases[0].status,
             SimulationCaseStatus::TimedOut { .. }
+        ));
+    }
+
+    #[derive(Clone)]
+    struct DomainFixture {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    struct DomainSuite {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    #[async_trait(?Send)]
+    impl SimulationSuiteDefinition for DomainSuite {
+        type Fixture = DomainFixture;
+        type Case = &'static str;
+
+        async fn prepare(&self) -> Result<Arc<Self::Fixture>, SimulationHarnessError> {
+            Ok(Arc::new(DomainFixture {
+                active: self.active.clone(),
+                max_active: self.max_active.clone(),
+            }))
+        }
+
+        async fn cases(
+            &self,
+            _fixture: Arc<Self::Fixture>,
+        ) -> Result<Vec<SimulationCaseSpec<Self::Case>>, SimulationHarnessError> {
+            Ok(vec![
+                SimulationCaseSpec::new("one", "one", "one", Duration::from_secs(1)),
+                SimulationCaseSpec::new("two", "two", "two", Duration::from_secs(1)),
+                SimulationCaseSpec::new("three", "three", "three", Duration::from_secs(1)),
+            ])
+        }
+
+        async fn run_case(
+            &self,
+            fixture: Arc<Self::Fixture>,
+            _case: SimulationCaseSpec<Self::Case>,
+        ) -> Result<(), SimulationHarnessError> {
+            let current = fixture.active.fetch_add(1, Ordering::SeqCst) + 1;
+            loop {
+                let observed = fixture.max_active.load(Ordering::SeqCst);
+                if current <= observed {
+                    break;
+                }
+                if fixture
+                    .max_active
+                    .compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            fixture.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_respects_execution_domain_cpu_budget() {
+        let resource_manager = Arc::new(InMemoryResourceManager::new(
+            ExecutionDomainBudget::default(),
+        ));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let report = SimulationHarness::new()
+            .with_max_workers(3)
+            .with_domain(SimulationDomainConfig {
+                resource_manager,
+                domain_spec: ExecutionDomainSpec {
+                    path: ExecutionDomainPath::new(["process", "systemtest", "cpu-serial"]),
+                    owner: ExecutionDomainOwner::Subsystem {
+                        database: None,
+                        name: "systemtest".to_string(),
+                    },
+                    budget: ExecutionDomainBudget {
+                        cpu: DomainCpuBudget {
+                            worker_slots: Some(1),
+                            weight: Some(1),
+                        },
+                        ..Default::default()
+                    },
+                    placement: ExecutionDomainPlacement::Dedicated,
+                    metadata: Default::default(),
+                },
+                default_case_usage: ExecutionResourceUsage {
+                    cpu_workers: 1,
+                    ..Default::default()
+                },
+            })
+            .run_suite(Arc::new(DomainSuite {
+                active: active.clone(),
+                max_active: max_active.clone(),
+            }))
+            .await
+            .expect("run domain-limited suite");
+        assert!(report.is_success());
+        assert_eq!(report.total_cases(), 3);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    struct UnschedulableSuite;
+
+    #[async_trait(?Send)]
+    impl SimulationSuiteDefinition for UnschedulableSuite {
+        type Fixture = ();
+        type Case = ();
+
+        async fn prepare(&self) -> Result<Arc<Self::Fixture>, SimulationHarnessError> {
+            Ok(Arc::new(()))
+        }
+
+        async fn cases(
+            &self,
+            _fixture: Arc<Self::Fixture>,
+        ) -> Result<Vec<SimulationCaseSpec<Self::Case>>, SimulationHarnessError> {
+            Ok(vec![
+                SimulationCaseSpec::new("too-big", "too-big", (), Duration::from_secs(1))
+                    .with_requested_usage(ExecutionResourceUsage {
+                        cpu_workers: 2,
+                        ..Default::default()
+                    }),
+            ])
+        }
+
+        async fn run_case(
+            &self,
+            _fixture: Arc<Self::Fixture>,
+            _case: SimulationCaseSpec<Self::Case>,
+        ) -> Result<(), SimulationHarnessError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_fails_fast_for_unschedulable_case_usage() {
+        let resource_manager = Arc::new(InMemoryResourceManager::new(
+            ExecutionDomainBudget::default(),
+        ));
+        let error = SimulationHarness::new()
+            .with_domain(SimulationDomainConfig {
+                resource_manager,
+                domain_spec: ExecutionDomainSpec {
+                    path: ExecutionDomainPath::new(["process", "systemtest", "cpu-tight"]),
+                    owner: ExecutionDomainOwner::Subsystem {
+                        database: None,
+                        name: "systemtest".to_string(),
+                    },
+                    budget: ExecutionDomainBudget {
+                        cpu: DomainCpuBudget {
+                            worker_slots: Some(1),
+                            weight: Some(1),
+                        },
+                        ..Default::default()
+                    },
+                    placement: ExecutionDomainPlacement::Dedicated,
+                    metadata: Default::default(),
+                },
+                default_case_usage: ExecutionResourceUsage {
+                    cpu_workers: 1,
+                    ..Default::default()
+                },
+            })
+            .run_suite(Arc::new(UnschedulableSuite))
+            .await
+            .expect_err("unschedulable case should fail");
+        assert!(matches!(
+            error,
+            SimulationHarnessError::DomainUnschedulable { .. }
         ));
     }
 }

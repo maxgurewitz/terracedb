@@ -22,4 +22,5 @@ It also owns the in-process simulation suite harness used for:
 - suite-scoped shared fixture preparation,
 - thread-level parallel case execution inside one Rust test process,
 - per-case timeout enforcement, and
+- optional execution-domain admission through Terracedb `ResourceManager`, and
 - future production-facing simulation scheduling APIs.

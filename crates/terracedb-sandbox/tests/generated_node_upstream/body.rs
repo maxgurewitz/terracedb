@@ -8,14 +8,170 @@ pub const GENERATED_UPSTREAM_NODE_CASES: &[node_compat::GeneratedUpstreamNodeCas
     ),
 
     node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-cache",
+        "/test/parallel/test-module-cache.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-children",
+        "/test/parallel/test-module-children.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-circular-dependency-warning",
+        "/test/parallel/test-module-circular-dependency-warning.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-circular-symlinks",
+        "/test/parallel/test-module-circular-symlinks.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-create-require-multibyte",
+        "/test/parallel/test-module-create-require-multibyte.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
         "test-module-create-require",
         "/test/parallel/test-module-create-require.js",
         30,
     ),
 
     node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-globalpaths-nodepath",
+        "/test/parallel/test-module-globalpaths-nodepath.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-isBuiltin",
+        "/test/parallel/test-module-isBuiltin.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-loading-deprecated",
+        "/test/parallel/test-module-loading-deprecated.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-loading-error",
+        "/test/parallel/test-module-loading-error.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-loading-globalpaths",
+        "/test/parallel/test-module-loading-globalpaths.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-main-extension-lookup",
+        "/test/parallel/test-module-main-extension-lookup.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-main-fail",
+        "/test/parallel/test-module-main-fail.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-main-preserve-symlinks-fail",
+        "/test/parallel/test-module-main-preserve-symlinks-fail.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-multi-extensions",
+        "/test/parallel/test-module-multi-extensions.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
         "test-module-nodemodulepaths",
         "/test/parallel/test-module-nodemodulepaths.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-parent-deprecation",
+        "/test/parallel/test-module-parent-deprecation.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-parent-setter-deprecation",
+        "/test/parallel/test-module-parent-setter-deprecation.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-prototype-mutation",
+        "/test/parallel/test-module-prototype-mutation.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-readonly",
+        "/test/parallel/test-module-readonly.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-relative-lookup",
+        "/test/parallel/test-module-relative-lookup.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-run-main-monkey-patch",
+        "/test/parallel/test-module-run-main-monkey-patch.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-setsourcemapssupport",
+        "/test/parallel/test-module-setsourcemapssupport.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-stat",
+        "/test/parallel/test-module-stat.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-strip-types",
+        "/test/parallel/test-module-strip-types.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-symlinked-peer-modules",
+        "/test/parallel/test-module-symlinked-peer-modules.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-version",
+        "/test/parallel/test-module-version.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-wrap",
+        "/test/parallel/test-module-wrap.js",
         30,
     ),
 
@@ -32,8 +188,86 @@ pub const GENERATED_UPSTREAM_NODE_CASES: &[node_compat::GeneratedUpstreamNodeCas
     ),
 
     node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-delete-array-iterator",
+        "/test/parallel/test-require-delete-array-iterator.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
         "test-require-dot",
         "/test/parallel/test-require-dot.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-empty-main",
+        "/test/parallel/test-require-empty-main.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-enoent-dir",
+        "/test/parallel/test-require-enoent-dir.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-exceptions",
+        "/test/parallel/test-require-exceptions.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-extension-over-directory",
+        "/test/parallel/test-require-extension-over-directory.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-extensions-main",
+        "/test/parallel/test-require-extensions-main.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-extensions-same-filename-as-dir-trailing-slash",
+        "/test/parallel/test-require-extensions-same-filename-as-dir-trailing-slash.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-extensions-same-filename-as-dir",
+        "/test/parallel/test-require-extensions-same-filename-as-dir.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-invalid-main-no-exports",
+        "/test/parallel/test-require-invalid-main-no-exports.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-invalid-package",
+        "/test/parallel/test-require-invalid-package.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-json",
+        "/test/parallel/test-require-json.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-long-path",
+        "/test/parallel/test-require-long-path.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-mjs",
+        "/test/parallel/test-require-mjs.js",
         30,
     ),
 
@@ -44,8 +278,56 @@ pub const GENERATED_UPSTREAM_NODE_CASES: &[node_compat::GeneratedUpstreamNodeCas
     ),
 
     node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-nul",
+        "/test/parallel/test-require-nul.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-process",
+        "/test/parallel/test-require-process.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-resolve-invalid-paths",
+        "/test/parallel/test-require-resolve-invalid-paths.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-resolve-opts-paths-relative",
+        "/test/parallel/test-require-resolve-opts-paths-relative.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
         "test-require-resolve",
         "/test/parallel/test-require-resolve.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-symlink",
+        "/test/parallel/test-require-symlink.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-unicode",
+        "/test/parallel/test-require-unicode.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-module-loading",
+        "/test/sequential/test-module-loading.js",
+        30,
+    ),
+
+    node_compat::GeneratedUpstreamNodeCase::new(
+        "test-require-cache-without-stat",
+        "/test/sequential/test-require-cache-without-stat.js",
         30,
     ),
 

@@ -19,8 +19,8 @@ use terracedb_git::worktree::GitWorktreeMaterializer;
 use terracedb_git::{
     DeterministicGitRepositoryStore, GitCancellationToken, GitCheckoutReport, GitCheckoutRequest,
     GitCommitRequest, GitDiffRequest, GitDiscoverRequest, GitExecutionHooks, GitForkPolicy,
-    GitHeadState, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportLayout, GitImportMode,
-    GitImportRequest, GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase,
+    GitHeadState, GitHostBridge, GitImportEntry, GitImportEntryKind, GitImportLayout,
+    GitImportMode, GitImportRequest, GitIndexEntry, GitIndexSnapshot, GitObject, GitObjectDatabase,
     GitObjectFormat, GitOpenRequest, GitPullRequestRequest, GitPushRequest, GitRefUpdate,
     GitReference, GitRepositoryHandle, GitRepositoryImage, GitRepositoryOrigin,
     GitRepositoryPolicy, GitRepositoryProvenance, GitRepositoryStore, GitStatusKind,
@@ -1989,7 +1989,10 @@ async fn host_git_bridge_can_import_tree_only_layout_without_git_metadata() {
     assert_eq!(imported.target_root, "/repo");
     assert_eq!(imported.layout, GitImportLayout::TreeOnly);
     assert!(
-        imported.entries.iter().all(|entry| !entry.path.starts_with(".git")),
+        imported
+            .entries
+            .iter()
+            .all(|entry| !entry.path.starts_with(".git")),
         "tree-only imports should not synthesize .git metadata: {:?}",
         imported
             .entries
@@ -2052,7 +2055,10 @@ async fn host_git_bridge_can_import_remote_tree_only_layout_without_git_metadata
         Some(b"tracked\n".to_vec())
     );
     assert!(
-        imported.entries.iter().all(|entry| !entry.path.starts_with(".git")),
+        imported
+            .entries
+            .iter()
+            .all(|entry| !entry.path.starts_with(".git")),
         "remote tree-only imports should not synthesize .git metadata: {:?}",
         imported
             .entries

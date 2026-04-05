@@ -1,14 +1,10 @@
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::{
-    EngineJsRuntimeHost,
-    JsForkPolicy, JsSubstrateError,
+    EngineJsRuntimeHost, JsForkPolicy, JsSubstrateError,
     entropy::JsEntropySource,
     host::JsHostServices,
     loader::{JsLoadedModule, JsModuleLoader, JsResolvedModule},

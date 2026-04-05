@@ -46,11 +46,14 @@ pub trait VfsArtifactStoreExt: VolumeStore {
             Err(error) => return Err(error),
         }
 
-        match self.import_volume_artifact_from_reader(reader, target.clone()).await {
+        match self
+            .import_volume_artifact_from_reader(reader, target.clone())
+            .await
+        {
             Ok(volume) => Ok(volume),
-            Err(VfsError::VolumeAlreadyExists { .. }) => self
-                .open_volume(target.with_create_if_missing(false))
-                .await,
+            Err(VfsError::VolumeAlreadyExists { .. }) => {
+                self.open_volume(target.with_create_if_missing(false)).await
+            }
             Err(error) => Err(error),
         }
     }
