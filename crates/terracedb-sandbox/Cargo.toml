@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 arc-swap = "1.7.1"
+async-recursion = "1.1.1"
 async-trait = "0.1.89"
 base64 = "0.22.1"
 boa_ast = { path = "/Users/maxwellgurewitz/dev/boa/core/ast" }
